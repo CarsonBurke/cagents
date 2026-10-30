@@ -38,6 +38,19 @@ fn encode(value: &impl serde::Serialize) -> Result<String, String> {
     serde_json::to_string(value).map_err(|error| error.to_string())
 }
 
+fn notification_key(id: Uuid) -> String {
+    format!("proposal:{id}")
+}
+
+fn retire_notification(db: &Connection, id: Uuid) -> Result<(), String> {
+    db.execute(
+        "DELETE FROM automation_notifications WHERE key=?1",
+        [notification_key(id)],
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn read(db: &Connection, id: Uuid, owner: Option<&Origin>) -> Result<Option<Proposal>, String> {
     let owner = owner.map(encode).transpose()?;
     let record: Option<String> = db
@@ -113,6 +126,31 @@ impl Registry {
         owner: Option<&Origin>,
     ) -> Result<Option<Proposal>, String> {
         read(&self.db, id, owner)
+    }
+
+    /// Approval attention follows the durable decision, including after a late
+    /// event was loaded or journaled. Do not load the saved execution prompt.
+    pub(crate) fn automation_proposal_needs_approval(&self, id: Uuid) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automation_proposals WHERE id=?1 AND pending=1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Also discard an old outbox row restored from before decision retirement
+    /// was supported. A pending request must retain its original notice.
+    pub(crate) fn retire_automation_proposal_notification(&self, id: Uuid) -> Result<(), String> {
+        self.db
+            .execute(
+                "DELETE FROM automation_notifications WHERE key=?1 AND NOT EXISTS(
+                    SELECT 1 FROM automation_proposals WHERE id=?2 AND pending=1)",
+                params![notification_key(id), id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub(crate) fn pending_automation_proposals(
@@ -252,7 +290,7 @@ impl Registry {
                 directory: Some(proposal.definition.agent.target.repository.clone()),
                 destination: None,
                 evidence: crate::notifications::Evidence {
-                    key: format!("proposal:{}", proposal.id),
+                    key: notification_key(proposal.id),
                     kind: crate::notifications::Kind::AutomationProposed,
                 },
             },
@@ -308,6 +346,7 @@ impl Registry {
             params![current.id.to_string(), encode(&current)?],
         )
         .map_err(|error| error.to_string())?;
+        retire_notification(&tx, current.id)?;
         tx.execute("UPDATE metadata SET sequence=sequence+1,automation_proposal_sequence=automation_proposal_sequence+1 WHERE key=0", [])
             .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -555,6 +594,7 @@ mod tests {
     #[test]
     fn approval_receipt_failure_rolls_back_schedule_creation_then_can_retry() {
         let (_root, mut registry, proposal) = fixture();
+        let original_notices = registry.automation_notifications().unwrap();
         registry
             .db
             .execute_batch(
@@ -572,6 +612,10 @@ mod tests {
             registry.automation_proposal(proposal.id, None).unwrap(),
             Some(proposal.clone())
         );
+        assert_eq!(
+            registry.automation_notifications().unwrap(),
+            original_notices
+        );
         registry
             .db
             .execute_batch("DROP TRIGGER reject_proposal_receipt")
@@ -583,6 +627,49 @@ mod tests {
                 .state,
             ProposalState::Approved { .. }
         ));
+        assert!(registry.automation_notifications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn notification_retirement_failure_keeps_the_decision_and_schedule_uncommitted() {
+        let (_root, mut registry, proposal) = fixture();
+        let original_notices = registry.automation_notifications().unwrap();
+        registry
+            .db
+            .execute_batch(
+                "CREATE TRIGGER reject_proposal_notice_retirement BEFORE DELETE ON automation_notifications
+                 BEGIN SELECT RAISE(ABORT,'fixture retirement failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            registry
+                .resolve_automation_proposal(&proposal, Some(next()), 200)
+                .is_err()
+        );
+        assert!(registry.automations(None, 100).unwrap().is_empty());
+        assert_eq!(
+            registry.automation_proposal(proposal.id, None).unwrap(),
+            Some(proposal.clone())
+        );
+        assert_eq!(
+            registry.automation_notifications().unwrap(),
+            original_notices
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_proposal_notice_retirement")
+            .unwrap();
+        let receipt = registry
+            .resolve_automation_proposal(&proposal, Some(next()), 300)
+            .unwrap();
+        assert_eq!(registry.automations(None, 100).unwrap().len(), 1);
+        assert!(registry.automation_notifications().unwrap().is_empty());
+        assert_eq!(
+            registry
+                .resolve_automation_proposal(&proposal, Some(next()), 400)
+                .unwrap(),
+            receipt
+        );
     }
 
     #[test]

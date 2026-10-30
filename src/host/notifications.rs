@@ -142,13 +142,18 @@ impl Handle {
     }
 
     pub(super) fn take_automation_receipts(&self) -> BTreeSet<String> {
-        std::mem::take(
+        let receipts = std::mem::take(
             &mut *self
                 .0
                 .automation_receipts
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()),
-        )
+        );
+        // Every committed proposal decision reaches this scheduler transfer,
+        // including when it deleted the last outbox event. Reconcile journaled
+        // and deferred attention without inventing another notification event.
+        self.change(|_| {});
+        receipts
     }
 
     pub fn record(&self, event: Event) {
@@ -1210,6 +1215,456 @@ mod tests {
         queue_withdrawal(&mut queue, existing);
         assert_eq!(queue.len(), MAX_PENDING);
     }
+
+    fn proposal_fixture() -> (
+        tempfile::TempDir,
+        super::super::agent_execution::SharedRegistry,
+        crate::automations::Proposal,
+        crate::automations::Proposal,
+    ) {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Lineage, Origin, Spec, Surface, Target as AgentTarget},
+            automations::{Definition, DirectoryIdentity, Schedule, SchedulePattern, SessionMode},
+            model::ProjectKind,
+            workspace_model::ModelEdit,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut registry =
+            super::super::model::Registry::at(&root.path().join("registry.sqlite3")).unwrap();
+        let repository = root.path().to_path_buf();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "Approval attention fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = Definition {
+            name: "Scheduled report".into(),
+            prompt: "Prepare the approved report".into(),
+            agent: Spec {
+                provider: Provider::Codex,
+                account: Some("codex/system".parse().unwrap()),
+                target: AgentTarget {
+                    repository: repository.clone(),
+                    directory: repository,
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: Some("fixture".into()),
+                reasoning_effort: Some("low".into()),
+                permission_mode: Some("readOnly".into()),
+            },
+            schedule: Schedule {
+                timezone: "America/Vancouver".into(),
+                pattern: SchedulePattern::Cron {
+                    expression: "30 9 * * 1,3,5".into(),
+                },
+            },
+            session_mode: SessionMode::Fresh,
+            visibility: Default::default(),
+            catch_up: Default::default(),
+            precheck: None,
+        };
+        let mut propose = || {
+            registry
+                .propose_automation(
+                    Uuid::new_v4(),
+                    Origin::Child {
+                        parent: Lineage(TerminalId::new()),
+                    },
+                    definition.clone(),
+                    definition.clone(),
+                    DirectoryIdentity {
+                        device: 1,
+                        inode: 2,
+                    },
+                    None,
+                    100,
+                )
+                .unwrap()
+        };
+        let first = propose();
+        let other = propose();
+        (root, Arc::new(Mutex::new(registry)), first, other)
+    }
+
+    fn next_proposal_occurrence() -> crate::automations::Occurrence {
+        crate::automations::Occurrence {
+            due_ms: 1000,
+            local: "2026-10-12T09:30".into(),
+        }
+    }
+
+    fn proposal_target(target: &Target, expected: Uuid) -> bool {
+        matches!(target, Target::AutomationProposal { id, .. } if *id == expected)
+    }
+
+    // Defer the actual desktop boundary, using the same real store, journal
+    // admission and delivery outbox that the notification worker uses.
+    fn defer_events(
+        registry: &ProposalRegistry,
+        shared: &Arc<Shared>,
+        journal: &mut journal::Journal,
+        delivery: &mut BTreeMap<Target, Notice>,
+    ) -> Vec<Event> {
+        let pending = std::mem::take(&mut *shared.pending.lock().unwrap());
+        let events: Vec<_> = pending
+            .events
+            .into_values()
+            .chain(pending.automation_events)
+            .collect();
+        for event in &events {
+            if let Some(notice) = journal_current_event(
+                registry,
+                journal,
+                &Arc::downgrade(shared),
+                event.clone(),
+                false,
+            )
+            .unwrap()
+            {
+                delivery.insert(notice.event.target(), notice);
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn resolution_before_transfer_preserves_other_pending_approval_attention() {
+        for approved in [true, false] {
+            let (_root, registry, proposal, other) = proposal_fixture();
+            let receipt = registry
+                .lock()
+                .unwrap()
+                .resolve_automation_proposal(
+                    &proposal,
+                    approved.then(next_proposal_occurrence),
+                    200,
+                )
+                .unwrap();
+            let (shared, _receiver) = shared();
+            let handle = Handle(shared.clone());
+            super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+            let pending = shared.pending.lock().unwrap();
+            assert_eq!(pending.automation_events.len(), 1);
+            assert!(proposal_target(
+                &pending.automation_events[0].target,
+                other.id
+            ));
+            drop(pending);
+            let mut store = registry.lock().unwrap();
+            for next in [None, Some(next_proposal_occurrence())] {
+                assert_eq!(
+                    store
+                        .resolve_automation_proposal(&proposal, next, 300)
+                        .unwrap(),
+                    receipt,
+                    "a retry or opposite decision retains the exact terminal receipt"
+                );
+            }
+            assert_eq!(
+                store.automations(None, 100).unwrap().len(),
+                usize::from(approved)
+            );
+            assert!(store.automation_proposal_needs_approval(other.id).unwrap());
+        }
+    }
+
+    #[test]
+    fn settled_last_proposal_wakes_reconciliation_without_an_outbox_event() {
+        let (root, registry, proposal, other) = proposal_fixture();
+        let registry_view = Ok(registry.clone());
+        let (shared, mut receiver) = shared();
+        let handle = Handle(shared.clone());
+        let mut journal = journal::Journal::open(&root.path().join("notices.sqlite3")).unwrap();
+        let mut delivery = BTreeMap::new();
+        let mut withdrawals = BTreeSet::new();
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        defer_events(&registry_view, &shared, &mut journal, &mut delivery);
+        receiver.try_recv().unwrap();
+        for proposal in [&proposal, &other] {
+            registry
+                .lock()
+                .unwrap()
+                .resolve_automation_proposal(proposal, None, 200)
+                .unwrap();
+        }
+        assert!(
+            registry
+                .lock()
+                .unwrap()
+                .automation_notifications()
+                .unwrap()
+                .is_empty()
+        );
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        assert!(shared.pending.lock().unwrap().automation_events.is_empty());
+        receiver
+            .try_recv()
+            .expect("a decision must wake the broker even after removing its last event");
+        reconcile_proposal_notices(
+            &registry_view,
+            &mut journal,
+            &mut delivery,
+            &mut withdrawals,
+        )
+        .unwrap();
+        assert!(journal.list().unwrap().is_empty());
+        assert!(delivery.is_empty());
+        assert_eq!(withdrawals.len(), 2);
+    }
+
+    #[test]
+    fn resolved_proposals_retire_deferred_delivery_and_cannot_reappear_on_replay() {
+        use crate::notifications::{Evidence, Kind};
+        for approved in [true, false] {
+            let (root, registry, proposal, other) = proposal_fixture();
+            let registry_view = Ok(registry.clone());
+            let (shared, _receiver) = shared();
+            let handle = Handle(shared.clone());
+            let session = TerminalId::new();
+            let unrelated = Event {
+                target: Target::Session(session),
+                source_session: Some(session),
+                provider: None,
+                directory: None,
+                destination: None,
+                evidence: Evidence {
+                    key: "unrelated-finished-turn".into(),
+                    kind: Kind::Succeeded,
+                },
+            };
+            handle.record(unrelated.clone());
+            super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+            let journal_path = root.path().join("notices.sqlite3");
+            let mut journal = journal::Journal::open(&journal_path).unwrap();
+            let mut delivery = BTreeMap::new();
+            let mut withdrawals = BTreeSet::new();
+            let events = defer_events(&registry_view, &shared, &mut journal, &mut delivery);
+            let stale = events
+                .iter()
+                .find(|event| proposal_target(&event.target, proposal.id))
+                .unwrap()
+                .clone();
+            let old = journal
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|notice| proposal_target(&notice.event.target, proposal.id))
+                .unwrap();
+            assert!(!old.delivered);
+            let retained: Vec<_> = journal
+                .list()
+                .unwrap()
+                .into_iter()
+                .filter(|notice| !proposal_target(&notice.event.target, proposal.id))
+                .collect();
+            // Collect before resolution, as when portal connection is awaiting.
+            let collected = desktop_batch(&registry_view, &delivery, &mut None);
+            assert_eq!(collected.notices.len(), 3);
+            let receipt = registry
+                .lock()
+                .unwrap()
+                .resolve_automation_proposal(
+                    &proposal,
+                    approved.then(next_proposal_occurrence),
+                    200,
+                )
+                .unwrap();
+            let mut sent = Vec::new();
+            for notice in collected.notices {
+                if admit_desktop_notice(
+                    &registry_view,
+                    &mut journal,
+                    &mut delivery,
+                    &mut withdrawals,
+                    &notice,
+                )
+                .unwrap()
+                {
+                    sent.push(notice.event.target());
+                }
+            }
+            assert_eq!(sent.len(), 2);
+            assert!(sent.iter().any(|target| proposal_target(target, other.id)));
+            assert!(sent.contains(&unrelated.target));
+            assert!(
+                !sent
+                    .iter()
+                    .any(|target| proposal_target(target, proposal.id))
+            );
+            assert!(withdrawals.contains(&old.id));
+            assert_eq!(journal.list().unwrap(), retained);
+            assert!(
+                !delivery
+                    .keys()
+                    .any(|target| proposal_target(target, proposal.id))
+            );
+
+            // An event already drained before resolution must not journal late.
+            assert!(
+                journal_current_event(
+                    &registry_view,
+                    &mut journal,
+                    &Arc::downgrade(&shared),
+                    stale.clone(),
+                    false,
+                )
+                .unwrap()
+                .is_none()
+            );
+            // Nor can the real incoming queue replay it after retirement.
+            // Restore a pre-fix outbox row too: worker authority must remove
+            // that persisted row rather than replay it on every scheduler tick.
+            super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+            rusqlite::Connection::open(root.path().join("registry.sqlite3"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO automation_notifications(key,event) VALUES(?1,?2)",
+                    rusqlite::params![stale.evidence.key, serde_json::to_string(&stale).unwrap()],
+                )
+                .unwrap();
+            handle.record(stale.clone());
+            super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+            defer_events(&registry_view, &shared, &mut journal, &mut delivery);
+            assert_eq!(journal.list().unwrap(), retained);
+            assert!(
+                registry
+                    .lock()
+                    .unwrap()
+                    .automation_notifications()
+                    .unwrap()
+                    .iter()
+                    .all(|event| !proposal_target(&event.target, proposal.id))
+            );
+
+            // Seed an old already-journaled notice, then reopen both stores as
+            // on startup. Retirement deletes seen keys, so authority must still
+            // reject its replay independently of bounded journal deduplication.
+            journal.record(stale.clone(), false).unwrap();
+            drop(journal);
+            drop(registry_view);
+            drop(registry);
+            let registry = Arc::new(Mutex::new(
+                super::super::model::Registry::at(&root.path().join("registry.sqlite3")).unwrap(),
+            ));
+            let registry_view = Ok(registry.clone());
+            let mut journal = journal::Journal::open(&journal_path).unwrap();
+            reconcile_proposal_notices(
+                &registry_view,
+                &mut journal,
+                &mut delivery,
+                &mut withdrawals,
+            )
+            .unwrap();
+            assert_eq!(journal.list().unwrap(), retained);
+            handle.record(stale);
+            defer_events(&registry_view, &shared, &mut journal, &mut delivery);
+            assert_eq!(journal.list().unwrap(), retained);
+            let batch = desktop_batch(&registry_view, &delivery, &mut None);
+            assert_eq!(batch.notices.len(), 2);
+            assert!(!batch.deferred);
+            assert!(!batch.more);
+            let mut store = registry.lock().unwrap();
+            assert_eq!(
+                store
+                    .resolve_automation_proposal(&proposal, None, 300)
+                    .unwrap(),
+                receipt
+            );
+            assert_eq!(
+                store.automations(None, 100).unwrap().len(),
+                usize::from(approved)
+            );
+        }
+    }
+
+    #[test]
+    fn unreadable_proposal_authority_defers_approval_without_blocking_other_alerts() {
+        let (root, registry, proposal, other) = proposal_fixture();
+        let registry_view = Ok(registry.clone());
+        let (shared, _receiver) = shared();
+        let handle = Handle(shared.clone());
+        super::super::automations::transfer_notifications(&registry, &handle).unwrap();
+        let mut journal = journal::Journal::open(&root.path().join("notices.sqlite3")).unwrap();
+        let mut delivery = BTreeMap::new();
+        defer_events(&registry_view, &shared, &mut journal, &mut delivery);
+        let before = journal.list().unwrap();
+        let connection = rusqlite::Connection::open(root.path().join("registry.sqlite3")).unwrap();
+        connection
+            .execute_batch("ALTER TABLE automation_proposals RENAME TO unreadable_proposals")
+            .unwrap();
+        let session = TerminalId::new();
+        let unrelated = Event {
+            target: Target::Session(session),
+            source_session: Some(session),
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: "unrelated-finished-turn".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            },
+        };
+        handle.record(unrelated.clone());
+        defer_events(&registry_view, &shared, &mut journal, &mut delivery);
+        let mut diagnostic = None;
+        let batch = desktop_batch(&registry_view, &delivery, &mut diagnostic);
+        assert!(diagnostic.is_some());
+        assert!(batch.deferred);
+        assert!(
+            !batch.more,
+            "unknown proposals wait rather than spinning a full batch"
+        );
+        assert_eq!(batch.notices.len(), 1);
+        assert_eq!(batch.notices[0].event, unrelated);
+        let mut withdrawals = BTreeSet::new();
+        assert!(
+            admit_desktop_notice(
+                &registry_view,
+                &mut journal,
+                &mut delivery,
+                &mut withdrawals,
+                &before[0],
+            )
+            .is_err()
+        );
+        assert!(withdrawals.is_empty());
+        assert!(
+            before
+                .iter()
+                .all(|notice| journal.list().unwrap().contains(notice))
+        );
+        assert_eq!(delivery.len(), 3);
+        connection
+            .execute_batch("ALTER TABLE unreadable_proposals RENAME TO automation_proposals")
+            .unwrap();
+        registry
+            .lock()
+            .unwrap()
+            .resolve_automation_proposal(&proposal, None, 200)
+            .unwrap();
+        reconcile_proposal_notices(
+            &registry_view,
+            &mut journal,
+            &mut delivery,
+            &mut withdrawals,
+        )
+        .unwrap();
+        let batch = desktop_batch(&registry_view, &delivery, &mut None);
+        assert!(!batch.deferred);
+        assert_eq!(batch.notices.len(), 2);
+        assert!(
+            batch
+                .notices
+                .iter()
+                .any(|notice| proposal_target(&notice.event.target, other.id))
+        );
+        assert!(batch.notices.iter().any(|notice| notice.event == unrelated));
+    }
+
     #[test]
     fn committed_automation_transfer_preserves_fifo_and_receipts_through_replay() {
         let directory = tempfile::tempdir().unwrap();
@@ -1407,6 +1862,131 @@ mod tests {
     }
 }
 
+type ProposalRegistry = Result<super::agent_execution::SharedRegistry, String>;
+
+fn proposal_registry(host: &Weak<HostLock>) -> ProposalRegistry {
+    super::agent_execution::registry(&host.upgrade().ok_or("The daemon is stopping")?)
+}
+
+/// The immutable decision, rather than queue order or journal replay evidence,
+/// owns approval attention. A failed read stays unknown and cannot permit send.
+fn proposal_attention_current(
+    registry: &ProposalRegistry,
+    target: &Target,
+) -> Result<bool, String> {
+    let Target::AutomationProposal { id, .. } = target else {
+        return Ok(true);
+    };
+    let registry = registry.as_ref().map_err(Clone::clone)?;
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let pending = registry.automation_proposal_needs_approval(*id)?;
+    if !pending {
+        registry.retire_automation_proposal_notification(*id)?;
+    }
+    Ok(pending)
+}
+
+fn retire_proposal_notice(
+    journal: &mut journal::Journal,
+    delivery: &mut BTreeMap<Target, Notice>,
+    withdrawals: &mut BTreeSet<Uuid>,
+    notice: &Notice,
+) -> Result<(), String> {
+    let Target::AutomationProposal { id, .. } = &notice.event.target else {
+        return Ok(());
+    };
+    // Target equality includes presentation metadata; retirement belongs to the
+    // immutable proposal ID even when an older queued copy has different labels.
+    delivery.retain(|target, _| {
+        !matches!(target, Target::AutomationProposal { id: current, .. } if current == id)
+    });
+    queue_withdrawal(withdrawals, notice.id);
+    journal.retire(notice.event.target())
+}
+
+fn reconcile_proposal_notices(
+    registry: &ProposalRegistry,
+    journal: &mut journal::Journal,
+    delivery: &mut BTreeMap<Target, Notice>,
+    withdrawals: &mut BTreeSet<Uuid>,
+) -> Result<(), String> {
+    let mut diagnostic = None;
+    for notice in journal.list()? {
+        if !matches!(notice.event.target, Target::AutomationProposal { .. }) {
+            continue;
+        }
+        let result = match proposal_attention_current(registry, &notice.event.target) {
+            Ok(false) => retire_proposal_notice(journal, delivery, withdrawals, &notice),
+            Ok(true) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            diagnostic = Some(error);
+        }
+    }
+    diagnostic.map_or(Ok(()), Err)
+}
+
+#[derive(Default)]
+struct DesktopBatch {
+    notices: Vec<Notice>,
+    more: bool,
+    deferred: bool,
+}
+
+fn desktop_batch(
+    registry: &ProposalRegistry,
+    delivery: &BTreeMap<Target, Notice>,
+    diagnostic: &mut Option<String>,
+) -> DesktopBatch {
+    let mut batch = DesktopBatch::default();
+    for notice in delivery.values() {
+        match proposal_attention_current(registry, &notice.event.target) {
+            Ok(true) if batch.notices.len() < 8 => batch.notices.push(notice.clone()),
+            Ok(_) => batch.more = true, // More delivery, or a decision to retire on the next pass.
+            Err(error) => {
+                *diagnostic = Some(error);
+                batch.deferred = true;
+            }
+        }
+    }
+    batch
+}
+
+/// Recheck after portal awaits and between individual sends. This read is send
+/// admission; a portal request already admitted before a decision may finish.
+fn admit_desktop_notice(
+    registry: &ProposalRegistry,
+    journal: &mut journal::Journal,
+    delivery: &mut BTreeMap<Target, Notice>,
+    withdrawals: &mut BTreeSet<Uuid>,
+    notice: &Notice,
+) -> Result<bool, String> {
+    if !proposal_attention_current(registry, &notice.event.target)? {
+        retire_proposal_notice(journal, delivery, withdrawals, notice)?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn journal_current_event(
+    registry: &ProposalRegistry,
+    journal: &mut journal::Journal,
+    shared: &Weak<Shared>,
+    event: Event,
+    suppressed: bool,
+) -> Result<Option<Notice>, String> {
+    if matches!(
+        proposal_attention_current(registry, &event.target),
+        Ok(false)
+    ) {
+        return Ok(None);
+    }
+    // If authority is unavailable, retain the event durably for reconciliation.
+    // Both desktop batch selection and final admission still refuse unknowns.
+    journal_event(journal, shared, event, suppressed)
+}
+
 /// Return scheduler receipts only after SQLite has committed the exact evidence.
 /// A duplicate is also a durable receipt: replay must not overwrite newer notice
 /// content, and the scheduler may then retire its already-journaled outbox row.
@@ -1456,7 +2036,13 @@ pub(in crate::host) fn transfer_scheduler_events_for_test(
     let mut journal = journal::Journal::open(path)?;
     let mut delivered = 0;
     for event in pending.automation_events {
-        if let Some(notice) = journal_event(&mut journal, &Arc::downgrade(&shared), event, false)? {
+        if let Some(notice) = journal_current_event(
+            &Ok(registry.clone()),
+            &mut journal,
+            &Arc::downgrade(&shared),
+            event,
+            false,
+        )? {
             journal.delivered(notice.id)?;
             delivered += 1;
         }
@@ -1491,25 +2077,42 @@ async fn run(
     let mut withdrawals = BTreeSet::new();
     let mut next_attempt = Instant::now();
     let mut retry_delay = RETRY_DELAY;
+    let mut proposal_retry = None;
     let mut snapshot = Snapshot {
         diagnostic: settings_error,
         ..Default::default()
     };
     match &mut journal {
-        Ok(journal) => match journal.list() {
-            Ok(notices) => snapshot.notices = notices,
-            Err(error) => snapshot.diagnostic = Some(error),
-        },
+        Ok(journal) => {
+            if let Err(error) = reconcile_proposal_notices(
+                &proposal_registry(&host),
+                journal,
+                &mut delivery,
+                &mut withdrawals,
+            ) {
+                snapshot.diagnostic = Some(error);
+                proposal_retry = Some(Instant::now() + RETRY_DELAY);
+            }
+            match journal.list() {
+                Ok(notices) => snapshot.notices = notices,
+                Err(error) => snapshot.diagnostic = Some(error),
+            }
+        }
         Err(error) => snapshot.diagnostic = Some(error.clone()),
     }
     publish(&shared, &host, snapshot.clone());
     while wait_for_work(
         &mut receiver,
         (proxy.is_none() && (!delivery.is_empty() || !withdrawals.is_empty()))
-            .then_some(next_attempt),
+            .then_some(next_attempt)
+            .into_iter()
+            .chain(proposal_retry)
+            .min(),
     )
     .await
     {
+        proposal_retry = None;
+        let registry = proposal_registry(&host);
         let Some(core) = shared.upgrade() else {
             break;
         };
@@ -1652,7 +2255,7 @@ async fn run(
                 &event.target,
                 Target::Automation { .. } | Target::AutomationProposal { .. }
             );
-            let recorded = journal_event(journal, &shared, event, suppressed);
+            let recorded = journal_current_event(&registry, journal, &shared, event, suppressed);
             if recorded.is_ok()
                 && automation
                 && let Some(host) = host.upgrade()
@@ -1676,6 +2279,12 @@ async fn run(
                 Ok(None) => {}
                 Err(error) => snapshot.diagnostic = Some(error),
             }
+        }
+        if let Err(error) =
+            reconcile_proposal_notices(&registry, journal, &mut delivery, &mut withdrawals)
+        {
+            snapshot.diagnostic = Some(error);
+            proposal_retry = Some(Instant::now() + RETRY_DELAY);
         }
         match journal.list() {
             Ok(notices) => snapshot.notices = notices,
@@ -1720,7 +2329,9 @@ async fn run(
             match connect(shared.clone(), application, &mut activation).await {
                 Ok(connected) => {
                     proxy = Some(connected);
-                    snapshot.diagnostic = None;
+                    if proposal_retry.is_none() {
+                        snapshot.diagnostic = None;
+                    }
                     retry_delay = RETRY_DELAY;
                 }
                 Err(error) => {
@@ -1745,14 +2356,32 @@ async fn run(
             // bounded batches, rather than delaying it behind thousands of alerts.
             // A portal that just failed the test is dropped below, not
             // handed the backlog as well.
-            let batch: Vec<_> = if failed {
-                Vec::new()
+            let batch = if failed {
+                DesktopBatch::default()
             } else {
-                delivery.values().take(8).cloned().collect()
+                desktop_batch(&registry, &delivery, &mut snapshot.diagnostic)
             };
-            for notice in batch {
+            if batch.deferred {
+                proposal_retry = Some(Instant::now() + RETRY_DELAY);
+            }
+            for notice in batch.notices {
                 if stopped(&shared) {
                     return;
+                }
+                match admit_desktop_notice(
+                    &registry,
+                    journal,
+                    &mut delivery,
+                    &mut withdrawals,
+                    &notice,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        snapshot.diagnostic = Some(error);
+                        proposal_retry = Some(Instant::now() + RETRY_DELAY);
+                        continue;
+                    }
                 }
                 match send(backend, &notice, activation.receives_actions()).await {
                     Ok(()) => {
@@ -1791,7 +2420,7 @@ async fn run(
                 proxy = None;
                 next_attempt = Instant::now() + retry_delay;
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(300));
-            } else if (!delivery.is_empty() || !withdrawals.is_empty())
+            } else if (batch.more || !withdrawals.is_empty())
                 && let Some(shared) = shared.upgrade()
             {
                 let _ = shared.wake.try_send(());
