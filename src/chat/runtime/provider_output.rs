@@ -4,6 +4,12 @@
 //! or the larger readable UTF-8 representation. A pipe can retain unread bytes
 //! after stdout EOF or process exit, and a descendant can keep stderr open.
 //! Only an actual stderr EOF observation justifies `End::StderrEof`.
+//!
+//! Input policy is UTF-8 with ESC sequences and UTF-8-encoded C1 controls, not
+//! legacy eight-bit ANSI. Outside an existing terminal sequence, standalone
+//! raw C1 bytes are invalid UTF-8: replacement is counted and following readable
+//! bytes remain visible. CAN/SUB cancellation follows the pinned anstyle-parse
+//! 1.0.0 Anywhere transition to Ground, including inside control strings.
 use std::collections::VecDeque;
 
 pub(super) const RAW_BYTES: usize = 8 * 1024 * 1024;
@@ -133,7 +139,7 @@ impl Captured {
         };
         let summary = summary(&status, &self.text);
         let header = format!(
-            "Captured {provider} stderr\n{status}\nObserved raw bytes: {}; retained tail: {}; omitted prefix: {}.\nUTF-8: {} invalid sequences replaced; {} boundary bytes omitted.\nTerminal controls removed: {} bytes.{unfinished}\n{completion}\n\n",
+            "Captured {provider} stderr\n{status}\nObserved raw bytes: {}; retained tail: {}; omitted prefix: {}.\nUTF-8: {} invalid sequences replaced; {} boundary bytes omitted.\nOutside terminal sequences, standalone raw 8-bit C1 bytes use UTF-8 replacement; following readable bytes are retained.\nTerminal controls removed: {} bytes.{unfinished}\n{completion}\n\n",
             m.raw_total,
             m.raw_retained,
             m.raw_prefix_omitted,
@@ -208,6 +214,14 @@ struct Decoder {
 
 impl Decoder {
     fn push(&mut self, byte: u8, retained: bool, out: &mut Readable) {
+        // CAN and SUB cancel from every state. Handle them before CSI or ESC
+        // can mistake the first following diagnostic character for a final.
+        if matches!(byte, 0x18 | 0x1a) {
+            self.flush_utf8(out);
+            out.controls += usize::from(retained);
+            self.escape = Escape::Ground;
+            return;
+        }
         if !matches!(self.escape, Escape::Ground) {
             out.controls += usize::from(retained);
             self.escape = match self.escape {
@@ -483,5 +497,94 @@ mod tests {
         assert_eq!(capture.push(b"refused"), Err("Stderr byte count overflow"));
         assert_eq!(capture.raw.iter().copied().collect::<Vec<_>>(), b"kept");
         assert_eq!(capture.total, u64::MAX);
+    }
+
+    #[test]
+    fn cancelled_terminal_sequences_preserve_diagnostics_across_all_chunk_boundaries() {
+        for cancel in [0x18, 0x1a] {
+            for prefix in [
+                b"\x1b[3".as_slice(),
+                b"\x1b ",
+                b"\x1b]8;;secret",
+                b"\x1bPsecret",
+                b"\x1b^secret",
+                b"\x1b_secret",
+            ] {
+                let mut bytes = prefix.to_vec();
+                bytes.push(cancel);
+                bytes.extend_from_slice(b"ERROR\nnext");
+                for split in 0..=bytes.len() {
+                    let result = capture(&[&bytes[..split], &bytes[split..]]);
+                    assert_eq!(result.text, "ERROR\nnext");
+                    assert_eq!(result.metadata.control_bytes_removed, prefix.len() + 1);
+                    assert_eq!(result.metadata.invalid_utf8_replacements, 0);
+                    assert!(!result.metadata.unfinished_terminal_sequence);
+                }
+                let chunks: Vec<_> = bytes.chunks(1).collect();
+                assert_eq!(capture(&chunks).text, "ERROR\nnext");
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_on_either_side_of_raw_retention_cut_keeps_resumed_diagnostic_bytes() {
+        for cancel in [0x18, 0x1a] {
+            for omitted in 3..=5 {
+                let mut bytes = b"\x1b[3".to_vec();
+                bytes.push(cancel);
+                bytes.extend_from_slice(b"ERROR\n");
+                bytes.resize(RAW_BYTES + omitted, b'x');
+                let mut c = Capture::default();
+                c.push(&bytes[..3]).unwrap();
+                c.push(&bytes[3..4]).unwrap();
+                for chunk in bytes[4..].chunks(8191) {
+                    c.push(chunk).unwrap();
+                }
+                let result = c.finish();
+                assert_eq!(result.text.as_bytes(), &bytes[omitted.max(4)..]);
+                assert_eq!(result.metadata.raw_prefix_omitted, omitted as u64);
+                assert_eq!(
+                    result.metadata.control_bytes_removed,
+                    usize::from(omitted == 3)
+                );
+                assert_eq!(result.metadata.utf8_boundary_bytes_omitted, 0);
+                assert_eq!(result.metadata.invalid_utf8_replacements, 0);
+                assert!(!result.metadata.unfinished_terminal_sequence);
+            }
+        }
+    }
+
+    #[test]
+    fn raw_c1_policy_preserves_payload_as_lossy_utf8_and_distinguishes_encoded_controls() {
+        for (c1, payload, raw_text) in [
+            (0x9b, b"31mX".as_slice(), "A\u{fffd}31mX"),
+            (0x9d, b"8;;secret\x07X", "A\u{fffd}8;;secretX"),
+            (0x90, b"secret\x1b\\X", "A\u{fffd}secretX"),
+        ] {
+            let mut raw = vec![b'A', c1];
+            raw.extend_from_slice(payload);
+            for split in 0..=raw.len() {
+                let result = capture(&[&raw[..split], &raw[split..]]);
+                assert_eq!(result.text, raw_text);
+                assert_eq!(result.metadata.invalid_utf8_replacements, 1);
+                assert!(!result.metadata.unfinished_terminal_sequence);
+                assert!(
+                    result
+                        .report(Origin::Claude, Exit::Code(1), End::StderrEof)
+                        .body
+                        .contains("standalone raw 8-bit C1 bytes use UTF-8 replacement")
+                );
+            }
+            let mut encoded = vec![b'A', 0xc2, c1];
+            encoded.extend_from_slice(payload);
+            for split in 0..=encoded.len() {
+                let result = capture(&[&encoded[..split], &encoded[split..]]);
+                assert_eq!(result.text, "AX");
+                assert_eq!(result.metadata.invalid_utf8_replacements, 0);
+                assert!(!result.metadata.unfinished_terminal_sequence);
+            }
+        }
+        // A C1-valued continuation within an ordinary UTF-8 scalar is text.
+        assert_eq!(capture(&[&[0xd8], &[0x9b]]).text, "؛");
     }
 }
