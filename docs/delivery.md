@@ -42,6 +42,13 @@ Use the documented task/resume operation for another harness. Confirm a
 task-specific response or produced artifact before calling the assignment
 applied. Keep message delivery, activation and completed work separate.
 
+Outcome owners make supported product and delivery decisions within their scope.
+Use specialist review asynchronously for architectural or product uncertainty
+and sampled assembled-flow critique. Do not put a particular model, lead or
+coordinator in a mandatory approval queue. Continue execution in parallel;
+escalate a concrete unresolved high-risk decision with its evidence. Required
+independent/native reviews and actual resource grants still apply.
+
 Before feature fanout, obtain accepted ownership and capacity for independent
 review, compilation/tests, affected native interactions and release. A person
 may own several stages. A reservation must identify the existing lane or job,
