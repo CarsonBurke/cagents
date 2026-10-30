@@ -17,12 +17,16 @@ Issue cases use a synthetic OPEN PR envelope to test assignment reconciliation;
 """
 
 import copy
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/prepare-delivery-task"
@@ -309,6 +313,169 @@ class PrepareDeliveryTask(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertEqual(result.stdout, "")
             self.assertIn("duplicate JSON field", result.stderr)
+
+
+class DeliveryWorkflowComposition(unittest.TestCase):
+    """Exercise the actual workflow block with private source pairs.
+
+    Only subprocess.run is a test double. It records the requested invocation
+    and returns its status without launching a contract suite or descendants.
+    The original PrepareDeliveryTask cases separately exercise the real CLI.
+    """
+
+    @staticmethod
+    def run_block():
+        workflow = SCRIPT.parents[1] / ".github/workflows/script-contracts.yml"
+        lines = workflow.read_text().splitlines()
+        marker = "      - name: Check delivery task preparation contracts"
+        assert lines.count(marker) == 1, "one owning workflow step"
+        start = lines.index(marker)
+        assert lines[start + 1] == "        run: |", "owning step must retain a shell block"
+        body = []
+        for line in lines[start + 2:]:
+            if line and not line.startswith(" " * 10):
+                break
+            body.append(line[10:] if line else "")
+        assert body, "the owning workflow block must not be empty"
+        while body and not body[-1]:
+            body.pop()
+        assert body[0] == "python3 -I -B - <<'PY'", "isolated Python entrypoint"
+        assert body[-1] == "PY", "complete inline Python source"
+        return "\n".join(body[1:-1]) + "\n"
+
+    def run_guard(self, root, command_exit=0):
+        def command_double(argv):
+            (root / "delivery-test-invocation.txt").write_text(
+                "\n".join([str(Path.cwd()), str(len(argv)), *argv]) + "\n")
+            print("fixture delivery test command")
+            return subprocess.CompletedProcess(argv, command_exit)
+
+        original = Path.cwd()
+        output, errors = io.StringIO(), io.StringIO()
+        returncode = 0
+        try:
+            os.chdir(root)
+            with redirect_stdout(output), redirect_stderr(errors), mock.patch(
+                    "subprocess.run", side_effect=command_double):
+                try:
+                    exec(compile(self.run_block(), "delivery workflow block", "exec"), {})
+                except SystemExit as error:
+                    returncode = error.code
+        finally:
+            os.chdir(original)
+        return subprocess.CompletedProcess([], returncode, output.getvalue(), errors.getvalue())
+
+    @staticmethod
+    def pair(root):
+        helper = root / "scripts/prepare-delivery-task"
+        tests = root / "tests/scripts/test-prepare-delivery-task.py"
+        for path in (helper, tests):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("owned fixture file\n")
+        return helper, tests
+
+    def refused(self, root):
+        result = self.run_guard(root)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertTrue(any(message in result.stderr for message in
+                            ("Invalid contract path:", "Incomplete contract pair:")), result.stderr)
+        self.assertNotIn("Not applicable:", result.stdout)
+        self.assertFalse((root / "delivery-test-invocation.txt").exists())
+
+    def test_absent_pair_is_explicit_not_applicable_without_another_checkout(self):
+        with tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+            parent = Path(temporary)
+            root = parent / "historical-head"
+            root.mkdir()
+            other = parent / "main"
+            self.pair(other)
+            result = self.run_guard(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Not applicable: delivery task preparation (source and fixture both absent at this head)", result.stdout)
+            self.assertNotIn("fixture delivery test command", result.stdout)
+            self.assertFalse((root / "delivery-test-invocation.txt").exists())
+            self.assertFalse((other / "delivery-test-invocation.txt").exists())
+
+    def test_regular_pair_runs_the_owned_test_path_with_verbosity(self):
+        with tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+            root = Path(temporary)
+            self.pair(root)
+            result = self.run_guard(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Not applicable:", result.stdout)
+            self.assertEqual(result.stdout.count("fixture delivery test command"), 1)
+            self.assertEqual((root / "delivery-test-invocation.txt").read_text().splitlines(),
+                             [str(root.resolve()), "5", sys.executable, "-I", "-B",
+                              "tests/scripts/test-prepare-delivery-task.py", "-v"])
+
+    def test_helper_without_tests_is_a_partial_pair_failure(self):
+        with tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+            root = Path(temporary)
+            helper, tests = self.pair(root)
+            tests.unlink()
+            self.assertTrue(helper.is_file())
+            self.refused(root)
+
+    def test_tests_without_helper_is_a_partial_pair_failure(self):
+        with tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+            root = Path(temporary)
+            helper, tests = self.pair(root)
+            helper.unlink()
+            self.assertTrue(tests.is_file())
+            self.refused(root)
+
+    def test_directory_in_either_file_slot_is_refused(self):
+        for member in (0, 1):
+            with self.subTest(member=member), tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+                root = Path(temporary)
+                path = self.pair(root)[member]
+                path.unlink()
+                path.mkdir()
+                self.refused(root)
+
+    def test_valid_or_dangling_file_symlinks_are_refused(self):
+        for member in (0, 1):
+            for dangling in (False, True):
+                with self.subTest(member=member, dangling=dangling), tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+                    root = Path(temporary)
+                    path = self.pair(root)[member]
+                    target = root / "owned-target"
+                    path.rename(target)
+                    path.symlink_to(root / "absent-target" if dangling else target)
+                    self.refused(root)
+        with tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+            root = Path(temporary)
+            for path in self.pair(root):
+                path.unlink()
+                path.symlink_to(root / "absent-target")
+            self.refused(root)
+
+    def test_source_directory_symlinks_cannot_supply_another_source(self):
+        for directory in ("scripts", "tests", "tests/scripts"):
+            with self.subTest(directory=directory), tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+                root = Path(temporary)
+                self.pair(root)
+                path = root / directory
+                target = root / ("owned-" + directory.replace("/", "-"))
+                path.rename(target)
+                path.symlink_to(target, target_is_directory=True)
+                self.refused(root)
+            with self.subTest(directory=directory, dangling=True), tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+                root = Path(temporary)
+                path = root / directory
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.symlink_to(root / "absent-directory", target_is_directory=True)
+                self.refused(root)
+
+    def test_contract_command_failure_is_not_skipped_or_mapped_to_pass(self):
+        with tempfile.TemporaryDirectory(prefix="delivery-workflow-") as temporary:
+            root = Path(temporary)
+            self.pair(root)
+            result = self.run_guard(root, command_exit=23)
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertEqual(result.stdout.count("fixture delivery test command"), 1)
+            self.assertNotIn("Not applicable:", result.stdout)
+            self.assertTrue((root / "delivery-test-invocation.txt").exists())
 
 
 if __name__ == "__main__":
