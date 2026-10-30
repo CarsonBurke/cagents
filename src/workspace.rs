@@ -637,6 +637,8 @@ pub struct Workspace {
     visibility: HashMap<CardId, VisibilityClass>,
     visibility_bands: Option<VisibilityBands>,
     pending_widget_focus: Option<CardId>,
+    /// Only this exact deferred close request may use the toolbar placeholder.
+    pending_widget_focus_from_close: Option<CardId>,
     pending_close: Option<PendingClose>,
     resize_limits: Option<(CardId, WidthLimits)>,
     config: WorkspaceConfig,
@@ -658,6 +660,7 @@ impl Workspace {
             visibility: HashMap::new(),
             visibility_bands: None,
             pending_widget_focus: None,
+            pending_widget_focus_from_close: None,
             pending_close: None,
             resize_limits: None,
             config,
@@ -864,6 +867,7 @@ impl Workspace {
         if self.focused.is_none() || focus {
             self.focused = Some(id);
             self.pending_widget_focus = Some(id);
+            self.pending_widget_focus_from_close = None;
         }
         self.rebuild_geometry();
         if let Some(previous) = previous {
@@ -983,6 +987,7 @@ impl Workspace {
         // Retarget the running spring without restarting on held-key repeats.
         self.focused = Some(id);
         self.pending_widget_focus = Some(id);
+        self.pending_widget_focus_from_close = None;
         if reveal {
             self.reveal_focused();
         }
@@ -1015,10 +1020,17 @@ impl Workspace {
         self.focus(id)
     }
 
+    /// Read before taking the request, which consumes both its ID and origin.
+    pub fn pending_widget_focus_is_close_handoff(&self) -> bool {
+        self.pending_widget_focus
+            .is_some_and(|id| self.pending_widget_focus_from_close == Some(id))
+    }
+
     pub fn take_widget_focus_request(&mut self) -> Option<CardId> {
         let id = self.pending_widget_focus?;
         if self.visibility(id).is_some_and(VisibilityClass::is_mounted) {
             self.pending_widget_focus = None;
+            self.pending_widget_focus_from_close = None;
             Some(id)
         } else {
             None
@@ -1074,6 +1086,7 @@ impl Workspace {
         self.visibility.remove(&id);
         if self.pending_widget_focus == Some(id) {
             self.pending_widget_focus = None;
+            self.pending_widget_focus_from_close = None;
         }
         if self.focused == Some(id) {
             self.focused = match pending.handoff.target {
@@ -1091,11 +1104,13 @@ impl Workspace {
             };
             if !matches!(pending.handoff.target, FocusTarget::Card(_)) {
                 self.pending_widget_focus = self.focused;
+                self.pending_widget_focus_from_close = self.focused;
             }
         }
         if self.cards.is_empty() {
             self.focused = None;
             self.pending_widget_focus = None;
+            self.pending_widget_focus_from_close = None;
         }
         self.rebuild_geometry();
         if !self.cards.is_empty() && self.viewport_width > 0.0 {
