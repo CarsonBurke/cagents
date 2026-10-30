@@ -26,6 +26,7 @@ GIT_ROUTING = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_ATTR_SOURCE",
 )
 RECORD_KEYS = {
     "version", "owner", "uid", "checkout", "common_git_dir", "common_identity",
@@ -47,13 +48,13 @@ class Arguments(argparse.ArgumentParser):
         raise Refusal("invalid-input", message)
 
 
-def git(repository, *arguments, allowed=(0,)):
+def git(repository, *arguments, allowed=(0,), input=None):
     result = subprocess.run(
         ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
          "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false",
          "-C", str(repository), *arguments],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        encoding="utf-8", errors="surrogateescape",
+        encoding="utf-8", errors="surrogateescape", input=input,
     )
     if result.returncode not in allowed:
         raise GitFailure(f"Git {arguments[0]} exited {result.returncode}: {result.stderr.strip()}")
@@ -61,12 +62,44 @@ def git(repository, *arguments, allowed=(0,)):
 
 
 def check_git_config(repository):
-    # Refuse programs during checkout and implicit object fetching. Do not
-    # inspect their configured values or modify the caller's environment.
+    # Conditional includes can activate in a new worktree; partial object reads
+    # can fetch. Dormant filter definitions alone execute nothing and are allowed.
     external = git(repository, "config", "--name-only", "--get-regexp",
-                   r"^(filter\.|includeif\.|remote\..*\.promisor$|extensions\.partialclone$)", allowed=(0, 1))
+                   r"^(includeif\.|remote\..*\.promisor$|extensions\.partialclone$)", allowed=(0, 1))
     if external.stdout:
-        raise Refusal("invalid-input", "Conditional Git config, external filters and partial/promisor clones are unsupported.")
+        raise Refusal("invalid-input", "Conditional Git config and partial/promisor clones are unsupported.")
+
+
+def nul_fields(text):
+    if text and not text.endswith("\0"):
+        raise Refusal("metadata-invalid", "Git returned unterminated path/attribute metadata.")
+    return text[:-1].split("\0") if text else []
+
+
+def tree_paths(repository, head):
+    paths = nul_fields(git(repository, "ls-tree", "-r", "--name-only", "-z", head).stdout)
+    if any(not path for path in paths) or len(set(paths)) != len(paths):
+        raise Refusal("metadata-invalid", "Git returned invalid or duplicate tracked paths.")
+    return paths
+
+
+def reject_filter_attributes(repository, paths, *source):
+    if not paths:
+        return
+    fields = nul_fields(git(repository, "check-attr", "-z", "--all", "--stdin", *source,
+                            input="\0".join(paths) + "\0").stdout)
+    if len(fields) % 3:
+        raise Refusal("metadata-invalid", "Git returned an incomplete attribute triple.")
+    selected, seen = set(paths), set()
+    for offset in range(0, len(fields), 3):
+        path, attribute, _value = fields[offset:offset + 3]
+        if path not in selected or not attribute or (path, attribute) in seen:
+            raise Refusal("metadata-invalid", "Git returned an unexpected or duplicate attribute.")
+        seen.add((path, attribute))
+        # --all omits genuinely unspecified attributes. Textual values such as
+        # 'unset' can also name real drivers, so no emitted filter is admitted.
+        if attribute == "filter":
+            raise Refusal("invalid-input", "Effective Git filter attributes are unsupported.")
 
 
 def reject_gitlinks(repository, head):
@@ -174,6 +207,9 @@ def checkout_state(checkout, common):
     indexed = git(checkout, "ls-files", "-v", "-z").stdout.split("\0")
     if any(entry and not entry.startswith("H ") for entry in indexed):
         raise Refusal("dirty-checkout", "Index flags or unresolved entries can conceal tracked changes.")
+    paths = [entry[2:] for entry in indexed if entry]
+    reject_filter_attributes(checkout, paths)
+    reject_filter_attributes(checkout, paths, "--cached")
     if git(checkout, "status", "--porcelain=v1", "-z", "--untracked-files=all",
            "--ignored=matching", "--ignore-submodules=none").stdout:
         raise Refusal("dirty-checkout", "Tracked, untracked or ignored checkout files have changed.")
@@ -207,10 +243,17 @@ def prepare(args, progress):
     if git(repository, "rev-parse", args.head + "^{tree}").stdout.strip() != args.tree:
         raise Refusal("tree-mismatch", "The candidate commit does not have the requested tree.")
     reject_gitlinks(repository, args.head)
+    candidate_paths = tree_paths(repository, args.head)
     directory = common / "validation-checkouts-v1"
     marker = directory / (hashlib.sha256(os.fsencode(checkout)).hexdigest() + ".json")
     if checkout.exists() and not marker.exists():
         raise Refusal("foreign-worktree", "An existing unregistered checkout is never adopted.")
+    if not marker.exists():
+        context = git(repository, "config", "--name-only", "--get-regexp",
+                      r"^(core\.attributesfile|extensions\.worktreeconfig)$", allowed=(0, 1))
+        if context.stdout:
+            raise Refusal("invalid-input", "Custom attribute-file or worktree config needs separate new-checkout admission.")
+        reject_filter_attributes(repository, candidate_paths, "--source=" + args.head)
     with staging_lock(directory):
         record = read_record(marker) if marker.exists() else None
         previous = None
@@ -226,6 +269,7 @@ def prepare(args, progress):
             if current["head"] != args.expect_current:
                 raise Refusal("unexpected-head", "The expected prior commit is stale.")
             previous = current["head"]
+            reject_filter_attributes(checkout, candidate_paths, "--source=" + args.head)
         elif args.expect_current != "absent":
             raise Refusal("unexpected-head", "Creation requires an explicit absent expectation.")
         elif checkout.exists():

@@ -57,7 +57,7 @@ class ValidationCheckout(unittest.TestCase):
             "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_COUNT",
             "GIT_CONFIG_PARAMETERS", "GIT_CEILING_DIRECTORIES",
-            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM", "GIT_ATTR_SOURCE",
         }
         present = sorted(
             name for name in os.environ
@@ -81,9 +81,10 @@ class ValidationCheckout(unittest.TestCase):
         self.checkout = self.root / "stable-validation"
 
     def preflight_git_only_context(self):
-        # This reads key NAMES before init/add/commit. A filter or promisor
-        # could otherwise execute during fixture seeding, before the helper's
-        # own refusal. Do not change HOME/config/authority to make it pass.
+        # This reads key NAMES before init/add/commit. Reject configuration
+        # that can change with repository context or fetch missing objects.
+        # Dormant filter definitions stay natural; actual attributes are
+        # checked before seed conversion. Do not change HOME/config/authority.
         result = subprocess.run(
             ["git", "--no-optional-locks", "config", "--includes", "--name-only", "--list"],
             cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -94,15 +95,14 @@ class ValidationCheckout(unittest.TestCase):
         names = sorted(name.lower() for name in result.stdout.splitlines())
         unsupported = [
             name for name in names
-            if name.startswith("filter.")
-            or name.startswith("includeif.")
+            if name.startswith("includeif.")
             or (name.startswith("remote.") and name.endswith(".promisor"))
             or name == "extensions.partialclone"
         ]
         if unsupported:
             raise RuntimeError("fixture refuses external Git configuration names: " + ", ".join(unsupported))
 
-    def git(self, repository, *arguments, check=True):
+    def git(self, repository, *arguments, check=True, input_data=None):
         result = subprocess.run(
             [
                 "git", "--no-optional-locks", "-c", f"core.hooksPath={self.empty_hooks}",
@@ -111,21 +111,59 @@ class ValidationCheckout(unittest.TestCase):
                 "-c", "user.email=fixture@example.invalid", "-C", str(repository),
                 *arguments,
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, input=input_data, timeout=30,
         )
         if check:
             self.assertEqual(result.returncode, 0, result.stderr)
         return result
+
+    def preflight_seed_attributes(self, repository):
+        result = self.git(
+            repository, "check-attr", "--all", "-z", "--", ".gitignore", "value.txt",
+        )
+        fields = result.stdout.split("\0")
+        if fields.pop() != "" or len(fields) % 3:
+            raise RuntimeError("cannot inspect fixture seed attributes")
+        # --all omits truly unspecified attributes. Do not mistake a literal
+        # filter=unset or filter=unspecified driver for a typed sentinel.
+        if any(attribute == "filter" for attribute in fields[1::3]):
+            raise RuntimeError("fixture refuses effective filter attributes before seed conversion")
+
+    def configure_inert_filter(self, driver):
+        names = self.git(self.repository, "config", "--name-only", "--list").stdout.splitlines()
+        commands = {f"filter.{driver}.{suffix}" for suffix in ("clean", "smudge", "process")}
+        if any(name.lower() in commands for name in names):
+            raise RuntimeError("fixture refuses existing commands for its private test driver")
+        # No executable is defined, even if a regression reaches conversion.
+        self.git(self.repository, "config", "--local", f"filter.{driver}.required", "true")
+
+    def prospective_filtered_commit(self, driver):
+        attributes = self.root / f"attributes-{driver}"
+        attributes.write_text(f"value.txt filter={driver}\n")
+        blob = self.git(
+            self.repository, "hash-object", "-w", "--no-filters", str(attributes),
+        ).stdout.strip()
+        entries = self.git(self.repository, "ls-tree", self.a).stdout
+        tree = self.git(
+            self.repository, "mktree",
+            input_data=f"100644 blob {blob}\t.gitattributes\n" + entries,
+        ).stdout.strip()
+        return self.git(
+            self.repository, "commit-tree", tree, "-p", self.a, "-m", "Fixture active filter",
+        ).stdout.strip()
 
     def make_repository(self, repository):
         repository.mkdir()
         self.git(repository, "init", "-q", f"--template={self.empty_hooks}")
         (repository / ".gitignore").write_text("*.ignored\ncache/\n")
         (repository / "value.txt").write_text("commit A\n")
+        self.preflight_seed_attributes(repository)
         self.git(repository, "add", ".gitignore", "value.txt")
+        self.preflight_seed_attributes(repository)
         self.git(repository, "commit", "-q", "-m", "Fixture A")
         a = self.git(repository, "rev-parse", "HEAD").stdout.strip()
         (repository / "value.txt").write_text("commit B\n")
+        self.preflight_seed_attributes(repository)
         self.git(repository, "commit", "-q", "-a", "-m", "Fixture B")
         b = self.git(repository, "rev-parse", "HEAD").stdout.strip()
         self.assertNotEqual(a, b)
@@ -244,6 +282,62 @@ class ValidationCheckout(unittest.TestCase):
             self.assertEqual((self.checkout / ".git").read_bytes(), git_file)
         inventory = self.git(self.repository, "worktree", "list", "--porcelain").stdout
         self.assertEqual(inventory.count(f"worktree {self.checkout}\n"), 1)
+
+    def test_dormant_filter_definition_allows_exact_a_to_b(self):
+        self.configure_inert_filter("validation-checkout-fixture")
+        config_before = snapshot(self.common / "config")
+        self.create()
+        self.prepared(self.b, expected=self.a, operation="updated", previous=self.a)
+        self.assertEqual((self.checkout / "value.txt").read_text(), "commit B\n")
+        self.assertEqual(snapshot(self.common / "config"), config_before)
+
+    def test_active_filters_are_refused_before_checkout_or_status(self):
+        for driver in ("validation-checkout-fixture", "unset", "unspecified"):
+            with self.subTest(driver=driver):
+                self.configure_inert_filter(driver)
+                head = self.prospective_filtered_commit(driver)
+                fields = self.git(
+                    self.repository, "check-attr", "--all", "-z", f"--source={head}", "--", "value.txt",
+                ).stdout.split("\0")
+                self.assertEqual(fields.pop(), "")
+                self.assertEqual(len(fields) % 3, 0)
+                self.assertIn(("value.txt", "filter", driver), list(zip(fields[::3], fields[1::3], fields[2::3])))
+                source_before = snapshot(self.repository)
+                self.assertFalse(os.path.lexists(self.checkout))
+                self.assertFalse(os.path.lexists(self.record_path(self.checkout)))
+                self.refused("invalid-input", head, expected="absent")
+                self.assertEqual(snapshot(self.repository), source_before)
+                self.assertFalse(os.path.lexists(self.checkout))
+                self.assertFalse(os.path.lexists(self.record_path(self.checkout)))
+
+        self.create()
+        staged = self.root / "index-only-blob"
+        staged.write_text("index-only staged content\n")
+        blob = self.git(
+            self.checkout, "hash-object", "-w", "--no-filters", str(staged),
+        ).stdout.strip()
+        self.git(self.checkout, "update-index", "--add", "--cacheinfo", f"100644,{blob},staged-only.txt")
+        (self.checkout / "staged-only.txt").write_text("modified after index-only insertion\n")
+        (self.checkout / ".gitattributes").write_text("staged-only.txt filter=validation-checkout-fixture\n")
+        self.assertEqual(self.git(self.checkout, "ls-tree", "HEAD", "--", "staged-only.txt").stdout, "")
+        self.assertEqual(
+            self.git(self.checkout, "ls-files", "--error-unmatch", "--", "staged-only.txt").stdout,
+            "staged-only.txt\n",
+        )
+        fields = self.git(
+            self.checkout, "check-attr", "--all", "-z", "--", "staged-only.txt",
+        ).stdout.split("\0")
+        self.assertEqual(fields.pop(), "")
+        self.assertEqual(len(fields) % 3, 0)
+        self.assertIn(
+            ("staged-only.txt", "filter", "validation-checkout-fixture"),
+            list(zip(fields[::3], fields[1::3], fields[2::3])),
+        )
+        # Snapshot after deliberate fixture changes. No Git status is invoked
+        # by this fixture: it could attempt clean conversion of the new path.
+        source_before = snapshot(self.repository)
+        self.refused("invalid-input")
+        self.assertEqual(snapshot(self.repository), source_before)
 
     def test_conditional_include_is_refused_before_checkout_creation(self):
         included = self.root / "conditional-config"
