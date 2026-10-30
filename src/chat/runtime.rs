@@ -2691,6 +2691,15 @@ impl Actor {
                     let update = self.execution.finish(run, outcome)?;
                     (self.notify)(Update::Execution { run, update });
                 }
+                crate::agent_execution::ProviderEvent::Diagnostic { message } => {
+                    self.execution.observe(
+                        run,
+                        &Event::Error {
+                            message: super::protocol::preview(message.as_bytes(), 1024),
+                            fatal: false,
+                        },
+                    );
+                }
                 crate::agent_execution::ProviderEvent::Started { .. } => unreachable!(),
                 crate::agent_execution::ProviderEvent::Scope => {}
             }
