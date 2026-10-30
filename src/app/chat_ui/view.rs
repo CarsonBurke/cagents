@@ -1572,6 +1572,20 @@ impl Runtime {
             return;
         }
         if let Some(literal) = self.prepared_literal(item) {
+            // System notices use a fully closed step disclosure. User-slot
+            // notices retain their existing visible body preview.
+            if item.role == chat::Role::System
+                && matches!(
+                    item.content,
+                    ItemContent::Delivery {
+                        kind: chat::DeliveryKind::Notice,
+                        ..
+                    }
+                )
+                && !(detail && self.item_expanded(&item.id))
+            {
+                return;
+            }
             literal.catalog(builder, item, detail && self.item_expanded(&item.id));
             return;
         }
@@ -4359,7 +4373,7 @@ impl Runtime {
                 Icon::Copy
             },
             "Copy this message",
-            if matches!(item.content, ItemContent::Text { .. })
+            if item.logical_copy_body().is_some()
                 && !self
                     .presentation_cache()
                     .get(&item.id)
@@ -5719,6 +5733,9 @@ mod issue1506_tests;
 mod user_image_preview_tests;
 
 #[cfg(test)]
+mod provider_context_tests;
+
+#[cfg(test)]
 pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>) {
     frame_cost::live_runtime(items)
 }
@@ -6516,7 +6533,7 @@ mod tests {
         }
     }
 
-    fn native_child_fixture() -> chat::Subagent {
+    pub(super) fn native_child_fixture() -> chat::Subagent {
         chat::Subagent {
             id: "native-child".into(),
             kind: "Scout".into(),
