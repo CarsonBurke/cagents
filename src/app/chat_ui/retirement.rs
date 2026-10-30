@@ -94,11 +94,10 @@ impl<Owner: Clone> Ledger<Owner> {
         })
     }
 
-    pub(in crate::app) fn failed_owner_mut(&mut self, target: Target) -> Option<&mut Owner> {
-        match self.entries.get_mut(&target)? {
-            Entry::Failed { owner, .. } => Some(owner),
-            Entry::Pending(_) => None,
-        }
+    pub(in crate::app) fn owner_mut(&mut self, target: Target) -> Option<&mut Owner> {
+        self.entries.get_mut(&target).map(|entry| match entry {
+            Entry::Pending(owner) | Entry::Failed { owner, .. } => owner,
+        })
     }
 
     pub(in crate::app) fn is_empty(&self) -> bool {

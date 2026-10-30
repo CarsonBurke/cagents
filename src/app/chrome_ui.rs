@@ -2507,11 +2507,9 @@ impl Cagents {
                     } else {
                         NoticeSeverity::Warning
                     };
-                    let message = if cleanup.retry {
-                        format!("Could not finish closing {}", cleanup.title)
-                    } else {
-                        format!("Closing {}", cleanup.title)
-                    };
+                    let message = cleanup.message();
+                    let retry_label = cleanup.retry_label();
+                    let retry_description = cleanup.retry_description();
                     let body = widget::column::with_children(vec![
                         super::notice_body(message),
                         super::notice_surface_detail(severity, cleanup.detail),
@@ -2521,8 +2519,8 @@ impl Cagents {
                     let retry = cleanup.retry.then(|| {
                         super::notice_surface_action(
                             severity,
-                            "Retry close",
-                            format!("Retry closing {}", cleanup.title),
+                            retry_label,
+                            retry_description,
                             widget::Id::new(cleanup_retry_id(cleanup.id)),
                             Message::ChromeUi(Action::RetryCleanup(cleanup.id)),
                         )

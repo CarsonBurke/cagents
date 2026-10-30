@@ -607,6 +607,37 @@ pub(super) struct CleanupNotice {
     pub(super) title: String,
     pub(super) detail: String,
     pub(super) retry: bool,
+    pub(super) restart: bool,
+}
+
+impl CleanupNotice {
+    pub(super) fn message(&self) -> String {
+        match (self.restart, self.retry) {
+            (true, true) => format!("Could not start a new conversation for {}", self.title),
+            (true, false) => format!("Stopping {} before starting a new conversation", self.title),
+            (false, true) => format!("Could not finish closing {}", self.title),
+            (false, false) => format!("Closing {}", self.title),
+        }
+    }
+
+    pub(super) fn retry_label(&self) -> &'static str {
+        if self.restart {
+            "Retry new conversation"
+        } else {
+            "Retry close"
+        }
+    }
+
+    pub(super) fn retry_description(&self) -> String {
+        if self.restart {
+            format!(
+                "Retry stopping {} and starting a new conversation",
+                self.title
+            )
+        } else {
+            format!("Retry closing {}", self.title)
+        }
+    }
 }
 
 pub(super) struct State {
@@ -750,12 +781,14 @@ impl State {
                     title: owner.title.clone(),
                     detail: failure.to_owned(),
                     retry: true,
+                    restart: matches!(owner.after, RetirementAfter::Restart(_)),
                 })
                 .chain(self.retiring.pending().map(|(_, owner)| CleanupNotice {
                     id: owner.id,
                     title: owner.title.clone(),
                     detail: "Waiting for confirmation that this conversation stopped.".into(),
                     retry: false,
+                    restart: matches!(owner.after, RetirementAfter::Restart(_)),
                 }))
                 .chain(self.retirement_refusals.values().map(|owner| {
                     CleanupNotice {
@@ -765,6 +798,7 @@ impl State {
                             "Cleanup could not be scheduled. Its original conversation is retained."
                                 .into(),
                         retry: true,
+                        restart: matches!(owner.after, RetirementAfter::Restart(_)),
                     }
                 }))
                 .collect();
@@ -6897,6 +6931,30 @@ impl Cagents {
     /// stashing its unsent text would pin the string for the lifetime of the
     /// process with nothing able to read it back.
     pub(super) fn chat_discard(&mut self, card: CardId) {
+        let targets = self
+            .chat_ui
+            .retiring
+            .iter()
+            .copied()
+            .filter(|target| target.card == card)
+            .collect::<Vec<_>>();
+        for target in targets {
+            if let Some(owner) = self.chat_ui.retiring.owner_mut(target)
+                && matches!(owner.after, RetirementAfter::Restart(_))
+            {
+                owner.after = RetirementAfter::None;
+            }
+        }
+        for owner in self
+            .chat_ui
+            .retirement_refusals
+            .values_mut()
+            .filter(|owner| owner.card == card)
+        {
+            if matches!(owner.after, RetirementAfter::Restart(_)) {
+                owner.after = RetirementAfter::None;
+            }
+        }
         self.chat_ui.default_chats.remove(&card);
         // A start still in flight is not dropped with the card: whatever it
         // leaves in the daemon is given up when it answers, as for a close.
@@ -7495,7 +7553,7 @@ impl Cagents {
             .failed()
             .find_map(|(target, owner, _)| (owner.id == id).then_some(target));
         if let Some(target) = failed
-            && let Some(owner) = self.chat_ui.retiring.failed_owner_mut(target)
+            && let Some(owner) = self.chat_ui.retiring.owner_mut(target)
             && matches!(owner.after, RetirementAfter::Restart(_))
         {
             // Close cancels the pending replacement intent, not its original
@@ -12856,6 +12914,13 @@ mod tests {
             .owner(target)
             .expect("failed cleanup retains its owner");
         let id = owner.id;
+        assert!(matches!(owner.after, RetirementAfter::None));
+        assert!(
+            !app.chat_ui
+                .cleanup_notices()
+                .iter()
+                .any(|notice| notice.restart)
+        );
         assert_eq!(owner.session.as_ref(), Some(&source));
         assert_eq!(owner.caller.authentication(), Some(expected.clone()));
         assert!(Arc::ptr_eq(owner.handle.as_ref().unwrap(), &handle));
@@ -12890,6 +12955,12 @@ mod tests {
         ))));
         let owner = app.chat_ui.retiring.owner(target).unwrap();
         let id = owner.id;
+        assert!(
+            app.chat_ui
+                .cleanup_notices()
+                .iter()
+                .any(|notice| notice.id == id && notice.restart && notice.retry)
+        );
         assert_eq!(owner.session.as_ref(), Some(&source));
         assert!(Arc::ptr_eq(owner.handle.as_ref().unwrap(), &handle));
         assert_eq!(app.chat_return_session(card), Some(source));
@@ -12932,6 +13003,12 @@ mod tests {
         let owner = app.chat_ui.retiring.owner(retry).unwrap();
         assert_eq!(owner.caller.authentication(), Some(original));
         assert!(matches!(owner.after, RetirementAfter::CloseChat));
+        assert!(
+            !app.chat_ui
+                .cleanup_notices()
+                .iter()
+                .any(|notice| notice.restart)
+        );
         drop(app.update(Message::ChatUi(Action::Retired(retry, Ok(())))));
         assert!(!app.card_state(card).unwrap().existence.is_open());
         assert!(app.chat_ui.attempt(card).is_none());
@@ -23388,13 +23465,14 @@ mod tests {
         let target = app.chat_ui.phases[&card].target();
         assert_ne!(target, old);
         let _ = app.update(Message::ChatUi(Action::HandoffFinished(
-            target,
+            old,
             Err("old handoff".into()),
         )));
         assert!(matches!(
             app.chat_ui.phases.get(&card),
-            Some(Phase::Closing { .. })
+            Some(Phase::Closing { target: active, .. }) if *active == target
         ));
+        assert!(app.chat_ui.retiring.is_pending(target));
         let _ = app.update(Message::ChatUi(Action::Retired(target, Ok(()))));
         assert!(app.chat_ui.attempt(card).is_some());
     }
