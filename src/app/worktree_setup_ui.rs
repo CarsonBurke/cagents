@@ -350,20 +350,11 @@ impl Cagents {
             self.refresh_worktree_setup_rows();
             return Task::none();
         }
-        let started_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
-            .unwrap_or_default();
         // Keep the existing window lease through guarded scope selection and
         // pane publication. The selection lifecycle callback retires this entry.
         self.setup_ui
             .pending
             .insert(worktree.clone(), (operation, CancellationToken::new()));
-        self.setup_ui
-            .authorized_runs
-            .lock()
-            .expect("setup launch authorization lock")
-            .insert(operation);
         let Some(creation) = self
             .setup_ui
             .recovered
@@ -372,6 +363,20 @@ impl Cagents {
         else {
             return self.worktree_setup_selection_finished(operation, worktree, false);
         };
+        // A refused selection leaves the current channel/scope in place. Do
+        // not publish a setup pane or grant a launch permit into that scope.
+        let Some(select) = self.try_select_worktree(worktree.clone(), false) else {
+            return self.worktree_setup_selection_finished(operation, worktree, false);
+        };
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
+        self.setup_ui
+            .authorized_runs
+            .lock()
+            .expect("setup launch authorization lock")
+            .insert(operation);
         let launch = LaunchRecipe {
             program: "/bin/sh".into(),
             arguments: vec!["-c".into(), command],
@@ -401,7 +406,6 @@ impl Cagents {
             .insert(worktree.clone(), WorktreeSetupStatus::Running);
         // The new worktree owns this card even if another channel was selected
         // while the bounded copy operation completed.
-        let select = self.select_worktree(worktree.clone(), false);
         let start = self.insert_terminal_card(session, None);
         let _ = self.worktree_setup_selection_finished(operation, worktree, true);
         self.refresh_worktree_setup_rows();
@@ -1467,6 +1471,222 @@ pub(super) fn review_view(review: &Review) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_setup_selection_fixture() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Cagents,
+        PathBuf,
+        OperationId,
+        crate::model::ChannelId,
+    ) {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("current");
+        let destination = directory.path().join("destination");
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let current = current.canonicalize().unwrap();
+        let destination = destination.canonicalize().unwrap();
+        let project = ProjectId::new();
+        let channel = crate::model::ChannelId::new();
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.worktree_protections = crate::worktree_cleanup::WindowProtections::with_test_runtime(
+            runtime.path().to_path_buf(),
+        );
+        app.worktree_protections.protect_next(&current).unwrap();
+        let mut original = app.durable.cards[0].clone();
+        original.kind = CardKind::Terminal(fresh_terminal_session(LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: current.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        }));
+        let original_id = original.id;
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "selection fixture".into(),
+            current.clone(),
+            vec![
+                SidebarWorktree::from_durable(
+                    crate::model::WorktreeId::new(),
+                    current.clone(),
+                    None,
+                ),
+                SidebarWorktree::from_durable(
+                    crate::model::WorktreeId::new(),
+                    destination.clone(),
+                    None,
+                ),
+            ],
+            Vec::new(),
+        )];
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![original],
+            focused: Some(original_id),
+            channels: vec![crate::model::ProjectChannel {
+                id: channel,
+                project_id: project,
+                title: "Current channel".into(),
+                title_source: Default::default(),
+                ordinal: 0,
+                shared: false,
+                cards: vec![original_id],
+                focused: Some(original_id),
+            }],
+            ..WorkspaceState::default()
+        });
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1280.0);
+        drop(app.select_channel(channel));
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert_eq!(app.active_workspace.as_ref(), Some(&current));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![original_id]);
+        let creation = OperationId::new();
+        let run = OperationId::new();
+        app.recover_worktree_setup(
+            creation,
+            destination.clone(),
+            SetupIntent {
+                primary: Some(current),
+                plan: Some(SetupPlan {
+                    copy: vec![".editorconfig".into()],
+                    commands: vec!["printf setup".into()],
+                    fingerprint: "a".repeat(64),
+                }),
+                run_id: Some(run),
+                copy_done: true,
+                skip: false,
+            },
+        );
+        app.setup_ui
+            .pending
+            .insert(destination.clone(), (run, CancellationToken::new()));
+        app.setup_ui
+            .statuses
+            .insert(destination.clone(), WorktreeSetupStatus::Preparing);
+        (runtime, directory, app, destination, run, channel)
+    }
+
+    #[test]
+    fn prepared_setup_enters_accepted_and_already_selected_destinations() {
+        for already_selected in [false, true] {
+            let (_runtime, _directory, mut app, destination, run, channel) =
+                prepared_setup_selection_fixture();
+            if already_selected {
+                drop(
+                    app.try_select_worktree(destination.clone(), false)
+                        .expect("destination accepted"),
+                );
+                let accepted = app
+                    .try_select_worktree(destination.clone(), false)
+                    .expect("an already selected destination is still accepted");
+                assert!(cosmic::iced::runtime::task::into_stream(accepted).is_none());
+            }
+            let channels = app.durable.channels.clone();
+            let previous_cards = app.durable.cards.len();
+            // Preparation is an injected completion DTO; all returned terminal
+            // and selection futures remain unpolled in this reducer fixture.
+            drop(app.finish_worktree_setup(
+                run,
+                destination.clone(),
+                Ok(SetupPreparation {
+                    command: Some("printf setup".into()),
+                    ..Default::default()
+                }),
+            ));
+            assert_eq!(app.durable.active_channel, None);
+            assert_eq!(app.active_workspace.as_ref(), Some(&destination));
+            assert_eq!(app.durable.channels, channels);
+            assert_eq!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|row| row.id == channel)
+                    .unwrap()
+                    .cards
+                    .len(),
+                1
+            );
+            assert_eq!(app.durable.cards.len(), previous_cards + 1);
+            let setup = app
+                .durable
+                .cards
+                .iter()
+                .filter_map(|card| {
+                    let CardKind::Terminal(session) = &card.kind else {
+                        return None;
+                    };
+                    (session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID")
+                        == Some(&run.to_string()))
+                    .then_some((card, session))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(setup.len(), 1);
+            assert_eq!(setup[0].1.launch.working_directory, destination);
+            assert_eq!(
+                app.workspace.order().collect::<Vec<_>>(),
+                vec![setup[0].0.id]
+            );
+            assert_eq!(
+                app.setup_ui.statuses[&destination],
+                WorktreeSetupStatus::Running
+            );
+            assert!(!app.setup_ui.preparing(&destination));
+            assert_eq!(app.setup_ui.terminals[&destination].1, setup[0].1.id);
+        }
+    }
+
+    #[test]
+    fn prepared_setup_refused_selection_preserves_channel_and_recovery() {
+        let (_runtime, _directory, mut app, destination, run, channel) =
+            prepared_setup_selection_fixture();
+        let durable = Arc::clone(&app.durable);
+        let active_workspace = app.active_workspace.clone();
+        let visible = app.workspace.order().collect::<Vec<_>>();
+        let focused = app.workspace.focused();
+        let runtime_cards = app.cards.keys().copied().collect::<HashSet<_>>();
+        let terminal_starts = app.terminal_starts.lock().unwrap().len();
+        let recovered = app.setup_ui.recovered[&destination].clone();
+        assert_eq!(app.setup_ui.current_run(&destination), Some(run));
+        assert!(app.setup_ui.preparing(&destination));
+        std::fs::remove_dir(&destination).unwrap();
+
+        // The same real lease acquisition used by normal scope selection now
+        // encounters the missing destination. No operational future is polled.
+        let refused = app.finish_worktree_setup(
+            run,
+            destination.clone(),
+            Ok(SetupPreparation {
+                command: Some("printf setup".into()),
+                ..Default::default()
+            }),
+        );
+        assert!(cosmic::iced::runtime::task::into_stream(refused).is_none());
+        assert_eq!(*app.durable, *durable);
+        assert_eq!(app.durable.active_channel, Some(channel));
+        assert_eq!(app.active_workspace, active_workspace);
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), visible);
+        assert_eq!(app.workspace.focused(), focused);
+        assert_eq!(
+            app.cards.keys().copied().collect::<HashSet<_>>(),
+            runtime_cards
+        );
+        assert_eq!(app.terminal_starts.lock().unwrap().len(), terminal_starts);
+        assert!(!app.setup_ui.preparing(&destination));
+        assert!(!app.setup_ui.terminals.contains_key(&destination));
+        assert!(app.setup_ui.authorized_runs.lock().unwrap().is_empty());
+        assert_eq!(app.setup_ui.recovered[&destination], recovered);
+        assert_eq!(app.setup_ui.current_run(&destination), Some(run));
+        assert!(matches!(
+            &app.setup_ui.statuses[&destination],
+            WorktreeSetupStatus::Interrupted(detail)
+                if detail.contains("could not be protected") && detail.contains("Review setup")
+        ));
+    }
+
     #[test]
     fn daemon_created_setup_terminal_markers_drive_the_worktree_row() {
         let mut app = crate::app::tests::context_inspector_test_app(true);

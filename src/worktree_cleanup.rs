@@ -431,16 +431,33 @@ pub(crate) struct WindowProtections {
     directories: BTreeMap<PathBuf, Protection>,
     requested: std::collections::BTreeSet<PathBuf>,
     ready: Option<crate::instance::OwnedLock>,
+    #[cfg(test)]
+    private_runtime: Option<PathBuf>,
 }
 
 impl WindowProtections {
+    #[cfg(test)]
+    pub(crate) fn with_test_runtime(runtime: PathBuf) -> Self {
+        Self {
+            private_runtime: Some(runtime),
+            ..Self::default()
+        }
+    }
+
     fn suspend_readiness(&mut self) {
         self.ready = None;
         self.requested.clear();
     }
 
     pub(crate) fn protect_next(&mut self, directory: &Path) -> io::Result<()> {
-        if let Some(protection) = protect(directory)? {
+        #[cfg(test)]
+        let protection = match self.private_runtime.as_deref() {
+            Some(runtime) => Some(acquire(runtime, directory, false)?),
+            None => protect(directory)?,
+        };
+        #[cfg(not(test))]
+        let protection = protect(directory)?;
+        if let Some(protection) = protection {
             self.directories
                 .insert(protection.directory.clone(), protection);
         }
@@ -826,6 +843,7 @@ mod tests {
             ready: Some(
                 crate::instance::owned_lock(&marker, libc::LOCK_EX | libc::LOCK_NB).unwrap(),
             ),
+            ..Default::default()
         };
         window.suspend_readiness();
         assert!(window.ready.is_none());

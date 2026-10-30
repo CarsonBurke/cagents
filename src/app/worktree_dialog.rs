@@ -701,16 +701,10 @@ impl Cagents {
             });
         let selected_ref = dialog.draft.selected_branch_reference.clone();
         let prefix = dialog.prefix_dirty.then(|| dialog.choices.prefix.clone());
-        let trust =
-            (dialog.trust_setup && !dialog.draft.skip_setup && !dialog.choices.setup_trusted)
-                .then(|| {
-                    dialog
-                        .choices
-                        .primary
-                        .clone()
-                        .zip(dialog.choices.setup_plan.clone())
-                })
-                .flatten();
+        let reviewed_config = dialog.choices.reviewed_config(
+            dialog.trust_setup && !dialog.draft.skip_setup && !dialog.choices.setup_trusted,
+            prefix,
+        );
         let branch = dialog
             .effective_branch()
             .expect("branch was validated before resolving");
@@ -726,14 +720,9 @@ impl Cagents {
         };
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                if let Some((primary, plan)) = trust {
-                    crate::worktree_setup::trust(&primary, &plan, &token)
-                        .map_err(|error| WorktreeInputError::general(error.to_string()))?;
-                }
-                if let Some(prefix) = prefix {
-                    super::worktree_choices::save_prefix(&input.repository, &prefix, &token)
-                        .map_err(WorktreeInputError::general)?;
-                }
+                reviewed_config
+                    .apply(&input.repository, &token)
+                    .map_err(WorktreeInputError::general)?;
                 RepositoryService::system("git")
                     .resolve_worktree_request_selected(&input, selected_ref.as_deref(), &token)
                     .map(|mut request| {

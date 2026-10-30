@@ -1,6 +1,152 @@
 //! One local ref read when the creation dialog opens; typing only filters memory.
 use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
+
+/// Consent belongs to the displayed checkout, not a later occupant of its name.
+/// Keep descriptors alive so an original inode cannot be recycled while the
+/// dialog is open. These checks precede path-based Git calls; they are not an
+/// atomic fence against an independent process changing the repository.
+#[derive(Debug)]
+struct CheckoutIdentity {
+    root: crate::fs_safety::Root,
+    admin: crate::fs_safety::Root,
+    common: crate::fs_safety::Root,
+}
+
+impl CheckoutIdentity {
+    fn capture(repository: &Path, cancellation: &CancellationToken) -> Result<Self, String> {
+        crate::secure_file::reject_symlink_components(repository)
+            .map_err(|error| error.to_string())?;
+        let root = crate::fs_safety::Root::open(
+            &repository
+                .canonicalize()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let service = crate::repository::RepositoryService::system("git");
+        let admin = service
+            .git_dir(root.path(), cancellation)
+            .map_err(|error| error.to_string())?;
+        let common = service
+            .common_dir(root.path(), cancellation)
+            .map_err(|error| error.to_string())?;
+        for path in [&admin, &common] {
+            crate::secure_file::reject_symlink_components(path)
+                .map_err(|error| error.to_string())?;
+        }
+        let identity = Self {
+            root,
+            admin: crate::fs_safety::Root::open(&admin).map_err(|error| error.to_string())?,
+            common: crate::fs_safety::Root::open(&common).map_err(|error| error.to_string())?,
+        };
+        identity.check(repository, cancellation)?;
+        Ok(identity)
+    }
+
+    fn check_directories(&self) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        for root in [&self.root, &self.admin, &self.common] {
+            crate::secure_file::reject_symlink_components(root.path())
+                .map_err(|error| error.to_string())?;
+            let held = root.metadata().map_err(|error| error.to_string())?;
+            let named = root
+                .path()
+                .symlink_metadata()
+                .map_err(|error| error.to_string())?;
+            if !named.is_dir() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+                return Err("The displayed checkout changed; reopen the worktree dialog and review it again".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn check(&self, repository: &Path, cancellation: &CancellationToken) -> Result<(), String> {
+        self.check_directories()?;
+        crate::secure_file::reject_symlink_components(repository)
+            .map_err(|error| error.to_string())?;
+        if repository
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            != self.root.path()
+        {
+            return Err("The displayed checkout path changed; review it again".into());
+        }
+        let service = crate::repository::RepositoryService::system("git");
+        if service
+            .git_dir(repository, cancellation)
+            .map_err(|error| error.to_string())?
+            != self.admin.path()
+            || service
+                .common_dir(repository, cancellation)
+                .map_err(|error| error.to_string())?
+                != self.common.path()
+        {
+            return Err("The displayed Git repository changed; review it again".into());
+        }
+        self.check_directories()
+    }
+}
+
+#[derive(Debug)]
+struct ChoicesIdentity {
+    repository: CheckoutIdentity,
+    primary: Option<CheckoutIdentity>,
+}
+
+impl ChoicesIdentity {
+    fn check(&self, repository: &Path, cancellation: &CancellationToken) -> Result<(), String> {
+        self.repository.check(repository, cancellation)?;
+        if let Some(primary) = &self.primary {
+            primary.check(primary.root.path(), cancellation)?;
+            if primary.common.path() != self.repository.common.path() {
+                return Err(
+                    "The primary checkout belongs to another repository; review it again".into(),
+                );
+            }
+        }
+        self.repository.check_directories()
+    }
+}
+
+/// A submission keeps the witness from the displayed choices. Never acquire a
+/// fresh identity here: that would transfer old consent to a replacement.
+pub(super) struct ReviewedConfig {
+    identity: Option<Arc<ChoicesIdentity>>,
+    trust: Option<(std::path::PathBuf, crate::worktree_setup::SetupPlan)>,
+    prefix: Option<String>,
+}
+
+impl ReviewedConfig {
+    pub(super) fn apply(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        if self.trust.is_none() && self.prefix.is_none() {
+            return Ok(());
+        }
+        let identity = self.identity.as_ref().ok_or(
+            "The displayed repository could not be verified; reopen the worktree dialog before saving project choices",
+        )?;
+        identity.check(repository, cancellation)?;
+        if let Some((primary, plan)) = &self.trust {
+            let original = identity
+                .primary
+                .as_ref()
+                .ok_or("The displayed primary checkout is unavailable; review it again")?;
+            original.check(primary, cancellation)?;
+            crate::worktree_setup::trust(primary, plan, cancellation)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(prefix) = &self.prefix {
+            // Trust may have taken time. Retain the original witness and
+            // validate again before this separate persistent effect.
+            identity.check(repository, cancellation)?;
+            save_prefix(repository, prefix, cancellation)?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -22,6 +168,7 @@ pub(super) struct Choice {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct Choices {
+    identity: Option<Arc<ChoicesIdentity>>,
     pub refs: Vec<Choice>,
     pub default_base: String,
     pub prefix: String,
@@ -34,6 +181,7 @@ pub(super) struct Choices {
 
 impl Choices {
     pub fn load(repository: &Path, cancellation: &CancellationToken) -> Result<Self, String> {
+        let repository_identity = CheckoutIdentity::capture(repository, cancellation)?;
         let command = git(repository)
             .args([
                 "for-each-ref",
@@ -85,6 +233,11 @@ impl Choices {
             .filter(|record| !record.bare)
             .map(|record| record.path.clone());
         if let Some(primary) = &choices.primary {
+            let primary_identity = CheckoutIdentity::capture(primary, cancellation)?;
+            choices.identity = Some(Arc::new(ChoicesIdentity {
+                repository: repository_identity,
+                primary: Some(primary_identity),
+            }));
             match crate::worktree_setup::load(primary) {
                 Ok(plan) => {
                     choices.setup_plan = plan;
@@ -97,8 +250,28 @@ impl Choices {
                 }
                 Err(error) => choices.setup_error = Some(error.to_string()),
             }
+        } else {
+            choices.identity = Some(Arc::new(ChoicesIdentity {
+                repository: repository_identity,
+                primary: None,
+            }));
         }
+        choices
+            .identity
+            .as_ref()
+            .expect("captured choices identity")
+            .check(repository, cancellation)?;
         Ok(choices)
+    }
+
+    pub(super) fn reviewed_config(&self, trust: bool, prefix: Option<String>) -> ReviewedConfig {
+        ReviewedConfig {
+            identity: self.identity.clone(),
+            trust: trust
+                .then(|| self.primary.clone().zip(self.setup_plan.clone()))
+                .flatten(),
+            prefix,
+        }
     }
 
     fn parse(bytes: &[u8]) -> Result<Self, String> {
@@ -386,6 +559,180 @@ pub(super) fn sanitize_branch(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_git(repository: &Path, arguments: &[&str]) -> crate::process::ProcessOutput {
+        // Each fixture command has private configuration routing. Do not
+        // mutate process-wide environment or consult the user's Git config.
+        let command = git(repository)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(arguments.iter().copied());
+        SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap()
+    }
+
+    fn checked_fixture_git(repository: &Path, arguments: &[&str]) -> Vec<u8> {
+        fixture_git(repository, arguments)
+            .require_success("git")
+            .unwrap()
+            .stdout
+    }
+
+    fn initialize_reviewed_checkout(repository: &Path) {
+        std::fs::create_dir_all(repository.join(".cagents")).unwrap();
+        checked_fixture_git(repository, &["init", "-q", "--initial-branch=main"]);
+        checked_fixture_git(
+            repository,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        std::fs::write(
+            repository.join(".cagents/worktree.toml"),
+            "setup = 'printf setup'\n",
+        )
+        .unwrap();
+        checked_fixture_git(
+            repository,
+            &[
+                "config",
+                "--local",
+                "cagents.worktreeBranchPrefix",
+                "original/",
+            ],
+        );
+    }
+
+    #[test]
+    fn displayed_config_consent_refuses_replaced_checkout_and_git_admin() {
+        for selected_is_linked in [false, true] {
+            for replace_checkout in [true, false] {
+                let directory = tempfile::tempdir().unwrap();
+                let primary = directory.path().join("checkout");
+                initialize_reviewed_checkout(&primary);
+                let repository = if selected_is_linked {
+                    let linked = directory.path().join("linked");
+                    checked_fixture_git(
+                        &primary,
+                        &[
+                            "worktree",
+                            "add",
+                            "-q",
+                            "-b",
+                            "feature",
+                            linked.to_str().unwrap(),
+                        ],
+                    );
+                    linked
+                } else {
+                    primary.clone()
+                };
+                let token = CancellationToken::new();
+                let choices = Choices::load(&repository, &token).unwrap();
+                let approval = choices.reviewed_config(true, Some("reviewed/".into()));
+                let original_config = std::fs::read(primary.join(".git/config")).unwrap();
+                let original_admin = if replace_checkout {
+                    let moved = directory.path().join("original-checkout");
+                    std::fs::rename(&primary, &moved).unwrap();
+                    moved.join(".git")
+                } else {
+                    let moved = primary.join(".git-original");
+                    std::fs::rename(primary.join(".git"), &moved).unwrap();
+                    moved
+                };
+                initialize_reviewed_checkout(&primary);
+                checked_fixture_git(
+                    &primary,
+                    &[
+                        "config",
+                        "--local",
+                        "cagents.worktreeBranchPrefix",
+                        "replacement/",
+                    ],
+                );
+                let replacement_config = std::fs::read(primary.join(".git/config")).unwrap();
+                // The plan bytes and pathname are identical. Only the original
+                // held checkout/admin identity distinguishes this repository.
+                assert_eq!(
+                    crate::worktree_setup::load(&primary).unwrap(),
+                    choices.setup_plan
+                );
+                drop(choices);
+                assert!(approval.apply(&repository, &token).is_err());
+                assert_eq!(
+                    std::fs::read(primary.join(".git/config")).unwrap(),
+                    replacement_config
+                );
+                assert_eq!(
+                    std::fs::read(original_admin.join("config")).unwrap(),
+                    original_config
+                );
+                assert_eq!(
+                    fixture_git(
+                        &primary,
+                        &["config", "--local", "--get", "cagents.worktreeSetupTrust"]
+                    )
+                    .exit_code,
+                    Some(1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn displayed_config_consent_survives_cloning_and_ordinary_file_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("checkout");
+        initialize_reviewed_checkout(&repository);
+        let token = CancellationToken::new();
+        let choices = Choices::load(&repository, &token).unwrap();
+        let approval = choices
+            .clone()
+            .reviewed_config(true, Some("reviewed/".into()));
+        let plan = choices.setup_plan.clone().unwrap();
+        drop(choices);
+        std::fs::write(
+            repository.join("ordinary.txt"),
+            "normal work during review\n",
+        )
+        .unwrap();
+        approval.apply(&repository, &token).unwrap();
+        assert!(crate::worktree_setup::is_trusted(&repository, &plan, &token).unwrap());
+        assert_eq!(
+            checked_fixture_git(
+                &repository,
+                &["config", "--local", "--get", "cagents.worktreeBranchPrefix"]
+            ),
+            b"reviewed/\n"
+        );
+    }
+
+    #[test]
+    fn missing_displayed_config_witness_does_not_recapture_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("checkout");
+        initialize_reviewed_checkout(&repository);
+        let token = CancellationToken::new();
+        let mut choices = Choices::load(&repository, &token).unwrap();
+        choices.identity = None;
+        let approval = choices.reviewed_config(true, Some("reviewed/".into()));
+        let config = std::fs::read(repository.join(".git/config")).unwrap();
+        assert!(approval.apply(&repository, &token).is_err());
+        assert_eq!(
+            std::fs::read(repository.join(".git/config")).unwrap(),
+            config
+        );
+    }
+
     fn choices() -> Choices {
         Choices::parse(b"refs/heads/main\0aaaa\0[behind 14]\0\0*\nrefs/heads/feature/x\0bbbb\0[ahead 2]\0\0 \nrefs/remotes/origin/main\0cccc\0\0\0 \nrefs/remotes/origin/feature/y\0dddd\0\0\0 \nrefs/remotes/origin/HEAD\0cccc\0\0refs/remotes/origin/main\0 \nrefs/tags/v1\0eeee\0\0\0 \n").unwrap()
     }

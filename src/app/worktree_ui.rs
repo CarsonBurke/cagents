@@ -612,6 +612,17 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> Task<Message> {
+        self.try_select_worktree(path, create_if_empty)
+            .unwrap_or_else(Task::none)
+    }
+
+    /// An accepted selection may need no effects. Only protection refusal is
+    /// None, so callers must not infer admission from whether a Task is empty.
+    pub(super) fn try_select_worktree(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+    ) -> Option<Task<Message>> {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
@@ -619,7 +630,7 @@ impl Cagents {
             self.status = Some(TransientNotice::warning(format!(
                 "Cannot open this worktree yet: {error}"
             )));
-            return Task::none();
+            return None;
         }
         let roots = self
             .known_worktree_roots
@@ -657,13 +668,13 @@ impl Cagents {
                 .map(|card| card.id))
         {
             if !create_if_empty {
-                return Task::none();
+                return Some(Task::none());
             }
-            return if !has_terminal {
+            return Some(if !has_terminal {
                 self.add_default_pane(path, self.settings.default_worktree_pane)
             } else {
                 Task::none()
-            };
+            });
         }
         let promoted = !was_channel
             && self.active_workspace.as_ref().is_some_and(|previous| {
@@ -723,7 +734,7 @@ impl Cagents {
         if discarded {
             self.persist();
         }
-        Task::batch([scope, terminal])
+        Some(Task::batch([scope, terminal]))
     }
 
     fn install_workspace_scope(
