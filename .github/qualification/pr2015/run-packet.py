@@ -617,6 +617,7 @@ def hosted_context():
     assert re.fullmatch(r'[0-9a-f]{64}', case_sha) and digest(case_path) == case_sha, 'Immutable selected research case differs'
     case = json.loads(case_path.read_bytes())
     assert case['case'] == 'installer2015' and case['never_merge'] is True
+    assert attempt == '1', 'Installer2015 requires one original attempt1; reruns are unsupported and no global C grant is implied'
     assert case['product_head'] == '6dc09b9a1b5d205650e244401da0938b653d16da' and case['product_tree'] == 'aaab67a21378958066103707baf3abe8850577d6'
     return {'repository': 'CarsonBurke/cagents', 'pr': 1921, 'event': 'pull_request',
             'head_ref': head['ref'], 'control_head': head['sha'], 'run_id': run, 'run_attempt': attempt,

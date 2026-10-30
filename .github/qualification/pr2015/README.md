@@ -46,7 +46,7 @@ There is no native, live provider, installed product, external process absence, 
 
 ## Future review input and invocation
 
-The active eight-file freeze is `/tmp/issue2015-hosted-user-active-source-freeze-v1.json`, SHA256 `813653b3edc70d94558eced6b63c279cb9340094dddf8c85685adcaf99b28409`. This is an author source freeze, not an independent clear verdict.
+The predecessor eight-file freeze `/tmp/issue2015-hosted-user-active-source-freeze-v1.json`, SHA256 `813653b3edc70d94558eced6b63c279cb9340094dddf8c85685adcaf99b28409`, and committed182075ed source remain unchanged for their reviewers. The corrected successor is sealed separately at `/tmp/issue2015-hosted-attempt1-source-freeze-v2.json`; Root receives its exact external hash. Both are author source freezes, not independent clear verdicts.
 
 A genuine reserved nonauthor review must supply its own actual verdict and full limits. The controller validator reads only `verdict`, `head`, `tree`, `runner_sha256` and `plan_sha256`; it does not authenticate authorship or grant runtime authority. If that review actually clears this source, Root may copy the genuine receipt to `independent-review.json` before research publication and preserve its externally sealed hash and source binding. No clear receipt or empty stub is included. The preflight fails before Cargo while that real input is absent.
 
@@ -55,9 +55,15 @@ After authenticated provenance, independent review, actual shared-resource sched
 ```sh
 python3 "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/run-packet.py" \
   --run-binding "$PR2015_RUN_BINDING" \
-  --runner-sha256 235e881b7448e98513b0848f1a4081e11d3b42f917f846684a58a1ade845ab9c \
+  --runner-sha256 1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20 \
   --controller-review "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/independent-review.json" \
   --controller-review-sha256 "$PR2015_CONTROLLER_REVIEW_SHA256"
 ```
 
 All runtime values come from original hosted preflight. No source-preparation command grants execution. Earlier local e3 source, #1287 controller lineage, historical Git HOLD, original diagnostic negative and Main15 UI results remain separate evidence and transfer no current pass.
+
+## Original attempt1 source correction
+
+The independent SOURCE_HOLD at `/tmp/fw16-issue2015-hosted-workflow-cache-admission-HOLD-813653b3.json`, SHA256 `d6b4b3e403ca0641aae1f1d1cd285bb9463d6a447fb281dd1ee55b4190feaf08`, found that positive rerun attempts could reach Cargo. The installer selector now requires literal attempt1 after immutable case parsing, before GITHUB_OUTPUT; the same selector runs again in heavy source preflight before rustup/cache/any Cargo, including failed-job reruns that reuse an earlier selection output. A defensive installer runner preflight imposes the same literal1 condition. Legacy1726 positive-attempt semantics and its job source remain unchanged. This guard does not authenticate or grant global C; original run provenance, external Root scheduling and later RAW remain mandatory.
+
+`test-original-attempt-context.py` is focused synthetic TEST SOURCE only. Its future oracle exercises the actual hosted_context function bodies against generated in-memory engine metadata/files: installer1 accepted by both contexts;2+ and nonliteral01 refused;0 invalid; legacy positive attempts preserved. It never reads, patches, copies or strips real os.environ, invokes no controller entrypoint and grants no actual User/provenance/permission/capability. Only AST syntax was checked; no fixture, guard, test or controller was executed. Plan, cache gate, source manifest, source binding, all archived old negatives and the original worktree remain unchanged.

@@ -60,5 +60,19 @@
   "runtime": "ALL_UNRUN",
   "actual_cache_visibility": "UNKNOWN",
   "actual_CLI_payload": "UNKNOWN",
-  "independent_review": "ABSENT"
+  "independent_review": "ABSENT",
+  "attempt1_successor": {
+    "predecessor_commit": "182075edc8014ecf30767a9d376ec133fa8548ec",
+    "HOLD_path": "/tmp/fw16-issue2015-hosted-workflow-cache-admission-HOLD-813653b3.json",
+    "HOLD_sha256": "d6b4b3e403ca0641aae1f1d1cd285bb9463d6a447fb281dd1ee55b4190feaf08",
+    "production_delta": "Exactly one literal attempt1 assertion added to selector installer branch and runner preflight; no other logic change",
+    "workflow_delta": "Only selector/case/runner hashes refreshed",
+    "plan_cache_manifest_binding": "BYTE_EXACT_PREDECESSOR",
+    "legacy_job_and_context_positive_attempt_policy": "UNCHANGED",
+    "lineage_files_byte_exact": 28,
+    "predecessor_frozen_files_unchanged": 41,
+    "synthetic_fixture_source_sha256": "0906fb636fae6e0b5b7cf3795b7174e0f5540c19dcf37b24cd0cf9b1ff467cac",
+    "fixture_execution": "NONE",
+    "actual_User_permission_C_capability_grant": "NONE"
+  }
 }

@@ -184,7 +184,7 @@ jobs:
     outputs:
       case: ${{ steps.select.outputs.case }}
     env:
-      PR2015_CASE_SHA256: 73174260590764f7e3a9606acf6756988a212002e7786b01c9582b44378a8e58
+      PR2015_CASE_SHA256: 9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -196,7 +196,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s  %s\n' 5c2fcbae6d1293e26d302456860bb1f03dd6138d55d81ff4dac2996190fcff3d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          printf '%s  %s\n' 360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85 research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
           python3 research/.github/qualification/pr2015/case-select.py
       - name: Upload original source-selection receipt
         if: always()
@@ -566,7 +566,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      PR2015_CASE_SHA256: 73174260590764f7e3a9606acf6756988a212002e7786b01c9582b44378a8e58
+      PR2015_CASE_SHA256: 9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f
     defaults:
       run:
         shell: bash
@@ -609,7 +609,7 @@ jobs:
         id: source_preflight
         run: |
           set -euo pipefail
-          printf '%s  %s\n' 5c2fcbae6d1293e26d302456860bb1f03dd6138d55d81ff4dac2996190fcff3d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          printf '%s  %s\n' 360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85 research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
           python3 research/.github/qualification/pr2015/case-select.py --require-installer-review
       - name: Install pinned compiler without invoking Cargo
         run: |
@@ -663,7 +663,7 @@ jobs:
         run: |
           python3 "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/run-packet.py" \
             --run-binding "$PR2015_RUN_BINDING" \
-            --runner-sha256 235e881b7448e98513b0848f1a4081e11d3b42f917f846684a58a1ade845ab9c \
+            --runner-sha256 1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20 \
             --controller-review "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/independent-review.json" \
             --controller-review-sha256 "$PR2015_CONTROLLER_REVIEW_SHA256"
       - name: Preserve original workflow step outcomes and artifact checksums

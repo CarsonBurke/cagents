@@ -4,18 +4,18 @@
   "never_merge": true,
   "product_head": "6dc09b9a1b5d205650e244401da0938b653d16da",
   "product_tree": "aaab67a21378958066103707baf3abe8850577d6",
-  "runner_sha256": "235e881b7448e98513b0848f1a4081e11d3b42f917f846684a58a1ade845ab9c",
+  "runner_sha256": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
   "plan_sha256": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
   "cache_gate_sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
   "selector_path": ".github/qualification/pr2015/case-select.py",
-  "selector_sha256": "5c2fcbae6d1293e26d302456860bb1f03dd6138d55d81ff4dac2996190fcff3d",
+  "selector_sha256": "360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85",
   "independent_review_path": ".github/qualification/pr2015/independent-review.json",
   "independent_review_input": "No author-produced clear receipt exists. Root must copy the genuine reserved independent nonauthor receipt before research publication; absence or mismatched runner/plan/product pins fails before Cargo.",
   "source_sha256": {
-    ".github/qualification/pr2015/run-packet.py": "235e881b7448e98513b0848f1a4081e11d3b42f917f846684a58a1ade845ab9c",
+    ".github/qualification/pr2015/run-packet.py": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
     ".github/qualification/pr2015/plan.json": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
     ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
-    ".github/qualification/pr2015/case-select.py": "5c2fcbae6d1293e26d302456860bb1f03dd6138d55d81ff4dac2996190fcff3d",
+    ".github/qualification/pr2015/case-select.py": "360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85",
     ".github/qualification/pr2015/manifest.json": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
     ".github/qualification/pr2015/source-review-binding.json": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87"
   },
@@ -39,5 +39,6 @@
     "Actual restored CLI payload is unknown and unprobed.",
     "No integration-harness warmth or Cargo freshness is established by library cache presence."
   ],
-  "publication_scope": "Research PR1921 only, NeverMerge. Creates no product PR and grants no mergeability or bypass of rejected product-PR creation. Source preparation allocates nothing; global C remains external and unavailable until Main15 return and Root scheduling."
+  "publication_scope": "Research PR1921 only, NeverMerge. Creates no product PR and grants no mergeability or bypass of rejected product-PR creation. Source preparation allocates nothing; global C remains external and unavailable until Main15 return and Root scheduling.",
+  "installer_original_run_attempt": "1"
 }

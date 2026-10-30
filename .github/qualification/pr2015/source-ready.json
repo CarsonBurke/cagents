@@ -6,18 +6,15 @@
   "product_head": "6dc09b9a1b5d205650e244401da0938b653d16da",
   "product_tree": "aaab67a21378958066103707baf3abe8850577d6",
   "active_source_sha256": {
-    ".github/workflows/research-pr1853-bd88.yml": "17fd4342e9199177bc3c94eea7fbb0ec4bfa6651b07d8822d056146efd516e38",
-    ".github/qualification/pr2015/run-packet.py": "235e881b7448e98513b0848f1a4081e11d3b42f917f846684a58a1ade845ab9c",
+    ".github/workflows/research-pr1853-bd88.yml": "97bef99d9c141bbed508a3d9ea4b5b04904f6a92346994279ff16f4da338a181",
+    ".github/qualification/pr2015/run-packet.py": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
     ".github/qualification/pr2015/plan.json": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
     ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
-    ".github/qualification/pr2015/case-select.py": "5c2fcbae6d1293e26d302456860bb1f03dd6138d55d81ff4dac2996190fcff3d",
-    ".github/qualification/pr2015/case.json": "73174260590764f7e3a9606acf6756988a212002e7786b01c9582b44378a8e58",
+    ".github/qualification/pr2015/case-select.py": "360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85",
+    ".github/qualification/pr2015/case.json": "9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f",
     ".github/qualification/pr2015/manifest.json": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
-    ".github/qualification/pr2015/source-review-binding.json": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87"
-  },
-  "active_freeze": {
-    "path": "/tmp/issue2015-hosted-user-active-source-freeze-v1.json",
-    "sha256": "813653b3edc70d94558eced6b63c279cb9340094dddf8c85685adcaf99b28409"
+    ".github/qualification/pr2015/source-review-binding.json": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87",
+    ".github/qualification/pr2015/test-original-attempt-context.py": "0906fb636fae6e0b5b7cf3795b7174e0f5540c19dcf37b24cd0cf9b1ff467cac"
   },
   "phase_count": 10,
   "qualifying_outer_parent_count": 5,
@@ -39,7 +36,9 @@
     "unchanged_cache_utility_helpers": 7,
     "local_e3_byte_exact_files": 23,
     "legacy_job": "BYTE_EXACT_AFTER_ONLY_EXPLICIT_CASE_DEPENDENCY_AND_CONDITION_REMOVAL",
-    "legacy_globals": "BYTE_EXACT"
+    "legacy_globals": "BYTE_EXACT",
+    "successor_logic_delta": "Only one literal attempt1 assert in each hosted_context; workflow changes only frozen dependent pins; plan/cache/manifest/binding unchanged",
+    "synthetic_fixture_AST_syntax": "PASS_WITHOUT_EXECUTION"
   },
   "runtime": {
     "status": "ALL_UNRUN",
@@ -54,10 +53,11 @@
     "global_C_return": null
   },
   "concrete_execution_blockers": [
+    "Successor exact nonauthor review must reassess the corrected original-attempt fence and new dependent pins; prior SOURCE_HOLD remains preserved negative evidence.",
     "Actual independent nonauthor controller source review receipt is absent; source preflight intentionally fails before Cargo until the real receipt is copied unchanged.",
     "Actual trusted-cache visibility from PR1921 is UNKNOWN and unprobed.",
     "Actual existing native features[] CLI rmeta+rlib/fingerprint payload is UNKNOWN; cache miss/UI-only/incomplete payload must stop before any Cargo, including cargo --version.",
-    "Current Main15 external C remains held. Source preparation allocates no C; complete original workflow scheduling, original authenticated job terminal, independent RAW and actual external return/acceptance remain Root-owned."
+    "External C status/scheduling/return remain Root-owned and unprobed. Source preparation allocates no C; complete original workflow scheduling, original authenticated job terminal, independent RAW and actual external return/acceptance remain required."
   ],
   "required_future_RAW": [
     "Authenticate actual original GitHub run/job/event/workflow source and immutable control/product bytes; environment preconditions alone are insufficient.",
@@ -75,5 +75,18 @@
     "plan_sha256"
   ],
   "author_cannot_supply_independent_verdict": true,
-  "limits": "Only10 serial phases and5 distinct CLI integration parents. Stop first negative/timeout/unknown/missing evidence. Full current --list sets must equal source-predicted36/11 names; runtime actualN is derived from each full inventory and every raw singleton summary must enforce1P0F0I/0M and N-1. Passive helpers/guardians/inline cases and compilation/inventory are not passes. Keep supported Git configuration/index/attribute refusal guards and cooperative source/context observations. No HOST/UI/default/full/integrated/broad/native/provider/live-install/release/WHOLE/SeedView/merge qualification. Natural unsupported authority context remains a real negative. Historical5a4 stale diagnostic/source-oracle finding and donor Git HOLD remain intact. Hosted-only User context. Actual PR1921 cache visibility and CLI payload are UNKNOWN. Exact existing Main15 cache namespace with same lock is reused, but UI-only cache cannot pass CLI features[] admission; a miss or incomplete payload fails before ANY Cargo invocation. Pre-controller setup/cache/action processes are outside controller-owned subreaper evidence and require original whole-job terminal/RAW accounting. Job-local fd closure does not return global C. Published legacy1726 source is deselected and UNRUN for this case; unpublished1951 branch is untouched. Never merge research scope; no suppressed required-check or mergeability assertion."
+  "limits": "Only10 serial phases and5 distinct CLI integration parents. Stop first negative/timeout/unknown/missing evidence. Full current --list sets must equal source-predicted36/11 names; runtime actualN is derived from each full inventory and every raw singleton summary must enforce1P0F0I/0M and N-1. Passive helpers/guardians/inline cases and compilation/inventory are not passes. Keep supported Git configuration/index/attribute refusal guards and cooperative source/context observations. No HOST/UI/default/full/integrated/broad/native/provider/live-install/release/WHOLE/SeedView/merge qualification. Natural unsupported authority context remains a real negative. Historical5a4 stale diagnostic/source-oracle finding and donor Git HOLD remain intact. Hosted-only User context. Actual PR1921 cache visibility and CLI payload are UNKNOWN. Exact existing Main15 cache namespace with same lock is reused, but UI-only cache cannot pass CLI features[] admission; a miss or incomplete payload fails before ANY Cargo invocation. Pre-controller setup/cache/action processes are outside controller-owned subreaper evidence and require original whole-job terminal/RAW accounting. Job-local fd closure does not return global C. Published legacy1726 source is deselected and UNRUN for this case; unpublished1951 branch is untouched. Never merge research scope; no suppressed required-check or mergeability assertion.",
+  "predecessor_active_source_freeze": {
+    "path": "/tmp/issue2015-hosted-user-active-source-freeze-v1.json",
+    "sha256": "813653b3edc70d94558eced6b63c279cb9340094dddf8c85685adcaf99b28409"
+  },
+  "committed_successor_freeze_path": "/tmp/issue2015-hosted-attempt1-source-freeze-v2.json",
+  "predecessor_commit": "182075edc8014ecf30767a9d376ec133fa8548ec",
+  "installer_original_run_attempt": "1",
+  "attempt_fence": {
+    "selector": "Installer-only literal1 after immutable case parse, before output; also repeated at heavy source preflight",
+    "runner": "Defensive installer-only preflight before candidate process spawn",
+    "global_C_grant": "NONE; remains externally authenticated and scheduled",
+    "synthetic_fixture": "TEST_SOURCE_ONLY_UNRUN; isolated in-memory engine/files; no real environ read, copy, patch or strip"
+  }
 }
