@@ -7403,7 +7403,7 @@ impl Cagents {
         owner: RetirementOwner,
     ) -> Task<Message> {
         if !matches!(owner.after, RetirementAfter::None)
-            && self.chat_return_session(owner.card).as_ref() == owner.session.as_ref()
+            && self.retirement_presentation_matches(&owner)
             && !self.chat_ui.phases.contains_key(&owner.card)
         {
             self.chat_ui.phases.insert(
@@ -7416,6 +7416,19 @@ impl Cagents {
             );
         }
         Self::dispatch_retirement(target, owner)
+    }
+
+    fn retirement_presentation_matches(&self, owner: &RetirementOwner) -> bool {
+        if matches!(owner.after, RetirementAfter::CloseTerminal) {
+            self.chat_ui
+                .parked
+                .get(&owner.card)
+                .is_some_and(|runtime| Some(&runtime.session) == owner.session.as_ref())
+                && matches!(self.card_state(owner.card).map(|state| &state.kind), Some(CardKind::Terminal(terminal))
+                if owner.session.as_ref().and_then(|source| source.terminal.as_ref()) == Some(terminal))
+        } else {
+            self.chat_return_session(owner.card).as_ref() == owner.session.as_ref()
+        }
     }
 
     fn refuse_chat_cleanup_reuse(&mut self, card: CardId, session: &chat::Session) -> bool {
@@ -7446,17 +7459,26 @@ impl Cagents {
             // keep offering a retry that is no longer necessary.
             return self.refocus_notices();
         }
-        let remove = if self.chat_return_session(owner.card).as_ref() == owner.session.as_ref() {
+        let matches_presentation = self.retirement_presentation_matches(&owner);
+        // A replaced terminal cannot inherit an old close intent. The old
+        // parked reader can still be released after its exact actor settled.
+        if matches!(owner.after, RetirementAfter::CloseTerminal)
+            && self
+                .chat_ui
+                .parked
+                .get(&owner.card)
+                .is_some_and(|runtime| Some(&runtime.session) == owner.session.as_ref())
+        {
+            self.chat_ui.parked.remove(&owner.card);
+            self.observe_agent_activity_for_card(owner.card, None);
+        }
+        let remove = if matches_presentation {
             match owner.after {
                 RetirementAfter::None => Task::none(),
                 RetirementAfter::CloseChat => self
                     .remove_chat_card(owner.card, None)
                     .unwrap_or_else(Task::none),
-                RetirementAfter::CloseTerminal => {
-                    self.chat_ui.parked.remove(&owner.card);
-                    self.observe_agent_activity_for_card(owner.card, None);
-                    self.begin_card_close(owner.card)
-                }
+                RetirementAfter::CloseTerminal => self.begin_card_close(owner.card),
             }
         } else {
             Task::none()
@@ -8057,6 +8079,11 @@ impl Cagents {
     /// The conversation starts under a new identity, so it never meets
     /// anything an earlier start of this card may have left in the daemon.
     fn start_chat_draft(&mut self, target: Target) -> Task<Message> {
+        if matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
+            if runtime.target == target && self.chat_ui.cleanup_blocks(target.card, &runtime.session))
+        {
+            return Task::none();
+        }
         if self.chat_start_pending(target.card)
             || self
                 .card_state(target.card)
@@ -8882,6 +8909,17 @@ impl Cagents {
             }
             Action::CancelQueued(target) => return self.cancel_queued(target),
             Action::Switch(card) => {
+                let cleanup_source = self.chat_return_session(card).or_else(|| {
+                    self.chat_ui
+                        .parked
+                        .get(&card)
+                        .map(|runtime| runtime.session.clone())
+                });
+                if let Some(source) = cleanup_source
+                    && self.refuse_chat_cleanup_reuse(card, &source)
+                {
+                    return Task::none();
+                }
                 if let Some(reason) = self.chat_switch_blocker(card) {
                     self.status = Some(
                         if self.chat_start_pending(card) || self.pending_terminal_spawn(card) {
@@ -12246,6 +12284,175 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    fn parked_cleanup_fixture(app: &mut Cagents) -> CardId {
+        let card = live_chat(app, Some(KNOWN_THREAD));
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let target = app.chat_ui.phases[&card].target();
+        let runtime = chat_runtime(app, card);
+        let proof = runtime.handle().unwrap().proof().unwrap();
+        let mut terminal = return_terminal(&runtime.session).unwrap();
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(
+            target,
+            Ok(terminal),
+        ))));
+        assert!(app.chat_ui.parked.contains_key(&card));
+        assert!(matches!(
+            app.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Terminal(_))
+        ));
+        card
+    }
+
+    #[test]
+    fn parked_cleanup_success_and_explicit_retry_reach_the_original_terminal_close() {
+        for fails_first in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = parked_cleanup_fixture(&mut app);
+            let source = app.chat_ui.parked[&card].session.clone();
+            let handle = app.chat_ui.parked[&card].handle().unwrap().clone();
+            let authority =
+                crate::agent_execution::Authority::session("synthetic-parked-cleanup".into());
+            let caller = crate::control::CallerContext::for_test(authority.clone(), false, true);
+            drop(app.begin_chat_close_as(caller, card));
+            let close = app.chat_ui.phases[&card].target();
+            if fails_first {
+                drop(app.update(Message::ChatUi(Action::CloseFinished(
+                    close,
+                    Err("pending original cleanup".into()),
+                ))));
+                drop(app.update(Message::ChatUi(Action::Switch(card))));
+                assert!(
+                    app.chat_ui.parked.contains_key(&card),
+                    "Switch cannot restore a closing actor"
+                );
+                assert!(!app.chat_ui.phases.contains_key(&card));
+                let owner = app.chat_ui.retiring.owner(close).unwrap();
+                let id = owner.id;
+                assert_eq!(owner.caller.authentication(), Some(authority));
+                assert_eq!(owner.session.as_ref(), Some(&source));
+                assert!(Arc::ptr_eq(owner.handle.as_ref().unwrap(), &handle));
+                drop(app.retry_chat_retirement(id));
+                let retry = app.chat_ui.phases[&card].target();
+                drop(app.update(Message::ChatUi(Action::CloseFinished(close, Ok(())))));
+                assert!(app.chat_ui.retiring.is_pending(retry));
+                drop(app.update(Message::ChatUi(Action::Retired(retry, Ok(())))));
+            } else {
+                drop(app.update(Message::ChatUi(Action::CloseFinished(close, Ok(())))));
+            }
+            assert!(!app.chat_ui.parked.contains_key(&card));
+            assert!(!app.chat_ui.cleanup_unresolved());
+            assert!(
+                app.terminal_close
+                    .as_ref()
+                    .is_some_and(|intent| intent.card == card),
+                "positive original actor cleanup continues the terminal close"
+            );
+        }
+    }
+
+    #[test]
+    fn draft_submit_during_pending_and_failed_cleanup_preserves_the_original_composer() {
+        chat::attachment_assets::with_test_image(|image| {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let target = chat_runtime(&app, card).target;
+            write(&mut app, card, "Keep this message and its image");
+            app.chat_runtime_mut(target).unwrap().attachments = vec![image.clone()];
+            let source = chat_runtime(&app, card).session.clone();
+            let text = chat_runtime(&app, card).composer.text();
+            let attachments = chat_runtime(&app, card).attachments.clone();
+            let caller = crate::control::CallerContext::for_test(
+                crate::agent_execution::Authority::session("synthetic-draft-cleanup".into()),
+                false,
+                true,
+            );
+            drop(app.retire_chat_as(caller, card, None, Some(source.clone())));
+            let close = retired(&mut app, card);
+            for fail in [false, true] {
+                if fail {
+                    drop(app.update(Message::ChatUi(Action::Retired(
+                        close,
+                        Err("cleanup uncertain".into()),
+                    ))));
+                }
+                drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.composer.text(), text);
+                assert_eq!(runtime.attachments, attachments);
+                assert_eq!(runtime.session, source);
+                assert!(runtime.queued.is_none());
+                assert!(app.chat_ui.attempt(card).is_none());
+            }
+            let id = app.chat_ui.retiring.owner(close).unwrap().id;
+            drop(app.retry_chat_retirement(id));
+            let retry = retired(&mut app, card);
+            drop(app.update(Message::ChatUi(Action::Retired(retry, Ok(())))));
+            drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+            assert!(app.chat_ui.attempt(card).is_some());
+            let runtime = chat_runtime(&app, card);
+            assert!(runtime.queued.is_some());
+            assert_ne!(runtime.session.id, source.id);
+        });
+    }
+
+    #[test]
+    fn live_switch_cannot_return_an_actor_with_unresolved_cleanup() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let caller = crate::control::CallerContext::for_test(
+            crate::agent_execution::Authority::session("synthetic-live-switch".into()),
+            false,
+            true,
+        );
+        drop(app.retire_chat_as(caller, card, Some(handle.clone()), Some(source.clone())));
+        let close = retired(&mut app, card);
+        drop(app.update(Message::ChatUi(Action::Retired(
+            close,
+            Err("cleanup uncertain".into()),
+        ))));
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        assert!(!app.chat_ui.phases.contains_key(&card));
+        assert_eq!(app.chat_return_session(card), Some(source));
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
+        assert!(app.chat_ui.retiring.failure(close).is_some());
+    }
+
+    #[test]
+    fn cleanup_close_dialog_opens_its_retry_surface_after_dismissing_the_modal() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let caller = crate::control::CallerContext::for_test(
+            crate::agent_execution::Authority::session("synthetic-review-cleanup".into()),
+            false,
+            true,
+        );
+        drop(app.retire_chat_as(caller, card, None, Some(source)));
+        let close = retired(&mut app, card);
+        drop(app.update(Message::ChatUi(Action::Retired(
+            close,
+            Err("cleanup uncertain".into()),
+        ))));
+        drop(app.update(Message::WindowCloseRequested(window::Id::unique())));
+        assert!(app.transient_work_close.is_some());
+        assert!(app.modal_is_open());
+        drop(app.update(Message::ReviewChatCleanupBeforeClose));
+        assert!(app.transient_work_close.is_none());
+        assert!(!app.modal_is_open());
+        assert!(app.chrome_ui.popup.is_some());
+        assert!(app.chat_ui.retiring.failure(close).is_some());
+    }
+
     #[test]
     fn failed_retirement_retains_the_captured_owner_after_notices_are_dismissed() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -21217,13 +21424,26 @@ mod tests {
             saved.clone(),
             Err("fixture: daemon unreachable".into()),
         )));
-        assert_eq!(app.chat_return_session(card), Some(saved));
+        assert_eq!(app.chat_return_session(card), Some(saved.clone()));
         assert!(app.card_state(card).unwrap().existence.is_open());
-        assert!(
-            !errors(&app).is_empty(),
-            "a conversation that may still run is reported"
+        let owner = app
+            .chat_ui
+            .retiring
+            .owner(target)
+            .expect("failed cleanup keeps its exact source");
+        assert_eq!(owner.session.as_ref(), Some(&saved));
+        assert_eq!(
+            app.chat_ui.retiring.failure(target),
+            Some("fixture: daemon unreachable")
         );
-        assert!(!app.chat_ui.transition_pending());
+        assert!(
+            app.chat_ui
+                .cleanup_notices()
+                .iter()
+                .any(|row| row.id == owner.id && row.retry)
+        );
+        assert!(app.chat_ui.transition_pending());
+        assert!(app.window_close_transient_blocker().is_some());
         app.notices.entries.clear();
         close_chat(&mut app, card);
         assert!(

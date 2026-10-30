@@ -2820,6 +2820,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::NewWindow
                 | Message::WindowCloseRequested(_)
                 | Message::CancelTransientWorkClose
+                | Message::ReviewChatCleanupBeforeClose
                 | Message::ReturnToDeviceBeforeClose
                 | Message::ReturnToAutomationBeforeClose
                 | Message::DiscardAutomationAndClose(_)
@@ -4392,6 +4393,7 @@ pub enum Message {
     CloseCardUnasked(CardId),
     WindowCloseRequested(window::Id),
     CancelTransientWorkClose,
+    ReviewChatCleanupBeforeClose,
     ReturnToDeviceBeforeClose,
     ReturnToAutomationBeforeClose,
     DiscardAutomationAndClose(u64),
@@ -16421,6 +16423,13 @@ impl Application for Cagents {
                     iced::widget::operation::focus(target).map(cosmic::Action::App)
                 })
             }
+            Message::ReviewChatCleanupBeforeClose => {
+                if self.transient_work_close.is_none() || !self.chat_ui.cleanup_unresolved() {
+                    return Task::none();
+                }
+                self.transient_work_close = None;
+                self.update_chrome(chrome_ui::Action::ToggleNotices)
+            }
             Message::ReturnToAutomationBeforeClose => {
                 if self.transient_work_close.is_none()
                     || self.automation_ui.draft_close_blocker().is_none()
@@ -18266,6 +18275,14 @@ impl Application for Cagents {
                     .on_press(Message::CancelTransientWorkClose)
                     .into(),
             ];
+            if self.chat_ui.cleanup_unresolved() {
+                controls.push(
+                    crate::ui_controls::button::primary("Review cleanup")
+                        .id(widget::Id::new("dialog.transient-close.cleanup"))
+                        .on_press(Message::ReviewChatCleanupBeforeClose)
+                        .into(),
+                );
+            }
             if self.device_ui.dirty() {
                 controls.push(
                     crate::ui_controls::button::primary("Return to file")
@@ -18292,7 +18309,12 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
-                        design::title("Keep unsaved work before closing").into(),
+                        design::title(if self.chat_ui.cleanup_unresolved() {
+                            "Finish pending work before closing"
+                        } else {
+                            "Keep unsaved work before closing"
+                        })
+                        .into(),
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),

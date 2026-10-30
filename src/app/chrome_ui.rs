@@ -2455,7 +2455,7 @@ impl Cagents {
             match severity {
                 NoticeSeverity::Success => "Application notices: success",
                 NoticeSeverity::Warning => "Application notices",
-                NoticeSeverity::Error => "Application errors",
+                NoticeSeverity::Error => "Application notices: errors",
             },
         )
         .selected(self.chrome_ui.popup == Some(Popup::Notices))
@@ -2514,7 +2514,7 @@ impl Cagents {
                     };
                     let body = widget::column::with_children(vec![
                         super::notice_body(message),
-                        super::notice_surface_details(severity, cleanup.detail),
+                        super::notice_surface_detail(severity, cleanup.detail),
                     ])
                     .spacing(space::XS)
                     .into();
@@ -2546,11 +2546,19 @@ impl Cagents {
                 ];
                 if !self.notices.is_empty() {
                     heading_children.push(
-                        crate::ui_controls::button::quiet("Dismiss all")
-                            .id(widget::Id::new(NOTICES_DISMISS_ALL_ID))
-                            .name("Dismiss every application notice")
-                            .on_press(Message::DismissAllNotices)
-                            .into(),
+                        crate::ui_controls::button::quiet(if self.chat_ui.cleanup_unresolved() {
+                            "Dismiss history"
+                        } else {
+                            "Dismiss all"
+                        })
+                        .id(widget::Id::new(NOTICES_DISMISS_ALL_ID))
+                        .name(if self.chat_ui.cleanup_unresolved() {
+                            "Dismiss recorded notices; conversation cleanup stays available"
+                        } else {
+                            "Dismiss every application notice"
+                        })
+                        .on_press(Message::DismissAllNotices)
+                        .into(),
                     );
                 }
                 heading_children.push(command(
