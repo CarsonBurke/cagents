@@ -854,6 +854,10 @@ fn quarantined_write_line<'a>(
             || "Window layout and panes (one pane was refused)".to_owned(),
             |title| format!("Window layout and panes (pane “{title}” was refused)"),
         ),
+        WriteSubject::Pane { card } => card_title(*card).map_or_else(
+            || "Latest changes to a pane".to_owned(),
+            |title| format!("Latest changes to pane “{title}”"),
+        ),
         WriteSubject::CardIdentity {
             card,
             kind: ReplacedIdentity::Terminal,
@@ -883,7 +887,9 @@ fn quarantined_write_line<'a>(
     // itself, so name the remedy the generic guidance only implies.
     if matches!(
         write.subject,
-        WriteSubject::CardIdentity { .. } | WriteSubject::Workspace { card: Some(_) }
+        WriteSubject::CardIdentity { .. }
+            | WriteSubject::Workspace { card: Some(_) }
+            | WriteSubject::Pane { .. }
     ) {
         line.push_str(" · closing the pane clears it");
     }
@@ -7645,6 +7651,11 @@ impl Cagents {
     /// conversation, so the replacement is recorded explicitly, together with
     /// the snapshot that shows it, the way a terminal relaunch records its new
     /// identity.
+    ///
+    /// The new conversation is published to the card's shared view as well,
+    /// like any other edit to it. Otherwise the next projection of that view
+    /// would put the earlier conversation back, and every later snapshot
+    /// would be refused for differing from the replacement storage holds.
     fn replace_chat_conversation(&mut self, card: CardId, session: crate::chat::Session) {
         let expected = match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(current)) if current != &session => current.id,
@@ -7654,6 +7665,7 @@ impl Cagents {
             return;
         }
         self.snapshot_workspace_scope();
+        self.publish_view_changes();
         let saved = self.persistent_workspace();
         if let Some(writer) = &self.session {
             writer.replace_chat_identity(card, expected, session, saved);
@@ -20200,6 +20212,16 @@ mod tests {
         assert!(line.contains("closing the pane clears it"), "{line}");
         let line = quarantined_write_line(&snapshot, &untitled);
         assert!(line.contains("(one pane was refused)"), "{line}");
+
+        let pane = write(WriteSubject::Pane { card });
+        let line = quarantined_write_line(&pane, &titled);
+        assert!(
+            line.starts_with("Latest changes to pane “build” —"),
+            "{line}"
+        );
+        assert!(line.contains("closing the pane clears it"), "{line}");
+        let line = quarantined_write_line(&pane, &untitled);
+        assert!(line.starts_with("Latest changes to a pane —"), "{line}");
 
         let relaunch = write(WriteSubject::CardIdentity {
             card,
