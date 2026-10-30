@@ -404,7 +404,7 @@ fn run(options: Options<'_>, failure_screen_owned: bool) -> Result<(), Box<dyn s
                 min_size: Some(iced::Size::new(900.0, 600.0)),
                 decorations: false,
                 transparent: true,
-                resize_border: 8,
+                resize_border: cagents::design::WINDOW_RESIZE_BORDER as u32,
                 exit_on_close_request: false,
                 // The startup task runs alongside window creation. Supply the
                 // icon here so no update can be dropped before the window opens.
