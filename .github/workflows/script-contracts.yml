@@ -75,6 +75,9 @@ jobs:
           CHECK_FORMAT_CARGO_FIXTURE: "1"
         run: python3 tests/check_format.py -v
 
+      - name: Check delivery task preparation contracts
+        run: python3 tests/scripts/test-prepare-delivery-task.py -v
+
       - name: Check shell syntax
         run: |
           sh -n scripts/run-development
