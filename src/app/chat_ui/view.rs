@@ -1218,6 +1218,48 @@ impl Runtime {
             chat::failure::FailureKind::Connection => "Connection interrupted",
             chat::failure::FailureKind::Interrupted => "Interrupted",
         });
+        // A completed turn does not complete its native goal. Keep the two
+        // observations distinct without changing turn activity or admission.
+        if !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+            && working == 0
+            && waiting == 0
+            && let Some((goal_glyph, goal_label)) = self.observed_goal_status()
+        {
+            let last_turn = failure_label.or_else(|| {
+                if self.error.is_some() || snapshot.error.is_some() {
+                    Some("Conversation has an error")
+                } else if snapshot.finished_at.is_some() {
+                    Some(match snapshot.detail.as_str() {
+                        "Turn interrupted" => "Last turn interrupted",
+                        "Turn failed" => "Last turn failed",
+                        _ => "Last turn finished",
+                    })
+                } else {
+                    None
+                }
+            });
+            let mut label = last_turn.map_or_else(
+                || goal_label.to_owned(),
+                |last_turn| format!("{goal_label} · {last_turn}"),
+            );
+            if failed > 0 {
+                label.push_str(&format!(" · {failed} failed"));
+            }
+            return (
+                if failure_label.is_some()
+                    || self.error.is_some()
+                    || snapshot.error.is_some()
+                    || failed > 0
+                {
+                    Some(Icon::Warning)
+                } else {
+                    goal_glyph
+                },
+                label,
+            );
+        }
         let mut parts = Vec::new();
         if let Some(label) = failure_label {
             parts.push(label.to_owned());
@@ -1255,6 +1297,35 @@ impl Runtime {
             }
         }
         (glyph, Self::short_description(label, 100))
+    }
+
+    fn observed_goal_status(&self) -> Option<(Option<Icon>, &'static str)> {
+        use chat::goal::{ReadState, Status, Support};
+        let goal = self.snapshot.goal.as_ref()?;
+        if goal.support == Support::Unsupported {
+            return None;
+        }
+        Some(if goal.pending || self.goal_pending.is_some() {
+            (Some(Icon::AgentWorking), "Goal updating")
+        } else if goal.uncertain
+            || goal.support == Support::Unknown
+            || matches!(goal.read, ReadState::Unknown)
+        {
+            (Some(Icon::Warning), "Goal unconfirmed")
+        } else {
+            match &goal.read {
+                ReadState::Known(Some(goal)) => match goal.status {
+                    Status::Active => (Some(Icon::AgentWorking), "Goal active"),
+                    Status::Blocked => (Some(Icon::Warning), "Goal blocked"),
+                    Status::UsageLimited => (Some(Icon::Warning), "Goal usage limited"),
+                    Status::BudgetLimited => (Some(Icon::Warning), "Goal budget limited"),
+                    Status::Paused => (None, "Goal paused"),
+                    Status::Complete => (Some(Icon::Check), "Goal complete"),
+                },
+                ReadState::Known(None) => return None,
+                ReadState::Unknown => unreachable!("unknown observations are qualified above"),
+            }
+        })
     }
 
     fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
@@ -2537,14 +2608,21 @@ impl Runtime {
             .height(Length::Fill)
             .into(),
         ];
-        let has_text = self
+        let first_text = self
             .composer
             .lines()
-            .any(|line| !line.text.trim().is_empty());
+            .find(|line| !line.text.trim().is_empty());
+        let has_text = first_text.is_some();
+        let goal_input = first_text.is_some_and(|line| chat::goal::is_command(&line.text));
         let has_draft = has_text || !self.attachments.is_empty();
         // The submit modes the send controls expose, in the order the keyboard
         // reaches them: the first is Ctrl+Enter, the second Ctrl+Shift+Enter.
-        let modes: &[PromptMode] = if snapshot.busy {
+        let modes: &[PromptMode] = if goal_input {
+            // Native Goal controls are independent of turn input. Even while
+            // a turn is active they need Send, including the path that explains
+            // unsupported providers or invalid reserved Goal syntax.
+            &[PromptMode::Send]
+        } else if snapshot.busy {
             match snapshot.capabilities.steer {
                 // A message taken back from the queue goes back the way it
                 // was queued unless the other chord says otherwise.
@@ -2822,6 +2900,14 @@ impl Runtime {
             let (name, tooltip) = submit_control(*mode, slot, enter_sends);
             submissions.push(
                 crate::ui_controls::icon_button(name, tooltip)
+                    .id(card_control_id(
+                        target.card,
+                        match mode {
+                            PromptMode::Send => "chat-submit-send",
+                            PromptMode::Steer => "chat-submit-steer",
+                            PromptMode::Queue => "chat-submit-queue",
+                        },
+                    ))
                     .selected(slot == 0)
                     .tone(crate::design::Tone::Themed(if slot == 0 {
                         design::accent_color
@@ -3030,6 +3116,22 @@ impl Runtime {
             Vec::new()
         };
         let mut footer = status;
+        let goal_panel = self.goal_panel();
+        if self.session.launch.provider == Provider::Codex {
+            footer.push(
+                widget::button::custom(design::caption("Goal"))
+                    .id(card_control_id(target.card, "chat-goal"))
+                    .name("Conversation goal")
+                    .selected(goal_panel.is_some())
+                    .class(crate::ui_controls::control_style(
+                        goal_panel.is_some(),
+                        None,
+                    ))
+                    .padding(CONTROL_PADDING)
+                    .on_press(action(Action::GoalPanel(target, true)))
+                    .into(),
+            );
+        }
         if let Some(notice) = permissions::notice(snapshot) {
             footer.push(
                 widget::button::custom(
@@ -3112,6 +3214,16 @@ impl Runtime {
                 .then(|| self.permissions_view(available, content_width - 32.0)),
             widget::popover::Position::Top,
             action(Action::PermissionPicker(target, false)),
+        );
+        let footer = crate::interaction::composer_popover(
+            footer,
+            goal_panel.map(|panel| {
+                widget::container(widget::scrollable(panel).height(Length::Shrink))
+                    .width((content_width - 32.0).clamp(180.0, 460.0))
+                    .max_height(360.0)
+                    .into()
+            }),
+            action(Action::GoalPanel(target, false)),
         );
         let pane = widget::container(super::layout::pane(
             widget::column::with_children(content.into_iter().enumerate().map(|(index, child)| {

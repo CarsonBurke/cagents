@@ -381,7 +381,18 @@ impl Drop for Holder {
     }
 }
 
-pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
+#[cfg(test)]
+pub(crate) fn spawn(spec: ProcessSpec, source: Session) -> Result<Holder, String> {
+    // Existing holder fixtures model legacy holders with no goal scope. The
+    // production actor supplies its once-captured original tuple explicitly.
+    spawn_with_account_scope(spec, source, None)
+}
+
+pub(crate) fn spawn_with_account_scope(
+    mut spec: ProcessSpec,
+    source: Session,
+    goal_account_scope: Option<crate::account::scope::LaunchAccountScope>,
+) -> Result<Holder, String> {
     std::hint::black_box(&SERVE);
     spec.remove_unset_environment();
     if source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly {
@@ -413,6 +424,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
         execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
             spec.environment.clone(),
         ),
+        goal_account_scope,
     };
     recovery.validate(&crate::daemon::read_boot_id().map_err(|error| error.to_string())?)?;
     let source_proof = retained_source

@@ -3205,6 +3205,7 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
                 None,
                 Default::default(),
                 Some(retry),
+                None,
                 None
             )
             .is_err_and(|error| error

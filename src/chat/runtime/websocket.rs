@@ -296,6 +296,7 @@ impl Actor {
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
         loop {
+            self.expire_adapter()?;
             if self.stop.load(Ordering::Acquire)
                 && self
                     .native_holder
@@ -320,6 +321,7 @@ impl Actor {
                 && !flushing
             {
                 if busy && !interrupt_sent {
+                    self.refresh_goal_resume_admission();
                     match self.adapter.command(Command::Interrupt) {
                         Ok(step) => {
                             self.step(step)?;
@@ -386,6 +388,7 @@ impl Actor {
                         let frame = serde_json::from_str(&text).map_err(|error| {
                             format!("Codex WebSocket text is not JSON: {error}")
                         })?;
+                        self.refresh_goal_resume_admission();
                         let step = self.adapter.receive(frame)?;
                         self.provider_step(step)?;
                         read_again = true;
@@ -462,6 +465,8 @@ impl Actor {
             } else {
                 -1
             };
+            let timeout =
+                super::adapter_poll_timeout(timeout, self.adapter.next_deadline(), Instant::now());
             poll(&socket.get_ref().socket, &mut self.wake, flushing, timeout)?;
         }
     }
