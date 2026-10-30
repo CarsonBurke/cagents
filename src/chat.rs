@@ -263,6 +263,212 @@ impl Launch {
     }
 }
 
+/// Explicit launch intent for an unstarted draft. Absence means the provider's
+/// configured default, including for older recipes; it never means a receiving
+/// window's remembered model. This is local parsing state, not a wire field.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct DraftModelChoice {
+    pub model: Option<String>,
+    pub reasoning: Option<String>,
+}
+
+/// Read only verified option slots. Values which happen to spell option names
+/// remain values, and everything after `--` remains opaque positional data.
+fn draft_model_arguments(
+    provider: Provider,
+    recipe: &LaunchRecipe,
+) -> Result<(DraftModelChoice, Vec<String>, usize), String> {
+    let refusal = || {
+        "These saved launch options cannot safely change model or effort. Start a new draft with the desired options.".to_owned()
+    };
+    if recipe.arguments.len() > 128
+        || recipe.arguments.iter().map(String::len).sum::<usize>() > 64 * 1024
+    {
+        return Err(refusal());
+    }
+    let mut choice = DraftModelChoice::default();
+    let mut kept = Vec::new();
+    let mut args = recipe.arguments.iter();
+    while let Some(argument) = args.next() {
+        if argument == "--" {
+            let boundary = kept.len();
+            kept.push(argument.clone());
+            kept.extend(args.cloned());
+            return Ok((choice, kept, boundary));
+        }
+        let (flag, inline) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(flag, value)| {
+                (flag, Some(value))
+            });
+        let model = flag == "--model" || (provider == Provider::Codex && flag == "-m");
+        let effort = match provider {
+            Provider::Claude => flag == "--effort",
+            Provider::Omp => flag == "--thinking",
+            Provider::Codex => matches!(flag, "-c" | "--config"),
+        };
+        if model || effort {
+            let value = inline
+                .or_else(|| args.next().map(String::as_str))
+                .ok_or_else(refusal)?;
+            let value = if effort && provider == Provider::Codex {
+                let value = value
+                    .strip_prefix("model_reasoning_effort=")
+                    .ok_or_else(refusal)?;
+                value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or(value)
+            } else {
+                value
+            };
+            if value.is_empty()
+                || value.starts_with('-')
+                || value.chars().any(char::is_control)
+                || (effort && !crate::agent_execution::valid_reasoning_effort(value))
+                || (model
+                    && provider == Provider::Omp
+                    && !value
+                        .split_once('/')
+                        .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty()))
+            {
+                return Err(refusal());
+            }
+            let slot = if model {
+                &mut choice.model
+            } else {
+                &mut choice.reasoning
+            };
+            // Duplicate settings have provider-dependent precedence. Do not
+            // claim one is effective or discard a contradictory old setting.
+            if slot.replace(value.to_owned()).is_some() {
+                return Err(refusal());
+            }
+            continue;
+        }
+        let opaque_choice = match provider {
+            Provider::Claude => matches!(
+                flag,
+                "--agent" | "--settings" | "--setting-sources" | "--fallback-model"
+            ),
+            Provider::Codex => matches!(flag, "--profile" | "-p"),
+            Provider::Omp => matches!(
+                flag,
+                "--provider"
+                    | "--profile"
+                    | "--config"
+                    | "--smol"
+                    | "--slow"
+                    | "--plan"
+                    | "--models"
+                    | "--extension"
+                    | "-e"
+                    | "--hook"
+                    | "--plugin-dir"
+            ),
+        };
+        if opaque_choice {
+            return Err(refusal());
+        }
+        let value_option = provider.is_value_option(flag)
+            || provider.is_cwd_option(flag)
+            || provider.is_identity_option(flag)
+            || (provider == Provider::Claude
+                && matches!(
+                    flag,
+                    "--input-format"
+                        | "--output-format"
+                        | "--permission-prompt-tool"
+                        | "--system-prompt"
+                        | "--append-system-prompt"
+                        | "--max-turns"
+                        | "--max-budget-usd"
+                ));
+        let switch = provider.is_switch(flag)
+            || (provider == Provider::Claude
+                && matches!(
+                    flag,
+                    "--print"
+                        | "-p"
+                        | "--verbose"
+                        | "--include-partial-messages"
+                        | "--replay-user-messages"
+                        | "--chrome"
+                        | "--strict-mcp-config"
+                        | "--disable-slash-commands"
+                        | "--allow-dangerously-skip-permissions"
+                ))
+            || (provider == Provider::Codex && flag == "--yolo");
+        if value_option {
+            kept.push(argument.clone());
+            if inline.is_none() {
+                kept.push(args.next().ok_or_else(refusal)?.clone());
+            }
+        } else if switch && inline.is_none() {
+            kept.push(argument.clone());
+        } else {
+            // Unknown arity and positional commands cannot establish which
+            // later tokens are options. Preserve the whole recipe on refusal.
+            return Err(refusal());
+        }
+    }
+    let boundary = kept.len();
+    Ok((choice, kept, boundary))
+}
+
+pub(crate) fn draft_model_choice(
+    provider: Provider,
+    recipe: &LaunchRecipe,
+) -> Result<DraftModelChoice, String> {
+    draft_model_arguments(provider, recipe).map(|(choice, _, _)| choice)
+}
+
+/// Replace the atomic model/effort pair without changing any other argument,
+/// environment, account, executable or working directory. `None/None` removes
+/// explicit overrides; literal OMP `auto` remains a real effort token.
+pub(crate) fn set_draft_model_choice(
+    provider: Provider,
+    recipe: &mut LaunchRecipe,
+    choice: &DraftModelChoice,
+) -> Result<(), String> {
+    let (_, mut arguments, boundary) = draft_model_arguments(provider, recipe)?;
+    if choice.model.as_ref().is_some_and(|model| {
+        model.is_empty()
+            || model.starts_with('-')
+            || model.chars().any(char::is_control)
+            || (provider == Provider::Omp
+                && !model
+                    .split_once('/')
+                    .is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty()))
+    }) || choice
+        .reasoning
+        .as_ref()
+        .is_some_and(|effort| !crate::agent_execution::valid_reasoning_effort(effort))
+    {
+        return Err("Choose a valid model and effort before changing this draft.".into());
+    }
+    let mut selected = Vec::new();
+    if let Some(model) = &choice.model {
+        selected.extend(["--model".into(), model.clone()]);
+    }
+    if let Some(effort) = &choice.reasoning {
+        selected.extend(match provider {
+            Provider::Claude => ["--effort".into(), effort.clone()],
+            Provider::Omp => ["--thinking".into(), effort.clone()],
+            Provider::Codex => [
+                "--config".into(),
+                format!("model_reasoning_effort={effort}"),
+            ],
+        });
+    }
+    arguments.splice(boundary..boundary, selected);
+    if arguments.len() > 128 || arguments.iter().map(String::len).sum::<usize>() > 64 * 1024 {
+        return Err("The selected model exceeds the launch argument limit.".into());
+    }
+    recipe.arguments = arguments;
+    Ok(())
+}
+
 pub(crate) fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bool {
     if !matches!(
         mode,
@@ -2702,6 +2908,203 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn draft_model_choices_round_trip_defaults_and_literal_omp_auto() {
+        for provider in Provider::ALL {
+            let mut recipe = LaunchRecipe {
+                program: provider.executable().into(),
+                arguments: vec![],
+                working_directory: "/project".into(),
+                environment: [("KEEP".into(), "value".into())].into(),
+                unset_environment: ["REMOVE".into()].into(),
+            };
+            let original = recipe.clone();
+            assert_eq!(
+                draft_model_choice(provider, &recipe).unwrap(),
+                DraftModelChoice::default()
+            );
+            let explicit = DraftModelChoice {
+                model: Some(
+                    if provider == Provider::Omp {
+                        "fixture/model"
+                    } else {
+                        "fixture-model"
+                    }
+                    .into(),
+                ),
+                reasoning: Some(
+                    if provider == Provider::Omp {
+                        "auto"
+                    } else {
+                        "high"
+                    }
+                    .into(),
+                ),
+            };
+            set_draft_model_choice(provider, &mut recipe, &explicit).unwrap();
+            assert_eq!(draft_model_choice(provider, &recipe).unwrap(), explicit);
+            assert_eq!(recipe.environment, original.environment);
+            assert_eq!(recipe.unset_environment, original.unset_environment);
+            assert_eq!(recipe.program, original.program);
+            assert_eq!(recipe.working_directory, original.working_directory);
+            set_draft_model_choice(provider, &mut recipe, &DraftModelChoice::default()).unwrap();
+            assert_eq!(recipe, original, "default removes both explicit settings");
+            let effort_only = DraftModelChoice {
+                model: None,
+                reasoning: explicit.reasoning.clone(),
+            };
+            set_draft_model_choice(provider, &mut recipe, &effort_only).unwrap();
+            assert_eq!(
+                draft_model_choice(provider, &recipe).unwrap(),
+                effort_only,
+                "saved default-model plus explicit effort stays distinct"
+            );
+            set_draft_model_choice(provider, &mut recipe, &DraftModelChoice::default()).unwrap();
+            assert_eq!(recipe, original);
+        }
+    }
+
+    #[test]
+    fn draft_model_rewrite_preserves_option_values_and_end_of_options() {
+        let mut recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: [
+                "--system-prompt",
+                "--model",
+                "--model=sonnet",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "plan",
+                "--",
+                "--model",
+                "opaque prompt",
+                "--effort=low",
+            ]
+            .map(String::from)
+            .into(),
+            working_directory: "/project".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        assert_eq!(
+            draft_model_choice(Provider::Claude, &recipe).unwrap(),
+            DraftModelChoice {
+                model: Some("sonnet".into()),
+                reasoning: Some("high".into())
+            }
+        );
+        set_draft_model_choice(
+            Provider::Claude,
+            &mut recipe,
+            &DraftModelChoice {
+                model: Some("opus".into()),
+                reasoning: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            recipe.arguments,
+            [
+                "--system-prompt",
+                "--model",
+                "--permission-mode",
+                "plan",
+                "--model",
+                "opus",
+                "--",
+                "--model",
+                "opaque prompt",
+                "--effort=low"
+            ]
+        );
+        let mut codex = recipe.clone();
+        codex.arguments = [
+            "--remote",
+            "unix://",
+            "-m",
+            "gpt-a",
+            "-c",
+            "model_reasoning_effort=\"xhigh\"",
+        ]
+        .map(String::from)
+        .into();
+        assert_eq!(
+            draft_model_choice(Provider::Codex, &codex).unwrap(),
+            DraftModelChoice {
+                model: Some("gpt-a".into()),
+                reasoning: Some("xhigh".into())
+            }
+        );
+        set_draft_model_choice(
+            Provider::Codex,
+            &mut codex,
+            &DraftModelChoice {
+                model: Some("gpt-b".into()),
+                reasoning: Some("low".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            codex.arguments,
+            [
+                "--remote",
+                "unix://",
+                "--model",
+                "gpt-b",
+                "--config",
+                "model_reasoning_effort=low"
+            ]
+        );
+    }
+
+    #[test]
+    fn draft_model_choice_refuses_ambiguous_options_without_rewriting_source() {
+        for (provider, arguments) in [
+            (Provider::Claude, vec!["--model", "a", "--model=b"]),
+            (Provider::Claude, vec!["--effort=high", "--effort", "low"]),
+            (
+                Provider::Claude,
+                vec!["--settings", "{\"model\":\"other\"}"],
+            ),
+            (Provider::Claude, vec!["--agent", "opaque"]),
+            (Provider::Claude, vec!["--model"]),
+            (
+                Provider::Claude,
+                vec!["--unknown-arity", "--model", "opaque"],
+            ),
+            (
+                Provider::Codex,
+                vec!["--config", "model_reasoning_effort_extra=high"],
+            ),
+            (Provider::Codex, vec!["--config", "model=other"]),
+            (Provider::Codex, vec!["--profile", "other"]),
+            (
+                Provider::Omp,
+                vec!["--provider", "other", "--model", "fixture/model"],
+            ),
+            (Provider::Omp, vec!["--profile", "other"]),
+            (Provider::Omp, vec!["--config", "other"]),
+            (Provider::Omp, vec!["--smol", "other"]),
+            (Provider::Omp, vec!["--model", "unqualified"]),
+        ] {
+            let mut recipe = LaunchRecipe {
+                program: provider.executable().into(),
+                arguments: arguments.into_iter().map(String::from).collect(),
+                working_directory: "/project".into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            };
+            let before = recipe.clone();
+            assert!(draft_model_choice(provider, &recipe).is_err());
+            assert!(
+                set_draft_model_choice(provider, &mut recipe, &DraftModelChoice::default())
+                    .is_err()
+            );
+            assert_eq!(recipe, before);
+        }
+    }
 
     #[test]
     fn delivery_headings_name_the_sender_before_any_summary() {

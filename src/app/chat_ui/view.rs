@@ -3403,34 +3403,35 @@ impl Runtime {
                 controls.push(self.model_picker(label, offers, shortcuts));
             }
         }
+        let reasoning_model = snapshot
+            .models
+            .iter()
+            .find(|model| Some(&model.id) == snapshot.selected_model.as_ref());
         if snapshot.capabilities.reasoning_selection
-            && let Some(model) = snapshot
-                .models
-                .iter()
-                .find(|model| Some(&model.id) == snapshot.selected_model.as_ref())
+            && let Some(model) = reasoning_model
             && !model.reasoning.is_empty()
         {
             let selected = model
                 .reasoning
                 .iter()
                 .position(|reasoning| Some(reasoning) == snapshot.reasoning.as_ref());
+            let label: Cow<'a, str> = match snapshot.reasoning.as_deref() {
+                Some(effort) if draft && selected.is_none() => {
+                    format!("Saved effort: {effort} (not listed)").into()
+                }
+                Some(effort) if selected.is_some() => effort.into(),
+                _ => "Reasoning".into(),
+            };
             if transitioning {
-                controls.push(
-                    design::caption(
-                        selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
-                    )
-                    .into(),
-                );
+                controls.push(design::caption(label).into());
             } else {
                 let open = self.reasoning_picker;
-                let anchor = widget::button::custom(design::caption(
-                    selected.map_or("Reasoning", |index| model.reasoning[index].as_str()),
-                ))
-                .name("Choose reasoning effort")
-                .id(card_control_id(target.card, "chat-reasoning-picker"))
-                .class(crate::ui_controls::control_style(open, None))
-                .padding(CONTROL_PADDING)
-                .on_press(action(Action::ReasoningPicker(target, !open)));
+                let anchor = widget::button::custom(design::caption(label))
+                    .name("Choose reasoning effort")
+                    .id(card_control_id(target.card, "chat-reasoning-picker"))
+                    .class(crate::ui_controls::control_style(open, None))
+                    .padding(CONTROL_PADDING)
+                    .on_press(action(Action::ReasoningPicker(target, !open)));
                 let choices = open.then(|| {
                     widget::column::with_children(
                         model
@@ -3468,6 +3469,17 @@ impl Runtime {
                     action(Action::ReasoningPicker(target, false)),
                 ));
             }
+        } else if draft && let Some(effort) = snapshot.reasoning.as_deref() {
+            // A receiver may not have this model's catalog yet. Keep the
+            // saved intent visible without fabricating any offered choices.
+            let label = if reasoning_model
+                .is_some_and(|model| !model.reasoning.iter().any(|offered| offered == effort))
+            {
+                format!("Saved effort: {effort} (not listed)")
+            } else {
+                format!("Saved effort: {effort}")
+            };
+            controls.push(design::caption(label).into());
         }
         if !snapshot.capabilities.permission_modes.is_empty() {
             let modes = &snapshot.capabilities.permission_modes;
@@ -10293,6 +10305,112 @@ mod tests {
             assert!(
                 field.x + field.width <= (width + column) / 2.0 - step::GAP_M,
                 "width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn saved_draft_effort_stays_visible_without_inventing_catalog_choices() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _id: Option<&widget::Id>, _bounds: Rectangle, text: &str) {
+                self.0.push(text.into());
+            }
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for (models, model, expected, editable) in [
+            (vec![], Some("saved-model"), "Saved effort: high", false),
+            (vec![], None, "Saved effort: high", false),
+            (
+                vec![chat::Model {
+                    id: "saved-model".into(),
+                    label: "Saved model".into(),
+                    reasoning: vec!["low".into()],
+                }],
+                Some("saved-model"),
+                "Saved effort: high (not listed)",
+                true,
+            ),
+            (
+                vec![chat::Model {
+                    id: "saved-model".into(),
+                    label: "Saved model".into(),
+                    reasoning: vec!["high".into()],
+                }],
+                Some("saved-model"),
+                "high",
+                true,
+            ),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Codex, Some("/workspace/chat-fixture".into())));
+            let card = app.workspace.focused().unwrap();
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                panic!("draft");
+            };
+            let mut session = runtime.session.clone();
+            chat::set_draft_model_choice(
+                Provider::Codex,
+                &mut session.launch.recipe,
+                &chat::DraftModelChoice {
+                    model: model.map(str::to_owned),
+                    reasoning: Some("high".into()),
+                },
+            )
+            .unwrap();
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(session.clone());
+            drop(app.observe_listed_models(Provider::Codex, models));
+            drop(app.open_chat_draft(card, session.clone()));
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                panic!("restored draft");
+            };
+            assert_eq!(runtime.session, session);
+            assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("high"));
+            let mut element: Element<'_, Message> = widget::row::with_children(
+                runtime.session_controls(false, None, vec![], &shortcuts),
+            )
+            .into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(450.0, 300.0)),
+            );
+            let mut texts = Texts::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+            assert!(
+                texts.0.iter().any(|text| text == expected),
+                "actual widget text: {:?}",
+                texts.0
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let reasoning_picker =
+                accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| {
+                        node.node().role() == iced_accessibility::accesskit::Role::Button
+                            && node.node().label() == Some("Choose reasoning effort")
+                    });
+            assert_eq!(
+                reasoning_picker, editable,
+                "no fabricated choices without a catalog"
             );
         }
     }
