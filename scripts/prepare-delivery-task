@@ -9,6 +9,7 @@ Then run:
 Brief fields: pr, url, source_head (full SHA), source_reference, delivery_owner,
 worker, reviewer, task, scope (list), interaction (false or {flow, before, after,
 preserve: [essential controls]}), next_gate ({kind, action, owner}). Optional:
+activity (implementation by default, or independent-review for read-only work),
 dependencies, limits, outcomes, and next_gate.capacity ({head, owner, status,
 reference}). For a new extraction, set extraction_from to the captured donor
 head and working_base to the actual main SHA; donor evidence stays historical.
@@ -76,7 +77,9 @@ def read_json(path):
 
 def prepare(pr, brief):
     fields(brief, "pr url source_head source_reference delivery_owner worker reviewer task scope "
-           "interaction next_gate dependencies limits outcomes extraction_from working_base".split(), "brief")
+           "interaction next_gate dependencies limits outcomes extraction_from working_base activity".split(), "brief")
+    activity = brief.get("activity", "implementation")
+    require(activity in ("implementation", "independent-review"), "unknown activity")
     require(isinstance(pr, dict), "PR capture must be a gh pr view JSON object")
     require(type(brief["pr"]) is int and brief["pr"] > 0 and
             type(pr["number"]) is int and brief["pr"] == pr["number"], "PR number mismatch")
@@ -98,7 +101,8 @@ def prepare(pr, brief):
                 "different working_base needs explicit extraction_from")
 
     names = {k: text(brief[k], k) for k in ("worker", "delivery_owner", "reviewer")}
-    require(names["worker"] != names["reviewer"], "worker and independent reviewer must be different")
+    require(activity == "independent-review" or names["worker"] != names["reviewer"],
+            "worker and independent reviewer must be different")
     task = phrase(brief["task"], "task")
     scope = strings(brief["scope"], "scope", True)
     dependencies = strings(brief.get("dependencies", []), "dependencies")
@@ -156,6 +160,10 @@ def prepare(pr, brief):
     lines = [f"Task for {names['worker']} — {url}",
              f"Accountable delivery owner: {names['delivery_owner']}; independent reviewer: {names['reviewer']}.",
              f"Captured public source: {head} ({source_ref})."]
+    if activity == "independent-review":
+        lines.append("Activity: read-only independent review. Review only; no product/module edits or implementation. "
+                     "The worker may be the named delivery reviewer. Report findings on the captured source and flow; "
+                     "do not approve your own source or claim delivery readiness.")
     if extraction:
         lines += [f"New extraction working base: {working_base}; donor: {head}.",
                   "This assignment concerns a bounded extraction; do not edit or qualify the entire donor PR. "
@@ -213,19 +221,26 @@ def prepare(pr, brief):
         lines += ["Evidence limits: " + "; ".join(limits)]
     lines += ["", f"Next gate: {gate['kind']} — {gate['action']} (owner: {gate['owner']})."]
     if gate["kind"] == "source":
-        lines.append("Source work may proceed in the owned boundary. No execution is planned by this assignment; "
+        source_action = ("Read-only source review may proceed; no product/module edits. "
+                         if activity == "independent-review" else "Source work may proceed in the owned boundary. ")
+        lines.append(source_action + "No execution is planned by this assignment; "
                      "no capacity grant is created or required for that source work.")
     elif capacity is None or capacity["status"] != "granted":
         state = "not supplied" if capacity is None else capacity["status"] + " at " + capacity["reference"]
+        source_action = ("Continue read-only source review; no product/module edits" if activity == "independent-review"
+                         else "Continue useful source preparation")
         lines.append("Execution BLOCKED: accepted completion capacity is " + state +
-                     ". Continue useful source preparation; the delivery owner must obtain the actual allocation.")
+                     ". " + source_action + "; the delivery owner must obtain the actual allocation.")
     else:
         lines.append("Captured capacity is GRANTED at " + capacity["reference"] +
                      ". Verify the original allocation and its limits before using it. GRANTED is not execution; "
                      "this preparation records no running job or result.")
+    returned_scope = ("Return the exact reviewed head, concrete findings, affected flow and evidence limits; "
+                      if activity == "independent-review" else
+                      "Return the exact delivered head, changed scope, original command exits/results and evidence links; ")
     lines += ["Compilation, tests, native interaction and merge are not authorized by this prompt alone. "
               "Use only the actual separately accepted allocation/authority for each required operation.",
-              "Return the exact delivered head, changed scope, original command exits/results and evidence links; "
+              returned_scope +
               "identify queued, unrun, failed and superseded work. Do not turn source approval, plans, worker/token "
               "counts or child subcases into feature readiness. The delivery owner retains review, qualification, "
               "merge and the requested release/install outcome."]
