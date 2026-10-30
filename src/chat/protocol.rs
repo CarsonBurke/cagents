@@ -1,7 +1,9 @@
 //! Provider JSON protocols used by daemon-owned pipe and Unix WebSocket transports.
+mod tool_cache;
 use super::{Command, Event, Launch};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
+pub(crate) use tool_cache::{ItemKey as CanonicalItemKey, ItemReader as CanonicalItemReader};
 
 pub mod claude;
 mod claude_edits;
@@ -332,6 +334,10 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Optional bodies are backed only by this exact Store, never a presentation page.
+    fn bind_item_reader(&mut self, _reader: std::sync::Arc<dyn CanonicalItemReader>) {}
+    /// The decoder has finished this Step; same-frame copies can now be released.
+    fn committed(&mut self) {}
     /// Private launch selection, distinct from a provider-confirmed session.
     /// Only a provider with a retained bootstrap contract supplies this value.
     fn prepared_launch_identity(&self) -> Option<claude::PreparedIdentity> {

@@ -349,7 +349,7 @@ impl LocalHandle {
 
     fn start_with_scope(
         mut spec: ProcessSpec,
-        adapter: Box<dyn Adapter>,
+        mut adapter: Box<dyn Adapter>,
         initial: Step,
         store: Store,
         session_id: Option<String>,
@@ -427,6 +427,7 @@ impl LocalHandle {
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
+        adapter.bind_item_reader(store::adapter_item_reader(&store));
         let confirmed_session = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
@@ -2710,6 +2711,7 @@ impl Actor {
         // Stop further Store writes, then report the original error after
         // this bounded frame's semantic proof has been published.
         let mut frame_error = None;
+        let mut source_reset = false;
         for event in step.events {
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
@@ -2762,6 +2764,7 @@ impl Actor {
                     | Event::Session { .. }
             )
             .then(|| event.clone());
+            let reset = matches!(&event, Event::Reset { .. });
             let events = if frame_error.is_some() {
                 None
             } else {
@@ -2771,7 +2774,10 @@ impl Actor {
                     .unwrap_or_else(|p| p.into_inner())
                     .apply(event)
                 {
-                    Ok(events) => Some(events),
+                    Ok(events) => {
+                        source_reset |= reset;
+                        Some(events)
+                    }
                     Err(error) => {
                         frame_error = Some(error);
                         None
@@ -2825,6 +2831,13 @@ impl Actor {
                 frame_error.get_or_insert(message);
             }
         }
+        if source_reset {
+            self.adapter
+                .bind_item_reader(store::adapter_item_reader(&self.store));
+        }
+        // Optional copies are released after the whole decoded frame. A failed
+        // Store frame still publishes its independent semantic proof below.
+        self.adapter.committed();
         // An outcome is acted on as soon as it is published, and its reader
         // asks which conversation produced it. Answer before announcing.
         if let Some(confirmed) = confirmed {

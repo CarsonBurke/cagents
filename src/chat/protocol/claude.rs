@@ -428,7 +428,12 @@ struct Claude {
     carrier_order: VecDeque<String>,
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
-    tools: HashMap<ScopedId, Item>,
+    tools: super::tool_cache::ToolCache,
+    item_reader: Option<std::sync::Arc<dyn super::CanonicalItemReader>>,
+    /// Count-bounded lifecycle facts outlive optional body copies.
+    tool_status: HashMap<ScopedId, (ToolStatus, bool)>,
+    /// Represented task rows have canonical source but no visible parent item.
+    hidden_task_rows: HashSet<String>,
     /// Synthetic task rows shown before their Agent tool is known. Bounded by
     /// the same cache as task tools, so late correlation can retract one row.
     visible_task_rows: HashSet<String>,
@@ -621,10 +626,19 @@ impl Claude {
     }
     fn tool(&mut self, parent: Option<&str>, item: Item) {
         let key = ScopedId::new(parent, &item.id);
-        if !self.tools.contains_key(&key) {
+        if !self.tool_order.contains(&key) {
             self.tool_order.push_back(key.clone());
         }
-        self.tools.insert(key, item);
+        if let Some(status) = item.content.status() {
+            self.tool_status.insert(
+                key.clone(),
+                (status, matches!(item.content, ItemContent::Tool { .. })),
+            );
+        }
+        if key.parent.is_none() {
+            self.hidden_task_rows.remove(&item.id);
+        }
+        self.tools.insert(parent, item);
         while self.tool_order.len() > MAX_TOOLS {
             if let Some(key) = self.tool_order.pop_front() {
                 self.forget_tool(&key);
@@ -632,40 +646,128 @@ impl Claude {
         }
     }
     fn forget_tool(&mut self, key: &ScopedId) {
-        self.tools.remove(key);
+        self.tools.remove(key.parent.as_deref(), &key.id);
+        self.tool_status.remove(key);
         self.edit_tools.remove(key);
         self.tool_inputs.remove(key);
         self.tool_input_order.retain(|known| known != key);
         if key.parent.is_none() {
+            self.hidden_task_rows.remove(&key.id);
             self.visible_task_rows.remove(&key.id);
         }
     }
     fn completed_tool(&self, parent: Option<&str>, id: &str) -> bool {
-        self.tools
+        self.tool_status
             .get(&ScopedId::new(parent, id))
-            .is_some_and(|old| {
-                old.content
-                    .status()
-                    .is_some_and(|status| status != ToolStatus::Running)
-            })
+            .is_some_and(|(status, _)| *status != ToolStatus::Running)
     }
-    fn task_rows_for_agent(&mut self, parent: Option<&str>, tool: &str) -> Vec<String> {
+    fn cached_tool(&self, parent: Option<&str>, id: &str) -> Result<Option<Item>, String> {
+        let key = super::CanonicalItemKey::new(parent, id);
+        let hidden = key.agent_id.is_none() && self.hidden_task_rows.contains(id);
+        let mut item = if let Some(item) = self.tools.get(parent, id) {
+            if let Some(reader) = &self.item_reader {
+                if self.tools.pending(parent, id) {
+                    reader.validate_key(&key)?;
+                } else if hidden {
+                    let canonical = reader
+                        .read_hidden_task(id)?
+                        .ok_or("Original task description is unavailable")?;
+                    if canonical.id != item.id
+                        || canonical.role != item.role
+                        || canonical.content != item.content
+                    {
+                        return Err("Hidden task source no longer matches its cached record".into());
+                    }
+                } else {
+                    reader.validate_cached_item(&key, item)?;
+                }
+            }
+            Some(item.clone())
+        } else if let Some(reader) = &self.item_reader {
+            if hidden {
+                reader.read_hidden_task(id)?
+            } else {
+                reader.read(&key)?
+            }
+        } else {
+            None
+        };
+        if item.is_none() && self.tool_order.contains(&ScopedId::new(parent, id)) {
+            return Err(
+                "Original tool source is unavailable; its stored call was preserved".into(),
+            );
+        }
+        if let Some(item) = &mut item {
+            if item.id != id {
+                return Err("Original tool source identity changed".into());
+            }
+            if let Some((known, _)) = self.tool_status.get(&ScopedId::new(parent, id)) {
+                match &mut item.content {
+                    ItemContent::Tool { status, .. }
+                    | ItemContent::Command { status, .. }
+                    | ItemContent::Changes { status, .. } => *status = *known,
+                    _ => {}
+                }
+            }
+        }
+        Ok(item)
+    }
+    fn task_rows_for_agent(
+        &mut self,
+        parent: Option<&str>,
+        tool: &str,
+        step: &mut Step,
+    ) -> Vec<String> {
         let incoming = ScopedId::new(parent, tool);
         if self
-            .tools
-            .keys()
+            .tool_order
+            .iter()
             .any(|known| known.id == tool && known.parent != incoming.parent)
         {
             // Task notifications carry no transcript. Keep their fallback row
             // while more than one scope could own the reported tool ID.
             return Vec::new();
         }
-        self.agent_task_calls
+        let candidates: Vec<_> = self
+            .agent_task_calls
             .iter()
             .filter(|(known, _)| known == tool)
             .map(|(_, task)| format!("claude-task:{task}"))
-            .filter(|id| self.visible_task_rows.remove(id))
-            .collect()
+            .filter(|id| self.visible_task_rows.contains(id))
+            .collect();
+        let mut removed = Vec::new();
+        for id in candidates {
+            // ItemsRemoved deletes the visible canonical row. Preserve its
+            // authenticated lifecycle source before publishing that removal.
+            let retained = self.cached_tool(None, &id).and_then(|item| {
+                let item = item.ok_or("Original task description is unavailable")?;
+                if let Some(reader) = &self.item_reader {
+                    let mut live: Vec<_> = self
+                        .hidden_task_rows
+                        .iter()
+                        .filter(|id| id.len() <= 4096)
+                        .cloned()
+                        .collect();
+                    if !live.contains(&id) {
+                        live.push(id.clone());
+                    }
+                    reader.retain_hidden_task(&item, &live)?;
+                }
+                Ok(())
+            });
+            match retained {
+                Ok(()) => {
+                    self.hidden_task_rows.insert(id.clone());
+                    self.visible_task_rows.remove(&id);
+                    removed.push(id);
+                }
+                Err(message) => step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                }),
+            }
+        }
+        removed
     }
     fn remember_tool_input(
         &mut self,
@@ -1452,11 +1554,25 @@ impl Claude {
                             at: None,
                         };
                         // Replayed assistant envelopes must not reset a completed tool result.
-                        if !self.completed_tool(child, &item.id) {
+                        let cached = match self.cached_tool(child, &item.id) {
+                            Ok(cached) => cached,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                continue;
+                            }
+                        };
+                        if !cached.as_ref().is_some_and(|old| {
+                            old.content
+                                .status()
+                                .is_some_and(|status| status != ToolStatus::Running)
+                        }) {
                             self.remember_tool_input(child, &tool_id, &block["input"])?;
                             if string(block, "name") == "Agent" {
                                 global_task_removals
-                                    .extend(self.task_rows_for_agent(child, &tool_id));
+                                    .extend(self.task_rows_for_agent(child, &tool_id, step));
                                 let background = child.is_none().then(|| {
                                     block["input"]["run_in_background"].as_bool() == Some(true)
                                 });
@@ -1485,15 +1601,25 @@ impl Claude {
                         } else if history {
                             // Keep the original call position as an overlap
                             // anchor without changing its confirmed outcome.
-                            if let Some(completed) = self.tools.get(&ScopedId::new(child, &tool_id))
-                            {
-                                step.events.push(Event::Item(completed.clone()));
+                            if let Some(completed) = cached {
+                                step.events.push(Event::Item(completed));
                             }
                         }
                     }
                     "tool_result" => {
                         let tool_id = required(block, "tool_use_id")?.to_owned();
-                        let needs_call=self.tools.get(&ScopedId::new(child, &tool_id)).is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
+                        let cached = match self.cached_tool(child, &tool_id) {
+                            Ok(cached) => cached,
+                            Err(_) if correlated_call.is_some() => None,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                continue;
+                            }
+                        };
+                        let needs_call=cached.as_ref().is_none_or(|old|matches!(&old.content,ItemContent::Tool{name,input,..} if name=="Tool"&&input.is_empty()));
                         let recovered = if needs_call {
                             if let Some(call) = correlated_call {
                                 self.remember_tool_input(child, &tool_id, &call["input"])?;
@@ -1518,7 +1644,7 @@ impl Claude {
                                 started_at: None,
                                 at: None,
                             })
-                            .or_else(|| self.tools.get(&ScopedId::new(child, &tool_id)).cloned())
+                            .or(cached)
                             .unwrap_or(Item {
                                 id: tool_id.clone(),
                                 role: Role::Assistant,
@@ -1531,16 +1657,39 @@ impl Claude {
                                 started_at: None,
                                 at: None,
                             });
+                        let failed = block["is_error"].as_bool() == Some(true);
+                        let original_input = if failed {
+                            correlated_call.map(|call| call["input"].to_string())
+                        } else {
+                            None
+                        };
+                        let edit = self
+                            .edit_tools
+                            .get(&ScopedId::new(child, &tool_id))
+                            .map(String::as_str)
+                            .or_else(|| correlated_call.and_then(|call| call["name"].as_str()));
+                        let input = self
+                            .tool_inputs
+                            .get(&ScopedId::new(child, &tool_id))
+                            .map(String::as_str)
+                            .or(original_input.as_deref());
+                        if failed
+                            && (edit.is_none() || input.is_none())
+                            && matches!(item.content, ItemContent::Changes { .. })
+                        {
+                            let message = content_text(&block["content"]);
+                            let message = &message[..message.floor_char_boundary(512)];
+                            step.events.push(Event::Error {
+                                message: format!("Tool failed: {message}. Its exact original invocation is unavailable; the full failed attempted changes were preserved."),
+                                fatal: false,
+                            });
+                        }
                         apply_result(
                             &mut item.content,
                             content_text(&block["content"]),
-                            block["is_error"].as_bool() == Some(true),
-                            self.edit_tools
-                                .get(&ScopedId::new(child, &tool_id))
-                                .map(String::as_str),
-                            self.tool_inputs
-                                .get(&ScopedId::new(child, &tool_id))
-                                .map(String::as_str),
+                            failed,
+                            edit,
+                            input,
                             // The structured result is the frame's, so it is
                             // this block's only when the frame has no other.
                             if content.len() == 1 {
@@ -1860,7 +2009,17 @@ impl Claude {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_adapter() -> Box<dyn Adapter> {
+    Box::new(Claude::default())
+}
 impl Adapter for Claude {
+    fn bind_item_reader(&mut self, reader: std::sync::Arc<dyn super::CanonicalItemReader>) {
+        self.item_reader = Some(reader);
+    }
+    fn committed(&mut self) {
+        self.tools.committed();
+    }
     fn prepared_launch_identity(&self) -> Option<PreparedIdentity> {
         self.prepared_identity.clone()
     }
@@ -2313,6 +2472,8 @@ impl Adapter for Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
+                self.tool_status.clear();
+                self.hidden_task_rows.clear();
                 self.visible_task_rows.clear();
                 self.edit_tools.clear();
                 self.tool_inputs.clear();
@@ -2608,12 +2769,15 @@ impl Adapter for Claude {
                         ToolStatus::Succeeded
                     };
                     self.background_agents.remove(parent);
-                    if let Some(Item {
-                        content: ItemContent::Tool { status: known, .. },
-                        ..
-                    }) = self.tools.get_mut(&ScopedId::new(None, parent))
-                    {
+                    let key = ScopedId::new(None, parent);
+                    if let Some((known, true)) = self.tool_status.get_mut(&key) {
                         *known = status;
+                    }
+                    if let Some(mut item) = self.tools.get(None, parent).cloned() {
+                        if let ItemContent::Tool { status: known, .. } = &mut item.content {
+                            *known = status;
+                            self.tools.insert(None, item);
+                        }
                     }
                     self.tasks.retain(|task| {
                         !self
@@ -3851,10 +4015,11 @@ fn apply_result(
         // An edit that failed changed nothing, and why it failed is the one
         // thing a reader needs: a patch has nowhere to say it, so the step
         // goes back to being the tool call it was, carrying the message.
-        ItemContent::Changes { changes, .. } => {
-            let input = input.map(str::to_owned).unwrap_or_else(|| {
-                json!({"file_path": changes.first().map(|change| change.path.as_str())}).to_string()
-            });
+        ItemContent::Changes { status, .. } if edit.is_none() || input.is_none() => {
+            *status = result;
+        }
+        ItemContent::Changes { .. } => {
+            let input = input.unwrap().to_owned();
             *content = ItemContent::Tool {
                 name: edit.unwrap_or("Edit").into(),
                 input,
@@ -4187,13 +4352,9 @@ impl Claude {
                 };
                 if matches!(&item.content, ItemContent::Tool { .. })
                     && self
-                        .tools
+                        .tool_status
                         .get(&ScopedId::new(Some(&parent), &item.id))
-                        .is_some_and(|old| {
-                            old.content
-                                .status()
-                                .is_some_and(|status| status != ToolStatus::Running)
-                        })
+                        .is_some_and(|(status, _)| *status != ToolStatus::Running)
                 {
                     return Ok(());
                 }
@@ -4274,7 +4435,7 @@ impl Claude {
                             self.edit_tools
                                 .insert(ScopedId::new(Some(&parent), &item.id), name.clone());
                         }
-                        if !matches!(content, ItemContent::Tool { .. }) {
+                        if item.content != content {
                             item.content = content;
                             step.events.push(Event::Item(item.clone()));
                         }
@@ -4420,7 +4581,18 @@ impl Claude {
             "task_started" | "task_progress" | "task_notification" | "task_updated" => {
                 let task = required(frame, "task_id")?;
                 let id = format!("claude-task:{task}");
-                let previous = self.tools.get(&ScopedId::new(None, &id)).cloned();
+                let mut presentation_known = true;
+                let previous = match self.cached_tool(None, &id) {
+                    Ok(previous) => previous,
+                    Err(message) => {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                        presentation_known = false;
+                        None
+                    }
+                };
                 let mut item = previous.unwrap_or(Item {
                     id,
                     role: Role::Assistant,
@@ -4504,18 +4676,35 @@ impl Claude {
                 });
                 // Lifecycle bookkeeping and notification summaries still need
                 // the synthetic tool. Only its duplicate presentation is hidden.
-                let represented = known_tool
+                let represented = if let Some(tool) = known_tool
                     .as_deref()
                     .or_else(|| frame["tool_use_id"].as_str())
-                    .is_some_and(|tool| {
-                        // Task notifications do not identify a transcript. A
-                        // unique nested Agent is valid prior correlation, but
-                        // an opaque ID shared by multiple scopes is ambiguous.
-                        let mut candidates = self.tools.iter().filter(|(key, _)| key.id == tool);
-                        let candidate = candidates.next();
-                        candidate.is_some_and(|(_, item)| matches!(&item.content, ItemContent::Tool { name, .. } if name == "Agent"))
-                            && candidates.next().is_none()
-                    });
+                {
+                    let mut owners = self.tool_order.iter().filter(|key| key.id == tool);
+                    let owner = owners.next().cloned();
+                    if owners.next().is_some() {
+                        presentation_known = false;
+                        false
+                    } else {
+                        let scope = owner.as_ref().and_then(|key| key.parent.as_deref());
+                        match self.cached_tool(scope, tool) {
+                            Ok(Some(item)) => {
+                                matches!(item.content,ItemContent::Tool{name,..} if name=="Agent")
+                            }
+                            Ok(None) => false,
+                            Err(message) => {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                                presentation_known = false;
+                                false
+                            }
+                        }
+                    }
+                } else {
+                    false
+                };
                 if let Some(tool) = &known_tool {
                     if string(frame, "subtype") == "task_started" {
                         self.stopped_agents.retain(|known| known != tool);
@@ -4560,14 +4749,33 @@ impl Claude {
                         background: None,
                     });
                 }
-                self.tool(None, item.clone());
+                if presentation_known {
+                    self.tool(None, item.clone());
+                    if represented {
+                        self.hidden_task_rows.insert(item.id.clone());
+                        if let Some(reader) = &self.item_reader {
+                            let live: Vec<_> = self
+                                .hidden_task_rows
+                                .iter()
+                                .filter(|id| id.len() <= 4096)
+                                .cloned()
+                                .collect();
+                            if let Err(message) = reader.retain_hidden_task(&item, &live) {
+                                step.events.push(Event::Error {
+                                    message,
+                                    fatal: false,
+                                });
+                            }
+                        }
+                    }
+                }
                 if represented {
                     if self.visible_task_rows.remove(&item.id) {
                         step.events.push(Event::ItemsRemoved {
                             ids: vec![item.id.clone()],
                         });
                     }
-                } else {
+                } else if presentation_known {
                     self.visible_task_rows.insert(item.id.clone());
                     step.events.push(Event::Item(item.clone()));
                 }
@@ -5915,6 +6123,750 @@ mod tests {
     use crate::chat::{ChangeKind, FileChange};
     use std::io::Write as _;
 
+    fn commit_tool_fixture(
+        adapter: &mut Claude,
+        store: &std::sync::Arc<std::sync::Mutex<crate::chat::runtime::Store>>,
+        step: Step,
+    ) {
+        for event in step.events {
+            store.lock().unwrap().apply(event).unwrap();
+        }
+        adapter.committed();
+    }
+
+    #[test]
+    fn child_record_budget_refusal_does_not_block_other_child_results() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chat::runtime::Store::new().unwrap(),
+        ));
+        let reader = crate::chat::runtime::Store::adapter_reader_for_test(&store);
+        let mut adapter = Claude::default();
+        adapter.bind_item_reader(reader.clone());
+        for parent in ["one", "two"] {
+            let step = adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{parent}"),
+                    "same",
+                    "Opaque",
+                    json!({"scope":parent}),
+                ))
+                .unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+        }
+        // Fill the real Store through admission, not an injected budget value.
+        // Its 8,192-record bound includes the two calls above. The decoder's
+        // small optional cache still holds both child-scoped calls.
+        for index in 0..8190 {
+            let events = store
+                .lock()
+                .unwrap()
+                .apply(Event::SubagentItem {
+                    id: "filler-child".into(),
+                    item: Item {
+                        id: format!("filler-{index}"),
+                        role: Role::Assistant,
+                        at: None,
+                        started_at: None,
+                        content: ItemContent::Tool {
+                            name: "Opaque".into(),
+                            input: "{}".into(),
+                            output: String::new(),
+                            status: ToolStatus::Running,
+                        },
+                    },
+                })
+                .unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+        }
+        let refused = store
+            .lock()
+            .unwrap()
+            .apply(Event::SubagentItem {
+                id: "refused-child".into(),
+                item: Item {
+                    id: "same".into(),
+                    role: Role::Assistant,
+                    at: None,
+                    started_at: None,
+                    content: ItemContent::Tool {
+                        name: "Opaque".into(),
+                        input: "{}".into(),
+                        output: String::new(),
+                        status: ToolStatus::Running,
+                    },
+                },
+            })
+            .unwrap();
+        assert!(
+            refused
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        for (parent, failed) in [("one", false), ("two", true)] {
+            let output = format!("exact result for {parent}");
+            let expected = ItemContent::Tool {
+                name: "Opaque".into(),
+                input: json!({"scope":parent}).to_string(),
+                output: output.clone(),
+                status: if failed {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Succeeded
+                },
+            };
+            let step = adapter
+                .receive(json!({"type":"user","uuid":format!("result-{parent}"),"parent_tool_use_id":parent,"message":{"content":[{"type":"tool_result","tool_use_id":"same","is_error":failed,"content":output}]}}))
+                .unwrap();
+            assert!(
+                step.events.iter().any(|event| matches!(
+                    event,
+                    Event::SubagentItem { id, item }
+                        if id == parent && item.id == "same" && item.content == expected
+                )),
+                "another child's budget refusal must not discard this result: {:?}",
+                step.events
+            );
+            assert!(
+                !step
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+            commit_tool_fixture(&mut adapter, &store, step);
+            assert_eq!(
+                reader
+                    .read(&super::super::CanonicalItemKey::new(Some(parent), "same"))
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                expected
+            );
+        }
+        assert!(
+            reader
+                .read(&super::super::CanonicalItemKey::new(
+                    Some("refused-child"),
+                    "same"
+                ))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stopped_generic_tools_keep_canonical_input_and_accept_scoped_results() {
+        fn receive_committed(
+            adapter: &mut Claude,
+            store: &std::sync::Arc<std::sync::Mutex<crate::chat::runtime::Store>>,
+            frame: Value,
+        ) {
+            let step = adapter.receive(frame).unwrap();
+            assert!(
+                !step
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+            commit_tool_fixture(adapter, store, step);
+        }
+
+        for envelope_before_stop in [false, true] {
+            for evict in [false, true] {
+                let store = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::chat::runtime::Store::new().unwrap(),
+                ));
+                let mut adapter = Claude::default();
+                adapter
+                    .bind_item_reader(crate::chat::runtime::Store::adapter_reader_for_test(&store));
+                let scopes = [None, Some("one"), Some("two")];
+                let input = json!({"value":"x"});
+                for parent in scopes {
+                    let message = format!("message-{}", parent.unwrap_or("root"));
+                    let frame = |event: Value| json!({"type":"stream_event","parent_tool_use_id":parent,"event":event});
+                    for event in [
+                        json!({"type":"message_start","message":{"id":message}}),
+                        json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"same","name":"Opaque"}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{ \"value\" : \"x\" }"}}),
+                    ] {
+                        receive_committed(&mut adapter, &store, frame(event));
+                    }
+                    let envelope = scoped_call(parent, &message, "same", "Opaque", input.clone());
+                    if envelope_before_stop {
+                        receive_committed(&mut adapter, &store, envelope.clone());
+                    }
+                    receive_committed(
+                        &mut adapter,
+                        &store,
+                        frame(json!({"type":"content_block_stop","index":0})),
+                    );
+                    // This validates against the real committed Store before a
+                    // later envelope can hide a missing normalized Item write.
+                    assert_eq!(
+                        adapter
+                            .cached_tool(parent, "same")
+                            .unwrap()
+                            .unwrap()
+                            .content,
+                        ItemContent::Tool {
+                            name: "Opaque".into(),
+                            input: input.to_string(),
+                            output: String::new(),
+                            status: ToolStatus::Running,
+                        }
+                    );
+                    if !envelope_before_stop {
+                        receive_committed(&mut adapter, &store, envelope);
+                    }
+                }
+                if evict {
+                    for index in 0..3 {
+                        receive_committed(
+                            &mut adapter,
+                            &store,
+                            scoped_call(
+                                None,
+                                &format!("filler-{index}"),
+                                &format!("filler-{index}"),
+                                "Write",
+                                json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                            ),
+                        );
+                    }
+                    for parent in scopes {
+                        assert!(adapter.tools.get(parent, "same").is_none());
+                    }
+                }
+                for (index, parent) in scopes.into_iter().enumerate() {
+                    let output = format!("finished-{}", parent.unwrap_or("root"));
+                    let failed = index == 1;
+                    receive_committed(
+                        &mut adapter,
+                        &store,
+                        json!({"type":"user","uuid":format!("result-{index}"),"parent_tool_use_id":parent,"message":{"content":[{"type":"tool_result","tool_use_id":"same","is_error":failed,"content":output}]}}),
+                    );
+                    let expected = ItemContent::Tool {
+                        name: "Opaque".into(),
+                        input: input.to_string(),
+                        output,
+                        status: if failed {
+                            ToolStatus::Failed
+                        } else {
+                            ToolStatus::Succeeded
+                        },
+                    };
+                    assert_eq!(
+                        adapter
+                            .cached_tool(parent, "same")
+                            .unwrap()
+                            .unwrap()
+                            .content,
+                        expected
+                    );
+                    let canonical = crate::chat::runtime::Store::adapter_reader_for_test(&store)
+                        .read(&super::super::CanonicalItemKey::new(parent, "same"))
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(canonical.content, expected);
+                }
+            }
+        }
+    }
+    #[test]
+    fn byte_eviction_keeps_one_logical_identity_and_its_permission_input() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chat::runtime::Store::new().unwrap(),
+        ));
+        let mut adapter = Claude::default();
+        adapter.bind_item_reader(crate::chat::runtime::Store::adapter_reader_for_test(&store));
+        let input = json!({"file_path":"owned.rs","content":"original"});
+        for parent in [Some("one"), Some("two")] {
+            let step = adapter
+                .receive(scoped_call(
+                    parent,
+                    &format!("call-{}", parent.unwrap()),
+                    "same",
+                    "Write",
+                    input.clone(),
+                ))
+                .unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+        }
+        for index in 0..3 {
+            let step = adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("filler-{index}"),
+                    &format!("filler-{index}"),
+                    "Write",
+                    json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                ))
+                .unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+        }
+        assert!(adapter.tools.get(Some("one"), "same").is_none());
+        let original = adapter.cached_tool(Some("one"), "same").unwrap().unwrap();
+        adapter.tool(Some("one"), original);
+        assert_eq!(
+            adapter
+                .tool_order
+                .iter()
+                .filter(|key| **key == ScopedId::new(Some("one"), "same"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            adapter
+                .tool_order
+                .iter()
+                .filter(|key| **key == ScopedId::new(Some("two"), "same"))
+                .count(),
+            1
+        );
+        assert!(
+            adapter
+                .edit_tools
+                .contains_key(&ScopedId::new(Some("two"), "same"))
+        );
+        assert_eq!(
+            adapter
+                .tool_inputs
+                .get(&ScopedId::new(Some("one"), "same"))
+                .and_then(|v| serde_json::from_str::<Value>(v).ok()),
+            Some(input)
+        );
+    }
+    #[test]
+    fn byte_evicted_parent_agent_keeps_actual_child_settlement_on_call_replay() {
+        for failed in [false, true] {
+            let store = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::chat::runtime::Store::new().unwrap(),
+            ));
+            let mut adapter = Claude::default();
+            adapter.bind_item_reader(crate::chat::runtime::Store::adapter_reader_for_test(&store));
+            let launch = scoped_call(
+                None,
+                "launch",
+                "agent",
+                "Agent",
+                json!({"run_in_background":true}),
+            );
+            let step = adapter.receive(launch.clone()).unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+            let step=adapter.receive(json!({"type":"result","uuid":"child-result","parent_tool_use_id":"agent","is_error":failed,"result":"done"})).unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+            let expected = if failed {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Succeeded
+            };
+            assert!(adapter.completed_tool(None, "agent"));
+            for index in 0..3 {
+                let step = adapter
+                    .receive(scoped_call(
+                        None,
+                        &format!("fill-{index}"),
+                        &format!("fill-{index}"),
+                        "Write",
+                        json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                    ))
+                    .unwrap();
+                commit_tool_fixture(&mut adapter, &store, step);
+            }
+            assert!(adapter.tools.get(None, "agent").is_none());
+            assert_eq!(
+                adapter
+                    .cached_tool(None, "agent")
+                    .unwrap()
+                    .unwrap()
+                    .content
+                    .status(),
+                Some(expected)
+            );
+            let replay = adapter.receive(launch).unwrap();
+            assert!(!replay.events.iter().any(|event| matches!(
+                event,
+                Event::Subagent {
+                    status: Some(ToolStatus::Running),
+                    ..
+                }
+            )));
+            assert!(!adapter.background_agents.contains("agent"));
+            assert_eq!(
+                adapter
+                    .tool_status
+                    .get(&ScopedId::new(None, "agent"))
+                    .map(|row| row.0),
+                Some(expected)
+            );
+        }
+    }
+    #[test]
+    fn late_agents_preserve_committed_task_source_before_removing_the_fallback_row() {
+        fn assert_no_source_errors(events: &[Event]) {
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Error { .. }
+                        | Event::Subagent {
+                            waiting: Some(true),
+                            ..
+                        }
+                )),
+                "unexpected source error: {events:?}"
+            );
+        }
+
+        fn receive_committed(
+            adapter: &mut Claude,
+            store: &std::sync::Arc<std::sync::Mutex<crate::chat::runtime::Store>>,
+            frame: Value,
+        ) -> Vec<Event> {
+            let step = adapter.receive(frame).unwrap();
+            assert_no_source_errors(&step.events);
+            let events = step.events.clone();
+            for event in step.events {
+                assert_no_source_errors(&store.lock().unwrap().apply(event).unwrap());
+            }
+            adapter.committed();
+            events
+        }
+
+        fn evict_task(
+            adapter: &mut Claude,
+            store: &std::sync::Arc<std::sync::Mutex<crate::chat::runtime::Store>>,
+            stage: &str,
+        ) {
+            for index in 0..3 {
+                receive_committed(
+                    adapter,
+                    store,
+                    scoped_call(
+                        None,
+                        &format!("{stage}-filler-{index}"),
+                        &format!("{stage}-filler-{index}"),
+                        "Write",
+                        json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                    ),
+                );
+            }
+            assert!(adapter.tools.get(None, "claude-task:task").is_none());
+        }
+
+        for parent in [None, Some("outer-agent")] {
+            for eviction in ["resident", "before", "after"] {
+                let store = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::chat::runtime::Store::new().unwrap(),
+                ));
+                let reader = crate::chat::runtime::Store::adapter_reader_for_test(&store);
+                let mut adapter = Claude::default();
+                adapter.bind_item_reader(reader.clone());
+                let task_id = "claude-task:task";
+                let key = super::super::CanonicalItemKey::new(None, task_id);
+                let description = "Inspect late Agent source";
+                let started = receive_committed(
+                    &mut adapter,
+                    &store,
+                    json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"agent","task_type":"local_agent","description":description}),
+                );
+                assert!(
+                    started
+                        .iter()
+                        .any(|event| matches!(event, Event::Item(item) if item.id == task_id))
+                );
+                let original = reader.read(&key).unwrap().unwrap();
+                if eviction == "before" {
+                    evict_task(&mut adapter, &store, "before");
+                } else {
+                    assert!(adapter.tools.get(None, task_id).is_some());
+                }
+
+                let agent = receive_committed(
+                    &mut adapter,
+                    &store,
+                    scoped_call(
+                        parent,
+                        "late-launch",
+                        "agent",
+                        "Agent",
+                        json!({"run_in_background":true}),
+                    ),
+                );
+                assert!(agent.iter().any(
+                    |event| matches!(event, Event::ItemsRemoved { ids } if ids == &[task_id])
+                ));
+                assert!(!agent.iter().any(|event| matches!(
+                    event,
+                    Event::SubagentItemsRemoved { ids, .. } if ids.iter().any(|id| id == task_id)
+                )));
+                assert!(agent.iter().any(|event| match (event, parent) {
+                    (Event::Item(item), None) => item.id == "agent",
+                    (Event::SubagentItem { id, item }, Some(parent)) => {
+                        id == parent && item.id == "agent"
+                    }
+                    _ => false,
+                }));
+                assert!(reader.read(&key).unwrap().is_none());
+                assert_eq!(
+                    reader.read_hidden_task(task_id).unwrap().unwrap().content,
+                    original.content
+                );
+                assert!(!adapter.visible_task_rows.contains(task_id));
+                assert!(adapter.hidden_task_rows.contains(task_id));
+                if eviction == "after" {
+                    evict_task(&mut adapter, &store, "after");
+                }
+
+                for summary in ["Checking tokens", "Checking completion"] {
+                    let progress = receive_committed(
+                        &mut adapter,
+                        &store,
+                        json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":summary}}),
+                    );
+                    assert!(!progress.iter().any(|event| matches!(
+                        event,
+                        Event::Item(item) | Event::SubagentItem { item, .. } if item.id == task_id
+                    )));
+                    assert!(reader.read(&key).unwrap().is_none());
+                    assert_eq!(
+                        reader.read_hidden_task(task_id).unwrap().unwrap().content,
+                        ItemContent::Tool {
+                            name: "Subagent task".into(),
+                            input: description.into(),
+                            output: summary.into(),
+                            status: ToolStatus::Running,
+                        }
+                    );
+                }
+                let body = "Finished the exact late Agent review.";
+                let done = receive_committed(
+                    &mut adapter,
+                    &store,
+                    json!({"type":"system","subtype":"task_notification","uuid":"done","task_id":"task","status":"completed","summary":body}),
+                );
+                assert!(!done.iter().any(|event| matches!(
+                    event,
+                    Event::Item(item) | Event::SubagentItem { item, .. } if item.id == task_id
+                )));
+                assert!(done.iter().any(|event| matches!(
+                    event,
+                    Event::Item(Item {
+                        content: ItemContent::Delivery {
+                            kind: DeliveryKind::Report,
+                            summary,
+                            body: actual_body,
+                            ..
+                        },
+                        ..
+                    }) if summary == "Native subagent \"Inspect late Agent source\" finished"
+                        && actual_body == body
+                )));
+                assert_eq!(
+                    reader.read_hidden_task(task_id).unwrap().unwrap().content,
+                    ItemContent::Tool {
+                        name: "Subagent task".into(),
+                        input: description.into(),
+                        output: body.into(),
+                        status: ToolStatus::Succeeded,
+                    }
+                );
+                assert!(reader.read(&key).unwrap().is_none());
+                assert!(!adapter.visible_task_rows.contains(task_id));
+            }
+        }
+    }
+    #[test]
+    fn late_agent_keeps_the_fallback_row_when_canonical_source_refuses_migration() {
+        for evict in [false, true] {
+            let store = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::chat::runtime::Store::new().unwrap(),
+            ));
+            let reader = crate::chat::runtime::Store::adapter_reader_for_test(&store);
+            let mut adapter = Claude::default();
+            adapter.bind_item_reader(reader.clone());
+            let task_id = "claude-task:task";
+            let key = super::super::CanonicalItemKey::new(None, task_id);
+            let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"agent","task_type":"local_agent","description":"Original task source"})).unwrap();
+            commit_tool_fixture(&mut adapter, &store, started);
+            let mut rewritten = reader.read(&key).unwrap().unwrap();
+            rewritten.content = ItemContent::Tool {
+                name: "Other tool".into(),
+                input: "Rewritten canonical source".into(),
+                output: String::new(),
+                status: ToolStatus::Running,
+            };
+            store
+                .lock()
+                .unwrap()
+                .apply(Event::Item(rewritten.clone()))
+                .unwrap();
+            if evict {
+                for index in 0..3 {
+                    let step = adapter
+                        .receive(scoped_call(
+                            None,
+                            &format!("filler-{index}"),
+                            &format!("filler-{index}"),
+                            "Write",
+                            json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                        ))
+                        .unwrap();
+                    commit_tool_fixture(&mut adapter, &store, step);
+                }
+                assert!(adapter.tools.get(None, task_id).is_none());
+            }
+            let agent = adapter
+                .receive(scoped_call(None, "launch", "agent", "Agent", json!({})))
+                .unwrap();
+            let errors: Vec<_> = agent
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Error {
+                        message,
+                        fatal: false,
+                    } => Some(message.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                errors,
+                [if evict {
+                    "Hidden task identity exceeds its retained lifecycle scope"
+                } else {
+                    "Cached tool invocation or body no longer matches its canonical source"
+                }]
+            );
+            assert!(!agent.events.iter().any(|event| matches!(
+                event,
+                Event::ItemsRemoved { ids } if ids.iter().any(|id| id == task_id)
+            )));
+            commit_tool_fixture(&mut adapter, &store, agent);
+            assert!(adapter.visible_task_rows.contains(task_id));
+            assert!(!adapter.hidden_task_rows.contains(task_id));
+            assert!(reader.read_hidden_task(task_id).unwrap().is_none());
+            assert_eq!(
+                reader.read(&key).unwrap().unwrap().content,
+                rewritten.content
+            );
+        }
+    }
+    #[test]
+    fn represented_task_source_keeps_description_through_progress_and_byte_eviction() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chat::runtime::Store::new().unwrap(),
+        ));
+        let mut adapter = Claude::default();
+        adapter.bind_item_reader(crate::chat::runtime::Store::adapter_reader_for_test(&store));
+        let step = adapter
+            .receive(scoped_call(
+                None,
+                "launch",
+                "agent",
+                "Agent",
+                json!({"run_in_background":true}),
+            ))
+            .unwrap();
+        commit_tool_fixture(&mut adapter, &store, step);
+        let started=adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"task","tool_use_id":"agent","task_type":"local_agent","description":"Review hidden source"})).unwrap();
+        assert!(
+            !started
+                .events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item) if item.id=="claude-task:task"))
+        );
+        assert!(
+            !started
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        commit_tool_fixture(&mut adapter, &store, started);
+        let progress=adapter.receive(json!({"type":"system","subtype":"task_progress","task_id":"task","patch":{"summary":"Checking files"}})).unwrap();
+        assert!(
+            !progress
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        commit_tool_fixture(&mut adapter, &store, progress);
+        for index in 0..3 {
+            let step = adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("fill-{index}"),
+                    &format!("fill-{index}"),
+                    "Write",
+                    json!({"file_path":"large.rs","content":"x".repeat(1024*1024)}),
+                ))
+                .unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+        }
+        assert!(adapter.tools.get(None, "claude-task:task").is_none());
+        assert!(adapter.hidden_task_rows.contains("claude-task:task"));
+        assert!(
+            adapter
+                .cached_tool(Some(""), "claude-task:task")
+                .unwrap()
+                .is_some(),
+            "empty parent aliases the same structural root namespace"
+        );
+        let source = adapter
+            .cached_tool(None, "claude-task:task")
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(source.content,ItemContent::Tool{input,output,..} if input=="Review hidden source" && output=="Checking files")
+        );
+        let done=adapter.receive(json!({"type":"system","subtype":"task_notification","uuid":"done","task_id":"task","tool_use_id":"agent","status":"completed","summary":"Finished review","patch":{"status":"completed"}})).unwrap();
+        assert!(
+            !done
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        assert!(done.events.iter().any(|event|matches!(event,Event::Subagent{id,status:Some(ToolStatus::Succeeded),..} if id=="agent")));
+        assert!(done.events.iter().any(|event|matches!(event,Event::Item(Item{content:ItemContent::Delivery{summary,..},..}) if summary.contains("Review hidden source"))));
+        assert!(
+            !done
+                .events
+                .iter()
+                .any(|event| matches!(event,Event::Item(item) if item.id=="claude-task:task"))
+        );
+        commit_tool_fixture(&mut adapter, &store, done);
+    }
+    #[test]
+    fn overlong_optional_body_keys_still_retire_all_logical_metadata() {
+        let mut adapter = Claude::default();
+        for index in 0..MAX_TOOLS + 3 {
+            let id = format!("{}-{index}", "k".repeat(4097));
+            adapter
+                .receive(scoped_call(
+                    None,
+                    &format!("carrier-{index}"),
+                    &id,
+                    "Write",
+                    json!({"file_path":"owned.rs","content":"keep"}),
+                ))
+                .unwrap();
+        }
+        assert_eq!(adapter.tool_order.len(), MAX_TOOLS);
+        assert_eq!(adapter.edit_tools.len(), MAX_TOOLS);
+        assert_eq!(adapter.tool_status.len(), MAX_TOOLS);
+        assert!(adapter.tool_inputs.len() <= chat::PermissionDenial::LIMIT);
+        let before = adapter.tool_status.len();
+        adapter.receive(json!({"type":"result","uuid":"unknown","parent_tool_use_id":"never-launched","result":"done","is_error":false})).unwrap();
+        assert_eq!(adapter.tool_status.len(), before);
+        assert!(
+            !adapter
+                .tool_status
+                .contains_key(&ScopedId::new(None, "never-launched"))
+        );
+    }
     #[test]
     fn child_result_settles_only_its_exact_task_without_settling_parent_or_siblings() {
         let run = crate::model::RunId::new();
@@ -8776,17 +9728,34 @@ mod tests {
         );
     }
 
-    /// A write too large for its input to be held, and an edit whose input
-    /// has since been pushed out by later calls, still fail as the tool they
-    /// were: the name is kept for as long as the call is.
+    /// Missing raw input must preserve the complete attempted changes rather
+    /// than invent a path-only invocation. Logical tool names remain bounded
+    /// separately from the shorter-lived permission input cache.
     #[test]
     fn a_failed_edit_keeps_its_name_without_its_input() {
         let mut adapter = Claude::default();
         let content = "x".repeat(chat::PermissionDenial::INPUT_LIMIT);
-        adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[
+        let initial = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[
             {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"big.txt","content":content}},
             {"type":"tool_use","id":"edit","name":"MultiEdit","input":{"file_path":"src/app.rs","edits":[{"old_string":"missing","new_string":"found"}]}},
         ]}})).unwrap();
+        let attempted: Vec<_> = initial
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(Item {
+                    id,
+                    content:
+                        ItemContent::Changes {
+                            changes,
+                            status: ToolStatus::Running,
+                        },
+                    ..
+                }) if id == "write" || id == "edit" => Some((id.clone(), changes.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempted.len(), 2);
         assert!(
             !adapter
                 .tool_inputs
@@ -8806,15 +9775,45 @@ mod tests {
             ("write", "Write", "big.txt"),
             ("edit", "MultiEdit", "src/app.rs"),
         ] {
+            assert_eq!(
+                adapter
+                    .edit_tools
+                    .get(&ScopedId::new(None, id))
+                    .map(String::as_str),
+                Some(name)
+            );
             let failed = adapter.receive(json!({"type":"user","uuid":format!("u-{id}"),"message":{"content":[{"type":"tool_result","tool_use_id":id,"is_error":true,"content":"denied"}]}})).unwrap();
+            let key = ScopedId::new(None, id);
+            assert_eq!(adapter.edit_tools.get(&key).map(String::as_str), Some(name));
+            let original = &attempted
+                .iter()
+                .find(|(item_id, _)| item_id == id)
+                .unwrap()
+                .1;
+            assert_eq!(original.len(), 1);
+            assert!(original[0].path.ends_with(path));
             assert_eq!(
                 items(&failed),
-                vec![ItemContent::Tool {
-                    name: name.into(),
-                    input: json!({"file_path": path}).to_string(),
-                    output: "denied".into(),
+                vec![ItemContent::Changes {
+                    changes: original.clone(),
                     status: ToolStatus::Failed,
                 }]
+            );
+            assert!(failed.events.iter().any(|event| matches!(event,
+                Event::Error { message, fatal: false }
+                    if message.contains("denied")
+                        && message.contains("exact original invocation is unavailable")
+                        && message.contains("full failed attempted changes were preserved")
+            )));
+            assert!(
+                !failed.events.iter().any(|event| matches!(
+                    event,
+                    Event::Item(Item {
+                        content: ItemContent::Tool { .. },
+                        ..
+                    })
+                )),
+                "missing input must not synthesize a replacement invocation"
             );
         }
         // The name is let go of with the call.
@@ -10006,9 +11005,7 @@ mod tests {
             }
         }
         assert_eq!(
-            adapter.tools[&ScopedId::new(None, "claude-task:task-one")]
-                .content
-                .status(),
+            adapter.tools["claude-task:task-one"].content.status(),
             Some(ToolStatus::Succeeded)
         );
         assert!(adapter.visible_task_rows.is_empty());
@@ -12372,9 +13369,7 @@ mod tests {
             }
         }
         assert_eq!(
-            adapter.tools[&ScopedId::new(None, "wanted")]
-                .content
-                .status(),
+            adapter.tools["wanted"].content.status(),
             Some(ToolStatus::Succeeded)
         );
     }
@@ -12410,7 +13405,7 @@ mod tests {
         let mut step = Step::default();
         adapter.message(&json!({"type":"user","uuid":"live","_cagents_history_tool_call":correlation_call("unlogged","/wrong/spoof.rs"),"message":{"content":[correlation_result("unlogged",false)]}}),&mut step).unwrap();
         assert!(
-            matches!(&adapter.tools[&ScopedId::new(None, "unlogged")].content,ItemContent::Tool{name,status:ToolStatus::Succeeded,..} if name=="Tool")
+            matches!(&adapter.tools["unlogged"].content,ItemContent::Tool{name,status:ToolStatus::Succeeded,..} if name=="Tool")
         );
     }
     #[test]
@@ -12470,9 +13465,7 @@ mod tests {
         assert!(adapter.command(Command::LoadEarlier).is_err());
         assert_eq!(adapter.history.as_ref().unwrap().offset, prior);
         assert_eq!(
-            adapter.tools[&ScopedId::new(None, "confirmed")]
-                .content
-                .status(),
+            adapter.tools["confirmed"].content.status(),
             Some(ToolStatus::Succeeded)
         );
     }
