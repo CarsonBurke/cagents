@@ -2755,23 +2755,18 @@ pub(crate) fn read_open_migration_sessions_with_budget(
             supported: CURRENT_SCHEMA_VERSION,
         });
     }
-    let (origin, listener, predecessor) = terminal_provenance_columns(version);
-    let mut statement = transaction.prepare(&format!(
+    let mut statement = transaction.prepare(
         "SELECT CASE WHEN length(CAST(c.card_id AS BLOB)) <= 128 THEN c.card_id ELSE NULL END, c.kind_tag,
          CASE WHEN length(CAST(c.content_json AS BLOB)) <= 4194304 THEN c.content_json ELSE NULL END,
          CASE WHEN length(CAST(c.existence_json AS BLOB)) <= 4096 THEN c.existence_json ELSE 'null' END,
          CASE WHEN length(CAST(w.existence_json AS BLOB)) <= 4096 THEN w.existence_json ELSE 'null' END,
          CASE WHEN c.kind_tag = 'chat' THEN length(CAST(c.content_json AS BLOB))
-         ELSE (SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
-                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
-                    + coalesce(length(CAST({origin} AS BLOB)),0) + coalesce(length(CAST({listener} AS BLOB)),0)
-                    + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
-               FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
+         ELSE 0
          END,
          CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
          WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id"
-    ))?;
+    )?;
     let mut rows = statement.query([])?;
     let mut sessions = Vec::new();
     let mut retained =
@@ -2785,13 +2780,23 @@ pub(crate) fn read_open_migration_sessions_with_budget(
         {
             continue;
         }
-        let bytes: u64 = row.get(5)?;
-        // Reserve before allocating the descriptor's JSON or normalized fields.
-        budget.reserve(bytes)?;
+        if budget.remaining_rows == 0 {
+            return Err(StoreError::InvalidState(
+                "Saved pane inventory exceeds the migration inspection limit".into(),
+            ));
+        }
         let card: String = row.get(0)?;
         let kind: String = row.get(1)?;
-        let content: Option<String> = row.get(2)?;
         let card = parse_id("migration card", &card)?;
+        let bytes = if kind == "terminal" {
+            migration_terminal_bytes_at_schema(&transaction, card, version, budget.remaining_bytes)?
+        } else {
+            row.get::<_, u64>(5)?
+        };
+        // Reserve the actual loader-consumed bytes before allocating JSON or
+        // normalized fields. The bounded raw terminal key is already dropped.
+        budget.reserve(bytes)?;
+        let content: Option<String> = row.get(2)?;
         let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
         if let CardKind::Chat(source) = &session {
             let workspace: String = row.get(6)?;
@@ -2830,6 +2835,66 @@ pub(crate) fn read_open_migration_sessions_with_budget(
     Ok(sessions)
 }
 
+// Budget exactly the fields consumed by the schema-aware loader. The caller's
+// existing read transaction keeps raw identity, canonical lookup and load in
+// one snapshot; this helper never opens or migrates a source database.
+fn migration_terminal_bytes_at_schema(
+    connection: &Connection,
+    card: CardId,
+    version: u32,
+    available_bytes: u64,
+) -> Result<u64> {
+    const MAX_DESCRIPTOR_BYTES: u64 = 4 * 1024 * 1024;
+    let raw_limit = available_bytes.min(MAX_DESCRIPTOR_BYTES);
+    let raw: Option<Option<String>> = connection
+        .query_row(
+            "SELECT length(CAST(terminal_id AS BLOB)) <= ?2, terminal_id
+         FROM terminal_recipes WHERE card_id = ?1",
+            params![card.to_string(), raw_limit],
+            |row| {
+                if row.get::<_, bool>(0)? {
+                    row.get::<_, String>(1).map(Some)
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .optional()?;
+    let raw = match raw {
+        Some(Some(raw)) => raw,
+        Some(None) if raw_limit < MAX_DESCRIPTOR_BYTES => {
+            return Err(StoreError::InvalidState(
+                "Saved pane inventory exceeds the migration inspection limit".into(),
+            ));
+        }
+        _ => {
+            return Err(StoreError::corrupt_row(
+                format!("migration terminal card {card}"),
+                "missing or oversized immutable descriptor",
+            ));
+        }
+    };
+    let terminal: TerminalId = parse_id("terminal", &raw)?;
+    drop(raw);
+    let (origin, listener, predecessor) = terminal_provenance_columns(version);
+    let bytes: Option<u64> = connection.query_row(
+        &format!("SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+            + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
+            + coalesce(length(CAST({origin} AS BLOB)),0) + coalesce(length(CAST({listener} AS BLOB)),0)
+            + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
+         FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=?2 WHERE r.card_id=?1"),
+        params![card.to_string(), terminal.to_string()], |row| row.get(0),
+    ).optional()?;
+    bytes
+        .filter(|bytes| *bytes <= MAX_DESCRIPTOR_BYTES)
+        .ok_or_else(|| {
+            StoreError::corrupt_row(
+                format!("migration terminal card {card}"),
+                "missing or oversized immutable descriptor",
+            )
+        })
+}
+
 /// Decode the exact row inside an existing read-only inspection transaction.
 /// Terminal ownership lives in normalized tables, not cards.content_json.
 /// The caller must read and validate this card's kind/existence in that same
@@ -2851,22 +2916,12 @@ pub(crate) fn read_migration_session_at(
                     supported: CURRENT_SCHEMA_VERSION,
                 });
             }
-            let (origin, listener, predecessor) = terminal_provenance_columns(version);
-            // Check lengths in SQLite before allocating any descriptor fields
-            // in Rust, including the nullable provenance and transcript path.
-            let bounded:Option<bool>=connection.query_row(
-                &format!("SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
-                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
-                    + coalesce(length(CAST({origin} AS BLOB)),0) + coalesce(length(CAST({listener} AS BLOB)),0)
-                    + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
-                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1"),
-                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
-            if bounded != Some(true) {
-                return Err(StoreError::corrupt_row(
-                    format!("migration terminal card {card}"),
-                    "missing or oversized immutable descriptor",
-                ));
-            }
+            migration_terminal_bytes_at_schema(
+                connection,
+                card,
+                version,
+                MAX_DESCRIPTOR_BYTES as u64,
+            )?;
             load_terminal_record_at_schema(connection, card, version).map(CardKind::Terminal)
         }
         "chat" => from_json(
@@ -6404,6 +6459,185 @@ mod tests {
     }
 
     #[test]
+    fn migration_terminal_inspection_budgets_the_canonical_transcript_lookup() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("raw-terminal.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        // Exercise the raw normalized decoder, without claiming whole-source
+        // schema admission or opening/migrating this source as a StateStore.
+        connection
+            .execute_batch(
+                "CREATE TABLE terminal_recipes(card_id TEXT PRIMARY KEY, terminal_id TEXT UNIQUE,
+             recipe_json TEXT, continuity_json TEXT, resume_hint TEXT, recovery_origin TEXT,
+             owned_codex_listener TEXT, predecessor TEXT);
+             CREATE TABLE transcript_metadata(terminal_id TEXT PRIMARY KEY,path_json TEXT);",
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+            .unwrap();
+        let state = workspace_with_terminal(&boot("migration-inspection"));
+        let card = state.cards[0].id;
+        let CardKind::Terminal(mut terminal) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        terminal.id = parse_id("terminal", "abcdefab-cdef-4abc-8def-abcdefabcdef").unwrap();
+        terminal.resume_hint = None;
+        terminal.transcript_path = Some(PathBuf::from("/canonical"));
+        let canonical = terminal.id.to_string();
+        let recipe = serde_json::to_string(&terminal.launch).unwrap();
+        let continuity = serde_json::to_string(&terminal.continuity).unwrap();
+        let path = serde_json::to_string(&terminal.transcript_path.as_ref().unwrap()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO terminal_recipes VALUES(?1,?2,?3,?4,NULL,NULL,NULL,NULL)",
+                params![card.to_string(), canonical, recipe, continuity],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transcript_metadata VALUES(?1,?2)",
+                params![canonical, path],
+            )
+            .unwrap();
+        let inspect = || {
+            let before = fs::read(&database).unwrap();
+            let mut reader =
+                Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let tx = reader.transaction().unwrap();
+            let result = read_migration_session_at(&tx, card, "terminal", None);
+            drop(tx);
+            drop(reader);
+            assert_eq!(
+                fs::read(&database).unwrap(),
+                before,
+                "inspection is read-only"
+            );
+            result
+        };
+        for raw in [
+            canonical.clone(),
+            canonical.to_uppercase(),
+            canonical.replace('-', ""),
+        ] {
+            connection
+                .execute("UPDATE terminal_recipes SET terminal_id=?1", [&raw])
+                .unwrap();
+            assert_eq!(inspect().unwrap(), CardKind::Terminal(terminal.clone()));
+        }
+        let raw = canonical.to_uppercase();
+        connection
+            .execute("UPDATE terminal_recipes SET terminal_id=?1", [&raw])
+            .unwrap();
+        let oversized_path = serde_json::to_string(&PathBuf::from("p".repeat(LIMIT))).unwrap();
+        // The canonical lookup is valid JSON that the old loader would copy;
+        // a small raw-key decoy must not stand in for its byte budget.
+        connection
+            .execute(
+                "UPDATE transcript_metadata SET path_json=?1 WHERE terminal_id=?2",
+                params![oversized_path, canonical],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO transcript_metadata VALUES(?1,?2)",
+                params![raw, path],
+            )
+            .unwrap();
+        assert!(matches!(inspect(), Err(StoreError::CorruptRow { .. })));
+
+        // Conversely, the loader never reads the raw alias's path.
+        connection
+            .execute(
+                "UPDATE transcript_metadata SET path_json=?1 WHERE terminal_id=?2",
+                params![path, canonical],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE transcript_metadata SET path_json=?1 WHERE terminal_id=?2",
+                params![oversized_path, raw],
+            )
+            .unwrap();
+        assert_eq!(inspect().unwrap(), CardKind::Terminal(terminal.clone()));
+
+        let fixed_bytes = raw.len() + recipe.len() + continuity.len() + path.len();
+        let exact_hint = format!("{}窓", "h".repeat(LIMIT - fixed_bytes - "窓".len()));
+        assert_eq!(fixed_bytes + exact_hint.len(), LIMIT);
+        connection
+            .execute("UPDATE terminal_recipes SET resume_hint=?1", [&exact_hint])
+            .unwrap();
+        terminal.resume_hint = Some(exact_hint.clone());
+        assert_eq!(inspect().unwrap(), CardKind::Terminal(terminal));
+        connection
+            .execute(
+                "UPDATE terminal_recipes SET resume_hint=?1",
+                [format!("{exact_hint}x")],
+            )
+            .unwrap();
+        assert!(matches!(inspect(), Err(StoreError::CorruptRow { .. })));
+    }
+
+    #[test]
+    fn migration_terminal_inspection_bounds_raw_ids_before_string_conversion() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE terminal_recipes(card_id TEXT PRIMARY KEY, terminal_id,
+             recipe_json TEXT, continuity_json TEXT, resume_hint TEXT, recovery_origin TEXT,
+             owned_codex_listener TEXT, predecessor TEXT);
+             CREATE TABLE transcript_metadata(terminal_id TEXT PRIMARY KEY,path_json TEXT);",
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+            .unwrap();
+        let card = CardId::new();
+        connection
+            .execute(
+                "INSERT INTO terminal_recipes VALUES(?1,?2,'{}','{}',NULL,NULL,NULL,NULL)",
+                params![card.to_string(), "x".repeat(LIMIT + 1)],
+            )
+            .unwrap();
+        let oversized = read_migration_session_at(&connection, card, "terminal", None).unwrap_err();
+        assert!(matches!(oversized, StoreError::CorruptRow { .. }));
+        // Oversized invalid UTF-8 TEXT must hit the size sentinel before a
+        // String conversion. No diagnostic may include the raw source value.
+        connection
+            .execute(
+                "UPDATE terminal_recipes SET terminal_id=CAST(zeroblob(?1)||x'80' AS TEXT)",
+                [LIMIT as u64],
+            )
+            .unwrap();
+        let invalid = read_migration_session_at(&connection, card, "terminal", None).unwrap_err();
+        assert_eq!(invalid.to_string(), oversized.to_string());
+        connection
+            .execute("UPDATE terminal_recipes SET terminal_id='not-a-uuid'", [])
+            .unwrap();
+        assert!(matches!(
+            read_migration_session_at(&connection, card, "terminal", None),
+            Err(StoreError::InvalidUuid { .. })
+        ));
+        for edit in [
+            "UPDATE terminal_recipes SET terminal_id=CAST(x'80' AS TEXT)",
+            "UPDATE terminal_recipes SET terminal_id=x'616263'",
+            "UPDATE terminal_recipes SET terminal_id=NULL",
+        ] {
+            connection.execute(edit, []).unwrap();
+            assert!(read_migration_session_at(&connection, card, "terminal", None).is_err());
+        }
+        connection
+            .execute("DELETE FROM terminal_recipes", [])
+            .unwrap();
+        assert!(matches!(
+            read_migration_session_at(&connection, card, "terminal", None),
+            Err(StoreError::CorruptRow { .. })
+        ));
+    }
+
+    #[test]
     fn explicit_pending_terminal_creation_survives_store_restore() {
         let directory = tempdir().unwrap();
         let boot_id = boot("pending-creation");
@@ -8112,6 +8346,142 @@ mod tests {
                 .contains("bounded budget")
         );
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn migration_terminal_inventory_counts_canonical_paths_across_windows_before_decode() {
+        let directory = tempdir().unwrap();
+        let mut paths = Vec::new();
+        let mut charges = Vec::new();
+        let mut raw_charges = Vec::new();
+        for index in 0..2 {
+            let path = directory.path().join(format!("terminal-{index}.sqlite3"));
+            let store = StateStore::open(&path, boot("terminal-inventory")).unwrap();
+            let mut workspace = workspace_with_terminal(&boot("terminal-inventory"));
+            // Deterministic card order places the alias before its canonical
+            // parent in each source. Both rows remain real saved descriptors.
+            workspace.cards[0].id = CardId::from_uuid(uuid::Uuid::from_u128(index * 2 + 1));
+            workspace.focused = Some(workspace.cards[0].id);
+            let CardKind::Terminal(terminal) = &mut workspace.cards[0].kind else {
+                unreachable!()
+            };
+            terminal.transcript_path = None;
+            terminal.resume_hint = None;
+            let canonical = terminal.id.to_string();
+            let alias = canonical.replace('-', "");
+            let recipe = to_json(&terminal.launch).unwrap();
+            let continuity = to_json(&terminal.continuity).unwrap();
+            let mut parent = workspace.cards[0].clone();
+            parent.id = CardId::from_uuid(uuid::Uuid::from_u128(index * 2 + 2));
+            let CardKind::Terminal(parent_terminal) = &mut parent.kind else {
+                unreachable!()
+            };
+            parent_terminal.id = TerminalId::new();
+            workspace.cards.push(parent);
+            SaveLane::default().save(&store, &workspace).unwrap();
+            drop(store);
+
+            let transcript = PathBuf::from(format!("/{}", "界".repeat(4096)));
+            let transcript_json = to_json(&transcript).unwrap();
+            let mut writer = Connection::open(&path).unwrap();
+            let tx = writer.transaction().unwrap();
+            tx.execute(
+                "UPDATE terminal_recipes SET terminal_id=?1 WHERE card_id=?2",
+                params![alias, workspace.cards[0].id.to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE terminal_recipes SET terminal_id=?1 WHERE card_id=?2",
+                params![canonical, workspace.cards[1].id.to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO transcript_metadata(terminal_id,generation,path_json,byte_len,durable_offset,updated_at_unix_ms)
+                 VALUES(?1,0,?2,0,0,1)", params![canonical, transcript_json],
+            ).unwrap();
+            tx.commit().unwrap();
+            drop(writer);
+            // Derive the expected charge from the fixture bytes, independently
+            // of the production query. Each loaded descriptor owns the path.
+            charges.push(
+                (alias.len()
+                    + canonical.len()
+                    + 2 * (recipe.len() + continuity.len() + transcript_json.len()))
+                    as u64,
+            );
+            raw_charges.push((alias.len() + recipe.len() + continuity.len()) as u64);
+            paths.push(path);
+        }
+        let before: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+        let mut exact = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        exact.remaining_bytes = charges.iter().sum();
+        for path in &paths {
+            let sessions = read_open_migration_sessions_with_budget(path, &mut exact).unwrap();
+            assert_eq!(sessions.len(), 2);
+            for (_, kind) in sessions {
+                let CardKind::Terminal(terminal) = kind else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    terminal
+                        .transcript_path
+                        .as_ref()
+                        .unwrap()
+                        .to_string_lossy()
+                        .len(),
+                    1 + 3 * 4096
+                );
+            }
+        }
+        assert_eq!(
+            exact.remaining_bytes, 0,
+            "canonical paths are charged for both aliases"
+        );
+        let mut short = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        short.remaining_bytes = charges.iter().sum::<u64>() - 1;
+        assert_eq!(
+            read_open_migration_sessions_with_budget(&paths[0], &mut short)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            read_open_migration_sessions_with_budget(&paths[1], &mut short)
+                .unwrap_err()
+                .to_string()
+                .contains("inventory exceeds")
+        );
+        for (path, original) in paths.iter().zip(&before) {
+            assert_eq!(fs::read(path).unwrap(), *original);
+        }
+
+        // A raw-key-only charge would admit this first alias, then decode its
+        // invalid JSON. Exact canonical accounting must refuse before decode.
+        let writer = Connection::open(&paths[1]).unwrap();
+        writer
+            .execute(
+                "UPDATE terminal_recipes SET recipe_json='!' || substr(recipe_json,2)",
+                [],
+            )
+            .unwrap();
+        drop(writer);
+        let malformed = fs::read(&paths[1]).unwrap();
+        let mut limited = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        limited.remaining_bytes = charges[0] + raw_charges[1];
+        assert_eq!(
+            read_open_migration_sessions_with_budget(&paths[0], &mut limited)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            read_open_migration_sessions_with_budget(&paths[1], &mut limited)
+                .unwrap_err()
+                .to_string()
+                .contains("inventory exceeds")
+        );
+        assert_eq!(fs::read(&paths[0]).unwrap(), before[0]);
+        assert_eq!(fs::read(&paths[1]).unwrap(), malformed);
     }
 
     #[test]
