@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""Stage a committed revision at an owned, stable validation checkout.
+
+The caller must hold the real exclusive build-lane allocation and positively
+settle its previous process family BEFORE invoking this helper. Neither the
+owner label, registry lock nor resulting JSON proves those external facts.
+This helper runs Git only: it never builds, chooses features or clears caches.
+"""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+HASH = re.compile(r"[0-9a-f]{40}\Z")
+OWNER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+GIT_ROUTING = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+)
+RECORD_KEYS = {
+    "version", "owner", "uid", "checkout", "common_git_dir", "common_identity",
+    "checkout_git_dir", "checkout_git_dir_identity", "head", "tree",
+}
+
+
+class Refusal(Exception):
+    def __init__(self, code, detail):
+        self.code, self.detail = code, detail
+
+
+class GitFailure(Exception):
+    pass
+
+
+class Arguments(argparse.ArgumentParser):
+    def error(self, message):
+        raise Refusal("invalid-input", message)
+
+
+def git(repository, *arguments, allowed=(0,)):
+    result = subprocess.run(
+        ["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+         "-c", "core.untrackedCache=false", "-c", "submodule.recurse=false",
+         "-C", str(repository), *arguments],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="surrogateescape",
+    )
+    if result.returncode not in allowed:
+        raise GitFailure(f"Git {arguments[0]} exited {result.returncode}: {result.stderr.strip()}")
+    return result
+
+
+def check_git_config(repository):
+    # Refuse programs during checkout and implicit object fetching. Do not
+    # inspect their configured values or modify the caller's environment.
+    external = git(repository, "config", "--name-only", "--get-regexp",
+                   r"^(filter\.|remote\..*\.promisor$|extensions\.partialclone$)", allowed=(0, 1))
+    if external.stdout:
+        raise Refusal("invalid-input", "External Git filters and partial/promisor clones are unsupported.")
+
+
+def reject_gitlinks(repository, head):
+    entries = git(repository, "ls-tree", "-r", "-z", head).stdout.split("\0")
+    if any(entry.startswith("160000 ") for entry in entries):
+        raise Refusal("invalid-input", "Submodule worktrees require separate source admission and are unsupported here.")
+
+
+def canonical(path):
+    path = Path(path)
+    if not path.is_absolute() or path != path.resolve():
+        raise Refusal("unsafe-path", "Use an absolute path without symlink ancestors or '..'.")
+    return path
+
+
+def owned_directory(path, private=False):
+    info = path.lstat()
+    forbidden = 0o077 if private else 0o022
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & forbidden:
+        raise Refusal("unsafe-path", f"Directory is not owned and protected: {path}")
+    return [info.st_dev, info.st_ino]
+
+
+def protected_file(info, private=True):
+    return (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+            and info.st_nlink == 1 and not info.st_mode & (0o077 if private else 0o022))
+
+
+@contextmanager
+def staging_lock(directory):
+    try:
+        directory.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    owned_directory(directory, private=True)
+    descriptor = os.open(directory / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        if not protected_file(os.fstat(descriptor)):
+            raise Refusal("unsafe-path", "The staging lock is not a private owned regular file.")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refusal("busy", "Another helper holds the source-staging lock.") from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def read_record(path):
+    if path.is_symlink():
+        raise Refusal("metadata-invalid", "The registry record must not be a symlink.")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor) as source:
+        if not protected_file(os.fstat(source.fileno())):
+            raise Refusal("metadata-invalid", "The registry record is not private and owned.")
+        try:
+            text = source.read(16 * 1024 + 1)
+            if len(text) > 16 * 1024:
+                raise Refusal("metadata-invalid", "The registry record is too large.")
+            record = json.loads(text)
+        except (ValueError, UnicodeError):
+            raise Refusal("metadata-invalid", "The registry record is invalid JSON.") from None
+    if (not isinstance(record, dict) or set(record) != RECORD_KEYS or record["version"] != 1
+            or not isinstance(record["head"], str) or not HASH.fullmatch(record["head"])
+            or not isinstance(record["tree"], str) or not HASH.fullmatch(record["tree"])):
+        raise Refusal("metadata-invalid", "The registry record has an unsupported shape.")
+    return record
+
+
+def write_record(path, record):
+    descriptor, name = tempfile.mkstemp(prefix=".record-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(record, output, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)  # Only this invocation's newly created metadata temporary.
+
+
+def checkout_state(checkout, common):
+    owned_directory(checkout)
+    if not protected_file((checkout / ".git").lstat(), private=False):
+        raise Refusal("foreign-worktree", "A registered linked worktree is required.")
+    actual_common = Path(git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+    top = Path(git(checkout, "rev-parse", "--show-toplevel").stdout.strip())
+    admin = Path(git(checkout, "rev-parse", "--absolute-git-dir").stdout.strip())
+    if actual_common != common or top != checkout or not admin.is_relative_to(common / "worktrees"):
+        raise Refusal("foreign-worktree", "The checkout belongs to a different Git worktree or common directory.")
+    identity = owned_directory(admin)
+    check_git_config(checkout)
+    if git(checkout, "symbolic-ref", "-q", "HEAD", allowed=(0, 1)).returncode == 0:
+        raise Refusal("foreign-worktree", "The validation checkout must remain detached.")
+    for setting in ("core.sparseCheckout", "index.sparse"):
+        if git(checkout, "config", "--bool", "--get", setting, allowed=(0, 1)).stdout.strip() == "true":
+            raise Refusal("dirty-checkout", "Sparse checkout/index settings can conceal source files.")
+    indexed = git(checkout, "ls-files", "-v", "-z").stdout.split("\0")
+    if any(entry and not entry.startswith("H ") for entry in indexed):
+        raise Refusal("dirty-checkout", "Index flags or unresolved entries can conceal tracked changes.")
+    if git(checkout, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+           "--ignored=matching", "--ignore-submodules=none").stdout:
+        raise Refusal("dirty-checkout", "Tracked, untracked or ignored checkout files have changed.")
+    reject_gitlinks(checkout, "HEAD")
+    return {
+        "head": git(checkout, "rev-parse", "HEAD").stdout.strip(),
+        "tree": git(checkout, "rev-parse", "HEAD^{tree}").stdout.strip(),
+        "checkout_git_dir": str(admin), "checkout_git_dir_identity": identity,
+    }
+
+
+def prepare(args, progress):
+    if any(name in os.environ for name in GIT_ROUTING):
+        raise Refusal("untrusted-environment", "Git-routing variable names are present; refusing ambient repository redirection.")
+    if (not HASH.fullmatch(args.head) or not HASH.fullmatch(args.tree)
+            or not OWNER.fullmatch(args.owner)
+            or args.expect_current != "absent" and not HASH.fullmatch(args.expect_current)):
+        raise Refusal("invalid-input", "Use full lowercase commit/tree hashes and a stable ASCII owner label.")
+    repository = canonical(str(Path(args.repository).absolute()))
+    checkout = canonical(args.checkout)
+    owned_directory(repository)
+    owned_directory(checkout.parent)
+    check_git_config(repository)
+    repository = Path(git(repository, "rev-parse", "--show-toplevel").stdout.strip())
+    common = canonical(git(repository, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+    common_identity = owned_directory(common)
+    if checkout == repository or repository.is_relative_to(checkout) or checkout.is_relative_to(common):
+        raise Refusal("unsafe-path", "The validation path overlaps the source root or Git administration.")
+    if git(repository, "cat-file", "-t", args.head).stdout.strip() != "commit":
+        raise Refusal("invalid-input", "The candidate must name a local commit object.")
+    if git(repository, "rev-parse", args.head + "^{tree}").stdout.strip() != args.tree:
+        raise Refusal("tree-mismatch", "The candidate commit does not have the requested tree.")
+    reject_gitlinks(repository, args.head)
+    directory = common / "validation-checkouts-v1"
+    marker = directory / (hashlib.sha256(os.fsencode(checkout)).hexdigest() + ".json")
+    if checkout.exists() and not marker.exists():
+        raise Refusal("foreign-worktree", "An existing unregistered checkout is never adopted.")
+    with staging_lock(directory):
+        record = read_record(marker) if marker.exists() else None
+        previous = None
+        if record is not None:
+            if record["owner"] != args.owner or record["uid"] != os.geteuid():
+                raise Refusal("foreign-owner", "The slot belongs to another recorded owner.")
+            if (record["checkout"] != str(checkout) or record["common_git_dir"] != str(common)
+                    or record["common_identity"] != common_identity or not checkout.exists()):
+                raise Refusal("foreign-worktree", "The registered checkout or common directory has changed.")
+            current = checkout_state(checkout, common)
+            if any(current[key] != record[key] for key in current):
+                raise Refusal("unexpected-head", "The checkout no longer matches its last admitted identity/head/tree.")
+            if current["head"] != args.expect_current:
+                raise Refusal("unexpected-head", "The expected prior commit is stale.")
+            previous = current["head"]
+        elif args.expect_current != "absent":
+            raise Refusal("unexpected-head", "Creation requires an explicit absent expectation.")
+        elif checkout.exists():
+            raise Refusal("foreign-worktree", "The path was occupied before creation.")
+        operation = "created" if record is None else "reused" if previous == args.head else "updated"
+        if operation != "reused":
+            progress["mutation_may_have_occurred"] = True
+            if record is None:
+                git(repository, "worktree", "add", "--detach", str(checkout), args.head)
+            else:
+                git(checkout, "checkout", "--detach", "--no-overwrite-ignore", args.head)
+        current = checkout_state(checkout, common)
+        if current["head"] != args.head or current["tree"] != args.tree:
+            raise Refusal("unexpected-head", "The staged checkout failed its exact commit/tree postcondition.")
+        updated = {"version": 1, "owner": args.owner, "uid": os.geteuid(),
+                   "checkout": str(checkout), "common_git_dir": str(common),
+                   "common_identity": common_identity, **current}
+        if updated != record:
+            write_record(marker, updated)
+    return {"version": 1, "status": "prepared", "operation": operation,
+            "repository": str(repository), "common_git_dir": str(common),
+            "checkout": str(checkout), "owner": args.owner, "head": args.head,
+            "tree": args.tree, "previous_head": previous, "registry": str(marker),
+            "detached": True, "clean": True, "source_only": True,
+            "external_requirements": ["exclusive_build_lane_ownership", "prior_owned_family_settled"]}
+
+
+def main():
+    progress = {"mutation_may_have_occurred": False}
+    try:
+        parser = Arguments(description=__doc__)
+        for name in ("repository", "checkout", "owner", "head", "tree", "expect-current"):
+            parser.add_argument("--" + name, required=True)
+        result = prepare(parser.parse_args(), progress)
+        status = 0
+    except Refusal as error:
+        result = {"version": 1, "status": "refused", "code": error.code,
+                  "detail": error.detail, **progress}
+        status = 2
+    except (GitFailure, OSError) as error:
+        result = {"version": 1, "status": "failed",
+                  "code": "git-failed" if isinstance(error, GitFailure) else "io-failed",
+                  "detail": str(error), **progress}
+        status = 1
+    print(json.dumps(result, sort_keys=True))
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())
