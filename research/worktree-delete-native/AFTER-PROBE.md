@@ -1,13 +1,16 @@
 The After-only probe is implemented in
 `.github/qualification/native-worktree-delete-after-probe.py`. It is a direct
-child control of `935d94f2ce7b8c228c5f3fe4422a5de031ef3b20`, preserving that
-head's private desktop, bus, C1 and R1 guards and root-authorized shared
-descendant-exit policy while routing snapshot's complete-query retry through
-the same bounded caller wrapper. All predecessors remain immutable.
+child control of `afd158a16855032b8a682f470888d02852a0fec9`, preserving that
+head's snapshot routing, private desktop/bus/C1 and shared descendant policy,
+while fencing each native call and setup effect before and after it under the
+same original absolute budget. All predecessors remain immutable.
 The e5 R1 source negative remains at
 `/tmp/coord-b9-1984-e5df-independent-private-desktop-caller-review.json`,
 SHA256 `9689a90c61e31da7f7ed475e602313c43efe9786c638311587354541105d7c1f`.
-It is preserved evidence of the previous caller gap, not a successor clearance. The original preserved base is
+It is preserved evidence of the previous caller gap, not a successor clearance.
+The afd residual negative is preserved at
+`/tmp/coord-b9-1984-afd1-independent-private-desktop-caller-review.json`,
+SHA256 `8358109a35627e44eccd9e608ab1e4fa0a01c69701d89098c33004131b28b1a9`. The original preserved base is
 `77647db730fd0d5b6ec7f2fc984d5edc94d42a3c`; all of that base's files,
 matched Before `94c3cef719f5cb27637899dfd13e67baca3cbc34` and product After
 `24d0474e250bcc4acc0958cf3abbf53ee1125581` are unchanged. No Before executable
@@ -48,8 +51,15 @@ lifecycle. No numeric PID signal/reap fallback is reachable through the bound
 controller. The caller supplies budget-only file/process reads, explicit child
 environment checks, one original work/final/cleanup deadline and epoch, and
 guarded input/query connections. Each fresh Xlib/XTest call has an immediate
-private-endpoint and absolute-budget guard, including constructor sequences,
-keysym lookup, injection and synchronization. A closed read-only AX adapter
+private-endpoint and absolute-budget guard before and after it, including
+constructor sequences, keysym lookup, injection, synchronization and close.
+Raw return values and handles are retained before the post-check may abort;
+they never imply successful synchronization. Partial constructor objects remain
+strongly held and mark custody UNCONFIRMED. Query-tree buffers retain their
+exact pointers until one returned free call; retained buffers prevent physical
+handback. The original subreaper and signal setup also use pre/post guards,
+and timers arm from the current remaining absolute budget. Final timer disarm
+is refused after fresh cancellation or expiry; only local evidence may follow. A closed read-only AX adapter
 checks each of the existing node/state/component reads before and after the
 call; it has no protocol fallback and preserves complete-query stale retry.
 The caller also binds the original snapshot body under that same bounded

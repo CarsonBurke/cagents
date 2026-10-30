@@ -3,7 +3,7 @@
   "mode": "AFTER_ONLY_CANCEL_NO_REMOVE",
   "never_merge": true,
   "status": "CORRECTIVE_SOURCE_CANDIDATE_FROZEN_HELPER_FRESH_CALLER_REVIEW_REQUIRED_UNGRANTED_UNRUN",
-  "parent_control_head": "935d94f2ce7b8c228c5f3fe4422a5de031ef3b20",
+  "parent_control_head": "afd158a16855032b8a682f470888d02852a0fec9",
   "after": {
     "head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
     "tree": "7d84da268933045b1add2ad310ce45c84be751db"
@@ -137,7 +137,8 @@
       "Seven raw fixture/DB/Git/terminal scope snapshots",
       "B file bytes and .git references/registrations plus A refs and directory identities",
       "Actual four terminal IDs, full HostSessionProof/continuity, launch scopes and unchanged actual sleep PID/start identities",
-      "Explicit final-before-cleanup conservation separate from synthetic resource disposal"
+      "Explicit final-before-cleanup conservation separate from synthetic resource disposal",
+      "Raw per-call Xlib/XTest/setup result receipts, original handler objects retained privately, constructor failure custody and retained/freed query-buffer receipts. These do not imply successful synchronization or natural-parent wait."
     ],
     "limits": "AX/OCR and nonblank machine checks are not independent readability/UX approval. Raw live DB bytes are observational, not a consistent transaction snapshot. No unsaved native editor buffer, backend scanner confirmation, absent/replacement recovery, Before causal result or full feature qualification."
   },
@@ -338,12 +339,20 @@
       "review": "/tmp/coord-b9-1984-e5df-independent-private-desktop-caller-review.json",
       "review_sha256": "9689a90c61e31da7f7ed475e602313c43efe9786c638311587354541105d7c1f"
     },
-    "caller_effect_guards": "Private endpoint and original absolute-budget guard immediately before each fresh Xlib/XTest effect/query. Closed AX adapter exposes only existing read APIs with pre/post guard, no fallback or per-read retry; complete read-only query owns existing stale retry. Input key/click/shortcut and XQueryTree buffers release on successful sequential paths only, never in an effect finally after BaseException.",
+    "caller_effect_guards": "Every Xlib/XTest/AX call has an immediate original-budget/private-endpoint pre/post fence. Raw X returns/handles are retained in memory before post-check; partial constructor objects remain strongly held and sticky UNCONFIRMED. XQueryTree buffers retain exact pointers and one returned-free receipt; unresolved buffers prevent physical-disposed. No native effect in input/screen exception finally.",
     "snapshot_retry_routing": "Caller binds the exact original snapshot body to current bounded complete-query a11y_read. The definition-time old snapshot wrapper is unreachable through the bound controller; no legacy .05s retry sleep after expiry. AX adapter still performs no individual-read retry.",
     "preserved_R1_successor": {
       "head": "935d94f2ce7b8c228c5f3fe4422a5de031ef3b20",
       "tree": "058b081cb009ffb7c71e9c9b2f7d1f3e13822c25",
       "scope": "Immutable R1 guarded-caller source candidate; exact snapshot successor requires fresh source review."
+    },
+    "setup_effect_guards": "prctl, each signal handler installation and each timer syscall use the same original budget pre/post checks. Collection and cleanup timers arm from current strictly positive remaining absolute budget. A fresh cancellation/spent bound refuses final timer-disarm too; later operations are local evidence only. No deadline/epoch renewal.",
+    "preserved_postcheck_candidate": {
+      "head": "afd158a16855032b8a682f470888d02852a0fec9",
+      "tree": "54115f50a12bb5217b1345d4167b55c181a8617c",
+      "review": "/tmp/coord-b9-1984-afd1-independent-private-desktop-caller-review.json",
+      "review_sha256": "8358109a35627e44eccd9e608ab1e4fa0a01c69701d89098c33004131b28b1a9",
+      "scope": "Immutable R1 residual negative: terminal post-call/raw custody/setup effect boundaries. Snapshot routing and prior guards conserved; no clearance transfer."
     }
   }
 }

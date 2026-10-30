@@ -113,6 +113,24 @@ def bind(native, desktop, context):
         guard()
         return value
 
+    def retain_result(label, value):
+        # Memory-only receipt must survive a failing immediate post-check.
+        context.setdefault('native_call_receipts', []).append(dict(
+            call=label, result=value, monotonic=time.monotonic()))
+        return value
+
+    def retain_constructor(function):
+        def construct(self):
+            context.setdefault('observer_objects', []).append(self)
+            try:
+                return function(self)
+            except BaseException as error:
+                state['unconfirmed'] = True
+                context.setdefault('observer_constructor_failures', []).append(dict(
+                    observer=type(self).__name__, error=type(error).__name__ + ': ' + str(error)))
+                raise
+        return construct
+
     def ax_read(function):
         desktop.require_private_desktop()
         value = function()
@@ -334,19 +352,24 @@ def bind(native, desktop, context):
 
     class GuardedScreen(original_screen):
         """Original geometry/capture algorithms, explicit proved connection."""
+        @retain_constructor
         def __init__(self):
             desktop.require_private_desktop()
             self.x = ctypes.CDLL('libX11.so.6')
             self.x.XOpenDisplay.argtypes, self.x.XOpenDisplay.restype = [ctypes.c_char_p], ctypes.c_void_p
             desktop.require_private_desktop()
-            self.display = self.x.XOpenDisplay(os.environ['DISPLAY'].encode('ascii'))
+            self.display = retain_result('Screen.XOpenDisplay', self.x.XOpenDisplay(os.environ['DISPLAY'].encode('ascii')))
+            desktop.require_private_desktop()
             assert self.display
             self.x.XDefaultRootWindow.argtypes, self.x.XDefaultRootWindow.restype = [ctypes.c_void_p], ctypes.c_ulong
             desktop.require_private_desktop()
-            self.root = self.x.XDefaultRootWindow(self.display)
+            self.root = retain_result('Screen.XDefaultRootWindow', self.x.XDefaultRootWindow(self.display))
+            desktop.require_private_desktop()
             self.x.XDefaultScreen.argtypes, self.x.XDefaultScreen.restype = [ctypes.c_void_p], ctypes.c_int
             desktop.require_private_desktop()
-            assert self.x.XDefaultScreen(self.display) == 0
+            default_screen = retain_result('Screen.XDefaultScreen', self.x.XDefaultScreen(self.display))
+            desktop.require_private_desktop()
+            assert default_screen == 0
             self.x.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(native.WindowAttributes)]
             self.x.XTranslateCoordinates.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
                 ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
@@ -357,6 +380,7 @@ def bind(native, desktop, context):
             self.x.XCloseDisplay.argtypes = [ctypes.c_void_p]
             self.x.XSetErrorHandler.argtypes, self.x.XSetErrorHandler.restype = [ctypes.c_void_p], ctypes.c_void_p
             self.errors = []
+            self.query_buffers = []
             def error(display, event):
                 value = event.contents
                 self.errors.append(dict(resource=value.resourceid, serial=value.serial, code=value.error_code,
@@ -364,11 +388,12 @@ def bind(native, desktop, context):
                 return 0
             self.handler = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(native.XError))(error)
             desktop.require_private_desktop()
-            self.previous = self.x.XSetErrorHandler(ctypes.cast(self.handler, ctypes.c_void_p))
+            self.previous = retain_result('Screen.XSetErrorHandler', self.x.XSetErrorHandler(ctypes.cast(self.handler, ctypes.c_void_p)))
+            desktop.require_private_desktop()
 
         def checked(self, status):
             desktop.require_private_desktop()
-            self.x.XSync(self.display, 0)
+            retain_result('Screen.XSync', self.x.XSync(self.display, 0))
             desktop.require_private_desktop()
             if self.errors:
                 native.put(native.OUT / 'x11-query-errors.json', self.errors)
@@ -377,7 +402,9 @@ def bind(native, desktop, context):
         def attributes(self, window):
             attributes = native.WindowAttributes()
             desktop.require_private_desktop()
-            self.checked(self.x.XGetWindowAttributes(self.display, window, ctypes.byref(attributes)))
+            status = retain_result('Screen.XGetWindowAttributes', self.x.XGetWindowAttributes(self.display, window, ctypes.byref(attributes)))
+            desktop.require_private_desktop()
+            self.checked(status)
             assert attributes.root == self.root
             return attributes
 
@@ -386,8 +413,10 @@ def bind(native, desktop, context):
             attributes = self.attributes(window)
             x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
             desktop.require_private_desktop()
-            self.checked(self.x.XTranslateCoordinates(self.display, window, self.root, 0, 0,
+            status = retain_result('Screen.XTranslateCoordinates', self.x.XTranslateCoordinates(self.display, window, self.root, 0, 0,
                 ctypes.byref(x), ctypes.byref(y), ctypes.byref(child)))
+            desktop.require_private_desktop()
+            self.checked(status)
             assert attributes.map_state == 2 and attributes.window_class == 1, 'Client is not viewable InputOutput'
             return dict(X=x.value, Y=y.value, WIDTH=attributes.width, HEIGHT=attributes.height, SCREEN=0)
 
@@ -396,13 +425,23 @@ def bind(native, desktop, context):
             root, parent, count = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_uint()
             children = ctypes.POINTER(ctypes.c_ulong)()
             desktop.require_private_desktop()
-            self.checked(self.x.XQueryTree(self.display, window, ctypes.byref(root), ctypes.byref(parent),
+            status = retain_result('Screen.XQueryTree', self.x.XQueryTree(self.display, window, ctypes.byref(root), ctypes.byref(parent),
                 ctypes.byref(children), ctypes.byref(count)))
+            if children:
+                self.query_buffers.append(children)
+                context.setdefault('native_buffer_receipts', []).append(dict(
+                    address=ctypes.cast(children, ctypes.c_void_p).value, phase='RETAINED'))
+            desktop.require_private_desktop()
+            self.checked(status)
             assert root.value == self.root and count.value < 10000
             result = parent.value, [children[i] for i in range(count.value)]
             if children:
                 desktop.require_private_desktop()
-                self.x.XFree(children)
+                retain_result('Screen.XFree', self.x.XFree(children))
+                self.query_buffers.remove(children)
+                context.setdefault('native_buffer_receipts', []).append(dict(
+                    address=ctypes.cast(children, ctypes.c_void_p).value, phase='FREE_RETURNED'))
+                desktop.require_private_desktop()
             return result
 
         def state(self, window):
@@ -412,18 +451,21 @@ def bind(native, desktop, context):
         def close(self):
             self.checked(True)
             desktop.require_private_desktop()
-            self.x.XCloseDisplay(self.display)
+            retain_result('Screen.XCloseDisplay', self.x.XCloseDisplay(self.display))
             desktop.require_private_desktop()
-            self.x.XSetErrorHandler(self.previous)
+            retain_result('Screen.XSetErrorHandler.restore', self.x.XSetErrorHandler(self.previous))
+            desktop.require_private_desktop()
 
     class GuardedInputs(original_inputs):
         """Original event semantics, owned endpoint and effect entry guards."""
+        @retain_constructor
         def __init__(self):
             desktop.require_private_desktop()
             self.x, self.t = ctypes.CDLL('libX11.so.6'), ctypes.CDLL('libXtst.so.6')
             self.x.XOpenDisplay.argtypes, self.x.XOpenDisplay.restype = [ctypes.c_char_p], ctypes.c_void_p
             desktop.require_private_desktop()
-            self.display = self.x.XOpenDisplay(os.environ['DISPLAY'].encode('ascii'))
+            self.display = retain_result('Inputs.XOpenDisplay', self.x.XOpenDisplay(os.environ['DISPLAY'].encode('ascii')))
+            desktop.require_private_desktop()
             assert self.display
             self.x.XStringToKeysym.argtypes, self.x.XStringToKeysym.restype = [ctypes.c_char_p], ctypes.c_ulong
             self.x.XKeysymToKeycode.argtypes, self.x.XKeysymToKeycode.restype = [ctypes.c_void_p, ctypes.c_ulong], ctypes.c_ubyte
@@ -433,7 +475,9 @@ def bind(native, desktop, context):
             self.t.XTestFakeKeyEvent.argtypes = self.t.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
             values = [ctypes.c_int() for _ in range(4)]
             desktop.require_private_desktop()
-            assert self.t.XTestQueryExtension(self.display, *[ctypes.byref(value) for value in values])
+            extension = retain_result('Inputs.XTestQueryExtension', self.t.XTestQueryExtension(self.display, *[ctypes.byref(value) for value in values]))
+            desktop.require_private_desktop()
+            assert extension
             native.put(native.OUT / 'xtest.json', dict(event_base=values[0].value, error_base=values[1].value,
                 major=values[2].value, minor=values[3].value))
             self.keys, self.buttons = set(), set()
@@ -444,23 +488,27 @@ def bind(native, desktop, context):
                     ((kind == 'key' and value in ('Return', 'space')) or (kind == 'button' and value == 1)))
             if kind == 'key':
                 desktop.require_private_desktop()
-                symbol = self.x.XStringToKeysym(value.encode('ascii'))
+                symbol = retain_result('Inputs.XStringToKeysym', self.x.XStringToKeysym(value.encode('ascii')))
                 desktop.require_private_desktop()
-                code = self.x.XKeysymToKeycode(self.display, symbol)
+                code = retain_result('Inputs.XKeysymToKeycode', self.x.XKeysymToKeycode(self.display, symbol))
+                desktop.require_private_desktop()
                 assert symbol and code
                 pressed = self.keys
                 if down:
                     pressed.add(value)
                 desktop.require_private_desktop()
-                result = self.t.XTestFakeKeyEvent(self.display, code, int(down), 0)
+                result = retain_result('Inputs.XTestFakeKeyEvent', self.t.XTestFakeKeyEvent(self.display, code, int(down), 0))
+                desktop.require_private_desktop()
             else:
                 code, pressed = value, self.buttons
                 if down:
                     pressed.add(value)
                 desktop.require_private_desktop()
-                result = self.t.XTestFakeButtonEvent(self.display, code, int(down), 0)
+                result = retain_result('Inputs.XTestFakeButtonEvent', self.t.XTestFakeButtonEvent(self.display, code, int(down), 0))
+                desktop.require_private_desktop()
             desktop.require_private_desktop()
-            self.x.XSync(self.display, 0)
+            retain_result('Inputs.XSync', self.x.XSync(self.display, 0))
+            desktop.require_private_desktop()
             if result and not down:
                 pressed.discard(value)
             desktop.require_private_desktop()
@@ -511,15 +559,18 @@ def bind(native, desktop, context):
             event.client.type, event.client.send_event = 33, 1
             event.client.display, event.client.window = self.display, int(window)
             desktop.require_private_desktop()
-            event.client.message_type = self.x.XInternAtom(self.display, b'WM_PROTOCOLS', 0)
+            event.client.message_type = retain_result('Inputs.XInternAtom.protocols', self.x.XInternAtom(self.display, b'WM_PROTOCOLS', 0))
+            desktop.require_private_desktop()
             event.client.format = 32
             desktop.require_private_desktop()
-            event.client.data.longs[0] = self.x.XInternAtom(self.display, b'WM_DELETE_WINDOW', 0)
+            event.client.data.longs[0] = retain_result('Inputs.XInternAtom.delete', self.x.XInternAtom(self.display, b'WM_DELETE_WINDOW', 0))
+            desktop.require_private_desktop()
             event.client.data.longs[1] = 0
             desktop.require_private_desktop()
-            result = self.x.XSendEvent(self.display, int(window), 0, 0, ctypes.byref(event))
+            result = retain_result('Inputs.XSendEvent', self.x.XSendEvent(self.display, int(window), 0, 0, ctypes.byref(event)))
             desktop.require_private_desktop()
-            self.x.XSync(self.display, 0)
+            retain_result('Inputs.XSync.close', self.x.XSync(self.display, 0))
+            desktop.require_private_desktop()
             native.EVENTS.append(dict(arm=native.ACTIVE, monotonic=time.monotonic(), kind='WM_DELETE_WINDOW',
                 window=window, injection_return=result))
             assert result, 'Native close request refused'
@@ -531,7 +582,8 @@ def bind(native, desktop, context):
                     self.event(kind, value, False, 'cleanup')
             assert not self.keys and not self.buttons
             desktop.require_private_desktop()
-            self.x.XCloseDisplay(self.display)
+            retain_result('Inputs.XCloseDisplay', self.x.XCloseDisplay(self.display))
+            desktop.require_private_desktop()
 
     # Explicit callback/state closure. No copied process table or implicit
     # supervisor exists in the shared capsule.
@@ -557,5 +609,6 @@ def bind(native, desktop, context):
     native.bootstrap = desktop.bootstrap
     native.require_private_desktop = desktop.require_private_desktop
     native.PRIVATE_DESKTOP = desktop
+    native.retain_native_result = retain_result
     native.NativeScreen, native.Inputs = GuardedScreen, GuardedInputs
     return native

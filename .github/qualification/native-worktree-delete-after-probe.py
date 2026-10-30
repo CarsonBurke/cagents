@@ -22,7 +22,7 @@ import sys
 import time
 
 CONTROL_BASE = '77647db730fd0d5b6ec7f2fc984d5edc94d42a3c'
-PARENT = '935d94f2ce7b8c228c5f3fe4422a5de031ef3b20'
+PARENT = 'afd158a16855032b8a682f470888d02852a0fec9'
 AFTER = '24d0474e250bcc4acc0958cf3abbf53ee1125581'
 AFTER_TREE = '7d84da268933045b1add2ad310ce45c84be751db'
 NATIVE, CONTEXT, INPUTS = None, None, None
@@ -67,7 +67,7 @@ def gates(args):
     assert manifest['mode'] == 'AFTER_ONLY_CANCEL_NO_REMOVE'
     assert set(git(control, 'diff', '--name-only', CONTROL_BASE, 'HEAD').splitlines()) == set(manifest['control_paths_from_base'])
     # Every original base control/product entry, including Before pins, is
-    # retained. The direct predecessor is the separately preserved 935 candidate;
+    # retained. The direct predecessor is the separately preserved afd candidate;
     # historical source clearance does not establish this exact composition.
     removed_or_modified = git(control, 'diff', '--name-only', '--diff-filter=DMRTUXB', CONTROL_BASE, 'HEAD')
     assert removed_or_modified == ''
@@ -558,16 +558,18 @@ def close_probe_inputs(inputs):
             inputs.event(kind, value, False, 'cleanup')
     assert not inputs.keys and not inputs.buttons, 'Held input cleanup incomplete'
     NATIVE.require_private_desktop()
-    inputs.x.XCloseDisplay(inputs.display)
+    NATIVE.retain_native_result('Probe.Inputs.XCloseDisplay', inputs.x.XCloseDisplay(inputs.display))
+    NATIVE.require_private_desktop()
 
 
 def close_probe_screen(screen):
     """Sequential observer shutdown; no native operation in an abort finally."""
     screen.checked(True)
     NATIVE.require_private_desktop()
-    screen.x.XCloseDisplay(screen.display)
+    NATIVE.retain_native_result('Probe.Screen.XCloseDisplay', screen.x.XCloseDisplay(screen.display))
     NATIVE.require_private_desktop()
-    screen.x.XSetErrorHandler(screen.previous)
+    NATIVE.retain_native_result('Probe.Screen.XSetErrorHandler.restore', screen.x.XSetErrorHandler(screen.previous))
+    NATIVE.require_private_desktop()
 
 
 def cleanup(context):
@@ -647,6 +649,12 @@ def cleanup(context):
     if unsettled_pins or p.PIDFD_FAILURES:
         errors.append(dict(stage='original-pidfd-custody-retained', pins=unsettled_pins,
             admission_or_release_failures=list(p.PIDFD_FAILURES)))
+    retained_buffers = [ctypes.cast(buffer, ctypes.c_void_p).value
+        for observer in context.get('observer_objects', [])
+        for buffer in getattr(observer, 'query_buffers', [])]
+    if retained_buffers:
+        p.CALLER_STATE['unconfirmed'] = True
+        errors.append(dict(stage='native-buffers-retained', addresses=retained_buffers))
     context['cleanup_process_status'] = (
         'OBSERVED_NO_OWNED_PROCESSES' if not remaining else 'OWNED_PROCESSES_REMAIN')
     context['cleanup_physical_status'] = ('OBSERVED_DISPOSED' if not remaining and
@@ -658,6 +666,7 @@ def cleanup(context):
         process_status=context['cleanup_process_status'],
         observer_status=context.get('cleanup_observer_status', 'UNCONFIRMED'),
         retained_pidfds=unsettled_pins, pidfd_failures=p.PIDFD_FAILURES,
+        retained_native_buffers=retained_buffers,
         retained_fixture=str(context.get('fixture')), directories_removed=False))
     return errors
 
@@ -722,13 +731,23 @@ def main():
         grant_id=context['lease']['grant_id'], collection_seconds=context['seconds'],
         requested_renderer=native.REQUESTED_RENDERER,
         policy='Natural hosted User; HOME/CODEX_HOME/inherited opaque authority retained; no provider'))
-    assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
-    signal.signal(signal.SIGTERM, native.cancelled)
-    signal.signal(signal.SIGINT, native.cancelled)
-    signal.signal(signal.SIGALRM, native.cancelled)
-    signal.setitimer(signal.ITIMER_REAL, context['seconds'])
     failed, error_record, cleanup_errors = True, None, []
     try:
+        native.check_native_budget()
+        subreaper = native.retain_native_result('Setup.prctl', ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0))
+        native.check_native_budget()
+        assert subreaper == 0
+        for signum in [signal.SIGTERM, signal.SIGINT, signal.SIGALRM]:
+            native.check_native_budget()
+            previous = signal.signal(signum, native.cancelled)
+            context.setdefault('setup_original_signal_handlers', []).append(previous)
+            context.setdefault('setup_signal_receipts', []).append(dict(signum=signum,
+                previous_type=type(previous).__name__, previous_repr=repr(previous)))
+            native.check_native_budget()
+        native.check_native_budget()
+        native.retain_native_result('Setup.setitimer.collection',
+            signal.setitimer(signal.ITIMER_REAL, native.check_native_budget()))
+        native.check_native_budget()
         for tool in ['xdotool', 'xdpyinfo', 'import', 'openbox', 'gdbus', 'tesseract']:
             assert shutil.which(tool), 'Required observation tool absent: ' + tool
         desktop_root = out / 'owned-desktop'
@@ -780,10 +799,14 @@ def main():
     finally:
         # Collection never gets more time. Only bounded cleanup uses the
         # separately pre-granted allowance, including after the first failure.
-        signal.setitimer(signal.ITIMER_REAL, 0)
         try:
-            cleanup_remaining = native.begin_probe_cleanup()
-            signal.setitimer(signal.ITIMER_REAL, cleanup_remaining)
+            native.begin_probe_cleanup()
+            native.check_native_budget()
+            native.retain_native_result('Cleanup.setitimer.disarm.collection', signal.setitimer(signal.ITIMER_REAL, 0))
+            native.check_native_budget()
+            native.retain_native_result('Cleanup.setitimer.arm',
+                signal.setitimer(signal.ITIMER_REAL, native.check_native_budget()))
+            native.check_native_budget()
             cleanup_errors = cleanup_handback(context)
         except BaseException as cleanup_error:
             context['cleanup_physical_status'] = 'UNCONFIRMED'
@@ -791,7 +814,22 @@ def main():
             cleanup_errors.append(dict(stage='cleanup-entry-aborted', type=type(cleanup_error).__name__,
                 error=str(cleanup_error)))
         finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            # A spent budget/fresh cancellation permits only local evidence;
+            # it does not authorize one more timer syscall in a finally.
+            try:
+                native.check_native_budget()
+                native.retain_native_result('Cleanup.setitimer.disarm.final', signal.setitimer(signal.ITIMER_REAL, 0))
+                native.check_native_budget()
+            except BaseException as timer_error:
+                context['cleanup_physical_status'] = 'UNCONFIRMED'
+                cleanup_errors = context.setdefault('cleanup_errors', [])
+                cleanup_errors.append(dict(stage='cleanup-timer-unconfirmed',
+                    type=type(timer_error).__name__, error=str(timer_error)))
+        native.put(out / 'native-call-receipts.json', dict(
+            calls=context.get('native_call_receipts', []),
+            buffers=context.get('native_buffer_receipts', []),
+            signal_handlers=context.get('setup_signal_receipts', []),
+            observer_constructor_failures=context.get('observer_constructor_failures', [])))
         native.put(out / 'inputs.json', native.EVENTS)
         native.put(out / 'commands.json', native.COMMANDS)
         native.put(out / 'owned-processes.json', native.OWNED)
