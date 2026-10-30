@@ -6135,6 +6135,130 @@ mod tests {
     }
 
     #[test]
+    fn child_record_budget_refusal_does_not_block_other_child_results() {
+        let store = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::chat::runtime::Store::new().unwrap(),
+        ));
+        let reader = crate::chat::runtime::Store::adapter_reader_for_test(&store);
+        let mut adapter = Claude::default();
+        adapter.bind_item_reader(reader.clone());
+        for parent in ["one", "two"] {
+            let step = adapter
+                .receive(scoped_call(
+                    Some(parent),
+                    &format!("call-{parent}"),
+                    "same",
+                    "Opaque",
+                    json!({"scope":parent}),
+                ))
+                .unwrap();
+            commit_tool_fixture(&mut adapter, &store, step);
+        }
+        // Fill the real Store through admission, not an injected budget value.
+        // Its 8,192-record bound includes the two calls above. The decoder's
+        // small optional cache still holds both child-scoped calls.
+        for index in 0..8190 {
+            let events = store
+                .lock()
+                .unwrap()
+                .apply(Event::SubagentItem {
+                    id: "filler-child".into(),
+                    item: Item {
+                        id: format!("filler-{index}"),
+                        role: Role::Assistant,
+                        at: None,
+                        started_at: None,
+                        content: ItemContent::Tool {
+                            name: "Opaque".into(),
+                            input: "{}".into(),
+                            output: String::new(),
+                            status: ToolStatus::Running,
+                        },
+                    },
+                })
+                .unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+        }
+        let refused = store
+            .lock()
+            .unwrap()
+            .apply(Event::SubagentItem {
+                id: "refused-child".into(),
+                item: Item {
+                    id: "same".into(),
+                    role: Role::Assistant,
+                    at: None,
+                    started_at: None,
+                    content: ItemContent::Tool {
+                        name: "Opaque".into(),
+                        input: "{}".into(),
+                        output: String::new(),
+                        status: ToolStatus::Running,
+                    },
+                },
+            })
+            .unwrap();
+        assert!(
+            refused
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        for (parent, failed) in [("one", false), ("two", true)] {
+            let output = format!("exact result for {parent}");
+            let expected = ItemContent::Tool {
+                name: "Opaque".into(),
+                input: json!({"scope":parent}).to_string(),
+                output: output.clone(),
+                status: if failed {
+                    ToolStatus::Failed
+                } else {
+                    ToolStatus::Succeeded
+                },
+            };
+            let step = adapter
+                .receive(json!({"type":"user","uuid":format!("result-{parent}"),"parent_tool_use_id":parent,"message":{"content":[{"type":"tool_result","tool_use_id":"same","is_error":failed,"content":output}]}}))
+                .unwrap();
+            assert!(
+                step.events.iter().any(|event| matches!(
+                    event,
+                    Event::SubagentItem { id, item }
+                        if id == parent && item.id == "same" && item.content == expected
+                )),
+                "another child's budget refusal must not discard this result: {:?}",
+                step.events
+            );
+            assert!(
+                !step
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Error { .. }))
+            );
+            commit_tool_fixture(&mut adapter, &store, step);
+            assert_eq!(
+                reader
+                    .read(&super::super::CanonicalItemKey::new(Some(parent), "same"))
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                expected
+            );
+        }
+        assert!(
+            reader
+                .read(&super::super::CanonicalItemKey::new(
+                    Some("refused-child"),
+                    "same"
+                ))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn stopped_generic_tools_keep_canonical_input_and_accept_scoped_results() {
         fn receive_committed(
             adapter: &mut Claude,

@@ -26,11 +26,27 @@ pub(super) struct Pending {
 }
 
 impl Store {
-    fn child_source_refused(&mut self, reason: &'static str) -> Option<String> {
-        let first = self.child_tools_unavailable.is_none();
-        self.child_tools_unavailable = Some(reason);
-        self.pending_child_tool = None;
-        first.then(|| reason.into())
+    fn child_record_refused(
+        &mut self,
+        agent: &str,
+        id: &str,
+        reason: &'static str,
+    ) -> Result<Option<String>, String> {
+        // A refused record does not corrupt the other children's source. Revoke
+        // an admitted record so its old body cannot stand in for the update.
+        // Unknown identities allocate no tombstone, including oversized keys;
+        // existing revocations stay charged to the same bounded item budget.
+        if agent.len() <= KEY_BYTES && id.len() <= KEY_BYTES {
+            self.revoke_child_tool(agent, id)?;
+        }
+        if self
+            .pending_child_tool
+            .as_ref()
+            .is_some_and(|pending| pending.agent == agent && pending.id == id)
+        {
+            self.pending_child_tool = None;
+        }
+        Ok(Some(reason.into()))
     }
 
     fn child_tool_revoked(&self, agent: &str, id: &str) -> Result<bool, String> {
@@ -155,21 +171,25 @@ impl Store {
         };
         if let Some((agent, id, offset, delta, input)) = delta {
             if agent.len() > KEY_BYTES || id.len() > KEY_BYTES {
-                return Ok(self.child_source_refused(BUDGET_ERROR));
+                return self.child_record_refused(agent, id, BUDGET_ERROR);
             }
-            if self.pending_child_tool.as_ref().is_some_and(|pending| {
+            let warning = if self.pending_child_tool.as_ref().is_some_and(|pending| {
                 pending.agent != *agent
                     || pending.id != *id
                     || pending.input != input
                     || pending.offset.checked_add(pending.delta.len()) != Some(offset)
                     || pending.delta.len().saturating_add(delta.len()) > PENDING_BYTES
             }) {
-                if let Some(warning) = self.flush_child_tool()? {
-                    return Ok(Some(warning));
-                }
+                self.flush_child_tool()?
+            } else {
+                None
+            };
+            if warning.is_some() && self.child_tool_revoked(agent, id)? {
+                return Ok(warning);
             }
             if delta.len() > PENDING_BYTES {
-                return self.append_child_tool(agent, id, input, offset, delta);
+                let appended = self.append_child_tool(agent, id, input, offset, delta)?;
+                return Ok(warning.or(appended));
             }
             if let Some(pending) = &mut self.pending_child_tool {
                 pending.delta.push_str(delta);
@@ -182,7 +202,7 @@ impl Store {
                     delta: delta.clone(),
                 });
             }
-            return Ok(None);
+            return Ok(warning);
         }
         let replaces_pending = match event {
             Event::SubagentItem { id, item } => self
@@ -215,7 +235,7 @@ impl Store {
     fn put_child_tool(&mut self, agent: &str, original: &Item) -> Result<Option<String>, String> {
         let id = &original.id;
         if agent.len() > KEY_BYTES || id.len() > KEY_BYTES {
-            return Ok(self.child_source_refused(BUDGET_ERROR));
+            return self.child_record_refused(agent, id, BUDGET_ERROR);
         }
         if self.child_tool_revoked(agent, id)? {
             return Ok(Some(
@@ -233,7 +253,7 @@ impl Store {
             } => {
                 identity = identity.saturating_add(name.len());
                 if identity > METADATA_LIMIT {
-                    return Ok(self.child_source_refused(BUDGET_ERROR));
+                    return self.child_record_refused(agent, id, BUDGET_ERROR);
                 }
                 (
                     ItemContent::Tool {
@@ -261,7 +281,7 @@ impl Store {
                     .saturating_add(command.len())
                     .saturating_add(working_directory.len());
                 if identity > METADATA_LIMIT {
-                    return Ok(self.child_source_refused(BUDGET_ERROR));
+                    return self.child_record_refused(agent, id, BUDGET_ERROR);
                 }
                 (
                     ItemContent::Command {
@@ -286,14 +306,14 @@ impl Store {
                     if let crate::chat::ChangeKind::Renamed { from } = &change.kind {
                         identity = identity.saturating_add(from.len());
                         if from.is_empty() || from.contains('\0') {
-                            return Ok(self.child_source_refused(SOURCE_ERROR));
+                            return self.child_record_refused(agent, id, SOURCE_ERROR);
                         }
                     }
                     if change.path.is_empty() || change.path.contains('\0') {
-                        return Ok(self.child_source_refused(SOURCE_ERROR));
+                        return self.child_record_refused(agent, id, SOURCE_ERROR);
                     }
                     if identity > METADATA_LIMIT {
-                        return Ok(self.child_source_refused(BUDGET_ERROR));
+                        return self.child_record_refused(agent, id, BUDGET_ERROR);
                     }
                 }
                 (
@@ -327,7 +347,7 @@ impl Store {
             }
         }
         if lengths[0].saturating_add(lengths[1]) > ITEM_BYTES {
-            return Ok(self.child_source_refused(BUDGET_ERROR));
+            return self.child_record_refused(agent, id, BUDGET_ERROR);
         }
         let mut item = Item {
             id: id.clone(),
@@ -357,7 +377,7 @@ impl Store {
         let metadata = postcard::to_stdvec(&item).map_err(|e| e.to_string())?;
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
         if metadata.len() > METADATA_LIMIT || spans.len() > METADATA_LIMIT {
-            return Ok(self.child_source_refused(BUDGET_ERROR));
+            return self.child_record_refused(agent, id, BUDGET_ERROR);
         }
         let preserve_input = matches!(&original.content,ItemContent::Tool{input,..} if input.is_empty())
             && previous.as_ref().is_some_and(|(_, _, bytes)| {
@@ -415,7 +435,7 @@ impl Store {
                 .saturating_add(chunks)
                 > STORE_CHUNKS
         {
-            return Ok(self.child_source_refused(BUDGET_ERROR));
+            return self.child_record_refused(agent, id, BUDGET_ERROR);
         }
         let tx = self.db.transaction().map_err(|e| e.to_string())?;
         tx.execute("INSERT INTO child_tools VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(agent,id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,spans=excluded.spans,cost=excluded.cost",params![agent,id,metadata,lengths[0],lengths[1],spans,cost]).map_err(|e|e.to_string())?;
@@ -477,7 +497,7 @@ impl Store {
             .optional()
             .map_err(|e| e.to_string())?;
         let Some((bytes, len0, len1)) = record else {
-            return Ok(self.child_source_refused(SOURCE_ERROR));
+            return self.child_record_refused(agent, id, SOURCE_ERROR);
         };
         let item: Item = postcard::from_bytes(&bytes).map_err(|e| e.to_string())?;
         let field = match item.content {
@@ -489,11 +509,11 @@ impl Store {
                 }
             }
             ItemContent::Command { .. } if !input => 0,
-            _ => return Ok(self.child_source_refused(SOURCE_ERROR)),
+            _ => return self.child_record_refused(agent, id, SOURCE_ERROR),
         };
         let length = if field == 0 { len0 } else { len1 };
         if offset != length {
-            return Ok(self.child_source_refused(SOURCE_ERROR));
+            return self.child_record_refused(agent, id, SOURCE_ERROR);
         }
         let (total, total_chunks): (usize, usize) = self
             .db
@@ -511,7 +531,7 @@ impl Store {
             || total.saturating_add(cost) > STORE_BYTES
             || total_chunks.saturating_add(chunks) > STORE_CHUNKS
         {
-            return Ok(self.child_source_refused(BUDGET_ERROR));
+            return self.child_record_refused(agent, id, BUDGET_ERROR);
         }
         let tx = self.db.transaction().map_err(|e| e.to_string())?;
         insert_fragments(&tx, agent, id, field, offset, &[delta])?;
@@ -1468,11 +1488,13 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, Event::Error { fatal: false, .. }))
             );
-            assert!(
-                store
-                    .child_adapter_item(&CanonicalItemKey::new(Some("child"), "old"))
-                    .is_err()
+            assert_eq!(
+                read(&mut store, "child", "old"),
+                Some(tool("old", "preserved", "")),
+                "refusing a new record must not hide an admitted record"
             );
+            assert!(read(&mut store, "child", "new").is_none());
+            assert!(store.child_tools_unavailable.is_none());
             assert_eq!(
                 store
                     .db
@@ -1492,6 +1514,7 @@ mod tests {
         }
         let mut store = Store::new().unwrap();
         put(&mut store, "child", tool("tool", "known", ""));
+        put(&mut store, "other", tool("tool", "unrelated", ""));
         store
             .apply(Event::SubagentOutputDelta {
                 id: "child".into(),
@@ -1505,7 +1528,48 @@ mod tests {
         // committed SQL. Exercise that boundary rather than the raw SQL helper.
         assert!(store.flush_child_adapter_read(&key).is_err());
         assert!(store.child_adapter_item(&key).is_err());
-        assert!(store.child_tools_unavailable.is_some());
+        assert!(store.child_tools_unavailable.is_none());
+        assert_eq!(
+            read(&mut store, "other", "tool"),
+            Some(tool("tool", "unrelated", ""))
+        );
+    }
+
+    #[test]
+    fn refused_child_batch_preserves_the_next_child_delta() {
+        let mut store = Store::new().unwrap();
+        put(&mut store, "one", tool("same", "first input", ""));
+        put(&mut store, "two", tool("same", "second input", ""));
+        store
+            .apply(Event::SubagentOutputDelta {
+                id: "one".into(),
+                item_id: "same".into(),
+                offset: 99,
+                delta: "missing prefix".into(),
+            })
+            .unwrap();
+        let warnings = store
+            .apply(Event::SubagentOutputDelta {
+                id: "two".into(),
+                item_id: "same".into(),
+                offset: 0,
+                delta: "exact second output".into(),
+            })
+            .unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|event| matches!(event, Event::Error { fatal: false, .. }))
+        );
+        assert!(
+            store
+                .child_adapter_item(&CanonicalItemKey::new(Some("one"), "same"))
+                .is_err()
+        );
+        assert_eq!(
+            read(&mut store, "two", "same"),
+            Some(tool("same", "second input", "exact second output"))
+        );
     }
 
     #[test]
