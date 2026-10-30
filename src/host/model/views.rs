@@ -2249,4 +2249,366 @@ mod tests {
     }
 
     include!("views/placement_tests.rs");
+
+    #[test]
+    fn issue_2016_shared_draft_choice_pair_commits_atomically_and_survives_registry_reopen() {
+        use crate::agent::Provider;
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::PermissionsExt;
+
+        for (provider, permission_flag, permission, effort_flag, effort) in [
+            (
+                Provider::Claude,
+                "--permission-mode",
+                "default",
+                "--effort",
+                "high",
+            ),
+            (
+                Provider::Codex,
+                "--ask-for-approval",
+                "on-request",
+                "--config",
+                "model_reasoning_effort=high",
+            ),
+            (
+                Provider::Omp,
+                "--approval-mode",
+                "ask",
+                "--thinking",
+                "high",
+            ),
+        ] {
+            let (mut registry, directory, channel, _) = setup();
+            assert_eq!(
+                directory.path().metadata().unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            let path = directory.path().join("model.sqlite3");
+            let scope = Scope::Channel(channel);
+            let mut original = pane();
+            original.kind = CardKind::Chat(crate::chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider,
+                    recipe: crate::model::LaunchRecipe {
+                        program: format!("/private/tools/{}", provider.executable()),
+                        arguments: [
+                            permission_flag,
+                            permission,
+                            "--model",
+                            "model-a",
+                            effort_flag,
+                            effort,
+                        ]
+                        .map(str::to_owned)
+                        .to_vec(),
+                        working_directory: "/repo/worktree".into(),
+                        environment: BTreeMap::from([
+                            ("HOME".into(), "/private/account-a".into()),
+                            ("KEEP_POLICY".into(), "literal value".into()),
+                        ]),
+                        unset_environment: ["PROVIDER_TOKEN".into()].into(),
+                    },
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            });
+            seed(&mut registry, channel, vec![original.clone()]);
+            let before = registry.model().unwrap();
+            let revision = registry.view_revision(&scope).unwrap();
+            let mut desired = original.clone();
+            let CardKind::Chat(chat) = &mut desired.kind else {
+                unreachable!()
+            };
+            let expected_arguments = [permission_flag, permission, "--model", "model-b"]
+                .map(str::to_owned)
+                .to_vec();
+            // B with provider-default effort is one source replacement, never B/high.
+            chat.launch.recipe.arguments = expected_arguments.clone();
+            let change = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original.clone(),
+                    pane: desired.clone(),
+                },
+            );
+            let ModelEdit::ChangeView { operation, .. } = &change else {
+                unreachable!()
+            };
+            registry.db.execute_batch("CREATE TEMP TRIGGER fail_shared_choice BEFORE UPDATE OF panes ON shared_views BEGIN SELECT RAISE(ABORT, 'fixture shared choice failure'); END;").unwrap();
+            assert!(
+                registry
+                    .apply(&change)
+                    .unwrap_err()
+                    .contains("fixture shared choice failure")
+            );
+            assert_eq!(registry.model().unwrap(), before);
+            assert!(!registry.view_operation_seen(*operation).unwrap());
+            registry
+                .db
+                .execute_batch("DROP TRIGGER fail_shared_choice")
+                .unwrap();
+
+            let committed = registry.apply(&change).unwrap();
+            assert!(committed.changed);
+            assert_eq!(committed.model.sequence, before.sequence + 1);
+            assert!(registry.view_operation_seen(*operation).unwrap());
+            assert_eq!(registry.view_revision(&scope).unwrap(), revision + 1);
+            assert_eq!(
+                read(&registry.db, &scope).unwrap().panes,
+                vec![desired.clone()]
+            );
+            drop(registry);
+
+            let second_client = Registry::at(&path).unwrap();
+            assert_eq!(second_client.model().unwrap(), committed.model);
+            assert!(second_client.view_operation_seen(*operation).unwrap());
+            let reopened = read(&second_client.db, &scope).unwrap();
+            assert_eq!(reopened.revision, revision + 1);
+            assert_eq!(reopened.panes, vec![desired]);
+            let CardKind::Chat(actual) = &reopened.panes[0].kind else {
+                unreachable!()
+            };
+            assert_eq!(actual.launch.recipe.arguments, expected_arguments);
+            let CardKind::Chat(source) = &original.kind else {
+                unreachable!()
+            };
+            let mut unchanged = actual.clone();
+            unchanged.launch.recipe.arguments = source.launch.recipe.arguments.clone();
+            assert_eq!(unchanged, *source, "only the atomic choice slots changed");
+        }
+    }
+
+    #[test]
+    fn issue_2016_shared_draft_choice_rebased_revision_cannot_overwrite_concurrent_source() {
+        use crate::agent::Provider;
+        use std::collections::BTreeMap;
+
+        for advance in ["account", "permission", "provider"] {
+            let (mut registry, directory, channel, _) = setup();
+            let path = directory.path().join("model.sqlite3");
+            let scope = Scope::Channel(channel);
+            let mut original = pane();
+            original.kind = CardKind::Chat(crate::chat::Session {
+                id: crate::model::TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: Provider::Claude,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "/private/tools/claude".into(),
+                        arguments: [
+                            "--permission-mode",
+                            "default",
+                            "--model",
+                            "model-a",
+                            "--effort",
+                            "high",
+                        ]
+                        .map(str::to_owned)
+                        .to_vec(),
+                        working_directory: "/repo/worktree".into(),
+                        environment: BTreeMap::from([(
+                            "CLAUDE_CONFIG_DIR".into(),
+                            "/private/account-a".into(),
+                        )]),
+                        unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+                    },
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            });
+            seed(&mut registry, channel, vec![original.clone()]);
+            let mut requested = original.clone();
+            let CardKind::Chat(chat) = &mut requested.kind else {
+                unreachable!()
+            };
+            chat.launch.recipe.arguments = ["--permission-mode", "default", "--model", "model-b"]
+                .map(str::to_owned)
+                .to_vec();
+            requested.title = "stale choice presentation".into();
+            requested.width_fraction = 0.75;
+            let mut delayed = edit(
+                &mut registry,
+                channel,
+                Change::Update {
+                    before: original.clone(),
+                    pane: requested,
+                },
+            );
+            let mut writer = Registry::at(&path).unwrap();
+            let mut current = original.clone();
+            let CardKind::Chat(chat) = &mut current.kind else {
+                unreachable!()
+            };
+            match advance {
+                "account" => {
+                    chat.launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/private/account-b".into());
+                }
+                "permission" => chat.launch.recipe.arguments[1] = "plan".into(),
+                "provider" => {
+                    chat.launch.provider = Provider::Codex;
+                    chat.launch.recipe.program = "/private/tools/codex".into();
+                    chat.launch.recipe.arguments = [
+                        "--ask-for-approval",
+                        "on-request",
+                        "--model",
+                        "destination-model",
+                    ]
+                    .map(str::to_owned)
+                    .to_vec();
+                    chat.launch.recipe.environment =
+                        BTreeMap::from([("CODEX_HOME".into(), "/private/account-c".into())]);
+                    chat.launch.recipe.unset_environment = ["OPENAI_API_KEY".into()].into();
+                }
+                _ => unreachable!(),
+            }
+            let concurrent = edit(
+                &mut writer,
+                channel,
+                Change::Update {
+                    before: original,
+                    pane: current.clone(),
+                },
+            );
+            assert!(writer.apply(&concurrent).unwrap().changed);
+            let ModelEdit::ChangeView {
+                expected_revision,
+                operation,
+                ..
+            } = &mut delayed
+            else {
+                unreachable!()
+            };
+            *expected_revision = registry.view_revision(&scope).unwrap();
+            let operation = *operation;
+            let canonical = registry.model().unwrap();
+            assert_eq!(
+                registry.apply(&delayed).unwrap_err(),
+                Registry::VIEW_SOURCE_CONFLICT,
+                "a fresh revision does not authorize an old {advance} source"
+            );
+            assert_eq!(registry.model().unwrap(), canonical);
+            assert_eq!(
+                read(&registry.db, &scope).unwrap().panes,
+                vec![current.clone()]
+            );
+            assert!(!registry.view_operation_seen(operation).unwrap());
+            drop(writer);
+            drop(registry);
+            let reopened = Registry::at(&path).unwrap();
+            assert_eq!(reopened.model().unwrap(), canonical);
+            assert_eq!(read(&reopened.db, &scope).unwrap().panes, vec![current]);
+            assert!(!reopened.view_operation_seen(operation).unwrap());
+        }
+    }
+
+    #[test]
+    fn issue_2016_shared_draft_choice_seen_operation_cannot_reapply_a_different_choice() {
+        use std::collections::BTreeMap;
+
+        let (mut registry, directory, channel, _) = setup();
+        let scope = Scope::Channel(channel);
+        let mut original = pane();
+        original.kind = CardKind::Chat(crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "/private/tools/claude".into(),
+                    arguments: ["--model", "model-a", "--effort", "high"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                    working_directory: "/repo/worktree".into(),
+                    environment: BTreeMap::from([(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        "/private/account-a".into(),
+                    )]),
+                    unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+                },
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        });
+        seed(&mut registry, channel, vec![original.clone()]);
+        let mut first = original.clone();
+        let CardKind::Chat(chat) = &mut first.kind else {
+            unreachable!()
+        };
+        chat.launch.recipe.arguments = ["--model", "model-b"].map(str::to_owned).to_vec();
+        let accepted = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original,
+                pane: first.clone(),
+            },
+        );
+        assert!(registry.apply(&accepted).unwrap().changed);
+        let ModelEdit::ChangeView { operation, .. } = &accepted else {
+            unreachable!()
+        };
+        let operation = *operation;
+        let mut later = first.clone();
+        let CardKind::Chat(chat) = &mut later.kind else {
+            unreachable!()
+        };
+        chat.launch.recipe.arguments = ["--model", "model-c", "--effort", "low"]
+            .map(str::to_owned)
+            .to_vec();
+        let next = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: first,
+                pane: later.clone(),
+            },
+        );
+        let canonical = registry.apply(&next).unwrap().model;
+        let replay = registry.apply(&accepted).unwrap();
+        assert!(!replay.changed);
+        assert_eq!(replay.model, canonical);
+
+        let mut different = later.clone();
+        let CardKind::Chat(chat) = &mut different.kind else {
+            unreachable!()
+        };
+        chat.launch.recipe.arguments = ["--model", "must-not-apply", "--effort", "medium"]
+            .map(str::to_owned)
+            .to_vec();
+        let reused = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: registry.view_revision(&scope).unwrap(),
+            operation,
+            change: Change::Update {
+                before: later.clone(),
+                pane: different,
+            },
+        };
+        // The existing API deduplicates IDs; it does not fingerprint the payload.
+        let replay = registry.apply(&reused).unwrap();
+        assert!(!replay.changed);
+        assert_eq!(replay.model, canonical);
+        assert_eq!(
+            read(&registry.db, &scope).unwrap().panes,
+            vec![later.clone()]
+        );
+        assert!(registry.view_operation_seen(operation).unwrap());
+        drop(registry);
+        let reopened = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(reopened.model().unwrap(), canonical);
+        assert_eq!(read(&reopened.db, &scope).unwrap().panes, vec![later]);
+    }
 }

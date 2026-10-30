@@ -1409,3 +1409,167 @@ mod managed_display_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shared_draft_choice_contract_tests {
+    use super::*;
+    use crate::agent::Provider;
+    use crate::model::*;
+    use crate::terminal::ipc::{
+        ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+        ServerResponse,
+    };
+    use crate::workspace_model::{ModelEdit, WorkspaceModel};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn issue_2016_shared_draft_choice_pairs_round_trip_in_chat_panes_and_workspace_envelopes() {
+        for (provider, permission_flag, permission, effort_flag) in [
+            (Provider::Claude, "--permission-mode", "default", "--effort"),
+            (
+                Provider::Codex,
+                "--ask-for-approval",
+                "on-request",
+                "--config",
+            ),
+            (Provider::Omp, "--approval-mode", "ask", "--thinking"),
+        ] {
+            let base_arguments = [permission_flag, permission].map(str::to_owned).to_vec();
+            let original = Pane {
+                id: CardId::new(),
+                title: "shared draft".into(),
+                user_title: Some("My draft".into()),
+                pending_terminal_start: false,
+                width_fraction: 0.5,
+                scope: Some("/repo/worktree".into()),
+                kind: CardKind::Chat(crate::chat::Session {
+                    id: TerminalId::new(),
+                    launch: crate::chat::Launch {
+                        provider,
+                        recipe: LaunchRecipe {
+                            program: format!("/private/tools/{}", provider.executable()),
+                            arguments: base_arguments.clone(),
+                            working_directory: "/repo/worktree".into(),
+                            environment: BTreeMap::from([
+                                ("HOME".into(), "/private/account-a".into()),
+                                ("KEEP_POLICY".into(), "value with spaces".into()),
+                            ]),
+                            unset_environment: ["PROVIDER_TOKEN".into()].into(),
+                        },
+                        session_id: None,
+                    },
+                    proof: None,
+                    terminal: None,
+                    owned_codex_listener: None,
+                    native_continuity: Default::default(),
+                }),
+            };
+            // Absence is authoritative provider-default intent, including legacy panes.
+            // No provenance marker or receiving window's local preference is serialized.
+            for (model, effort) in [
+                (Some("model-b"), Some("medium")),
+                (None, None),
+                (Some("model-b"), None),
+            ] {
+                let mut expected_arguments = base_arguments.clone();
+                if let Some(model) = model {
+                    expected_arguments.extend(["--model".into(), model.into()]);
+                }
+                if let Some(effort) = effort {
+                    expected_arguments.extend([
+                        effort_flag.into(),
+                        if provider == Provider::Codex {
+                            format!("model_reasoning_effort={effort}")
+                        } else {
+                            effort.into()
+                        },
+                    ]);
+                }
+                let mut desired = original.clone();
+                let CardKind::Chat(chat) = &mut desired.kind else {
+                    unreachable!()
+                };
+                chat.launch.recipe.arguments = expected_arguments.clone();
+                desired.validate().unwrap();
+                let json = serde_json::to_string(&desired).unwrap();
+                let from_json: Pane = serde_json::from_str(&json).unwrap();
+                assert_eq!(from_json, desired);
+                let scope = Scope::Channel(ChannelId::new());
+                let change = Change::Update {
+                    before: original.clone(),
+                    pane: desired.clone(),
+                };
+                let edit = ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: 7,
+                    operation: uuid::Uuid::new_v4(),
+                    change: change.clone(),
+                };
+                assert_eq!(
+                    postcard::from_bytes::<ModelEdit>(&postcard::to_allocvec(&edit).unwrap())
+                        .unwrap(),
+                    edit
+                );
+                let request = ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 19,
+                    proof: None,
+                    request: ClientRequest::EditWorkspaceModel { edit },
+                };
+                assert_eq!(
+                    postcard::from_bytes::<ClientEnvelope>(
+                        &postcard::to_allocvec(&request).unwrap()
+                    )
+                    .unwrap(),
+                    request
+                );
+                let mut view = View {
+                    scope,
+                    revision: 7,
+                    panes: vec![original.clone()],
+                    retired: vec![],
+                };
+                view.apply(&change).unwrap();
+                assert_eq!(view.panes, vec![desired.clone()]);
+                // This covers the real response DTO/wrapper, not a live connection.
+                let response = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(19),
+                    proof: HostSessionProof {
+                        host_session_id: HostSessionId::new("codec-only-host"),
+                        boot_id: BootId::new("codec-only-boot"),
+                        host_incarnation: HostIncarnation::new("codec-only-incarnation"),
+                    },
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel {
+                            model: WorkspaceModel {
+                                views: vec![view],
+                                ..Default::default()
+                            },
+                        },
+                    },
+                };
+                assert_eq!(
+                    postcard::from_bytes::<ServerEnvelope>(
+                        &postcard::to_allocvec(&response).unwrap()
+                    )
+                    .unwrap(),
+                    response
+                );
+                let CardKind::Chat(actual) = &from_json.kind else {
+                    unreachable!()
+                };
+                assert_eq!(actual.launch.recipe.arguments, expected_arguments);
+                let CardKind::Chat(source) = &original.kind else {
+                    unreachable!()
+                };
+                let mut unchanged = actual.clone();
+                unchanged.launch.recipe.arguments = base_arguments.clone();
+                assert_eq!(unchanged, *source);
+                if model.is_none() && effort.is_none() {
+                    assert_eq!(desired, original, "default reset and legacy absence agree");
+                }
+            }
+        }
+    }
+}
