@@ -48,17 +48,17 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: c727f886628897c1749290213e9d65037253095a
+          ref: d38ebe59f15334516f368cd94490ed8ac56a6e72
           path: before
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: c4e75601ae2e8c6f11f810d36af94726477efbb4
+          ref: 5e7c3149b7203808d7df81cf53d663dcb66a7fed
           path: before-main
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: bb88099d1037a04e5c914a6f2b055e1445cd2a47
+          ref: ac7fd847fc4cb25fe421dd5fe9674c40de245dbf
           path: before-image
           persist-credentials: false
       - name: Install native evidence tools

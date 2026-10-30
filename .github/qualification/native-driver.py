@@ -1481,11 +1481,13 @@ try:
     review_helpers = {}
     for variant, checkout in [('before', before), ('after', after), ('before-main', before_main), ('before-image', before_image)]:
         revision = subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip()
+        # Distinct historical c727, c4 and bb88099 baselines each include only
+        # the common button-overlay translation repair on their original parent.
         expected_sha, expected_tree = {
-            'before': ('c727f886628897c1749290213e9d65037253095a', '6d4f36e2b4dd48fc9744305d34c78469384edcc5'),
+            'before': ('d38ebe59f15334516f368cd94490ed8ac56a6e72', '3bac3bd2a719e4c0aba1db2a205a91113e882509'),
             'after': (os.environ['PRODUCT_SHA'], os.environ['PRODUCT_TREE']),
-            'before-main': ('c4e75601ae2e8c6f11f810d36af94726477efbb4', '69dacc7a72689e6d24f0a3d4122f9ddfe6ed23c8'),
-            'before-image': ('bb88099d1037a04e5c914a6f2b055e1445cd2a47', '0309bedf50697d303396147dd3d728c6eae4a733'),
+            'before-main': ('5e7c3149b7203808d7df81cf53d663dcb66a7fed', 'c7a3b6510748ea64fa2b5404e58a2101c1c3cdd2'),
+            'before-image': ('ac7fd847fc4cb25fe421dd5fe9674c40de245dbf', 'aa6b78c0fb3febdd13ba1661a7e2d9a76437de5d'),
         }[variant]
         assert revision == expected_sha
         assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
@@ -1540,17 +1542,17 @@ try:
                 'revision': revision, 'tree': expected_tree, 'cargo_lock_sha256': digest(checkout / 'Cargo.lock'),
                 'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
                 'helper_cfg': 'held_composition_main_before',
-                'scope': 'Current-main native composition comparison only; original c727 comparison remains separate.',
+                'scope': 'Historical c4 composition baseline plus only the common button-overlay repair; c727 and image-loss baselines remain separate.',
             }, indent=2) + '\n')
         if variant == 'before-image':
             (out / 'before-image-source.json').write_text(json.dumps({
                 'revision': revision, 'tree': expected_tree, 'cargo_lock_sha256': digest(checkout / 'Cargo.lock'),
                 'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
                 'helper_cfg': ['held_product_after', 'held_image_before'],
-                'scope': 'Image-only association-loss comparison on 9ead plus shared tooltip accessibility repair bb88099; this is a modified baseline. Historical c727 and c4 comparisons remain separate.',
+                'scope': 'Image-only association-loss baseline bb88099 (9ead plus shared tooltip accessibility foundation), plus only the common button-overlay repair. Historical c727 and c4 baselines remain separate.',
             }, indent=2) + '\n')
-    # Compile each matched helper first. The original c727 reader still checks
-    # candidate schema refusal; current main owns only the last comparison arm.
+    # Compile each matched helper first. The c727 overlay-only foundation still
+    # checks candidate schema refusal; the distinct c4 foundation owns composition.
     for variant, checkout, composition in [('after', after, False), ('before', before, False), ('after', after, True), ('before-main', before_main, True)] + [('before-image', before_image, 'image-only'), ('after', after, 'image-only')]:
         image_only = composition == 'image-only'
         composition = composition is True
@@ -1681,7 +1683,7 @@ try:
                 (out / (label + '-receipts.txt')).write_text(events)
                 receipts.append({'arm': label, 'revision': revision, 'ui_sha256': ui_hash,
                                  'fixture_source_sha256': digest(source), 'helper_sha256': digest(helper),
-                                 'events': events.splitlines(), 'scope': 'Current-main synthetic mixed-scope comparison. Healthy draft entry and context disclosure/copy were unavailable; only New channel creation/reveal and return navigation were exercised.'})
+                                 'events': events.splitlines(), 'scope': 'Historical c4 plus only the common button-overlay repair synthetic mixed-scope comparison. Healthy draft entry and context disclosure/copy were unavailable; only New channel creation/reveal and return navigation were exercised.'})
                 assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD'], text=True).strip() == expected_sha
                 assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
                 event({'event': 'arm-completed', 'revision': revision})
