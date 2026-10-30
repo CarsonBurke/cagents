@@ -210,6 +210,7 @@ fn index(
     cancel: &AtomicBool,
     mut send: impl FnMut(Progress) -> bool,
 ) {
+    let saved_failed = saved.is_err();
     let (mut entries, error) = match saved {
         Ok(entries) => (entries, None),
         Err(error) => (Vec::new(), Some(error)),
@@ -239,6 +240,11 @@ fn index(
         seeds: seeds.clone(),
         error,
     }) {
+        return;
+    }
+    // A failed saved-source read may conceal rejection evidence. A provider
+    // catalog copy cannot become permission to recreate that unreadable row.
+    if saved_failed {
         return;
     }
     let candidates = catalog::candidates(&seeds, cancel);
@@ -462,6 +468,13 @@ impl Cagents {
         let cancel = state.cancel.clone();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         let current = self.durable.cards.clone();
+        let quarantined = self
+            .shared_views
+            .quarantined
+            .iter()
+            .copied()
+            .chain(self.durable.quarantined_panes.keys().copied())
+            .collect::<HashSet<_>>();
         let accounts = self.resume_catalog_accounts();
         let directory = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
         let (sender, receiver) = async_channel::bounded(2);
@@ -476,6 +489,10 @@ impl Cagents {
                         if let CardKind::Chat(session) = card.kind
                             && session.launch.session_id.is_some()
                         {
+                            let rejected = quarantined.contains(&card.id)
+                                || entries
+                                    .iter()
+                                    .any(|entry| entry.card == card.id && entry.quarantined);
                             let updated_at_unix_ms = entries
                                 .iter()
                                 .find(|entry| entry.card == card.id)
@@ -489,6 +506,7 @@ impl Cagents {
                                 title: card.title,
                                 session,
                                 open: card.existence.is_open(),
+                                quarantined: rejected,
                                 updated_at_unix_ms,
                             });
                         }
@@ -591,6 +609,7 @@ impl Cagents {
                             title: row.title.clone(),
                             session,
                             open: false,
+                            quarantined: false,
                             updated_at_unix_ms: row.updated_at_unix_ms,
                         }),
                 };
@@ -613,12 +632,16 @@ impl Cagents {
                     return Task::none();
                 }
                 self.resume_ui.loading = false;
-                let Some((_, caller)) = self
+                let caller = self
                     .resume_ui
                     .preparing_caller
                     .take()
-                    .filter(|(owner, _)| *owner == generation)
-                else {
+                    .filter(|(owner, _)| *owner == generation);
+                if entry.quarantined || self.refuse_quarantined_pane_recreation(entry.card) {
+                    self.resume_error("This saved pane could not be verified and cannot be reopened here. Its saved data remains stored.");
+                    return Task::none();
+                }
+                let Some((_, caller)) = caller else {
                     self.resume_error("The saved conversation caller context is unavailable. Its original identity was retained; choose it again.");
                     return Task::none();
                 };
@@ -781,6 +804,10 @@ impl Cagents {
             };
             return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
         }
+        if entry.quarantined || self.refuse_quarantined_pane_recreation(entry.card) {
+            self.resume_error("This saved pane could not be verified and cannot be reopened here. Its saved data remains stored.");
+            return Task::none();
+        }
         let local_pending = self.chat_awaiting_admission(entry.card)
             && matches!(self.card_state(entry.card).map(|card| &card.kind),
                 Some(CardKind::Chat(session)) if session == &entry.session);
@@ -815,6 +842,10 @@ impl Cagents {
         entry: SavedConversation,
         prepared: bool,
     ) -> Task<Message> {
+        if entry.quarantined || self.refuse_quarantined_pane_recreation(entry.card) {
+            self.resume_error("This saved pane could not be verified and cannot be reopened here. Its saved data remains stored.");
+            return Task::none();
+        }
         let mut session = entry.session;
         if !session.launch.recipe.working_directory.is_dir()
             && !session.launch.needs_read_only_history()
@@ -893,7 +924,13 @@ impl Cagents {
                 "{} · {}{}",
                 row.provider.label(),
                 row.account,
-                if row.open { " · Open" } else { "" }
+                if matches!(&row.source, Source::Saved(entry) if entry.quarantined) {
+                    " · Unavailable"
+                } else if row.open {
+                    " · Open"
+                } else {
+                    ""
+                }
             );
             let date = chat::local_time(row.updated_at_unix_ms / 1000)
                 .map(|time| {
@@ -1085,6 +1122,7 @@ mod tests {
             title: "Review peripheral Rust modules".into(),
             session,
             open: false,
+            quarantined: false,
             updated_at_unix_ms: 1,
         }
     }
@@ -1100,6 +1138,301 @@ mod tests {
             },
         ));
         let _ = app.update_resume(Action::Indexed(generation, Progress::Counted(0)));
+    }
+
+    #[test]
+    fn quarantined_history_and_late_preparation_cannot_allocate_a_new_actor() {
+        let directory = tempfile::tempdir().unwrap();
+        for durable_marker in [false, true] {
+            for late_preparation in [false, true] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let mut entry = saved(directory.path());
+                if late_preparation {
+                    entry.session.proof = Some(crate::model::HostSessionProof {
+                        host_session_id: "saved-owner".into(),
+                        boot_id: "fixture-boot".into(),
+                        host_incarnation: "saved-incarnation".into(),
+                    });
+                    entry.session.native_continuity =
+                        chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+                    // Capture preparation before the rejected source arrives.
+                    // Its task is never polled and cannot contact a provider.
+                    drop(app.resume_saved_conversation(entry.clone()));
+                    assert!(app.resume_ui.loading);
+                }
+                let source = entry.session.clone();
+                if durable_marker {
+                    Arc::make_mut(&mut app.durable)
+                        .quarantined_panes
+                        .insert(entry.card, CardKind::Chat(source.clone()));
+                } else {
+                    app.shared_views.quarantined.insert(entry.card);
+                }
+                let original_starts = app.terminal_starts.lock().unwrap().clone();
+                if late_preparation {
+                    let mut prepared = source.clone();
+                    prepared.id = TerminalId::new();
+                    prepared.reset_owned_codex_listener();
+                    prepared.proof = None;
+                    prepared.terminal = None;
+                    let generation = app.resume_ui.generation;
+                    drop(app.update_resume(Action::Prepared(
+                        generation,
+                        entry.clone(),
+                        Ok(prepared),
+                    )));
+                } else {
+                    drop(app.resume_saved_conversation(entry.clone()));
+                }
+                assert!(app.durable.cards.is_empty());
+                assert_eq!(app.workspace.order().count(), 0);
+                assert_eq!(app.workspace.focused(), None);
+                assert_eq!(*app.terminal_starts.lock().unwrap(), original_starts);
+                assert!(!app.chat_start_pending(entry.card));
+                assert!(!app.resume_ui.loading);
+                assert!(
+                    app.resume_ui
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| { error.contains("cannot be reopened here") })
+                );
+                if durable_marker {
+                    assert_eq!(
+                        app.durable.quarantined_panes.get(&entry.card),
+                        Some(&CardKind::Chat(source))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn history_from_another_stored_workspace_keeps_quarantine_provenance_through_preparation() {
+        use crate::persistence::{SnapshotBase, StateStore};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("two-workspace-history.sqlite3");
+        let store = StateStore::open(&path, crate::model::BootId::new("history-boot")).unwrap();
+        let entry = saved(directory.path());
+        let source = CardKind::Chat(entry.session.clone());
+        let mut rejected = WorkspaceState::default();
+        rejected.cards.push(CardState {
+            id: entry.card,
+            generation: 0,
+            title: entry.title.clone(),
+            width_fraction: 0.6,
+            existence: crate::app::project_ui::removed_existence("removed unverified pane"),
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind: source.clone(),
+        });
+        rejected
+            .quarantined_panes
+            .insert(entry.card, source.clone());
+        rejected.local_only_cards.insert(entry.card);
+        rejected
+            .chat_drafts
+            .insert(entry.card, "Keep cross-workspace draft".into());
+        let other = WorkspaceState::default();
+        let bases = std::collections::BTreeMap::new();
+        for workspace in [&rejected, &other] {
+            store
+                .save_workspace(
+                    workspace,
+                    SnapshotBase {
+                        workspace: 0,
+                        cards: &bases,
+                    },
+                )
+                .unwrap();
+        }
+        let listed = store
+            .saved_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|listed| listed.card == entry.card)
+            .unwrap();
+        assert!(listed.quarantined);
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.durable = Arc::new(store.load_workspace(other.id, None).unwrap().unwrap());
+        app.shared_views = crate::app::shared_views::State::for_workspace(&app.durable);
+        assert!(
+            !app.pane_is_quarantined(entry.card),
+            "only source-workspace provenance can block this row"
+        );
+        let denied = app.resume_saved_conversation(listed.clone());
+        assert!(iced::runtime::task::into_stream(denied).is_none());
+        assert!(app.durable.cards.is_empty());
+        assert!(!app.resume_ui.loading);
+        // A same-generation preparation receipt must keep that source denial,
+        // even after the receiving window joins another registry.
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.resume_ui.loading = true;
+        let mut prepared = listed.session.clone();
+        prepared.id = TerminalId::new();
+        let generation = app.resume_ui.generation;
+        let denied = app.update_resume(Action::Prepared(generation, listed, Ok(prepared)));
+        assert!(iced::runtime::task::into_stream(denied).is_none());
+        assert!(app.durable.cards.is_empty());
+        assert!(app.terminal_starts.lock().unwrap().is_empty());
+        assert!(!app.resume_ui.loading);
+        assert!(
+            app.resume_ui
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("cannot be reopened here")
+        );
+        let retained = store.load_workspace(rejected.id, None).unwrap().unwrap();
+        assert_eq!(retained.quarantined_panes.get(&entry.card), Some(&source));
+        assert_eq!(
+            retained.chat_drafts[&entry.card],
+            "Keep cross-workspace draft"
+        );
+    }
+
+    #[test]
+    fn failed_saved_source_read_does_not_fall_back_to_unmarked_catalog_rows() {
+        let mut progress = Vec::new();
+        index(
+            Err("Saved pane admission metadata is unreadable".into()),
+            Vec::new(),
+            &catalog::Cache::default(),
+            &AtomicBool::new(false),
+            |event| {
+                progress.push(event);
+                true
+            },
+        );
+        assert_eq!(progress.len(), 1);
+        assert!(
+            matches!(&progress[0], Progress::Saved { entries, error: Some(error), .. } if entries.is_empty() && error.contains("admission metadata"))
+        );
+    }
+
+    #[test]
+    fn quarantined_unreadable_history_cannot_reappear_from_matching_provider_transcripts() {
+        use crate::persistence::{SnapshotBase, StateStore};
+        for corruption in [
+            "session-json",
+            "existence-json",
+            "invalid-continuity",
+            "missing-name",
+            "changed-source",
+            "unnamed-original",
+        ] {
+            for held in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let account = crate::account::Account {
+                    provider: Provider::Claude,
+                    home: crate::account::AccountHome::Linked {
+                        key: uuid::Uuid::new_v4(),
+                        path: root.path().join("claude"),
+                    },
+                };
+                let seed = chat::fresh_session(
+                    Provider::Claude,
+                    TerminalId::new(),
+                    root.path().into(),
+                    &account,
+                )
+                .unwrap();
+                let thread = uuid::Uuid::new_v4().to_string();
+                let mut source = seed.clone();
+                source.launch.session_id =
+                    (corruption != "unnamed-original").then(|| thread.clone());
+                let projects = provider_root(&seed).join("projects/project");
+                std::fs::create_dir_all(&projects).unwrap();
+                std::fs::write(projects.join(format!("{thread}.jsonl")), format!("{}\n", serde_json::json!({"type":"user","sessionId":thread,"cwd":root.path(),"message":{"content":"Retained source transcript"}}))).unwrap();
+                let path = root.path().join("history.sqlite3");
+                let store =
+                    StateStore::open(&path, crate::model::BootId::new("history-boot")).unwrap();
+                let mut workspace = WorkspaceState::default();
+                let mut card = crate::app::tests::terminal_card_state();
+                let id = card.id;
+                card.kind = CardKind::Chat(source.clone());
+                card.existence = crate::app::project_ui::removed_existence("removed saved pane");
+                workspace.cards.push(card);
+                if held {
+                    workspace
+                        .quarantined_panes
+                        .insert(id, CardKind::Chat(source.clone()));
+                }
+                let bases = std::collections::BTreeMap::new();
+                store
+                    .save_workspace(
+                        &workspace,
+                        SnapshotBase {
+                            workspace: 0,
+                            cards: &bases,
+                        },
+                    )
+                    .unwrap();
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                if corruption == "existence-json" {
+                    connection
+                        .execute(
+                            "UPDATE cards SET existence_json='{broken' WHERE card_id=?1",
+                            [id.to_string()],
+                        )
+                        .unwrap();
+                } else if corruption != "unnamed-original" {
+                    let mut changed = source;
+                    match corruption {
+                        "invalid-continuity" => {
+                            changed.native_continuity =
+                                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                        }
+                        "missing-name" => changed.launch.session_id = None,
+                        "changed-source" => {
+                            changed.id = TerminalId::new();
+                            changed.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+                        }
+                        _ => {}
+                    }
+                    let content = if corruption == "session-json" {
+                        "{broken".to_owned()
+                    } else {
+                        serde_json::to_string(&changed).unwrap()
+                    };
+                    connection
+                        .execute(
+                            "UPDATE cards SET content_json=?2 WHERE card_id=?1",
+                            rusqlite::params![id.to_string(), content],
+                        )
+                        .unwrap();
+                }
+                drop(connection);
+                let saved = store.saved_conversations();
+                assert_eq!(
+                    saved.is_err(),
+                    held,
+                    "{corruption}/{held}: only a known denied row makes ordinary per-row failure fatal"
+                );
+                let mut progress = Vec::new();
+                index(
+                    saved.map_err(|error| error.to_string()),
+                    vec![seed],
+                    &catalog::Cache::default(),
+                    &AtomicBool::new(false),
+                    |event| {
+                        progress.push(event);
+                        true
+                    },
+                );
+                if held {
+                    assert_eq!(
+                        progress.len(),
+                        1,
+                        "{corruption}: known denial stops catalog fallback"
+                    );
+                    assert!(
+                        matches!(&progress[0], Progress::Saved { entries, error: Some(_), .. } if entries.is_empty())
+                    );
+                } else {
+                    assert!(progress.iter().any(|event| matches!(event, Progress::Found { conversations, .. } if conversations.iter().any(|found| found.id == thread))), "{corruption}: matching real transcript proves the fallback fixture, ordinary readable catalog behavior stays available");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1183,6 +1516,7 @@ mod tests {
             title: card.title.clone(),
             session: session.clone(),
             open: true,
+            quarantined: false,
             updated_at_unix_ms: 1,
         };
         let before = app.durable.cards.len();
@@ -1304,10 +1638,23 @@ mod tests {
     fn preparation_rechecks_a_conversation_opened_while_waiting() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let entry = saved(directory.path());
-        let _ = app.resume_saved_conversation(entry.clone());
+        let mut entry = saved(directory.path());
+        entry.session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
+        entry.session.native_continuity =
+            chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        // Stage the real preparation boundary, without polling its service task.
+        drop(app.resume_saved_conversation(entry.clone()));
+        assert!(app.resume_ui.loading);
+        assert!(app.resume_ui.preparing_caller.is_some());
+        assert!(app.durable.cards.is_empty());
+        // Another open publishes this same conversation before its reply.
+        drop(app.insert_chat_card(entry.session.clone(), None, None));
         let card = app.workspace.focused();
-        app.resume_ui.loading = true;
+        assert!(card.is_some());
         let generation = app.resume_ui.generation;
         let _ = app.update_resume(Action::Prepared(
             generation,
@@ -1317,6 +1664,11 @@ mod tests {
         assert_eq!(app.durable.cards.len(), 1);
         assert_eq!(app.workspace.focused(), card);
         assert!(!app.resume_ui.loading);
+        assert!(app.resume_ui.preparing_caller.is_none());
+        assert!(
+            app.resume_ui.error.is_none(),
+            "the existing pane was reused"
+        );
     }
 
     #[test]

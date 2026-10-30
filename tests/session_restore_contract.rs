@@ -101,6 +101,7 @@ impl RestoreFixture {
             agent_updates: BTreeMap::new(),
             repository_navigation: HashMap::new(),
             local_only_cards: Default::default(),
+            quarantined_panes: Default::default(),
             pending_chat_admissions: Default::default(),
             pending_terminal_creations: Default::default(),
             workspace_model_identity: None,

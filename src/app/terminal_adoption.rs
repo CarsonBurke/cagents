@@ -108,7 +108,10 @@ impl Cagents {
             // only after a fresh inventory proves its complete issued lineage;
             // the start path checks the replacement daemon's lease again.
             for card in &self.durable.cards {
-                if !card.existence.is_open() || self.terminal_start_in_flight(card.id) {
+                if !card.existence.is_open()
+                    || self.pane_is_quarantined(card.id)
+                    || self.terminal_start_in_flight(card.id)
+                {
                     continue;
                 }
                 let CardKind::Terminal(saved) = &card.kind else {
@@ -235,6 +238,7 @@ impl Cagents {
                 .iter()
                 .filter(|card| {
                     card.existence.is_open()
+                        && !self.shared_views.quarantined.contains(&card.id)
                         && self.shared_views.attached.contains(&card.id)
                         && matches!(&card.kind, CardKind::Terminal(saved) if saved.id == session.id)
                         && matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
@@ -599,6 +603,47 @@ mod tests {
         let remaining = cards_for(&app, card_terminal(&app, card));
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].existence, closed);
+    }
+
+    #[test]
+    fn replacement_inventory_cannot_turn_a_quarantined_terminal_into_loading() {
+        for durable_marker in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            register_worktrees(&mut app, &["/repo"]);
+            let saved = hosted("/repo");
+            drop(app.observe_hosted_terminals(vec![saved.clone()]));
+            let card = cards_for(&app, saved.id)[0].id;
+            let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(
+                saved.id,
+                saved.launch.clone(),
+                None,
+            );
+            descriptor.session = saved.clone();
+            descriptor.session.continuity = TerminalContinuity::DetachedSameBoot {
+                host_session_id: HostSessionId::new("replacement"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("replacement"),
+            };
+            descriptor.upgrade_sources = vec![saved];
+            if durable_marker {
+                let source = app.card_state(card).unwrap().kind.clone();
+                Arc::make_mut(&mut app.durable)
+                    .quarantined_panes
+                    .insert(card, source);
+            } else {
+                app.shared_views.quarantined.insert(card);
+            }
+            app.present_quarantined_pane(card);
+            let source = app.card_state(card).unwrap().clone();
+            for _ in 0..2 {
+                drop(app.observe_hosted_descriptors(vec![descriptor.clone()]));
+                assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+                assert!(app.lifecycle.state(card).is_none());
+                assert_eq!(app.terminal_starts_in_flight(), 0);
+                assert_eq!(app.card_state(card).unwrap().kind, source.kind);
+                assert_eq!(app.card_state(card).unwrap().residency, source.residency);
+            }
+        }
     }
 
     #[test]
