@@ -129,6 +129,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     let setup = {
         let account = account.clone();
         let cache = cache.clone();
+        let search_path = search_path.clone();
         tokio::task::spawn_blocking(move || {
             prepare(&account, cache.as_ref(), force, now, search_path.as_deref())
         })
@@ -139,7 +140,11 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         Ok(Prepared::Probe { program, key, lock }) => (program, key, lock),
         Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
     };
-    let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &program)).await;
+    let probed = tokio::time::timeout(
+        TIMEOUT,
+        probe_cli(&account, &program, search_path.as_deref()),
+    )
+    .await;
     let outcome = match probed {
         Ok(Ok(Probed {
             identity,
@@ -290,10 +295,14 @@ fn now_ms() -> u64 {
     crate::chat::now_ms().unwrap_or_default()
 }
 
-async fn probe_cli(account: &Account, program: &Path) -> Result<Probed, String> {
+async fn probe_cli(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Probed, String> {
     match account.provider {
-        Provider::Claude => probe_claude(account, program).await,
-        Provider::Codex => probe_codex(account, program).await,
+        Provider::Claude => probe_claude_with_path(account, program, search_path).await,
+        Provider::Codex => probe_codex_with_path(account, program, search_path).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
     }
 }
@@ -302,6 +311,60 @@ async fn probe_cli(account: &Account, program: &Path) -> Result<Probed, String> 
 /// could not say.
 static SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> = tokio::sync::OnceCell::const_new();
 
+/// Refreshes share one read when they overlap. Every reader receives an owned
+/// path, so a later installation cannot invalidate a command already prepared.
+struct ShellPathRefresh {
+    serial: tokio::sync::Mutex<()>,
+    state: std::sync::Mutex<(u64, Option<OsString>)>,
+}
+
+impl ShellPathRefresh {
+    const fn new() -> Self {
+        Self {
+            serial: tokio::sync::Mutex::const_new(()),
+            state: std::sync::Mutex::new((0, None)),
+        }
+    }
+
+    fn path(&self) -> Option<OsString> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .1
+            .clone()
+    }
+
+    async fn refresh<F, R>(&self, read: F) -> Option<OsString>
+    where
+        F: FnOnce() -> R,
+        R: std::future::Future<Output = Option<OsString>>,
+    {
+        let observed = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .0;
+        let _serial = self.serial.lock().await;
+        {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.0 != observed {
+                return state.1.clone();
+            }
+        }
+        let path = read().await;
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // A failed shell read preserves the last usable path, but still settles
+        // this cohort of waiters rather than repeating the failed startup.
+        if path.is_some() {
+            state.1 = path;
+        }
+        state.0 = state.0.wrapping_add(1);
+        state.1.clone()
+    }
+}
+
+static REFRESHED_SHELL_PATH: ShellPathRefresh = ShellPathRefresh::new();
+
 /// The directories a provider's CLI is looked for in: the ones a terminal
 /// would search.
 ///
@@ -309,8 +372,9 @@ static SHELL_PATH: tokio::sync::OnceCell<Option<OsString>> = tokio::sync::OnceCe
 /// are where installers put `~/.local/bin` or a Node version manager's `bin`.
 /// The interface may have been started from a desktop launcher with a much
 /// shorter `PATH`, and a CLI the reader runs in every terminal would then
-/// read as not installed. So the shell is asked, once per process; where it
-/// cannot say, this process's own `PATH` stands in.
+/// read as not installed. The first request initializes the shell path;
+/// explicit Accounts discovery can refresh it after installation. Where the
+/// shell cannot say, this process's own `PATH` stands in.
 pub async fn search_path() -> Option<OsString> {
     SHELL_PATH
         .get_or_init(|| async {
@@ -324,9 +388,7 @@ pub async fn search_path() -> Option<OsString> {
 /// What [`search_path`] would answer now, without waiting for the shell:
 /// this process's own `PATH` until the shell has been asked.
 pub fn current_search_path() -> Option<OsString> {
-    shell_search_path()
-        .map(OsStr::to_owned)
-        .or_else(|| std::env::var_os("PATH"))
+    shell_search_path().or_else(|| std::env::var_os("PATH"))
 }
 
 /// Whether the shell has been asked for its `PATH`, so that
@@ -338,8 +400,28 @@ pub fn shell_asked() -> bool {
 /// The shell's `PATH`, if [`search_path`] has already read one. A CLI found on
 /// it runs with it, as it would in a terminal: a Node CLI's
 /// `#!/usr/bin/env node` looks for Node there.
-pub fn shell_search_path() -> Option<&'static OsStr> {
-    SHELL_PATH.get()?.as_deref()
+pub fn shell_search_path() -> Option<OsString> {
+    REFRESHED_SHELL_PATH
+        .path()
+        .or_else(|| SHELL_PATH.get().cloned().flatten())
+}
+
+/// Re-read interactive shell startup after an explicit setup refresh or return
+/// from installing a CLI. The existing bounded shell reader never runs a
+/// provider; concurrent requests share one result and failures keep the old path.
+pub async fn refresh_search_path() -> Option<OsString> {
+    REFRESHED_SHELL_PATH
+        .refresh(|| async {
+            if !shell_asked() {
+                search_path().await;
+                SHELL_PATH.get().cloned().flatten()
+            } else {
+                let shell = crate::model::login_shell().ok()?;
+                shell_path(Path::new(&shell), SHELL_TIMEOUT).await
+            }
+        })
+        .await;
+    current_search_path()
 }
 
 /// The `PATH` `shell` sets up when started interactively, as a terminal
@@ -452,7 +534,12 @@ fn is_executable(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+#[cfg(test)]
 fn command(account: &Account, program: &Path) -> Command {
+    command_with_path(account, program, current_search_path().as_deref())
+}
+
+fn command_with_path(account: &Account, program: &Path, search_path: Option<&OsStr>) -> Command {
     let mut command = Command::new(program);
     for variable in SCRUBBED_ENVIRONMENT {
         command.env_remove(variable);
@@ -470,7 +557,7 @@ fn command(account: &Account, program: &Path) -> Command {
         }
         None => {}
     }
-    if let Some(path) = shell_search_path() {
+    if let Some(path) = search_path {
         command.env("PATH", path);
     }
     for variable in account.credential_overrides() {
@@ -690,6 +777,7 @@ async fn run_json(command: Command) -> Result<Value, String> {
 /// not an error: the home is going regardless, and only the CLI knows where
 /// else its login lived. Only a managed account is ever signed out here; the
 /// system account's login is the reader's own.
+#[cfg(test)]
 pub async fn logout(account: Account) -> Result<(), String> {
     if account.is_system() {
         return Err("The system account is not signed out by cagents".into());
@@ -701,15 +789,16 @@ pub async fn logout(account: Account) -> Result<(), String> {
     };
     let executable = account.provider.executable();
     let search_path = search_path().await;
+    let lookup_path = search_path.clone();
     let Some(program) =
-        tokio::task::spawn_blocking(move || find_executable(executable, search_path.as_deref()))
+        tokio::task::spawn_blocking(move || find_executable(executable, lookup_path.as_deref()))
             .await
             .ok()
             .flatten()
     else {
         return Ok(());
     };
-    let mut command = command(&account, &program);
+    let mut command = command_with_path(&account, &program, search_path.as_deref());
     command.args(arguments);
     let mut group = Group::spawn(command).await?;
     let finished = tokio::time::timeout(TIMEOUT, async {
@@ -736,10 +825,19 @@ pub async fn logout(account: Account) -> Result<(), String> {
 /// slash commands and no session persistence: it only ever answers two
 /// control requests and never takes a turn, and that way it runs none of the
 /// user's hooks and leaves nothing behind in their history.
+#[cfg(test)]
 async fn probe_claude(account: &Account, program: &Path) -> Result<Probed, String> {
-    let mut status = command(account, program);
+    probe_claude_with_path(account, program, current_search_path().as_deref()).await
+}
+
+async fn probe_claude_with_path(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Probed, String> {
+    let mut status = command_with_path(account, program, search_path);
     status.args(["auth", "status", "--json"]);
-    let mut usage = command(account, program);
+    let mut usage = command_with_path(account, program, search_path);
     usage.args([
         "-p",
         "--input-format",
@@ -892,8 +990,17 @@ pub fn match_control_response(frame: &Value, request_id: &str) -> Option<Result<
 
 /// Codex: `codex app-server` over stdio, asked for the account and its
 /// limits and then closed.
+#[cfg(test)]
 async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String> {
-    let mut command = command(account, program);
+    probe_codex_with_path(account, program, current_search_path().as_deref()).await
+}
+
+async fn probe_codex_with_path(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Probed, String> {
+    let mut command = command_with_path(account, program, search_path);
     command.arg("app-server");
     let mut session = Session::spawn(command).await?;
     let result = codex_exchange(&mut session).await;
@@ -1400,5 +1507,123 @@ cat >/dev/null
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlapping_path_refreshes_share_one_read_and_failure_keeps_owned_readers() {
+        use std::future::Future;
+        let cache = ShellPathRefresh::new();
+        let calls = std::cell::Cell::new(0);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let first_path = OsString::from("/first/private/bin");
+        let mut first = Box::pin(cache.refresh(|| async {
+            calls.set(calls.get() + 1);
+            released.await.unwrap();
+            Some(first_path.clone())
+        }));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(first.as_mut().poll(&mut context).is_pending());
+        let mut waiting = Box::pin(cache.refresh(|| async {
+            calls.set(calls.get() + 1);
+            Some(OsString::from("/must/not/read"))
+        }));
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        release.send(()).unwrap();
+        let (first, waiting) = tokio::join!(first, waiting);
+        assert_eq!(
+            calls.get(),
+            1,
+            "overlapping requests share the settled read"
+        );
+        assert_eq!(first, Some(first_path.clone()));
+        assert_eq!(waiting, first);
+        let old_reader = cache.path().unwrap();
+        let next = OsString::from("/new/installer/bin");
+        assert_eq!(
+            cache.refresh(|| async { Some(next.clone()) }).await,
+            Some(next.clone())
+        );
+        assert_eq!(
+            old_reader, first_path,
+            "published readers retain their owned path"
+        );
+        assert_eq!(cache.refresh(|| async { None }).await, Some(next.clone()));
+        assert_eq!(cache.path(), Some(next));
+        // No process-global PATH, shell, OnceCell or environment was changed.
+    }
+
+    #[tokio::test]
+    async fn rediscovery_observes_executable_metadata_on_the_refreshed_path_without_running_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("old bin");
+        let second = directory.path().join("new bin");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let cache = ShellPathRefresh::new();
+        let old = cache
+            .refresh(|| async { Some(first.clone().into_os_string()) })
+            .await
+            .unwrap();
+        assert!(find_executable("codex", Some(&old)).is_none());
+        let codex = first.join("codex");
+        std::fs::write(&codex, "not an executable program: metadata fixture only").unwrap();
+        make_executable(&codex);
+        assert_eq!(find_executable("codex", Some(&old)), Some(codex.clone()));
+        std::fs::remove_file(codex).unwrap();
+        let other = second.join("codex");
+        std::fs::write(&other, "not an executable program: metadata fixture only").unwrap();
+        make_executable(&other);
+        let changed = cache
+            .refresh(|| async { Some(second.clone().into_os_string()) })
+            .await
+            .unwrap();
+        assert_eq!(find_executable("codex", Some(&changed)), Some(other));
+        assert!(find_executable("codex", Some(&old)).is_none());
+        assert_eq!(cache.refresh(|| async { None }).await, Some(changed));
+        assert_eq!(
+            old,
+            first.into_os_string(),
+            "existing readers never borrow replaced storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prepared_probe_command_keeps_its_selected_executable_and_path_together() {
+        let cache = ShellPathRefresh::new();
+        let selected = cache
+            .refresh(|| async { Some(OsString::from("/old/node/bin:/old/cli/bin")) })
+            .await;
+        let _ = cache
+            .refresh(|| async { Some(OsString::from("/new/node/bin:/new/cli/bin")) })
+            .await;
+        let command = command_with_path(
+            &Account::system(Provider::Codex),
+            Path::new("/old/cli/bin/codex"),
+            selected.as_deref(),
+        );
+        assert_eq!(
+            command.as_std().get_program(),
+            OsStr::new("/old/cli/bin/codex")
+        );
+        let path = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("PATH"))
+            .unwrap()
+            .1;
+        assert_eq!(path, selected.as_deref());
+        assert_ne!(path, cache.path().as_deref());
+        let missing = command_with_path(
+            &Account::system(Provider::Codex),
+            Path::new("/old/cli/bin/codex"),
+            None,
+        );
+        assert!(
+            !missing
+                .as_std()
+                .get_envs()
+                .any(|(key, _)| key == OsStr::new("PATH")),
+            "a missing captured path never substitutes a later published shell path"
+        );
     }
 }
