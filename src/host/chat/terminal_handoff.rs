@@ -114,12 +114,12 @@ fn require_close_owner(state: &HostState, receipt: &TerminalHandoff) -> Result<(
         .as_ref()
         .expect("validated private binding");
     if terminal_transition(state, receipt.terminal.id)
+        || state.any_live(&[receipt.terminal.id])
         || state
             .terminals
             .get(&receipt.terminal.id)
             .is_some_and(|record| {
-                record.running
-                    || !record.handle.is_completed()
+                !record.handle.is_completed()
                     || record.handle.holder_identity() != Some(&issued.holder)
                     || !matches_paired_terminal(&record.session, &receipt.terminal, &issued.proof)
             })
@@ -144,7 +144,10 @@ pub(super) fn close(
         let receipt = require_binding(&state, chat_id, Some(client))?;
         require_close_owner(&state, receipt)?;
         if receipt.terminal_retired {
-            return Ok(Some(ServerResponse::ChatClosed { chat_id }));
+            return Ok(Some(ServerResponse::ChatClosed {
+                chat_id,
+                snapshot: receipt.snapshot(),
+            }));
         }
         (
             receipt
@@ -187,11 +190,15 @@ pub(super) fn close(
         .chat_handoffs
         .get_mut(&chat_id)
         .expect("revalidated exact handoff");
-    if !receipt.terminal_retired {
+    let newly_retired = !receipt.terminal_retired;
+    if newly_retired {
         receipt.terminal_retired = true;
         receipt.awaiting_ack = false;
         receipt.generation += 1;
+    }
+    let snapshot = receipt.snapshot();
+    if newly_retired {
         state.inventory_generation += 1;
     }
-    Ok(Some(ServerResponse::ChatClosed { chat_id }))
+    Ok(Some(ServerResponse::ChatClosed { chat_id, snapshot }))
 }
