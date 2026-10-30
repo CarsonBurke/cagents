@@ -301,10 +301,23 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device,
         device_window_scoped,
     } = options;
+    #[cfg(feature = "development")]
+    let account_native_fixture = cagents::app::Cagents::development_account_fixture_requested()?;
+    #[cfg(not(feature = "development"))]
+    let account_native_fixture = false;
+    if account_native_fixture
+        && (new_window
+            || slot.is_some()
+            || source.is_some()
+            || device.is_some()
+            || device_window_scoped)
+    {
+        return Err("inert Accounts fixture accepts only the default local window".into());
+    }
     let _device_cleanup = cagents::device::Cleanup;
     cagents::device::select(device)?;
     cagents::device::prepare()?;
-    if !cagents::device::is_remote() {
+    if !account_native_fixture && !cagents::device::is_remote() {
         if let Some(executable) = cagents::control::staged_ui_executable()? {
             // exec preserves the launcher handshake pipe and window arguments.
             let mut command = std::process::Command::new(executable);
@@ -342,7 +355,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let (activation_tx, activation_rx) = async_channel::unbounded();
         let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
-        if !fixture {
+        if !fixture && !account_native_fixture {
             cagents::terminal::ensure_daemon_ready()?;
         }
         let restored = cagents::app::Cagents::load_startup()?;
