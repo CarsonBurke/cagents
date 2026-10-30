@@ -1,0 +1,62 @@
+{
+  "kind": "ISSUE2015_AUTHOR_PREPARED_SOURCE_FOR_NEW_INDEPENDENT_REVIEW",
+  "status": "AUTHOR_PREPARED_UNREVIEWED_UNGRANTED_ALL_RUNTIME_UNRUN",
+  "product": {
+    "head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+    "tree": "aaab67a21378958066103707baf3abe8850577d6",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install"
+  },
+  "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015",
+  "runner": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/run-packet.py",
+    "sha256": "6fb2456472135952a7855dd1fb7f2089d9d9b8679ed23476a2626d0d063c351e"
+  },
+  "plan": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/plan.json",
+    "sha256": "43b2b230e45a1f1e8fe4b3b4736788bfa9f5b046e5b39353c82001c67a336314"
+  },
+  "source_binding": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/source-review-binding.json",
+    "sha256": "2fb1b8529ee45233741c49939564ebf6259eacb29e422eb4f1c0d3a01c6e380e"
+  },
+  "corrected_data": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/command-data-6dc.json",
+    "sha256": "e4dc07796afbbdbb40095128fdfcbdf24f7b3a1cfcbb60087060a9c1ec4f3938"
+  },
+  "source_pins": 17,
+  "predicted_inventories": {
+    "installer_lifecycle_contract": 36,
+    "installer_guard_contract": 11
+  },
+  "owning_parents": 5,
+  "phases": 10,
+  "assigned_graphs": {
+    "cli": 5,
+    "host": 0,
+    "ui": 0
+  },
+  "actual_passes": 0,
+  "argv": [
+    "python3",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-qualification-control/qualification-packets/issue2015/run-packet.py",
+    "--grant",
+    "<ACTUAL_AUTHENTICATED_GRANT>",
+    "--runner-sha256",
+    "6fb2456472135952a7855dd1fb7f2089d9d9b8679ed23476a2626d0d063c351e",
+    "--controller-review",
+    "<NEW_INDEPENDENT_REVIEW_RECEIPT>",
+    "--controller-review-sha256",
+    "<RECEIPT_SHA256>"
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-fresh-install",
+  "current_receipts": {
+    "new_independent_controller_review": null,
+    "actual_grant": null,
+    "actual_execution": null,
+    "actual_release": null
+  },
+  "source_only_checks": "AST parse/JSON syntax, immutable Git blob/live SHA comparison, lexical inventory/conservation and source whitespace only. No target/lock/tool/process/capacity/registry probe, build/test/native/provider/helper/controller/oracle execution.",
+  "context": "Main15 C7a237 remains exclusive as reported; A/B unknown occupied. No grant, reservation, return or availability claim.",
+  "constraints": "Exact natural inherited authority/account/environment/policy preserved; supported guards remain. Any original negative/unknown stops dependencies and stays recorded. Five owning results only; children/inline cases nonadditive. No optional library/host/ui heavy prerequisite.",
+  "limits": "Only10 serial phases and5 distinct CLI integration parents. Stop first negative/timeout/unknown/missing evidence. Full current --list sets must equal source-predicted36/11 names; runtime actualN is derived from each full inventory and every raw singleton summary must enforce1P0F0I/0M and N-1. Passive helpers/guardians/inline cases and compilation/inventory are not passes. Keep supported Git configuration/index/attribute refusal guards and cooperative source/context observations. No HOST/UI/default/full/integrated/broad/native/provider/live-install/release/WHOLE/SeedView/merge qualification. Natural unsupported authority context remains a real negative. Historical5a4 stale diagnostic/source-oracle finding and donor Git HOLD remain intact."
+}
