@@ -264,7 +264,13 @@ impl<Message: 'static + Clone> Widget<Message, crate::Theme, Renderer> for FlexR
                 .iter()
                 .zip(layout.children())
                 .zip(state.children.iter())
-                .map(|((c, c_layout), state)| c.as_widget().a11y_nodes(c_layout, state, p)),
+                .map(|((c, c_layout), state)| {
+                    c.as_widget().a11y_nodes(
+                        c_layout.with_virtual_offset(layout.virtual_offset()),
+                        state,
+                        p,
+                    )
+                }),
         )
     }
 

@@ -301,6 +301,20 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device,
         device_window_scoped,
     } = options;
+    #[cfg(feature = "development")]
+    let automation_native_fixture =
+        cagents::app::Cagents::development_automation_fixture_requested()?;
+    #[cfg(not(feature = "development"))]
+    let automation_native_fixture = false;
+    if automation_native_fixture
+        && (new_window
+            || slot.is_some()
+            || source.is_some()
+            || device.is_some()
+            || device_window_scoped)
+    {
+        return Err("inert automation fixture accepts only the default local window".into());
+    }
     let _device_cleanup = cagents::device::Cleanup;
     cagents::device::select(device)?;
     cagents::device::prepare()?;
@@ -326,8 +340,9 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         cagents::device::window_slot(slot)?
     };
     let slot = scoped_slot.as_deref();
-    let fixture =
-        cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
+    let fixture = automation_native_fixture
+        || (cfg!(feature = "latency-harness")
+            && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some());
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
         let lease = cagents::instance::WindowLease::acquire(new_window, slot)?;
         let device_source = if device_window_scoped && source.is_some() {

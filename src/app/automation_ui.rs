@@ -1,3 +1,6 @@
+#[cfg(feature = "development")]
+pub(super) mod native_admission_fixture;
+
 use super::*;
 use crate::automation_ui::{Action, Effect, TargetChoice};
 
@@ -73,6 +76,10 @@ impl Cagents {
     }
 
     pub(super) fn update_automation_ui(&mut self, action: Action) -> Task<Message> {
+        #[cfg(feature = "development")]
+        if self.automation_native_fixture.is_some() {
+            native_admission_fixture::observe(self, &action);
+        }
         // Restored utility cards bypass open_automations, and the account
         // catalog can finish loading after the card opens. Keep labels and
         // availability current before displaying or confirming a definition.
@@ -85,8 +92,8 @@ impl Cagents {
                 | Action::Select(_)
                 | Action::New
                 | Action::Edit
-                | Action::Enable
-                | Action::RunNow
+                | Action::Enable { .. }
+                | Action::RunNow { .. }
         ) {
             self.refresh_automation_choices();
         }
@@ -121,23 +128,29 @@ impl Cagents {
                 }
                 Task::none()
             }
-            Some(Effect::Request { sequence, request }) => cosmic::task::future(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    let socket = crate::terminal::ensure_daemon_ready()
-                        .map_err(|error| error.to_string())?;
-                    let mut client = crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?;
-                    client
-                        .automation(crate::agent_execution::Authority::default(), request)
-                        .map_err(|error| error.to_string())
+            Some(Effect::Request { sequence, request }) => {
+                #[cfg(feature = "development")]
+                if self.automation_native_fixture.is_some() {
+                    return native_admission_fixture::request(self, sequence, request);
+                }
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let socket = crate::terminal::ensure_daemon_ready()
+                            .map_err(|error| error.to_string())?;
+                        let mut client = crate::control::ControlClient::connect(&socket)
+                            .map_err(|error| error.to_string())?;
+                        client
+                            .automation(crate::agent_execution::Authority::default(), request)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error.to_string()));
+                    Message::AutomationUi(Action::Received {
+                        sequence,
+                        result: Arc::new(result),
+                    })
                 })
-                .await
-                .unwrap_or_else(|error| Err(error.to_string()));
-                Message::AutomationUi(Action::Received {
-                    sequence,
-                    result: Arc::new(result),
-                })
-            }),
+            }
             Some(Effect::OpenRun(detail)) => {
                 let Some(agent) = detail.agent else {
                     return Task::none();

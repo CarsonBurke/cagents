@@ -5302,6 +5302,8 @@ pub struct Cagents {
     operation_recovery: crate::operation_recovery::Shared,
     account_ui: account_ui::State,
     automation_ui: crate::automation_ui::State,
+    #[cfg(feature = "development")]
+    automation_native_fixture: Option<automation_ui::native_admission_fixture::State>,
     work_ui: crate::work_ui::State,
     channel_work: channel_work::State,
     automation_approval: automation_approval::State,
@@ -5518,7 +5520,20 @@ impl Cagents {
         })
     }
 
+    /// Recognize only the explicit owned inert development fixture.
+    #[cfg(feature = "development")]
+    pub fn development_automation_fixture_requested() -> Result<bool, String> {
+        automation_ui::native_admission_fixture::context().map(|context| context.is_some())
+    }
+
     pub fn load_startup() -> Result<Startup, String> {
+        #[cfg(feature = "development")]
+        if let Some(context) = automation_ui::native_admission_fixture::context()? {
+            return Ok(Startup {
+                bootstrap: automation_ui::native_admission_fixture::bootstrap(&context)?,
+                window_view: None,
+            });
+        }
         #[cfg(feature = "latency-harness")]
         if crate::latency_fixture::Fixture::from_env().is_some() {
             return Ok(Startup {
@@ -14034,11 +14049,20 @@ impl Application for Cagents {
     }
 
     fn init(mut core: Core, (activation_rx, startup): Self::Flags) -> (Self, Task<Message>) {
-        if let Err(error) = crate::performance::chat_stage::initialize_from_environment() {
-            tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
-                "Could not enable opt-in chat stage measurements");
+        #[cfg(feature = "development")]
+        let automation_native_context = automation_ui::native_admission_fixture::context()
+            .expect("validated inert automation fixture context");
+        #[cfg(feature = "development")]
+        let automation_native_active = automation_native_context.is_some();
+        #[cfg(not(feature = "development"))]
+        let automation_native_active = false;
+        if !automation_native_active {
+            if let Err(error) = crate::performance::chat_stage::initialize_from_environment() {
+                tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
+                    "Could not enable opt-in chat stage measurements");
+            }
+            std::thread::spawn(chat_ui::prune_pasted_images);
         }
-        std::thread::spawn(chat_ui::prune_pasted_images);
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
@@ -14106,18 +14130,22 @@ impl Application for Cagents {
         // the whole of its life, so the observer starts with the window rather
         // than with the first card that happens to need a daemon.
         let (hosted_terminals_tx, hosted_terminals_rx) = async_channel::unbounded();
-        terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        if !automation_native_active {
+            terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        }
         // The daemon owns the shared sidebar model for the same reason it owns
         // the terminal inventory: it outlives every window. Both threads start
         // with the window, so a channel created elsewhere appears without the
         // window having to do anything first.
         let (workspace_model_updates, workspace_model_rx) = async_channel::unbounded();
         let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
-        workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
-        workspace_model_sync::publish_workspace_model(
-            workspace_model_updates,
-            workspace_model_requests,
-        );
+        if !automation_native_active {
+            workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
+            workspace_model_sync::publish_workspace_model(
+                workspace_model_updates,
+                workspace_model_requests,
+            );
+        }
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -14228,8 +14256,14 @@ impl Application for Cagents {
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
-            account_ui: account_ui::State::installation(),
+            account_ui: if automation_native_active {
+                account_ui::State::default()
+            } else {
+                account_ui::State::installation()
+            },
             automation_ui: crate::automation_ui::State::default(),
+            #[cfg(feature = "development")]
+            automation_native_fixture: None,
             work_ui: crate::work_ui::State::default(),
             channel_work: channel_work::State::default(),
             automation_approval: automation_approval::State::default(),
@@ -14326,6 +14360,11 @@ impl Application for Cagents {
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
         };
+        #[cfg(feature = "development")]
+        if let Some(context) = automation_native_context {
+            let task = automation_ui::native_admission_fixture::install(&mut app, context);
+            return (app, task);
+        }
         // One notice per lost card, not a single joined line: the log dedupes
         // by message, so distinct failures stay distinct and a repeated one
         // collapses into a count. The alternative this replaces was losing
@@ -14442,6 +14481,10 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        #[cfg(feature = "development")]
+        if self.automation_native_fixture.is_some() {
+            return automation_ui::native_admission_fixture::update(self, message);
+        }
         // Pane callbacks retain their rendering origin while queued. Unwrap
         // once before all message-dependent policy and completion bookkeeping.
         let (message, pane_origin) = match message {
@@ -18114,6 +18157,10 @@ impl Application for Cagents {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        #[cfg(feature = "development")]
+        if self.automation_native_fixture.is_some() {
+            return automation_ui::native_admission_fixture::subscription(self);
+        }
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),
@@ -19037,6 +19084,10 @@ impl Application for Cagents {
 
 impl Drop for Cagents {
     fn drop(&mut self) {
+        #[cfg(feature = "development")]
+        if self.automation_native_fixture.is_some() {
+            return;
+        }
         self.latency.abandon_pending();
         self.persist();
         self.fold_settings_drafts();
@@ -29303,6 +29354,8 @@ mod tests {
             device_ui: device_ui::State::default(),
             account_ui: account_ui::State::default(),
             automation_ui: crate::automation_ui::State::default(),
+            #[cfg(feature = "development")]
+            automation_native_fixture: None,
             work_ui: crate::work_ui::State::default(),
             channel_work: channel_work::State::default(),
             automation_approval: automation_approval::State::default(),
