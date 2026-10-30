@@ -3,8 +3,8 @@ use crate::{
     account::AccountId,
     agent::Provider,
     agent_execution::{
-        Agent, Authority, Control, Destination, Operation, Reply, Run, Spec, Submit, Summary,
-        Surface, Target, directory::Scope,
+        Accepted, Agent, Authority, Control, Destination, Operation, Reply, Run, Spec, Submit,
+        Summary, Surface, Target, directory::Scope,
     },
     model::{AgentId, RunId},
 };
@@ -13,7 +13,10 @@ use crate::{
 pub enum AgentCommand {
     /// The terminal presentation of an already hosted execution agent.
     #[command(hide = true)]
-    Console { agent_id: AgentId },
+    Console {
+        #[arg(help = "The hosted agent ID.")]
+        agent_id: AgentId,
+    },
     /// Start a provider session on one prompt, accepted durably.
     ///
     /// The provider defaults to the calling session's, the directory to the
@@ -41,12 +44,19 @@ pub enum AgentCommand {
         #[arg(long)]
         channel: Option<ChannelId>,
         #[arg(long)]
+        #[arg(help = "Stable account ID (provider/system or provider/UUID).")]
         account: Option<AccountId>,
         #[arg(long, default_value = "chat", value_parser = ["chat", "terminal"])]
+        #[arg(help = "Presentation surface for the provider session.")]
         surface: String,
         #[arg(long)]
+        #[arg(
+            help = "Provider model ID (Claude: haiku/sonnet/opus; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs."
+        )]
         model: Option<String>,
         #[arg(long)]
+        #[arg(help = "Permission policy (Claude: default/manual/auto/acceptEdits/plan/dontAsk/bypassPermissions; Codex: untrusted/on-failure/on-request/never; OMP: always-ask/write/yolo).",
+            value_parser = ["default", "manual", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions", "untrusted", "on-failure", "on-request", "never", "always-ask", "write", "yolo"])]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
         #[arg(long)]
@@ -73,6 +83,7 @@ pub enum AgentCommand {
     },
     /// Read an owned agent and its latest run.
     Status {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         #[command(flatten)]
         show: ShowArgs,
@@ -83,21 +94,31 @@ pub enum AgentCommand {
     ///
     /// Each handle is an agent, standing for its latest run, or a run, by ID
     /// or a unique prefix of it.
+    ///
+    /// Exit codes: 0 succeeded; 3 timed out; 4 failed, cancelled or interrupted;
+    /// 5 waiting for input, approval or an arrived message. With --any, use
+    /// the first ready run; otherwise failure outranks input, then timeout.
     Wait {
         #[arg(required = true, value_name = "AGENT_OR_RUN")]
+        #[arg(help = "Agent or run handles to wait for.")]
         handles: Vec<String>,
         /// Return as soon as any of them is ready, rather than all.
         #[arg(long)]
         any: bool,
         #[arg(long, default_value = "60", value_parser = parse_positive_seconds)]
+        #[arg(help = "Maximum time to wait, in seconds.")]
         timeout: f64,
         #[command(flatten)]
         show: ShowArgs,
     },
     /// List the questions and approvals an owned agent is waiting on.
-    Requests { agent: String },
+    Requests {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+    },
     /// Answer one of an owned agent's requests with one of its actions.
     Answer {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// The request ID `requests` lists.
         request: String,
@@ -109,13 +130,17 @@ pub enum AgentCommand {
     },
     /// Interrupt an owned agent's active run.
     Interrupt {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// Permit the interrupt to stop the provider's running background subagents.
         #[arg(long)]
         including_subagents: bool,
     },
     /// Stop and close an agent, including its background subagents.
-    Close { agent: String },
+    Close {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+    },
 }
 
 /// A prompt given as an argument, in a file, or on standard input.
@@ -128,6 +153,7 @@ pub struct PromptArgs {
     /// Read the prompt from this file.
     #[arg(long, value_name = "FILE", conflicts_with = "text")]
     pub(super) prompt_file: Option<PathBuf>,
+    /// Legacy named prompt; prefer the positional prompt or --prompt-file.
     #[arg(long = "prompt", hide = true, conflicts_with_all = ["text", "prompt_file"])]
     pub(super) flag: Option<String>,
 }
@@ -142,7 +168,8 @@ pub struct RetryArgs {
 
 #[derive(Debug, clap::Args)]
 pub struct WaitArgs {
-    /// Wait for the run to settle or ask for input before returning.
+    /// Wait for the run. Exit: 0 success, 3 timeout, 4 failure/cancellation,
+    /// 5 input or approval needed.
     #[arg(long)]
     pub(super) wait: bool,
     /// How long `--wait` waits.
@@ -163,7 +190,7 @@ pub struct ShowArgs {
 pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     Provider::ALL
         .into_iter()
-        .find(|provider| provider.executable() == value)
+        .find(|provider| provider.executable().eq_ignore_ascii_case(value))
         .ok_or_else(|| "Choose omp, claude, or codex".into())
 }
 
@@ -274,6 +301,38 @@ fn checkout(project: &Path) -> PathBuf {
         }
         _ => project.to_owned(),
     }
+}
+
+pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str {
+    match state {
+        crate::agent_execution::State::Accepted => "Queued",
+        crate::agent_execution::State::Running => "Running",
+        crate::agent_execution::State::Waiting => "Waiting for input",
+        crate::agent_execution::State::Succeeded => "Succeeded",
+        crate::agent_execution::State::Failed => "Failed",
+        crate::agent_execution::State::Cancelled => "Cancelled",
+        crate::agent_execution::State::Interrupted => "Outcome uncertain",
+    }
+}
+
+fn list_human(summaries: &[Summary]) -> String {
+    super::format::table(
+        ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"],
+        summaries
+            .iter()
+            .map(|summary| {
+                [
+                    short(summary.agent.id),
+                    summary.agent.spec.provider.executable().into(),
+                    state_label(summary.state).into(),
+                    short(summary.run),
+                    summary.agent.spec.target.directory.display().to_string(),
+                    summary.agent.name.clone().unwrap_or_default(),
+                ]
+            })
+            .collect(),
+        "No open agents",
+    )
 }
 
 /// The part of an ID people type and read: unique among one caller's agents
@@ -423,11 +482,28 @@ impl ControlClient {
         let deadline = Instant::now() + timeout;
         let mut replies = Vec::with_capacity(runs.len());
         for run in runs {
-            replies.push(self.agent_before(
-                authority.clone(),
-                Operation::Run(*run),
-                Some(deadline),
-            )?);
+            match self.agent_before(authority.clone(), Operation::Run(*run), Some(deadline)) {
+                Ok(reply) => {
+                    let ready =
+                        matches!(&reply, Reply::Status { run, .. } if run.state.wait_ready());
+                    replies.push(reply);
+                    if any && ready {
+                        return Ok(Waited {
+                            replies,
+                            timed_out: false,
+                            messages: Vec::new(),
+                        });
+                    }
+                }
+                Err(error) if is_timeout_error(&error) => {
+                    return Ok(Waited {
+                        replies,
+                        timed_out: true,
+                        messages: Vec::new(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
         }
         let ready =
             |reply: &Reply| matches!(reply, Reply::Status { run, .. } if run.state.wait_ready());
@@ -482,7 +558,12 @@ impl ControlClient {
                     continue;
                 }
                 match self.agent_before(authority.clone(), Operation::Run(*run), Some(deadline)) {
-                    Ok(current) => *reply = current,
+                    Ok(current) => {
+                        *reply = current;
+                        if any && ready(reply) {
+                            break;
+                        }
+                    }
                     Err(error) if is_timeout_error(&error) => {
                         return waited(replies, true, Vec::new());
                     }
@@ -613,34 +694,30 @@ fn resolve(summaries: &[Summary], handle: &str) -> Result<Option<Handle>, AppErr
 /// The caller's authority and, once a command first needs the daemon, a
 /// connection to it and the caller's agents.
 struct Session {
-    authority: Authority,
-    connection: Option<(ControlClient, PathBuf)>,
+    context: ServiceRequestContext,
+    connection: Option<ControlClient>,
     summaries: Option<Vec<Summary>>,
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(context: &ServiceRequestContext) -> Self {
         Self {
-            authority: Authority::from_environment(),
+            context: context.clone(),
             connection: None,
             summaries: None,
         }
     }
 
-    /// Connects on first use, starting the daemon if it is not running.
+    /// Selects an endpoint on first use under the original caller's policy.
     fn client(&mut self) -> Result<&mut ControlClient, AppError> {
         if self.connection.is_none() {
-            let socket =
-                terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
-            let client = ControlClient::connect(&socket)
-                .map_err(|e| AppError::new("daemon_connection", e))?;
-            self.connection = Some((client, socket));
+            self.connection = Some(self.context.connect()?);
         }
-        Ok(&mut self.connection.as_mut().expect("connected above").0)
+        Ok(self.connection.as_mut().expect("connected above"))
     }
 
     fn call(&mut self, operation: Operation) -> Result<Reply, AppError> {
-        let authority = self.authority.clone();
+        let authority = self.context.authority.clone();
         self.client()?
             .agent(authority, operation)
             .map_err(protocol_error)
@@ -649,7 +726,7 @@ impl Session {
     /// Waits for `runs`; an agent's wait also ends when a message arrives
     /// for it. The user's shell has `cagents inbox` and is never busy.
     fn wait(&mut self, runs: &[RunId], any: bool, timeout: f64) -> Result<Waited, AppError> {
-        let authority = self.authority.clone();
+        let authority = self.context.authority.clone();
         let messages = authority.token().is_some();
         self.client()?
             .wait_agents(
@@ -716,7 +793,7 @@ impl Session {
     /// was lost: the key makes the retry return the first acceptance rather
     /// than start the work twice. Says whether it retried.
     fn submit(&mut self, request: Submit) -> Result<(Reply, bool), AppError> {
-        let authority = self.authority.clone();
+        let authority = self.context.authority.clone();
         match self
             .client()?
             .agent(authority, Operation::Submit(request.clone()))
@@ -760,7 +837,19 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
     if let AgentCommand::Console { agent_id } = command {
         return run_console(agent_id);
     }
-    let mut session = Session::new();
+    execute_with_context(command, &ServiceRequestContext::capture())
+}
+
+pub(super) fn execute_with_context(
+    command: AgentCommand,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    // The hidden console has its own existing-only opaque-capability route.
+    if let AgentCommand::Console { agent_id } = command {
+        return run_console(agent_id);
+    }
+    context.admit_remote()?;
+    let mut session = Session::new(context);
     match command {
         AgentCommand::Console { .. } => unreachable!("handled console presentation"),
         AgentCommand::Spawn {
@@ -948,30 +1037,7 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
         }
         AgentCommand::List => {
             let summaries = session.summaries()?.to_vec();
-            let human = if summaries.is_empty() {
-                "No open agents".to_owned()
-            } else {
-                summaries
-                    .iter()
-                    .map(|summary| {
-                        format!(
-                            "{}  {:<6} {:<11} run {}  {}{}",
-                            short(summary.agent.id),
-                            summary.agent.spec.provider.executable(),
-                            format!("{:?}", summary.state),
-                            short(summary.run),
-                            summary.agent.spec.target.directory.display(),
-                            summary
-                                .agent
-                                .name
-                                .as_ref()
-                                .map(|name| format!("  {name}"))
-                                .unwrap_or_default()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
+            let human = list_human(&summaries);
             Ok(CommandOutput {
                 command: "agent.list",
                 data: json!({"agents": summaries}),
@@ -1006,23 +1072,16 @@ pub(super) fn execute(command: AgentCommand) -> Result<CommandOutput, AppError> 
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
+            if statuses.is_empty() && timed_out {
+                human = "Wait timed out before any run status was available".into();
+            }
             human.push_str(&arrived_lines(&messages));
-            let mut data = match statuses.as_slice() {
-                [(agent, run)] => json!({
-                    "agent": agent,
-                    "run": run,
-                    "timed_out": timed_out,
-                    "ended_by": ended_by,
-                }),
-                _ => json!({
-                    "results": statuses
-                        .iter()
-                        .map(|(agent, run)| json!({"agent": agent, "run": run}))
-                        .collect::<Vec<_>>(),
-                    "timed_out": timed_out,
-                    "ended_by": ended_by,
-                }),
-            };
+            let mut data = wait_data(&statuses, any, timed_out, ended_by);
+            data["unresolved_runs"] = json!(
+                runs.iter()
+                    .filter(|id| !statuses.iter().any(|(_, run)| run.id == **id))
+                    .collect::<Vec<_>>()
+            );
             if !messages.is_empty() {
                 data["messages"] = json!(messages);
             }
@@ -1119,6 +1178,9 @@ fn submitted(
         .validate()
         .map_err(|e| AppError::new("agent_request", e))?;
     let key = request.idempotency_key.clone();
+    let device = crate::device::selected()
+        .map(|device| device.name.as_str())
+        .unwrap_or("local");
     // Whether a failed submission was accepted is unknown, so the key that
     // makes retrying it safe goes with the error.
     let (reply, retried) = session.submit(request).map_err(|mut error| {
@@ -1155,19 +1217,31 @@ fn submitted(
         "idempotency_key": key,
     });
     if wait.wait {
-        let waited = session.wait(&[accepted.run.id], false, wait.timeout)?;
+        let waited = session
+            .wait(&[accepted.run.id], false, wait.timeout)
+            .map_err(|error| accepted_wait_error(error, &accepted, &key, device))?;
         data["ended_by"] = json!(waited.ended_by());
         let Waited {
             mut replies,
             timed_out,
             messages,
         } = waited;
-        let (agent, run) = status_reply(replies.remove(0))?;
+        let (agent, run) = match replies.pop() {
+            Some(reply) => status_reply(reply)
+                .map_err(|error| accepted_wait_error(error, &accepted, &key, device))?,
+            None => (accepted.agent, accepted.run),
+        };
         human = status_lines(&agent, &run, timed_out, show);
         human.push_str(&arrived_lines(&messages));
         data["agent"] = json!(agent);
         data["run"] = json!(run);
         data["timed_out"] = json!(timed_out);
+        data["outcome"] = json!(wait_outcome(
+            &[run.state],
+            false,
+            timed_out,
+            !messages.is_empty(),
+        ));
         if !messages.is_empty() {
             data["messages"] = json!(messages);
         }
@@ -1176,6 +1250,89 @@ fn submitted(
         command,
         data,
         human,
+    })
+}
+
+/// A failed observation must not hide work the daemon already accepted.
+fn accepted_wait_error(
+    mut error: AppError,
+    accepted: &Accepted,
+    key: &str,
+    device: &str,
+) -> AppError {
+    let mut details = match error.details.take() {
+        Some(Value::Object(details)) => details,
+        Some(cause) => serde_json::Map::from_iter([("cause_details".into(), cause)]),
+        None => serde_json::Map::new(),
+    };
+    details.insert(
+        "acceptance".into(),
+        json!({
+            "agent": accepted.agent,
+            "run": accepted.run,
+            "created": accepted.created,
+            "idempotency_key": key,
+            "device": device,
+        }),
+    );
+    error.details = Some(Value::Object(details));
+    error.message = format!(
+        "{}; work was accepted as agent {} run {} with idempotency key {key:?}; recover with cagents --device={device} agent wait {}; repeat the submission only with the same idempotency key",
+        error.message, accepted.agent.id, accepted.run.id, accepted.run.id
+    );
+    error
+}
+
+fn run_outcome(state: crate::agent_execution::State) -> WaitOutcome {
+    use crate::agent_execution::State;
+    match state {
+        State::Succeeded => WaitOutcome::Succeeded,
+        State::Failed | State::Cancelled | State::Interrupted => WaitOutcome::Failed,
+        State::Waiting => WaitOutcome::Waiting,
+        State::Accepted | State::Running => WaitOutcome::Pending,
+    }
+}
+
+fn wait_outcome(
+    states: &[crate::agent_execution::State],
+    any: bool,
+    timed_out: bool,
+    messages: bool,
+) -> WaitOutcome {
+    if any && !timed_out && !messages {
+        return states
+            .iter()
+            .copied()
+            .find(|state| state.wait_ready())
+            .map(run_outcome)
+            .unwrap_or(WaitOutcome::TimedOut);
+    }
+    let outcomes: Vec<_> = states.iter().copied().map(run_outcome).collect();
+    if outcomes.contains(&WaitOutcome::Failed) {
+        WaitOutcome::Failed
+    } else if messages || outcomes.contains(&WaitOutcome::Waiting) {
+        WaitOutcome::Waiting
+    } else if timed_out || outcomes.contains(&WaitOutcome::Pending) {
+        WaitOutcome::TimedOut
+    } else {
+        WaitOutcome::Succeeded
+    }
+}
+
+fn wait_data(statuses: &[(Agent, Run)], any: bool, timed_out: bool, ended_by: &str) -> Value {
+    let states = statuses
+        .iter()
+        .map(|(_, run)| run.state)
+        .collect::<Vec<_>>();
+    json!({
+        "results": statuses.iter().map(|(agent, run)| json!({
+            "agent": agent, "run": run, "outcome": if timed_out && !run.state.wait_ready() {
+                WaitOutcome::TimedOut
+            } else { run_outcome(run.state) },
+        })).collect::<Vec<_>>(),
+        "timed_out": timed_out,
+        "ended_by": ended_by,
+        "outcome": wait_outcome(&states, any, timed_out, ended_by == "messages"),
     })
 }
 
@@ -1347,6 +1504,157 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_wait_recovery_keeps_device_routing_and_original_error_details() {
+        let (_, reply) = running();
+        let (agent, run) = status_reply(reply).unwrap();
+        let accepted = Accepted {
+            agent,
+            run,
+            created: false,
+        };
+        for device in ["remote-a", "-secondary"] {
+            for cause in [
+                json!({"code": "fixture", "retryable": true}),
+                json!(["opaque", 17]),
+            ] {
+                let error = accepted_wait_error(
+                    AppError {
+                        kind: "protocol",
+                        message: "original observation failure".into(),
+                        details: Some(cause.clone()),
+                    },
+                    &accepted,
+                    "same supplied key",
+                    device,
+                );
+                assert_eq!(error.kind, "protocol");
+                assert!(error.message.starts_with("original observation failure;"));
+                let details = error.details.unwrap();
+                assert_eq!(details["acceptance"]["device"], device);
+                assert_eq!(details["acceptance"]["run"], json!(accepted.run));
+                if cause.is_object() {
+                    assert_eq!(details["code"], cause["code"]);
+                    assert_eq!(details["retryable"], cause["retryable"]);
+                } else {
+                    assert_eq!(details["cause_details"], cause);
+                }
+                let selection = format!("--device={device}");
+                let run = accepted.run.id.to_string();
+                assert!(
+                    error
+                        .message
+                        .contains(&format!("cagents {selection} agent wait {run}"))
+                );
+                let cli =
+                    Cli::try_parse_from(["cagents", &selection, "agent", "wait", &run]).unwrap();
+                assert_eq!(cli.device.as_deref(), Some(device));
+                assert!(
+                    matches!(cli.command, TopCommand::Agent { command: AgentCommand::Wait { handles, .. } } if handles == [run])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn readable_provider_flags_accept_cli_and_legacy_json_casing() {
+        for (name, expected) in [
+            ("claude", Provider::Claude),
+            ("Claude", Provider::Claude),
+            ("CLAUDE", Provider::Claude),
+            ("CoDeX", Provider::Codex),
+            ("Omp", Provider::Omp),
+        ] {
+            let parsed =
+                Cli::try_parse_from(["cagents", "account", "list", "--provider", name]).unwrap();
+            assert!(matches!(parsed.command, TopCommand::Account {
+                command: crate::control::AccountCommand::List { provider: Some(provider) }
+            } if provider == expected));
+        }
+        assert!(parse_provider("unknown").is_err());
+    }
+
+    #[test]
+    fn wait_contract_has_one_shape_and_outcome_exit_codes() {
+        use crate::agent_execution::State;
+        for (state, timed_out, code, outcome) in [
+            (State::Succeeded, false, 0, "succeeded"),
+            (State::Failed, false, 4, "failed"),
+            (State::Cancelled, false, 4, "failed"),
+            (State::Interrupted, false, 4, "failed"),
+            (State::Running, true, 3, "timed_out"),
+            (State::Waiting, false, 5, "waiting"),
+        ] {
+            let (_, reply) = running();
+            let (agent, mut run) = status_reply(reply).unwrap();
+            run.state = state;
+            let one = vec![(agent, run)];
+            let data = wait_data(&one, false, timed_out, "runs");
+            assert_eq!(data["results"][0]["outcome"], outcome);
+            let two = wait_data(&[one[0].clone(), one[0].clone()], false, timed_out, "runs");
+            assert_eq!(
+                data.as_object().unwrap().keys().collect::<Vec<_>>(),
+                two.as_object().unwrap().keys().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                CommandOutput {
+                    command: "agent.wait",
+                    data,
+                    human: String::new()
+                }
+                .exit_code(),
+                ExitCode::from(code)
+            );
+            // Spawn and send use this same outcome calculation after acceptance.
+            for command in ["agent.spawn", "agent.send"] {
+                let outcome = wait_outcome(&[state], false, timed_out, false);
+                assert_eq!(
+                    CommandOutput {
+                        command,
+                        data: json!({"outcome": outcome}),
+                        human: String::new()
+                    }
+                    .exit_code(),
+                    ExitCode::from(code)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wait_any_uses_first_ready_run_and_all_uses_worst_outcome() {
+        use crate::agent_execution::State::*;
+        assert_eq!(
+            wait_outcome(&[Running, Succeeded, Failed], true, false, false),
+            WaitOutcome::Succeeded
+        );
+        assert_eq!(
+            wait_outcome(&[Running, Waiting, Failed], true, false, false),
+            WaitOutcome::Waiting
+        );
+        assert_eq!(
+            wait_outcome(&[Succeeded, Failed, Waiting], false, false, false),
+            WaitOutcome::Failed
+        );
+        assert_eq!(
+            wait_outcome(&[Succeeded, Running], false, true, false),
+            WaitOutcome::TimedOut
+        );
+        assert_eq!(
+            wait_outcome(&[Running], false, false, true),
+            WaitOutcome::Waiting
+        );
+    }
+
+    #[test]
+    fn wait_help_documents_every_exit_code() {
+        let error = Cli::try_parse_from(["cagents", "agent", "wait", "--help"]).unwrap_err();
+        let help = error.to_string();
+        for text in ["0 succeeded", "3 timed out", "4 failed", "5 waiting"] {
+            assert!(help.contains(text), "missing {text}: {help}");
+        }
+    }
 
     fn proof() -> HostSessionProof {
         HostSessionProof {
@@ -1594,6 +1902,79 @@ mod tests {
             drop(client);
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn stalled_initial_wait_read_returns_timeout_without_inventing_a_run() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (run_id, _) = running();
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let waited = client
+            .wait_agents(
+                Authority::default(),
+                &[run_id],
+                false,
+                false,
+                Duration::from_millis(25),
+            )
+            .unwrap();
+        assert!(waited.timed_out);
+        assert!(waited.replies.is_empty());
+        let data = wait_data(&[], false, waited.timed_out, waited.ended_by());
+        assert_eq!(
+            CommandOutput {
+                command: "agent.wait",
+                data,
+                human: String::new()
+            }
+            .exit_code(),
+            ExitCode::from(3)
+        );
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn any_wait_returns_the_first_ready_initial_status_without_querying_later_runs() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (run_id, mut response) = running();
+        let Reply::Status { run, .. } = &mut response else {
+            panic!("expected status");
+        };
+        run.state = crate::agent_execution::State::Succeeded;
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            answer(
+                &mut server_stream,
+                |request| matches!(request, ClientRequest::Agent { operation: Operation::Run(id), .. } if *id == run_id),
+                ServerResponse::Agent(response),
+            );
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none()
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let waited = client
+            .wait_agents(
+                Authority::default(),
+                &[run_id, RunId::new()],
+                true,
+                false,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(!waited.timed_out);
+        assert_eq!(waited.replies.len(), 1);
+        assert_eq!(waited.ended_by(), "runs");
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]
@@ -2023,6 +2404,33 @@ mod tests {
             run: run.parse().unwrap(),
             state: crate::agent_execution::State::Running,
         }
+    }
+
+    #[test]
+    fn readable_agent_list_labels_waiting_and_uncertain_results_with_an_empty_state() {
+        assert_eq!(list_human(&[]), "No open agents");
+        let mut entry = summary(
+            "abcdef00-0000-4000-8000-000000000001",
+            "12345678-0000-4000-8000-000000000001",
+        );
+        entry.agent.name = Some("reviewer\nnext".into());
+        entry.state = crate::agent_execution::State::Waiting;
+        let human = list_human(&[entry.clone()]);
+        assert_eq!(human.lines().count(), 2);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"]
+        );
+        assert!(human.contains("abcdef00"));
+        assert!(human.contains("Waiting for input"));
+        assert!(human.ends_with("reviewer next"));
+        entry.state = crate::agent_execution::State::Interrupted;
+        assert!(list_human(&[entry]).contains("Outcome uncertain"));
     }
 
     #[test]

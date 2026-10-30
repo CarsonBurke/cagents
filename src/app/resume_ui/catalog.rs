@@ -3,12 +3,13 @@
 //! Discovery takes two passes so that a large history is listed at once. The
 //! first only stats each provider's session store, which stays cheap at any
 //! size and orders every transcript newest first. The second reads each
-//! transcript's identity and title from as little of the file as answers
-//! them, newest first, and remembers the answer until the file changes.
+//! transcript's bounded identity header and complete Claude name metadata,
+//! newest first, and remembers the answer until the file changes.
 use super::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,7 +29,7 @@ pub struct Candidate {
     pub seed: usize,
     pub path: PathBuf,
     modified_ms: i64,
-    len: u64,
+    version: FileVersion,
 }
 
 /// A saved conversation as listed, without the session it would resume as.
@@ -59,10 +60,31 @@ struct Header {
     named: bool,
 }
 
-/// Transcript headers by path, valid while the file keeps its size and
-/// modification time.
+/// File identity and nanosecond change stamps distinguish replacement and
+/// same-size rewrites too; the millisecond UI timestamp is not a cache key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileVersion {
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+impl FileVersion {
+    fn new(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+/// Transcript headers by exact file version, retained across picker openings.
 #[derive(Default)]
-pub struct Cache(Mutex<HashMap<PathBuf, (i64, u64, Option<Header>)>>);
+pub struct Cache(Mutex<HashMap<PathBuf, (FileVersion, Option<Header>)>>);
 
 /// Every transcript in the seeds' session stores, newest first, or as many
 /// as were found before `cancel` was set.
@@ -98,7 +120,7 @@ pub fn candidates(seeds: &[chat::Session], cancel: &AtomicBool) -> Vec<Candidate
                 seed: index,
                 path,
                 modified_ms,
-                len: metadata.len(),
+                version: FileVersion::new(&metadata),
             });
         }
     }
@@ -154,28 +176,40 @@ fn modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
 impl Cache {
     /// The conversation `candidate` holds, read only when it changed since it
     /// was last read.
+    #[cfg(test)]
     pub fn find(&self, provider: Provider, candidate: &Candidate) -> Option<Found> {
+        self.find_with_cancel(provider, candidate, &AtomicBool::new(false))
+    }
+
+    fn find_with_cancel(
+        &self,
+        provider: Provider,
+        candidate: &Candidate,
+        cancel: &AtomicBool,
+    ) -> Option<Found> {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         let cached = self
             .0
             .lock()
             .ok()?
             .get(&candidate.path)
-            .filter(|(modified, len, _)| {
-                *modified == candidate.modified_ms && *len == candidate.len
-            })
-            .map(|(_, _, header)| header.clone());
+            .filter(|(version, _)| *version == candidate.version)
+            .map(|(_, header)| header.clone());
         let header = match cached {
             Some(header) => header,
             None => {
-                let header = header(provider, &candidate.path);
+                let mut covered = true;
+                let header = header_with_cancel(provider, &candidate.path, cancel, &mut covered);
+                if !covered || cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let mut cache = self.0.lock().ok()?;
                 if cache.len() >= CACHE_LIMIT {
                     cache.clear();
                 }
-                cache.insert(
-                    candidate.path.clone(),
-                    (candidate.modified_ms, candidate.len, header.clone()),
-                );
+                cache.insert(candidate.path.clone(), (candidate.version, header.clone()));
                 header
             }
         }?;
@@ -207,7 +241,9 @@ pub fn find_all(
         chunk
             .iter()
             .take_while(|_| !cancel.load(Ordering::Relaxed))
-            .filter_map(|candidate| cache.find(seeds[candidate.seed].launch.provider, candidate))
+            .filter_map(|candidate| {
+                cache.find_with_cancel(seeds[candidate.seed].launch.provider, candidate, cancel)
+            })
             .collect::<Vec<_>>()
     };
     let size = candidates.len().div_ceil(workers.max(1)).max(1);
@@ -225,45 +261,63 @@ pub fn find_all(
     })
 }
 
-/// The names Codex keeps for its conversations apart from their
-/// transcripts, by conversation ID, the latest for each.
-pub fn names(seeds: &[chat::Session]) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    let mut roots = HashSet::new();
-    for seed in seeds {
-        if seed.launch.provider != Provider::Codex {
-            continue;
-        }
-        let Some(root) = Provider::Codex.session_root(&seed.launch.recipe) else {
-            continue;
-        };
-        let path = root.join("session_index.jsonl");
-        if !roots.insert(path.clone()) {
-            continue;
-        }
-        let Ok(file) = std::fs::File::open(&path) else {
-            continue;
-        };
-        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if let (Some(id), Some(name)) = (
-                value["id"].as_str(),
-                value["thread_name"]
-                    .as_str()
-                    .and_then(crate::account::clean_label),
-            ) {
-                names.insert(id.to_owned(), name);
+/// Codex names by the seed's actual account root and conversation ID. A
+/// copied session ID in another account is a different resume choice. Shared
+/// roots are read once and share their immutable result across seed recipes.
+pub fn names(seeds: &[chat::Session]) -> Vec<Arc<HashMap<String, String>>> {
+    let mut roots = HashMap::<PathBuf, Arc<HashMap<String, String>>>::new();
+    let empty = Arc::new(HashMap::new());
+    seeds
+        .iter()
+        .map(|seed| {
+            if seed.launch.provider != Provider::Codex {
+                return empty.clone();
             }
-        }
-    }
-    names
+            let Some(root) = Provider::Codex.session_root(&seed.launch.recipe) else {
+                return empty.clone();
+            };
+            let path = root.join("session_index.jsonl");
+            roots
+                .entry(path.clone())
+                .or_insert_with(|| {
+                    let mut names = HashMap::new();
+                    if let Ok(file) = std::fs::File::open(&path) {
+                        for line in std::io::BufReader::new(file).lines().map_while(Result::ok) {
+                            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                                continue;
+                            };
+                            if let (Some(id), Some(name)) = (
+                                value["id"].as_str(),
+                                value["thread_name"]
+                                    .as_str()
+                                    .and_then(crate::workspace_model::channel_title),
+                            ) {
+                                names.insert(id.to_owned(), name);
+                            }
+                        }
+                    }
+                    Arc::new(names)
+                })
+                .clone()
+        })
+        .collect()
 }
 
 /// Reads a transcript's identity and title, or `None` for a file that is not
 /// a resumable top-level conversation.
+#[cfg(test)]
 fn header(provider: Provider, path: &Path) -> Option<Header> {
+    let mut covered = true;
+    header_with_cancel(provider, path, &AtomicBool::new(false), &mut covered)
+}
+
+// An interrupted metadata pass must not become a cached negative lookup.
+fn header_with_cancel(
+    provider: Provider,
+    path: &Path,
+    cancel: &AtomicBool,
+    covered: &mut bool,
+) -> Option<Header> {
     let mut file = std::fs::File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
     let mut identity = None;
@@ -274,6 +328,10 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
     // Most records are irrelevant and some are large, so a record is parsed
     // only when its text could hold what is still missing.
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            *covered = false;
+            return None;
+        }
         line.clear();
         if reader.read_until(b'\n', &mut line).ok()? == 0 {
             break;
@@ -301,20 +359,47 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
         if wants_title {
             titles.note(&value);
         }
-        // Titles past this point are looked for only in the tail, as Claude's
-        // own picker does: it appends a conversation's name again there for
-        // that reader, OMP keeps its title on the first line, and Codex keeps
-        // names apart. Reading the whole head would double a cold index.
+        // Identity and first prompt are bounded header data. Claude names
+        // need the complete metadata pass below: a rename is not guaranteed
+        // to remain near either end of a growing transcript.
         if identity.is_some() && prompt.is_some() {
             break;
         }
     }
     let (id, directory) = identity?;
+    if provider == Provider::Claude {
+        use crate::chat::claude_metadata::{Lines, Names};
+        let mut lines = Lines::default();
+        let mut names = Names::default();
+        if !matches!(
+            lines.scan(
+                &mut file,
+                len,
+                || cancel.load(Ordering::Relaxed),
+                |line| names.note(line, &id, &directory),
+            ),
+            Ok(true)
+        ) {
+            *covered = false;
+            return None;
+        }
+        let name = names.title().map(str::to_owned);
+        return Some(Header {
+            id,
+            directory,
+            named: name.is_some(),
+            title: name.or(prompt),
+        });
+    }
     let answer = |titles: Titles| Header {
         id,
         directory,
-        named: titles.named.is_some() || titles.summary.is_some(),
-        title: titles.named.or(titles.summary).or(prompt),
+        named: titles.named.is_some() || titles.generated.is_some() || titles.summary.is_some(),
+        title: titles
+            .named
+            .or(titles.generated)
+            .or(titles.summary)
+            .or(prompt),
     };
     // Codex keeps a conversation's name apart from it, in [`names`].
     if provider == Provider::Codex {
@@ -347,15 +432,21 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
 struct Titles {
     /// Set by the reader or the provider as the conversation's name.
     named: Option<String>,
+    generated: Option<String>,
     /// A provider's generated account of the conversation.
     summary: Option<String>,
 }
 
 impl Titles {
     fn note(&mut self, value: &Value) {
-        let label = |key: &str| value[key].as_str().and_then(crate::account::clean_label);
+        let label = |key: &str| {
+            value[key]
+                .as_str()
+                .and_then(crate::workspace_model::channel_title)
+        };
         match value["type"].as_str() {
             Some("custom-title") => self.named = label("customTitle").or(self.named.take()),
+            Some("ai-title") => self.generated = label("aiTitle").or(self.generated.take()),
             Some("title") => self.named = label("title").or(self.named.take()),
             Some("session_info") => self.named = label("name").or(self.named.take()),
             Some("summary") => self.summary = label("summary").or(self.summary.take()),
@@ -368,6 +459,7 @@ impl Titles {
 fn holds_title(line: &str) -> bool {
     [
         "\"custom-title\"",
+        "\"ai-title\"",
         "\"type\":\"title\"",
         "\"session_info\"",
         "\"type\":\"summary\"",
@@ -448,21 +540,34 @@ fn prompt_of(provider: Provider, value: &Value) -> Option<String> {
         {
             return value["payload"]["message"]
                 .as_str()
-                .and_then(crate::account::clean_label);
+                .and_then(crate::workspace_model::channel_title_from_prompt);
         }
         _ => return None,
     };
     let content = &message["content"];
-    let text = content.as_str().or_else(|| {
-        content
+    let combined;
+    let text = if let Some(text) = content.as_str() {
+        text
+    } else {
+        combined = content
             .as_array()?
             .iter()
-            .find_map(|part| part["text"].as_str())
-    })?;
+            .take(32)
+            .filter_map(|part| part["text"].as_str())
+            .fold(String::new(), |mut text, part| {
+                let remaining = (32 * 1024usize).saturating_sub(text.len() + 1);
+                if remaining > 0 {
+                    text.push('\n');
+                    text.push_str(&part[..part.floor_char_boundary(remaining.min(part.len()))]);
+                }
+                text
+            });
+        &combined
+    };
     if provider == Provider::Claude {
         return claude_prompt(text);
     }
-    crate::account::clean_label(text)
+    crate::workspace_model::channel_title_from_prompt(text)
 }
 
 /// What a Claude user record asked, as a title: a command with what it was
@@ -475,11 +580,9 @@ fn claude_prompt(text: &str) -> Option<String> {
         let end = start + text[start..].find(&format!("</{name}>"))?;
         Some(text[start..end].trim())
     };
-    if let Some(command) = element("command-name") {
+    if element("command-name").is_some() {
         let args = element("command-args").unwrap_or_default();
-        return (!args.is_empty())
-            .then(|| crate::account::clean_label(&format!("{command} {args}")))
-            .flatten();
+        return crate::workspace_model::channel_title_from_prompt(args);
     }
     let trimmed = text.trim_start();
     if ["<local-command-", "<bash-", "<command-"]
@@ -488,7 +591,7 @@ fn claude_prompt(text: &str) -> Option<String> {
     {
         return None;
     }
-    crate::account::clean_label(text)
+    crate::workspace_model::channel_title_from_prompt(text)
 }
 
 /// The session `found` resumes as: `seed`'s account and launch, with the
@@ -682,6 +785,41 @@ mod tests {
     }
 
     #[test]
+    fn claude_resume_uses_custom_then_generated_name_then_content_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let prompt = json!({"type":"user","sessionId":id,"cwd":"/project","message":{"content":"\"\n> Quoted old context\nReview bundle encryption and performance"}});
+        let ai = json!({"type":"ai-title","sessionId":id,"aiTitle":"Generated encryption audit"});
+        std::fs::write(&path, format!("{prompt}\n{ai}\n")).unwrap();
+        let found = header(Provider::Claude, &path).unwrap();
+        assert_eq!(found.title.as_deref(), Some("Generated encryption audit"));
+        assert!(found.named);
+        let custom =
+            json!({"type":"custom-title","sessionId":id,"customTitle":"My bundle project"});
+        std::fs::write(&path, format!("{prompt}\n{custom}\n{ai}\n")).unwrap();
+        assert_eq!(
+            header(Provider::Claude, &path).unwrap().title.as_deref(),
+            Some("My bundle project")
+        );
+        for title in ["1341", "🔐", "🧑‍💻"] {
+            let custom = json!({"type":"custom-title","sessionId":id,"customTitle":title});
+            std::fs::write(&path, format!("{prompt}\n{custom}\n")).unwrap();
+            let found = header(Provider::Claude, &path).unwrap();
+            assert_eq!(found.title.as_deref(), Some(title));
+            assert!(found.named);
+            assert_eq!(found.title, crate::workspace_model::channel_title(title));
+        }
+        std::fs::write(&path, format!("{prompt}\n")).unwrap();
+        let found = header(Provider::Claude, &path).unwrap();
+        assert_eq!(
+            found.title.as_deref(),
+            Some("Review bundle encryption and performance")
+        );
+        assert!(!found.named);
+    }
+
+    #[test]
     fn a_claude_command_titles_a_conversation_only_by_what_it_asks() {
         let command = |name: &str, args: &str| {
             format!(
@@ -691,7 +829,7 @@ mod tests {
         assert_eq!(claude_prompt(&command("/exit", "")), None);
         assert_eq!(
             claude_prompt(&command("/solve-task", "fix resume")).as_deref(),
-            Some("/solve-task fix resume")
+            Some("fix resume")
         );
         assert_eq!(
             claude_prompt("<local-command-stdout>Bye!</local-command-stdout>"),
@@ -736,7 +874,103 @@ mod tests {
             .concat(),
         )
         .unwrap();
-        assert_eq!(names(&[seed]).get(id).map(String::as_str), Some("Renamed"));
+        assert_eq!(
+            names(&[seed.clone()])[0].get(id).map(String::as_str),
+            Some("Renamed")
+        );
+        for title in [
+            "A".repeat(70),
+            "🔐".repeat(90),
+            "\u{202e}Bundle\nreview\u{2066}".into(),
+        ] {
+            std::fs::write(
+                root.join("session_index.jsonl"),
+                format!("{}\n", json!({"id":id,"thread_name":title})),
+            )
+            .unwrap();
+            assert_eq!(
+                names(&[seed.clone()])[0].get(id).cloned(),
+                crate::workspace_model::channel_title(&title)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_names_stay_with_the_original_account_and_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut seeds = Vec::new();
+        let id = "01a0743a-ccb3-7990-b840-3a0779cca5dd";
+        for (slot, provider) in [Provider::Codex, Provider::Codex, Provider::Claude]
+            .into_iter()
+            .enumerate()
+        {
+            let home = directory.path().join(slot.to_string());
+            std::fs::create_dir_all(&home).unwrap();
+            let account = crate::account::Account {
+                provider,
+                home: crate::account::AccountHome::Linked {
+                    key: uuid::Uuid::new_v4(),
+                    path: home,
+                },
+            };
+            let seed = chat::fresh_session(
+                provider,
+                TerminalId::new(),
+                directory.path().into(),
+                &account,
+            )
+            .unwrap();
+            if provider == Provider::Codex {
+                let root = provider.session_root(&seed.launch.recipe).unwrap();
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::write(
+                    root.join("session_index.jsonl"),
+                    format!(
+                        "{}\n",
+                        json!({"id":id,"thread_name":format!("Account {slot} title")})
+                    ),
+                )
+                .unwrap();
+            }
+            seeds.push(seed);
+        }
+        seeds.push(seeds[0].clone());
+        let names = names(&seeds);
+        assert_eq!(
+            names[0].get(id).map(String::as_str),
+            Some("Account 0 title")
+        );
+        assert_eq!(
+            names[1].get(id).map(String::as_str),
+            Some("Account 1 title")
+        );
+        assert!(
+            names[2].is_empty(),
+            "Claude cannot borrow a same-ID Codex name"
+        );
+        assert!(
+            Arc::ptr_eq(&names[0], &names[3]),
+            "one account root is read only once"
+        );
+    }
+
+    #[test]
+    fn provider_resume_names_share_live_label_sanitization_and_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let prompt = json!({"type":"user","sessionId":id,"cwd":"/project","message":{"content":"Review encryption performance"}});
+        for title in [
+            "A".repeat(70),
+            "🧑‍💻".repeat(40),
+            "\u{202e}Bundle\nreview\u{2066}".into(),
+        ] {
+            let custom = json!({"type":"custom-title","sessionId":id,"customTitle":title});
+            std::fs::write(&path, format!("{prompt}\n{custom}\n")).unwrap();
+            let found = header(Provider::Claude, &path).unwrap();
+            assert_eq!(found.title, crate::workspace_model::channel_title(&title));
+            assert!(found.named);
+        }
     }
 
     /// The cache answers for a file until it changes.
@@ -754,19 +988,202 @@ mod tests {
                 seed: 0,
                 path: path.clone(),
                 modified_ms: modified_ms(&metadata).unwrap(),
-                len: metadata.len(),
+                version: FileVersion::new(&metadata),
             }
         };
         let cache = Cache::default();
-        write("First");
+        write("Review encryption");
         assert_eq!(
             cache.find(Provider::Claude, &candidate()).unwrap().title,
-            "First"
+            "Review encryption"
         );
-        write("Second, longer");
+        write("Review encryption throughput");
         assert_eq!(
             cache.find(Provider::Claude, &candidate()).unwrap().title,
-            "Second, longer"
+            "Review encryption throughput"
+        );
+    }
+
+    #[test]
+    fn fresh_claude_picker_and_changed_cache_keep_middle_custom_name() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let cwd = directory.path();
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"user","sessionId":id,"cwd":cwd,"message":{"content":"First fallback"}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Earlier generated"})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"assistant","message":{"content":"x".repeat(2*HEAD_BYTES as usize)}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Middle custom"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let candidate = || {
+            let metadata = std::fs::metadata(&path).unwrap();
+            Candidate {
+                seed: 0,
+                path: path.clone(),
+                modified_ms: modified_ms(&metadata).unwrap(),
+                version: FileVersion::new(&metadata),
+            }
+        };
+        let cache = Cache::default();
+        assert_eq!(
+            cache.find(Provider::Claude, &candidate()).unwrap().title,
+            "Middle custom"
+        );
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"assistant","message":{"content":"y".repeat(128*1024)}})
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"ai-title","sessionId":id,"aiTitle":"Later generated"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            cache.find(Provider::Claude, &candidate()).unwrap().title,
+            "Middle custom"
+        );
+        let fresh = Cache::default()
+            .find(Provider::Claude, &candidate())
+            .unwrap();
+        assert_eq!(fresh.title, "Middle custom");
+        assert!(fresh.named);
+        assert_eq!(fresh.id, id);
+        assert_eq!(fresh.directory, cwd);
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Latest custom"})
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            cache.find(Provider::Claude, &candidate()).unwrap().title,
+            "Latest custom"
+        );
+    }
+
+    #[test]
+    fn claude_picker_scopes_names_and_does_not_cache_cancelled_reads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let records = [
+            json!({"type":"user","sessionId":id,"cwd":directory.path(),"message":{"content":"Original fallback"}}),
+            json!({"type":"custom-title","sessionId":"00000000-0000-4000-8000-000000000002","customTitle":"Other session"}),
+            json!({"type":"custom-title","sessionId":id,"cwd":"/foreign","customTitle":"Other directory"}),
+            json!({"type":"custom-title","sessionId":id,"isSidechain":true,"customTitle":"Sidechain"}),
+        ];
+        std::fs::write(
+            &path,
+            records
+                .iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let candidate = Candidate {
+            seed: 0,
+            path: path.clone(),
+            modified_ms: modified_ms(&metadata).unwrap(),
+            version: FileVersion::new(&metadata),
+        };
+        let cache = Cache::default();
+        assert!(
+            cache
+                .find_with_cancel(Provider::Claude, &candidate, &AtomicBool::new(true))
+                .is_none()
+        );
+        assert!(cache.0.lock().unwrap().is_empty());
+        let found = cache.find(Provider::Claude, &candidate).unwrap();
+        assert_eq!(found.title, "Original fallback");
+        assert!(!found.named);
+        let other = directory.path().join("another-account.jsonl");
+        std::fs::write(
+            &other,
+            format!(
+                "{}\n{}\n",
+                records[0],
+                json!({"type":"custom-title","sessionId":id,"customTitle":"Another account name"})
+            ),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&other).unwrap();
+        let other = Candidate {
+            seed: 1,
+            path: other,
+            modified_ms: modified_ms(&metadata).unwrap(),
+            version: FileVersion::new(&metadata),
+        };
+        assert_eq!(
+            cache.find(Provider::Claude, &other).unwrap().title,
+            "Another account name"
+        );
+        assert_eq!(
+            cache.find(Provider::Claude, &candidate).unwrap().title,
+            "Original fallback"
+        );
+    }
+
+    #[test]
+    fn same_size_replacement_invalidates_claude_picker_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let write = |path: &Path, name: &str| {
+            std::fs::write(path,format!("{}\n{}\n",json!({"type":"user","sessionId":id,"cwd":directory.path(),"message":{"content":"Fallback"}}),json!({"type":"custom-title","sessionId":id,"customTitle":name}))).unwrap();
+        };
+        let candidate = || {
+            let metadata = std::fs::metadata(&path).unwrap();
+            Candidate {
+                seed: 0,
+                path: path.clone(),
+                modified_ms: modified_ms(&metadata).unwrap(),
+                version: FileVersion::new(&metadata),
+            }
+        };
+        write(&path, "First custom");
+        let before = candidate();
+        let cache = Cache::default();
+        assert_eq!(
+            cache.find(Provider::Claude, &before).unwrap().title,
+            "First custom"
+        );
+        let replacement = path.with_extension("replacement");
+        write(&replacement, "Other custom");
+        std::fs::rename(replacement, &path).unwrap();
+        let after = candidate();
+        assert_eq!(before.version.len, after.version.len);
+        assert_ne!(before.version.inode, after.version.inode);
+        assert_eq!(
+            cache.find(Provider::Claude, &after).unwrap().title,
+            "Other custom"
         );
     }
 }

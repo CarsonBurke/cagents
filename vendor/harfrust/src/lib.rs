@@ -8,6 +8,9 @@ A complete [harfbuzz](https://github.com/harfbuzz/harfbuzz) shaping algorithm po
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+// Keep this local patch fresh when worktrees share Cargo artifacts.
+const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
+
 extern crate alloc;
 
 mod hb;

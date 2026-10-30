@@ -17,54 +17,161 @@ use crate::chat::coordination::{
     Act, Arrival, Coordination, Kind, Outbound, OutboundKind, Run, Spawn, Text,
 };
 
-/// A coordinating step as read, with the Markdown its card draws, formed
-/// once per change of its item rather than once per frame.
-pub(super) struct Coordinated {
-    pub(super) reading: Coordination,
-    /// A message's body, or each started agent's prompt in order. `None`
-    /// where the step does not show the text.
-    prompts: Vec<Option<markdown::Content>>,
-    /// The brief every started agent shares.
-    brief: Option<markdown::Content>,
-    /// Each message the step printed, or a started agent's result.
-    answers: Vec<markdown::Content>,
+#[cfg(test)]
+thread_local! { static PREPARATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn preparations() -> usize {
+    PREPARATIONS.with(std::cell::Cell::get)
 }
-
-impl Coordinated {
-    pub(super) fn new(reading: Coordination) -> Self {
-        let parse = |text: &Text| text.inline().map(markdown::Content::parse);
+/// Send payload formed by the admitted parser worker, including every rich
+/// part and its immutable publication graph. UI owners transfer it intact on
+/// eviction, so canonical parser and recognition metadata also retire off UI.
+pub(super) struct Prepared {
+    pub(super) reading: Coordination,
+    prompts: Vec<Option<markdown::Content>>,
+    brief: Option<markdown::Content>,
+    answers: Vec<markdown::Content>,
+    documents: Vec<prose_document::Data>,
+    #[cfg(test)]
+    pub(super) created_on: std::thread::ThreadId,
+    #[cfg(test)]
+    disposed: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
+}
+impl Prepared {
+    pub(super) fn prepare(reading: Coordination, cancelled: &AtomicBool) -> Result<Self, String> {
+        let check = || {
+            if cancelled.load(Ordering::Relaxed) {
+                Err("Message loading was cancelled.".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        #[cfg(test)]
+        PREPARATIONS.with(|count| count.set(count.get() + 1));
+        let parse = |text: &str| {
+            check()?;
+            Ok(markdown::Content::parse(text))
+        };
+        let inline = |text: &Text| text.inline().map(parse).transpose();
         let prompts = match &reading.kind {
-            Kind::Message(message) => vec![parse(&message.body)],
+            Kind::Message(message) => vec![inline(&message.body)?],
             Kind::Spawn(spawn) => spawn
                 .agents
                 .iter()
-                .map(|agent| parse(&agent.prompt))
-                .collect(),
+                .map(|agent| inline(&agent.prompt))
+                .collect::<Result<Vec<_>, String>>()?,
             Kind::Act(_) => Vec::new(),
         };
         let brief = match &reading.kind {
-            Kind::Spawn(spawn) if !spawn.brief.trim().is_empty() => {
-                Some(markdown::Content::parse(&spawn.brief))
-            }
+            Kind::Spawn(spawn) if !spawn.brief.trim().is_empty() => Some(parse(&spawn.brief)?),
             _ => None,
         };
         let mut answers: Vec<markdown::Content> = reading
             .outcome
             .messages
             .iter()
-            .map(|message| markdown::Content::parse(&message.body))
-            .collect();
+            .map(|message| parse(&message.body))
+            .collect::<Result<Vec<_>, String>>()?;
         if let Some(run) = &reading.outcome.run
             && !run.result.is_empty()
         {
-            answers.push(markdown::Content::parse(&run.result));
+            answers.push(parse(&run.result)?);
         }
-        Self {
+        let mut prepared = Self {
             reading,
             prompts,
             brief,
             answers,
+            documents: vec![],
+            #[cfg(test)]
+            created_on: std::thread::current().id(),
+            #[cfg(test)]
+            disposed: None,
+        };
+        for content in prepared
+            .prompts
+            .iter_mut()
+            .flatten()
+            .chain(&mut prepared.brief)
+            .chain(&mut prepared.answers)
+        {
+            content.discard_continuation();
+            preparation::prime_plain(content.items(), cancelled)?;
         }
+        prepared.documents = prepared
+            .contents()
+            .map(|content| {
+                check()?;
+                Ok(prose_document::Data::snapshot(content))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(prepared)
+    }
+    #[cfg(test)]
+    pub(super) fn new(reading: Coordination) -> Self {
+        Self::prepare(reading, &AtomicBool::new(false)).unwrap()
+    }
+    pub(super) fn contents(&self) -> impl Iterator<Item = &markdown::Content> {
+        self.prompts
+            .iter()
+            .flatten()
+            .chain(&self.brief)
+            .chain(&self.answers)
+    }
+    #[cfg(test)]
+    pub(super) fn watch_disposal(
+        &mut self,
+        sender: std::sync::mpsc::Sender<std::thread::ThreadId>,
+    ) {
+        self.disposed = Some(sender);
+    }
+}
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        // Raw Send graphs drop inside one existing reclaimer batch. UI owners
+        // transfer this complete payload; no recursive retirement is queued.
+        drop(std::mem::take(&mut self.prompts));
+        drop(self.brief.take());
+        drop(std::mem::take(&mut self.answers));
+        drop(std::mem::take(&mut self.documents));
+        #[cfg(test)]
+        if let Some(disposed) = self.disposed.take() {
+            let _ = disposed.send(std::thread::current().id());
+        }
+    }
+}
+pub(super) struct Coordinated {
+    prepared: Option<Prepared>,
+    documents: Vec<prose_document::Document>,
+}
+impl std::ops::Deref for Coordinated {
+    type Target = Prepared;
+    fn deref(&self) -> &Prepared {
+        self.prepared.as_ref().expect("live coordination")
+    }
+}
+impl Drop for Coordinated {
+    fn drop(&mut self) {
+        if let Some(prepared) = self.prepared.take() {
+            preparation::retire_coordination(prepared);
+        }
+    }
+}
+impl Coordinated {
+    pub(super) fn from_prepared(mut prepared: Prepared) -> Self {
+        let documents = std::mem::take(&mut prepared.documents)
+            .into_iter()
+            .map(prose_document::Document::new)
+            .collect();
+        Self {
+            prepared: Some(prepared),
+            documents,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn new(reading: Coordination) -> Self {
+        Self::from_prepared(Prepared::new(reading))
     }
 
     /// Every piece of Markdown the card draws, for highlighting its fences.
@@ -74,6 +181,19 @@ impl Coordinated {
             .flatten()
             .chain(&self.brief)
             .chain(&self.answers)
+    }
+
+    #[cfg(test)]
+    pub(super) fn address(&self) -> usize {
+        self.prepared.as_ref().expect("live coordination") as *const Prepared as usize
+    }
+    pub(super) fn document(
+        &self,
+        content: &markdown::Content,
+    ) -> Option<&prose_document::Document> {
+        self.contents()
+            .position(|candidate| std::ptr::eq(candidate, content))
+            .and_then(|index| self.documents.get(index))
     }
 
     pub(super) fn is_card(&self) -> bool {
@@ -954,7 +1074,7 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
         let key = format!("{}#{part}", item.id);
-        let open = self.unfolded.contains(&key);
+        let open = self.part_unfolded(&key);
         let toggle =
             widget::button::custom(design::caption(if open { "Show less" } else { unfold }))
                 .class(crate::ui_controls::control_style(false, None))
@@ -1070,7 +1190,7 @@ impl Runtime {
                 .into(),
             );
         }
-        let open = self.expanded.contains(&item.id);
+        let open = self.item_expanded(&item.id);
         let source = match &item.content {
             ItemContent::Command { .. } => "command",
             _ => "tool call",

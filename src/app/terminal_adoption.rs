@@ -92,7 +92,8 @@ fn card_claims_terminal(card: &CardState, terminal: &TerminalSession) -> bool {
         | CardKind::Repository(_)
         | CardKind::Settings
         | CardKind::Accounts
-        | CardKind::Automations => false,
+        | CardKind::Automations
+        | CardKind::Work => false,
     }
 }
 
@@ -227,6 +228,7 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         for session in terminals {
+            tasks.extend(self.recheck_saved_terminal(&session));
             let waiting = self
                 .durable
                 .cards
@@ -290,7 +292,11 @@ impl Cagents {
             let pending = std::mem::take(&mut self.pending_adoptions);
             self.observe_hosted_terminals(pending)
         };
-        Task::batch([adopted, self.attach_next_restored_agent()])
+        Task::batch([
+            adopted,
+            self.attach_next_restored_agent(),
+            self.start_next_saved_terminal(),
+        ])
     }
 
     pub(super) fn terminal_starts_in_flight(&self) -> usize {

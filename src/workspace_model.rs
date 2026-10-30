@@ -61,54 +61,8 @@ pub struct ModelChannel {
     pub ordinal: u32,
 }
 
-/// A prompt fallback labels its first substantive line, rather than flattening
-/// attached context into the sidebar. Provider titles use `channel_title`.
-pub fn channel_title_from_prompt(prompt: &str) -> Option<String> {
-    let mut fence = false;
-    let mut context = false;
-    prompt.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with("```") || line.starts_with("~~~") {
-            fence = !fence;
-            return None;
-        }
-        if matches!(
-            line,
-            "<INSTRUCTIONS>" | "<environment_context>" | "<system-reminder>"
-        ) {
-            context = true;
-            return None;
-        }
-        if matches!(
-            line,
-            "</INSTRUCTIONS>" | "</environment_context>" | "</system-reminder>"
-        ) {
-            context = false;
-            return None;
-        }
-        if fence || context || line.starts_with("# AGENTS.md") || line.starts_with("<image ") {
-            return None;
-        }
-        let line = line.trim_start_matches(['#', '*', '-', '>', ' ']);
-        channel_title(line)
-    })
-}
-
-pub fn channel_title(text: &str) -> Option<String> {
-    let title = crate::names::normalize_card_name(text)?;
-    if title.chars().count() <= 80 {
-        return Some(title);
-    }
-    let shortened: String = title.chars().take(79).collect();
-    let end = shortened
-        .rfind(' ')
-        .filter(|end| *end > shortened.len() / 2);
-    Some(format!(
-        "{}…",
-        end.map_or(shortened.as_str(), |end| &shortened[..end])
-            .trim_end()
-    ))
-}
+mod conversation_titles;
+pub use conversation_titles::{channel_title, channel_title_from_prompt};
 
 /// The identity of a registry that has never been created.
 ///
@@ -130,6 +84,26 @@ pub enum NavigationItem {
 pub struct NavigationOrder {
     pub repository: PathBuf,
     pub items: Vec<NavigationItem>,
+}
+
+/// Complete a saved mixed order using the same placement as the sidebar:
+/// newly discovered channels precede saved destinations; new worktrees follow.
+/// Existing destinations retain their relative order before an explicit move.
+pub fn merge_navigation_fallback(items: &mut Vec<NavigationItem>, fallback: &[NavigationItem]) {
+    let mut known = std::collections::HashSet::new();
+    items.retain(|item| known.insert(item.clone()));
+    let mut channels = Vec::new();
+    let mut worktrees = Vec::new();
+    for item in fallback {
+        if known.insert(item.clone()) {
+            match item {
+                NavigationItem::Channel(_) => channels.push(item.clone()),
+                NavigationItem::Worktree(_) => worktrees.push(item.clone()),
+            }
+        }
+    }
+    items.splice(0..0, channels);
+    items.extend(worktrees);
 }
 
 pub fn reorder_navigation(
@@ -196,6 +170,20 @@ impl WorkspaceModel {
 
     pub fn channel(&self, id: ChannelId) -> Option<&ModelChannel> {
         self.channels.iter().find(|channel| channel.id == id)
+    }
+
+    /// The view currently displaying this exact agent, independent of its
+    /// execution repository and original placement. Old daemons transferred
+    /// panes without updating managed placement records.
+    ///
+    /// Saved pane membership wins, including a move across project displays.
+    /// Ambiguous, removed, or replaced panes must not be recreated at the old
+    /// placement. An agent not yet published as a pane retains its launch target.
+    pub fn agent_view_scope<'a>(
+        &'a self,
+        agent: &'a crate::agent_execution::Agent,
+    ) -> Option<&'a views::Scope> {
+        views::ManagedDisplayIndex::new(self).scope(agent)
     }
 
     /// Folds an observed edge into this cached copy.
@@ -285,11 +273,7 @@ impl WorkspaceModel {
                         self.navigation_orders.len() - 1
                     });
                 let items = &mut self.navigation_orders[index].items;
-                for item in fallback {
-                    if !items.contains(item) {
-                        items.push(item.clone());
-                    }
-                }
+                merge_navigation_fallback(items, fallback);
                 reorder_navigation(items, source, before.as_ref());
             }
             ModelEdit::RetitleChannel { id, title } => {
@@ -306,6 +290,33 @@ impl WorkspaceModel {
                     channel.title_source = *source;
                 }
             }
+            ModelEdit::SuggestConversationTitle {
+                id,
+                card,
+                expected_revision,
+                title,
+                source,
+            } => {
+                let current = self.views.iter().any(|view| {
+                    view.scope == views::Scope::Channel(*id)
+                        && view.revision == *expected_revision
+                        && view.primary_chat() == Some(*card)
+                });
+                if current
+                    && !title.is_empty()
+                    && let Some(channel) =
+                        self.channels.iter_mut().find(|channel| channel.id == *id)
+                    && channel
+                        .title_source
+                        .accepts_refresh(&channel.title, *source)
+                {
+                    channel.title = title.clone();
+                    channel.title_source = *source;
+                }
+            }
+            // Requires canonical work and pane evidence; an optimistic client
+            // cannot infer whether retirement was accepted.
+            ModelEdit::RetireEmptyChannel { .. } | ModelEdit::ChannelWorkChanged { .. } => {}
             ModelEdit::DeleteChannel { id } => {
                 self.channels.retain(|channel| channel.id != *id);
             }
@@ -381,6 +392,21 @@ pub enum ModelEdit {
         expected_revision: u64,
         operation: Uuid,
         change: views::Change,
+    },
+    /// A refresh from the current primary conversation. The daemon checks the
+    /// original view revision and primary card in the title-update transaction.
+    SuggestConversationTitle {
+        id: ChannelId,
+        card: crate::model::CardId,
+        expected_revision: u64,
+        title: String,
+        source: crate::model::ChannelTitleSource,
+    },
+    /// Daemon-only invalidation after a committed channel-work transaction.
+    ChannelWorkChanged { home: crate::channel_work::Home },
+    RetireEmptyChannel {
+        home: crate::channel_work::Home,
+        expected_view_revision: u64,
     },
 }
 
@@ -465,8 +491,11 @@ impl ModelEdit {
             }
             edit @ (Self::RetitleChannel { .. }
             | Self::SuggestChannelTitle { .. }
+            | Self::SuggestConversationTitle { .. }
             | Self::DeleteChannel { .. }
-            | Self::AgentsChanged) => edit,
+            | Self::AgentsChanged
+            | Self::ChannelWorkChanged { .. }
+            | Self::RetireEmptyChannel { .. }) => edit,
         })
     }
 }
@@ -524,6 +553,248 @@ pub fn repository_display_name(repository: &Path) -> String {
 mod tests {
     use super::*;
     use crate::model::ChannelTitleSource;
+
+    #[test]
+    fn navigation_folding_keeps_missing_channels_above_the_saved_mixed_order() {
+        let repository = PathBuf::from("/repo/.git");
+        let worktree = NavigationItem::Worktree("/repo".into());
+        let old = NavigationItem::Channel(ChannelId::new());
+        let first = NavigationItem::Channel(ChannelId::new());
+        let newest = NavigationItem::Channel(ChannelId::new());
+        let added_worktree = NavigationItem::Worktree("/repo/.worktrees/new".into());
+        let mut model = WorkspaceModel::default();
+        model.navigation_orders.push(NavigationOrder {
+            repository: repository.clone(),
+            items: vec![worktree.clone(), old.clone()],
+        });
+        let visible = vec![
+            newest.clone(),
+            first.clone(),
+            worktree.clone(),
+            old.clone(),
+            added_worktree,
+        ];
+        model.fold(
+            1,
+            &ModelEdit::ReorderNavigation {
+                repository,
+                source: worktree,
+                before: Some(old),
+                fallback: visible.clone(),
+            },
+        );
+        assert_eq!(model.navigation_orders[0].items, visible);
+    }
+
+    #[test]
+    fn conversation_title_proof_roundtrips_without_changing_existing_edit_prefix() {
+        let old = ModelEdit::SuggestChannelTitle {
+            id: ChannelId::new(),
+            title: "old".into(),
+            source: ChannelTitleSource::Provider,
+        };
+        assert_eq!(postcard::to_allocvec(&old).unwrap()[0], 7);
+        let edit = ModelEdit::SuggestConversationTitle {
+            id: ChannelId::new(),
+            card: crate::model::CardId::new(),
+            expected_revision: 23,
+            title: "Bundle encryption".into(),
+            source: ChannelTitleSource::Provider,
+        };
+        let bytes = postcard::to_allocvec(&edit).unwrap();
+        assert_eq!(bytes[0], 12);
+        assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
+    }
+
+    #[test]
+    fn channel_work_edits_preserve_captured_home_and_retirement_revision() {
+        let home = crate::channel_work::Home {
+            registry: Uuid::new_v4(),
+            channel: ChannelId::new(),
+            creation_ordinal: 73,
+        };
+        for (edit, tag) in [
+            (ModelEdit::ChannelWorkChanged { home }, 13),
+            (
+                ModelEdit::RetireEmptyChannel {
+                    home,
+                    expected_view_revision: u64::MAX,
+                },
+                14,
+            ),
+        ] {
+            let canonical = edit.clone().canonicalized().unwrap();
+            assert_eq!(canonical, edit);
+            assert_eq!(canonical.clone().canonicalized().unwrap(), edit);
+            let bytes = postcard::to_allocvec(&canonical).unwrap();
+            assert_eq!(bytes[0], tag);
+            assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
+        }
+    }
+
+    #[test]
+    fn agent_display_membership_survives_stale_records_without_changing_execution() {
+        use crate::{
+            agent::Provider,
+            agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target},
+            model::{AgentId, CardId, CardKind, LaunchRecipe, TerminalId},
+            workspace_model::views::{Pane, Scope, View},
+        };
+        let original = Scope::Channel(ChannelId::new());
+        let moved = Scope::Channel(ChannelId::new());
+        let session = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: Provider::Codex,
+                session_id: None,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec![],
+                    working_directory: "/execution-repo".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("host"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let agent = Agent {
+            id: AgentId::new(),
+            name: Some("live lead".into()),
+            origin: Origin::User,
+            spec: Spec {
+                provider: Provider::Codex,
+                account: None,
+                target: Target {
+                    repository: "/execution-repo".into(),
+                    directory: "/execution-repo".into(),
+                    placement: Some(original.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: original.clone(),
+            session: Some(HostedSession::Chat(session.clone())),
+            console: None,
+            created_ms: 1,
+            closed: false,
+        };
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        let pane = Pane {
+            id,
+            title: "Mailbox lead".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: CardKind::Chat(session),
+            scope: Some("/execution-repo".into()),
+        };
+        let mut model = WorkspaceModel::default();
+        assert_eq!(model.agent_view_scope(&agent), Some(&original));
+        let mut source = View::empty(original.clone());
+        source.retired.push(id);
+        model.views.push(source);
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "closed panes stay closed"
+        );
+        let mut destination = View::empty(moved.clone());
+        destination.panes.push(pane.clone());
+        model.views.push(destination);
+        assert_eq!(model.agent_view_scope(&agent), Some(&moved));
+        let restored: WorkspaceModel =
+            serde_json::from_str(&serde_json::to_string(&model).unwrap()).unwrap();
+        assert_eq!(
+            restored.agent_view_scope(&agent),
+            Some(&moved),
+            "reconnect follows durable pane membership"
+        );
+        let CardKind::Chat(promoted) = &mut model.views[1].panes[0].kind else {
+            unreachable!()
+        };
+        promoted.launch.session_id = Some("confirmed-provider-thread".into());
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            Some(&moved),
+            "thread promotion does not replace the actor"
+        );
+        assert_eq!(agent.placement, original);
+        assert_eq!(
+            agent.spec.target.repository,
+            std::path::Path::new("/execution-repo")
+        );
+        // A legacy inventory alias can own the exact same actor.
+        model.views[1].panes[0].id = CardId::new();
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "an inventory alias must not create a second canonical pane"
+        );
+        model.views[1].panes[0].id = id;
+        let mut conflicting = View::empty(Scope::Worktree {
+            repository: "/execution-repo".into(),
+            path: "/execution-repo/tree".into(),
+        });
+        conflicting.panes.push(pane);
+        model.views.push(conflicting);
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "ambiguous legacy membership chooses no view"
+        );
+        model.views.pop();
+        let CardKind::Chat(session) = &mut model.views[1].panes[0].kind else {
+            unreachable!()
+        };
+        session.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("replacement");
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "same session id cannot substitute a different host"
+        );
+        let HostedSession::Chat(source) = agent.session.as_ref().unwrap() else {
+            unreachable!()
+        };
+        let proof = source.proof.clone().unwrap();
+        let terminal = crate::model::TerminalSession {
+            id: TerminalId::new(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: source.launch.recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
+            },
+        };
+        let mut terminal_agent = agent.clone();
+        terminal_agent.spec.surface = Surface::Terminal;
+        terminal_agent.console = Some(terminal.clone());
+        model.views[1].panes[0].kind = CardKind::Terminal(terminal);
+        let worktree = Scope::Worktree {
+            repository: "/execution-repo".into(),
+            path: "/execution-repo/tree".into(),
+        };
+        model.views[1].scope = worktree.clone();
+        assert_eq!(
+            model.agent_view_scope(&terminal_agent),
+            Some(&worktree),
+            "terminal presentation follows its console pane, not its native chat source"
+        );
+    }
 
     #[test]
     fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {

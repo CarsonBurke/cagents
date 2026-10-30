@@ -9,18 +9,24 @@ pub(super) struct Recovery {
 }
 impl Runtime {
     pub(super) fn auth_error(&self) -> Option<&str> {
-        self.snapshot.error
+        self.snapshot
+            .error
             .as_deref()
             .into_iter()
             .chain(self.error.as_deref())
             .find(|error| chat::requires_sign_in(self.session.launch.provider, error))
     }
     pub(super) fn auth_verification_detail(&self) -> Option<&str> {
-        self.auth_error().and_then(chat::sign_in_verification_detail)
+        self.auth_error()
+            .and_then(chat::sign_in_verification_detail)
     }
     pub(super) fn active_auth_notice(&self, anchor: &Option<String>, message: &str) -> bool {
         self.auth_error().is_some()
-            && anchor.as_deref() == self.turns.last().map(|turn| turn.key.as_str())
+            && failure::same_prompt(
+                self.session.launch.provider,
+                anchor.as_deref(),
+                self.notice_anchor(&self.snapshot, &self.turns),
+            )
             && chat::requires_sign_in(self.session.launch.provider, message)
     }
     fn recovery_available(&self) -> bool {
@@ -28,7 +34,7 @@ impl Runtime {
             && self.pending.is_none()
             && self.queued.is_none()
             && !self.snapshot.busy
-            && !self.attachment_chooser_pending
+            && self.attachment_chooser_pending.is_none()
     }
 }
 impl Cagents {
@@ -178,6 +184,18 @@ pub(super) fn view<'a>(
             .wrap()
             .into(),
     ];
+    for incident in runtime
+        .failure_ui
+        .incidents
+        .iter()
+        .filter(|incident| incident.active_recovery)
+    {
+        rows.push(
+            widget::container(runtime.failure_diagnostics(incident))
+                .id(runtime.find_anchor(&format!("failure:{}", incident.key)))
+                .into(),
+        );
+    }
     if let Some(detail) = runtime.auth_verification_detail() {
         rows.insert(
             1,

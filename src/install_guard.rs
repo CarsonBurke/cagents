@@ -21,6 +21,27 @@ use std::{
 
 use crate::instance::UiUpdateGuard;
 
+mod companions;
+pub(crate) use companions::{preflight_editor_companions, trusted_executable_owner};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceInspectionRequest {
+    pub(crate) protocol: u16,
+    pub(crate) proof: Option<crate::model::HostSessionProof>,
+    pub(crate) require_resumable: bool,
+    #[serde(default)]
+    pub(crate) reconcile_retained: bool,
+}
+
+pub(crate) fn preflight_source_panes(
+    guard: &UiUpdateGuard,
+    proof: Option<crate::model::HostSessionProof>,
+    require_resumable: bool,
+) -> io::Result<()> {
+    crate::update::inspect_source_panes(guard, proof, require_resumable).map_err(io::Error::other)
+}
+
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
 const OWNER_CLI_ENV: &str = "CAGENTS_INSTALL_OWNER_CLI";
 const DEFERRED_RECEIPT: &[u8] = b"{\"version\":1,\"preserve_previous_ui\":true}\n";
@@ -206,7 +227,21 @@ pub(crate) fn run(
     let slots = if stage_only {
         Vec::new()
     } else {
-        guard.prepare_and_close_windows(Duration::from_secs(45))?
+        if arguments
+            .iter()
+            .any(|argument| argument == "--restart-daemon")
+        {
+            preflight_editor_companions(None)?;
+        }
+        guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+            preflight_source_panes(
+                guard,
+                None,
+                arguments
+                    .iter()
+                    .any(|argument| argument == "--restart-daemon"),
+            )
+        })?
     };
     let fd = script.as_raw_fd();
     let mut result = ResultPipe::new()?;
@@ -465,8 +500,20 @@ pub(crate) fn staged_owner_bin(
     // Shared with every UI launch, exclusive against reviewed update/close.
     // Keep it through synchronous daemon recovery and ownership revalidation.
     let launch = crate::instance::LaunchFence::recovery()?;
-    let windows = crate::instance::verified_running_windows()?;
     let running = crate::daemon::running_executable().map_err(io::Error::other)?;
+    let (windows, _legacy) = if std::env::var_os(crate::instance::INSTALL_GUARD_ENV).is_some() {
+        // The reviewed updater also holds the shared legacy fence after all
+        // windows close. Authenticate its exact exclusive inherited guard;
+        // probing legacy exclusivity here would mistake our coordinator for UI.
+        (crate::instance::verified_staged_windows()?, None)
+    } else if running.as_deref() == Some(layout.version_root.join("bin/cagentsd").as_path()) {
+        let (windows, legacy) = crate::instance::verified_windows_for_daemon(
+            &layout.version_root.join("bin/cagentsd"),
+        )?;
+        (windows, Some(legacy))
+    } else {
+        (crate::instance::verified_running_windows()?, None)
+    };
     let window_bin = window_owner_bin(&layout.prefix, &windows)?;
     if running.as_ref() == Some(&layout.version_root.join("bin/cagentsd")) && windows.is_empty() {
         return Ok(None);
@@ -575,27 +622,134 @@ fn restore_window_daemon(bin: &Path, launch: &crate::instance::LaunchFence) -> i
         .stderr(Stdio::inherit());
     sanitize_child_environment(&mut command);
     launch.inherit(&mut command)?;
-    let mut child = command.spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_daemon_start(&mut command, daemon_start_timeout()?).map_err(|failure| failure.error)
+}
+
+/// Capture before spawning: the successor may consume its checkpoint while
+/// restoring, but this outer caller must retain the same startup allowance.
+pub(crate) fn daemon_start_timeout() -> io::Result<Duration> {
+    crate::upgrade::handoff::startup_timeout()
+        .map(|timeout| timeout + Duration::from_secs(30))
+        .map_err(io::Error::other)
+}
+
+/// A startup error distinguishes a proven spawn failure from a command that
+/// actually acquired custody. Readiness is never a substitute for its wait.
+#[derive(Debug)]
+pub(crate) struct DaemonStartError {
+    pub(crate) error: io::Error,
+    pub(crate) spawned: bool,
+}
+
+/// Startup owns restoration, not a disposable download. Crossing its budget
+/// remains an error, but this coordinator must stay alive until the ORIGINAL
+/// child has actually been waited. A pathological hang can delay it indefinitely;
+/// there is no durable background owner after this process exits.
+pub(crate) fn wait_daemon_start(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<(), DaemonStartError> {
+    wait_daemon_start_with_progress(command, timeout, || Ok(()))
+}
+
+/// Reports once when the startup budget is crossed with the original child
+/// still running. Reporting failure cannot unwind child or caller-fence custody.
+pub(crate) fn wait_daemon_start_with_progress(
+    command: &mut Command,
+    timeout: Duration,
+    waiting: impl FnOnce() -> io::Result<()>,
+) -> Result<(), DaemonStartError> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| DaemonStartError {
+            error,
+            spawned: false,
+        })?;
+    let budget_error = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "The matched terminal service exceeded its startup budget; its original command was retained until its actual wait completed. Check cagents daemon status before retrying",
+        )
+    };
     loop {
-        if let Some(status) = child.try_wait()? {
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(io::Error::other(
-                    "the surviving window's matched daemon could not be restored",
-                ))
-            };
+        let (error, overdue) = match child.try_wait() {
+            Ok(Some(status)) => {
+                return if Instant::now() >= deadline {
+                    Err(DaemonStartError {
+                        error: budget_error(),
+                        spawned: true,
+                    })
+                } else if status.success() {
+                    Ok(())
+                } else {
+                    Err(DaemonStartError {
+                        error: io::Error::other("The matched daemon startup command failed"),
+                        spawned: true,
+                    })
+                };
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Ok(None) => (budget_error(), true),
+            Err(error) => (error, false),
+        };
+        tracing::warn!(
+            pid = child.id(),
+            "Daemon startup result was not confirmed within its budget; retaining the original wait owner"
+        );
+        // A failed diagnostic (including an unwinding reporter) must not drop
+        // the original child or return through the caller's held fences.
+        let progress_result = if overdue {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                waiting().map_err(|failure| failure.to_string())
+            }))
+        } else {
+            // A failed try_wait is unconfirmed ownership, not evidence that
+            // this allowance elapsed. Preserve its original error and wait.
+            Ok(Ok(()))
+        };
+        let progress_failure = match &progress_result {
+            Ok(Ok(())) => None,
+            Ok(Err(failure)) => Some(failure.clone()),
+            Err(_) => Some("the startup progress reporter panicked".to_owned()),
+        };
+        let error = match progress_failure {
+            Some(failure) => io::Error::new(
+                error.kind(),
+                format!("{error}; Could not record the waiting status: {failure}"),
+            ),
+            None => error,
+        };
+        // Neither a timeout nor an unconfirmed wait permits dropping the
+        // original Child. Retry actual wait errors without fabricating success.
+        loop {
+            match child.wait() {
+                Ok(status) => {
+                    tracing::debug!(
+                        pid = child.id(),
+                        success = status.success(),
+                        "Original daemon startup command was naturally waited"
+                    );
+                    if let Err(payload) = progress_result {
+                        // An arbitrary panic payload may itself panic on Drop.
+                        // The short-lived coordinator must still return through
+                        // its candidate-recovery routing after the exact reap.
+                        std::mem::forget(payload);
+                    }
+                    return Err(DaemonStartError {
+                        error,
+                        spawned: true,
+                    });
+                }
+                Err(_) => thread::sleep(Duration::from_millis(25)),
+            }
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "matched daemon recovery timed out",
-            ));
-        }
-        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -624,6 +778,164 @@ fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_timeout_retains_the_original_waiter_and_does_not_reap_another_child() {
+        use std::{fs, path::PathBuf, process::Child};
+        const CHILD_ROOT: &str = "CAGENTS_STARTUP_WAIT_FIXTURE_ROOT";
+        fn command(root: &Path, label: &str) -> Command {
+            let mut command = Command::new("/usr/bin/python3");
+            command.args(["-u", "-c", "import os,pathlib,sys,time\nroot=pathlib.Path(sys.argv[1]); label=sys.argv[2]\nready=root/(label+'-ready.tmp'); ready.write_text(str(os.getpid())); ready.replace(root/(label+'-ready'))\ndeadline=time.monotonic()+10\nwhile not (root/(label+'-release')).exists():\n if time.monotonic()>=deadline: sys.exit(7)\n time.sleep(.005)\n(root/(label+'-finished')).write_text('natural exit')"]);
+            command.arg(root).arg(label).current_dir(root);
+            command
+        }
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            // Exercise the production helper in a short-lived coordinator. Its
+            // final error would normally return directly from process main.
+            let failure =
+                wait_daemon_start(&mut command(&root, "startup"), Duration::from_millis(10))
+                    .unwrap_err();
+            assert!(failure.spawned);
+            assert_eq!(failure.error.kind(), io::ErrorKind::TimedOut);
+            let pid: i32 = fs::read_to_string(root.join("startup-ready"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "helper returned before exact child reap"
+            );
+            fs::write(
+                root.join("caller-final-error"),
+                b"TimedOut after actual reap",
+            )
+            .unwrap();
+            std::process::exit(1);
+        }
+        struct OwnedChild {
+            child: Child,
+            release: PathBuf,
+        }
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.release, b"release");
+                let _ = self.child.wait();
+            }
+        }
+        let selector = thread::current()
+            .name()
+            .expect("libtest selector")
+            .to_owned();
+        let root = tempfile::tempdir().unwrap();
+        let mut neighbor = OwnedChild {
+            child: command(root.path(), "neighbor").spawn().unwrap(),
+            release: root.path().join("neighbor-release"),
+        };
+        let mut caller = OwnedChild {
+            child: Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env(CHILD_ROOT, root.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+            release: root.path().join("startup-release"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !root.path().join("startup-ready").exists()
+            || !root.path().join("neighbor-ready").exists()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "actual dummy children never became ready"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pid: i32 = fs::read_to_string(root.path().join("startup-ready"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let process = crate::daemon::holder_registry::Process::read(pid).unwrap();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        assert!(raw >= 0);
+        let pinned = unsafe { File::from_raw_fd(raw) };
+        // The real caller must remain alive beyond the budget instead of
+        // returning its error and abandoning the original startup process.
+        thread::sleep(Duration::from_millis(75));
+        assert!(caller.child.try_wait().unwrap().is_none());
+        assert!(process.is_current());
+        let mut readiness = libc::pollfd {
+            fd: pinned.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 0);
+        assert!(neighbor.child.try_wait().unwrap().is_none());
+        assert!(!root.path().join("caller-final-error").exists());
+        fs::write(&caller.release, b"natural exit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = caller.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "coordinator did not settle its original child"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(status.code(), Some(1));
+        assert_eq!(
+            fs::read(root.path().join("caller-final-error")).unwrap(),
+            b"TimedOut after actual reap"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("startup-finished")).unwrap(),
+            "natural exit"
+        );
+        assert!(!process.is_current());
+        assert_eq!(unsafe { libc::poll(&mut readiness, 1, 0) }, 1);
+        assert_ne!(readiness.revents & libc::POLLIN, 0);
+        assert!(
+            neighbor.child.try_wait().unwrap().is_none(),
+            "startup wait stole or stopped another child"
+        );
+        fs::write(&neighbor.release, b"natural exit").unwrap();
+        assert!(neighbor.child.wait().unwrap().success());
+        assert_eq!(
+            fs::read_to_string(root.path().join("neighbor-finished")).unwrap(),
+            "natural exit"
+        );
+    }
+
+    #[test]
+    fn daemon_start_reports_actual_failure_and_spawn_failure_without_success() {
+        wait_daemon_start(&mut Command::new("/bin/true"), Duration::from_secs(5)).unwrap();
+        let elapsed =
+            wait_daemon_start(&mut Command::new("/bin/true"), Duration::ZERO).unwrap_err();
+        assert!(elapsed.spawned);
+        assert_eq!(elapsed.error.kind(), io::ErrorKind::TimedOut);
+        let error =
+            wait_daemon_start(&mut Command::new("/bin/false"), Duration::from_secs(5)).unwrap_err();
+        assert!(error.spawned);
+        assert_eq!(error.error.kind(), io::ErrorKind::Other);
+        assert_eq!(
+            error.error.to_string(),
+            "The matched daemon startup command failed"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let error = wait_daemon_start(
+            &mut Command::new(root.path().join("missing-start-command")),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(!error.spawned);
+        assert_eq!(error.error.kind(), io::ErrorKind::NotFound);
+    }
+
     #[test]
     fn repeated_staging_keeps_the_running_version_even_when_current_is_newer() {
         let root = tempfile::tempdir().unwrap();
