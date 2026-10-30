@@ -19,6 +19,23 @@ older results only for the source and behavior they actually covered. A missing
 GitHub check does not prove that no external job exists: ask its actual owner
 for the original job and revision rather than submitting a duplicate.
 
+For repository delivery assignments, prepare the actual worker prompt from a
+captured PR and a short task brief before dispatching it:
+
+```sh
+gh pr view NUMBER --json number,url,title,state,headRefOid,isDraft > /tmp/delivery-pr.json
+scripts/prepare-delivery-task --pr-json /tmp/delivery-pr.json --brief /path/to/task.json
+```
+
+Use `scripts/prepare-delivery-task --help` for the brief fields. Consume its
+output as the worker's assignment, with only necessary task-specific context.
+It checks the captured head and labels an extraction's new working base
+separately; it does not fetch fresh state, grant resources or certify readiness.
+Recapture changed PR state before dispatch. Keep source-only work independent
+of ungranted execution, and require a new exact candidate before qualifying an
+extraction. Give current workers explicit steering on their next useful task;
+do not restart them merely to refresh instructions.
+
 Before feature fanout, obtain accepted ownership and capacity for independent
 review, compilation/tests, affected native interactions and release. A person
 may own several stages. A reservation must identify the existing lane or job,
@@ -95,3 +112,9 @@ calling the user's problem fixed.
 
 Worker counts and token counters can diagnose resource use. They do not show
 that a check ran, that an interaction works or that the fix reached the user.
+
+The bundled cagents skill is embedded in the executable at build time. A source
+edit or a newly built CLI alongside an older daemon does not update existing
+workers. Qualify its hash/upgrade contract at the matched executor revision;
+preserve custom skills and active work. Installing or discovering a skill is
+separate from a worker receiving and applying the actual task instructions.
