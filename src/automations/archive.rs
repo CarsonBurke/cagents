@@ -980,6 +980,16 @@ mod tests {
             residency: crate::model::Residency::Cold,
             kind: CardKind::Terminal(terminal.clone()),
         });
+        // Keep a second real recipe row available as the canonical transcript
+        // parent when the inspected row later uses a raw UUID alias. This
+        // preserves the source schema's foreign-key constraints.
+        let mut transcript_parent = workspace.cards[0].clone();
+        transcript_parent.id = crate::model::CardId::new();
+        let CardKind::Terminal(parent) = &mut transcript_parent.kind else {
+            unreachable!()
+        };
+        parent.id = crate::model::TerminalId::new();
+        workspace.cards.push(transcript_parent);
         let mut receipt = store
             .save_workspace(
                 &workspace,
@@ -1151,6 +1161,12 @@ mod tests {
                 params![alias, card.to_string()],
             )
             .unwrap();
+        actual
+            .execute(
+                "UPDATE terminal_recipes SET terminal_id=?1 WHERE card_id=?2",
+                params![terminal.id.to_string(), workspace.cards[1].id.to_string()],
+            )
+            .unwrap();
         drop(actual);
         let before = (
             std::fs::read(&terminal_window).unwrap(),
@@ -1211,11 +1227,39 @@ mod tests {
             .unwrap();
         actual
             .execute(
+                "DELETE FROM terminal_recipes WHERE card_id=?1",
+                [workspace.cards[1].id.to_string()],
+            )
+            .unwrap();
+        actual
+            .execute(
                 "UPDATE terminal_recipes SET terminal_id=?1 WHERE card_id=?2",
                 params![terminal.id.to_string(), card.to_string()],
             )
             .unwrap();
         drop(actual);
+        let before = (
+            std::fs::read(&terminal_window).unwrap(),
+            std::fs::read(&registry).unwrap(),
+        );
+        assert!(
+            inspect_completed_automation_pane(
+                &terminal_window,
+                &registry,
+                card,
+                &CardKind::Terminal(terminal.clone()),
+            )
+            .unwrap()
+            .unwrap()
+            .matches_terminal(id, &terminal)
+        );
+        assert_eq!(
+            before,
+            (
+                std::fs::read(&terminal_window).unwrap(),
+                std::fs::read(&registry).unwrap()
+            )
+        );
         terminal.launch.working_directory = "/explicit-replacement".into();
         let actual = Connection::open(&terminal_window).unwrap();
         actual
