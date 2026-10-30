@@ -5,6 +5,7 @@ on:
     types: [opened, synchronize, reopened]
     paths:
       - .github/workflows/research-pr1853-bd88.yml
+      - .github/qualification/pr2015/**
 
 permissions:
   contents: read
@@ -173,8 +174,43 @@ env:
     }
 
 jobs:
-  qualify:
+  select-case:
     if: >-
+      github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: Select one immutable research case
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      case: ${{ steps.select.outputs.case }}
+    env:
+      PR2015_CASE_SHA256: 73174260590764f7e3a9606acf6756988a212002e7786b01c9582b44378a8e58
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+      - name: Verify source selector and select exactly one case
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' 5c2fcbae6d1293e26d302456860bb1f03dd6138d55d81ff4dac2996190fcff3d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          python3 research/.github/qualification/pr2015/case-select.py
+      - name: Upload original source-selection receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: research-case-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue2015-hosted-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  qualify:
+    needs: select-case
+    if: >-
+      needs.select-case.outputs.case == 'legacy-final-save-1726' &&
       github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' &&
       github.event.pull_request.head.repo.full_name == github.repository
     name: One exact UI final-save diagnostic
@@ -519,3 +555,184 @@ jobs:
           path: ${{ runner.temp }}/final-save-diagnostic-evidence/
           if-no-files-found: error
           retention-days: 14
+
+  installer2015:
+    needs: select-case
+    if: >-
+      needs.select-case.outputs.case == 'installer2015' &&
+      github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: Research installer2015 hosted User CLI qualification
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      PR2015_CASE_SHA256: 73174260590764f7e3a9606acf6756988a212002e7786b01c9582b44378a8e58
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require natural hosted User context before source setup
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, platform
+          from pathlib import Path
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'issue2015-hosted-evidence'
+          evidence.mkdir(mode=0o700, exist_ok=True)
+          inherited_scope_present = any(name.startswith('CAGENTS_') for name in os.environ)
+          record = {'outcome': 'failed', 'CAGENTS_scope_present': inherited_scope_present,
+                    'scope_values_read': False, 'environment_stripped': False,
+                    'engine_metadata_is_not_authenticated_RAW_proof': True}
+          try:
+              assert not inherited_scope_present, 'Inherited CAGENTS scope is unsupported; no environment changes made'
+              assert os.environ.get('GITHUB_ACTIONS') == 'true'
+              assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+              assert os.environ.get('RUNNER_OS') == 'Linux' and os.environ.get('RUNNER_ARCH') == 'X64'
+              assert os.environ.get('GITHUB_EVENT_NAME') == 'pull_request' and platform.system() == 'Linux'
+              record['outcome'] = 'success'
+          finally:
+              with (evidence / 'natural-context.json').open('x') as stream:
+                  json.dump(record, stream, indent=2)
+                  stream.write('\n')
+          PY
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 6dc09b9a1b5d205650e244401da0938b653d16da
+          path: product
+          persist-credentials: false
+      - name: Require exact product source and genuine independent controller review
+        id: source_preflight
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' 5c2fcbae6d1293e26d302456860bb1f03dd6138d55d81ff4dac2996190fcff3d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          python3 research/.github/qualification/pr2015/case-select.py --require-installer-review
+      - name: Install pinned compiler without invoking Cargo
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=30s 600s rustup toolchain install 1.93.0 --profile minimal > "$QUALIFICATION_EVIDENCE/rustup.stdout" 2> "$QUALIFICATION_EVIDENCE/rustup.stderr"
+          setup_exit=$?
+          set -e
+          printf '%s\n' "$setup_exit" > "$QUALIFICATION_EVIDENCE/rustup.original-exit"
+          exit "$setup_exit"
+      - name: Restore only the existing trusted Main15 hosted namespace
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: |
+            held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-
+      - name: Admit actual existing CLI feature-empty cache before any Cargo
+        id: warm_cache
+        if: ${{ !cancelled() && steps.cache.outcome != 'skipped' }}
+        env:
+          CACHE_RESTORE_OUTCOME: ${{ steps.cache.outcome }}
+          CACHE_PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+          CACHE_MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          CACHE_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+          CACHE_LOCK_HASH: ${{ hashFiles('product/Cargo.lock') }}
+        run: |
+          python3 research/.github/qualification/pr2015/cache-restore-gate.py "$GITHUB_WORKSPACE/product"
+      - name: Install bounded CLI native dependencies after warm admission
+        if: ${{ success() && steps.warm_cache.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=30s 1200s bash -c 'set -euo pipefail; sudo apt-get update; sudo apt-get install --yes --no-install-recommends build-essential clang cmake curl git libclang-dev libdbus-1-dev libssl-dev ninja-build pkg-config python3 xz-utils' > "$QUALIFICATION_EVIDENCE/native-setup.stdout" 2> "$QUALIFICATION_EVIDENCE/native-setup.stderr"
+          setup_exit=$?
+          set -e
+          printf '%s\n' "$setup_exit" > "$QUALIFICATION_EVIDENCE/native-setup.original-exit"
+          test "$setup_exit" -eq 0
+          test -x /usr/bin/clang
+          test -x /usr/bin/clang++
+          test -d /usr/lib/llvm-14/lib
+          printf '%s\n' 'CC=/usr/bin/clang' 'CXX=/usr/bin/clang++' 'LIBCLANG_PATH=/usr/lib/llvm-14/lib' >> "$GITHUB_ENV"
+      - name: Execute one original ten-phase CLI-only packet
+        id: cli
+        if: ${{ success() && steps.warm_cache.outcome == 'success' }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/run-packet.py" \
+            --run-binding "$PR2015_RUN_BINDING" \
+            --runner-sha256 235e881b7448e98513b0848f1a4081e11d3b42f917f846684a58a1ade845ab9c \
+            --controller-review "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/independent-review.json" \
+            --controller-review-sha256 "$PR2015_CONTROLLER_REVIEW_SHA256"
+      - name: Preserve original workflow step outcomes and artifact checksums
+        if: always()
+        env:
+          SOURCE_PREFLIGHT_OUTCOME: ${{ steps.source_preflight.outcome }}
+          CACHE_RESTORE_OUTCOME: ${{ steps.cache.outcome }}
+          WARM_CACHE_OUTCOME: ${{ steps.warm_cache.outcome }}
+          CLI_PACKET_OUTCOME: ${{ steps.cli.outcome }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'issue2015-hosted-evidence'
+          root.mkdir(mode=0o700, exist_ok=True)
+          record = {'outcomes': {name: os.environ[name] for name in (
+              'SOURCE_PREFLIGHT_OUTCOME', 'CACHE_RESTORE_OUTCOME', 'WARM_CACHE_OUTCOME', 'CLI_PACKET_OUTCOME')},
+              'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'workflow_job_terminal': 'NOT_YET_TERMINAL_POST_ACTIONS_PENDING',
+              'global_C_return': 'NOT_MADE_BY_WORKFLOW',
+              'external_original_GitHub_job_log_ZIP_and_sole_RAW_required': True,
+              'native_provider_installed_and_whole_PR_claims': 'NONE'}
+          with (root / 'workflow-step-outcomes.json').open('x') as stream:
+              json.dump(record, stream, indent=2)
+              stream.write('\n')
+          rows = []
+          for path in sorted(root.rglob('*')):
+              if path.is_file() and not path.is_symlink() and path.name != 'sha256.txt':
+                  rows.append(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + str(path.relative_to(root)))
+          with (root / 'sha256.txt').open('x') as stream:
+              stream.write('\n'.join(rows) + '\n')
+          PY
+      - name: Upload full original controller ledger and compact terminal receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: installer2015-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue2015-hosted-evidence
+          if-no-files-found: error
+          retention-days: 14
+
+  case-result:
+    needs: [select-case, qualify, installer2015]
+    if: always()
+    name: Report the selected research case without transferring passes
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    env:
+      SELECTED_CASE: ${{ needs.select-case.outputs.case }}
+      SELECT_RESULT: ${{ needs.select-case.result }}
+      LEGACY_RESULT: ${{ needs.qualify.result }}
+      INSTALLER_RESULT: ${{ needs.installer2015.result }}
+    steps:
+      - name: Require only the actual selected case and disclose the unrun case
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          selected = os.environ['SELECTED_CASE']
+          legacy, installer = os.environ['LEGACY_RESULT'], os.environ['INSTALLER_RESULT']
+          selected_result = {'installer2015': installer, 'legacy-final-save-1726': legacy}.get(selected, 'unknown')
+          other_result = legacy if selected == 'installer2015' else installer
+          with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as stream:
+              stream.write('Research only / NeverMerge. Selected case: ' + selected + '.\n\n')
+              stream.write('Selected job result: ' + selected_result + '; other case: UNRUN (' + other_result + ').\n\n')
+              stream.write('No native, provider, installed, external process absence, whole-PR or mergeability claim. Original authenticated run/job/log/artifact review and external C return remain required.\n')
+          assert os.environ['SELECT_RESULT'] == 'success'
+          assert selected_result == 'success', 'Selected case failed, was cancelled, skipped, or remained unknown'
+          assert other_result == 'skipped', 'More than the selected heavy case ran'
+          PY

@@ -1,0 +1,145 @@
+name: Qualify held saved scope
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: held-scope-qualification-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  user-ui:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      PRODUCT_SHA: b3e036c71e83c0168b8ff7b3a1f6607caa24cced
+      PRODUCT_TREE: fe98f00eb1d0d90a800c1e5808a0bbc756258ab5
+      CARGO_BUILD_JOBS: '2'
+      RUSTUP_TOOLCHAIN: 1.93.0
+    steps:
+      - name: Require a genuine hosted User context
+        shell: bash
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
+            printf '%s\n' 'Refusing inherited caller authority; no environment changes were made.' >&2
+            exit 77
+          fi
+          printf '%s\n' "CARGO_TARGET_DIR=$RUNNER_TEMP/held-scope-target" "QUALIFICATION_EVIDENCE=$RUNNER_TEMP/held-scope-evidence" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: control
+          persist-credentials: false
+      - name: Verify the pinned setup action
+        shell: bash
+        run: |
+          printf '%s  %s\n' 82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052 control/.github/actions/setup-linux/action.yml | sha256sum --check --strict
+      - uses: ./control/.github/actions/setup-linux
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: d38ebe59f15334516f368cd94490ed8ac56a6e72
+          path: before
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 5e7c3149b7203808d7df81cf53d663dcb66a7fed
+          path: before-main
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ac7fd847fc4cb25fe421dd5fe9674c40de245dbf
+          path: before-image
+          persist-credentials: false
+      - name: Install native evidence tools
+        shell: bash
+        run: sudo apt-get update && sudo apt-get install -y xvfb xauth x11-utils openbox dbus-x11 at-spi2-core python3-pyatspi python3-pil xdotool xclip imagemagick libxtst-dev libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0 adwaita-icon-theme fonts-noto-cjk
+      - name: Restore the isolated hosted build lane
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: |
+            held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-
+      - name: Require an actual warm hosted debug UI cache
+        id: warm_cache
+        if: ${{ !cancelled() && steps.cache.outcome != 'skipped' }}
+        shell: bash
+        env:
+          CACHE_RESTORE_OUTCOME: ${{ steps.cache.outcome }}
+          CACHE_PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+          CACHE_MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          CACHE_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+          CACHE_LOCK_HASH: ${{ hashFiles('product/Cargo.lock') }}
+        run: python3 control/.github/qualification/cache-restore-gate.py "$GITHUB_WORKSPACE/product"
+      - name: Check exact UI source and execute focused User regressions
+        id: focus
+        if: ${{ success() && steps.warm_cache.outcome == 'success' }}
+        shell: bash
+        run: python3 control/.github/qualification/held-scope.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --focused-only
+      - name: Capture actual native X11 before and after evidence
+        id: native
+        shell: bash
+        run: |
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x800x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 control/.github/qualification/native-driver.py "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/before-main" "$GITHUB_WORKSPACE/before-image"
+      - name: Upload native interaction evidence
+        if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: held-scope-${{ env.PRODUCT_SHA }}-${{ github.run_attempt }}-native
+          path: ${{ runner.temp }}/held-scope-evidence
+          if-no-files-found: error
+          retention-days: 14
+      # Planned 56 fresh commands = 55 focused/preparation + 1 UI broad; 5 CLI/HOST
+      # contracts retain their original 112e/8259/run 41071089029 origin only
+      # after independent final-ZIP/map review and actual accepted return.
+      - name: Run the affected UI all-targets suite after native cleanup
+        if: ${{ !cancelled() && steps.focus.outcome == 'success' && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
+        shell: bash
+        run: |
+          test -f "$QUALIFICATION_EVIDENCE/native/cleanup-complete"
+          python3 -c 'import json, os; from pathlib import Path; p = Path(os.environ["QUALIFICATION_EVIDENCE"]) / "native/cleanup.json"; assert json.loads(p.read_text())["errors"] == []'
+          python3 control/.github/qualification/held-scope.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --ui-suites-only
+      - name: Recompute all artifact checksums
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "$QUALIFICATION_EVIDENCE" ]; then
+            cd "$QUALIFICATION_EVIDENCE"
+            find . -type f ! -name sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > sha256.txt
+          fi
+      - name: Upload source and validation receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: held-scope-${{ env.PRODUCT_SHA }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/held-scope-evidence
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve the hosted lane after validation
+        # Keep a focused build fallback when native capture never started.
+        # Skip another archive after native/three-boundary execution grows
+        # the target. Build artifacts are never passing-result evidence.
+        if: always() && steps.cache.outcome == 'success' && steps.warm_cache.outcome == 'success' && steps.native.outcome == 'skipped'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cache.outputs.cache-primary-key }}

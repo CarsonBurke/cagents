@@ -1,0 +1,13 @@
+{
+  "kind": "issue2015_cause_and_guard_oracle_correction",
+  "utc": "2026-10-30T19:46:29.931370+00:00",
+  "head": "5a4d6e6278714f673d0ce6f9c8453007a417f3b2",
+  "finding": "Newfriendlymessage discarded originalENOENT requiredbyexistingguardnegative; no runtimefailureclaimed. Preserve cause in both originalmetadata-refusal messages and require friendlyrecovery+OSnotfound in existing owningguardparent. Event/fence/windowconservation unchanged.",
+  "leaves": {
+    "install.sh": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+    "src/update.rs": "48a9c75b73a3948063f4fca76e0ecf3159e0065a3a9ab19d6d8749a8446eec55",
+    "tests/installer_guard_contract.rs": "a4413f4a235ef796438d32fa538f0e1d46fa5221283a588e1f36aaac01d92a00",
+    "tests/installer_lifecycle_contract.rs": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec"
+  },
+  "execution": "ALLcompile/tests/install/nativeUNRUN; fullformatrunningoriginala077ff/session67243"
+}

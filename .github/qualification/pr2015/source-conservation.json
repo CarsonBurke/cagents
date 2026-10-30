@@ -1,0 +1,64 @@
+{
+  "schema": "issue2015-hosted-source-conservation/v1",
+  "kind": "AUTHOR_STATIC_SOURCE_RECORD_NOT_EXECUTION_OR_INDEPENDENT_REVIEW",
+  "source_pins_Git_blob_and_live_equal": 17,
+  "local_e3_archived_byte_exact_files": 23,
+  "runner_identical_helpers": [
+    "digest",
+    "now",
+    "observed_wait",
+    "supervision_failure",
+    "bounded_capture",
+    "refuse_git_routing",
+    "git",
+    "git_nul_fields",
+    "guard_git_metadata",
+    "signal_pidfd",
+    "children",
+    "settle_children",
+    "cargo_test_artifacts",
+    "elf_record",
+    "verify_elf",
+    "inventory_names",
+    "parent_pass",
+    "validate_controller_review",
+    "evidence_copy",
+    "execute_contracts",
+    "custody_clean",
+    "safe_lane_handoff",
+    "parent_accounting",
+    "final_observations",
+    "note_lane_cancellation",
+    "require_workload_allowed",
+    "retain_uncertain_lane"
+  ],
+  "runner_changed_helpers": [
+    "main"
+  ],
+  "runner_added_helpers": [
+    "control_path",
+    "hosted_context",
+    "materialize_plan"
+  ],
+  "cache_identical_helpers": [
+    "require",
+    "identity",
+    "directory",
+    "observe",
+    "cache_metadata",
+    "toolchains",
+    "version"
+  ],
+  "cache_changed_helpers": [
+    "warm_target",
+    "main"
+  ],
+  "cache_added_helpers": [
+    "physical_tools"
+  ],
+  "syntax_check": "Python ast.parse and YAML safe_load only; no candidate imports/evaluation/execution",
+  "runtime": "ALL_UNRUN",
+  "actual_cache_visibility": "UNKNOWN",
+  "actual_CLI_payload": "UNKNOWN",
+  "independent_review": "ABSENT"
+}
