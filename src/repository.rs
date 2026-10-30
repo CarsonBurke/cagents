@@ -1240,12 +1240,16 @@ impl HistoryDestinationRoots {
             let relative = bytes
                 .strip_prefix(b"gitdir: ")
                 .ok_or_else(|| io::Error::other("History Git directory is invalid"))?;
-            worktree.path.join(bytes_to_path(trim_one_line_ending(relative)))
+            worktree
+                .path
+                .join(bytes_to_path(trim_one_line_ending(relative)))
         };
         let git_dir = HistoryDirectory::open(&git_path)?;
         let common_dir = match git_dir.read("commondir")? {
             Some(bytes) => HistoryDirectory::open(
-                &git_dir.path.join(bytes_to_path(trim_one_line_ending(&bytes))),
+                &git_dir
+                    .path
+                    .join(bytes_to_path(trim_one_line_ending(&bytes))),
             )?,
             None => git_dir.clone(),
         };
@@ -4642,8 +4646,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<bool, RepositoryError> {
         let same_roots = || {
-            HistoryDestinationRoots::capture(worktree)
-                .is_ok_and(|roots| roots == destination.roots)
+            HistoryDestinationRoots::capture(worktree).is_ok_and(|roots| roots == destination.roots)
         };
         if !history_head_matches(&destination.roots.raw_head, &destination.head) || !same_roots() {
             return Ok(false);
@@ -4682,7 +4685,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if !self.history_destination_is_current(worktree, destination, cancellation)? {
                 return Ok(MutationOutcome::NotApplied {
                     failure: MutationFailure::Rejected {
-                        reason: "The History destination changed; refresh it before trying again".into(),
+                        reason: "The History destination changed; refresh it before trying again"
+                            .into(),
                     },
                 });
             }
@@ -8417,10 +8421,15 @@ mod tests {
             oid.as_bytes(),
             &HeadState::Detached { oid: oid.clone() },
         ));
-        assert!(!history_head_matches(b"ref: refs/heads/A\n", &HeadState::Unknown));
+        assert!(!history_head_matches(
+            b"ref: refs/heads/A\n",
+            &HeadState::Unknown
+        ));
         assert!(history_head_matches(
             b"ref: refs/heads/A\n",
-            &HeadState::Unborn { branch: Some("A".into()) },
+            &HeadState::Unborn {
+                branch: Some("A".into())
+            },
         ));
         assert!(!history_head_matches(
             b"ref: refs/heads/A\n",
@@ -8954,13 +8963,48 @@ mod tests {
             let destination_snapshot = service.snapshot(&target, &cancel).unwrap();
             let serialized = serde_json::to_vec(&destination_snapshot).unwrap();
             let restored: RepositorySnapshot = serde_json::from_slice(&serialized).unwrap();
-            assert!(restored.history_destination.is_none(),
-                "serialized data cannot grant local History mutation authority");
-            assert!(matches!(service.git_operation(&target, &GitOperation::CherryPick { oid: source.clone(), mainline: None, destination: destination_snapshot.history_destination.unwrap() }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
-            assert_eq!(fs::read(target.join("agent-change.txt")).unwrap(), b"selected agent change\n");
+            assert!(
+                restored.history_destination.is_none(),
+                "serialized data cannot grant local History mutation authority"
+            );
+            assert!(matches!(
+                service
+                    .git_operation(
+                        &target,
+                        &GitOperation::CherryPick {
+                            oid: source.clone(),
+                            mainline: None,
+                            destination: destination_snapshot.history_destination.unwrap()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert_eq!(
+                fs::read(target.join("agent-change.txt")).unwrap(),
+                b"selected agent change\n"
+            );
             let picked = service.resolve_head(&target, &cancel).unwrap().unwrap();
             assert_ne!(picked, source);
-            assert!(matches!(service.git_operation(&target, &GitOperation::RevertCommit { oid: picked, mainline: None, destination: service.snapshot(&target, &cancel).unwrap().history_destination.unwrap() }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert!(matches!(
+                service
+                    .git_operation(
+                        &target,
+                        &GitOperation::RevertCommit {
+                            oid: picked,
+                            mainline: None,
+                            destination: service
+                                .snapshot(&target, &cancel)
+                                .unwrap()
+                                .history_destination
+                                .unwrap()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
             assert!(!target.join("agent-change.txt").exists());
             assert_eq!(fs::read(target.join("target-only.txt")).unwrap(), b"preserve target\n");
             assert!(root.join("agent-change.txt").exists());

@@ -28186,7 +28186,11 @@ mod tests {
             .env_remove("GIT_COMMON_DIR")
             .output()
             .expect("fixture Git must run");
-        assert!(output.status.success(), "fixture Git {arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "fixture Git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         output.stdout
     }
 
@@ -28197,7 +28201,10 @@ mod tests {
             let iced::runtime::Action::Output(cosmic::Action::App(next)) = action else {
                 panic!("unexpected non-message queue task effect");
             };
-            assert!(message.replace(next).is_none(), "a queue task completed twice");
+            assert!(
+                message.replace(next).is_none(),
+                "a queue task completed twice"
+            );
         }
         message.expect("queue task must complete")
     }
@@ -28228,41 +28235,90 @@ mod tests {
         history_queue_fixture_git(&worktree, &["add", "file.txt"]);
         history_queue_fixture_git(&worktree, &["commit", "--quiet", "-m", "incoming"]);
         let source_oid = crate::repository::Oid::parse_object(
-            String::from_utf8(history_queue_fixture_git(&worktree, &["rev-parse", "HEAD"])).unwrap().trim(),
-        ).unwrap();
+            String::from_utf8(history_queue_fixture_git(&worktree, &["rev-parse", "HEAD"]))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
         if cherry_pick {
             history_queue_fixture_git(&worktree, &["switch", "--quiet", "main"]);
         }
         history_queue_fixture_git(&worktree, &["branch", "equal-tip"]);
         let service = RepositoryService::system("git");
-        let snapshot = service.snapshot(&worktree, &CancellationToken::new()).unwrap();
-        let original = snapshot.history_destination.clone().expect("original local destination");
-        let original_head = service.resolve_head(&worktree, &CancellationToken::new()).unwrap().unwrap();
+        let snapshot = service
+            .snapshot(&worktree, &CancellationToken::new())
+            .unwrap();
+        let original = snapshot
+            .history_destination
+            .clone()
+            .expect("original local destination");
+        let original_head = service
+            .resolve_head(&worktree, &CancellationToken::new())
+            .unwrap()
+            .unwrap();
 
         let mut app = context_inspector_test_app(false);
         app.sidebar_model = sidebar::tests::panel_model();
-        let mut key = app.sidebar_model.source_control.as_ref().unwrap().key.clone();
+        let mut key = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .key
+            .clone();
         key.canonical_path = worktree.clone();
         let repository_id = app.sidebar_model.projects[0].repository_id;
-        app.sidebar_model = sidebar::SidebarModel::ready(sidebar::SidebarMode::Expanded, vec![
-            sidebar::SidebarProject::new(key.project_id, repository_id, "History fixture".into(), worktree.clone(), vec![
-                sidebar::SidebarWorktree::new(key.worktree_id, worktree.clone(), Some("main".into()), false, false, Some(snapshot.status.dirty.clone()), None, None),
-            ], Vec::new()),
-        ]).with_source_control(Some(sidebar::SourceControlModel::ready(key.clone(), &snapshot)));
-        assert!(app.sidebar_state.sync_active_worktree(&app.sidebar_model, &sidebar::SidebarFocus::Repository { worktree: worktree.clone() }));
+        app.sidebar_model = sidebar::SidebarModel::ready(
+            sidebar::SidebarMode::Expanded,
+            vec![sidebar::SidebarProject::new(
+                key.project_id,
+                repository_id,
+                "History fixture".into(),
+                worktree.clone(),
+                vec![sidebar::SidebarWorktree::new(
+                    key.worktree_id,
+                    worktree.clone(),
+                    Some("main".into()),
+                    false,
+                    false,
+                    Some(snapshot.status.dirty.clone()),
+                    None,
+                    None,
+                )],
+                Vec::new(),
+            )],
+        )
+        .with_source_control(Some(sidebar::SourceControlModel::ready(
+            key.clone(),
+            &snapshot,
+        )));
+        assert!(app.sidebar_state.sync_active_worktree(
+            &app.sidebar_model,
+            &sidebar::SidebarFocus::Repository {
+                worktree: worktree.clone()
+            }
+        ));
         assert!(sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state).is_some());
         assert_eq!(app.sidebar_state.active_worktree(), Some(&key));
         app.active_workspace = Some(worktree.clone());
-        let held = app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Operation(
-            crate::repository::GitOperation::CreateBranch {
+        let held = app.enqueue_git_mutation(
+            key.clone(),
+            QueuedGitMutation::Operation(crate::repository::GitOperation::CreateBranch {
                 oid: original_head.clone(),
                 name: crate::repository::ValidatedBranchName::parse("queue-marker").unwrap(),
-            },
-        ));
+            }),
+        );
         let first_operation = app.source_control_mutations[&worktree].id;
         let action = SidebarAction::HistoryCommand {
-            key: key.clone(), oid: source_oid, mainline: None, message: "incoming".into(),
-            command: if cherry_pick { sidebar::HistoryCommand::CherryPick } else { sidebar::HistoryCommand::Revert },
+            key: key.clone(),
+            oid: source_oid,
+            mainline: None,
+            message: "incoming".into(),
+            command: if cherry_pick {
+                sidebar::HistoryCommand::CherryPick
+            } else {
+                sidebar::HistoryCommand::Revert
+            },
             destination: Some(original.clone()),
         };
         // Deliver the real History effect while the earlier normal operation
@@ -28273,65 +28329,133 @@ mod tests {
         let active = &app.source_control_mutations[&worktree];
         assert_eq!(active.id, first_operation);
         assert_eq!(active.pending.len(), 1);
-        let QueuedGitMutation::Operation(operation) = &active.pending[0] else { panic!("queued History operation"); };
+        let QueuedGitMutation::Operation(operation) = &active.pending[0] else {
+            panic!("queued History operation");
+        };
         let (crate::repository::GitOperation::RevertCommit { destination, .. }
-            | crate::repository::GitOperation::CherryPick { destination, .. }) = operation else { panic!("captured commit operation"); };
-        assert_eq!(destination, &original, "queue must retain the rendered witness");
+        | crate::repository::GitOperation::CherryPick { destination, .. }) = operation
+        else {
+            panic!("captured commit operation");
+        };
+        assert_eq!(
+            destination, &original,
+            "queue must retain the rendered witness"
+        );
         if switch_branch {
             history_queue_fixture_git(&worktree, &["switch", "--quiet", "equal-tip"]);
         }
-        assert_eq!(service.resolve_head(&worktree, &CancellationToken::new()).unwrap(), Some(original_head.clone()));
+        assert_eq!(
+            service
+                .resolve_head(&worktree, &CancellationToken::new())
+                .unwrap(),
+            Some(original_head.clone())
+        );
 
         // Finish the earlier real service operation, then pause at the normal
         // completion-to-next-task seam before the History worker starts.
         let completed = one_history_queue_message(held).await;
-        assert!(matches!(&completed, Message::SourceControlMutated { operation, report: None, .. } if *operation == first_operation));
+        assert!(
+            matches!(&completed, Message::SourceControlMutated { operation, report: None, .. } if *operation == first_operation)
+        );
         let next = app.update(completed);
         assert!(app.source_control_mutations[&worktree].pending.is_empty());
-        let refs = history_queue_fixture_git(&worktree, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+        let refs = history_queue_fixture_git(
+            &worktree,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
         let index = std::fs::read(worktree.join(".git/index")).unwrap();
         let head = std::fs::read(worktree.join(".git/HEAD")).unwrap();
         let contents = std::fs::read(worktree.join("file.txt")).unwrap();
         let completed = one_history_queue_message(next).await;
-        let Message::SourceControlMutated { report, .. } = &completed else { panic!("real History worker completion"); };
+        let Message::SourceControlMutated { report, .. } = &completed else {
+            panic!("real History worker completion");
+        };
         if switch_branch {
-            assert!(report.as_ref().is_some_and(|text| text.to_ascii_lowercase().contains("destination")), "{report:?}");
+            assert!(
+                report
+                    .as_ref()
+                    .is_some_and(|text| text.to_ascii_lowercase().contains("destination")),
+                "{report:?}"
+            );
             assert_eq!(std::fs::read(worktree.join(".git/index")).unwrap(), index);
             assert_eq!(std::fs::read(worktree.join(".git/HEAD")).unwrap(), head);
             assert_eq!(std::fs::read(worktree.join("file.txt")).unwrap(), contents);
-            assert_eq!(history_queue_fixture_git(&worktree, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+            assert_eq!(
+                history_queue_fixture_git(
+                    &worktree,
+                    &["for-each-ref", "--format=%(refname) %(objectname)"]
+                ),
+                refs
+            );
         } else {
-            assert!(report.is_none(), "unchanged destination must execute: {report:?}");
-            assert_ne!(service.resolve_head(&worktree, &CancellationToken::new()).unwrap(), Some(original_head.clone()));
-            assert_eq!(std::fs::read(worktree.join("file.txt")).unwrap(), if cherry_pick { b"incoming\n".as_slice() } else { b"base\n".as_slice() });
-            assert_eq!(history_queue_fixture_git(&worktree, &["rev-parse", "equal-tip"]), format!("{original_head}\n").as_bytes());
+            assert!(
+                report.is_none(),
+                "unchanged destination must execute: {report:?}"
+            );
+            assert_ne!(
+                service
+                    .resolve_head(&worktree, &CancellationToken::new())
+                    .unwrap(),
+                Some(original_head.clone())
+            );
+            assert_eq!(
+                std::fs::read(worktree.join("file.txt")).unwrap(),
+                if cherry_pick {
+                    b"incoming\n".as_slice()
+                } else {
+                    b"base\n".as_slice()
+                }
+            );
+            assert_eq!(
+                history_queue_fixture_git(&worktree, &["rev-parse", "equal-tip"]),
+                format!("{original_head}\n").as_bytes()
+            );
         }
         for marker in ["CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_HEAD", "sequencer"] {
-            assert!(!worktree.join(".git").join(marker).exists(), "no stale operation state: {marker}");
+            assert!(
+                !worktree.join(".git").join(marker).exists(),
+                "no stale operation state: {marker}"
+            );
         }
         // Apply the normal completion, retaining the visible refusal. The
         // subsequent refresh is intentionally unpolled, not a service retry.
         drop(app.update(completed));
         assert!(app.source_control_mutations.is_empty());
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().error.is_some(), switch_branch);
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .is_some(),
+            switch_branch
+        );
     }
 
     #[test]
     fn queued_history_actions_refuse_an_equal_tip_destination_branch_switch() {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            for cherry_pick in [false, true] {
-                exercise_history_queue_destination(cherry_pick, true).await;
-            }
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for cherry_pick in [false, true] {
+                    exercise_history_queue_destination(cherry_pick, true).await;
+                }
+            });
     }
 
     #[test]
     fn queued_history_actions_apply_to_the_unchanged_original_destination() {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            for cherry_pick in [false, true] {
-                exercise_history_queue_destination(cherry_pick, false).await;
-            }
-        });
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for cherry_pick in [false, true] {
+                    exercise_history_queue_destination(cherry_pick, false).await;
+                }
+            });
     }
 
     #[test]
@@ -28340,15 +28464,36 @@ mod tests {
         app.sidebar_model = sidebar::tests::panel_model();
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         assert!(sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state).is_some());
-        let key = app.sidebar_model.source_control.as_ref().unwrap().key.clone();
-        for command in [sidebar::HistoryCommand::Revert, sidebar::HistoryCommand::CherryPick] {
+        let key = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .key
+            .clone();
+        for command in [
+            sidebar::HistoryCommand::Revert,
+            sidebar::HistoryCommand::CherryPick,
+        ] {
             let task = app.update(Message::Sidebar(SidebarAction::HistoryCommand {
-                key: key.clone(), oid: crate::repository::Oid::parse_object("ab".repeat(20)).unwrap(),
-                mainline: None, message: "unavailable authority".into(), command, destination: None,
+                key: key.clone(),
+                oid: crate::repository::Oid::parse_object("ab".repeat(20)).unwrap(),
+                mainline: None,
+                message: "unavailable authority".into(),
+                command,
+                destination: None,
             }));
             assert!(iced::runtime::task::into_stream(task).is_none());
             assert!(app.source_control_mutations.is_empty());
-            assert!(app.sidebar_model.source_control.as_ref().unwrap().error.as_deref().is_some_and(|text| text.contains("worktree's local device")));
+            assert!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .as_deref()
+                    .is_some_and(|text| text.contains("worktree's local device"))
+            );
         }
     }
 

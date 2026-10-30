@@ -3907,7 +3907,14 @@ pub enum SidebarAction {
     },
     HistoryQueryChanged { key: ActiveWorktreeKey, query: String },
     SearchHistory { key: ActiveWorktreeKey, query: String },
-    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand, mainline: Option<u32>, message: Arc<str>, destination: Option<crate::repository::HistoryDestination> },
+    HistoryCommand {
+        key: ActiveWorktreeKey,
+        oid: Oid,
+        command: HistoryCommand,
+        mainline: Option<u32>,
+        message: Arc<str>,
+        destination: Option<crate::repository::HistoryDestination>,
+    },
     HistoryBranchChanged { key: ActiveWorktreeKey, name: String },
     CancelHistoryBranch,
     CreateHistoryBranch { key: ActiveWorktreeKey, oid: Oid, name: ValidatedBranchName },
@@ -6527,29 +6534,90 @@ fn context_controls<'a>(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HistoryCommand { CopySha, CopyMessage, NewWorktree, CreateBranch, Revert, CherryPick }
+pub enum HistoryCommand {
+    CopySha,
+    CopyMessage,
+    NewWorktree,
+    CreateBranch,
+    Revert,
+    CherryPick,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand, destination: Option<&'a crate::repository::HistoryDestination> }
+struct HistoryContextCommand<'a> {
+    key: &'a ActiveWorktreeKey,
+    row: &'a CommitRow,
+    command: HistoryCommand,
+    destination: Option<&'a crate::repository::HistoryDestination>,
+}
 
 impl widget::menu::Action for HistoryContextCommand<'_> {
     type Message = SidebarAction;
     fn message(&self) -> SidebarAction {
-        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message), destination: self.destination.cloned() }
+        SidebarAction::HistoryCommand {
+            key: self.key.clone(),
+            oid: self.row.oid.clone(),
+            command: self.command,
+            mainline: self.row.mainline,
+            message: Arc::clone(&self.row.message),
+            destination: self.destination.cloned(),
+        }
     }
 }
 
-fn history_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a CommitRow, destination: Option<&'a crate::repository::HistoryDestination>, blocked: bool) -> Element<'a, SidebarAction> {
-    if blocked { return content; }
+fn history_context_controls<'a>(
+    content: Element<'a, SidebarAction>,
+    key: &'a ActiveWorktreeKey,
+    row: &'a CommitRow,
+    destination: Option<&'a crate::repository::HistoryDestination>,
+    blocked: bool,
+) -> Element<'a, SidebarAction> {
+    if blocked {
+        return content;
+    }
     let entries = [
         ("Copy SHA", HistoryCommand::CopySha),
         ("Copy message", HistoryCommand::CopyMessage),
-        ("New worktree from this commit…", HistoryCommand::NewWorktree),
+        (
+            "New worktree from this commit…",
+            HistoryCommand::NewWorktree,
+        ),
         ("Create branch here…", HistoryCommand::CreateBranch),
-        (if row.mainline.is_some() { "Revert commit (first parent)" } else { "Revert commit" }, HistoryCommand::Revert),
-        (if row.mainline.is_some() { "Cherry-pick into this worktree (first parent)" } else { "Cherry-pick into this worktree" }, HistoryCommand::CherryPick),
-    ].into_iter().map(|(label, command)| widget::menu::Item::Button(label.to_owned(), None, HistoryContextCommand { key, row, command, destination })).collect();
-    crate::interaction::context_menu(content, widget::menu::items(&std::collections::HashMap::new(), entries))
+        (
+            if row.mainline.is_some() {
+                "Revert commit (first parent)"
+            } else {
+                "Revert commit"
+            },
+            HistoryCommand::Revert,
+        ),
+        (
+            if row.mainline.is_some() {
+                "Cherry-pick into this worktree (first parent)"
+            } else {
+                "Cherry-pick into this worktree"
+            },
+            HistoryCommand::CherryPick,
+        ),
+    ]
+    .into_iter()
+    .map(|(label, command)| {
+        widget::menu::Item::Button(
+            label.to_owned(),
+            None,
+            HistoryContextCommand {
+                key,
+                row,
+                command,
+                destination,
+            },
+        )
+    })
+    .collect();
+    crate::interaction::context_menu(
+        content,
+        widget::menu::items(&std::collections::HashMap::new(), entries),
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9459,45 +9527,51 @@ fn history_section<'a>(
     let mut rows = widget::column::with_capacity(source.history.len());
     for row in &source.history {
         let chrome = &row.chrome;
-        rows = rows.push(history_context_controls(crate::interaction::keyboard_list_row(
-            button::custom(
-                widget::row::with_children(vec![
-                    widget::container(Icon::Commit.handle().icon().size(ROW_ICON_SIZE))
-                        .center_x(Length::Fixed(ROW_ICON_WIDTH))
+        rows = rows.push(history_context_controls(
+            crate::interaction::keyboard_list_row(
+                button::custom(
+                    widget::row::with_children(vec![
+                        widget::container(Icon::Commit.handle().icon().size(ROW_ICON_SIZE))
+                            .center_x(Length::Fixed(ROW_ICON_WIDTH))
+                            .into(),
+                        widget::column::with_children(vec![
+                            design::body(&*chrome.subject)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                                    EllipsizeHeightLimit::Lines(1),
+                                ))
+                                .width(Length::Fill)
+                                .into(),
+                            design::caption(&*chrome.metadata)
+                                .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
+                                    EllipsizeHeightLimit::Lines(1),
+                                ))
+                                .width(Length::Fill)
+                                .into(),
+                        ])
+                        .width(Length::Fill)
                         .into(),
-                    widget::column::with_children(vec![
-                        design::body(&*chrome.subject)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .width(Length::Fill)
-                            .into(),
-                        design::caption(&*chrome.metadata)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
-                            .width(Length::Fill)
-                            .into(),
                     ])
-                    .width(Length::Fill)
-                    .into(),
-                ])
-                .spacing(space::XS)
-                .align_y(Alignment::Center),
-            )
-            .padding([space::XS, space::XS])
-            .class(sidebar_button_style(false))
-            .on_press_maybe(gated(
-                SidebarAction::OpenCommit {
-                    key: key.clone(),
-                    oid: row.oid.clone(),
-                },
-                modal_open,
-            ))
-            .width(Length::Fill),
-        ), key, row, source.history_destination.as_ref(), modal_open));
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center),
+                )
+                .padding([space::XS, space::XS])
+                .class(sidebar_button_style(false))
+                .on_press_maybe(gated(
+                    SidebarAction::OpenCommit {
+                        key: key.clone(),
+                        oid: row.oid.clone(),
+                    },
+                    modal_open,
+                ))
+                .width(Length::Fill),
+            ),
+            key,
+            row,
+            source.history_destination.as_ref(),
+            modal_open,
+        ));
     }
     column = column.push(rows);
     column = column.push(slot((!source.history_complete && !source.unborn).then(
@@ -17758,13 +17832,38 @@ pub(crate) mod tests {
 
     #[test]
     fn history_actions_pin_the_message_and_merge_parent_from_the_rendered_commit() {
-        let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
-        let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![oid_of(1), oid_of(2)], author: identity.clone(), committer: identity, subject: "Merge subject".into(), body: "Body line\n".into() });
+        let identity = CommitIdentity {
+            name: "Author".into(),
+            email: "author@example.invalid".into(),
+            timestamp: 0,
+            offset_minutes: 0,
+        };
+        let row = CommitRow::new(&CommitSummary {
+            oid: oid_of(3),
+            parents: vec![oid_of(1), oid_of(2)],
+            author: identity.clone(),
+            committer: identity,
+            subject: "Merge subject".into(),
+            body: "Body line\n".into(),
+        });
         let key = main_key();
-        let action = widget::menu::Action::message(&HistoryContextCommand { key: &key, row: &row, command: HistoryCommand::Revert, destination: None });
+        let action = widget::menu::Action::message(&HistoryContextCommand {
+            key: &key,
+            row: &row,
+            command: HistoryCommand::Revert,
+            destination: None,
+        });
         let message = Arc::clone(&row.message);
         drop(row);
-        let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = action else { panic!("expected a history command"); };
+        let SidebarAction::HistoryCommand {
+            oid,
+            mainline,
+            message: captured,
+            ..
+        } = action
+        else {
+            panic!("expected a history command");
+        };
         assert_eq!(oid, oid_of(3));
         assert_eq!(mainline, Some(1));
         assert_eq!(captured.as_ref(), "Merge subject\n\nBody line\n");
