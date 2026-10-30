@@ -553,7 +553,7 @@ fn effects(app: &Cagents) -> serde_json::Value {
     serde_json::json!({"snapshot":row.snapshot,"identity":row.identity,"present":row.present,
         "failure":row.failure,"schedule":format!("{:?}",row.schedule),"pending_serial":pending,
         "catalog":app.account_ui.catalog(f.system.provider),"row_visible":app.account_ui.shown_in_switcher(row),
-        "accounts_table_row":row.present || !row.account.is_system(),
+        "accounts_table_row":table::listed(row),
         "provider_chip":app.provider_chip(f.system.provider, app.account_ui.now_ms, false).is_some(),
         "failure_count":row.schedule.failures(),"manual_ready":row.schedule.manual_ready(app.account_ui.now_ms),
         "focus_before_backoff":row.schedule.should_probe(Trigger::Focus, app.account_ui.now_ms.saturating_add(schedule::BACKOFF_BASE - 1), true),
@@ -721,6 +721,14 @@ fn completed(
                 && before["present"] == after["present"]
                 && before["catalog"] == after["catalog"]
                 && before["row_visible"] == after["row_visible"]
+                && after["accounts_table_row"] == true
+                && (f.context.scenario != Scenario::Malformed
+                    || (before["snapshot"].is_null()
+                        && before["identity"].is_null()
+                        && before["present"] == false
+                        && after["snapshot"].is_null()
+                        && after["identity"].is_null()
+                        && after["present"] == false))
                 && before["known_account"] == after["known_account"]
                 && before["default_controls"] == after["default_controls"]
                 && before["automation_choices"] == after["automation_choices"]
@@ -769,7 +777,13 @@ fn completed(
                 && after["row_visible"] == true
                 && after["failure"].is_null()
                 && after["pending_serial"].is_null()
-                && !after["automatic_alternate"].is_null()
+                && if f.context.scenario == Scenario::Malformed {
+                    // The empty scene has no synthetic exhausted source row.
+                    // Recovery must not fabricate a source or an alternate.
+                    after["automatic_alternate"].is_null()
+                } else {
+                    !after["automatic_alternate"].is_null()
+                }
         }
     };
     receipt(
@@ -792,20 +806,13 @@ fn completed(
                 Scenario::Ticket => Kind::OldA,
             });
         }
-        Kind::Sparse => {
-            f.phase = if f.context.scenario == Scenario::Malformed {
-                "empty-recovery-unavailable-no-row-refresh"
-            } else {
-                "failed-retained"
-            };
-        }
+        Kind::Sparse => f.phase = "failed-retained",
         Kind::OldA => f.phase = "obsolete-a-refused-b-still-held",
         _ => f.phase = "complete",
     }
     app.account_ui.now_ms = f.logical_now.max(now_ms());
     receipt(
-        serde_json::json!({"event":"scene_state","scene":f.context.scene,"phase":f.phase,"qualified":false,
-        "native_control_gap":(f.phase == "empty-recovery-unavailable-no-row-refresh").then_some("SYSTEM presence remains unknown: normal Accounts table has no row Refresh; no programmatic recovery is a user interaction")}),
+        serde_json::json!({"event":"scene_state","scene":f.context.scene,"phase":f.phase,"qualified":false}),
     );
 }
 
