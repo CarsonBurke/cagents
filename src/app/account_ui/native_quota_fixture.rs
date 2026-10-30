@@ -15,6 +15,8 @@ const SCENES: &[&str] = &[
     "codex-delayed",
     "claude-ticket",
     "codex-ticket",
+    "claude-startup",
+    "codex-startup",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +25,7 @@ enum Scenario {
     Malformed,
     Delayed,
     Ticket,
+    Startup,
 }
 
 pub(in crate::app) struct Context {
@@ -107,6 +110,7 @@ pub(in crate::app) fn context() -> Result<Option<Context>, String> {
         "malformed" => Scenario::Malformed,
         "delayed" => Scenario::Delayed,
         "ticket" => Scenario::Ticket,
+        "startup" => Scenario::Startup,
         _ => unreachable!(),
     };
     Ok(Some(Context {
@@ -212,6 +216,22 @@ pub(in crate::app) struct Fixture {
     phase: &'static str,
     works: Vec<Work>,
     error: Option<String>,
+    startup: Option<Startup>,
+}
+
+struct StartupAdmission {
+    id: AccountId,
+    owner: u64,
+    ticket: ProbeTicket,
+    trigger: Trigger,
+}
+
+struct Startup {
+    original_accounts: Vec<(AccountId, u64)>,
+    original_revision: u64,
+    trigger: Option<Trigger>,
+    admissions: Vec<StartupAdmission>,
+    sign_in_owner: Option<u64>,
 }
 
 /// Internal in-process gate notification only; no wire, commands or arbitrary
@@ -236,6 +256,9 @@ fn fail(app: &mut Cagents, message: &str) {
 }
 
 pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Message> {
+    if context.scenario == Scenario::Startup {
+        return install_startup(app, context);
+    }
     let system = Account {
         provider: context.provider,
         home: account::AccountHome::SystemAt {
@@ -310,6 +333,7 @@ pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Messa
         phase: "initial-collector",
         works: Vec::new(),
         error: None,
+        startup: None,
     });
     app.account_ui = state;
     app.active_workspace = Some(
@@ -357,6 +381,13 @@ pub(in crate::app) fn admission_time(
     let Some(f) = app.account_ui.native_fixture.as_mut() else {
         return Some(now);
     };
+    if let Some(startup) = f.startup.as_mut() {
+        // Never mask the production readiness gate with the quota fixture's
+        // phase/Manual-only filter. A rejected automatic attempt must reach
+        // probe_policy_ready; an unexpected actual admission is a failure.
+        startup.trigger = Some(trigger);
+        return f.error.is_none().then_some(now);
+    }
     let initial = f.works.is_empty();
     if f.error.is_some()
         || f.next.is_none()
@@ -373,6 +404,410 @@ pub(in crate::app) fn admission_time(
     f.logical_now = time;
     app.account_ui.now_ms = time;
     Some(time)
+}
+
+fn startup_accounts(app: &Cagents) -> Vec<(AccountId, u64)> {
+    app.account_ui
+        .accounts
+        .iter()
+        .map(|row| (row.id.clone(), row.owner))
+        .collect()
+}
+
+fn startup_effects(app: &Cagents) -> serde_json::Value {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    let startup = f.startup.as_ref().unwrap();
+    let rows: Vec<_> = app
+        .account_ui
+        .accounts
+        .iter()
+        .map(|row| {
+            let pending = row.pending_probe.as_ref().and_then(|ticket| {
+                startup.admissions.iter().position(|admission| {
+                    admission.id == row.id
+                        && admission.owner == row.owner
+                        && admission.ticket.same(ticket)
+                })
+            });
+            serde_json::json!({"id":row.id,"owner":row.owner,"present":row.present,
+            "in_flight":row.schedule.in_flight(app.account_ui.now_ms),
+            "queued":format!("{:?}",row.queued),"pending_original_serial":pending,
+            "sign_in_preparing":app.account_ui.preparing_logins.contains(&row.owner),
+            "sign_in_terminal":row.sign_in_terminal.is_some(),
+            "awaiting_login":row.schedule.awaiting_login(app.account_ui.now_ms)})
+        })
+        .collect();
+    let admissions: Vec<_> = startup
+        .admissions
+        .iter()
+        .enumerate()
+        .map(|(serial, admission)| {
+            serde_json::json!({"serial":serial,"id":admission.id,"owner":admission.owner,
+            "trigger":format!("{:?}",admission.trigger)})
+        })
+        .collect();
+    serde_json::json!({"registry_ready":app.account_ui.registry_ready,
+        "registry_revision":app.account_ui.registry.revision(),
+        "selected_account":f.system.id(),"untouched_account":f.source.id(),
+        "original_registry_revision":startup.original_revision,
+        "original_account_count":startup.original_accounts.len(),
+        "account_count":app.account_ui.accounts.len(),"rows":rows,"admissions":admissions,
+        "original_ids_and_owners_conserved":startup_accounts(app)==startup.original_accounts,
+        "store_present":app.account_ui.store.is_some(),"cache_present":app.account_ui.cache.is_some(),
+        "terminal_cards":app.durable.cards.iter().filter(|card| matches!(&card.kind, CardKind::Terminal(_))).count(),
+        "qualified":false,"provider_outcome":null})
+}
+
+fn startup_receipt(app: &Cagents, event: &str) {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    receipt(
+        serde_json::json!({"event":event,"scene":f.context.scene,"phase":f.phase,
+        "effects":startup_effects(app),"error":f.error,"boundary":"synthetic in-memory callback and actual reducer admission only",
+        "input_origin_requires_native_controller_evidence":true,
+        "operational_tasks_polled":false,"provider_executed":false,"qualified":false}),
+    );
+}
+
+fn install_startup(app: &mut Cagents, context: Context) -> Task<Message> {
+    let mut state = State::default();
+    for provider in Account::PROVIDERS {
+        state.remote_system_homes.insert(
+            provider,
+            context
+                .root
+                .join(format!("synthetic-{}-never-read", provider.executable())),
+        );
+    }
+    state.sync_accounts();
+    let system = state
+        .account(&Account::system(context.provider).id())
+        .unwrap()
+        .account
+        .clone();
+    let other = match context.provider {
+        Provider::Claude => Provider::Codex,
+        Provider::Codex => Provider::Claude,
+        _ => unreachable!("only the two explicit startup scenes"),
+    };
+    let source = state
+        .account(&Account::system(other).id())
+        .unwrap()
+        .account
+        .clone();
+    let original_accounts = state
+        .accounts
+        .iter()
+        .map(|row| (row.id.clone(), row.owner))
+        .collect();
+    let original_revision = state.registry.revision();
+    let restored = state
+        .accounts
+        .iter()
+        .map(|row| Restored {
+            id: row.id.clone(),
+            present: true,
+            entry: None,
+        })
+        .collect();
+    let now = now_ms();
+    state.native_fixture = Some(Fixture {
+        context,
+        system,
+        source,
+        baseline: now,
+        logical_now: now,
+        next: None,
+        phase: "startup-unready",
+        works: Vec::new(),
+        error: None,
+        startup: Some(Startup {
+            original_accounts,
+            original_revision,
+            trigger: None,
+            admissions: Vec::new(),
+            sign_in_owner: None,
+        }),
+    });
+    app.account_ui = state;
+    app.active_workspace = Some(
+        app.account_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .context
+            .root
+            .join("public-project"),
+    );
+    app.refresh_ui.focused = false;
+    app.settings.show_status_bar = false;
+    app.context_inspector_open = false;
+    // A fixture-owned failed callback carries synthetic installed/present
+    // metadata. It is not a Store read or a provider discovery result. The real
+    // Loaded reducer must retain unknown policy and publish its normal notice.
+    drop(app.update_account_ui(Action::Loaded(Loaded {
+        registry: Err("INERT startup registry unavailable".into()),
+        restored,
+        catalogs: BTreeMap::new(),
+        installed: Account::PROVIDERS.into_iter().map(|p| (p, true)).collect(),
+        provisional: false,
+    })));
+    if let Some(notice) = app.status.take() {
+        app.notices.record(notice);
+    }
+    app.notices.record(TransientNotice::warning("INERT startup policy · synthetic metadata · F8 stages failed read/retry · no provider or sign-in execution"));
+    let open = app.open_utility_card(CardKind::Accounts);
+    app.refresh_sidebar_channels();
+    app.synchronize_sidebar_selection();
+    let sidebar = sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+    let _ = app
+        .workspace
+        .resize_viewport((app.content_width() - sidebar).max(0.0));
+    startup_receipt(app, "startup_installed_unknown_policy");
+    let theme = app.settings.app_theme.resolve(app.core.system_theme());
+    Task::batch([open, app.sync_chrome(), cosmic::command::set_theme(theme)])
+}
+
+fn start_startup(
+    app: &mut Cagents,
+    account: Account,
+    id: AccountId,
+    owner: u64,
+    ticket: ProbeTicket,
+) -> Task<Message> {
+    let current = app.account_ui.account(&id).is_some_and(|row| {
+        row.account == account
+            && row.owner == owner
+            && row
+                .pending_probe
+                .as_ref()
+                .is_some_and(|pending| pending.same(&ticket))
+    });
+    let f = app.account_ui.native_fixture.as_mut().unwrap();
+    let startup = f.startup.as_mut().unwrap();
+    let Some(trigger) = startup.trigger.take() else {
+        fail(app, "startup admission has no original scheduling trigger");
+        return Task::none();
+    };
+    let expected = current
+        && match f.phase {
+            "startup-manual-dispatch" => {
+                id == f.system.id() && trigger == Trigger::Manual && startup.admissions.is_empty()
+            }
+            "startup-retry-loading" => {
+                id == f.source.id() && trigger == Trigger::Focus && startup.admissions.len() == 1
+            }
+            _ => false,
+        };
+    // Retain the actual private ticket allocation, never a reconstructed one.
+    startup.admissions.push(StartupAdmission {
+        id,
+        owner,
+        ticket,
+        trigger,
+    });
+    startup_receipt(app, "startup_actual_probe_admission");
+    if !expected {
+        fail(app, "unexpected actual startup probe admission");
+    }
+    // No collector, outcome, provider future or completion is manufactured.
+    Task::none()
+}
+
+fn startup_action(app: &mut Cagents, action: Action) -> Task<Message> {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    if f.error.is_some() {
+        return Task::none();
+    }
+    match action {
+        Action::Refresh(id) => {
+            if f.phase != "startup-manual-ready" || id != f.system.id() {
+                fail(
+                    app,
+                    "startup Refresh requires the selected original row and phase",
+                );
+                return Task::none();
+            }
+            app.account_ui.native_fixture.as_mut().unwrap().phase = "startup-manual-dispatch";
+            drop(app.update_account_ui(Action::Refresh(id.clone())));
+            let f = app.account_ui.native_fixture.as_ref().unwrap();
+            let startup = f.startup.as_ref().unwrap();
+            let admitted = f.error.is_none()
+                && !app.account_ui.registry_ready
+                && startup.admissions.len() == 1
+                && app.account_ui.account(&id).is_some_and(|row| {
+                    row.pending_probe
+                        .as_ref()
+                        .is_some_and(|ticket| startup.admissions[0].ticket.same(ticket))
+                });
+            if !admitted {
+                fail(
+                    app,
+                    "manual Refresh was not admitted while startup policy stayed unknown",
+                );
+            } else {
+                app.account_ui.native_fixture.as_mut().unwrap().phase = "startup-manual-admitted";
+            }
+            startup_receipt(app, "startup_native_refresh_callback");
+        }
+        action @ (Action::SignIn(_) | Action::SignInWithCode(_)) => {
+            // Both native controls are explicit intent. This scene exercises
+            // preparation admission only, not LoginReady, await-login or a
+            // terminal. Keep the exact callback kind in the receipt below.
+            let (id, device) = match &action {
+                Action::SignIn(id) => (id.clone(), false),
+                Action::SignInWithCode(id) => (id.clone(), true),
+                _ => unreachable!(),
+            };
+            if f.phase != "startup-manual-admitted" || id != f.system.id() {
+                fail(
+                    app,
+                    "startup Sign in requires the selected original row and phase",
+                );
+                return Task::none();
+            }
+            let owner = app.account_ui.account(&id).unwrap().owner;
+            if app.account_ui.preparing_logins.contains(&owner) {
+                fail(
+                    app,
+                    "startup Sign in must create its own preparation reservation",
+                );
+                return Task::none();
+            }
+            drop(app.update_account_ui(action));
+            let admitted = app.account_ui.preparing_logins.contains(&owner)
+                && !app.account_ui.registry_ready
+                && app.account_ui.account(&id).is_some_and(|row| {
+                    row.owner == owner
+                        && row.sign_in_terminal.is_none()
+                        && !row.schedule.awaiting_login(app.account_ui.now_ms)
+                });
+            if admitted {
+                let f = app.account_ui.native_fixture.as_mut().unwrap();
+                f.startup.as_mut().unwrap().sign_in_owner = Some(owner);
+                f.phase = "startup-signin-preparation-admitted";
+            } else {
+                fail(
+                    app,
+                    "explicit Sign in preparation was not admitted under unknown policy",
+                );
+            }
+            startup_receipt(
+                app,
+                if device {
+                    "startup_native_signin_with_code_preparation_callback"
+                } else {
+                    "startup_native_signin_preparation_callback"
+                },
+            );
+        }
+        action @ (Action::Tick | Action::Popover(_)) => {
+            drop(app.update_account_ui(action));
+            startup_receipt(app, "startup_scheduling_callback");
+        }
+        _ => unreachable!("finite startup callbacks only"),
+    }
+    Task::none()
+}
+
+fn advance_startup(app: &mut Cagents) {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    if f.error.is_some() {
+        return;
+    }
+    match f.phase {
+        "startup-unready" => {
+            if !app.refresh_ui.focused {
+                fail(
+                    app,
+                    "startup scheduling needs actual native window focus first",
+                );
+                return;
+            }
+            let id = f.system.id();
+            drop(app.update_account_ui(Action::RegistryLoaded(Err(
+                "INERT registry retry unavailable".into(),
+            ))));
+            drop(app.accounts_focus_changed(true, true));
+            drop(app.update_account_ui(Action::Tick));
+            drop(app.update_account_ui(Action::Popover(Some(id))));
+            drop(app.update_account_ui(Action::Popover(None)));
+            let f = app.account_ui.native_fixture.as_ref().unwrap();
+            let startup = f.startup.as_ref().unwrap();
+            if app.account_ui.registry_ready
+                || !startup.admissions.is_empty()
+                || startup_accounts(app) != startup.original_accounts
+                || app
+                    .account_ui
+                    .accounts
+                    .iter()
+                    .any(|row| row.pending_probe.is_some() || row.queued.is_some())
+            {
+                fail(
+                    app,
+                    "failed registry read admitted automatic work or changed original rows",
+                );
+            } else {
+                app.account_ui.native_fixture.as_mut().unwrap().phase = "startup-manual-ready";
+            }
+            startup_receipt(app, "startup_failed_registry_automatic_refused");
+        }
+        "startup-signin-preparation-admitted" => {
+            let count = app.account_ui.accounts.len();
+            let prior = app.account_ui.registry.revision();
+            let revision = prior.checked_add(1).expect("finite fixture revision");
+            let mut value =
+                serde_json::to_value(&app.account_ui.registry).expect("typed fixture registry");
+            value["revision"] = serde_json::json!(revision);
+            let registry: Registry =
+                serde_json::from_value(value).expect("same typed fixture policy, later revision");
+            app.account_ui.native_fixture.as_mut().unwrap().phase = "startup-retry-loading";
+            // Synthetic authoritative callback into the REAL reducer. No
+            // actual Store read, ready assignment or registry I/O is implied.
+            drop(app.update_account_ui(Action::RegistryLoaded(Ok(registry))));
+            let f = app.account_ui.native_fixture.as_ref().unwrap();
+            let startup = f.startup.as_ref().unwrap();
+            let valid = f.error.is_none()
+                && app.account_ui.registry_ready
+                && app.account_ui.registry.revision() == revision
+                && revision > startup.original_revision
+                && prior == startup.original_revision
+                && app.account_ui.accounts.len() == count
+                && startup_accounts(app) == startup.original_accounts
+                && startup.admissions.len() == 2
+                && startup.admissions[0].id == f.system.id()
+                && startup.admissions[0].trigger == Trigger::Manual
+                && startup.admissions[1].id == f.source.id()
+                && startup.admissions[1].trigger == Trigger::Focus
+                && !startup.admissions[0]
+                    .ticket
+                    .same(&startup.admissions[1].ticket)
+                && startup.admissions.iter().all(|admission| {
+                    app.account_ui.account(&admission.id).is_some_and(|row| {
+                        row.owner == admission.owner
+                            && row
+                                .pending_probe
+                                .as_ref()
+                                .is_some_and(|pending| pending.same(&admission.ticket))
+                    })
+                })
+                && startup
+                    .sign_in_owner
+                    .is_some_and(|owner| app.account_ui.preparing_logins.contains(&owner));
+            if valid {
+                app.account_ui.native_fixture.as_mut().unwrap().phase = "startup-complete";
+            } else {
+                fail(
+                    app,
+                    "successful same-count later registry did not release the untouched account",
+                );
+            }
+            startup_receipt(app, "startup_same_count_later_revision_admitted");
+        }
+        _ => startup_receipt(
+            app,
+            "startup_step_refused_wait_for_native_refresh_or_signin",
+        ),
+    }
 }
 
 fn frames(provider: Provider, sparse: bool, malformed: bool) -> probe::collector_fixture::Frames {
@@ -429,6 +864,14 @@ pub(in crate::app) fn start(
     owner: u64,
     ticket: ProbeTicket,
 ) -> Task<Message> {
+    if app
+        .account_ui
+        .native_fixture
+        .as_ref()
+        .is_some_and(|f| f.startup.is_some())
+    {
+        return start_startup(app, account, id, owner, ticket);
+    }
     let f = app.account_ui.native_fixture.as_mut().unwrap();
     if account != f.system || f.works.len() >= 3 {
         fail(
@@ -589,6 +1032,15 @@ fn release(app: &mut Cagents, kind: Kind) {
 }
 
 fn advance(app: &mut Cagents) {
+    if app
+        .account_ui
+        .native_fixture
+        .as_ref()
+        .is_some_and(|f| f.startup.is_some())
+    {
+        advance_startup(app);
+        return;
+    }
     let f = app.account_ui.native_fixture.as_ref().unwrap();
     if f.error.is_some() {
         return;
@@ -804,6 +1256,7 @@ fn completed(
                 Scenario::Sparse | Scenario::Malformed => Kind::Sparse,
                 Scenario::Delayed => Kind::Delayed,
                 Scenario::Ticket => Kind::OldA,
+                Scenario::Startup => unreachable!("startup never constructs a collector"),
             });
         }
         Kind::Sparse => f.phase = "failed-retained",
@@ -823,12 +1276,31 @@ pub(in crate::app) fn update(app: &mut Cagents, message: Message) -> Task<Messag
         Message::UtilityPaneUi(message) => *message,
         message => message,
     };
+    let startup = app
+        .account_ui
+        .native_fixture
+        .as_ref()
+        .is_some_and(|f| f.startup.is_some());
     if let Message::AccountUi(Action::Refresh(id)) = &message {
         receipt(serde_json::json!({"event":"refresh_callback","id":id,
             "phase":app.account_ui.native_fixture.as_ref().unwrap().phase,
             "input_origin_requires_native_controller_evidence":true}));
     }
     let task = match message {
+        Message::AccountUi(
+            action @ (Action::Refresh(_)
+            | Action::SignIn(_)
+            | Action::SignInWithCode(_)
+            | Action::Popover(_)
+            | Action::Tick),
+        ) if startup => startup_action(app, action),
+        Message::AccountUi(Action::Probed { .. } | Action::LoginReady { .. }) if startup => {
+            fail(
+                app,
+                "startup admits no provider or login-preparation completion",
+            );
+            Task::none()
+        }
         Message::AccountNativeFixture(Event::QuotaObserved(serial)) => {
             let f = app.account_ui.native_fixture.as_mut().unwrap();
             if let Some(work) = f.works.get_mut(serial) {
@@ -963,7 +1435,12 @@ pub(in crate::app) fn update(app: &mut Cagents, message: Message) -> Task<Messag
         Message::RefreshUi(refresh_ui::Action::Focused(window, focused))
             if app.core.main_window_id() == Some(window) =>
         {
+            let regained = focused && !app.refresh_ui.focused;
             app.refresh_ui.focused = focused;
+            if startup {
+                drop(app.accounts_focus_changed(focused, regained));
+                startup_receipt(app, "startup_window_focus");
+            }
             Task::none()
         }
         Message::WindowCloseRequested(window) if app.core.main_window_id() == Some(window) => {
