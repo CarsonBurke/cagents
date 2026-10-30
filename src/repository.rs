@@ -4200,6 +4200,7 @@ pub enum RepositoryError {
     /// Retain a process timeout's original diagnostics when it caused the limit.
     #[error("History search reached its work or time limit. Narrow your search and try again.")]
     HistorySearchLimit {
+        matches: Vec<CommitSummary>,
         #[source]
         failure: Option<Box<ProcessFailure>>,
     },
@@ -5574,18 +5575,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 deadline,
             }),
         );
-        bounded
-            .filtered_history_walk(request, query, cancellation, deadline)
-            .map_err(|error| match error {
-                RepositoryError::Process(failure)
-                    if failure.kind == ProcessFailureKind::TimedOut =>
-                {
-                    RepositoryError::HistorySearchLimit {
-                        failure: Some(Box::new(failure)),
-                    }
-                }
-                error => error,
-            })
+        bounded.filtered_history_walk(request, query, cancellation, deadline)
     }
 
     fn check_history_search(
@@ -5603,7 +5593,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .into());
         }
         if Instant::now() >= deadline {
-            return Err(RepositoryError::HistorySearchLimit { failure: None });
+            return Err(RepositoryError::HistorySearchLimit {
+                matches: Vec::new(),
+                failure: None,
+            });
         }
         Ok(())
     }
@@ -5615,22 +5608,39 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         deadline: Instant,
     ) -> Result<Vec<CommitSummary>, RepositoryError> {
+        let mut matches = Vec::new();
+        match self.filtered_history_collect(request, query, cancellation, deadline, &mut matches) {
+            Ok(()) => Ok(matches),
+            Err(RepositoryError::HistorySearchLimit { failure, .. }) => {
+                Err(RepositoryError::HistorySearchLimit { matches, failure })
+            }
+            Err(RepositoryError::Process(failure))
+                if failure.kind == ProcessFailureKind::TimedOut =>
+            {
+                Err(RepositoryError::HistorySearchLimit {
+                    matches,
+                    failure: Some(Box::new(failure)),
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn filtered_history_collect(
+        &self,
+        request: &HistoryRequest,
+        query: &str,
+        cancellation: &CancellationToken,
+        deadline: Instant,
+        matches: &mut Vec<CommitSummary>,
+    ) -> Result<(), RepositoryError> {
         self.check_history_search(cancellation, deadline)?;
         // Conservatively reserve one page for a possible sibling SHA match,
         // including when its path scope ultimately contains no matching entry.
         let mut work_left = HISTORY_SEARCH_PREFIX_WORK - u64::from(HISTORY_PAGE_SIZE);
         let candidate = self.history_sha_match(request, query, cancellation)?;
-        self.check_history_search(cancellation, deadline)?;
         let candidate_oid = candidate.as_ref().map(|commit| commit.oid.clone());
-        let start = self.history_start(request, cancellation)?;
-        self.check_history_search(cancellation, deadline)?;
-        let mut walk = request.clone();
-        if let Some(start) = &start {
-            walk.revision = HistoryRevision::Object { oid: start.clone() };
-        }
-        walk.page = 0;
         let mut skip = u64::from(request.page) * u64::from(HISTORY_PAGE_SIZE);
-        let mut matches = Vec::new();
         if let Some(candidate) = candidate {
             if skip > 0 {
                 skip -= 1;
@@ -5638,13 +5648,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 matches.push(candidate);
             }
         }
+        // Publish the resolved candidate into retained partials before a
+        // subsequent deadline/HEAD read can fail. This does not shortcut the
+        // literal message/author/SHA OR walk or claim it is exhausted.
+        self.check_history_search(cancellation, deadline)?;
+        let start = self.history_start(request, cancellation)?;
+        self.check_history_search(cancellation, deadline)?;
+        let mut walk = request.clone();
+        if let Some(start) = &start {
+            walk.revision = HistoryRevision::Object { oid: start.clone() };
+        }
+        walk.page = 0;
         loop {
             self.check_history_search(cancellation, deadline)?;
             let commits = if start.is_some() {
                 let prefix_work = (u64::from(walk.page) + 1) * u64::from(HISTORY_PAGE_SIZE);
-                work_left = work_left
-                    .checked_sub(prefix_work)
-                    .ok_or(RepositoryError::HistorySearchLimit { failure: None })?;
+                work_left = work_left.checked_sub(prefix_work).ok_or(
+                    RepositoryError::HistorySearchLimit {
+                        matches: Vec::new(),
+                        failure: None,
+                    },
+                )?;
                 self.history(&walk, cancellation)?
             } else {
                 Vec::new()
@@ -5663,16 +5687,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     }
                     if matches.len() == HISTORY_PAGE_SIZE as usize {
                         self.check_history_search(cancellation, deadline)?;
-                        return Ok(matches);
+                        return Ok(());
                     }
                 }
             }
             self.check_history_search(cancellation, deadline)?;
             if complete {
-                return Ok(matches);
+                return Ok(());
             }
             let Some(next) = walk.page.checked_add(1) else {
-                return Err(RepositoryError::HistorySearchLimit { failure: None });
+                return Err(RepositoryError::HistorySearchLimit {
+                    matches: Vec::new(),
+                    failure: None,
+                });
             };
             walk.page = next;
         }
@@ -11627,9 +11654,16 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(
                 &error,
-                RepositoryError::HistorySearchLimit { failure: None }
+                RepositoryError::HistorySearchLimit { failure: None, .. }
             ));
             assert!(error.to_string().contains("Narrow your search"));
+            let RepositoryError::HistorySearchLimit { matches, .. } = &error else {
+                unreachable!();
+            };
+            assert_eq!(matches.len(), usize::from(early_match));
+            if early_match {
+                assert_eq!(matches[0].oid, oid(2));
+            }
             let commands = counter.commands.lock().unwrap();
             assert_eq!(commands.len(), 31, "must not read the beyond-budget tail");
             for (page, command) in commands.iter().enumerate() {
@@ -11721,7 +11755,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            RepositoryError::HistorySearchLimit { failure: None }
+            RepositoryError::HistorySearchLimit { failure: None, .. }
         ));
         let cancelled = CancellationToken::new();
         cancelled.cancel();
@@ -11767,12 +11801,15 @@ mod tests {
             )
             .unwrap_err();
         let RepositoryError::HistorySearchLimit {
+            matches,
             failure: Some(failure),
         } = error
         else {
             panic!("timeout must remain distinguishable from exhausted history");
         };
         assert_eq!(*failure, timeout);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].oid, oid(1));
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(commands.len(), 5);
         assert!(
@@ -11799,6 +11836,101 @@ mod tests {
         for pair in commands.windows(2) {
             assert!(pair[0].timeout.unwrap() >= pair[1].timeout.unwrap());
         }
+    }
+
+    #[test]
+    fn history_filter_retains_resolved_full_sha_and_literal_or_hits_at_the_work_limit() {
+        for candidate_on_current_branch in [false, true] {
+            let candidate = oid(1);
+            let query = candidate.to_string();
+            let mut first = history_search_record(
+                if candidate_on_current_branch { 1 } else { 2 },
+                "ordinary current history",
+            );
+            first.extend(history_search_record(4, &format!("References {query}")));
+            first.extend(
+                history_search_record(2, "ordinary").repeat(HISTORY_PAGE_SIZE as usize - 2),
+            );
+            let mut outputs = vec![
+                success(format!("{candidate}\n").as_bytes()),
+                success(&history_search_record(1, "resolved exact commit")),
+                success(&first),
+            ];
+            for _ in 0..30 {
+                outputs.push(success(
+                    &history_search_record(2, "ordinary").repeat(HISTORY_PAGE_SIZE as usize),
+                ));
+            }
+            // The history really ends, but its short tail is beyond budget.
+            // Neither that exhaustion nor singleton full-SHA semantics may
+            // be invented to make the already resolved hit available.
+            outputs.push(success(b""));
+            let service = fake_service(outputs);
+            let error = service
+                .filtered_history(
+                    &HistoryRequest {
+                        worktree: "/repo".into(),
+                        revision: HistoryRevision::Object { oid: oid(3) },
+                        page: 0,
+                        path: None,
+                    },
+                    &query,
+                    &CancellationToken::new(),
+                )
+                .unwrap_err();
+            let RepositoryError::HistorySearchLimit { matches, failure } = error else {
+                panic!("the bounded walk must remain explicitly incomplete");
+            };
+            assert!(failure.is_none());
+            assert_eq!(
+                matches
+                    .iter()
+                    .map(|commit| commit.oid.clone())
+                    .collect::<Vec<_>>(),
+                vec![candidate.clone(), oid(4)],
+                "keep the exact current/sibling target once AND literal message OR hit"
+            );
+            let commands = service.executor.commands.lock().unwrap();
+            assert_eq!(commands.len(), 33);
+            assert!(
+                commands[1]
+                    .arguments
+                    .contains(&OsString::from(candidate.as_str()))
+            );
+            for command in &commands[2..] {
+                assert!(command.arguments.contains(&OsString::from(oid(3).as_str())));
+            }
+            assert_eq!(service.executor.outputs.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn history_filter_keeps_text_matches_when_a_later_page_times_out() {
+        let mut first = history_search_record(4, "known needle");
+        first.extend(history_search_record(2, "ordinary").repeat(HISTORY_PAGE_SIZE as usize - 1));
+        let mut timeout = unstarted_failure();
+        timeout.kind = ProcessFailureKind::TimedOut;
+        timeout.started = true;
+        let service = fake_service(vec![success(&first), Err(timeout.clone())]);
+        let error = service
+            .filtered_history(
+                &HistoryRequest {
+                    worktree: "/repo".into(),
+                    revision: HistoryRevision::Object { oid: oid(3) },
+                    page: 0,
+                    path: None,
+                },
+                "needle",
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        let RepositoryError::HistorySearchLimit { matches, failure } = error else {
+            panic!("deadline cannot erase matches from earlier completed pages");
+        };
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].oid, oid(4));
+        assert_eq!(*failure.unwrap(), timeout);
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 2);
     }
 
     #[test]

@@ -2013,6 +2013,9 @@ pub struct SourceControlModel {
     history_requested: bool,
     pub history_loading: bool,
     pub history_error: Option<String>,
+    /// A bounded search stopped without establishing exhaustion. Known rows
+    /// remain inspectable; only a new query or HEAD starts a fresh search.
+    pub history_limit: Option<String>,
     /// False while another [`HISTORY_PAGE_SIZE`] page may exist.
     pub history_complete: bool,
     /// The next zero-based page `History` should request.
@@ -2161,6 +2164,7 @@ impl SourceControlModel {
             history_requested: false,
             history_loading: false,
             history_error: None,
+            history_limit: None,
             history_complete: false,
             next_history_page: 0,
             reloading: false,
@@ -2303,6 +2307,7 @@ impl SourceControlModel {
             history_requested: false,
             history_loading: false,
             history_error: None,
+            history_limit: None,
             history_complete: false,
             next_history_page: 0,
             reloading: false,
@@ -2319,6 +2324,7 @@ impl SourceControlModel {
         self.commit_changes = None;
         self.history_loaded = false;
         self.history_complete = false;
+        self.history_limit = None;
         self.next_history_page = 0;
         self.mark_history_requested();
     }
@@ -2337,6 +2343,23 @@ impl SourceControlModel {
         self.history_requested = true;
         self.history_complete = page.len() < HISTORY_PAGE_SIZE as usize;
         self.next_history_page = self.next_history_page.saturating_add(1);
+    }
+
+    pub fn append_limited_history(&mut self, page: &[CommitSummary], notice: String) {
+        let mut seen: HashSet<_> = self.history.iter().map(|row| row.oid.clone()).collect();
+        for commit in page {
+            if seen.insert(commit.oid.clone()) {
+                self.history.push(CommitRow::new(commit));
+            }
+        }
+        self.history_loading = false;
+        self.history_loaded = true;
+        self.history_requested = true;
+        self.history_complete = false;
+        self.history_error = None;
+        self.history_limit = Some(notice);
+        // The partial page did not complete. Keep its number, but refuse
+        // pagination/replay until explicit new-query or changed-HEAD reset.
     }
 
     /// True once a page has been asked for and landed for this binding, and
@@ -2371,7 +2394,11 @@ impl SourceControlModel {
     /// True while a further page can exist. An unborn `HEAD` has no walk to
     /// page through, so it is offered no pager.
     fn can_load_history(&self) -> bool {
-        !self.history_loading && !self.history_complete && !self.unborn && self.head_oid.is_some()
+        !self.history_loading
+            && self.history_limit.is_none()
+            && !self.history_complete
+            && !self.unborn
+            && self.head_oid.is_some()
     }
 
     /// Records that the first page has been asked for, so expanding, closing,
@@ -2543,6 +2570,7 @@ impl SourceControlModel {
             next.history_requested = self.history_requested;
             next.history_loading = self.history_loading;
             next.history_error = self.history_error.clone();
+            next.history_limit = self.history_limit.clone();
             next.history = self.history.clone();
             next.history_loaded = self.history_loaded;
             next.history_complete = self.history_complete;
@@ -10954,8 +10982,8 @@ fn history_section<'a>(
         ));
     }
     column = column.push(rows);
-    column = column.push(slot((!source.history_complete && !source.unborn).then(
-        || {
+    column = column.push(slot(
+        (!source.history_complete && source.history_limit.is_none() && !source.unborn).then(|| {
             // The first page is not "more": labelling it that way while the list is
             // empty hides that nothing has been asked for yet.
             button::custom(design::caption(if source.history.is_empty() {
@@ -10975,8 +11003,8 @@ fn history_section<'a>(
                 modal_open || !source.can_load_history(),
             ))
             .into()
-        },
-    )));
+        }),
+    ));
     column.into()
 }
 
@@ -10987,7 +11015,10 @@ fn history_section<'a>(
 /// asked for yet is a different fact: reporting it as an empty repository is
 /// how this section came to contradict the commits the repository card beside
 /// it was listing at the same moment.
-fn history_notice(source: &SourceControlModel) -> Option<&'static str> {
+fn history_notice(source: &SourceControlModel) -> Option<&str> {
+    if let Some(notice) = &source.history_limit {
+        return Some(notice);
+    }
     if source.history_loading && source.history.is_empty() {
         return Some("Loading commits…");
     }
@@ -22610,6 +22641,71 @@ pub(crate) mod tests {
         );
         assert!(!source.can_load_history(), "a short page ends the walk");
     }
+
+    #[test]
+    fn limited_history_is_not_empty_or_exhausted_and_resets_with_query_or_head() {
+        let mut source = source_control();
+        source.head_oid = Some(oid_of(1).to_string().into());
+        source.search_history("needle".into());
+        let notice = "Search reached its limit; more matches may exist.";
+        source.append_limited_history(&[], notice.into());
+        assert_eq!(history_notice(&source), Some(notice));
+        assert_eq!(source.history_count(), Some(0));
+        assert!(source.history_loaded);
+        assert!(!source.history_complete);
+        assert!(!source.can_load_history());
+        assert!(!source.wants_history());
+        assert_eq!(source.next_history_page, 0);
+        let identity = CommitIdentity {
+            name: "Author".into(),
+            email: "author@example.invalid".into(),
+            timestamp: 0,
+            offset_minutes: 0,
+        };
+        let found = CommitSummary {
+            oid: oid_of(3),
+            parents: vec![],
+            author: identity.clone(),
+            committer: identity,
+            subject: "Known needle".into(),
+            body: String::new(),
+        };
+        source.append_limited_history(&[found.clone(), found.clone()], notice.into());
+        source.append_limited_history(&[found], notice.into());
+        assert_eq!(
+            source.history.len(),
+            1,
+            "repeated partial hits retain one row"
+        );
+        assert_eq!(source.history[0].oid, oid_of(3));
+        let mut same = source_control();
+        same.head_oid = source.head_oid.clone();
+        source.carry_mutation_into(&mut same);
+        assert_eq!(same.history_limit.as_deref(), Some(notice));
+        assert_eq!(same.history.len(), 1);
+        assert!(!same.can_load_history());
+        let mut moved = source_control();
+        moved.head_oid = Some(oid_of(2).to_string().into());
+        source.carry_mutation_into(&mut moved);
+        assert!(moved.history_limit.is_none());
+        assert!(moved.history.is_empty());
+        assert!(moved.wants_history());
+        same.search_history("refined".into());
+        assert!(same.history_limit.is_none());
+        assert!(same.history.is_empty());
+        assert!(same.history_loading);
+        assert_eq!(same.next_history_page, 0);
+        same.append_history(&[]);
+        assert!(
+            same.history_complete,
+            "only an actual short page proves exhaustion"
+        );
+        assert_eq!(
+            history_notice(&same),
+            Some("No commits match this message, author or SHA.")
+        );
+    }
+
     #[test]
     fn untracked_starts_expanded_and_history_reloads_when_head_moves() {
         assert!(SidebarState::default().section_expanded(PanelSection::Untracked));

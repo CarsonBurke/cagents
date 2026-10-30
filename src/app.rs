@@ -4278,7 +4278,7 @@ pub enum Message {
         key: ActiveWorktreeKey,
         page: u32,
         head: crate::repository::Oid,
-        result: Result<Vec<CommitSummary>, String>,
+        result: Result<Vec<CommitSummary>, history_ui::ReadFailure>,
     },
     SourceControlStageChecked {
         key: ActiveWorktreeKey,
@@ -12310,10 +12310,12 @@ impl Cagents {
             let result = tokio::task::spawn_blocking(move || {
                 RepositoryService::system("git")
                     .filtered_history(&request, &query, &cancellation)
-                    .map_err(|error| error.to_string())
+                    .map_err(history_ui::ReadFailure::from)
             })
             .await
-            .map_err(|error| format!("history reader join failed: {error}"))
+            .map_err(|error| {
+                history_ui::ReadFailure::Failed(format!("history reader join failed: {error}"))
+            })
             .and_then(|result| result);
             Message::SourceControlHistory {
                 generation,
@@ -16351,7 +16353,7 @@ impl Application for Cagents {
                             return Task::none();
                         }
                         let Some(source) = self.sidebar_model.source_control.as_mut() else { return Task::none(); };
-                        if source.history_loading || source.next_history_page != page { return Task::none(); }
+                        if source.history_loading || source.history_limit.is_some() || source.next_history_page != page { return Task::none(); }
                         let Some(head) = source.head_oid.as_deref()
                             .and_then(|oid| crate::repository::Oid::parse_object(oid).ok()) else {
                             return Task::none();
@@ -18333,28 +18335,25 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                let Some(source) = self.sidebar_model.source_control.as_mut() else {
+                    return Task::none();
+                };
+                // Success, partial limit and error share the same admission.
+                // A consumed page cannot be replayed, even if its number did
+                // not advance because the result was incomplete.
+                if source.head_oid.as_deref() != Some(head.as_str())
+                    || source.next_history_page != page
+                    || !source.history_loading
+                {
+                    return Task::none();
+                }
                 match result {
-                    Ok(commits) => {
-                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                            // A page that arrives out of order would append the
-                            // same commits twice, so only the page the walk is
-                            // waiting for is taken.
-                            if source.head_oid.as_deref() == Some(head.as_str())
-                                && source.next_history_page == page
-                            {
-                                source.append_history(&commits);
-                            }
-                        }
+                    Ok(commits) => source.append_history(&commits),
+                    Err(history_ui::ReadFailure::Limited { matches, notice }) => {
+                        source.append_limited_history(&matches, notice);
                     }
-                    Err(error) => {
-                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                            if source.head_oid.as_deref() == Some(head.as_str())
-                                && source.next_history_page == page
-                                && source.history_loading
-                            {
-                                source.history_failed(format!("Could not read history: {error}"));
-                            }
-                        }
+                    Err(history_ui::ReadFailure::Failed(error)) => {
+                        source.history_failed(format!("Could not read history: {error}"));
                     }
                 }
                 Task::none()
