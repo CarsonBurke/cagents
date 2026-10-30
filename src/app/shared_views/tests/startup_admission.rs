@@ -1303,11 +1303,9 @@ fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cance
             .unwrap()
             .project_id;
         let directory = tempfile::tempdir().unwrap();
-        let (writer, _) = SessionRuntime::open(
-            directory.path().join("mixed-draft-options.sqlite3"),
-            crate::model::BootId::new("boot"),
-        )
-        .unwrap();
+        let database = directory.path().join("mixed-draft-options.sqlite3");
+        let (writer, _) =
+            SessionRuntime::open(&database, crate::model::BootId::new("boot")).unwrap();
         writer.save_project(ProjectState {
             id: project,
             generation: 0,
@@ -1387,7 +1385,13 @@ fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cance
                 unreachable!()
             };
             *reply = rejected_target;
-            drop(app.update(late));
+            let stale = app.update(late);
+            settle(app, stale);
+            assert_eq!(app.shared_views.quarantined, HashSet::from([rejected.id]));
+            assert!(matches!(
+                app.cards.get(&rejected.id),
+                Some(CardRuntime::Failed(_))
+            ));
             assert_stored(app, &draft, &chosen, &rejected, &image, &rejected_image);
         });
         let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
@@ -1426,6 +1430,48 @@ fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cance
         let mut writer = app.session.take().unwrap();
         writer.shutdown();
         assert_eq!(writer.last_error(), None);
+        drop(writer);
+        // Read the real saved database again without a second snapshot/save.
+        let reopened = StateStore::open(&database, crate::model::BootId::new("boot")).unwrap();
+        let saved = reopened
+            .load_workspace(app.durable.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == draft.id)
+                .unwrap()
+                .kind,
+            CardKind::Chat(chosen)
+        );
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == rejected.id)
+                .unwrap()
+                .kind,
+            rejected.kind
+        );
+        assert_eq!(
+            saved.quarantined_panes,
+            HashMap::from([(rejected.id, rejected.kind.clone())])
+        );
+        assert_eq!(
+            saved.chat_drafts,
+            HashMap::from([(rejected.id, "Keep the rejected sibling's draft".into())])
+        );
+        assert_eq!(
+            saved.chat_draft_attachments,
+            HashMap::from([
+                (draft.id, vec![image.clone()]),
+                (rejected.id, vec![rejected_image.clone()])
+            ])
+        );
+        attachment_assets::validate(&saved.chat_draft_attachments[&draft.id][0]).unwrap();
+        attachment_assets::validate(&saved.chat_draft_attachments[&rejected.id][0]).unwrap();
     });
 }
 
