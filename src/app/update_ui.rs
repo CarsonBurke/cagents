@@ -575,8 +575,15 @@ impl Cagents {
             )
         } else if state.superseded.is_some() {
             (
-                Icon::Update,
-                "A newer build is installed; reopen windows to use it".to_owned(),
+                if state.error.is_some() {
+                    Icon::Warning
+                } else {
+                    Icon::Update
+                },
+                state.error.as_ref().map_or_else(
+                    || "A newer build is installed; reopen windows to use it".to_owned(),
+                    |error| format!("Could not finish reopening windows: {error}"),
+                ),
                 Some(Message::UpdateUi(Action::Restart)),
             )
         } else if let Some(error) = &state.error {
@@ -617,11 +624,17 @@ impl Cagents {
         )
         .then(|| self.window_update_blocker())
         .flatten();
+        let enabled = !self.modal_is_open() && action.is_some() && blocker.is_none();
         let label = match blocker {
             Some(reason) => format!("{label} — {reason}"),
+            None if enabled
+                && state.error.is_some()
+                && matches!(action, Some(Message::UpdateUi(Action::Restart))) =>
+            {
+                format!("{label}. Retry reopening")
+            }
             None => label,
         };
-        let enabled = !self.modal_is_open() && action.is_some() && blocker.is_none();
         Some(
             crate::ui_controls::icon_button(icon, label)
                 .selected(true)
