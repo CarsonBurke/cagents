@@ -21749,7 +21749,163 @@ mod tests {
 
     #[test]
     fn resetting_settings_restores_autosave_for_an_already_open_editor() {
-        async fn settle_repository_tasks(app: &mut Cagents, task: Task<Message>) {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::resetting_settings_restores_autosave_for_an_already_open_editor",
+        ) {
+            return;
+        }
+
+        #[derive(Debug, Default)]
+        struct SaveDiagnostics {
+            auto_save_due_delivered: usize,
+            events: Vec<String>,
+        }
+
+        fn editor_state(app: &Cagents, card: CardId) -> String {
+            let editor = match app.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => {
+                    let context = runtime.inspector_context();
+                    format!(
+                        "document={:?}, document_error={:?}, text={:?}, dirty={}, saving={}, save_error={:?}, editor_recovery={}, blocks_navigation={}",
+                        context.document,
+                        context.document_error,
+                        runtime.editor_text(),
+                        runtime.is_dirty(),
+                        runtime.is_saving(),
+                        runtime.save_error(),
+                        runtime.has_editor_recovery(),
+                        runtime.blocks_navigation(),
+                    )
+                }
+                Some(_) => "non-repository runtime".into(),
+                None => "runtime missing".into(),
+            };
+            format!(
+                "{editor}, window_custody_pending={}",
+                app.operation_recovery_pending(),
+            )
+        }
+
+        impl SaveDiagnostics {
+            fn before_message(
+                &mut self,
+                app: &Cagents,
+                card: CardId,
+                phase: &str,
+                message: &Message,
+            ) {
+                let detail = match message {
+                    Message::Repository(RepositoryAction::FileLoadedAt { identity, result }) => {
+                        let disposition = match result {
+                            Err(error) => format!("Err({error:?})"),
+                            Ok(read) => {
+                                let same_worktree = read.worktree() == identity.worktree;
+                                // Inspect a clone of this fixture's actual read
+                                // result; leave the original message/root intact.
+                                // Cloning performs no new file read or admission.
+                                let (_, loaded) = read.clone().into_parts();
+                                let content = match loaded {
+                                    Err(error) => format!("inner Err({error:?})"),
+                                    Ok(loaded) => match loaded.content {
+                                        crate::editor::FileContent::Editable { text, .. } => {
+                                            format!("Editable {{ bytes: {} }}", text.len())
+                                        }
+                                        crate::editor::FileContent::Image {
+                                            width, height, ..
+                                        } => {
+                                            format!("Image {{ width: {width}, height: {height} }}")
+                                        }
+                                        crate::editor::FileContent::Pdf { pages, .. } => {
+                                            format!("Pdf {{ pages: {pages} }}")
+                                        }
+                                        crate::editor::FileContent::ReadOnly(reason) => {
+                                            format!("ReadOnly({reason:?})")
+                                        }
+                                    },
+                                };
+                                format!(
+                                    "Ok(FileRead {{ same_worktree: {same_worktree}, content: {content} }})"
+                                )
+                            }
+                        };
+                        Some(format!(
+                            "FileLoadedAt card_matches={}, generation={}, disposition={disposition}",
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::Repository(RepositoryAction::AutoSaveDue {
+                        identity,
+                        revision,
+                        ticket,
+                    }) => {
+                        self.auto_save_due_delivered += 1;
+                        Some(format!(
+                            "AutoSaveDue delivered={} card_matches={}, generation={}, revision={revision}, ticket={ticket}",
+                            self.auto_save_due_delivered,
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::Repository(RepositoryAction::RetainedSaveFinished {
+                        identity,
+                        ticket,
+                        revision,
+                        saved_text,
+                        result,
+                    }) => {
+                        // Match before the runtime flattens retained errors.
+                        // Never Debug-print a live recovery authority/owner.
+                        let disposition = match result {
+                            Ok(outcome) => format!(
+                                "Ok({:?}), recovery_present={}",
+                                outcome.outcome(),
+                                outcome.recovery_authority().is_some(),
+                            ),
+                            Err(crate::editor::retained_save::RetainedSaveError::Io(error)) => {
+                                format!("Err(Io({error:?})), recovery_present=false")
+                            }
+                            Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                                message,
+                                ..
+                            }) => {
+                                format!("Err(Recovery({message:?})), recovery_present=true")
+                            }
+                        };
+                        Some(format!(
+                            "RetainedSaveFinished card_matches={}, generation={}, ticket={ticket}, revision={revision}, saved_text={saved_text:?}, result={disposition}",
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::SettingsSaved { result, .. } => Some(format!(
+                        "SettingsSaved success={}, error={:?}",
+                        result.is_ok(),
+                        result.as_ref().err(),
+                    )),
+                    _ => None,
+                };
+                if let Some(detail) = detail {
+                    self.events.push(format!(
+                        "{phase}: before consumption: {detail}; {}",
+                        editor_state(app, card),
+                    ));
+                }
+            }
+
+            fn checkpoint(&mut self, app: &Cagents, card: CardId, phase: &str) {
+                self.events
+                    .push(format!("{phase}: {}", editor_state(app, card)));
+            }
+        }
+
+        async fn settle_repository_tasks(
+            app: &mut Cagents,
+            task: Task<Message>,
+            diagnostics: &mut SaveDiagnostics,
+            card: CardId,
+            phase: &str,
+        ) {
             let mut pending = VecDeque::from([task]);
             while let Some(task) = pending.pop_front() {
                 let Some(mut stream) = iced::runtime::task::into_stream(task) else {
@@ -21760,10 +21916,13 @@ mod tests {
                         message @ (Message::Repository(_) | Message::SettingsSaved { .. }),
                     )) = action
                     {
+                        diagnostics.before_message(app, card, phase, &message);
                         pending.push_back(app.update(message));
+                        diagnostics.checkpoint(app, card, "after message consumption");
                     }
                 }
             }
+            diagnostics.checkpoint(app, card, phase);
         }
 
         tokio::runtime::Builder::new_current_thread()
@@ -21778,6 +21937,7 @@ mod tests {
                 app.settings_path = Some(directory.path().join("settings.toml"));
                 app.settings_write_blocked = false;
                 let card = CardId::new();
+                let mut diagnostics = SaveDiagnostics::default();
                 app.cards.insert(
                     card,
                     CardRuntime::Repository(Box::new(RepositoryRuntime::file_list_fixture(
@@ -21794,27 +21954,45 @@ mod tests {
                     card,
                     path: PathBuf::from("notes.txt"),
                 }));
-                settle_repository_tasks(&mut app, task).await;
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after open").await;
 
                 let task = app.apply_setting_input(SettingsField::EditorAutoSave, "false".into());
-                settle_repository_tasks(&mut app, task).await;
+                settle_repository_tasks(
+                    &mut app,
+                    task,
+                    &mut diagnostics,
+                    card,
+                    "after disabling autosave",
+                )
+                .await;
                 let task = app.update(Message::Repository(RepositoryAction::EditorAction {
                     card,
                     action: cosmic::widget::text_editor::Action::Edit(
                         cosmic::widget::text_editor::Edit::Insert('a'),
                     ),
                 }));
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after typing a")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "",
+                    "save diagnostics: {diagnostics:#?}",
+                );
 
                 // Reset schedules the dirty buffer without requiring another edit.
                 let task = app.reset_settings();
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "a");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after reset")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "a",
+                    "save diagnostics: {diagnostics:#?}",
+                );
                 assert!(
                     settings::load(app.settings_path.as_ref().unwrap())
                         .unwrap()
-                        .editor_auto_save
+                        .editor_auto_save,
+                    "save diagnostics: {diagnostics:#?}",
                 );
 
                 // The same open editor must keep saving subsequent changes.
@@ -21824,8 +22002,13 @@ mod tests {
                         cosmic::widget::text_editor::Edit::Insert('b'),
                     ),
                 }));
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after typing b")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "ab",
+                    "save diagnostics: {diagnostics:#?}",
+                );
             });
     }
 
