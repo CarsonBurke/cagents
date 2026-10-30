@@ -505,7 +505,8 @@ class DriverRefusalTests(unittest.TestCase):
 
     def test_inherited_authority_is_preserved_and_Git_routing_is_refused_by_name(self):
         environment = {'HOME': '/original/home', 'OPAQUE_AUTHORITY': 'fixture-opaque-value'}
-        with mock.patch.dict(os.environ, environment, clear=True), \
+        # Substitute a synthetic mapping; do not clear/copy the real environment.
+        with mock.patch.object(driver.os, 'environ', environment), \
              mock.patch.object(driver.signal, 'getsignal', return_value=driver.signal.SIG_DFL):
             driver.context_guard()
             self.assertEqual(dict(os.environ), environment)
@@ -514,6 +515,44 @@ class DriverRefusalTests(unittest.TestCase):
                 driver.context_guard()
             self.assertNotIn('/fixture-only-routing', str(caught.exception))
             self.assertEqual(os.environ['OPAQUE_AUTHORITY'], environment['OPAQUE_AUTHORITY'])
+
+    def test_self_reexec_child_markers_are_refused_without_reading_values(self):
+        class NamesOnly:
+            def __init__(self, marker):
+                self.marker = marker
+
+            def __iter__(self):
+                return iter(('HOME', 'OPAQUE_AUTHORITY', self.marker))
+
+            def __getitem__(self, _name):
+                raise AssertionError('Environment values must not be read')
+
+        for marker in ('CAGENTS_RETAINED_CLOSE_RETRY_TEST', 'CAGENTS_NATIVE_HOLDER_STDERR_TEST',
+                       'CAGENTS_NATIVE_HOLDER_TRANSPORT_TEST', 'CAGENTS_NATIVE_HOLDER_FAILED_SPAWN_TEST'):
+            with self.subTest(marker=marker), \
+                 mock.patch.object(driver.os, 'environ', NamesOnly(marker)), \
+                 mock.patch.object(driver.signal, 'getsignal') as disposition:
+                with self.assertRaisesRegex(RuntimeError, 'routing conflicts') as caught:
+                    driver.context_guard()
+                self.assertNotIn(marker, str(caught.exception))
+                disposition.assert_not_called()
+
+    def test_child_marker_refuses_constructor_before_paths_helpers_or_lane_effects(self):
+        for marker in ('CAGENTS_RETAINED_CLOSE_RETRY_TEST', 'CAGENTS_NATIVE_HOLDER_STDERR_TEST',
+                       'CAGENTS_NATIVE_HOLDER_TRANSPORT_TEST', 'CAGENTS_NATIVE_HOLDER_FAILED_SPAWN_TEST'):
+            environment = {'HOME': '/original/home', 'OPAQUE_AUTHORITY': 'fixture-opaque-value', marker: ''}
+            with self.subTest(marker=marker), \
+                 mock.patch.object(driver.os, 'environ', environment), \
+                 mock.patch.object(driver, 'absolute') as paths, \
+                 mock.patch.object(driver.runpy, 'run_path') as helper, \
+                 mock.patch.object(driver.fcntl, 'flock') as flock:
+                with self.assertRaisesRegex(RuntimeError, 'routing conflicts'):
+                    driver.Runner(SimpleNamespace())
+                paths.assert_not_called()
+                helper.assert_not_called()
+                flock.assert_not_called()
+                self.assertEqual(environment[marker], '')
+                self.assertEqual(environment['OPAQUE_AUTHORITY'], 'fixture-opaque-value')
 
 
 class SourceWitnessTests(unittest.TestCase):
