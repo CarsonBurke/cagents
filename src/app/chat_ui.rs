@@ -11964,6 +11964,8 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    mod old_save_recovery;
+
     #[test]
     fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
         const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME_COMMAND";
