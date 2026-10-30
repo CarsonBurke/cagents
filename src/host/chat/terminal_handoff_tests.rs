@@ -257,6 +257,149 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
         .expect("actual registered original holder")
         .clone();
     assert_eq!(original.terminal, terminal.id);
+    assert_ne!(terminal.id, chat_id);
+    let mut cleanup = source.clone();
+    cleanup.terminal = Some(terminal.clone());
+    for client in 2..=7 {
+        host.lock().unwrap().register_client(client);
+    }
+    // These calls use the real HOST request dispatcher and admission path,
+    // with private fixture clients; they do not exercise socket authentication.
+    let retained_close = |client, session: Session| {
+        super::super::client::process_request(
+            &host,
+            client,
+            ClientRequest::ChatCloseRetained { session },
+        )
+    };
+    assert!(retained_close(6, cleanup.clone()).is_err());
+    let mut wrong_source = cleanup.clone();
+    wrong_source.launch.session_id = Some("a-different-conversation".into());
+    let mut wrong_terminal = cleanup.clone();
+    wrong_terminal.terminal.as_mut().unwrap().id = TerminalId::new();
+    let mut wrong_terminal_recipe = cleanup.clone();
+    wrong_terminal_recipe
+        .terminal
+        .as_mut()
+        .unwrap()
+        .launch
+        .program = "not-the-issued-terminal".into();
+    let mut missing_proof = cleanup.clone();
+    missing_proof.proof = None;
+    let mut wrong_epoch = cleanup.clone();
+    wrong_epoch.proof.as_mut().unwrap().host_incarnation =
+        crate::model::HostIncarnation::new("different-host-incarnation");
+    for changed in [
+        wrong_source,
+        wrong_terminal,
+        wrong_terminal_recipe,
+        missing_proof,
+        wrong_epoch,
+    ] {
+        assert!(
+            process(
+                &host,
+                5,
+                ClientRequest::ChatAttach {
+                    session: changed.clone()
+                }
+            )
+            .is_err()
+        );
+        assert!(retained_close(1, changed).is_err());
+        assert!(
+            !host.lock().unwrap().chat_handoffs[&chat_id]
+                .subscribers
+                .contains_key(&5)
+        );
+    }
+    // A spent Resolve remains a fence even for the exact handoff. The shared
+    // consume helper also converts a Ready attempt to Spent before refusal.
+    let attempt = uuid::Uuid::new_v4();
+    host.lock()
+        .unwrap()
+        .chat_resolutions
+        .insert(7, upgrade_resolution::Attempt::Spent(attempt));
+    assert!(
+        process(
+            &host,
+            7,
+            ClientRequest::ChatAttach {
+                session: cleanup.clone()
+            }
+        )
+        .is_err()
+    );
+    {
+        let mut state = host.lock().unwrap();
+        assert!(
+            matches!(state.chat_resolutions.get(&7), Some(upgrade_resolution::Attempt::Spent(id)) if *id == attempt)
+        );
+        assert!(!state.chat_handoffs[&chat_id].subscribers.contains_key(&7));
+        state.chat_resolutions.remove(&7);
+    }
+    let attached = process(
+        &host,
+        6,
+        ClientRequest::ChatAttach {
+            session: cleanup.clone(),
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(attached, ServerResponse::ChatAttached { session, snapshot }
+        if session == cleanup && snapshot.exited && snapshot.session_id == source.launch.session_id)
+    );
+    assert!(
+        retained_close(6, cleanup.clone()).is_err(),
+        "live T cannot be retired by metadata cleanup"
+    );
+    // Missing private evidence must never fall through to an ordinary resident
+    // A or history cleanup. Preserve the real issued receipt across negatives.
+    let receipt = host.lock().unwrap().chat_handoffs.remove(&chat_id).unwrap();
+    assert!(
+        process(
+            &host,
+            6,
+            ClientRequest::ChatAttach {
+                session: cleanup.clone()
+            }
+        )
+        .is_err()
+    );
+    assert!(retained_close(6, cleanup.clone()).is_err());
+    host.lock().unwrap().chats.insert(
+        chat_id,
+        Record {
+            execution_instance: uuid::Uuid::new_v4(),
+            console_recipe: None,
+            paired_terminal: None,
+            session: source.clone(),
+            handle: handle.clone(),
+            source_process: None,
+            subscribers: BTreeMap::from([(6, false)]),
+            observations: BTreeMap::new(),
+            completion_observed: false,
+            returning_terminal: false,
+        },
+    );
+    assert!(retained_close(6, cleanup.clone()).is_err());
+    assert!(
+        process(
+            &host,
+            6,
+            ClientRequest::ChatAttach {
+                session: cleanup.clone()
+            }
+        )
+        .is_err()
+    );
+    {
+        let mut state = host.lock().unwrap();
+        assert!(state.chats.remove(&chat_id).is_some());
+        assert!(state.terminals.contains_key(&terminal.id));
+        assert!(state.chat_handoffs.insert(chat_id, receipt).is_none());
+    }
     // ACK may arrive from another window's ordinary hydration/save before
     // that actual T is closed. It must preserve the original A recovery route.
     process(
@@ -289,6 +432,11 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
             .unwrap()
     );
     host.lock().unwrap().retire_terminal(terminal.id);
+    for _ in 0..2 {
+        assert!(matches!(retained_close(6, cleanup.clone()).unwrap().0,
+            ServerResponse::ChatClosed { chat_id: closed, snapshot }
+            if closed == chat_id && snapshot.exited && snapshot.session_id == source.launch.session_id));
+    }
     for _ in 0..2 {
         assert!(
             matches!(process(&host, 3, ClientRequest::ChatClose { chat_id }).unwrap(), ServerResponse::ChatClosed { chat_id: closed, .. } if closed == chat_id)

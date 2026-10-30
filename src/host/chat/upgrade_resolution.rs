@@ -204,6 +204,12 @@ pub(in crate::host) fn resolve(
 /// Ordinary fresh/History attachments have no attempt and keep their existing
 /// path. Once this connection resolves a recovery, every Attach consumes that
 /// attempt before validation; no failure can fall through to ordinary Attach.
+pub(super) fn consume_attach_attempt(state: &mut HostState, client: ClientId) -> Option<Attempt> {
+    let attempt = state.chat_resolutions.get_mut(&client)?;
+    let id = attempt.id();
+    Some(std::mem::replace(attempt, Attempt::Spent(id)))
+}
+
 pub(in crate::host) fn attach(
     host: &SharedHost,
     client: ClientId,
@@ -211,11 +217,10 @@ pub(in crate::host) fn attach(
 ) -> Result<Option<ServerResponse>, ProtocolError> {
     let (grant, newly_subscribed) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(attempt) = state.chat_resolutions.get_mut(&client) else {
+        let Some(attempt) = consume_attach_attempt(&mut state, client) else {
             return Ok(None);
         };
-        let id = attempt.id();
-        let Attempt::Ready(grant) = std::mem::replace(attempt, Attempt::Spent(id)) else {
+        let Attempt::Ready(grant) = attempt else {
             return Err(unavailable(
                 "Native recovery attempt is spent; resolve again",
             ));

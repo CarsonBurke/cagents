@@ -56,6 +56,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(super) fn close_retained(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+) -> Result<ServerResponse, ProtocolError> {
+    if terminal_handoff::is_cleanup_descriptor(source) {
+        return terminal_handoff::close_retained(host, client, source);
+    }
+    close_retained_native(host, source).map_err(unavailable)?;
+    Ok(ServerResponse::Accepted)
+}
+
 pub(super) struct Record {
     pub(super) execution_instance: uuid::Uuid,
     pub(super) console_recipe: Option<crate::model::LaunchRecipe>,
@@ -2685,6 +2697,9 @@ fn process_inner(
             )
         }
         ClientRequest::ChatAttach { session } => {
+            if let Some(response) = terminal_handoff::attach_cleanup(host, client, &session)? {
+                return Ok(response);
+            }
             if let Some(response) = upgrade_resolution::attach(host, client, &session)? {
                 return Ok(response);
             }
