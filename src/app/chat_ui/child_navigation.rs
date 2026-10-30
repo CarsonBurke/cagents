@@ -45,7 +45,12 @@ impl Picker {
     }
 
     pub fn rows<'a>(&self, children: &'a [chat::Subagent]) -> Vec<&'a chat::Subagent> {
-        let query = self.query.trim().to_lowercase();
+        let query = self.query.trim();
+        // Share transcript Find's streaming, full Unicode case folding. Keep
+        // only query-sized matching state, never a folded copy of a task that
+        // may contain a multi-megabyte first line. Whole source characters
+        // still match across case-fold expansions (for example Straße/STRASSE).
+        let pattern = find::Pattern::prepare(query, &|| true).expect("uncancelled picker search");
         let mut rows: Vec<_> = children
             .iter()
             .filter(|child| {
@@ -64,7 +69,10 @@ impl Picker {
                             Runtime::native_child_status(child),
                         ]
                         .iter()
-                        .any(|part| part.to_lowercase().contains(&query)))
+                        .any(|part| {
+                            find::matched_pattern_checked(part, &pattern, 0, &|| true)
+                                .is_some_and(|matches| matches.truncated)
+                        }))
             })
             .collect();
         // Stable ordering preserves the provider's order among equal states.

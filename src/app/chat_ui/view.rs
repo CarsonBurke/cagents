@@ -6990,6 +6990,51 @@ mod tests {
     }
 
     #[test]
+    fn native_child_picker_searches_huge_task_tails_with_streaming_unicode_matching() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let mut task = "x".repeat(4 * 1024 * 1024);
+        task.push_str(" Straße ΟΣ İ end-of-task");
+        let original_ptr = task.as_ptr();
+        let original_len = task.len();
+        let child = chat::Subagent {
+            kind: "Scout".into(),
+            description: task,
+            ..native_child_fixture()
+        };
+        Arc::make_mut(&mut runtime.snapshot).subagents = vec![child];
+        let mut picker = child_navigation::Picker::new(&runtime.snapshot.subagents);
+        for query in ["STRASSE", "οσ", "ος", "i\u{307}", "END-OF-TASK"] {
+            picker.query = query.into();
+            let pattern = find::Pattern::prepare(query, &|| true).unwrap();
+            assert!(
+                pattern.bytes() < 256,
+                "scratch depends on query, not task length"
+            );
+            let rows = picker.rows(&runtime.snapshot.subagents);
+            assert_eq!(
+                rows.len(),
+                1,
+                "the entire first line is searchable: {query}"
+            );
+            assert_eq!(rows[0].id, "native-child");
+        }
+        // Full folding is whole-character matching: one s cannot match half
+        // of ß's expansion. An absent suffix must scan to the end without
+        // allocating a lowercase copy or truncating the searchable task.
+        for query in ["absent-tail", "straS"] {
+            picker.query = query.into();
+            assert!(picker.rows(&runtime.snapshot.subagents).is_empty());
+        }
+        let child = &runtime.snapshot.subagents[0];
+        assert_eq!(child.description.as_ptr(), original_ptr);
+        assert_eq!(child.description.len(), original_len);
+        assert!(child.description.ends_with(" Straße ΟΣ İ end-of-task"));
+        assert_eq!(Runtime::native_child_name(child), "Scout");
+        let task = Runtime::native_child_task(child).unwrap();
+        assert_eq!(Runtime::short_description(task, 120).chars().count(), 121);
+    }
+
+    #[test]
     fn selected_native_child_keeps_named_header_and_secondary_task_after_updates() {
         let (mut runtime, handle) = frame_cost::live_runtime(&[]);
         let child = chat::Subagent {
