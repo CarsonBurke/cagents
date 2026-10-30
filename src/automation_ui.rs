@@ -1159,6 +1159,7 @@ impl State {
         // Captured controls may arrive after another definition or run was read.
         // Reject them before consuming a current read or confirmation.
         if let Action::Enable { id, revision }
+        | Action::Pause { id, revision }
         | Action::RunNow { id, revision }
         | Action::Remove { id, revision } = &action
         {
@@ -1169,22 +1170,17 @@ impl State {
                 && self.selected.as_ref().is_some_and(|selected| {
                     selected.id == *id
                         && selected.revision == *revision
-                        && selected.blocked.is_none()
                         && match &action {
-                            Action::Enable { .. } => !selected.enabled,
-                            _ => selected.active_firing.is_none(),
+                            Action::Pause { .. } => selected.enabled,
+                            Action::Enable { .. } => {
+                                !selected.enabled && selected.blocked.is_none()
+                            }
+                            _ => selected.active_firing.is_none() && selected.blocked.is_none(),
                         }
                 });
             if !available {
                 return None;
             }
-        }
-        if let Action::Pause { id, revision } = &action
-            && !self.selected.as_ref().is_some_and(|selected| {
-                selected.id == *id && selected.revision == *revision && selected.enabled
-            })
-        {
-            return None;
         }
         if let Action::OpenSession { automation, firing } = &action
             && !self
