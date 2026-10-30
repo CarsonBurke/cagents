@@ -4737,6 +4737,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         paths: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<Vec<RepoPath>, RepositoryError> {
+        if bounded_pathspec_batches(paths).nth(1).is_some() {
+            // Matching many literal pathspecs makes Git compare every index
+            // entry against the selection, once again for each argv batch.
+            // A single bounded census avoids that quadratic matching cost.
+            let command = self.git_literal_read(worktree, ["ls-files", "-z"]);
+            if let Some(listed) = self.membership_census(&command, "git ls-files", cancellation)? {
+                return Ok(paths
+                    .iter()
+                    .filter(|path| listed.contains(*path))
+                    .cloned()
+                    .collect());
+            }
+        }
         // ls-files has no stdin pathspec support. Bound both argv and stdout
         // by querying selected literal paths in small batches; a one-file
         // operation must not enumerate an arbitrarily large repository index.
@@ -4773,6 +4786,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<Vec<RepoPath>, RepositoryError> {
         let mut listed = HashSet::new();
         let paths: Vec<RepoPath> = paths.iter().map(|path| (*path).clone()).collect();
+        if bounded_pathspec_batches(&paths).nth(1).is_some() {
+            let command = self.git_literal_read(
+                worktree,
+                ["ls-tree", "-r", "--name-only", "-z", revision.as_str()],
+            );
+            if let Some(listed) = self.membership_census(&command, "git ls-tree", cancellation)? {
+                return Ok(paths
+                    .iter()
+                    .filter(|path| listed.contains(*path))
+                    .cloned()
+                    .collect());
+            }
+        }
         for batch in bounded_pathspec_batches(&paths) {
             let mut arguments = vec![
                 OsString::from("ls-tree"),
@@ -4793,6 +4819,35 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .filter(|path| listed.contains(*path))
             .cloned()
             .collect())
+    }
+
+    /// A large selection can use one name census while it fits the normal
+    /// process-output bound. Never use a truncated census to decide absence:
+    /// an oversized repository falls back to selected-path queries instead.
+    /// Small selections skip the census entirely, so selecting one file never
+    /// enumerates a repository with hundreds of thousands of unrelated names.
+    fn membership_census(
+        &self,
+        command: &CommandSpec,
+        format: &'static str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<HashSet<RepoPath>>, RepositoryError> {
+        let output = match self.executor.execute(command, cancellation) {
+            Ok(output) if output.success => output,
+            Ok(output) => return Err(git_failure(command, output).into()),
+            Err(failure)
+                if failure.kind == ProcessFailureKind::OutputLimit
+                    && !cancellation.is_cancelled() =>
+            {
+                return Ok(None);
+            }
+            Err(failure) => {
+                log_git_failure(command, &failure);
+                return Err(failure.into());
+            }
+        };
+        let parsed = parse_path_list(&output.stdout, format);
+        Ok(Some(invalid_output(parsed, output)?.into_iter().collect()))
     }
 
     /// Restores tracked paths from the index and deletes untracked files.
@@ -7099,6 +7154,75 @@ mod tests {
             );
         }
 
+        #[cfg(unix)]
+        #[test]
+        fn large_membership_census_preserves_real_git_entry_kinds_and_byte_paths() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("seed"), b"binary\0content\n").unwrap();
+            git(root, &["add", "seed"]);
+            let blob = String::from_utf8(git_output(root, &["rev-parse", ":seed"])).unwrap();
+            let mut expected: Vec<_> = large_membership_paths().into_iter().take(600).collect();
+            expected.extend([
+                RepoPath::from_bytes(b":(glob)*\n\xff").unwrap(),
+                path("vendor/gitlink"),
+                path("symlink"),
+            ]);
+            let mut input = Vec::new();
+            for name in expected
+                .iter()
+                .chain(std::iter::once(&path("directory/child")))
+            {
+                let (mode, object) = match name.as_bytes() {
+                    b"vendor/gitlink" => ("160000", oid(7).to_string()),
+                    b"symlink" => ("120000", blob.trim().to_owned()),
+                    _ => ("100644", blob.trim().to_owned()),
+                };
+                input.extend_from_slice(format!("{mode} {object}\t").as_bytes());
+                input.extend_from_slice(name.as_bytes());
+                input.push(0);
+            }
+            let service = service();
+            let cancel = CancellationToken::new();
+            let command = service.git_mutation(root, ["update-index", "-z", "--index-info"]);
+            service
+                .run_checked(&command.clone().stdin(input), &cancel)
+                .unwrap();
+            git(root, &["commit", "--quiet", "-m", "entry kinds"]);
+            let head = service.resolve_head(root, &cancel).unwrap().unwrap();
+
+            // Membership describes the index entry, even if its object is
+            // unavailable locally; conflict stages likewise all name one path.
+            let mut input = format!("100644 {}\tmissing-blob\0", oid(8)).into_bytes();
+            for stage in 1..=3 {
+                input.extend_from_slice(
+                    format!("100644 {} {stage}\tconflict\0", blob.trim()).as_bytes(),
+                );
+            }
+            service.run_checked(&command.stdin(input), &cancel).unwrap();
+            let mut paths = expected.clone();
+            paths.extend([
+                path("directory"),
+                path("missing-blob"),
+                path("conflict"),
+                path("ghost"),
+            ]);
+            assert_eq!(bounded_pathspec_batches(&paths).count(), 2);
+            let mut indexed = expected.clone();
+            indexed.extend([path("missing-blob"), path("conflict")]);
+            assert_eq!(
+                service.indexed_paths(root, &paths, &cancel).unwrap(),
+                indexed
+            );
+            assert_eq!(
+                service
+                    .head_tree_paths(root, &head, &paths.iter().collect::<Vec<_>>(), &cancel)
+                    .unwrap(),
+                expected
+            );
+        }
+
         #[test]
         fn ignored_file_listing_preserves_collapsed_folders_and_git_rules() {
             let directory = tempfile::tempdir().unwrap();
@@ -8870,6 +8994,175 @@ mod tests {
 
         let empty = service.stage_command(Path::new("/repo"), &[]);
         assert!(matches!(empty, Err(ValidationError::EmptySelection)));
+    }
+
+    fn large_membership_paths() -> Vec<RepoPath> {
+        (0..40_000)
+            .map(|index| {
+                path(&format!(
+                    "generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt"
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn large_membership_queries_use_one_census_and_keep_exact_selected_paths() {
+        let mut paths = large_membership_paths();
+        assert_eq!(bounded_pathspec_batches(&paths).count(), 95);
+        let mut expected = vec![paths[0].clone(), paths[39_999].clone()];
+        let special = [
+            path(":(glob)magic"),
+            path("line\nname"),
+            RepoPath::from_bytes(b"non-utf8-\xff").unwrap(),
+            path("conflict"),
+            path("vendor/gitlink"),
+        ];
+        paths.extend(special.iter().cloned());
+        paths.push(path("directory"));
+        expected.extend(special);
+        let mut census = pathspec_input(&expected);
+        // An unmerged index lists one name per stage. Directory descendants
+        // and unrelated names must never validate the directory itself.
+        census.extend_from_slice(b"conflict\0conflict\0directory/child\0unselected\0");
+        let service = fake_service(vec![success(&census), success(&census)]);
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            service
+                .indexed_paths(Path::new("/repo"), &paths, &cancel)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            service
+                .head_tree_paths(
+                    Path::new("/repo"),
+                    &oid(1),
+                    &paths.iter().collect::<Vec<_>>(),
+                    &cancel
+                )
+                .unwrap(),
+            expected
+        );
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2, "one census per membership query");
+        for command in commands.iter() {
+            assert_eq!(command.stdout_limit, 16 * 1024 * 1024);
+            assert!(!command.arguments.contains(&paths[0].as_os_str().to_owned()));
+        }
+    }
+
+    #[test]
+    fn large_membership_census_output_limit_retries_every_selected_batch() {
+        let expected = large_membership_paths();
+        let mut paths = expected.clone();
+        paths.push(path("ghost"));
+        let mut capped = launched_failure(b"ghost\0");
+        capped.kind = ProcessFailureKind::OutputLimit;
+        for tree in [false, true] {
+            let mut outputs = vec![Err(capped.clone())];
+            for batch in bounded_pathspec_batches(&paths) {
+                let mut output = Vec::new();
+                for path in batch.iter().filter(|path| path.as_bytes() != b"ghost") {
+                    if tree {
+                        output.extend_from_slice(format!("100644 blob {}\t", oid(1)).as_bytes());
+                    }
+                    output.extend_from_slice(path.as_bytes());
+                    output.push(0);
+                }
+                outputs.push(success(&output));
+            }
+            let service = fake_service(outputs);
+            let cancel = CancellationToken::new();
+            let listed = if tree {
+                service.head_tree_paths(
+                    Path::new("/repo"),
+                    &oid(1),
+                    &paths.iter().collect::<Vec<_>>(),
+                    &cancel,
+                )
+            } else {
+                service.indexed_paths(Path::new("/repo"), &paths, &cancel)
+            };
+            assert_eq!(
+                listed.unwrap(),
+                expected,
+                "discard the entire capped census"
+            );
+            let commands = service.executor.commands.lock().unwrap();
+            assert_eq!(
+                commands.len(),
+                96,
+                "one capped census plus 95 bounded reads"
+            );
+            for command in commands.iter() {
+                assert_eq!(command.stdout_limit, 16 * 1024 * 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn large_membership_census_errors_never_fall_back_or_start_a_mutation() {
+        let paths = large_membership_paths();
+        for response in [
+            Err(launched_failure(b"partial\0")),
+            Err(unstarted_failure()),
+            exit(128, b""),
+            success(b"truncated"),
+            success(b"../outside\0"),
+        ] {
+            let service = fake_service(vec![success(oid(1).as_str().as_bytes()), response]);
+            assert!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: PathBuf::from("/repo"),
+                            selection: paths.iter().cloned().map(PathSelection::new).collect(),
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .is_err()
+            );
+            assert_eq!(service.executor.commands.lock().unwrap().len(), 2);
+        }
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let mut capped = launched_failure(b"partial\0");
+        capped.kind = ProcessFailureKind::OutputLimit;
+        let service = fake_service(vec![Err(capped)]);
+        assert!(
+            service
+                .indexed_paths(Path::new("/repo"), &paths, &cancellation)
+                .is_err()
+        );
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn large_unstage_with_a_ghost_refuses_the_whole_selection() {
+        let indexed = large_membership_paths();
+        let mut selection: Vec<_> = indexed.iter().cloned().map(PathSelection::new).collect();
+        selection.push(PathSelection::new(path("ghost")));
+        let service = fake_service(vec![
+            success(oid(1).as_str().as_bytes()),
+            success(&pathspec_input(&indexed)),
+            success(b""),
+        ]);
+        assert!(matches!(
+            service
+                .unstage(
+                    &UnstageRequest {
+                        worktree: PathBuf::from("/repo"),
+                        selection
+                    },
+                    &CancellationToken::new(),
+                )
+                .unwrap(),
+            MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { .. }
+            }
+        ));
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 3);
     }
 
     /// `git add` and `git restore --worktree` match a pathspec against the

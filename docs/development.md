@@ -355,13 +355,54 @@ A bare `cargo test` runs only the shared CLI lane: under the default `full`
 feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
 targets whose required features are absent, rather than compiling and linking
 empty harnesses. The host-only terminal workload example is also skipped outside
-its lane. Cover the boundaries a change touches:
+its lane. Cover the boundaries a change touches; prepare the HOST prerequisites
+below before running that lane:
 
 ```sh
 cargo test --locked --no-default-features --all-targets
 cargo test --locked --no-default-features --features host --all-targets
 cargo test --locked --no-default-features --features ui --all-targets
 ```
+
+HOST fixtures that exec retained actors require
+`CAGENTS_TEST_RETAINED_ACTOR_HELPER` to name a `cagentsd` built from the same
+checkout and source state as the tests. Build it immediately before testing,
+keeping sources, Cargo environment, target, configuration and any explicit
+profile overrides fixed. Ordinary build and test profile defaults differ as
+expected.
+The existing artifact helper reads Cargo's exact executable path, including
+configured target directories/triples. A matching version alone does not prove
+that two dirty source trees match.
+
+Use a fresh private temporary directory with a short, physical absolute path
+outside Git ancestry: neither it nor any ancestor may contain a `.git` file,
+directory or symlink. For this Linux example, verify that `XDG_RUNTIME_DIR`
+meets those conditions before creating the root. The **final** nested Unix
+socket path must be shorter than 108 bytes, including fixture suffixes. For
+example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
+bytes, so that layout requires a temporary base of at most 28 bytes. Longer
+fixture layouts need more room; a short base alone is not proof.
+
+```sh
+(
+    TMPDIR=$(mktemp -d "${XDG_RUNTIME_DIR:?}/tXXXXXX") || exit
+    export TMPDIR
+    printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    cargo test --locked --no-default-features --features host --all-targets
+)
+```
+
+A helper build failure prevents the test command. Use the same preparation for
+narrow HOST targets that need retained actors. Keep the temporary root and any
+separately retained fixture evidence until their original children have settled;
+this recipe deliberately installs no automatic deletion trap. Do not change
+socket limits, remove enclosing Git markers or silently select another runtime
+root to make a failed preparation pass.
 
 Prefer the narrow target that covers the changed contract, for example:
 
