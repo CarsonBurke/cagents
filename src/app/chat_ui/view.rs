@@ -2263,7 +2263,7 @@ impl Runtime {
                     // second control does and does not do: the old
                     // conversation is left alone, but this card stops being
                     // the way back to it.
-                    "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it."
+                    "The saved conversation did not load. Retry resumes it, or start a new one here. The old conversation stays on disk, but this card stops pointing at it."
                 } else if snapshot.exited && self.session.owns_codex_listener() {
                     "Chat attachment ended. The retained provider may still be running; your draft is retained."
                 } else if snapshot.exited {
@@ -2294,7 +2294,7 @@ impl Runtime {
             if unresumable {
                 controls.push(icon(
                     Icon::Plus,
-                    "Start a new conversation beside it",
+                    "Start a new conversation here",
                     enabled,
                     Action::StartFresh(target.card),
                 ));

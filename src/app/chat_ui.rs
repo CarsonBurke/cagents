@@ -4745,8 +4745,8 @@ impl Runtime {
         }
     }
 
-    /// Whether this card should offer to start a new conversation beside the
-    /// one it was asked to resume.
+    /// Whether this card should offer to start a new conversation in place of
+    /// the one it was asked to resume.
     ///
     /// The offer belongs to a card whose launch names a saved conversation and
     /// whose provider has since stopped without ever reporting that
@@ -12833,7 +12833,19 @@ mod tests {
             assert!(app.chat_ui.fresh_offers.contains(&card));
         }
         let mut canonical = source.clone();
-        canonical.id = TerminalId::new();
+        let proof = canonical
+            .proof
+            .as_mut()
+            .expect("fixture has a complete original proof");
+        proof.host_incarnation.push_str("-canonical");
+        if let Some(terminal) = &mut canonical.terminal {
+            terminal.continuity = TerminalContinuity::Live {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            };
+        }
+        assert!(chat::is_upgrade_recovery(&source, &canonical));
         // The canonical upgrade is its own admitted path. Its task is not polled.
         drop(app.start_chat_with_upgrade_as(
             caller,
@@ -12849,6 +12861,7 @@ mod tests {
             .attempt(card)
             .expect("canonical upgrade remains available");
         assert_eq!(attempt.session, source);
+        assert_eq!(attempt.intent, chat::Intent::Restore);
         assert_eq!(attempt.upgrade_admission, Some(canonical));
         assert_eq!(attempt.caller.authentication(), Some(authority));
         assert!(attempt.target.generation > generation);
