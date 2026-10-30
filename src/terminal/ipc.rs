@@ -195,7 +195,10 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 146 provisionally composes saved provider execution policy and
+/// the Home shell-configuration error with the version 127 matched set.
+/// Source candidate only: allocation and matched-peer validation are pending.
+pub const PROTOCOL_VERSION: u16 = 146;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -548,6 +551,10 @@ pub enum ClientRequest {
     ChannelWork {
         authority: crate::agent_execution::Authority,
         request: crate::channel_work_api::Request,
+    },
+    /// Start a new draft using this daemon's saved provider execution policy.
+    ChatStartConfigured {
+        start: crate::chat::ConfiguredChatStart,
     },
 }
 

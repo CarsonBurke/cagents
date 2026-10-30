@@ -457,6 +457,7 @@ impl Cagents {
             .into_iter()
             .filter_map(|id| {
                 if self.shared_views.retained.contains(&id)
+                    || self.configured_chat_is_local(id)
                     || self.chat_is_unused_default(id)
                     || self.shared_views.defaults.contains_key(&id)
                 {
@@ -602,6 +603,7 @@ impl Cagents {
                 .iter()
                 .filter_map(|id| {
                     if self.shared_views.retained.contains(id)
+                        || self.configured_chat_is_local(*id)
                         || self.chat_is_unused_default(*id)
                         || self.shared_views.defaults.contains_key(id)
                     {
@@ -1365,7 +1367,8 @@ impl Cagents {
                         }
                         continue;
                     }
-                    let local_work = self.shared_chat_has_local_work(alias);
+                    let local_work = self.configured_chat_is_local(alias)
+                        || self.shared_chat_has_local_work(alias);
                     let can_adopt = if matches!(shared.kind, CardKind::Terminal(_)) {
                         self.can_rekey_shared_terminal_draft(alias, shared.id)
                     } else {
@@ -1512,6 +1515,9 @@ impl Cagents {
         let mut tasks = Vec::new();
         let mut retained_upgrades = Vec::new();
         for id in current.iter().copied() {
+            if self.configured_chat_is_local(id) {
+                continue;
+            }
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
                 continue;
             }
@@ -1549,6 +1555,12 @@ impl Cagents {
         }
         current.extend(retained_upgrades);
         for shared in &view.panes {
+            // A New Window backup can retain the same card ID with its own
+            // private choices. Shared descriptors cannot issue that draft;
+            // only its authenticated start result ends the local exclusion.
+            if self.configured_chat_is_local(shared.id) {
+                continue;
+            }
             self.shared_views.closed_chats.remove(&shared.id);
             self.sync_closed_chat_draft(shared.id);
             self.prepare_terminal_restoration(shared);
@@ -1738,6 +1750,7 @@ impl Cagents {
             .into_iter()
             .filter(|id| {
                 self.shared_views.retained.contains(id)
+                    || self.configured_chat_is_local(*id)
                     || (view.panes.is_empty() && self.chat_is_unused_default(*id))
                     || self
                         .card_state(*id)
@@ -1747,6 +1760,7 @@ impl Cagents {
         let visible = view
             .panes
             .iter()
+            .filter(|pane| !self.configured_chat_is_local(pane.id))
             .map(|pane| pane.id)
             .chain(retained)
             .collect::<Vec<_>>();
@@ -1777,7 +1791,12 @@ impl Cagents {
             }
         }
         if active {
-            tasks.push(self.project_shared_strip(&view.panes, &visible));
+            let public_panes = view
+                .panes
+                .iter()
+                .filter(|pane| !self.configured_chat_is_local(pane.id))
+                .collect::<Vec<_>>();
+            tasks.push(self.project_shared_strip(&public_panes, &visible));
         }
         if !self.shared_views.applying {
             self.persist();
@@ -1883,12 +1902,13 @@ impl Cagents {
         let Some(scope) = scope else {
             return Task::none();
         };
-        let panes = self.local_view_panes(&scope);
+        let public_panes = self.local_view_panes(&scope);
+        let panes = public_panes.iter().collect::<Vec<_>>();
         let visible = self.local_view_cards(&scope);
         self.project_shared_strip(&panes, &visible)
     }
 
-    fn project_shared_strip(&mut self, panes: &[Pane], visible: &[CardId]) -> Task<Message> {
+    fn project_shared_strip(&mut self, panes: &[&Pane], visible: &[CardId]) -> Task<Message> {
         let camera = self.workspace.camera().offset();
         let focus = self.workspace.focused();
         let mut updates = Vec::new();
@@ -4270,6 +4290,157 @@ mod tests {
     }
 
     #[test]
+    fn configured_unsent_drafts_are_not_published_or_projected_into_a_peer() {
+        let (mut app, channel, _, incoming) = fixture();
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.workspace_model.views = vec![View::empty(channel)];
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.new_native_chat(crate::agent::Provider::Claude, Some(PathBuf::from("/repo"))));
+        let card = app.workspace.focused().unwrap();
+        assert!(app.configured_chat_is_local(card));
+        assert!(
+            !app.shared_chat_has_local_work(card),
+            "even an empty composer stays private"
+        );
+        app.publish_view_changes();
+        let scope = Scope::Channel(channel);
+        assert!(app.local_view_panes(&scope).is_empty());
+        assert!(app.local_views().panes[&scope].is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "no configured placeholder leaves the publisher"
+        );
+
+        // A separate peer receives exactly the sender's public descriptors,
+        // without its private workspace metadata or card database.
+        let (mut peer, _, _, _) = fixture();
+        Arc::make_mut(&mut peer.durable).channels = app.durable.channels.clone();
+        for channel in &mut Arc::make_mut(&mut peer.durable).channels {
+            channel.cards.clear();
+            channel.focused = None;
+        }
+        Arc::make_mut(&mut peer.durable).active_channel = Some(channel);
+        let mut public = View::empty(channel);
+        public.panes = app.local_view_panes(&scope);
+        drop(peer.project_shared_view(&public, &HashSet::new()));
+        assert!(peer.card_state(card).is_none());
+        assert!(
+            !peer
+                .cards
+                .values()
+                .any(|runtime| matches!(runtime, CardRuntime::Chat(_)))
+        );
+        assert!(peer.durable.configured_chat_drafts.is_empty());
+
+        // Retention uses private metadata even for a cold or invalid draft,
+        // including when another pane appears in the same shared scope.
+        let runtime = app.cards.remove(&card).unwrap();
+        Arc::make_mut(&mut app.durable)
+            .configured_chat_drafts
+            .get_mut(&card)
+            .unwrap()
+            .id = TerminalId::new();
+        public.panes.push(incoming.clone());
+        drop(app.project_shared_view(&public, &HashSet::from([incoming.id])));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.card(card).is_some());
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|item| item.id == channel)
+                .unwrap()
+                .cards
+                .contains(&card)
+        );
+        assert!(!app.shared_views.retained.contains(&card));
+        assert!(!app.durable.local_only_cards.contains(&card));
+        // A backup shares the original card ID, but a peer's descriptor must
+        // not replace this window's still-unstarted private choices.
+        let before = app.card_state(card).unwrap().kind.clone();
+        let strip_before = app.workspace.card(card).unwrap().clone();
+        let order_before = app.workspace.order().collect::<Vec<_>>();
+        let mut peer_issued = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        let CardKind::Chat(session) = &mut peer_issued.kind else {
+            panic!("draft")
+        };
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "peer-host".into(),
+            boot_id: "peer-boot".into(),
+            host_incarnation: "peer-incarnation".into(),
+        });
+        peer_issued.title = "different peer title".into();
+        peer_issued.user_title = Some("peer-only custom title".into());
+        peer_issued.width_fraction = 0.9;
+        public.panes.insert(0, peer_issued);
+        drop(app.project_shared_view(&public, &HashSet::from([incoming.id, card])));
+        assert_eq!(app.card_state(card).unwrap().kind, before);
+        assert_eq!(app.workspace.card(card), Some(&strip_before));
+        assert_eq!(app.workspace.order().collect::<Vec<_>>(), order_before);
+        let channel = app
+            .durable
+            .channels
+            .iter()
+            .find(|item| item.id == channel)
+            .unwrap();
+        assert_eq!(channel.cards.iter().filter(|id| **id == card).count(), 1);
+        assert!(app.configured_chat_is_local(card));
+        app.cards.insert(card, runtime);
+    }
+
+    #[test]
+    fn issued_configured_drafts_publish_the_exact_session_without_clearing_other_retention() {
+        let (mut app, channel, _, _) = fixture();
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.workspace_model.views = vec![View::empty(channel)];
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.new_native_chat(crate::agent::Provider::Claude, Some(PathBuf::from("/repo"))));
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Chat(mut issued) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("draft")
+        };
+        issued.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "private-fixture-host".into(),
+            boot_id: "private-fixture-boot".into(),
+            host_incarnation: "private-fixture-incarnation".into(),
+        });
+        issued.launch.recipe.program = "/owning-daemon/issued-provider".into();
+        app.commit_chat_session(card, issued.clone());
+        assert!(!app.configured_chat_is_local(card));
+        assert!(!app.durable.configured_chat_drafts.contains_key(&card));
+        assert_eq!(
+            app.local_view_panes(&Scope::Channel(channel))[0].kind,
+            CardKind::Chat(issued.clone())
+        );
+        app.publish_view_changes();
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. }
+                if pane.id == card && pane.kind == CardKind::Chat(issued.clone())))
+        );
+
+        // An independent local-only reason must survive issued adoption.
+        drop(app.new_native_chat(crate::agent::Provider::Claude, Some(PathBuf::from("/repo"))));
+        let retained = app.workspace.focused().unwrap();
+        app.retain_local_pane(retained);
+        let CardKind::Chat(retained_draft) = &app.card_state(retained).unwrap().kind else {
+            panic!("draft")
+        };
+        issued.id = retained_draft.id;
+        app.commit_chat_session(retained, issued);
+        assert!(!app.configured_chat_is_local(retained));
+        assert!(app.shared_views.retained.contains(&retained));
+        assert!(app.durable.local_only_cards.contains(&retained));
+        assert!(
+            !app.local_view_panes(&Scope::Channel(channel))
+                .iter()
+                .any(|pane| pane.id == retained)
+        );
+    }
+
+    #[test]
     fn empty_shared_views_keep_unused_defaults_local_until_used() {
         let (mut app, a, _, _) = fixture();
         app.active_workspace = Some(PathBuf::from("/repo"));
@@ -4282,6 +4453,19 @@ mod tests {
         assert!(app.workspace.card(card).is_some());
         assert!(app.card_state(card).unwrap().existence.is_open());
         app.chat_ui = chat_ui::State::with_drafts(HashMap::from([(card, "draft".into())]));
+        assert!(
+            app.local_view_panes(&Scope::Channel(a)).is_empty(),
+            "configured defaults stay private after typing too"
+        );
+        // A legacy draft without private typed choices keeps its prior sharing
+        // behavior once it has local text.
+        Arc::make_mut(&mut app.durable)
+            .configured_chat_drafts
+            .remove(&card);
+        let CardKind::Chat(session) = app.card_state(card).unwrap().kind.clone() else {
+            panic!("draft")
+        };
+        drop(app.open_chat(card, session, crate::chat::Intent::Start));
         assert_eq!(app.local_view_panes(&Scope::Channel(a))[0].id, card);
     }
     #[test]

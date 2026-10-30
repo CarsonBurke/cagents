@@ -614,3 +614,181 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
 }
 
 mod startup_recovery_tests;
+
+// The pause is armed only by the two self-exec signal regressions below.
+// Normal test loops only observe the idle counter; production has no hook.
+static IDLE_ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDLE_PAUSE: std::sync::Mutex<Option<Arc<IdlePause>>> = std::sync::Mutex::new(None);
+
+#[derive(Default)]
+struct IdlePauseState {
+    paused_at: Option<u64>,
+    released: bool,
+    parked_again_at: Option<u64>,
+}
+struct IdlePause {
+    state: std::sync::Mutex<IdlePauseState>,
+    changed: std::sync::Condvar,
+}
+struct IdlePauseFence(Arc<IdlePause>);
+impl IdlePauseFence {
+    fn arm() -> Self {
+        let pause = Arc::new(IdlePause {
+            state: std::sync::Mutex::new(IdlePauseState::default()),
+            changed: std::sync::Condvar::new(),
+        });
+        let mut active = IDLE_PAUSE.lock().unwrap();
+        assert!(
+            active.is_none(),
+            "one private daemon loop owns the idle fence"
+        );
+        *active = Some(pause.clone());
+        Self(pause)
+    }
+    fn wait(&self, predicate: impl Fn(&IdlePauseState) -> bool, message: &str) {
+        let state = self.0.state.lock().unwrap();
+        let (state, _) = self
+            .0
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| !predicate(state))
+            .unwrap();
+        assert!(predicate(&state), "{message}");
+    }
+    fn release(&self) {
+        self.0.state.lock().unwrap().released = true;
+        self.0.changed.notify_all();
+    }
+}
+impl Drop for IdlePauseFence {
+    fn drop(&mut self) {
+        // A failed assertion must not strand the owned daemon thread in this
+        // test-only pause. No signal, daemon wake or authority change occurs.
+        self.release();
+        let mut active = IDLE_PAUSE.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|pause| Arc::ptr_eq(pause, &self.0))
+        {
+            *active = None;
+        }
+    }
+}
+
+pub(super) fn observe_idle() {
+    let entry = IDLE_ENTRIES.fetch_add(1, Ordering::AcqRel) + 1;
+    let pause = IDLE_PAUSE.lock().unwrap().clone();
+    if let Some(pause) = pause {
+        let mut state = pause.state.lock().unwrap();
+        if state.paused_at.is_none() {
+            state.paused_at = Some(entry);
+            pause.changed.notify_all();
+            while !state.released {
+                state = pause.changed.wait(state).unwrap();
+            }
+        } else {
+            state.parked_again_at = Some(entry);
+            pause.changed.notify_all();
+        }
+    }
+}
+
+fn quiet_signal_preparation_exit(name: &str, promote: bool) {
+    let Some(root) = private_runtime(name) else {
+        return;
+    };
+    let paths = RuntimePaths::discover().unwrap();
+    let (host, completed, running) = run_host();
+    // The existing fixture authenticates its predetermined User RPC role;
+    // private_runtime retains and checks the caller's opaque inherited scope.
+    // An unsupported DaemonAdmission must fail; this test never retries with
+    // removed credentials, another role or a fabricated launch permit.
+    let quiet = Rpc::connect(&paths.socket);
+    let mut source = crate::chat::history_session_configured(
+        crate::agent::Provider::Claude,
+        TerminalId::new(),
+        root.clone(),
+        &crate::account::Account::system(crate::agent::Provider::Claude),
+        &crate::settings::AgentLaunchSettings::default(),
+    )
+    .unwrap();
+    source.proof = Some(host.lock().unwrap().proof().clone());
+    let preparation = chat::capacity::FreshSignalPreparation::reserve(&host, source.id).unwrap();
+    let idle = IdlePauseFence::arm();
+    // This setup wake occurs BEFORE SIGTERM, while the preparation is held.
+    // It puts the actual accept loop at the pre-poll pause deterministically.
+    daemon::wake();
+    idle.wait(
+        |state| state.paused_at.is_some(),
+        "actual daemon reached pre-poll fence",
+    );
+    assert_lease_held(&paths);
+    assert!(!host.lock().unwrap().is_shutting_down());
+    // SAFETY: this exact-test child owns its process. Actual host::run has
+    // installed the ordinary handler; no provider or foreign PID is signaled.
+    assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+    wait_for(daemon::termination_requested);
+    idle.release();
+    idle.wait(
+        |state| state.parked_again_at.zip(state.paused_at).is_some_and(|(after, before)| after > before),
+        "daemon drained the queued signal, rechecked its intent and reparked with the fresh owner held",
+    );
+    {
+        let state = host.lock().unwrap();
+        assert!(state.chat_preparing.contains_key(&source.id));
+        assert!(state.startup_blocks_shutdown());
+        assert!(!state.is_shutting_down());
+        assert!(!state.ordinary_exit_cleanup_pending());
+    }
+    assert!(completed.try_recv().is_err());
+    assert_lease_held(&paths);
+    assert!(!child_reaper::has_outstanding_ownership());
+    // No further RPC, connection, explicit wake, second signal or client Drop
+    // can make progress after this point. The exact guard transition owns it.
+    if promote {
+        preparation.promote(&source).unwrap();
+    } else {
+        drop(preparation);
+    }
+    assert!(
+        completed
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok()
+    );
+    // Keep the same authenticated client open through actual run completion
+    // and all server joins: peer EOF cannot supply the missing wake.
+    running.join().unwrap();
+    assert!(
+        daemon::termination_requested(),
+        "queued signal intent was retained"
+    );
+    assert!(!paths.socket.exists());
+    assert!(!HostLease::is_held(&paths).unwrap());
+    assert!(!child_reaper::has_outstanding_ownership());
+    assert!(!child_reaper::has_retained_ownership());
+    assert!(
+        child_reaper::reserve().is_err(),
+        "ordinary exit keeps reservation admission sealed"
+    );
+    let state = host.lock().unwrap();
+    assert!(state.chat_preparing.is_empty());
+    assert!(state.chat_spawning.is_empty());
+    drop(state);
+    drop(quiet);
+}
+
+#[test]
+fn signal_waiting_on_fresh_preparation_error_exits_with_quiet_persistent_client() {
+    quiet_signal_preparation_exit(
+        "host::exit_drain_tests::signal_waiting_on_fresh_preparation_error_exits_with_quiet_persistent_client",
+        false,
+    );
+}
+
+#[test]
+fn signal_waiting_on_fresh_preparation_promotion_exits_with_quiet_persistent_client() {
+    quiet_signal_preparation_exit(
+        "host::exit_drain_tests::signal_waiting_on_fresh_preparation_promotion_exits_with_quiet_persistent_client",
+        true,
+    );
+}

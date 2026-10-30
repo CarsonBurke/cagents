@@ -506,6 +506,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             // exits, or a signal arrives; an idle daemon blocks here indefinitely
             // instead of waking on a timer.
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                #[cfg(all(test, target_os = "linux"))]
+                exit_drain_tests::observe_idle();
                 daemon::wait_for_activity(&listener).err()
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => None,

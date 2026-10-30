@@ -1,3 +1,5 @@
+pub mod agents;
+pub use agents::AgentLaunchSettings;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
@@ -823,6 +825,10 @@ pub struct AppSettings {
     pub palette_recents: Vec<String>,
     pub max_hot_cards: usize,
     pub hibernation_delay_ms: u64,
+    #[serde(default, serialize_with = "agents::serialize_provider_settings")]
+    pub agents: std::collections::BTreeMap<String, AgentLaunchSettings>,
+    #[serde(default)]
+    pub default_shell: Option<String>,
     #[serde(default = "default_focus_follows_mouse")]
     pub focus_follows_mouse: bool,
     #[serde(default)]
@@ -976,6 +982,8 @@ impl Default for AppSettings {
             palette_recents: Vec::new(),
             max_hot_cards: 6,
             hibernation_delay_ms: 30_000,
+            agents: Default::default(),
+            default_shell: None,
             focus_follows_mouse: default_focus_follows_mouse(),
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
@@ -1656,11 +1664,82 @@ impl AppSettings {
             Some(_) => LinkOpenDestination::IntegratedBrowser,
         }
     }
-    pub fn validate(mut self) -> Result<Self, SettingsError> {
+    pub fn validate(self) -> Result<Self, SettingsError> {
+        self.validate_with_agent_launches(true)
+    }
+
+    /// Validate edited launch fields while retaining unavailable saved paths
+    /// and policy in other fields. Each selected launch still validates fully.
+    pub fn validate_transition(self, previous: &Self) -> Result<Self, SettingsError> {
+        self.validate_transition_with_availability(previous, true)
+    }
+
+    /// Reducers check syntax; blocking save and launch workers check files.
+    pub(crate) fn validate_transition_syntax(self, previous: &Self) -> Result<Self, SettingsError> {
+        self.validate_transition_with_availability(previous, false)
+    }
+
+    fn validate_transition_with_availability(
+        self,
+        previous: &Self,
+        availability: bool,
+    ) -> Result<Self, SettingsError> {
+        if self.default_shell != previous.default_shell
+            && self.default_shell.as_deref().is_some_and(|path| {
+                if availability {
+                    !agents::executable_available(path)
+                } else {
+                    !agents::executable_path_syntax(path)
+                }
+            })
+        {
+            return Err(SettingsError::AgentLaunch(
+                "Default shell must be an absolute path to an executable file.".into(),
+            ));
+        }
+        for provider in crate::agent::Provider::ALL {
+            let key = agents::provider_key(provider);
+            if let Some(configuration) = self.agents.get(key) {
+                let previous = previous.agents.get(key).cloned().unwrap_or_default();
+                (if availability {
+                    configuration.validate_changes(&previous, provider)
+                } else {
+                    configuration.validate_changes_syntax(&previous, provider)
+                })
+                .map_err(SettingsError::AgentLaunch)?;
+            }
+        }
+        self.validate_with_agent_launches(false)
+    }
+
+    fn validate_with_agent_launches(mut self, check_launches: bool) -> Result<Self, SettingsError> {
         let mut seen = std::collections::HashSet::new();
         self.palette_recents
             .retain(|key| !key.is_empty() && key.len() <= 128 && seen.insert(key.clone()));
         self.palette_recents.truncate(24);
+        // Loading must retain pinned launch policy even if a binary disappears.
+        // New edits are validated here; each actual launch validates again.
+        if check_launches {
+            if self
+                .default_shell
+                .as_deref()
+                .is_some_and(|path| !agents::executable_available(path))
+            {
+                return Err(SettingsError::AgentLaunch(
+                    "Default shell must be an absolute path to an executable file.".into(),
+                ));
+            }
+            for (key, configuration) in &self.agents {
+                if let Some(provider) = crate::agent::Provider::ALL
+                    .into_iter()
+                    .find(|provider| agents::provider_key(*provider) == key)
+                {
+                    configuration
+                        .validate(provider)
+                        .map_err(SettingsError::AgentLaunch)?;
+                }
+            }
+        }
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -1922,6 +2001,8 @@ fn is_relative_marker(marker: &str) -> bool {
 
 #[derive(Debug, Error)]
 pub enum SettingsError {
+    #[error("{0}")]
+    AgentLaunch(String),
     #[error("cagents configuration directory is unavailable")]
     DirectoryUnavailable,
     #[error("failed to access settings: {0}")]
@@ -1973,6 +2054,27 @@ fn settings_lock(path: &Path) -> Result<File, SettingsError> {
     Ok(lock)
 }
 
+#[cfg(test)]
+thread_local! {
+    static AGENT_REPAIR_CONFIRMATION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce(&Path)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_agent_repair_confirmation_hook<R>(
+    hook: impl FnOnce(&Path) + 'static,
+    action: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<Box<dyn FnOnce(&Path)>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            AGENT_REPAIR_CONFIRMATION_HOOK.with(|hook| *hook.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore =
+        Restore(AGENT_REPAIR_CONFIRMATION_HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+    action()
+}
+
 /// Applies only fields this window changed since its last successful save.
 /// Nested shortcut tables merge by action; list-valued preferences are atomic.
 pub fn save_merged(
@@ -1982,18 +2084,73 @@ pub fn save_merged(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
-    let current = load_unlocked(path)?.settings;
-    let mut current = toml::Value::try_from(current)?;
+    let previous = load_unlocked(path)?.settings;
+    // Loading may retain unreadable saved execution policy, but a newly
+    // invalid edited value must still refuse the save rather than fall back.
+    desired.clone().validate_transition(base)?;
+    let retry_base = if agents::has_policy_repairs(&desired.agents) {
+        let mut retry_base = base.clone();
+        retry_base.agents =
+            agents::policy_repair_merge_base(&base.agents, &desired.agents, &previous.agents)
+                .map_err(SettingsError::AgentLaunch)?;
+        Some(retry_base)
+    } else {
+        None
+    };
+    let merge_base = retry_base.as_ref().unwrap_or(base);
+    agents::validate_container_repairs(&merge_base.agents, &desired.agents, &previous.agents)
+        .map_err(SettingsError::AgentLaunch)?;
+    let mut current = toml::Value::try_from(&previous)?;
     merge_changed_fields(
-        &toml::Value::try_from(base)?,
+        &merge_base_value(merge_base, desired)?,
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let mut table = current.try_into::<toml::Table>()?;
+    let retained = agents::retain_unreadable_containers(&mut table)?;
+    let mut settings = toml::Value::Table(table).try_into::<AppSettings>()?;
+    retained.restore(&mut settings.agents);
+    let settings = settings.validate_transition(&previous)?;
+    save_validated_unlocked(path, &settings)?;
+    if agents::has_policy_repairs(&desired.agents) {
+        // The same writer lock still owns this file, including on final-close
+        // saves. A failed read or changed canonical scope cannot acknowledge
+        // the repair or clear its live refusal.
+        #[cfg(test)]
+        if let Some(hook) = AGENT_REPAIR_CONFIRMATION_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook(path);
+        }
+        let persisted = load_unlocked(path)?.settings;
+        agents::confirm_policy_repairs(&desired.agents, &persisted.agents)
+            .map_err(SettingsError::AgentLaunch)?;
+    }
+    Ok(())
+}
+
+/// A newly configured provider still has default-valued fields before its
+/// table first exists. Materialize those only in the merge baseline so two
+/// windows creating different fields do not overwrite each other's policy.
+/// Keep a removed provider absent in desired, preserving explicit table reset.
+pub(crate) fn merge_base_value(
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<toml::Value, SettingsError> {
+    let mut value = toml::Value::try_from(base)?;
+    let defaults = toml::Value::try_from(&AgentLaunchSettings::default())?;
+    if let Some(agents) = value.get_mut("agents").and_then(toml::Value::as_table_mut) {
+        for provider in desired
+            .agents
+            .keys()
+            .filter(|provider| !base.agents.contains_key(*provider))
+        {
+            agents.insert(provider.clone(), defaults.clone());
+        }
+    }
+    Ok(value)
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
-    if base == desired {
+    if same_toml(base, desired) {
         return;
     }
     if let (Some(base), Some(desired), Some(current)) =
@@ -2012,6 +2169,33 @@ fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut
         }
     } else {
         *current = desired.clone();
+    }
+}
+
+/// Unreadable saved policy may contain TOML NaN. Its non-reflexive float
+/// equality must not turn an unchanged preference into an old window's edit.
+fn same_toml(left: &toml::Value, right: &toml::Value) -> bool {
+    match (left, right) {
+        (toml::Value::Float(left), toml::Value::Float(right)) => {
+            left == right
+                || (left.is_nan()
+                    && right.is_nan()
+                    && left.is_sign_negative() == right.is_sign_negative())
+        }
+        (toml::Value::Array(left), toml::Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| same_toml(left, right))
+        }
+        (toml::Value::Table(left), toml::Value::Table(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .all(|(key, value)| right.get(key).is_some_and(|right| same_toml(value, right)))
+        }
+        _ => left == right,
     }
 }
 
@@ -2049,6 +2233,10 @@ pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), Settin
 
 fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
     let settings = settings.clone().validate()?;
+    save_validated_unlocked(path, &settings)
+}
+
+fn save_validated_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
     let directory = open_private_directory(parent)?;
@@ -2292,7 +2480,8 @@ struct Decoded {
 /// that decodes but fails validation, such as a range a newer build widened
 /// or a chord naming a key it added, falls back the same way; each shortcut
 /// action is a setting of its own. Anything else still fails the document.
-fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
+fn decode_current(mut table: toml::Table) -> Result<Decoded, SettingsError> {
+    let retained = agents::retain_unreadable_containers(&mut table)?;
     let defaults = written(&AppSettings::default())?;
     let mut read = toml::Value::Table(table);
     let mut foreign: Vec<Foreign> = Vec::new();
@@ -2335,7 +2524,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
     for path in &absent {
         tracing::debug!(setting = %dotted(path), "settings.toml lacks a setting; this build fills it in and writes it only if that is not the plain default");
     }
-    let settings = loop {
+    let mut settings = loop {
         let mut unknown = Vec::new();
         let decoded: Result<AppSettings, _> = serde_path_to_error::deserialize(
             serde_ignored::Deserializer::new(read.clone(), &mut |path: serde_ignored::Path<'_>| {
@@ -2351,7 +2540,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         let (path, reason, error) = match decoded {
             Ok(settings) => {
                 let fault = settings.keyboard_shortcuts.fault();
-                match (settings.validate(), fault) {
+                match (settings.validate_with_agent_launches(false), fault) {
                     (Ok(settings), _) => {
                         foreign.extend(unknown.into_iter().map(|path| Foreign {
                             path,
@@ -2414,6 +2603,7 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
                 }),
         );
     }
+    retained.restore(&mut settings.agents);
     Ok(Decoded {
         settings,
         foreign,
@@ -2481,7 +2671,7 @@ fn invalid_setting(
             trial
                 .try_into::<AppSettings>()
                 .map_err(SettingsError::from)
-                .and_then(AppSettings::validate)
+                .and_then(|settings| settings.validate_with_agent_launches(false))
                 .map_or_else(|error| error.to_string() != failure, |_| true)
         })
 }

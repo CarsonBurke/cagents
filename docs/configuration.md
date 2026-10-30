@@ -142,6 +142,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `schema_version` | integer | `3` | Exactly `3`. Required |
 | `max_hot_cards` | integer | `6` | `1` through `9223372036854775807`. The number of panes kept live; extra background panes can hibernate |
 | `hibernation_delay_ms` | integer | `30000` | `0` through `9223372036854775807` milliseconds before a background pane hibernates |
+| `agents` | table | `{}` | Per-provider launch defaults, executable paths, arguments and environment; see [Agents and terminal shell](#agents-and-terminal-shell) |
+| `default_shell` | optional path | unset | Absolute executable for new default terminals; otherwise uses the login-shell fallback |
 | `focus_follows_mouse` | boolean | `false` | Activates a pane after the pointer crosses into it and stays for 300 ms. Typing cancels the pending activation |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |
@@ -269,6 +271,83 @@ ansi = [
   "#8fbcdb", "#c5a0c0", "#93ccdc", "#eceff4",
 ]
 ```
+
+## Agents and terminal shell
+
+`default_shell` is an optional absolute executable path. When set, new UI
+terminals and `cagents terminal spawn` without a command use it. An explicit
+terminal command still wins. When absent, the login shell is chosen from the
+passwd entry, `SHELL`, then `/bin/sh`.
+
+Each `[agents.claude]`, `[agents.codex]` and `[agents.omp]` table can contain:
+
+| Key | Value | Behavior |
+| --- | --- | --- |
+| `model` | optional string | Default model for a new conversation |
+| `effort` | optional string | Provider effort name for a new conversation |
+| `permission_mode` | optional string | A mode offered by the provider's composer |
+| `executable` | optional absolute path | Provider CLI or wrapper; must exist and be executable |
+| `arguments` | string array | Extra arguments in order; each string is one argument, with no shell parsing |
+| `environment` | string table | Environment for future launches; values are masked in Settings |
+
+Claude modes are `manual`, `acceptEdits`, `auto`, `plan`, `dontAsk` and
+`bypassPermissions`. Codex modes are `readOnly`, `workspaceWrite` and `yolo`.
+Omp currently exposes no composer permission-mode default. Models and efforts
+come from the same provider catalogs as the composer.
+
+```toml
+default_shell = "/bin/bash"
+
+[agents.claude]
+model = "haiku"
+effort = "low"
+permission_mode = "plan"
+executable = "/home/example/bin/claude-wrapper"
+arguments = ["--verbose"]
+
+[agents.claude.environment]
+HTTPS_PROXY = "http://localhost:8080"
+```
+
+Settings > Agents offers model, effort and permission choices, executable
+**Detect**, and individual argument and environment rows. A conversation's
+composer or explicit `agent spawn` options override defaults. Launch recipes
+record the executable, arguments and environment used; changing a preference
+does not rewrite existing conversations. If a pinned executable or shell
+becomes unavailable, its preference and provider policy remain saved. New launches
+refuse that path until it is repaired; they do not silently switch binaries or permissions. These options apply to native UI,
+CLI agent launches and automation launches through the shared daemon policy.
+
+For a new native conversation, the selected device's daemon resolves its own
+saved executable, extra arguments and environment. The window sends the account
+identity and its chosen model, effort and permission mode. These conversation
+choices stay with an unsent draft across saves and restarts. At its first start,
+the daemon resolves the current saved execution policy and records the actual
+launch recipe. Changing execution preferences does not replace an already
+issued conversation's recorded recipe.
+
+Configured unsent drafts stay private to their window. **New Window** copies
+these choices into a separate draft; starting one copy does not replace the
+other. After the daemon starts a conversation, it follows ordinary shared-pane
+behavior.
+
+The Settings pane edits this window's local settings file. When connected to a
+remote device, its provider execution policy and terminal shell come from that
+remote installation's settings file. Editing local executable, argument,
+environment or shell preferences does not rewrite the remote file. Model,
+effort and permission choices in the window still apply to its new remote
+conversations.
+
+Environment names must start with a letter or underscore and contain only
+letters, digits and underscores. Provider account homes, credential overrides
+used for account isolation, and `CAGENTS_` variables are reserved. Custom
+variables are applied before the selected account's home and credential
+removals. Settings files retain their existing private permissions.
+An explicit provider `PATH` applies to launch, account discovery and sign-in.
+Without a pinned `executable`, every directory in that PATH must be absolute;
+empty or relative entries depend on the launch directory and are refused.
+Pinning the executable permits relative PATH entries for the provider's tools
+while keeping the provider CLI itself consistent.
 
 ## Language servers
 
@@ -422,9 +501,10 @@ New terminal panes use a default shell. So does `cagents terminal spawn` when
 you give it no command. cagents tries these in order and uses the first one
 that is an absolute path to an executable file:
 
-1. The shell in the effective user's passwd entry.
-2. `SHELL`.
-3. `/bin/sh`.
+1. `default_shell` from Settings > Agents, when configured.
+2. The shell in the effective user's passwd entry.
+3. `SHELL`.
+4. `/bin/sh`.
 
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
