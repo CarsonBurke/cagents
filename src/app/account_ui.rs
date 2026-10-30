@@ -95,6 +95,9 @@ pub(super) struct State {
     accounts: Vec<AccountState>,
     installed: BTreeMap<Provider, bool>,
     registry: Registry,
+    /// A successful authoritative result has admitted the registry's policy.
+    /// The constructor's default is only a placeholder until then.
+    registry_ready: bool,
     store: Option<Store>,
     homes: Option<Homes>,
     remote_system_homes: BTreeMap<Provider, PathBuf>,
@@ -190,6 +193,16 @@ impl State {
         self.account(id)?.pending_probe.clone()
     }
 
+    /// A pending explicit sign-in can finish without admitting unknown default
+    /// policy for the other accounts. These watches are in-memory intent only.
+    fn probe_policy_ready(&self, id: &AccountId, trigger: Trigger, now: Millis) -> bool {
+        self.registry_ready
+            || trigger == Trigger::Manual
+            || self.account(id).is_some_and(|state| {
+                state.sign_in_terminal.is_some() || state.schedule.awaiting_login(now)
+            })
+    }
+
     fn shown_in_switcher(&self, account: &AccountState) -> bool {
         account.present || account.account.registry_key().is_some()
     }
@@ -252,6 +265,7 @@ impl State {
             accounts: Vec::new(),
             installed: BTreeMap::new(),
             registry,
+            registry_ready: false,
             store,
             homes,
             remote_system_homes: BTreeMap::new(),
@@ -336,6 +350,7 @@ impl State {
         if registry.revision() < self.registry.revision() {
             return;
         }
+        self.registry_ready = true;
         if self.registry != registry {
             self.registry = registry;
             self.sync_accounts();
@@ -1960,9 +1975,17 @@ impl Cagents {
             .accounts
             .iter()
             .filter(|account| !account.account.is_brokered())
+            .filter(|account| {
+                self.account_ui
+                    .probe_policy_ready(&account.id, trigger, now)
+            })
             .map(|account| account.id.clone())
             .collect();
-        let omp = self.read_omp(trigger, now);
+        let omp = if self.account_ui.registry_ready || trigger == Trigger::Manual {
+            self.read_omp(trigger, now)
+        } else {
+            None
+        };
         Task::batch(
             ids.iter()
                 .filter_map(|id| self.probe_account(id, trigger, now))
@@ -1976,6 +1999,12 @@ impl Cagents {
         trigger: Trigger,
         now: Millis,
     ) -> Option<Task<Message>> {
+        // Focus can also arrive through a popover, a live login report or a
+        // queued probe. All automatic paths wait for policy, except an
+        // already explicit account-specific sign-in that needs verification.
+        if !self.account_ui.probe_policy_ready(id, trigger, now) {
+            return None;
+        }
         self.refresh_login_watch(id, now);
         let focused = self.refresh_ui.focused;
         let cache = self.account_ui.cache.clone();
@@ -2558,11 +2587,12 @@ impl Cagents {
                         .collect::<Vec<_>>();
                     let migrate = registry.migrate_project_ids(&projects);
                     let before = self.account_ui.accounts.len();
+                    let was_ready = self.account_ui.registry_ready;
                     self.account_ui.set_registry(registry);
                     for id in std::mem::take(&mut self.account_ui.login_changes_unconfirmed) {
                         self.report_login_change(&id);
                     }
-                    let probe = if self.account_ui.accounts.len() != before {
+                    let probe = if !was_ready || self.account_ui.accounts.len() != before {
                         self.probe_accounts(Trigger::Focus)
                     } else {
                         Task::none()
@@ -5333,6 +5363,281 @@ mod tests {
     use crate::app::tests::context_inspector_test_app;
 
     const NOW: Millis = 1_790_000_000_000;
+
+    #[test]
+    fn hidden_explicit_account_policy_waits_for_the_authoritative_startup_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        store
+            .update(|registry| {
+                for provider in Account::PROVIDERS {
+                    registry.set_default(&Account::system(provider));
+                }
+            })
+            .unwrap();
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.settings.show_status_bar = false;
+        app.refresh_ui.focused = true;
+        assert!(!app.account_ui.registry_ready);
+        assert!(
+            app.account_ui.registry.automatic(Provider::Codex),
+            "constructor policy is only a placeholder"
+        );
+        assert!(app.utility_card(&CardKind::Accounts).is_none());
+        // These are the actual focus and tick scheduling paths. Their returned
+        // provider/registry futures remain unpolled in this regression.
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
+        );
+        let registry = store.load().unwrap();
+        drop(
+            app.update(Message::AccountUi(Action::Loaded(Loaded {
+                registry: Ok(registry.clone()),
+                restored: Account::PROVIDERS
+                    .into_iter()
+                    .map(|provider| Restored {
+                        id: Account::system(provider).id(),
+                        present: true,
+                        entry: None,
+                    })
+                    .collect(),
+                catalogs: BTreeMap::new(),
+                installed: BTreeMap::new(),
+                provisional: false,
+            }))),
+        );
+        assert!(app.account_ui.registry_ready);
+        assert_eq!(app.account_ui.registry, registry);
+        assert!(!app.accounts_surface_visible());
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
+        );
+        let id = Account::system(Provider::Codex).id();
+        drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms()),
+            "explicit refresh remains available under hidden explicit defaults"
+        );
+    }
+
+    #[test]
+    fn a_successful_empty_registry_read_releases_normal_automatic_probes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, Some(store.clone()), None);
+        app.settings.show_status_bar = false;
+        app.refresh_ui.focused = true;
+        let id = Account::system(Provider::Codex).id();
+        let owner = app.account_ui.account(&id).unwrap().owner;
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(
+            !app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms())
+        );
+        // A genuinely absent private registry file is an authoritative default,
+        // unlike the equal-valued in-memory constructor placeholder.
+        let registry = store.load().unwrap();
+        assert_eq!(registry, Registry::default());
+        drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            registry: Ok(registry),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            provisional: false,
+        }))));
+        assert!(app.account_ui.registry_ready);
+        assert_eq!(app.account_ui.account(&id).unwrap().owner, owner);
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| state.schedule.in_flight(now_ms())),
+            "eligible automatic accounts resume after policy admission"
+        );
+        let ticket = app
+            .account_ui
+            .pending_probe_for_test(&id)
+            .expect("the authoritative load admitted this probe");
+        drop(app.update(Message::AccountUi(Action::Probed {
+            id: id.clone(),
+            owner: owner.wrapping_add(1),
+            ticket,
+            outcome: Outcome::Failed("stale owner".into()),
+        })));
+        let account = app.account_ui.account(&id).unwrap();
+        assert!(account.failure.is_none());
+        assert!(
+            account.schedule.in_flight(now_ms()),
+            "readiness does not relax stale-owner fencing"
+        );
+    }
+
+    #[test]
+    fn failed_initial_registry_reads_stay_unready_until_a_successful_retry() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, None, None);
+        app.refresh_ui.focused = true;
+        let id = Account::system(Provider::Claude).id();
+        drop(app.update(Message::AccountUi(Action::RemoteLoaded(Err(
+            "device unavailable".into(),
+        )))));
+        assert!(!app.account_ui.registry_ready);
+        drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            registry: Err("registry unreadable".into()),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            provisional: false,
+        }))));
+        assert!(!app.account_ui.registry_ready);
+        let notices: Vec<_> = app
+            .notices
+            .recent()
+            .filter(|entry| {
+                entry.notice.message == "Your added accounts could not be read: registry unreadable"
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].notice.severity, NoticeSeverity::Error);
+        assert_eq!(notices[0].repeats, 1);
+        assert!(app.status.is_none(), "the reducer drains the write channel");
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        drop(app.update(Message::AccountUi(Action::Popover(Some(id.clone())))));
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
+        );
+        drop(app.update(Message::AccountUi(Action::Refresh(id.clone()))));
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms()),
+            "an explicit manual request does not silently admit default policy"
+        );
+        assert!(!app.account_ui.registry_ready);
+        let count = app.account_ui.accounts.len();
+        drop(app.update(Message::AccountUi(Action::RegistryLoaded(Err(
+            "still unreadable".into(),
+        )))));
+        assert!(!app.account_ui.registry_ready);
+        drop(app.update(Message::AccountUi(Action::RegistryLoaded(Ok(
+            Registry::default(),
+        )))));
+        assert_eq!(app.account_ui.accounts.len(), count);
+        assert!(app.account_ui.registry_ready);
+        let other = Account::system(Provider::Codex).id();
+        assert!(
+            app.account_ui
+                .account(&other)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms()),
+            "a successful retry admits eligible probes even with unchanged account count"
+        );
+    }
+
+    #[test]
+    fn an_explicit_login_can_finish_while_unrelated_initial_probes_wait() {
+        let mut app = context_inspector_test_app(false);
+        app.account_ui = State::new(None, None, None);
+        app.refresh_ui.focused = true;
+        let id = Account::system(Provider::Codex).id();
+        let other = Account::system(Provider::Claude).id();
+        let before = app.account_ui.account(&id).unwrap().owner;
+        // Real existing-account login admission; the terminal task is unpolled.
+        drop(app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into())));
+        let state = app.account_ui.account(&id).unwrap();
+        let owner = state.owner;
+        assert_ne!(owner, before);
+        assert!(state.sign_in_terminal.is_some());
+        assert!(state.schedule.awaiting_login(now_ms()));
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(!app.account_ui.registry_ready);
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .in_flight(now_ms())
+        );
+        let unrelated = app.account_ui.account(&other).unwrap();
+        assert!(!unrelated.schedule.in_flight(now_ms()) && unrelated.queued.is_none());
+        let ticket = app
+            .account_ui
+            .pending_probe_for_test(&id)
+            .expect("the explicit sign-in admitted this probe");
+        drop(app.update(Message::AccountUi(Action::Probed {
+            owner: before,
+            id: id.clone(),
+            ticket: ticket.clone(),
+            outcome: Outcome::Failed("stale pre-login reply".into()),
+        })));
+        assert!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .schedule
+                .awaiting_login(now_ms())
+        );
+        drop(app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            ticket,
+            outcome: Outcome::Answered {
+                catalog: None,
+                identity: Some(Identity {
+                    email: Some("signed-in@example.com".into()),
+                    ..Identity::default()
+                }),
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "signed in", now_ms()),
+            },
+        })));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.sign_in_terminal.is_none());
+        assert!(!state.schedule.awaiting_login(now_ms()));
+        assert_eq!(
+            state.identity.as_ref().unwrap().email.as_deref(),
+            Some("signed-in@example.com")
+        );
+        assert!(
+            !app.account_ui.registry_ready,
+            "explicit intent never promotes unknown registry policy"
+        );
+        drop(app.accounts_focus_changed(true, true));
+        drop(app.update(Message::AccountUi(Action::Tick)));
+        assert!(
+            app.account_ui
+                .accounts
+                .iter()
+                .all(|state| !state.schedule.in_flight(now_ms()) && state.queued.is_none())
+        );
+    }
 
     #[test]
     fn provider_status_does_not_treat_retained_signed_out_identity_as_available() {
@@ -8578,6 +8883,13 @@ mod app_tests {
     #[test]
     fn a_changed_login_reported_live_is_checked_at_once() {
         let mut app = context_inspector_test_app(false);
+        drop(app.update(Message::AccountUi(Action::Loaded(Loaded {
+            registry: Ok(Registry::default()),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            provisional: false,
+        }))));
         app.refresh_ui.focused = true;
         let id = Account::system(Provider::Codex).id();
         let now = now_ms();
