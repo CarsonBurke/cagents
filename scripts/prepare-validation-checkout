@@ -208,12 +208,26 @@ def checkout_state(checkout, common):
     if any(entry and not entry.startswith("H ") for entry in indexed):
         raise Refusal("dirty-checkout", "Index flags or unresolved entries can conceal tracked changes.")
     paths = [entry[2:] for entry in indexed if entry]
+    reject_gitlinks(checkout, "HEAD")
+    staged_paths = set()
+    for entry in nul_fields(git(checkout, "ls-files", "--stage", "-z").stdout):
+        header, separator, path = entry.partition("\t")
+        fields = header.split(" ")
+        if (not separator or not path or len(fields) != 3
+                or fields[0] not in ("100644", "100755", "120000", "160000")
+                or not HASH.fullmatch(fields[1]) or fields[2] != "0"
+                or path in staged_paths):
+            raise Refusal("metadata-invalid", "Git returned invalid index mode, object, stage or path metadata.")
+        if fields[0] == "160000":
+            raise Refusal("invalid-input", "Index submodules require separate source admission and are unsupported here.")
+        staged_paths.add(path)
+    if len(staged_paths) != len(paths) or staged_paths != set(paths):
+        raise Refusal("metadata-invalid", "Git index path inventories changed or disagree.")
     reject_filter_attributes(checkout, paths)
     reject_filter_attributes(checkout, paths, "--cached")
     if git(checkout, "status", "--porcelain=v1", "-z", "--untracked-files=all",
            "--ignored=matching", "--ignore-submodules=none").stdout:
         raise Refusal("dirty-checkout", "Tracked, untracked or ignored checkout files have changed.")
-    reject_gitlinks(checkout, "HEAD")
     return {
         "head": git(checkout, "rev-parse", "HEAD").stdout.strip(),
         "tree": git(checkout, "rev-parse", "HEAD^{tree}").stdout.strip(),

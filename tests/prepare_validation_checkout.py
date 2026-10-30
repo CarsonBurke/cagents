@@ -456,6 +456,44 @@ class ValidationCheckout(unittest.TestCase):
         self.refused("invalid-input", head, expected="absent")
         self.assertFalse(os.path.lexists(self.checkout))
 
+    def test_staged_gitlink_is_refused_before_populated_nested_status(self):
+        self.create()
+        nested = self.checkout / "nested-fixture"
+        _, nested_head = self.make_repository(nested)
+        self.git(self.checkout, "update-index", "--add", "--cacheinfo", f"160000,{nested_head},nested-fixture")
+        (self.checkout / ".gitmodules").write_text(
+            '[submodule "nested-fixture"]\n\tpath = nested-fixture\n',
+        )
+        self.assertEqual(self.git(self.checkout, "ls-tree", "HEAD", "--", "nested-fixture").stdout, "")
+        self.assertEqual(
+            self.git(self.checkout, "ls-files", "--stage", "--", "nested-fixture").stdout,
+            f"160000 {nested_head} 0\tnested-fixture\n",
+        )
+        self.assertEqual(self.git(self.checkout, "ls-files", "-v", "--", "nested-fixture").stdout, "H nested-fixture\n")
+        self.assertTrue((nested / ".git").is_dir())
+        self.assertEqual(self.git(nested, "rev-parse", "HEAD").stdout.strip(), nested_head)
+        names = self.git(nested, "config", "--name-only", "--list").stdout.splitlines()
+        commands = {f"filter.validation-checkout-nested.{suffix}" for suffix in ("clean", "smudge", "process")}
+        if any(name.lower() in commands for name in names):
+            raise RuntimeError("fixture refuses existing commands for its private nested driver")
+        self.git(nested, "config", "--local", "filter.validation-checkout-nested.required", "true")
+        (nested / ".gitattributes").write_text("value.txt filter=validation-checkout-nested\n")
+        (nested / "value.txt").write_text("modified nested tracked bytes\n")
+        fields = self.git(nested, "check-attr", "--all", "-z", "--", "value.txt").stdout.split("\0")
+        self.assertEqual(fields.pop(), "")
+        self.assertEqual(len(fields) % 3, 0)
+        self.assertIn(
+            ("value.txt", "filter", "validation-checkout-nested"),
+            list(zip(fields[::3], fields[1::3], fields[2::3])),
+        )
+        # No nested status or content conversion is used to establish the
+        # control. This driver has no executable, even on a regression.
+        source_before = snapshot(self.repository)
+        nested_before = snapshot(nested)
+        self.refused("invalid-input")
+        self.assertEqual(snapshot(self.repository), source_before)
+        self.assertEqual(snapshot(nested), nested_before)
+
     def test_existing_unregistered_directories_are_not_adopted(self):
         for occupied in [False, True]:
             with self.subTest(occupied=occupied):
