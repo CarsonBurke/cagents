@@ -1,0 +1,143 @@
+name: NEVERMERGE Issue 1968 pinned membership qualification
+
+'on':
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/research-issue1968-membership.yml
+      - scripts/research-issue1968-membership.py
+      - docs/research-issue1968-membership.md
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-issue1968-membership-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: 1.93.0
+  EXPECTED_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+
+jobs:
+  candidate:
+    name: Narrow repository parents, original scale contract, isolated checks
+    if: >-
+      github.event.pull_request.head.ref == 'research/fw16-issue1968-membership-qualification' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Require natural User context and initialize evidence
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, tempfile
+          logs = pathlib.Path(os.environ['RUNNER_TEMP']) / 'issue1968-membership-logs'
+          logs.mkdir(mode=0o700)
+          names = sorted(name for name in os.environ if name.startswith('CAGENTS_'))
+          context = {
+              'present_cagents_names': names,
+              'present_cagents_test_names': [name for name in names if name.startswith('CAGENTS_TEST_')],
+              'pathspec_override_presence': {name: name in os.environ for name in ['CAGENTS_LARGE_PATHSPEC_CONTRACT', 'CAGENTS_LARGE_PATHSPEC_ROOT']},
+          }
+          (logs / 'bootstrap-context.json').write_text(json.dumps(context, indent=2) + '\n')
+          if names:
+              raise SystemExit('Natural User qualification refused; present names: ' + ', '.join(names))
+          fixture = pathlib.Path(tempfile.mkdtemp(prefix='c1968', dir='/tmp'))
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              print('CARGO_TARGET_DIR=' + str(pathlib.Path(os.environ['RUNNER_TEMP']) / 'issue1968-target'), file=env)
+              print('TMPDIR=' + str(fixture), file=env)
+              for name, leaf in [('XDG_RUNTIME_DIR', 'runtime'), ('XDG_DATA_HOME', 'data'), ('XDG_CONFIG_HOME', 'config'), ('XDG_CACHE_HOME', 'cache'), ('XDG_STATE_HOME', 'state')]:
+                  (fixture / leaf).mkdir(mode=0o700)
+                  print(name + '=' + str(fixture / leaf), file=env)
+          PY
+
+      - name: Check out research control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+
+      - name: Check out literal candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: c96008f4f7e7e6d8d96a5d34d0dcc388bfc970ab
+          path: product
+          persist-credentials: false
+
+      - name: Check out immutable Linux setup
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: c727f886628897c1749290213e9d65037253095a
+          path: setup-main
+          persist-credentials: false
+
+      - name: Verify exact source, frozen harness and clean checkouts
+        run: python3 research/scripts/research-issue1968-membership.py prepare
+
+      - name: Install pinned main Linux Rust and Zig setup
+        uses: ./setup-main/.github/actions/setup-linux-build
+
+      - name: Retain toolchain and runner hardware
+        run: python3 research/scripts/research-issue1968-membership.py tools
+
+      - name: Check formatting and isolated HOST boundary
+        run: python3 research/scripts/research-issue1968-membership.py host
+
+      - name: Require the narrow nonzero membership and owning semantic parents
+        run: python3 research/scripts/research-issue1968-membership.py parents
+
+      - name: Run the unchanged original 240-second scale contract
+        run: python3 research/scripts/research-issue1968-membership.py scale
+
+      - name: Check isolated CLI boundary
+        run: python3 research/scripts/research-issue1968-membership.py cli
+
+      - name: Check isolated browserless UI boundary
+        run: python3 research/scripts/research-issue1968-membership.py ui
+
+      - name: Always retain final source, clean state, original exits and unrun gates
+        if: always()
+        run: |
+          set -euo pipefail
+          if test -f research/scripts/research-issue1968-membership.py; then
+            python3 research/scripts/research-issue1968-membership.py finalize
+          else
+            python3 - <<'PY'
+          import json, os, pathlib
+          logs = pathlib.Path(os.environ['RUNNER_TEMP']) / 'issue1968-membership-logs'
+          logs.mkdir(mode=0o700, exist_ok=True)
+          (logs / 'final-state-unavailable.json').write_text(json.dumps({'qualified': False, 'reason': 'Research control checkout unavailable; no source or command qualification claim'}) + '\n')
+          PY
+            exit 1
+          fi
+
+      - name: Always hash original evidence files
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          logs = pathlib.Path(os.environ['RUNNER_TEMP']) / 'issue1968-membership-logs'
+          logs.mkdir(mode=0o700, exist_ok=True)
+          rows = [hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + str(path.relative_to(logs)) for path in sorted(logs.rglob('*')) if path.is_file() and path.name != 'artifact-sha256.txt']
+          (logs / 'artifact-sha256.txt').write_text('\n'.join(rows) + '\n')
+          PY
+
+      - name: Always upload immutable qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: issue1968-membership-c96008f4f-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue1968-membership-logs/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
