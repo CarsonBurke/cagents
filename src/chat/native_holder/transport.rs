@@ -2679,19 +2679,16 @@ exec /bin/sleep 60
                 .output().unwrap();
             // A successful staged child can still report unqualified scope
             // isolation. Preserve both original streams, not only panic text.
-            // Frames keep the child's libtest summary distinct from this
-            // outer parent's count. Reporting must not replace its exit status.
+            // Send both labelled streams to stderr to keep the outer parent's
+            // stdout/libtest count intact. Reporting must not replace its exit.
             {
-                let mut stdout = io::stdout().lock();
-                let _ = writeln!(stdout, "native adoption/close staged stdout begin");
-                let _ = stdout.write_all(&output.stdout);
-                let _ = writeln!(stdout, "\nnative adoption/close staged stdout end");
-            }
-            {
-                let mut stderr = io::stderr().lock();
-                let _ = writeln!(stderr, "native adoption/close staged stderr begin");
-                let _ = stderr.write_all(&output.stderr);
-                let _ = writeln!(stderr, "\nnative adoption/close staged stderr end");
+                let mut diagnostics = io::stderr().lock();
+                let _ = writeln!(diagnostics, "native adoption/close staged stdout begin");
+                let _ = diagnostics.write_all(&output.stdout);
+                let _ = writeln!(diagnostics, "\nnative adoption/close staged stdout end");
+                let _ = writeln!(diagnostics, "native adoption/close staged stderr begin");
+                let _ = diagnostics.write_all(&output.stderr);
+                let _ = writeln!(diagnostics, "\nnative adoption/close staged stderr end");
             }
             assert!(
                 output.status.success(),
