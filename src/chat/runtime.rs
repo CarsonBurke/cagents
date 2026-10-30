@@ -134,6 +134,55 @@ pub(crate) enum UpdateReadiness {
     Unready,
 }
 
+/// A bounded resident display sample, not actor authority or admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ActivityObservation {
+    pub ready: bool,
+    pub activity: ActivityState,
+    pub title: Option<String>,
+}
+
+impl ActivityObservation {
+    fn bounded(ready: bool, activity: ActivityState, title: Option<&str>) -> Self {
+        Self {
+            ready,
+            activity,
+            title: title.map(|title| {
+                let head = title.chars().take(100).collect::<Vec<_>>();
+                if title.chars().nth(100).is_some() {
+                    head.into_iter()
+                        .take(49)
+                        .chain(std::iter::once('…'))
+                        .chain(
+                            title
+                                .chars()
+                                .rev()
+                                .take(50)
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev(),
+                        )
+                        .collect()
+                } else {
+                    head.into_iter().collect()
+                }
+            }),
+        }
+    }
+
+    fn from_snapshot(state: &Snapshot, live: bool) -> Self {
+        Self::bounded(
+            live && state.ready && !state.exited,
+            if live {
+                state.activity()
+            } else {
+                ActivityState::Unknown
+            },
+            state.title.as_deref(),
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum Update {
     /// Helper outbox has uncommitted semantic evidence; wake the host broker.
@@ -1251,6 +1300,17 @@ impl LocalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .activity()
+    }
+
+    /// One resident sample without transcript hydration. Busy or poisoned
+    /// state is unavailable. Completion is an adjacent atomic display fence;
+    /// this observation does not authorize an actor operation.
+    pub(crate) fn attention_activity(&self) -> Option<ActivityObservation> {
+        let state = self.0.state.try_lock().ok()?;
+        Some(ActivityObservation::from_snapshot(
+            &state,
+            !self.0.history_only && !self.is_completed(),
+        ))
     }
 
     /// Update preflights need activity without loading the transcript window.
@@ -4466,6 +4526,183 @@ mod tests {
             handle.failure().is_some(),
             "the transcript I/O failure remains visible independently of provider success"
         );
+    }
+
+    #[test]
+    fn resident_attention_projection_keeps_ready_and_exact_activity_together() {
+        let title = "界🦀".repeat(1000);
+        let mut state = Snapshot {
+            session_id: Some("unneeded-provider-identity".repeat(1000)),
+            title: Some(title.clone()),
+            ..Snapshot::default()
+        };
+        for (ready, busy, waiting, exited, live, expected_ready, expected_activity) in [
+            (
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                ActivityState::Waiting,
+            ),
+            (true, false, true, false, true, true, ActivityState::Waiting),
+            (true, true, false, false, true, true, ActivityState::Working),
+            (true, false, false, false, true, true, ActivityState::Idle),
+            (true, true, true, true, true, false, ActivityState::Unknown),
+            (
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                ActivityState::Unknown,
+            ),
+        ] {
+            state.ready = ready;
+            state.busy = busy;
+            state.waiting = waiting;
+            state.exited = exited;
+            let observation = ActivityObservation::from_snapshot(&state, live);
+            assert_eq!(observation.ready, expected_ready);
+            assert_eq!(observation.activity, expected_activity);
+            assert_eq!(
+                observation.title.as_deref(),
+                Some(
+                    format!(
+                        "{}…{}",
+                        "界🦀".repeat(25).chars().take(49).collect::<String>(),
+                        "界🦀".repeat(25)
+                    )
+                    .as_str()
+                )
+            );
+            assert_eq!(state.title.as_deref(), Some(title.as_str()));
+        }
+        state.title = None;
+        assert!(
+            ActivityObservation::from_snapshot(&state, true)
+                .title
+                .is_none()
+        );
+    }
+
+    fn attention_history_fixture() -> (LocalHandle, tempfile::TempDir) {
+        struct History;
+        impl Adapter for History {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::History,
+            program: "unused-history-reader".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut initial = Step {
+            events: vec![
+                Event::Session {
+                    id: "saved-history".into(),
+                    title: Some("History still waiting".into()),
+                },
+                Event::Ready(true),
+                Event::Waiting(true),
+            ],
+            ..Step::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(History), initial, store, None, |_| {}).unwrap();
+        until(&handle, |snapshot| snapshot.ready && snapshot.waiting);
+        (handle, directory)
+    }
+
+    #[test]
+    fn attention_getter_refuses_busy_or_poisoned_state_without_reading_store() {
+        let (handle, _directory) = attention_history_fixture();
+        let state = handle.0.state.lock().unwrap();
+        let probe = handle.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || sender.send(probe.attention_activity()).unwrap());
+        let busy = receiver.recv_timeout(Duration::from_millis(250));
+        drop(state);
+        let busy_join = worker.join();
+
+        let store = handle.0.store.lock().unwrap();
+        let probe = handle.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || sender.send(probe.attention_activity()).unwrap());
+        let without_store = receiver.recv_timeout(Duration::from_millis(250));
+        // Always release before joining or asserting, including a regression
+        // that accidentally reads Store or waits for the snapshot mutex.
+        drop(store);
+        let store_join = worker.join();
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = handle.0.state.lock().unwrap();
+            panic!("intentional resident attention poison fixture");
+        }));
+        let poison_sample = handle.attention_activity();
+        handle.0.state.clear_poison();
+        let closed = handle.close();
+        let after_close = handle.attention_activity();
+
+        busy_join.unwrap();
+        store_join.unwrap();
+        closed.unwrap();
+        assert_eq!(busy.unwrap(), None);
+        assert!(poisoned.is_err());
+        assert_eq!(poison_sample, None);
+        let observation = without_store
+            .unwrap()
+            .expect("history naming remains resident");
+        assert!(
+            !observation.ready,
+            "saved waiting flags are not a live provider"
+        );
+        assert_eq!(observation.activity, ActivityState::Unknown);
+        assert_eq!(observation.title.as_deref(), Some("History still waiting"));
+        let observation = after_close.expect("closed resident metadata can still be named");
+        assert!(!observation.ready);
+        assert_eq!(observation.activity, ActivityState::Unknown);
+    }
+
+    #[test]
+    fn completed_attention_cannot_revive_retained_waiting_metadata() {
+        let (mut handle, _directory) = attention_history_fixture();
+        handle.close().unwrap();
+        assert!(
+            handle.is_completed(),
+            "the actual fixture worker was joined"
+        );
+        // Isolate the completed fence from the independent history/exited
+        // fences, using only this retired test fixture. No actor is restarted
+        // or admitted, and no provider operation is performed.
+        let inner = Arc::get_mut(&mut handle.0).expect("retired fixture has no other handles");
+        inner.history_only = false;
+        {
+            let mut state = inner.state.lock().unwrap();
+            state.ready = true;
+            state.waiting = true;
+            state.exited = false;
+        }
+        let observation = handle.attention_activity().unwrap();
+        assert!(!observation.ready);
+        assert_eq!(observation.activity, ActivityState::Unknown);
+        assert_eq!(observation.title.as_deref(), Some("History still waiting"));
     }
 
     #[test]
