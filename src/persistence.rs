@@ -9733,10 +9733,28 @@ mod tests {
                 .insert("CLAUDE_CONFIG_DIR".into(), "/accounts/claude/a".into());
             session
         };
-        assert!(refused(&mut lane, &workspace, other_account(started)).contains("(launch recipe)"));
+        assert!(
+            refused(&mut lane, &workspace, other_account(started.clone()))
+                .contains("(launch recipe)")
+        );
         assert!(
             refused(&mut lane, &workspace, other_account(retargeted)).contains("(launch recipe)")
         );
+
+        // Closing a pane whose recipe storage refuses stores its tombstone
+        // over the recipe storage holds.
+        workspace.cards[0].kind = CardKind::Chat(other_account(started.clone()));
+        workspace.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 785,
+                reason: Some("user closed".into()),
+            },
+        };
+        assert!(lane.save(&reopened, &workspace).unwrap().refused.is_empty());
+        let closed = reopened.load_card(card, None).unwrap().unwrap();
+        assert!(matches!(closed.existence, Existence::Closed { .. }));
+        assert_eq!(closed.kind, CardKind::Chat(started));
     }
 
     /// One pane storage refuses does not strand the rest of its window. The
