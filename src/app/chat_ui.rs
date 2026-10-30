@@ -6104,6 +6104,34 @@ impl Cagents {
         for card in used {
             self.chat_ui.default_chats.remove(&card);
         }
+        let saved = self.startup_window_payload();
+        if saved.agent_updates != self.durable.agent_updates {
+            Arc::make_mut(&mut self.durable).agent_updates = saved.agent_updates.clone();
+        }
+        saved
+    }
+
+    /// Runtime attempts are independent of a saved descriptor: a reconnect
+    /// can install a new handle without changing the persisted conversation.
+    pub(super) fn startup_chat_targets(&self) -> HashMap<CardId, Target> {
+        self.chat_ui
+            .parked
+            .iter()
+            .map(|(card, runtime)| (*card, runtime.target))
+            .chain(
+                self.cards
+                    .iter()
+                    .filter_map(|(card, runtime)| match runtime {
+                        CardRuntime::Chat(runtime) => Some((*card, runtime.target)),
+                        _ => None,
+                    }),
+            )
+            .collect()
+    }
+
+    /// Pure projection of the payload used by the session writer. A startup
+    /// receipt must inspect current drafts without publishing or settling them.
+    pub(super) fn startup_window_payload(&self) -> Arc<WorkspaceState> {
         let defaults = self
             .chat_ui
             .default_chats
@@ -6198,14 +6226,8 @@ impl Cagents {
                 }
             }
         }
-        // Unread state belongs to the saved workspace, not its visible strip.
-        // Update durable before the unchanged-snapshot fast path so reads also
-        // persist when no draft or editor navigation changed.
         let mut agent_updates = self.sidebar_state.unread_updates().clone();
         agent_updates.retain(|card, _| open_cards.contains(card));
-        if agent_updates != self.durable.agent_updates {
-            Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
-        }
         let admission_sources = self
             .chat_ui
             .phases
@@ -6222,6 +6244,7 @@ impl Cagents {
             && chat_drafts == self.durable.chat_drafts
             && chat_draft_attachments == self.durable.chat_draft_attachments
             && repository_navigation == self.durable.repository_navigation
+            && agent_updates == self.durable.agent_updates
         {
             return Arc::clone(&self.durable);
         }
@@ -6229,6 +6252,7 @@ impl Cagents {
         saved.chat_drafts = chat_drafts;
         saved.chat_draft_attachments = chat_draft_attachments;
         saved.repository_navigation = repository_navigation;
+        saved.agent_updates = agent_updates;
         for card in &mut saved.cards {
             if let Some(source) = admission_sources.get(&card.id) {
                 // The canonical view permits an attachment, not a speculative

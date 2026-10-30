@@ -2830,6 +2830,88 @@ fn launch_ui(
 }
 
 pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
+    match spawn_ui_process_monitored(command)? {
+        UiLaunchOutcome::Ready => Ok(()),
+        UiLaunchOutcome::Retained(monitor) => Err(io::Error::new(
+            monitor.initial_kind,
+            monitor.initial_error.to_string(),
+        )),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UiLaunchStatus {
+    Pending,
+    RecoveryIncomplete,
+    Ready,
+    Exited,
+}
+
+#[derive(Clone)]
+pub(crate) struct UiLaunchMonitor {
+    owner: std::sync::Arc<UiLaunchOwner>,
+    initial_error: std::sync::Arc<str>,
+    initial_kind: io::ErrorKind,
+}
+
+struct UiLaunchOwner {
+    child: std::sync::Mutex<std::process::Child>,
+    status: std::sync::Mutex<UiLaunchStatus>,
+}
+
+impl std::fmt::Debug for UiLaunchMonitor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UiLaunchMonitor")
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+impl UiLaunchMonitor {
+    pub(crate) fn status(&self) -> UiLaunchStatus {
+        self.owner
+            .status
+            .lock()
+            .map_or(UiLaunchStatus::RecoveryIncomplete, |status| status.clone())
+    }
+
+    /// The original unreplaced Child remains owned and cannot be reaped while
+    /// an exact-peer check borrows it. A numeric PID is never launch authority.
+    pub(crate) fn with_live_child<T>(
+        &self,
+        check: impl FnOnce(&std::process::Child) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut child = self
+            .owner
+            .child
+            .lock()
+            .map_err(|_| io::Error::other("original UI launch owner unavailable"))?;
+        if child.try_wait()?.is_some() {
+            if let Ok(mut status) = self.owner.status.lock() {
+                *status = UiLaunchStatus::Exited;
+            }
+            return Err(io::Error::other("the original UI launch has exited"));
+        }
+        let result = check(&child);
+        if child.try_wait()?.is_some() {
+            if let Ok(mut status) = self.owner.status.lock() {
+                *status = UiLaunchStatus::Exited;
+            }
+            return Err(io::Error::other(
+                "the original UI launch exited during its startup check",
+            ));
+        }
+        result
+    }
+}
+
+pub(crate) enum UiLaunchOutcome {
+    Ready,
+    Retained(UiLaunchMonitor),
+}
+
+pub(crate) fn spawn_ui_process_monitored(command: &mut Command) -> io::Result<UiLaunchOutcome> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
@@ -2858,14 +2940,28 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
         .as_mut()
         .ok_or_else(|| io::Error::other("cagents-ui handshake pipe was not created"))
         .and_then(|stdout| read_ui_launch_handshake(stdout, timeout));
-    finish_ui_launch(child, result, stdout)
+    finish_ui_launch_monitored(child, result, stdout)
 }
 
 fn finish_ui_launch(
-    mut child: std::process::Child,
+    child: std::process::Child,
     result: io::Result<()>,
     stdout: Option<ChildStdout>,
 ) -> io::Result<()> {
+    match finish_ui_launch_monitored(child, result, stdout)? {
+        UiLaunchOutcome::Ready => Ok(()),
+        UiLaunchOutcome::Retained(monitor) => Err(io::Error::new(
+            monitor.initial_kind,
+            monitor.initial_error.to_string(),
+        )),
+    }
+}
+
+fn finish_ui_launch_monitored(
+    mut child: std::process::Child,
+    result: io::Result<()>,
+    stdout: Option<ChildStdout>,
+) -> io::Result<UiLaunchOutcome> {
     if let Err(error) = result {
         if error
             .to_string()
@@ -2873,37 +2969,136 @@ fn finish_ui_launch(
         {
             // A visible window can still offer exact-session recovery. Keep its
             // drafts and controls available while the updater reports failure.
-            thread::spawn(move || {
-                // A late final acknowledgement must not hit BrokenPipe and
-                // turn an otherwise usable recovery window into a failed UI.
-                if let Some(mut stdout) = stdout {
-                    let mut buffer = [0; 256];
-                    loop {
-                        match stdout.read(&mut buffer) {
-                            Ok(0) => break,
-                            Ok(_) => {}
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(100))
-                            }
-                            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                            Err(_) => break,
-                        }
-                    }
-                }
-                let _ = child.wait();
-            });
-            return Err(error);
+            let pending = error.kind() == io::ErrorKind::TimedOut;
+            return Ok(UiLaunchOutcome::Retained(retain_ui_launch(
+                child, stdout, pending, error,
+            )));
         }
-        if child.try_wait().ok().flatten().is_none() {
-            let _ = child.kill();
+        match child.try_wait() {
+            Ok(Some(_)) => return Err(error),
+            Ok(None) => {}
+            Err(_) => {
+                return Ok(UiLaunchOutcome::Retained(retain_ui_launch(
+                    child, stdout, false, error,
+                )));
+            }
         }
-        let _ = child.wait();
+        if child.kill().is_err() || child.wait().is_err() {
+            return Ok(UiLaunchOutcome::Retained(retain_ui_launch(
+                child, stdout, false, error,
+            )));
+        }
         return Err(error);
     }
     thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(())
+    Ok(UiLaunchOutcome::Ready)
+}
+
+fn retain_ui_launch(
+    child: std::process::Child,
+    mut stdout: Option<ChildStdout>,
+    pending: bool,
+    error: io::Error,
+) -> UiLaunchMonitor {
+    let owner = std::sync::Arc::new(UiLaunchOwner {
+        child: std::sync::Mutex::new(child),
+        status: std::sync::Mutex::new(if pending {
+            UiLaunchStatus::Pending
+        } else {
+            UiLaunchStatus::RecoveryIncomplete
+        }),
+    });
+    let monitor = UiLaunchMonitor {
+        owner: owner.clone(),
+        initial_kind: error.kind(),
+        initial_error: error.to_string().into(),
+    };
+    thread::spawn(move || {
+        let mut response = Vec::new();
+        let mut awaiting_initial = pending;
+        let mut buffer = [0; 256];
+        loop {
+            match owner.child.lock().map(|mut child| child.try_wait()) {
+                Ok(Ok(Some(_))) => {
+                    if let Ok(mut status) = owner.status.lock() {
+                        *status = UiLaunchStatus::Exited;
+                    }
+                    break;
+                }
+                Ok(Ok(None)) => {}
+                _ => {
+                    if let Ok(mut status) = owner.status.lock() {
+                        *status = UiLaunchStatus::RecoveryIncomplete;
+                    }
+                }
+            }
+            if let Some(pipe) = &mut stdout {
+                // Older callers/tests may supply a blocking pipe. Poll before
+                // reading so ownership checks never wait behind a live writer.
+                let mut poll = libc::pollfd {
+                    fd: pipe.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut poll, 1, 0) } <= 0 {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                match pipe.read(&mut buffer) {
+                    Ok(0) => {
+                        stdout = None;
+                        if awaiting_initial {
+                            awaiting_initial = false;
+                            if let Ok(mut status) = owner.status.lock() {
+                                *status = UiLaunchStatus::RecoveryIncomplete;
+                            }
+                        }
+                    }
+                    Ok(read) if awaiting_initial => {
+                        response.extend_from_slice(&buffer[..read]);
+                        if response.len() > MAX_UI_LAUNCH_HANDSHAKE_BYTES {
+                            awaiting_initial = false;
+                            if let Ok(mut status) = owner.status.lock() {
+                                *status = UiLaunchStatus::RecoveryIncomplete;
+                            }
+                        } else if let Some(newline) =
+                            response.iter().position(|byte| *byte == b'\n')
+                        {
+                            // Only the original pending final report may qualify.
+                            // After an explicit incomplete report, stdout is
+                            // drained but never treated as a second readiness API.
+                            let ready = parse_ui_launch_handshake(&response[..newline]).is_ok();
+                            awaiting_initial = false;
+                            if let Ok(mut status) = owner.status.lock() {
+                                *status = if ready {
+                                    UiLaunchStatus::Ready
+                                } else {
+                                    UiLaunchStatus::RecoveryIncomplete
+                                };
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        stdout = None;
+                        awaiting_initial = false;
+                        if let Ok(mut status) = owner.status.lock() {
+                            *status = UiLaunchStatus::RecoveryIncomplete;
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    monitor
 }
 
 fn already_running_ui_output() -> CommandOutput {
@@ -7497,6 +7692,97 @@ mod tests {
             !failed_marker.exists(),
             "ordinary failed initialization still terminates its child"
         );
+    }
+
+    #[test]
+    fn typed_incomplete_launch_retains_original_child_pipe_and_single_wait_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("late-receipt-drained");
+        let mut child = Command::new("sh")
+            .args(["-c", "printf 'error: recovery-incomplete: pane unavailable\\n'; read reply; printf 'ready\\n' || exit 44; printf usable > \"$1\"; read reply", "fixture"])
+            .arg(&marker).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let original = child.id();
+        let mut input = child.stdin.take().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let result = read_ui_launch_handshake(&mut stdout, Duration::from_secs(1));
+        let UiLaunchOutcome::Retained(monitor) =
+            finish_ui_launch_monitored(child, result, Some(stdout)).unwrap()
+        else {
+            panic!("incomplete is retained, not Ready");
+        };
+        assert_eq!(monitor.status(), UiLaunchStatus::RecoveryIncomplete);
+        monitor
+            .with_live_child(|child| {
+                assert_eq!(child.id(), original);
+                Ok(())
+            })
+            .unwrap();
+        writeln!(input, "continue").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.is_file() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            monitor.status(),
+            UiLaunchStatus::RecoveryIncomplete,
+            "a second stdout line cannot replace exact requalification"
+        );
+        monitor
+            .with_live_child(|child| {
+                assert_eq!(child.id(), original);
+                Ok(())
+            })
+            .unwrap();
+        writeln!(input, "exit").unwrap();
+        drop(input);
+        while monitor.status() != UiLaunchStatus::Exited {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(monitor.with_live_child(|_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn typed_pending_launch_accepts_only_its_original_late_initial_ready() {
+        let mut child = Command::new("sh")
+            .args(["-c", "read reply; printf 'ready\\n'; read reply"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let original = child.id();
+        let mut input = child.stdin.take().unwrap();
+        let stdout = child.stdout.take();
+        let timeout = io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}still recovering"),
+        );
+        let UiLaunchOutcome::Retained(monitor) =
+            finish_ui_launch_monitored(child, Err(timeout), stdout).unwrap()
+        else {
+            panic!("pending is retained");
+        };
+        assert_eq!(monitor.status(), UiLaunchStatus::Pending);
+        monitor
+            .with_live_child(|child| {
+                assert_eq!(child.id(), original);
+                Ok(())
+            })
+            .unwrap();
+        writeln!(input, "ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while monitor.status() == UiLaunchStatus::Pending {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(monitor.status(), UiLaunchStatus::Ready);
+        writeln!(input, "exit").unwrap();
+        drop(input);
+        while monitor.status() != UiLaunchStatus::Exited {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
