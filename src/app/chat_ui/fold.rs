@@ -177,6 +177,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return;
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         self.content
             .as_widget_mut()
             .operate(&mut tree.children[0], content, renderer, operation);
@@ -202,6 +204,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return;
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         let state = tree.state.downcast_mut::<State>();
         if let Event::Mouse(mouse::Event::ButtonPressed(_)) = event {
             state.pressed = cursor.is_over(Self::shown(state, layout));
@@ -247,6 +251,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return mouse::Interaction::None;
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         let state = tree.state.downcast_ref::<State>();
         let shown = self.content.as_widget().mouse_interaction(
             &tree.children[0],
@@ -282,6 +288,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return;
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         let state = tree.state.downcast_ref::<State>();
         let shown = Self::shown(state, layout);
         let cut = shown.height < content.bounds().height;
@@ -355,6 +363,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
             return iced_accessibility::A11yTree::default();
         };
+        let content = content.with_virtual_offset(layout.virtual_offset());
+        let toggle = toggle.with_virtual_offset(layout.virtual_offset());
         let content = self
             .content
             .as_widget()
@@ -369,6 +379,41 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         iced_accessibility::A11yTree::join([content, toggle].into_iter())
     }
 
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        let mut children = layout.children();
+        let (Some(content), Some(toggle)) = (children.next(), children.next()) else {
+            return;
+        };
+        let state = tree.state.downcast_ref::<State>();
+        let mut inner = cosmic::iced::advanced::clipboard::DndDestinationRectangles::new();
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            content.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            &mut inner,
+        );
+        let mut rectangles = inner.into_rectangles();
+        crate::workspace_widget::clip_drag_destinations(
+            &mut rectangles,
+            Self::shown(state, layout),
+        );
+        destinations.append(&mut rectangles);
+        if state.tall {
+            self.toggle.as_widget().drag_destinations(
+                &tree.children[1],
+                toggle.with_virtual_offset(layout.virtual_offset()),
+                renderer,
+                destinations,
+            );
+        }
+    }
+
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
@@ -377,7 +422,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
         viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        let content = layout.children().next()?;
+        let content = layout
+            .children()
+            .next()?
+            .with_virtual_offset(layout.virtual_offset());
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             content,
@@ -385,5 +433,152 @@ impl<Message> Widget<Message, Theme, Renderer> for Fold<'_, Message> {
             viewport,
             translation,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace_widget::forwarding_test::{Traverse, leaf, renderer};
+    use cosmic::iced::advanced::clipboard::DndDestinationRectangles;
+
+    #[test]
+    fn fold_keeps_native_control_bounds_and_action_anchors_in_scroll_coordinates() {
+        use crate::workspace_widget::forwarding_test::{native_button, native_controls};
+        use iced_accessibility::accesskit::Rect;
+
+        let renderer = renderer();
+        let offset = Vector::new(7.0, -35.0);
+        for (height, folded, toggle_y) in [
+            (200.0, true, Some(130.0)),
+            (200.0, false, Some(250.0)),
+            (60.0, true, None),
+        ] {
+            let mut widget = fold(
+                native_button("Content", Size::new(100.0, height)),
+                native_button("Show more", Size::new(100.0, 20.0)),
+                folded,
+                80.0,
+                10.0,
+                |_| Color::BLACK,
+            );
+            let mut tree = Tree::new(&widget);
+            let node = widget
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 500.0)),
+                )
+                .move_to(Point::new(30.0, 40.0));
+            let mut expected = vec![(
+                "Content".to_owned(),
+                Rect::new(23.0, 75.0, 123.0, f64::from(75.0 + height)),
+                vec![(
+                    "Content",
+                    offset,
+                    Rectangle::new(Point::new(30.0, 40.0), Size::new(100.0, height)),
+                )],
+            )];
+            if let Some(y) = toggle_y {
+                expected.push((
+                    "Show more".to_owned(),
+                    Rect::new(23.0, f64::from(y + 35.0), 123.0, f64::from(y + 55.0)),
+                    vec![(
+                        "Show more",
+                        offset,
+                        Rectangle::new(Point::new(30.0, y), Size::new(100.0, 20.0)),
+                    )],
+                ));
+            }
+            assert_eq!(
+                native_controls(&mut widget, &mut tree, &node, offset, &renderer),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fold_forwards_virtual_offsets_and_only_visible_drop_targets() {
+        let renderer = renderer();
+        let offset = Vector::new(7.0, -35.0);
+        for (height, folded, expected) in [
+            (
+                200.0,
+                true,
+                vec![(4, 130.0, 20.0), (2, 100.0, 20.0), (1, 40.0, 50.0)],
+            ),
+            (
+                200.0,
+                false,
+                vec![
+                    (4, 250.0, 20.0),
+                    (3, 140.0, 20.0),
+                    (2, 100.0, 50.0),
+                    (1, 40.0, 50.0),
+                ],
+            ),
+            (60.0, true, vec![(1, 40.0, 50.0)]),
+        ] {
+            let mut targets = vec![(1, Rectangle::new(Point::ORIGIN, Size::new(60.0, 50.0)))];
+            if height > 60.0 {
+                targets.extend([
+                    (
+                        2,
+                        Rectangle::new(Point::new(0.0, 60.0), Size::new(60.0, 50.0)),
+                    ),
+                    (
+                        3,
+                        Rectangle::new(Point::new(0.0, 100.0), Size::new(60.0, 20.0)),
+                    ),
+                ]);
+            }
+            let (content, visits) = leaf::<()>(Size::new(100.0, height), targets);
+            let (toggle, toggle_visits) = leaf::<()>(
+                Size::new(100.0, 20.0),
+                vec![(4, Rectangle::new(Point::ORIGIN, Size::new(60.0, 20.0)))],
+            );
+            let mut widget = fold(content, toggle, folded, 80.0, 10.0, |_| Color::BLACK);
+            let mut tree = Tree::new(&widget);
+            let node = widget
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 500.0)),
+                )
+                .move_to(Point::new(30.0, 40.0));
+            let layout = Layout::new(&node).with_virtual_offset(offset);
+            widget
+                .as_widget_mut()
+                .operate(&mut tree, layout, &renderer, &mut Traverse);
+            assert!(
+                widget
+                    .as_widget_mut()
+                    .overlay(&mut tree, layout, &renderer, &layout.bounds(), Vector::ZERO)
+                    .is_none()
+            );
+            let mut destinations = DndDestinationRectangles::new();
+            widget
+                .as_widget()
+                .drag_destinations(&tree, layout, &renderer, &mut destinations);
+            let actual: Vec<_> = destinations
+                .into_native_rectangles()
+                .into_iter()
+                .map(|target| (target.id, target.rectangle.y, target.rectangle.height))
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(visits.offsets("operate"), vec![offset]);
+            assert_eq!(visits.offsets("overlay"), vec![offset]);
+            assert_eq!(visits.offsets("drag"), vec![offset]);
+            assert_eq!(
+                toggle_visits.offsets("drag"),
+                if height > 60.0 { vec![offset] } else { vec![] }
+            );
+            assert_eq!(
+                toggle_visits.offsets("operate"),
+                if height > 60.0 { vec![offset] } else { vec![] }
+            );
+        }
     }
 }
