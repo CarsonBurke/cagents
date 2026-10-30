@@ -47,6 +47,8 @@ use crate::account::{
 };
 use crate::agent::Provider;
 
+#[cfg(feature = "development")]
+pub(super) mod native_quota_fixture;
 mod table;
 
 fn remote_lifecycle<T: serde::de::DeserializeOwned>(
@@ -92,6 +94,8 @@ const POPOVER_WIDTH: f32 = 320.0;
 const COMPACT_WIDTH: f32 = design::OVERLAY_DOCK_BREAKPOINT;
 
 pub(super) struct State {
+    #[cfg(feature = "development")]
+    pub(super) native_fixture: Option<native_quota_fixture::Fixture>,
     accounts: Vec<AccountState>,
     installed: BTreeMap<Provider, bool>,
     registry: Registry,
@@ -262,6 +266,8 @@ impl State {
     fn new(cache: Option<Cache>, store: Option<Store>, homes: Option<Homes>) -> Self {
         let registry = Registry::default();
         let mut state = Self {
+            #[cfg(feature = "development")]
+            native_fixture: None,
             accounts: Vec::new(),
             installed: BTreeMap::new(),
             registry,
@@ -1999,6 +2005,10 @@ impl Cagents {
         trigger: Trigger,
         now: Millis,
     ) -> Option<Task<Message>> {
+        #[cfg(feature = "development")]
+        let now = native_quota_fixture::admission_time(self, trigger, now)?;
+        #[cfg(feature = "development")]
+        let native_fixture = self.account_ui.native_fixture.is_some();
         // Focus can also arrive through a popover, a live login report or a
         // queued probe. All automatic paths wait for policy, except an
         // already explicit account-specific sign-in that needs verification.
@@ -2054,6 +2064,12 @@ impl Cagents {
         let account = state.account.clone();
         let id = state.id.clone();
         let owner = state.owner;
+        #[cfg(feature = "development")]
+        if native_fixture {
+            return Some(native_quota_fixture::start(
+                self, account, id, owner, ticket,
+            ));
+        }
         let probe = cosmic::task::future(async move {
             let outcome = if crate::device::is_remote() {
                 tokio::task::spawn_blocking(move || {
