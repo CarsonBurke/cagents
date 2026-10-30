@@ -145,6 +145,9 @@ def freeze_helper(source, artifact, directory):
 try:
     user_context()
     unchanged()
+    ui_suites_only = '--ui-suites-only' in sys.argv[3:]
+    if ui_suites_only and any(mode in sys.argv[3:] for mode in ('--focused-only', '--suites-only')):
+        raise RuntimeError('--ui-suites-only cannot be combined with another qualification mode')
     private_tmp = Path(tempfile.mkdtemp(prefix='h1922.', dir='/tmp')).resolve()
     os.chmod(private_tmp, 0o700)
     assert len(str(private_tmp)) < 30 and all(not (parent / '.git').exists() for parent in [private_tmp, *private_tmp.parents])
@@ -160,9 +163,25 @@ try:
         'zig': subprocess.check_output(['zig', 'version'], text=True).strip(),
         'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
         'physical_tmpdir': str(private_tmp),
+        **({'qualification_plan': {
+            'fresh_command_count': 56,
+            'fresh_focused_and_preparation_count': 55,
+            'fresh_ui_broad_count': 1,
+            'retained_command_count': 5,
+            'retained_origin': {
+                'product_sha': '112e671cfe7df93fb1bfd9404f4cc960ad3dec15',
+                'product_tree': 'cc043b5c32501ec73164d506739256296908fb60',
+                'control_sha': '8259b7b0bdb227e1140fd60c34c5e457bfe5d708',
+                'run_id': '41071089029',
+            },
+            'retained_command_names': ['cli-check', 'host-check', 'cli-all-targets-suite',
+                                       'host-helper-build', 'host-all-targets-suite'],
+            'retention_validated': False,
+            'requires': 'Independent original final ZIP, reviewed two-origin retention map and actual accepted return.',
+        }} if ui_suites_only else {}),
     }, indent=2) + '\n')
     lane = ['--locked', '--no-default-features', '--features', 'ui']
-    if '--suites-only' not in sys.argv[3:]:
+    if '--suites-only' not in sys.argv[3:] and not ui_suites_only:
         version = subprocess.run(['systemd-run', '--version'], stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, timeout=5)
         (evidence / 'systemd-run-version.log').write_bytes(version.stdout)
@@ -259,6 +278,11 @@ try:
         if failures:
             raise RuntimeError('User startup qualification failed: ' + ', '.join(failures))
     if '--focused-only' in sys.argv[3:]:
+        sys.exit(0)
+    if ui_suites_only:
+        run('ui-all-targets-suite', ['cargo', 'test', *lane, '--all-targets', '--', '--test-threads=1'], required=False)
+        if failures:
+            raise RuntimeError('Qualification failures: ' + ', '.join(failures))
         sys.exit(0)
     run('cli-check', ['cargo', 'check', '--locked', '--no-default-features', '--bin', 'cagents'])
     host = ['--locked', '--no-default-features', '--features', 'host']
