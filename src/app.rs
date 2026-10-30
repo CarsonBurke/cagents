@@ -119,8 +119,8 @@ use crate::{
         self, LspIntent, RepositoryAction, RepositoryRuntime, RepositoryRuntimeStatus,
     },
     session::{
-        QUARANTINE_GUIDANCE, QuarantinedWrite, ReplacedIdentity, SessionRuntime, SessionSaveHealth,
-        SessionSaveHealthEvent, WriteSubject,
+        QuarantinedWrite, ReplacedIdentity, SessionRuntime, SessionSaveHealth,
+        SessionSaveHealthEvent, WriteSubject, quarantine_guidance,
     },
     settings::{
         self, AppSettings, AppTheme, KeyboardShortcuts, LinkOpenDestination, LinkOpenGesture,
@@ -583,6 +583,15 @@ impl SaveHealthState {
             .iter()
             .any(|write| write.subject.is_window_state())
     }
+
+    fn quarantine_guidance(&self) -> String {
+        let guidance = quarantine_guidance(&self.quarantined);
+        if self.retry_requested {
+            format!("{guidance} Retry requested; waiting for the session writer.")
+        } else {
+            guidance.to_owned()
+        }
+    }
 }
 
 impl TransientNotice {
@@ -885,15 +894,15 @@ fn quarantined_write_line<'a>(
         write.category.label(),
         unix_time_label(write.refused_at_unix_ms),
     );
-    // Changing the card cannot supersede a refusal of the card
-    // itself, so name the remedy the generic guidance only implies.
+    // Keep the named pane available: closing it could clear the refusal by
+    // discarding its rejected content, rather than preserving that content.
     if matches!(
         write.subject,
         WriteSubject::CardIdentity { .. }
             | WriteSubject::Workspace { card: Some(_) }
             | WriteSubject::Pane { .. }
     ) {
-        line.push_str(" · closing the pane clears it");
+        line.push_str(" · keep this window open");
     }
     match write.held_back {
         0 => {}
@@ -912,9 +921,13 @@ fn save_quarantine_view<'a>(
     if health.quarantined.is_empty() {
         return None;
     }
-    let title = match health.quarantined.len() {
-        1 => "A change cannot be saved — storage refused it".to_owned(),
-        count => format!("{count} changes cannot be saved — storage refused them"),
+    let title = if health.window_state_refused() {
+        "This window has unsaved changes — storage refused a save".to_owned()
+    } else {
+        match health.quarantined.len() {
+            1 => "A change cannot be saved — storage refused it".to_owned(),
+            count => format!("{count} changes cannot be saved — storage refused them"),
+        }
     };
     let mut detail = health
         .quarantined
@@ -925,22 +938,16 @@ fn save_quarantine_view<'a>(
     // An exhausted lane offers the one retry on its own notice; a retry
     // re-offers these writes too, so a second button would only repeat it.
     let lane_offers_retry = matches!(health.health, SessionSaveHealth::RetryExhausted { .. });
-    let (guidance, action) = if health.retry_requested {
-        ("Retry requested; waiting for the session writer.", None)
-    } else {
-        (
-            QUARANTINE_GUIDANCE,
-            (health.offers_retry() && !lane_offers_retry).then(|| {
-                notice_surface_action(
-                    NoticeSeverity::Error,
-                    "Retry save",
-                    "Offer the refused changes to storage again",
-                    widget::Id::new("session-save.retry"),
-                    Message::RetrySessionSave,
-                )
-            }),
+    let guidance = health.quarantine_guidance();
+    let action = (health.offers_retry() && !lane_offers_retry).then(|| {
+        notice_surface_action(
+            NoticeSeverity::Error,
+            "Retry save",
+            "Offer the refused changes to storage again",
+            widget::Id::new("session-save.retry"),
+            Message::RetrySessionSave,
         )
-    };
+    });
     let actions: Vec<_> = action.into_iter().chain(recovery).collect();
     let action = (!actions.is_empty()).then(|| {
         widget::row::with_children(actions)
@@ -20155,6 +20162,10 @@ mod tests {
             !state.window_state_refused(),
             "a refused catalog row leaves terminal handoffs free to commit"
         );
+        let guidance = state.quarantine_guidance();
+        assert!(guidance.contains("project or worktree changes are not saved"));
+        assert!(guidance.contains("Other changes in this window can still be saved independently"));
+        assert!(!guidance.contains("Recent changes in this window are not saved"));
         assert_eq!(save_health_views(&state, |_| None, None).len(), 1);
 
         let mut event = health_event(
@@ -20166,9 +20177,22 @@ mod tests {
             },
             Some(10),
         );
-        event.quarantined = vec![refused(WriteSubject::Workspace { card: None })];
+        event.quarantined = vec![
+            refused(WriteSubject::Project {
+                id: ProjectId::new(),
+                name: "still refused".into(),
+            }),
+            refused(WriteSubject::Workspace { card: None }),
+        ];
         assert!(state.apply(event));
         assert!(state.window_state_refused());
+        let guidance = state.quarantine_guidance();
+        assert!(guidance.contains("Recent changes in this window are not saved"));
+        assert!(guidance.contains("including changes in other panes"));
+        assert!(guidance.contains("Keep this window open"));
+        assert!(guidance.contains("remain only in memory"));
+        assert!(guidance.contains("cannot repair an incompatible pane identity"));
+        assert!(!guidance.contains("can still be saved independently"));
         assert_eq!(
             save_health_views(&state, |_| None, None).len(),
             2,
@@ -20177,6 +20201,17 @@ mod tests {
 
         state.retry_requested = true;
         assert!(!state.offers_retry(), "one retry at a time");
+        let pending = state.quarantine_guidance();
+        assert!(pending.starts_with(guidance.as_str()));
+        assert!(pending.contains("Retry requested; waiting for the session writer"));
+        let mut stale = health_event(1, SessionSaveHealth::Healthy, Some(10));
+        stale.quarantined = vec![refused(WriteSubject::Worktree {
+            id: WorktreeId::new(),
+            path: "/stale/worktree".into(),
+            branch: None,
+        })];
+        assert!(!state.apply(stale));
+        assert_eq!(state.quarantine_guidance(), pending);
         assert!(state.apply(health_event(3, SessionSaveHealth::Healthy, Some(40))));
         assert!(
             !state.is_visible(),
@@ -20191,6 +20226,12 @@ mod tests {
             !state.offers_retry(),
             "a stopped writer cannot answer a retry"
         );
+        assert!(
+            state
+                .quarantine_guidance()
+                .contains("Keep this window open")
+        );
+        assert!(!state.quarantine_guidance().contains("Retry requested"));
     }
 
     #[test]
@@ -20211,9 +20252,11 @@ mod tests {
             line.starts_with("Window layout and panes (pane “build” was refused)"),
             "{line}"
         );
-        assert!(line.contains("closing the pane clears it"), "{line}");
+        assert!(line.contains("keep this window open"), "{line}");
+        assert!(!line.contains("closing the pane"), "{line}");
         let line = quarantined_write_line(&snapshot, &untitled);
         assert!(line.contains("(one pane was refused)"), "{line}");
+        assert!(line.contains("keep this window open"), "{line}");
 
         let pane = write(WriteSubject::Pane { card });
         let line = quarantined_write_line(&pane, &titled);
@@ -20233,7 +20276,8 @@ mod tests {
         });
         let line = quarantined_write_line(&relaunch, &titled);
         assert!(line.starts_with("Relaunched terminal “build”"), "{line}");
-        assert!(line.contains("closing the pane clears it"), "{line}");
+        assert!(line.contains("keep this window open"), "{line}");
+        assert!(!line.contains("closing the pane"), "{line}");
 
         let line = quarantined_write_line(&write(WriteSubject::Workspace { card: None }), &titled);
         assert!(line.starts_with("Window layout and panes —"), "{line}");
