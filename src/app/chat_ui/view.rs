@@ -5894,11 +5894,73 @@ mod tests {
 
     #[test]
     fn composer_attachment_tooltip_preserves_native_image_and_remove_ownership() {
-        use iced::advanced::{layout, widget::Tree};
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
         use iced_accessibility::{
             A11yId,
-            accesskit::{Action as A11yAction, Role, TreeId},
+            accesskit::{Action as A11yAction, Role},
         };
+        fn remove_is_focused(
+            element: &mut Element<'_, Message>,
+            node: &iced::advanced::layout::Node,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            target: &widget::Id,
+        ) -> bool {
+            struct Probe<'a> {
+                target: &'a widget::Id,
+                focused: Vec<bool>,
+            }
+            impl Operation for Probe<'_> {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn operation::Focusable,
+                ) {
+                    if id == Some(self.target) {
+                        self.focused.push(state.is_focused());
+                    }
+                }
+            }
+            let mut probe = Probe {
+                target,
+                focused: vec![],
+            };
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(node), renderer, &mut probe);
+            assert_eq!(probe.focused.len(), 1, "one actual Remove focus owner");
+            probe.focused[0]
+        }
+        fn enter(pressed: bool) -> iced::Event {
+            let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+            let physical_key = keyboard::key::Physical::Code(keyboard::key::Code::Enter);
+            iced::Event::Keyboard(if pressed {
+                keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key,
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }
+            } else {
+                keyboard::Event::KeyReleased {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key,
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                }
+            })
+        }
         chat::attachment_assets::with_test_image(|image| {
             // This owns a real Store receipt and the production view, without
             // claiming clipboard, ImageSaved, provider or writer execution.
@@ -5925,24 +5987,27 @@ mod tests {
             let shortcuts = crate::settings::KeyboardShortcuts::default();
             for width in [600.0, 320.0] {
                 for transitioning in [false, true] {
-                    let mut element = runtime.view(
-                        None,
-                        transitioning,
-                        true,
-                        &shortcuts,
-                        width,
-                        Place {
-                            name: "Fixture".into(),
-                            channel: None,
-                            branch: None,
-                        },
-                        true,
-                        None,
-                        vec![],
-                    );
+                    let view = || {
+                        runtime.view(
+                            None,
+                            transitioning,
+                            true,
+                            &shortcuts,
+                            width,
+                            Place {
+                                name: "Fixture".into(),
+                                channel: None,
+                                branch: None,
+                            },
+                            true,
+                            None,
+                            vec![],
+                        )
+                    };
+                    let mut element = view();
                     let mut tree = Tree::new(element.as_widget());
                     let viewport = iced::Rectangle::with_size(iced::Size::new(width, 800.0));
-                    let node = element.as_widget_mut().layout(
+                    let mut node = element.as_widget_mut().layout(
                         &mut tree,
                         &renderer,
                         &layout::Limits::new(iced::Size::ZERO, viewport.size()),
@@ -6017,23 +6082,18 @@ mod tests {
                             .is_empty()
                         );
                     }
-                    let mut mismatch = tooltip_consumer_a11y(remove.id.clone(), A11yAction::Click);
-                    if let iced::Event::A11y(_, request) = &mut mismatch {
-                        request.target_node = children
-                            .iter()
-                            .find(|child| child.label == "Image 1")
-                            .unwrap()
-                            .id
-                            .clone()
-                            .into();
+                    // Winit derives the outer widget ID from target_node.
+                    // Exercise coherent events for actual passive children;
+                    // an independent outer Remove ID is not native ingress.
+                    for label in ["Image 1", finished.as_str()] {
+                        let passive = children.iter().find(|child| child.label == label).unwrap();
+                        for action in [A11yAction::Click, A11yAction::Focus] {
+                            assert!(
+                                dispatch(tooltip_consumer_a11y(passive.id.clone(), action))
+                                    .is_empty()
+                            );
+                        }
                     }
-                    assert!(dispatch(mismatch).is_empty());
-                    let mut wrong_tree =
-                        tooltip_consumer_a11y(remove.id.clone(), A11yAction::Click);
-                    if let iced::Event::A11y(_, request) = &mut wrong_tree {
-                        request.target_tree = TreeId(uuid::Uuid::new_v4());
-                    }
-                    assert!(dispatch(wrong_tree).is_empty());
                     assert!(
                         dispatch(tooltip_consumer_a11y(remove.id.clone(), A11yAction::Focus))
                             .is_empty()
@@ -6045,6 +6105,140 @@ mod tests {
                     } else {
                         assert!(
                             matches!(messages.as_slice(), [Message::ChatUi(Action::RemoveAttachment(target, 0))] if *target == runtime.target)
+                        );
+                    }
+                    drop(dispatch);
+                    let A11yId::Widget(remove_id) = remove.id.clone() else {
+                        panic!("actual Remove widget identity")
+                    };
+                    assert!(
+                        !remove_is_focused(&mut element, &node, &mut tree, &renderer, &remove_id),
+                        "a direct A11y Focus callback alone does not move focus"
+                    );
+                    for pressed in [true, false] {
+                        assert!(
+                            tooltip_consumer_event(
+                                &mut element,
+                                &node,
+                                &mut tree,
+                                &renderer,
+                                &viewport,
+                                enter(pressed),
+                                iced::mouse::Cursor::Unavailable
+                            )
+                            .is_empty(),
+                            "unfocused Remove cannot activate from Enter"
+                        );
+                    }
+                    // This is the public operation Winit applies after finding
+                    // the requested target in the published accessibility tree.
+                    assert!(
+                        element
+                            .as_widget()
+                            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable)
+                            .contains(&remove.id)
+                    );
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(remove_id.clone()),
+                    );
+                    assert!(
+                        tooltip_consumer_event(
+                            &mut element,
+                            &node,
+                            &mut tree,
+                            &renderer,
+                            &viewport,
+                            tooltip_consumer_a11y(remove.id.clone(), A11yAction::Focus),
+                            iced::mouse::Cursor::Unavailable
+                        )
+                        .is_empty()
+                    );
+                    for rerender in [false, true] {
+                        if rerender {
+                            // Rebuild the actual consumer against the retained
+                            // tree; fresh unrelated trees have no ID guarantee.
+                            element = view();
+                            tree.diff(element.as_widget_mut());
+                            node = element.as_widget_mut().layout(
+                                &mut tree,
+                                &renderer,
+                                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+                            );
+                            assert_eq!(
+                                native_tooltip_children(&element, &node, &tree, &labels),
+                                children
+                            );
+                        }
+                        assert!(
+                            remove_is_focused(
+                                &mut element,
+                                &node,
+                                &mut tree,
+                                &renderer,
+                                &remove_id
+                            ),
+                            "public focus survives the mounted consumer's rerender"
+                        );
+                        let pressed = tooltip_consumer_event(
+                            &mut element,
+                            &node,
+                            &mut tree,
+                            &renderer,
+                            &viewport,
+                            enter(true),
+                            iced::mouse::Cursor::Unavailable,
+                        );
+                        if transitioning {
+                            assert!(pressed.is_empty(), "focused disabled Remove stays inert");
+                        } else {
+                            assert!(
+                                matches!(pressed.as_slice(), [Message::ChatUi(Action::RemoveAttachment(target, 0))]
+                                if *target == runtime.target),
+                                "one focused Enter keeps exact attachment ownership"
+                            );
+                        }
+                        assert!(
+                            tooltip_consumer_event(
+                                &mut element,
+                                &node,
+                                &mut tree,
+                                &renderer,
+                                &viewport,
+                                enter(false),
+                                iced::mouse::Cursor::Unavailable
+                            )
+                            .is_empty(),
+                            "Enter release cannot remove a second attachment"
+                        );
+                    }
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::unfocus::<()>(),
+                    );
+                    assert!(!remove_is_focused(
+                        &mut element,
+                        &node,
+                        &mut tree,
+                        &renderer,
+                        &remove_id
+                    ));
+                    for pressed in [true, false] {
+                        assert!(
+                            tooltip_consumer_event(
+                                &mut element,
+                                &node,
+                                &mut tree,
+                                &renderer,
+                                &viewport,
+                                enter(pressed),
+                                iced::mouse::Cursor::Unavailable
+                            )
+                            .is_empty()
                         );
                     }
                 }

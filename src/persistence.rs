@@ -10797,9 +10797,46 @@ mod tests {
                     assert_eq!(stale.chat_draft_attachments[&card], [image.clone()]);
                     crate::chat::attachment_assets::validate(&image).unwrap();
                 }
+                // Raw migration inspection preserves Live until a store open
+                // reconciles the dirty same-boot shutdown. Build that one
+                // expected change from the independent pre-open inventory;
+                // every other source field and inventory entry stays exact.
+                let mut expected_post_reopen_inventory = migration.clone();
+                assert_eq!(
+                    expected_post_reopen_inventory
+                        .iter()
+                        .filter(|(id, _)| *id == sibling)
+                        .count(),
+                    1
+                );
+                let (_, CardKind::Terminal(healthy)) = expected_post_reopen_inventory
+                    .iter_mut()
+                    .find(|(id, _)| *id == sibling)
+                    .unwrap()
+                else {
+                    panic!("the known healthy sibling is a terminal")
+                };
+                let original_proof = healthy.continuity.live_proof().unwrap();
+                assert!(original_proof.is_complete());
+                healthy.continuity = match &healthy.continuity {
+                    TerminalContinuity::Live {
+                        host_session_id,
+                        boot_id,
+                        host_incarnation,
+                    } => TerminalContinuity::DetachedSameBoot {
+                        host_session_id: host_session_id.clone(),
+                        boot_id: boot_id.clone(),
+                        host_incarnation: host_incarnation.clone(),
+                    },
+                    other => panic!("pre-open inventory must hold the exact live proof: {other:?}"),
+                };
+                assert_eq!(healthy.continuity.live_proof(), Some(original_proof));
                 drop(first);
                 drop(peer);
                 let reopened = StateStore::open(&database, boot("chat-boot")).unwrap();
+                assert!(reopened.recovery_report().dirty_shutdown);
+                assert!(!reopened.recovery_report().boot_changed);
+                assert_eq!(reopened.recovery_report().terminals_downgraded, 1);
                 assert_eq!(
                     reopened.load_workspace(stale.id, None).unwrap().unwrap(),
                     committed
@@ -10809,7 +10846,10 @@ mod tests {
                     CardKind::Chat(replacement)
                 );
                 assert!(reopened.saved_conversations().unwrap().is_empty());
-                assert_eq!(read_open_migration_sessions(&database).unwrap(), migration);
+                assert_eq!(
+                    read_open_migration_sessions(&database).unwrap(),
+                    expected_post_reopen_inventory
+                );
             }
         });
     }
