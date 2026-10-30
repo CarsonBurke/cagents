@@ -365,37 +365,109 @@ async fn repository_message(task: Task<Message>) -> Message {
     .expect("repository answer is bounded")
 }
 
-/// Preserve the actual returned widget operations as well as reducing the
-/// real file-worker messages. The caller probes focus outside Tokio, using
-/// the existing App widget-tree operation reader rather than inventing focus.
-async fn settle_navigation(app: &mut Cagents, task: Task<Message>) -> Task<Message> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let mut pending = std::collections::VecDeque::from([task]);
-        let mut focus = Vec::new();
-        let mut count = 0;
-        while let Some(task) = pending.pop_front() {
-            count += 1;
-            assert!(count < 64, "navigation callbacks must settle");
-            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
-                continue;
+/// Drive the original worker stream and its widget operations together: a
+/// widget operation can own the producer that lets that same stream settle.
+/// Keep its resulting focus in one actual App tree rather than replaying it.
+fn settle_navigation(
+    executor: &tokio::runtime::Runtime,
+    app: &mut Cagents,
+    task: Task<Message>,
+) -> Option<widget::Id> {
+    use cosmic::iced::advanced::layout;
+    use cosmic::iced::advanced::widget::{Operation, Tree, operation};
+    use cosmic::iced::{Size, advanced::Layout};
+
+    // Like the existing focus reader, headless renderer setup runs outside
+    // Tokio and outside the worker/callback clock. That clock never renews.
+    let renderer = headless_renderer();
+    let mut tree = {
+        let mut element = cosmic::Application::view(&*app);
+        Tree::new(element.as_widget_mut())
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut pending = std::collections::VecDeque::from([task]);
+    let mut count = 0;
+    while let Some(task) = pending.pop_front() {
+        count += 1;
+        assert!(count < 64, "navigation callbacks must settle");
+        let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+            continue;
+        };
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("actual navigation workers and callbacks finish");
+            let Some(action) = executor
+                .block_on(async { tokio::time::timeout(remaining, stream.next()).await })
+                .expect("actual navigation workers and callbacks finish")
+            else {
+                break;
             };
-            while let Some(action) = stream.next().await {
-                match action {
-                    iced::runtime::Action::Output(cosmic::Action::App(
-                        message @ Message::Repository(_),
-                    )) => pending.push_back(app.update(message)),
-                    iced::runtime::Action::Widget(operation) => focus.push(
-                        iced::runtime::task::widget(operation)
-                            .map(|()| cosmic::Action::App(Message::LifecycleSweep)),
-                    ),
-                    _ => {}
+            match action {
+                iced::runtime::Action::Output(cosmic::Action::App(
+                    message @ Message::Repository(_),
+                )) => {
+                    let callback = {
+                        // LSP admission observes the original runtime, but
+                        // this entry ends before any widget work below.
+                        let _runtime_entry = executor.enter();
+                        app.update(message)
+                    };
+                    pending.push_back(callback);
                 }
+                iced::runtime::Action::Widget(mut operation) => {
+                    let mut element = cosmic::Application::view(&*app);
+                    tree.diff(element.as_widget_mut());
+                    let node = element.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+                    );
+                    loop {
+                        assert!(
+                            std::time::Instant::now() <= deadline,
+                            "actual navigation workers and callbacks finish"
+                        );
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut operation,
+                        );
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                    drop(operation);
+                }
+                _ => {}
             }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "actual navigation workers and callbacks finish"
+            );
         }
-        Task::batch(focus)
-    })
-    .await
-    .expect("actual navigation workers and callbacks finish")
+    }
+
+    let mut element = cosmic::Application::view(&*app);
+    tree.diff(element.as_widget_mut());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+    );
+    let found: Arc<std::sync::Mutex<Option<widget::Id>>> = Default::default();
+    let sink = Arc::clone(&found);
+    let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+        *sink.lock().expect("the probe is not shared across a panic") = Some(id);
+    });
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+    let _ = probe.finish();
+    let answer = found.lock().expect("the probe survived").clone();
+    answer
 }
 
 #[test]
@@ -446,7 +518,7 @@ fn cross_file_jump_uses_loaded_clone_buffer_without_taking_its_language_owner() 
         },
     ));
     assert!(app.lsp_pending_jumps.contains_key(&source));
-    let focus = executor.block_on(settle_navigation(&mut app, task));
+    let focus = settle_navigation(&executor, &mut app, task);
     assert_eq!(
         runtime(&app, source).selected_path(),
         Some(Path::new("other.rs"))
@@ -461,10 +533,7 @@ fn cross_file_jump_uses_loaded_clone_buffer_without_taking_its_language_owner() 
     );
     assert!(!app.lsp_pending_jumps.contains_key(&source));
     assert_blocked(&app, source, owner, doc);
-    assert_eq!(
-        focused(&app, focus),
-        Some(repository_widget::editor_focus_id(source))
-    );
+    assert_eq!(focus, Some(repository_widget::editor_focus_id(source)));
     assert_eq!(app.next_lsp_document, next_document);
 
     // An ordinary later open has no parked position to replay. Opening the
@@ -523,16 +592,13 @@ fn cross_file_jump_uses_loaded_clone_buffer_without_taking_its_language_owner() 
         fixture.root.join("other.rs")
     );
     assert_eq!(app.lsp_pending_jumps[&source].at, LspPosition::new(1, 3));
-    let focus = executor.block_on(settle_navigation(&mut app, current_read));
+    let focus = settle_navigation(&executor, &mut app, current_read);
     assert_eq!(
         runtime(&app, source).cursor_position(),
         Some(LspPosition::new(1, 2))
     );
     assert!(!app.lsp_pending_jumps.contains_key(&source));
-    assert_eq!(
-        focused(&app, focus),
-        Some(repository_widget::editor_focus_id(source))
-    );
+    assert_eq!(focus, Some(repository_widget::editor_focus_id(source)));
     assert_blocked(&app, source, owner, doc);
     assert_eq!(app.lsp.document_version(doc), Some(owner_version));
     assert_eq!(
