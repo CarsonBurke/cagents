@@ -148,7 +148,10 @@ impl Registry {
             || historical.launch.provider != source.launch.provider
             || historical.launch.recipe != source.launch.recipe
             || historical.launch.session_id.is_some()
-            || historical.native_continuity != source.native_continuity
+            || !super::execution::historical_claude_continuity_matches(
+                &historical.native_continuity,
+                &source.native_continuity,
+            )
             || historical.terminal.is_some()
             || historical.owned_codex_listener.is_some()
             || !historical

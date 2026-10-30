@@ -1744,13 +1744,25 @@ fn start_with_execution(
             installed_handle.wake_retained_outcomes();
             retained_actor::wake(host, id);
             if let Some(expected) = expected_saved {
-                let confirmation = confirm_saved_conversation(
+                let confirmation = wait_saved_conversation_ready(
                     &installed_handle,
                     expected,
                     Instant::now() + Duration::from_secs(15),
                     || {
                         crate::daemon::termination_requested()
                             || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down
+                    },
+                    || {
+                        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                        if state.proof() != &proof
+                            || state.chats.get(&id).is_none_or(|record| {
+                                record.execution_instance != execution_instance
+                                    || !record.handle.same_attachment(&installed_handle)
+                            })
+                        {
+                            return Err("The resumed conversation changed its owner".into());
+                        }
+                        Ok(())
                     },
                 )
                 .and_then(|()| {
@@ -2412,6 +2424,52 @@ fn recover_account(
     response
 }
 
+/// Named retained starts can confirm identity before initialization publishes
+/// Ready. Poll only their bounded resident metadata, on the captured attachment;
+/// the caller still hydrates and fences its final attachment snapshot once ready.
+fn wait_saved_conversation_ready(
+    handle: &Handle,
+    expected: &str,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+    current: impl Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    loop {
+        current()?;
+        confirm_saved_conversation(handle, expected, deadline, &cancelled)?;
+        // This helper is used only by the remote named-start path. A local
+        // attachment_snapshot would hydrate history, so keep account recovery
+        // and other local confirmation callers on their existing helper.
+        let snapshot = handle.attachment_snapshot();
+        if let Some(failure) = snapshot.error {
+            return Err(failure);
+        }
+        if snapshot.exited {
+            return Err(
+                "The provider exited before its saved conversation was ready; it remains unchanged"
+                    .into(),
+            );
+        }
+        if snapshot
+            .session_id
+            .as_deref()
+            .is_some_and(|actual| actual != expected)
+        {
+            return Err(
+                "The provider opened a different conversation; the saved conversation is unchanged"
+                    .into(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err("The provider confirmed the saved conversation but did not become ready in time; it remains unchanged".into());
+        }
+        if snapshot.ready && snapshot.session_id.as_deref() == Some(expected) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn confirm_saved_conversation(
     handle: &Handle,
     expected: &str,
@@ -2534,29 +2592,7 @@ fn process_inner(
                     "The old provider owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
                 ));
             }
-            let predecessor = source.id;
-            let root = source
-                .terminal
-                .as_ref()
-                .and_then(|terminal| terminal.recovery_origin);
-            let mut session = source;
-            session.reset_owned_codex_listener();
-            session.id = TerminalId::new();
-            session.proof = None;
-            session.terminal = None;
-            // The old owner's close is proved, so the reopened conversation
-            // takes over its lineage, unless another of its sessions runs.
-            if let Ok(registry) = super::agent_execution::registry(host) {
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .succeed(session.id, predecessor, root, |members| {
-                        host.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .any_other_live(members, predecessor)
-                    })
-                    .map_err(unavailable)?;
-            }
+            let session = prepare_resume_successor(host, source)?;
             Ok(ServerResponse::ChatResumePrepared { session })
         }
         ClientRequest::ChatRecoverAccount {
@@ -3132,6 +3168,33 @@ fn process_inner(
         }
         _ => Err(error("Not a native chat request")),
     }
+}
+
+fn prepare_resume_successor(
+    host: &SharedHost,
+    mut session: Session,
+) -> Result<Session, ProtocolError> {
+    let predecessor = session.id;
+    let root = session
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.recovery_origin);
+    session.reset_owned_codex_listener();
+    session.id = TerminalId::new();
+    session.proof = None;
+    session.terminal = None;
+    if let Ok(registry) = super::agent_execution::registry(host) {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .succeed(session.id, predecessor, root, |members| {
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .any_other_live(members, predecessor)
+            })
+            .map_err(unavailable)?;
+    }
+    Ok(session)
 }
 
 /// Borrow the complete native transition only while its closing reservation is

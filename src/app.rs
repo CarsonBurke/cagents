@@ -2757,6 +2757,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::OpenTerminalOutput(_)
         | Message::NewBrowser
         | Message::RetryCard(_)
+        | Message::RetrySharedChatAdmission(_)
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
@@ -4659,6 +4660,7 @@ pub enum Message {
     },
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
+    RetrySharedChatAdmission(shared_views::SharedChatAdmissionRetry),
     UpdateUi(update_ui::Action),
     ChromeUi(chrome_ui::Action),
     ChannelUi(channel_ui::Action),
@@ -7566,13 +7568,19 @@ impl Cagents {
         #[cfg(test)]
         terminal_output_tests::record_persist();
         let saved = self.shared_window_snapshot();
+        let resumes = self.chat_resume_snapshot_bindings();
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
             let restorations = std::mem::take(&mut self.shared_views.restorations);
             if adoptions.is_empty() && restorations.is_empty() {
-                session.snapshot(saved);
+                session.snapshot_with_resumes(saved, resumes);
             } else {
-                session.snapshot_terminal_panes(saved, adoptions, restorations);
+                session.snapshot_terminal_panes_with_resumes(
+                    saved,
+                    adoptions,
+                    restorations,
+                    resumes,
+                );
             }
         }
     }
@@ -7607,6 +7615,7 @@ impl Cagents {
         card: CardId,
         session: crate::chat::Session,
     ) -> Option<bool> {
+        self.cancel_stale_history_resume(card, &session);
         let unchanged = self.card_state(card).is_some_and(
             |state| matches!(&state.kind, CardKind::Chat(current) if current == &session),
         );
@@ -14470,6 +14479,7 @@ impl Application for Cagents {
         }
         if crate::device::is_remote() {
             match &message {
+                Message::RetrySharedChatAdmission(_) => return Task::none(),
                 Message::GitUi(_)
                 | Message::ProjectUi(
                     project_ui::Action::EditorsLoaded(_) | project_ui::Action::AvatarLoaded { .. },
@@ -17708,6 +17718,7 @@ impl Application for Cagents {
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::RetrySharedChatAdmission(retry) => self.retry_shared_chat_admission(retry),
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();

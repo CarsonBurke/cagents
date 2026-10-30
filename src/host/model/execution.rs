@@ -18,6 +18,23 @@ pub(in crate::host) enum ResidentRelease {
     CompletedWriter,
 }
 
+/// Historical metadata may predate installation of the retained helper. This
+/// comparison grants no actor alias or execution authority: callers must still
+/// prove the exact closed helper, old boot, descriptor and completed history.
+pub(super) fn historical_claude_continuity_matches(
+    historical: &crate::chat::NativeContinuity,
+    retired: &crate::chat::NativeContinuity,
+) -> bool {
+    use crate::chat::NativeContinuity;
+    matches!(
+        historical,
+        NativeContinuity::ReconnectOnly | NativeContinuity::RetainedClaudeActor { protocol: 2 }
+    ) && matches!(
+        retired,
+        NativeContinuity::RetainedClaudeActor { protocol: 2 }
+    )
+}
+
 /// A self capability is not a managed agent binding. A history reader cannot
 /// prove teardown of a former writer, so only a completed writer may retire it.
 fn resident_release_authority(
@@ -434,6 +451,21 @@ impl Registry {
             .transpose()
     }
 
+    /// A historical Agent allocation must never be reused for a new process.
+    /// This is a refusal fence, not retirement or successor authority.
+    pub(in crate::host) fn has_retired_agent_allocation(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE session_id=?1 AND closed=1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     /// Archive a completed execution reference from a kernel boot that cannot
     /// still own a process. The caller separately authenticates the current
     /// cleanup actor; this never binds the historical source to that actor.
@@ -562,7 +594,10 @@ impl Registry {
                 .is_some_and(|proof| proof.is_complete() && &proof.boot_id == boot)
             || retirement_source.terminal != current.terminal
             || retirement_source.owned_codex_listener != current.owned_codex_listener
-            || source.native_continuity != retirement_source.native_continuity
+            || !historical_claude_continuity_matches(
+                &source.native_continuity,
+                &retirement_source.native_continuity,
+            )
             || !matches!(
                 current.native_continuity,
                 crate::chat::NativeContinuity::ReconnectOnly
@@ -1891,7 +1926,10 @@ mod tests {
     fn removed_completed_previous_boot_execution_archives_without_borrowing_cleanup_authority() {
         use crate::daemon::holder_registry::{Kind, Process, Record};
         use crate::workspace_model::views::{Pane, Scope};
-        for case in 0..13 {
+        for (legacy_canonical, case) in [false, true]
+            .into_iter()
+            .flat_map(|legacy| (0..15).map(move |case| (legacy, case)))
+        {
             let (mut registry, directory, request) = fixture();
             let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
             let HostedSession::Chat(mut current) = source() else {
@@ -1903,6 +1941,20 @@ mod tests {
             let mut historical = current.clone();
             historical.proof.as_mut().unwrap().boot_id = "previous-kernel-boot".into();
             historical.launch.session_id = None;
+            if legacy_canonical {
+                // The installed119 canonical descriptor remains read-only even
+                // after the real cleanup helper publishes retained protocol2.
+                historical.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+            }
+            if case == 13 {
+                historical.native_continuity =
+                    crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 1 };
+            }
+            if case == 14 {
+                historical.native_continuity = crate::chat::NativeContinuity::Durable {
+                    provider_version: "unsupported-historical-provider".into(),
+                };
+            }
             if case == 1 {
                 historical.proof.as_mut().unwrap().boot_id = boot.clone();
             }
@@ -1956,7 +2008,7 @@ mod tests {
                 root: Process { pid: 43, start: 2 },
             };
             let mut pending = current.clone();
-            if case >= 11 {
+            if matches!(case, 11 | 12) {
                 pending.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
             }
             registry
@@ -2008,7 +2060,7 @@ mod tests {
                     )
                     .unwrap();
             }
-            if case == 8 || case >= 11 {
+            if matches!(case, 8 | 11 | 12) {
                 registry
                     .fresh_agent_authority(&HostedSession::Chat(pending.clone()))
                     .unwrap();
@@ -2061,17 +2113,19 @@ mod tests {
             match case {
                 7 => assert!(
                     result.unwrap_err().contains("fixture archive failure"),
-                    "case {case}"
+                    "case {case}, legacy canonical={legacy_canonical}"
                 ),
                 9 => assert_eq!(
                     result.unwrap_err(),
                     "Historical cleanup census key changed its actor identity",
-                    "case {case}"
+                    "case {case}, legacy canonical={legacy_canonical}"
                 ),
                 _ => assert_eq!(
-                    result.unwrap_or_else(|error| panic!("case {case}: {error}")),
+                    result.unwrap_or_else(|error| panic!(
+                        "case {case}, legacy canonical={legacy_canonical}: {error}"
+                    )),
                     case == 0 || case == 8 || case == 11,
-                    "case {case}"
+                    "case {case}, legacy canonical={legacy_canonical}"
                 ),
             }
             let mut expected = before.clone();
@@ -2079,7 +2133,7 @@ mod tests {
             assert_eq!(
                 registry.agent(accepted.agent.id).unwrap(),
                 expected,
-                "original descriptor preserved, case {case}"
+                "original descriptor preserved, case {case}, legacy canonical={legacy_canonical}"
             );
             assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
             assert_eq!(
@@ -2118,8 +2172,10 @@ mod tests {
                     .unwrap();
             }
             drop(registry);
-            let registry = Registry::at(&directory.path().join("model.sqlite3"))
-                .unwrap_or_else(|error| panic!("reopen case {case}: {error}"));
+            let registry =
+                Registry::at(&directory.path().join("model.sqlite3")).unwrap_or_else(|error| {
+                    panic!("reopen case {case}, legacy canonical={legacy_canonical}: {error}")
+                });
             assert_eq!(registry.agent(accepted.agent.id).unwrap(), expected);
             assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
         }
@@ -2132,7 +2188,9 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         // Typed durable-model qualification only. Runtime still requires the
         // independently authenticated private VerifiedRetirement and account.
-        for pending_only in [false, true] {
+        for (legacy_canonical, pending_only) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
             for case in 0..9 {
                 let (mut registry, directory, request) = fixture();
                 let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
@@ -2146,6 +2204,9 @@ mod tests {
                 let mut historical = current.clone();
                 historical.proof.as_mut().unwrap().boot_id = "previous-kernel-boot".into();
                 historical.launch.session_id = None;
+                if legacy_canonical {
+                    historical.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+                }
                 registry
                     .bind_agent(accepted.agent.id, None, HostedSession::Chat(historical))
                     .unwrap();
@@ -2319,7 +2380,7 @@ mod tests {
                 assert_eq!(
                     registry.recheck_archived_history(&witness).is_ok(),
                     case == 0 || case == 6,
-                    "pending_only={pending_only} case={case}"
+                    "legacy canonical={legacy_canonical} pending_only={pending_only} case={case}"
                 );
             }
         }

@@ -358,8 +358,16 @@ fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_ad
     } else {
         retained_actor::reconcile_retired_actors(&successor).unwrap();
     }
-    retained_actor::reconcile_retired_actors(&successor).unwrap();
     let registry = super::super::agent_execution::registry(&successor).unwrap();
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .retained_agent_authority_source(id)
+            .unwrap()
+            .is_none(),
+        "one cold-close or reconciliation pass must retire the exact source authority"
+    );
     let retirement = registry
         .lock()
         .unwrap()

@@ -208,6 +208,10 @@ fn require_execution_owner(
 #[path = "retained_execution_owner_tests.rs"]
 mod execution_owner_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "retained_archived_history_tests.rs"]
+mod archived_history_tests;
+
 struct SemanticTarget {
     handle: Handle,
     source: Session,
@@ -1966,6 +1970,10 @@ pub(in crate::host) fn reconcile_retired_actors(host: &SharedHost) -> Result<(),
                         .map_err(String::as_str),
                     receipt.confirmed_session.as_deref(),
                 )?;
+            // The newly verified receipt and an already committed receipt
+            // have the same exact-source retirement obligation. Finish it in
+            // this startup pass; a newer authority remains protected by CAS.
+            super::super::agent_execution::retired(host, &receipt.source)?;
         }
     }
 }
