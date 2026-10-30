@@ -3348,6 +3348,7 @@ mod tests {
                     .iter()
                     .map(|card| (card.id, base.cards.get(&card.id).copied().unwrap_or(0) + 1))
                     .collect(),
+                refused: Vec::new(),
             })
         }
 
@@ -5181,16 +5182,19 @@ mod tests {
             assert_eq!(receipt.recv().unwrap().is_ok(), scenario != "failed");
             let stored = store.load_workspace(original.id, None).unwrap().unwrap();
             if scenario == "aba" {
+                // Untagged A is refused for that pane alone: storage keeps B,
+                // while the rest of the window, its late drafts included, lands.
                 assert_eq!(stored.cards[0].kind, CardKind::Chat(replacement));
-                let refused = &writes
+                assert_eq!(stored.chat_drafts, late.chat_drafts);
+                assert_eq!(stored.chat_draft_attachments, late.chat_draft_attachments);
+                assert!(writes.quarantine.workspace.is_none());
+                let (refused, panes) = writes
                     .quarantine
-                    .workspace
+                    .panes
                     .as_ref()
-                    .expect("untaggedA remains an explicit save refusal")
-                    .0;
+                    .expect("untaggedA remains an explicit save refusal");
+                assert!(panes.contains_key(&original.cards[0].id));
                 assert_eq!(refused.cards[0].kind, CardKind::Chat(source));
-                assert_eq!(refused.chat_drafts, late.chat_drafts);
-                assert_eq!(refused.chat_draft_attachments, late.chat_draft_attachments);
             } else {
                 let expected = if scenario == "failed" {
                     source.clone()

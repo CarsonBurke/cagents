@@ -1412,7 +1412,10 @@ impl StateStore {
     }
 
     /// Commit the prepared allocation and its associated unsent content in one
-    /// transaction. A refused snapshot cannot authorize provider admission.
+    /// transaction. A refused snapshot cannot authorize provider admission:
+    /// the resumed card must land with it. Another open card whose content
+    /// storage refuses keeps its stored row, as in [`Self::save_workspace`],
+    /// so one refused pane does not block resuming every other chat.
     pub fn save_chat_resume(
         &self,
         state: &WorkspaceState,
@@ -1441,8 +1444,16 @@ impl StateStore {
         } = &mut *inner;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         rebind_chat_descriptor_transaction(&transaction, card_id, source, replacement)?;
-        let commit =
-            save_workspace_transaction(&transaction, state, base, refused_closures, false)?;
+        let mut commit =
+            save_workspace_transaction(&transaction, state, base, refused_closures, true)?;
+        if let Some(index) = commit
+            .refused
+            .iter()
+            .position(|error| matches!(error, StoreError::Card { card, .. } if *card == card_id))
+        {
+            // Dropping the transaction rolls back the rebind with the window.
+            return Err(commit.refused.swap_remove(index));
+        }
         transaction.commit()?;
         Ok(commit)
     }
@@ -9563,6 +9574,60 @@ mod tests {
             stored.chat_draft_attachments,
             prepared.chat_draft_attachments
         );
+    }
+
+    #[test]
+    fn prepared_history_resume_commits_around_another_refused_pane() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("resume.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+        let mut sibling = workspace.cards[0].clone();
+        sibling.id = CardId::new();
+        source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+        source.terminal = None;
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        workspace.cards.push(sibling);
+        let (card, sibling) = (workspace.cards[0].id, workspace.cards[1].id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let kept = store.load_card(sibling, None).unwrap().unwrap();
+
+        // The sibling terminal is re-pointed without its relaunch, which
+        // storage refuses for that pane alone.
+        let mut successor = source.clone();
+        successor.id = TerminalId::new();
+        let mut prepared = workspace.clone();
+        prepared.cards[0].kind = CardKind::Chat(successor.clone());
+        prepared
+            .chat_drafts
+            .insert(card, "Latest unsent draft".into());
+        let CardKind::Terminal(terminal) = &mut prepared.cards[1].kind else {
+            unreachable!()
+        };
+        terminal.id = TerminalId::new();
+        let commit = store
+            .save_chat_resume(
+                &prepared,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &lane.cards,
+                },
+                card,
+                &source,
+                &successor,
+            )
+            .unwrap();
+        assert!(matches!(
+            commit.refused.as_slice(),
+            [StoreError::Card { card: refused, .. }] if *refused == sibling
+        ));
+        drop(store);
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let stored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(stored.cards[0].kind, CardKind::Chat(successor));
+        assert_eq!(stored.chat_drafts, prepared.chat_drafts);
+        assert_eq!(store.load_card(sibling, None).unwrap().unwrap(), kept);
     }
 
     #[test]
