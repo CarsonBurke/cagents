@@ -2235,123 +2235,343 @@ mod tests {
         }
 
         #[test]
-        fn channel_header_omits_duplicate_identity_but_keeps_owned_navigation() {
-            #[derive(Default, Debug)]
-            struct Texts(Vec<String>);
-            impl Operation for Texts {
+        fn channel_header_keeps_visible_identity_and_owned_navigation_without_caption() {
+            #[derive(Default)]
+            struct Header {
+                text: Vec<(String, iced::Rectangle)>,
+                tabs: Option<(iced::Rectangle, iced::Rectangle, iced::Vector)>,
+                target: Option<widget::Id>,
+                focused_tab: Option<iced::Rectangle>,
+            }
+            impl Operation for Header {
                 fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                     visit(self);
                 }
-                fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
-                    self.0.push(text.to_owned());
+                fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                    self.text.push((text.to_owned(), bounds));
+                }
+                fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
+                    if id.is_some() && id == self.target.as_ref() {
+                        self.focused_tab = Some(bounds);
+                    }
+                }
+                fn scrollable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    bounds: iced::Rectangle,
+                    content: iced::Rectangle,
+                    translation: iced::Vector,
+                    _: &mut dyn operation::Scrollable,
+                ) {
+                    if id == Some(&widget::Id::new("workspace.tabs")) {
+                        self.tabs = Some((bounds, content, translation));
+                    }
                 }
             }
 
-            for width in [300.0, 700.0, 900.0] {
-                for title in [
-                    "A long channel identity already shown in its own context",
-                    "",
-                ] {
-                    for work in [false, true] {
-                        let (mut app, home) = main_fixture();
-                        two_channels(&mut app, home);
-                        app.window_width = width;
-                        app.channel_work.main = work;
-                        app.channel_work.title = title.into();
-                        app.workspace_model.channels[0].title = title.into();
-                        app.channel_work.view.set_title(home, title.into());
-                        let before = (
-                            app.durable.active_channel,
-                            app.workspace.order().collect::<Vec<_>>(),
-                            app.workspace.focused(),
-                        );
-                        let expected = Navigation {
-                            home,
-                            generation: app.channel_home_generation(),
-                            workspace: app.workspace_view_generation,
-                            surface: if work {
-                                Surface::Conversations
-                            } else {
-                                Surface::Work
-                            },
-                        };
-                        let mut renderer = super::super::super::tests::headless_renderer();
-                        // Mount the actual outer chrome with an inert body: a
-                        // pane or Work leaf cannot supply the omitted identity.
-                        let mut frame = iced::runtime::UserInterface::build(
-                            app.workspace_chrome(widget::Space::new().height(Length::Fill).into())
-                                .map(cosmic::Action::App),
-                            iced::Size::new(width, 600.0),
-                            Cache::new(),
-                            &mut renderer,
-                        );
-                        draw(&mut frame, &mut renderer);
-                        let mut text = Texts::default();
-                        frame.operate(&renderer, &mut text);
-                        for redundant in ["CHANNEL", "Untitled channel", title] {
-                            if !redundant.is_empty() {
-                                assert!(!text.0.iter().any(|text| text == redundant), "{text:?}");
+            let title = "Parser delivery across this named channel, independent of its selected conversation or terminal";
+            let mut renderer = super::super::super::tests::headless_renderer();
+            for width in [760.0, 1280.0] {
+                for compact in [true, false] {
+                    for scene in [
+                        "default-chat",
+                        "renamed-chat",
+                        "nonprimary-chat",
+                        "terminal",
+                        "empty",
+                        "scrolled-chat",
+                    ] {
+                        for work in [false, true] {
+                            let (mut app, home) = main_fixture();
+                            let (_, focused, _) = two_channels(&mut app, home);
+                            app.window_width = width;
+                            app.window_height = 900.0;
+                            app.core.set_main_window_id(Some(window::Id::RESERVED));
+                            app.chrome_ui.projects_collapsed = compact;
+                            app.channel_work.main = work;
+                            app.channel_work.title = title.into();
+                            app.workspace_model.channels[0].title = title.into();
+                            app.channel_work.view.set_title(home, title.into());
+                            if scene.contains("chat") {
+                                let card = app.card_state_mut(focused).unwrap();
+                                let CardKind::Terminal(terminal) = &card.kind else {
+                                    panic!()
+                                };
+                                card.kind = CardKind::Chat(crate::chat::Session {
+                                    native_continuity: Default::default(),
+                                    owned_codex_listener: None,
+                                    id: TerminalId::new(),
+                                    launch: crate::chat::Launch {
+                                        provider: crate::agent::Provider::Omp,
+                                        recipe: terminal.launch.clone(),
+                                        session_id: None,
+                                    },
+                                    proof: None,
+                                    terminal: None,
+                                });
+                                card.title =
+                                    chat_ui::chat_card_title(crate::agent::Provider::Omp).into();
                             }
-                        }
-                        let nodes = frame.a11y_nodes(iced::mouse::Cursor::Unavailable);
-                        for (label, selected) in [("Conversations", !work), ("Work", work)] {
-                            let name = format!("{label} for channel {title}");
-                            let controls = nodes
-                                .root()
-                                .iter()
-                                .chain(nodes.children())
-                                .filter(|node| {
-                                    node.node().role()
-                                        == iced_accessibility::accesskit::Role::Button
-                                        && node.node().label() == Some(name.as_str())
-                                })
-                                .collect::<Vec<_>>();
-                            assert_eq!(controls.len(), 1, "one owned {name} control");
-                            assert_eq!(controls[0].node().is_selected(), Some(selected));
-                            let bounds = controls[0].node().bounds().unwrap();
-                            assert!(bounds.x0 >= 0.0 && bounds.x1 <= f64::from(width) + 0.1);
-                            assert!(bounds.y0 >= 0.0 && bounds.y1 <= 600.0);
-                            assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
-                        }
-                        drop(nodes);
-                        let label = if work { "Conversations" } else { "Work" };
-                        let name = format!("{label} for channel {title}");
-                        let (id, area) = labelled(&mut frame, &renderer, &name);
-                        let pointer = click(&mut frame, &mut renderer, area.center());
-                        // Reuse the real Tab adapter, then activate the same
-                        // traversed control with Enter rather than injecting it.
-                        tab(&mut frame, &mut renderer, true);
-                        seek(&mut frame, &mut renderer, &id);
-                        let keyboard = event(
-                            &mut frame,
-                            &mut renderer,
-                            &[key(
-                                keyboard::Key::Named(keyboard::key::Named::Enter),
-                                keyboard::key::Code::Enter,
-                                None,
-                            )],
-                            iced::mouse::Cursor::Unavailable,
-                        )
-                        .0;
-                        for messages in [pointer, keyboard] {
-                            let [cosmic::Action::App(Message::ChannelWorkNavigation(actual))] =
-                                messages.as_slice()
-                            else {
-                                panic!("actual owned header callback: {messages:?}");
+                            if scene == "renamed-chat" {
+                                app.chrome_ui
+                                    .user_titles
+                                    .insert(focused, "A separately named conversation".into());
+                            }
+                            if scene == "nonprimary-chat" {
+                                let mut primary = app.card_state(focused).unwrap().clone();
+                                primary.id = CardId::new();
+                                let CardKind::Chat(session) = &mut primary.kind else {
+                                    panic!()
+                                };
+                                session.id = TerminalId::new();
+                                let id = primary.id;
+                                Arc::make_mut(&mut app.durable).cards.insert(0, primary);
+                                app.cards.insert(id, CardRuntime::Loading);
+                                app.card_state_mut(focused).unwrap().title =
+                                    "Follow-up conversation".into();
+                                Arc::make_mut(&mut app.durable).channels[0]
+                                    .cards
+                                    .insert(0, id);
+                            }
+                            if scene == "scrolled-chat" {
+                                for _ in 0..24 {
+                                    let card = super::super::super::tests::terminal_card_state();
+                                    let id = card.id;
+                                    Arc::make_mut(&mut app.durable).cards.push(card);
+                                    Arc::make_mut(&mut app.durable).channels[0].cards.push(id);
+                                    app.cards.insert(id, CardRuntime::Loading);
+                                }
+                            }
+                            let members = {
+                                let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
+                                channel.title = title.into();
+                                if scene == "empty" {
+                                    channel.cards.clear();
+                                    channel.focused = None;
+                                }
+                                channel.cards.clone()
                             };
-                            assert_eq!(*actual, expected);
-                        }
-                        drop(frame.into_cache());
-                        drop(app.update(Message::ChannelWorkNavigation(expected)));
-                        assert_eq!(app.channel_work_is_main(), !work);
-                        assert_eq!(
-                            (
+                            let visible = members
+                                .iter()
+                                .map(|id| app.card_state(*id).unwrap().clone())
+                                .collect::<Vec<_>>();
+                            let focused = (scene != "empty").then_some(focused);
+                            Arc::make_mut(&mut app.durable).focused = focused;
+                            app.workspace_model.views[0].panes = visible
+                                .iter()
+                                .filter_map(|card| {
+                                    crate::workspace_model::views::Pane::from_card(card, None)
+                                })
+                                .collect();
+                            app.workspace = Cagents::rebuild_workspace(&WorkspaceState {
+                                cards: visible,
+                                focused,
+                                ..Default::default()
+                            });
+                            let viewport = app.content_width()
+                                - sidebar::effective_width(
+                                    app.projects_sidebar_mode(),
+                                    app.settings.sidebar_width,
+                                );
+                            app.workspace.resize_viewport(viewport);
+                            app.refresh_sidebar_channels();
+                            drop(app.sync_chrome());
+                            if let Some(id) = focused {
+                                let actual = app.card_display_title(app.card_state(id).unwrap());
+                                if scene == "renamed-chat"
+                                    || scene == "nonprimary-chat"
+                                    || scene == "terminal"
+                                {
+                                    assert_ne!(actual, title);
+                                } else {
+                                    assert_eq!(actual, title);
+                                }
+                            }
+                            let before = (
                                 app.durable.active_channel,
                                 app.workspace.order().collect::<Vec<_>>(),
                                 app.workspace.focused(),
-                            ),
-                            before
-                        );
+                            );
+                            let expected = Navigation {
+                                home,
+                                generation: app.channel_home_generation(),
+                                workspace: app.workspace_view_generation,
+                                surface: if work {
+                                    Surface::Conversations
+                                } else {
+                                    Surface::Work
+                                },
+                            };
+                            // Real full application chrome: the sidebar, actual
+                            // loading/empty panes and Work leaf all stay mounted.
+                            let mut frame = iced::runtime::UserInterface::build(
+                                cosmic::ApplicationExt::view_main(&app),
+                                iced::Size::new(width, 900.0),
+                                Cache::new(),
+                                &mut renderer,
+                            );
+                            draw(&mut frame, &mut renderer);
+                            let mut header = Header {
+                                target: focused.map(|id| card_control_id(id, "tab")),
+                                ..Default::default()
+                            };
+                            frame.operate(&renderer, &mut header);
+                            if scene == "scrolled-chat" && !work {
+                                let (_, content, _) = header.tabs.expect("actual tab strip");
+                                let mut scroll = operation::scrollable::scroll_to(
+                                    widget::Id::new("workspace.tabs"),
+                                    operation::scrollable::AbsoluteOffset {
+                                        x: Some(content.width),
+                                        y: None,
+                                    },
+                                );
+                                frame.operate(&renderer, &mut scroll);
+                                draw(&mut frame, &mut renderer);
+                                header.text.clear();
+                                frame.operate(&renderer, &mut header);
+                                let (viewport, _, translation) = header.tabs.unwrap();
+                                let tab = header.focused_tab.unwrap();
+                                assert!(translation.x > 0.0);
+                                assert!(
+                                    tab.x + tab.width - translation.x <= viewport.x + 0.1,
+                                    "the matching focused tab must actually be offscreen"
+                                );
+                            }
+                            assert!(!header.text.iter().any(|(text, _)| text == "CHANNEL"));
+                            let nodes = frame.a11y_nodes(iced::mouse::Cursor::Unavailable);
+                            let mut navigation = Vec::new();
+                            for (label, selected) in [("Conversations", !work), ("Work", work)] {
+                                let name = format!("{label} for channel {title}");
+                                let controls = nodes
+                                    .root()
+                                    .iter()
+                                    .chain(nodes.children())
+                                    .filter(|node| {
+                                        node.node().role()
+                                            == iced_accessibility::accesskit::Role::Button
+                                            && node.node().label() == Some(name.as_str())
+                                    })
+                                    .collect::<Vec<_>>();
+                                assert_eq!(controls.len(), 1);
+                                assert_eq!(controls[0].node().is_selected(), Some(selected));
+                                let b = controls[0].node().bounds().unwrap();
+                                assert!(
+                                    b.x0 >= 0.0
+                                        && b.x1 <= f64::from(width) + 0.1
+                                        && b.y0 >= 0.0
+                                        && b.y1 <= 900.0
+                                );
+                                navigation.push(iced::Rectangle {
+                                    x: b.x0 as f32,
+                                    y: b.y0 as f32,
+                                    width: (b.x1 - b.x0) as f32,
+                                    height: (b.y1 - b.y0) as f32,
+                                });
+                            }
+                            drop(nodes);
+                            let top = navigation[0].y;
+                            let bottom = navigation[0].y + navigation[0].height;
+                            let left = header
+                                .tabs
+                                .map_or(navigation[0].x, |(viewport, _, _)| viewport.x);
+                            let identity = header
+                                .text
+                                .iter()
+                                .filter(|(text, bounds)| {
+                                    text == title
+                                        && bounds.x >= left
+                                        && bounds.y >= design::HEADER_CONTENT_HEIGHT
+                                })
+                                .collect::<Vec<_>>();
+                            if work {
+                                assert!(!identity.iter().any(|(_, bounds)| bounds.y < bottom));
+                                assert!(
+                                    identity.iter().any(|(_, bounds)| bounds.y >= bottom),
+                                    "the actual Work leaf retains its captured channel title"
+                                );
+                            } else {
+                                let visible = identity
+                                    .iter()
+                                    .filter(|(_, bounds)| {
+                                        if width < 800.0 {
+                                            bounds.y + bounds.height <= top + 0.1
+                                        } else {
+                                            bounds.center().y >= top && bounds.center().y <= bottom
+                                        }
+                                    })
+                                    .collect::<Vec<_>>();
+                                assert_eq!(
+                                    visible.len(),
+                                    1,
+                                    "explicit channel identity survives {scene}/{compact}/{width}"
+                                );
+                                let bounds = visible[0].1;
+                                assert!(
+                                    bounds.width > 0.0
+                                        && bounds.x + bounds.width <= width + 0.1
+                                        && bounds.y + bounds.height <= 900.0
+                                );
+                            }
+                            let name = format!(
+                                "{} for channel {title}",
+                                if work { "Conversations" } else { "Work" }
+                            );
+                            let (id, area) = labelled(&mut frame, &renderer, &name);
+                            let pointer = click(&mut frame, &mut renderer, area.center());
+                            tab(&mut frame, &mut renderer, true);
+                            seek(&mut frame, &mut renderer, &id);
+                            let keyboard = event(
+                                &mut frame,
+                                &mut renderer,
+                                &[key(
+                                    keyboard::Key::Named(keyboard::key::Named::Enter),
+                                    keyboard::key::Code::Enter,
+                                    None,
+                                )],
+                                iced::mouse::Cursor::Unavailable,
+                            )
+                            .0;
+                            for messages in [pointer, keyboard] {
+                                let [cosmic::Action::App(Message::ChannelWorkNavigation(actual))] =
+                                    messages.as_slice()
+                                else {
+                                    panic!("actual owned header callback: {messages:?}");
+                                };
+                                assert_eq!(*actual, expected);
+                            }
+                            drop(frame.into_cache());
+                            for stale in [
+                                Navigation {
+                                    generation: uuid::Uuid::new_v4(),
+                                    ..expected
+                                },
+                                Navigation {
+                                    workspace: expected.workspace + 1,
+                                    ..expected
+                                },
+                                Navigation {
+                                    home: Home {
+                                        creation_ordinal: home.creation_ordinal + 1,
+                                        ..home
+                                    },
+                                    ..expected
+                                },
+                            ] {
+                                drop(app.update(Message::ChannelWorkNavigation(stale)));
+                                assert_eq!(app.channel_work_is_main(), work);
+                                assert_eq!(app.workspace.focused(), before.2);
+                            }
+                            drop(app.update(Message::ChannelWorkNavigation(expected)));
+                            assert_eq!(app.channel_work_is_main(), !work);
+                            assert_eq!(
+                                (
+                                    app.durable.active_channel,
+                                    app.workspace.order().collect::<Vec<_>>(),
+                                    app.workspace.focused()
+                                ),
+                                before
+                            );
+                        }
                     }
                 }
             }

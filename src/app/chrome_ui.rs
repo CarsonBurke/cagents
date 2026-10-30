@@ -2848,8 +2848,39 @@ impl Cagents {
         let navigation = widget::row::with_children(navigation)
             .spacing(space::XXS)
             .align_y(Alignment::Center);
+        let identity = widget::row::with_children(vec![
+            Icon::Channel
+                .handle()
+                .icon()
+                .size(design::ROW_ICON_SIZE)
+                .into(),
+            design::heading(if title.is_empty() {
+                "Untitled channel".to_owned()
+            } else {
+                title
+            })
+            .width(Length::Fill)
+            .into(),
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        let content: Element<'_, Message> = if work {
+            // Work's leaf already owns the captured channel title. A pane tab
+            // in Conversations may be renamed, clipped or scrolled out of view.
+            navigation.into()
+        } else if compact {
+            widget::column::with_children(vec![identity.into(), navigation.into()])
+                .spacing(space::XS)
+                .into()
+        } else {
+            widget::row::with_children(vec![identity.into(), navigation.into()])
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into()
+        };
         Some(
-            widget::container(navigation)
+            widget::container(content)
                 .padding([space::XS, space::S])
                 .width(Length::Fill)
                 .into(),
