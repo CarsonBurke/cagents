@@ -12837,7 +12837,7 @@ mod tests {
             .proof
             .as_mut()
             .expect("fixture has a complete original proof");
-        proof.host_incarnation.push_str("-canonical");
+        proof.host_incarnation = format!("{}-canonical", proof.host_incarnation.as_str()).into();
         if let Some(terminal) = &mut canonical.terminal {
             terminal.continuity = TerminalContinuity::Live {
                 host_session_id: proof.host_session_id.clone(),
