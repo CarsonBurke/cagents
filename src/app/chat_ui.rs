@@ -4923,7 +4923,9 @@ fn close_returned_terminal_on(
         .continuity
         .live_proof()
         .filter(HostSessionProof::is_complete)
-        .ok_or("The returned terminal has no complete host proof; nothing was closed")?;
+        .ok_or(
+            "The terminal's service could not be verified. Your conversation and draft are kept",
+        )?;
     if client.proof() != &proof {
         return Err(
             "The returned terminal belongs to a different service; nothing was closed".into(),
@@ -4934,7 +4936,7 @@ fn close_returned_terminal_on(
         .iter()
         .find(|current| current.session.id == terminal.id)
     else {
-        return Ok(());
+        return Err("The service no longer lists the returned terminal, so its cleanup could not be confirmed. Your conversation and draft are kept".into());
     };
     let outcome = if crate::agent_execution::same_terminal_process(terminal, &current.session) {
         client.close_terminal_checked(terminal.id, true)
@@ -23320,7 +23322,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("could not be queued")
+                .contains("pane could not be updated")
         );
         assert_eq!(
             f.app.pending_terminal_handoffs.get(&f.terminal.id),
@@ -23588,7 +23590,7 @@ mod tests {
             let result = returned_terminal_close_fixture(f.terminal.clone(), scenario);
             assert_eq!(
                 result.is_ok(),
-                matches!(scenario, "closed" | "gone" | "ended"),
+                matches!(scenario, "closed" | "ended"),
                 "{scenario}: {result:?}"
             );
         }

@@ -330,7 +330,7 @@ impl Cagents {
                 operation,
                 change,
             })
-            .map_err(|_| "The shared view could not be queued. The conversation and returned terminal are kept; retry Return to terminal after reconnecting.".to_owned())?;
+            .map_err(|_| "This pane could not be updated. Your conversation and draft are kept. Reconnect, then retry Return to terminal to show the same terminal here.".to_owned())?;
         Ok(operation)
     }
 
