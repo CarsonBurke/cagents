@@ -1132,7 +1132,10 @@ impl ControlClient {
         self.attach_and_synchronize(terminal_id)?;
         let action =
             self.expect_accepted(ClientRequest::ShutdownTerminal { terminal_id }, terminal_id);
-        self.finish_attachment(terminal_id, action)
+        match action {
+            Ok(()) => self.finish_closed_attachment(terminal_id, ()),
+            Err(error) => self.finish_attachment(terminal_id, Err(error)),
+        }
     }
 
     pub fn release_completed_terminal(
@@ -1179,7 +1182,11 @@ impl ControlClient {
                 } if actual == terminal_id => Ok(outcome),
                 response => Err(unexpected_response("a checked terminal close", &response)),
             });
-        self.finish_attachment(terminal_id, action)
+        match action {
+            Ok(terminal::ipc::TerminalCloseResult::Closed) => self
+                .finish_closed_attachment(terminal_id, terminal::ipc::TerminalCloseResult::Closed),
+            result => self.finish_attachment(terminal_id, result),
+        }
     }
 
     pub fn snapshot(&mut self, terminal_id: TerminalId) -> Result<RenderedSnapshot, ControlError> {
@@ -1510,6 +1517,36 @@ impl ControlClient {
         match result {
             Err(error) => Err(error),
             Ok(value) => detached.map(|()| value),
+        }
+    }
+
+    /// Teardown is already confirmed by the pinned, correlated close reply.
+    /// Ordinary exit may finish this connection before the trailing Detach.
+    /// Other detach failures remain errors, and unconfirmed closes use the
+    /// ordinary attachment path above.
+    fn finish_closed_attachment<T>(
+        &mut self,
+        terminal_id: TerminalId,
+        value: T,
+    ) -> Result<T, ControlError> {
+        match self.detach(terminal_id) {
+            Ok(())
+            | Err(ControlError::ConnectionClosed)
+            | Err(ControlError::UnexpectedMessage {
+                actual: "host_shutting_down",
+                ..
+            }) => Ok(value),
+            Err(ControlError::Frame(FrameError::Io(error)))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::NotConnected
+                ) =>
+            {
+                Ok(value)
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -2262,29 +2299,80 @@ where
         emit_success(cli.json, completions::execute(shell));
         return ExitCode::SUCCESS;
     }
+    if matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::ProtocolVersion
+        }
+    ) {
+        return match execute_daemon(DaemonCommand::ProtocolVersion) {
+            Ok(output) => {
+                emit_success(cli.json, output);
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // These operations govern the whole daemon, not a hosted session's own
     // actors. Refuse before staged-owner routing, SSH preparation, autostart or
     // local installer effects. Presence is enough: malformed/non-Unicode
     // authority must never silently become a User connection.
-    if matches!(
-        &cli.command,
+    let user_only_message = match &cli.command {
         TopCommand::Daemon {
-            command: DaemonCommand::Start
+            command:
+                DaemonCommand::Bridge
+                | DaemonCommand::Start
                 | DaemonCommand::Stop { .. }
                 | DaemonCommand::Preflight
                 | DaemonCommand::PrepareUpgrade { .. }
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
                 | DaemonCommand::StopForRebuild { .. },
+        } => Some(
+            "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
+        ),
+        TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
+            Some("Installation and window restart commands require your own terminal")
         }
-    ) && std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+        TopCommand::Account {
+            command:
+                AccountCommand::Link { .. }
+                | AccountCommand::Default { .. }
+                | AccountCommand::Remove { .. },
+        } => Some("Account changes require your own terminal"),
+        _ => None,
+    };
+    if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
+        && let Some(message) = user_only_message
+    {
+        emit_error(cli.json, &AppError::new("permission_denied", message));
+        return ExitCode::FAILURE;
+    }
+
+    // These implementations operate on this installation's files or pidfds.
+    // Refuse a remote target before selecting/preparing it or touching local
+    // recovery state; the selected remote must never imply local consent.
+    if (cli.device.as_deref().is_some_and(|name| name != "local") || crate::device::is_remote())
+        && matches!(
+            &cli.command,
+            TopCommand::Daemon {
+                command: DaemonCommand::Bridge
+                    | DaemonCommand::Upgrade { .. }
+                    | DaemonCommand::AbandonUpgrade { .. }
+                    | DaemonCommand::StopForRebuild { .. },
+            } | TopCommand::CoordinateInstall { .. }
+                | TopCommand::RestartWindows { .. }
+        )
     {
         emit_error(
             cli.json,
             &AppError::new(
-                "permission_denied",
-                "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
+                "daemon_local_only",
+                "This operation manages the local installation; omit --device or select local",
             ),
         );
         return ExitCode::FAILURE;
@@ -4433,9 +4521,15 @@ mod tests {
                     .lines()
                     .filter_map(|line| serde_json::from_str::<Value>(line).ok())
                     .collect::<Vec<_>>();
-                assert_eq!(errors.len(), if case == "user" { 0 } else { 14 });
+                assert_eq!(errors.len(), if case == "user" { 6 } else { 26 });
                 assert!(errors.iter().all(|error| {
-                    error["ok"] == false && error["error"]["kind"] == "permission_denied"
+                    error["ok"] == false
+                        && error["error"]["kind"]
+                            == if case == "user" {
+                                "daemon_local_only"
+                            } else {
+                                "permission_denied"
+                            }
                 }));
             }
             return;
@@ -4447,6 +4541,22 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let before = std::fs::symlink_metadata(&socket).unwrap();
         let pinned = proof("fixture-host", "fixture-boot", "fixture-incarnation");
+        for no_start in [false, true] {
+            let mut argv = vec![
+                "cagents",
+                "--json",
+                "--device",
+                "unknown-must-not-be-selected",
+            ];
+            if no_start {
+                argv.push("--no-start");
+            }
+            argv.extend(["daemon", "protocol-version"]);
+            assert_eq!(
+                run_from_with_staged_lookup(argv, |_, _| panic!("local protocol query routed")),
+                ExitCode::SUCCESS
+            );
+        }
 
         fn accept(listener: &UnixListener) -> UnixStream {
             let mut event = libc::pollfd {
@@ -4488,21 +4598,68 @@ mod tests {
         }
 
         if case != "user" {
-            let commands: [&[&str]; 7] = [
-                &["start"],
-                &["stop", "--require-empty"],
-                &["preflight"],
-                &["prepare-upgrade", "--yes", "--no-relaunch-agents"],
-                &["upgrade", "--yes"],
-                &["abandon-upgrade", "--yes"],
-                &["stop-for-rebuild", "--including-subagents"],
+            let commands: [&[&str]; 13] = [
+                &["daemon", "start"],
+                &["daemon", "stop", "--require-empty"],
+                &["daemon", "preflight"],
+                &["daemon", "prepare-upgrade", "--yes", "--no-relaunch-agents"],
+                &["daemon", "upgrade", "--yes"],
+                &["daemon", "abandon-upgrade", "--yes"],
+                &["daemon", "stop-for-rebuild", "--including-subagents"],
+                &["daemon", "bridge"],
+                &[
+                    "coordinate-install",
+                    "--prefix",
+                    "/missing-prefix",
+                    "--installer",
+                    "/missing-installer",
+                ],
+                &["restart-windows", "--instance", "missing-instance"],
+                &["account", "default", "claude", "automatic"],
+                &["account", "link", "codex", "/missing-home"],
+                &["account", "remove", "claude/system", "--yes"],
             ];
             for device in ["local", "fixture-device-must-not-be-selected"] {
                 for command in commands {
-                    let mut argv = vec!["cagents", "--json", "--device", device, "daemon"];
+                    let mut argv = vec!["cagents", "--json", "--device", device];
                     argv.extend_from_slice(command);
-                    assert_eq!(run_from(argv), ExitCode::FAILURE);
+                    assert_eq!(
+                        run_from_with_staged_lookup(argv, |_, _| panic!(
+                            "scoped initiator reached staged routing"
+                        )),
+                        ExitCode::FAILURE
+                    );
                 }
+            }
+            // Test the bridge's own admission as well as public CLI dispatch.
+            // The private EOF peer keeps a missing guard a bounded failure;
+            // no-start prevents even a broken entry from spawning a daemon.
+            {
+                let _policy =
+                    StartPolicy(NO_START.swap(true, std::sync::atomic::Ordering::Relaxed));
+                let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let stop = stopped.clone();
+                let observed = listener.try_clone().unwrap();
+                let peer = thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        match observed.accept() {
+                            Ok((stream, _)) => {
+                                drop(stream);
+                                return true;
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                            Err(error) => panic!("private bridge peer: {error}"),
+                        }
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    false
+                });
+                let result = crate::device::serve_stdio();
+                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                assert!(!peer.join().unwrap(), "scoped bridge connected");
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             }
             assert!(
                 matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
@@ -4636,6 +4793,32 @@ mod tests {
             assert_eq!(run_from(argv), ExitCode::SUCCESS);
         }
         server.join().unwrap();
+        for command in [
+            vec!["daemon", "upgrade", "--yes"],
+            vec!["daemon", "abandon-upgrade", "--yes"],
+            vec!["daemon", "stop-for-rebuild", "--including-subagents"],
+            vec!["daemon", "bridge"],
+            vec![
+                "coordinate-install",
+                "--prefix",
+                "/missing-prefix",
+                "--installer",
+                "/missing-installer",
+            ],
+            vec!["restart-windows", "--instance", "missing-instance"],
+        ] {
+            let mut argv = vec![
+                "cagents",
+                "--json",
+                "--device",
+                "unknown-must-not-be-selected",
+            ];
+            argv.extend(command);
+            assert_eq!(
+                run_from_with_staged_lookup(argv, |_, _| panic!("local-only operation routed")),
+                ExitCode::FAILURE
+            );
+        }
     }
 
     #[test]
@@ -6485,6 +6668,288 @@ mod tests {
         assert!(client.attached_chats.is_empty());
         assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn terminal_close_keeps_confirmed_completion_when_detach_connection_ends() {
+        for checked in [false, true] {
+            for ending in ["detached", "shutdown", "eof", "closed-write"] {
+                let (result, reusable) =
+                    terminal_close_completion_fixture(checked, "closed", ending);
+                assert!(result.is_ok(), "{checked}/{ending}: {result:?}");
+                assert_eq!(reusable, ending == "detached");
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_close_preserves_unconfirmed_outcomes_and_other_detach_errors() {
+        for outcome in ["active", "unknown", "refused"] {
+            let (result, _) = terminal_close_completion_fixture(true, outcome, "eof");
+            if outcome == "refused" {
+                assert!(matches!(
+                    result,
+                    Err(ControlError::Remote {
+                        code: ProtocolErrorCode::TerminalUnavailable,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(result.is_err(), "{outcome} must not become confirmed Close");
+            }
+        }
+        for ending in [
+            "proof",
+            "version",
+            "request-id",
+            "unexpected",
+            "refused",
+            "timeout",
+            "malformed",
+        ] {
+            let (result, _) = terminal_close_completion_fixture(true, "closed", ending);
+            match ending {
+                "proof" => assert!(matches!(result, Err(ControlError::ProofMismatch))),
+                "version" => assert!(matches!(
+                    result,
+                    Err(ControlError::UnsupportedVersion { .. })
+                )),
+                "request-id" => assert!(matches!(
+                    result,
+                    Err(ControlError::RequestIdMismatch { .. })
+                )),
+                "unexpected" => assert!(matches!(
+                    result,
+                    Err(ControlError::UnexpectedResponse { .. })
+                )),
+                "refused" => assert!(matches!(
+                    result,
+                    Err(ControlError::Remote {
+                        code: ProtocolErrorCode::QueueFull,
+                        ..
+                    })
+                )),
+                "timeout" => assert!(matches!(result, Err(ControlError::ReplyTimeout { .. }))),
+                "malformed" => assert!(matches!(
+                    result,
+                    Err(ControlError::Frame(FrameError::InvalidPayload(_)))
+                )),
+                _ => unreachable!(),
+            }
+        }
+        let (result, _) = terminal_close_completion_fixture(false, "refused", "eof");
+        assert!(matches!(
+            result,
+            Err(ControlError::Remote {
+                code: ProtocolErrorCode::TerminalUnavailable,
+                ..
+            })
+        ));
+        let (result, _) = terminal_close_completion_fixture(false, "write", "eof");
+        assert!(
+            result.is_err(),
+            "ordinary writes still require successful Detach"
+        );
+        for outcome in ["active", "unknown"] {
+            let (result, _) = terminal_close_completion_fixture(true, outcome, "detached");
+            assert!(result.is_ok(), "unchanged non-Closed result: {result:?}");
+        }
+    }
+
+    /// A private framed peer exercises the public client, including attachment
+    /// replay and correlation. It starts no daemon, terminal or provider.
+    fn terminal_close_completion_fixture(
+        checked: bool,
+        outcome: &'static str,
+        ending: &'static str,
+    ) -> (Result<(), ControlError>, bool) {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let pinned = proof("close-completion", "boot", "incarnation");
+        let terminal = TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            LaunchRecipe::shell("/fixture".into()).unwrap(),
+            None,
+        );
+        let id = terminal.session.id;
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(connect.request_id, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(attach.request, ClientRequest::Attach { terminal_id, .. } if terminal_id == id)
+            );
+            let send = |stream: &mut UnixStream, request_id, message| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: pinned.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            send(
+                &mut server_stream,
+                Some(attach.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Attached { terminal },
+                },
+            );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::Synchronized {
+                    terminal_id: id,
+                    generation: 0,
+                    event_sequence: 0,
+                },
+            );
+            let close: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(if outcome == "write" {
+                matches!(close.request, ClientRequest::Input { terminal_id, ref bytes } if terminal_id == id && bytes == b"fixture")
+            } else if checked {
+                matches!(close.request, ClientRequest::CloseTerminalChecked { terminal_id, allow_active: true } if terminal_id == id)
+            } else {
+                matches!(close.request, ClientRequest::ShutdownTerminal { terminal_id } if terminal_id == id)
+            });
+            let message = if outcome == "refused" {
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    "original close refused",
+                    true,
+                ))
+            } else if checked {
+                ServerMessage::Response {
+                    response: ServerResponse::TerminalCloseChecked {
+                        terminal_id: id,
+                        outcome: match outcome {
+                            "closed" => terminal::ipc::TerminalCloseResult::Closed,
+                            "active" => terminal::ipc::TerminalCloseResult::Active,
+                            "unknown" => terminal::ipc::TerminalCloseResult::Unknown(
+                                "original custody remains".into(),
+                            ),
+                            _ => unreachable!(),
+                        },
+                    },
+                }
+            } else {
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                }
+            };
+            if ending == "closed-write" {
+                // Retire the peer's read direction before the client can
+                // receive success and attempt Detach; keep writing that reply.
+                server_stream.shutdown(std::net::Shutdown::Read).unwrap();
+            }
+            send(&mut server_stream, Some(close.request_id), message);
+            if ending == "closed-write" {
+                return;
+            }
+            let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(detach.request, ClientRequest::Detach { terminal_id: id });
+            if ending == "eof" {
+                return;
+            }
+            if ending == "timeout" {
+                wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                return;
+            }
+            if ending == "malformed" {
+                server_stream.write_all(&[0, 0, 0, 1, 255]).unwrap();
+                return;
+            }
+            let mut reply = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(detach.request_id),
+                proof: pinned.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Detached,
+                },
+            };
+            match ending {
+                "shutdown" => {
+                    reply.request_id = None;
+                    reply.message = ServerMessage::HostShuttingDown;
+                }
+                "proof" => reply.proof = proof("replacement", "boot", "incarnation"),
+                "version" => reply.version += 1,
+                "request-id" => reply.request_id = Some(detach.request_id + 1),
+                "unexpected" => {
+                    reply.message = ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    }
+                }
+                "refused" => {
+                    reply.message = ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::QueueFull,
+                        "detach refused",
+                        true,
+                    ))
+                }
+                "detached" => {}
+                _ => unreachable!(),
+            }
+            write_frame(&mut server_stream, &reply).unwrap();
+            if ending == "detached" {
+                let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(list.request, ClientRequest::List);
+                send(
+                    &mut server_stream,
+                    Some(list.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed {
+                            terminals: Vec::new(),
+                        },
+                    },
+                );
+            }
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        if ending == "timeout" {
+            client
+                .stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+        }
+        let result = if checked {
+            client.close_terminal_checked(id, true).map(|actual| {
+                assert_eq!(
+                    actual,
+                    match outcome {
+                        "closed" => terminal::ipc::TerminalCloseResult::Closed,
+                        "active" => terminal::ipc::TerminalCloseResult::Active,
+                        "unknown" => terminal::ipc::TerminalCloseResult::Unknown(
+                            "original custody remains".into()
+                        ),
+                        _ => unreachable!(),
+                    }
+                );
+            })
+        } else if outcome == "write" {
+            client.write(id, b"fixture".to_vec())
+        } else {
+            client.close_terminal(id)
+        };
+        if ending == "timeout" {
+            release.send(()).unwrap();
+        }
+        let reusable = ending == "detached" && client.list().unwrap().is_empty();
+        server.join().unwrap();
+        (result, reusable)
     }
 
     #[test]
