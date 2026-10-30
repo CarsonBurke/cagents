@@ -1,11 +1,13 @@
 {
-  "product_head": "5ec1209b84b97ce56ea1e66cd1e4100f509b808c",
-  "product_tree": "eef3ef6e2b916a83f8f8835b68d1c92c93a2e9db",
+  "product_head": "074f08d7107b57b66aba8649bf2f2bbcc2dfd3d9",
+  "product_tree": "9472604d44df913bdbdc21f7e5414c4c5d6c538d",
   "feature_paths": [
     "src/chat/attachment_assets.rs",
     "src/control.rs",
     "src/daemon.rs",
     "src/daemon/holder_registry/connection.rs",
+    "src/editor.rs",
+    "src/editor/retained_save.rs",
     "src/fs_safety.rs",
     "src/fs_safety/darwin.rs",
     "src/fs_safety/directory_creation.rs",
@@ -20,29 +22,48 @@
     "src/instance/daemon_admission.rs",
     "src/lsp.rs",
     "src/process.rs",
+    "src/repository.rs",
     "src/terminal/hosted.rs",
     "src/update.rs",
     "src/update/source.rs",
+    "src/worktree_branch/registered_heads.rs",
     "src/worktree_cleanup.rs",
     "src/worktree_setup.rs",
     "tests/repository_git_contract.rs"
   ],
   "incoming_main_paths": [
+    ".github/workflows/script-contracts.yml",
+    "README.md",
     "docs/chat-composer-fixture.md",
+    "scripts/prepare-validation-checkout",
+    "scripts/qualification/process_custody.py",
+    "src/app.rs",
     "src/app/channel_ui.rs",
     "src/app/chat_ui.rs",
     "src/app/chat_ui/view.rs",
     "src/app/chat_ui/view/provider_context_tests.rs",
+    "src/app/session_recovery.rs",
+    "src/app/shared_views.rs",
+    "src/app/shared_views/tests/published_card_edits.rs",
     "src/app/workspace_model_sync.rs",
     "src/chat.rs",
     "src/chat/protocol/claude.rs",
     "src/chat/runtime/child_text_copy.rs",
     "src/chat/runtime/store.rs",
     "src/chat/runtime/store/text_copy.rs",
+    "src/filesystem_recovery_context.rs",
+    "src/filesystem_recovery_context/save_local.rs",
+    "src/fs_safety/directory_creation.rs",
     "src/host/model.rs",
     "src/host/model/navigation.rs",
+    "src/persistence.rs",
+    "src/repository_widget.rs",
+    "src/repository_widget/retained_save_tests.rs",
+    "src/session.rs",
     "src/sidebar.rs",
-    "src/workspace_model.rs"
+    "src/workspace_model.rs",
+    "tests/prepare_validation_checkout.py",
+    "tests/qualification/test_process_custody.py"
   ],
   "files": {
     ".cargo/config.toml": {
@@ -221,9 +242,9 @@
       "git_entry": "100644 blob 24e5956197360f52aa04f69f2b1903640a756785\tsrc/daemon/holder_registry/connection.rs"
     },
     "src/fs_safety.rs": {
-      "sha256": "ddf86474139058ead6f80b8029bc3253e1d68789fb40735b605f150a3c11b2f0",
-      "bytes": 96019,
-      "git_entry": "100644 blob 85fe92e22115074f516937d94cd6e69bcd1968e1\tsrc/fs_safety.rs"
+      "sha256": "1a876f05b5b478c2dfde18665327b39085302cb8a38d63e0351a818917d7ca6f",
+      "bytes": 114178,
+      "git_entry": "100644 blob b14043f405cc48b3ce76559b65ed6a534213d7e2\tsrc/fs_safety.rs"
     },
     "src/fs_safety/darwin.rs": {
       "sha256": "4e4a1cfa28e5a4e6fbcb9c5582483e5c72423b1ef9cc4f5176e2e0f0578219a9",
@@ -231,9 +252,9 @@
       "git_entry": "100644 blob 7e009fb27370af09c94179b223ed8e7690484ee4\tsrc/fs_safety/darwin.rs"
     },
     "src/fs_safety/directory_creation.rs": {
-      "sha256": "6f001138885e0a4589199f8be1472e378fc3e259bae4ce926bdd5dc6ee012933",
-      "bytes": 105929,
-      "git_entry": "100644 blob 6a5f21ce1bb2789a9e8ec3d52a5d3a06904fcc89\tsrc/fs_safety/directory_creation.rs"
+      "sha256": "be14e46da6af57920c9df4ad623827edb9efe4f78f52e82e82d5a30321b729fa",
+      "bytes": 106547,
+      "git_entry": "100644 blob b1fb063d7b1caa5318b2b06275c577b00073745e\tsrc/fs_safety/directory_creation.rs"
     },
     "src/fs_safety/linux.rs": {
       "sha256": "fa395311c12229860af2e2c12379430679908cd6182e92da0aac96912afc332a",
@@ -361,14 +382,14 @@
       "git_entry": "100644 blob 73b2017fb9f79b89d16c6f27f4cf9c768cbdb365\tsrc/process.rs"
     },
     "src/repository.rs": {
-      "sha256": "a5f586b27a589cb81b18b70fe371c84431b6f16e13b775ecee7ea8a357cdaf32",
-      "bytes": 542656,
-      "git_entry": "100644 blob c0e67e5bee794ae5a826789647307516607c1c2f\tsrc/repository.rs"
+      "sha256": "3f15493d4b97c2af0ae22f6eb1c80c83a6486a21e4b954864c2851b951bcd875",
+      "bytes": 542767,
+      "git_entry": "100644 blob 26f52b67d43ce942985bed27c9061bc18eaf26de\tsrc/repository.rs"
     },
     "src/sidebar.rs": {
-      "sha256": "4944dcf4aab437a0252e691a997c5e0f9b79ead00c42fafb34c13751e65a56e9",
-      "bytes": 821614,
-      "git_entry": "100644 blob 7aa5485058b8cc3a1863ef343b3d240cfc15202c\tsrc/sidebar.rs"
+      "sha256": "d158cd57a692865ace96995a968c6c32b7caf44a5190956adffb9ea9beaac9c9",
+      "bytes": 827351,
+      "git_entry": "100644 blob 4be62f2c14a776863ac579ede339b5b82d9c2e3a\tsrc/sidebar.rs"
     },
     "src/terminal/hosted.rs": {
       "sha256": "26d3f6c4575544d628b18dabb48f2120fb2cd4ab1c64e8e4f809e351e6231e8e",
@@ -396,9 +417,9 @@
       "git_entry": "100644 blob 0e09b0f447e3bf28aaecd49569359dc78b4c132d\tsrc/worktree_cleanup.rs"
     },
     "src/worktree_setup.rs": {
-      "sha256": "cf39b8551b8a4998239f0cb5b9d953ac0aae92da94e38ef8cd62f3511463c866",
-      "bytes": 69657,
-      "git_entry": "100644 blob 5518a453c4f05cad941396a45469a970c4d51350\tsrc/worktree_setup.rs"
+      "sha256": "7487dd9f53b3b180793a51a5358acd599d8db1fd649814e1416c60a519e2d9f0",
+      "bytes": 69715,
+      "git_entry": "100644 blob 2c30fd790b073acb05d283d140e4abaa53ca97e8\tsrc/worktree_setup.rs"
     },
     "tests/account_cache_contract.rs": {
       "sha256": "36c3522ede3f104cf8984bb49781632ba58432031fd3451bc7e74dd748c989ee",
@@ -484,6 +505,101 @@
       "sha256": "dc05668101b19b296b2ada318c74aed9e242eb5b40e0fd1671d6d1915cf19709",
       "bytes": 21421,
       "git_entry": "100644 blob 5d934d7e73140b0564384be80bb996e8b2fc1a07\ttests/upgrade_inspection_contract.rs"
+    },
+    ".github/workflows/script-contracts.yml": {
+      "sha256": "d0bd373b65d73b24c0d6df64bfe089cf20093e70566a597597d0ab15a4aff975",
+      "bytes": 4744,
+      "git_entry": "100644 blob 68c58f9806c1a53fc7b418a4cc6b0845d1b4a095\t.github/workflows/script-contracts.yml"
+    },
+    "README.md": {
+      "sha256": "d3823c845998be5bd7fcafc1d860bc90ba079f4f2d46c1a89ea6e48c5a9d4084",
+      "bytes": 4519,
+      "git_entry": "100644 blob 3f346fa58544fb488d06ff3f6a461a3678022136\tREADME.md"
+    },
+    "scripts/prepare-validation-checkout": {
+      "sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+      "bytes": 16754,
+      "git_entry": "100755 blob be0f3157c54f8d8592ec73d25427e0ce6a0e7e25\tscripts/prepare-validation-checkout"
+    },
+    "scripts/qualification/process_custody.py": {
+      "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+      "bytes": 21755,
+      "git_entry": "100644 blob f349b79d8312691d91c385b1a2c0477118ddc709\tscripts/qualification/process_custody.py"
+    },
+    "src/app.rs": {
+      "sha256": "c405ea52503acc5076a5e77d3bc81d5e9ab341b1a78e313147e9ca70dfc67e77",
+      "bytes": 1376636,
+      "git_entry": "100644 blob fb4de01435e61d174ed960a1fc3a50559fd96119\tsrc/app.rs"
+    },
+    "src/app/session_recovery.rs": {
+      "sha256": "98650adcb4af494cc6c4932b57a4e093e6c355010e9e90cf4334101c253d3c82",
+      "bytes": 27532,
+      "git_entry": "100644 blob 306e839e716be9d8fdfe36509e3c91889e6eb4b3\tsrc/app/session_recovery.rs"
+    },
+    "src/app/shared_views.rs": {
+      "sha256": "99d311a28d969aa8887011e06ff0ae0a0b698a6ce1ee04058980c2e6360a096b",
+      "bytes": 231550,
+      "git_entry": "100644 blob c90b44917732be60bd4a3b7e873627c56be9058d\tsrc/app/shared_views.rs"
+    },
+    "src/app/shared_views/tests/published_card_edits.rs": {
+      "sha256": "e3995dd3a8355e1c34d8ca3d496835ec2d68ecfa2655ef6a29b6b1d5b68b7a1d",
+      "bytes": 6495,
+      "git_entry": "100644 blob d2c802125332d1510e58b9a2df0d4b9ecb9e91d3\tsrc/app/shared_views/tests/published_card_edits.rs"
+    },
+    "src/editor.rs": {
+      "sha256": "a3e8b6313188dfad328284531c0bc9a99c5b41620a637761ba8521da654029af",
+      "bytes": 93985,
+      "git_entry": "100644 blob bfe4ac34ae63df7ec58de6a4a5d3793231af8f1e\tsrc/editor.rs"
+    },
+    "src/editor/retained_save.rs": {
+      "sha256": "a1dda26c3092e6edd644898585de0f48423fdaa21b4d236e71e007dc3d264a55",
+      "bytes": 57897,
+      "git_entry": "100644 blob f657adf88afb9c0a673538edddaf7976b1df8cc7\tsrc/editor/retained_save.rs"
+    },
+    "src/filesystem_recovery_context.rs": {
+      "sha256": "01d26513d7a778ed4de85cc0420f7c5e863255097f99fee9f5fe55996a8d5ea1",
+      "bytes": 31609,
+      "git_entry": "100644 blob 677587b948e04fa6641f2b05b0e2c19d28a87393\tsrc/filesystem_recovery_context.rs"
+    },
+    "src/filesystem_recovery_context/save_local.rs": {
+      "sha256": "36cf8d8879be5511080e3ea67479a8ebab6213fab9a7f977679586211ed68284",
+      "bytes": 30627,
+      "git_entry": "100644 blob 2ed4023d180a74fbd2147c18a93b8336ad860f04\tsrc/filesystem_recovery_context/save_local.rs"
+    },
+    "src/persistence.rs": {
+      "sha256": "4449877833c2ede0383f8e0060f423a3d7ee3e0d9af009084eb6a9e2efc5be3e",
+      "bytes": 481868,
+      "git_entry": "100644 blob 740d1926aee15f0025e2bfd2870b3c4e13d58614\tsrc/persistence.rs"
+    },
+    "src/repository_widget.rs": {
+      "sha256": "d1d440a154502c29905b852eacadc22858b812b044d0a3937ff2862bc9d106b2",
+      "bytes": 901280,
+      "git_entry": "100644 blob 0d216880a943afac8c056531939787a96e2264b0\tsrc/repository_widget.rs"
+    },
+    "src/repository_widget/retained_save_tests.rs": {
+      "sha256": "b2a6a1c8ae7073599affeea353fad62b0d0f2d446be01b93873c9c5bdfa0b181",
+      "bytes": 32189,
+      "git_entry": "100644 blob 2228efa119e383983c7dca99e7a19ecb806119b0\tsrc/repository_widget/retained_save_tests.rs"
+    },
+    "src/session.rs": {
+      "sha256": "82823614d9d649ebf9c3eb17cebef700b5dd44873ae20cdf530c701b2025a994",
+      "bytes": 265028,
+      "git_entry": "100644 blob 68136543d519c6ac032d1972fb8af26a838ba5ed\tsrc/session.rs"
+    },
+    "src/worktree_branch/registered_heads.rs": {
+      "sha256": "42d4d7a794caf031ec3bb3e4470bf7fefafd57ff79f6bd4cc51caa71b473979e",
+      "bytes": 21628,
+      "git_entry": "100644 blob 89384a5f60acee166cca7e16ec1f4fd75e62356e\tsrc/worktree_branch/registered_heads.rs"
+    },
+    "tests/prepare_validation_checkout.py": {
+      "sha256": "8c74298c6d6caaabaf590d65ce081f4fd807f610a44203028da4ee3688507592",
+      "bytes": 39779,
+      "git_entry": "100644 blob 9c799cf97da4e3b25e64811af6afe1b3b240792d\ttests/prepare_validation_checkout.py"
+    },
+    "tests/qualification/test_process_custody.py": {
+      "sha256": "90cbae4a068bddfda052d3e517e9320278d7b63e822198986a2e2aae4930fcec",
+      "bytes": 20606,
+      "git_entry": "100644 blob eb1b303c457600837fa533f5c7bda3c7cd56c74a\ttests/qualification/test_process_custody.py"
     }
   },
   "fixture_parents": [

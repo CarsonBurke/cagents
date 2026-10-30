@@ -17,13 +17,13 @@ env:
   CARGO_BUILD_JOBS: 2
   CARGO_TERM_COLOR: never
   RUSTUP_TOOLCHAIN: 1.93.0
-  EXPECTED_PRODUCT_SHA: 5ec1209b84b97ce56ea1e66cd1e4100f509b808c
-  EXPECTED_PRODUCT_TREE: eef3ef6e2b916a83f8f8835b68d1c92c93a2e9db
+  EXPECTED_PRODUCT_SHA: 074f08d7107b57b66aba8649bf2f2bbcc2dfd3d9
+  EXPECTED_PRODUCT_TREE: 9472604d44df913bdbdc21f7e5414c4c5d6c538d
 jobs:
   macos:
     if: github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' && github.event.pull_request.head.repo.full_name
       == github.repository
-    name: Native Apple ARM CLI link run and seventeen owning roots
+    name: Native Apple ARM CLI link run and twenty-two owning roots
     runs-on: macos-15
     timeout-minutes: 45
     defaults:
@@ -61,7 +61,7 @@ jobs:
     - name: Check out product
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
-        ref: 5ec1209b84b97ce56ea1e66cd1e4100f509b808c
+        ref: 074f08d7107b57b66aba8649bf2f2bbcc2dfd3d9
         path: product
         persist-credentials: 'false'
     - name: Bind exact product and research sources
@@ -163,7 +163,7 @@ jobs:
     - name: Check out product
       uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       with:
-        ref: 5ec1209b84b97ce56ea1e66cd1e4100f509b808c
+        ref: 074f08d7107b57b66aba8649bf2f2bbcc2dfd3d9
         path: product
         persist-credentials: false
     - name: Check out pinned Linux setup
