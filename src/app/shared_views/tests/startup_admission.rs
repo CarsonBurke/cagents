@@ -1196,11 +1196,35 @@ fn mixed_scope_verified_retirement_preserves_runtime_only_managed_images() {
                 full.agents = vec![issuer, invalid];
                 let (tx, rx) = async_channel::unbounded();
                 app.workspace_model_tx = tx;
+                assert_eq!(
+                    app.workspace_model.identity,
+                    crate::workspace_model::NO_REGISTRY
+                );
+                // A publisher rank cannot establish the initial registry or
+                // admit cached sources before the real connection snapshot.
                 let ranked = app.apply_workspace_model_update(ModelUpdate::Ranked {
                     channel,
                     model: full.clone(),
                 });
                 settle(&mut app, ranked);
+                assert_eq!(
+                    app.workspace_model.identity,
+                    crate::workspace_model::NO_REGISTRY
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "an early rank publishes no view edits"
+                );
+                assert!(daemon.requests().is_empty());
+                assert!(app.chat_awaiting_admission(healthy.id));
+                assert!(app.chat_awaiting_admission(rejected.id));
+                assert!(app.shared_views.seeding.is_empty());
+                assert!(app.shared_views.initialized.is_empty());
+                assert!(app.shared_views.pending.is_empty());
+
+                let connected =
+                    app.apply_workspace_model_update(ModelUpdate::Connected(full.clone()));
+                settle(&mut app, connected);
                 let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
                 let seeds = edits
                     .iter()
