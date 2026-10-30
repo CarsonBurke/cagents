@@ -119,6 +119,53 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
     run(['xdotool', 'windowsize', '--sync', window, '1280', '800'])
     run(['xdotool', 'windowmove', '--sync', window, '0', '0'])
     api['viewport'] = (1280, 800)
+    def inspector_setup(panel_visible):
+        # The global inspector and this review's internal file panel are
+        # separate. Observe their actual controls; do not infer toggle state.
+        nodes = live_tree(pid)
+        header_names = tuple('Pull requests pane Private review fixture, ' + str(project) + ', ' + state
+                             for state in ('focused', 'not focused'))
+        controls = {}
+        for key, names, role, present in [
+            ('inspector_toggle', ('Toggle inspector — Ctrl+Shift+I',), atspi.ROLE_PUSH_BUTTON, True),
+            ('global_files_tab', ('Files panel tab',), atspi.ROLE_PUSH_BUTTON, panel_visible),
+            ('global_details_tab', ('Details panel tab',), atspi.ROLE_PUSH_BUTTON, panel_visible),
+            ('global_resize', ('Resize context inspector',), atspi.ROLE_SEPARATOR, panel_visible),
+            ('pane_header', header_names, atspi.ROLE_PUSH_BUTTON, True),
+            ('review_list', ('Review pull request #42 Synthetic discussion-count review',), atspi.ROLE_PUSH_BUTTON, True),
+            ('internal_file_panel', ('Hide review files',), atspi.ROLE_PUSH_BUTTON, True),
+        ]:
+            matches = [node for node in nodes if node.name in names and node.getRole() == role and visible(node)]
+            assert len(matches) <= 1, ('Ambiguous native review setup control', key)
+            if len(matches) != int(present):
+                return None
+            if matches:
+                node = matches[0]
+                bounds = node.queryComponent().getExtents(atspi.DESKTOP_COORDS)
+                if not (bounds.width > 0 and bounds.height > 0 and bounds.x >= 0 and bounds.y >= 0
+                        and bounds.x + bounds.width <= api['viewport'][0]
+                        and bounds.y + bounds.height <= api['viewport'][1]):
+                    return None
+                enabled = node.getState().contains(atspi.STATE_ENABLED)
+                if role == atspi.ROLE_PUSH_BUTTON and not enabled:
+                    return None
+                controls[key] = {'name': node.name, 'role': node.getRoleName(),
+                                 'bounds': [bounds.x, bounds.y, bounds.width, bounds.height],
+                                 'enabled': enabled}
+        return {'panel_controls_visible': panel_visible, 'controls': controls,
+                'repository': str(project), 'internal_file_panel_open_control': 'Hide review files'}
+    setup_before = wait(lambda: snapshot(lambda: inspector_setup(True)))
+    setup_focus = int(subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip())
+    setup_pid = int(subprocess.check_output(['xdotool', 'getwindowpid', str(setup_focus)], text=True, timeout=5).strip())
+    assert setup_focus == int(window) and setup_pid == pid, 'Inspector setup left the owned review window'
+    event({'event': 'native-review-inspector-setup', 'phase': 'before-close',
+           'window': setup_focus, 'pid': setup_pid, 'viewport': list(api['viewport']), 'binding': setup_before})
+    run(['xdotool', 'key', 'ctrl+shift+i'])
+    setup_after = wait(lambda: snapshot(lambda: inspector_setup(False)))
+    assert setup_after['controls']['pane_header']['name'] == setup_before['controls']['pane_header']['name']
+    event({'event': 'native-review-inspector-setup', 'phase': 'after-close',
+           'input': 'ctrl+shift+i', 'viewport': list(api['viewport']), 'binding': setup_after,
+           'state_evidence': 'Global panel tabs and resize handle removed; exact PR list and internal Hide review files control exposed.'})
     api['click'](pid, 'Review pull request #42 Synthetic discussion-count review')
     def owned_row():
         nodes = live_tree(pid)

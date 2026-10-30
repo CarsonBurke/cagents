@@ -828,6 +828,65 @@ def exercise_image_only(pid, window, root, label, receipt, before_loss):
         capture(window, label + '-tooltip-' + phase + '-returned-wide', (1280, 800), neutral_pointer=True)
         input_receipt('tooltip-' + phase + '-returned-wide', expected)
         assert observed_requests() == effects, 'Returning the tooltip viewport changed model/provider requests'
+    def inspector_setup(panel_visible):
+        # The toggle exposes no pressed/selected state. Observe the actual
+        # panel tabs and docked resize handle, alongside A's available column.
+        nodes = live_tree(pid)
+        controls = {}
+        for name, role, present in [
+            ('Toggle inspector — Ctrl+Shift+I', pyatspi.ROLE_PUSH_BUTTON, True),
+            ('Files panel tab', pyatspi.ROLE_PUSH_BUTTON, panel_visible),
+            ('Details panel tab', pyatspi.ROLE_PUSH_BUTTON, panel_visible),
+            ('Resize context inspector', pyatspi.ROLE_SEPARATOR, panel_visible),
+        ]:
+            matches = [node for node in nodes if node.name == name and node.getRole() == role and visible(node)]
+            assert len(matches) <= 1, ('Ambiguous native inspector setup control', name)
+            if len(matches) != int(present):
+                return None
+            if matches:
+                node = matches[0]
+                bounds = node.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+                if not (bounds.width > 0 and bounds.height > 0 and bounds.x >= 0 and bounds.y >= 0
+                        and bounds.x + bounds.width <= viewport[0] and bounds.y + bounds.height <= viewport[1]):
+                    return None
+                controls[name] = {'name': node.name, 'role': node.getRoleName(),
+                                  'bounds': [bounds.x, bounds.y, bounds.width, bounds.height],
+                                  'enabled': node.getState().contains(pyatspi.STATE_ENABLED)}
+        if not controls['Toggle inspector — Ctrl+Shift+I']['enabled']:
+            return None
+        value = binding()
+        if value is None:
+            return None
+        field = value.pop('field')
+        field.clearCache()
+        if (field.queryText().getText(0, -1) != ''
+                or not field.getState().contains(pyatspi.STATE_EDITABLE)
+                or not field.getState().contains(pyatspi.STATE_ENABLED)):
+            return None
+        left, right = value['column']
+        x, y, width, height = value['header_bounds']
+        if not (left <= x and x + width <= right and width > 0 and height > 0
+                and y >= 0 and y + height <= viewport[1]):
+            return None
+        # binding() requires a unique visible Ready sentinel and enabled,
+        # editable Message Entry wholly inside these actual column anchors.
+        return {'panel_controls_visible': panel_visible, 'controls': controls,
+                'ready_sentinel': ready, 'editor_text': '',
+                'editor_editable': field.getState().contains(pyatspi.STATE_EDITABLE),
+                'editor_enabled': field.getState().contains(pyatspi.STATE_ENABLED), **value}
+    setup_before = wait(lambda: accessibility_snapshot(lambda: inspector_setup(True)))
+    setup_focus = int(subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip())
+    setup_pid = int(subprocess.check_output(['xdotool', 'getwindowpid', str(setup_focus)], text=True, timeout=5).strip())
+    assert setup_focus == int(window) and setup_pid == pid, 'Inspector setup left the owned A window'
+    event({'event': 'image-only-inspector-setup', 'phase': 'before-close',
+           'window': setup_focus, 'pid': setup_pid, 'viewport': list(viewport), 'binding': setup_before})
+    run(['xdotool', 'key', 'ctrl+shift+i'])  # Match ordinary arms before any image input.
+    setup_after = wait(lambda: accessibility_snapshot(lambda: inspector_setup(False)))
+    assert setup_after['header'] == setup_before['header']
+    assert setup_after['resize_anchor'] == setup_before['resize_anchor']
+    event({'event': 'image-only-inspector-setup', 'phase': 'after-close',
+           'input': 'ctrl+shift+i', 'viewport': list(viewport), 'binding': setup_after,
+           'state_evidence': 'Visible panel tabs and resize handle removed; A header, Ready sentinel and empty editable Entry exposed.'})
     wait(lambda: (field := composer()) is not None and field.queryText().getText(0, -1) == '')
     bootstrap = image_only_observation(root, label, 'bootstrap')
     sources = {card: value['source'] for card, value in bootstrap['cards'].items()}
