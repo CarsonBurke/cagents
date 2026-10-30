@@ -1140,6 +1140,138 @@ pub enum GitHeadGuard {
     Commit(Oid),
 }
 
+/// The original local destination a rendered History mutation was offered for.
+///
+/// Directory descriptors keep the original inodes alive while an action waits
+/// in the queue. This value is deliberately not serializable: a deserialized
+/// snapshot cannot manufacture authority to mutate a local checkout.
+///
+/// Checking this witness rejects a destination changed while work was queued.
+/// It is not an atomic Git compare-and-swap: the application queue serializes
+/// its own operations, but an external checkout can still race the final check
+/// and Git's writes. Callers must not describe this as excluding external Git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryDestination {
+    roots: HistoryDestinationRoots,
+    head: HeadState,
+}
+
+#[derive(Clone)]
+struct HistoryDirectory {
+    path: PathBuf,
+    root: Arc<fs_safety::Root>,
+    identity: (u64, u64),
+}
+
+impl fmt::Debug for HistoryDirectory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HistoryDirectory")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
+
+impl PartialEq for HistoryDirectory {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.identity == other.identity
+    }
+}
+
+impl Eq for HistoryDirectory {}
+
+impl HistoryDirectory {
+    fn open(path: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        // Root::open also refuses UI remote paths before any local lookup.
+        let root = fs_safety::Root::open(path)?;
+        crate::secure_file::reject_symlink_components(path)?;
+        let path = fs::canonicalize(path)?;
+        let held = root.metadata()?;
+        let named = fs::symlink_metadata(&path)?;
+        if !named.is_dir() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+            return Err(io::Error::other("History destination directory changed"));
+        }
+        Ok(Self {
+            path,
+            root: Arc::new(root),
+            identity: (held.dev(), held.ino()),
+        })
+    }
+
+    fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        let file = match fs_safety::open_beneath(&self.root, Path::new(name)) {
+            Ok(file) => file,
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(error) => return Err(io::Error::other(error.to_string())),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("History metadata is not a regular file"));
+        }
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes)?;
+        if bytes.len() > 4096 {
+            return Err(io::Error::other("History metadata exceeds its size limit"));
+        }
+        Ok(Some(bytes))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryDestinationRoots {
+    worktree: HistoryDirectory,
+    git_dir: HistoryDirectory,
+    common_dir: HistoryDirectory,
+    raw_head: Vec<u8>,
+}
+
+impl HistoryDestinationRoots {
+    fn capture(worktree: &Path) -> io::Result<Self> {
+        let worktree = HistoryDirectory::open(worktree)?;
+        let marker = fs_safety::metadata_beneath(&worktree.root, Path::new(".git"))
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        let git_path = if marker.is_dir() {
+            worktree.path.join(".git")
+        } else {
+            let bytes = worktree
+                .read(".git")?
+                .ok_or_else(|| io::Error::other("History Git directory is missing"))?;
+            let relative = bytes
+                .strip_prefix(b"gitdir: ")
+                .ok_or_else(|| io::Error::other("History Git directory is invalid"))?;
+            worktree.path.join(bytes_to_path(trim_one_line_ending(relative)))
+        };
+        let git_dir = HistoryDirectory::open(&git_path)?;
+        let common_dir = match git_dir.read("commondir")? {
+            Some(bytes) => HistoryDirectory::open(
+                &git_dir.path.join(bytes_to_path(trim_one_line_ending(&bytes))),
+            )?,
+            None => git_dir.clone(),
+        };
+        let raw_head = git_dir
+            .read("HEAD")?
+            .ok_or_else(|| io::Error::other("History HEAD is missing"))?;
+        Ok(Self {
+            worktree,
+            git_dir,
+            common_dir,
+            raw_head,
+        })
+    }
+}
+
+fn history_head_matches(raw: &[u8], head: &HeadState) -> bool {
+    let raw = trim_one_line_ending(raw);
+    match head {
+        HeadState::Branch { name, .. } | HeadState::Unborn { branch: Some(name) } => {
+            raw == format!("ref: refs/heads/{name}").as_bytes()
+        }
+        HeadState::Detached { oid } => raw == oid.as_bytes(),
+        HeadState::Unborn { branch: None } | HeadState::Unknown => false,
+    }
+}
+
 /// Commands share cancellation, ordering, failure output and refresh semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitOperation {
@@ -1182,10 +1314,12 @@ pub enum GitOperation {
     RevertCommit {
         oid: Oid,
         mainline: Option<u32>,
+        destination: HistoryDestination,
     },
     CherryPick {
         oid: Oid,
         mainline: Option<u32>,
+        destination: HistoryDestination,
     },
     CreateBranch {
         oid: Oid,
@@ -1262,6 +1396,9 @@ pub fn scan_conflict_markers(
 /// Everything the source-control surfaces need about one worktree in one shot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
+    /// Local, retained authority only; serialized/remote snapshots cannot grant it.
+    #[serde(skip)]
+    pub history_destination: Option<HistoryDestination>,
     #[serde(default)]
     pub operation: Option<GitOperationState>,
     #[serde(default)]
@@ -4219,6 +4356,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         cache: &mut SnapshotCache,
     ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
+        // Pin the original namespace before status, not at enqueue/dequeue.
+        // Failure leaves History read-only and never weakens ordinary snapshots.
+        let history_roots = HistoryDestinationRoots::capture(worktree).ok();
         let admin = snapshot_admin_fingerprint(worktree);
         if !cache.admin.is_empty() && cache.admin != admin {
             cache.invalidate(true);
@@ -4353,7 +4493,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cache.admin = admin;
         cache.digest = Some(digest);
         cache.dirty = false;
+        let history_destination = history_roots.and_then(|roots| {
+            let destination = HistoryDestination {
+                roots,
+                head: status.head.clone(),
+            };
+            self.history_destination_is_current(worktree, &destination, cancellation)
+                .ok()
+                .filter(|current| *current)
+                .map(|_| destination)
+        });
         Ok(Some(RepositorySnapshot {
+            history_destination,
             operation: control.operation.clone(),
             stashes: control.stashes.clone(),
             last_fetch_unix_ms: control.last_fetch_unix_ms,
@@ -4484,6 +4635,37 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(entries)
     }
 
+    fn history_destination_is_current(
+        &self,
+        worktree: &Path,
+        destination: &HistoryDestination,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let same_roots = || {
+            HistoryDestinationRoots::capture(worktree)
+                .is_ok_and(|roots| roots == destination.roots)
+        };
+        if !history_head_matches(&destination.roots.raw_head, &destination.head) || !same_roots() {
+            return Ok(false);
+        }
+        if self.git_dir(worktree, cancellation)? != destination.roots.git_dir.path
+            || self.common_dir(worktree, cancellation)? != destination.roots.common_dir.path
+        {
+            return Ok(false);
+        }
+        let expected = match &destination.head {
+            HeadState::Branch { oid, .. } | HeadState::Detached { oid } => {
+                let Ok(oid) = Oid::parse_object(oid) else {
+                    return Ok(false);
+                };
+                Some(oid)
+            }
+            HeadState::Unborn { .. } => None,
+            HeadState::Unknown => return Ok(false),
+        };
+        Ok(self.resolve_head(worktree, cancellation)? == expected && same_roots())
+    }
+
     /// Execute a non-path mutation under the same worktree lifetime protection
     /// as commit/push. On failure the next snapshot reads any conflict state.
     pub fn git_operation(
@@ -4494,6 +4676,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<MutationOutcome, RepositoryError> {
         let _protection = crate::worktree_cleanup::protect(worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
+        if let GitOperation::RevertCommit { destination, .. }
+        | GitOperation::CherryPick { destination, .. } = operation
+        {
+            if !self.history_destination_is_current(worktree, destination, cancellation)? {
+                return Ok(MutationOutcome::NotApplied {
+                    failure: MutationFailure::Rejected {
+                        reason: "The History destination changed; refresh it before trying again".into(),
+                    },
+                });
+            }
+        }
         if let GitOperation::ApplyPatch {
             expected_head: Some(expected),
             ..
@@ -4752,8 +4945,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 }
                 command.arg("-").stdin(patch.clone())
             }
-            GitOperation::RevertCommit { oid, mainline }
-            | GitOperation::CherryPick { oid, mainline } => {
+            GitOperation::RevertCommit { oid, mainline, .. }
+            | GitOperation::CherryPick { oid, mainline, .. } => {
                 if *mainline == Some(0) {
                     return Ok(MutationOutcome::NotApplied {
                         failure: MutationFailure::Rejected {
@@ -8208,6 +8401,34 @@ mod tests {
     }
 
     #[test]
+    fn history_head_observation_keeps_equal_tip_branches_distinct() {
+        let oid = "a".repeat(40);
+        let branch = |name: &str| HeadState::Branch {
+            name: name.into(),
+            oid: oid.clone(),
+        };
+        assert!(history_head_matches(b"ref: refs/heads/A\n", &branch("A")));
+        assert!(!history_head_matches(b"ref: refs/heads/A\n", &branch("B")));
+        assert!(!history_head_matches(
+            b"ref: refs/heads/A\n",
+            &HeadState::Detached { oid: oid.clone() },
+        ));
+        assert!(history_head_matches(
+            oid.as_bytes(),
+            &HeadState::Detached { oid: oid.clone() },
+        ));
+        assert!(!history_head_matches(b"ref: refs/heads/A\n", &HeadState::Unknown));
+        assert!(history_head_matches(
+            b"ref: refs/heads/A\n",
+            &HeadState::Unborn { branch: Some("A".into()) },
+        ));
+        assert!(!history_head_matches(
+            b"ref: refs/heads/A\n",
+            &HeadState::Unborn { branch: None },
+        ));
+    }
+
+    #[test]
     fn parses_worktree_porcelain_and_ignores_future_fields() {
         let input = b"worktree /repo\0HEAD 0123456789012345678901234567890123456789\0branch refs/heads/main\0locked reason\0future value\0\0worktree /repo/wt\0HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0detached\0prunable missing\0\0";
         let records = parse_worktree_list(input).unwrap();
@@ -8730,11 +8951,16 @@ mod tests {
                 assert_eq!(found[0].oid, source);
                 assert!(found[0].body.contains("Multiline body"));
             }
-            assert!(matches!(service.git_operation(&target, &GitOperation::CherryPick { oid: source.clone(), mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            let destination_snapshot = service.snapshot(&target, &cancel).unwrap();
+            let serialized = serde_json::to_vec(&destination_snapshot).unwrap();
+            let restored: RepositorySnapshot = serde_json::from_slice(&serialized).unwrap();
+            assert!(restored.history_destination.is_none(),
+                "serialized data cannot grant local History mutation authority");
+            assert!(matches!(service.git_operation(&target, &GitOperation::CherryPick { oid: source.clone(), mainline: None, destination: destination_snapshot.history_destination.unwrap() }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
             assert_eq!(fs::read(target.join("agent-change.txt")).unwrap(), b"selected agent change\n");
             let picked = service.resolve_head(&target, &cancel).unwrap().unwrap();
             assert_ne!(picked, source);
-            assert!(matches!(service.git_operation(&target, &GitOperation::RevertCommit { oid: picked, mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert!(matches!(service.git_operation(&target, &GitOperation::RevertCommit { oid: picked, mainline: None, destination: service.snapshot(&target, &cancel).unwrap().history_destination.unwrap() }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
             assert!(!target.join("agent-change.txt").exists());
             assert_eq!(fs::read(target.join("target-only.txt")).unwrap(), b"preserve target\n");
             assert!(root.join("agent-change.txt").exists());
@@ -9797,6 +10023,7 @@ mod tests {
         // The join the two fields exist for: every branch of a remote that has
         // a pointer finds that remote's own pointer, and never another's.
         let snapshot = RepositorySnapshot {
+            history_destination: None,
             operation: None,
             stashes: Vec::new(),
             last_fetch_unix_ms: None,

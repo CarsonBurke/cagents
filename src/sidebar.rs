@@ -1895,6 +1895,9 @@ pub struct SourceControlModel {
     /// read. History is a walk from `HEAD`, so a `HEAD` that moved invalidates
     /// every page already loaded.
     pub head_oid: Option<Box<str>>,
+    /// Original destination authority captured by the snapshot worker, retained
+    /// by rendered History actions rather than recaptured when a queue drains.
+    pub history_destination: Option<crate::repository::HistoryDestination>,
     /// True only for an unborn `HEAD`. That is the one state in which "no
     /// commits yet" is a true statement about a repository; a `HEAD` this
     /// surface could not read is not that state and must not be reported as it.
@@ -2061,6 +2064,7 @@ impl SourceControlModel {
             branch: None,
             detached: false,
             head_oid: None,
+            history_destination: None,
             unborn: false,
             upstream: None,
             up_to_date: false,
@@ -2199,6 +2203,7 @@ impl SourceControlModel {
             data_state: SidebarDataState::Ready,
             detached: matches!(snapshot.status.head, HeadState::Detached { .. }),
             head_oid,
+            history_destination: snapshot.history_destination.clone(),
             unborn,
             upstream: upstream_push_target(snapshot),
             up_to_date: matches!(
@@ -3902,7 +3907,7 @@ pub enum SidebarAction {
     },
     HistoryQueryChanged { key: ActiveWorktreeKey, query: String },
     SearchHistory { key: ActiveWorktreeKey, query: String },
-    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand, mainline: Option<u32>, message: Arc<str> },
+    HistoryCommand { key: ActiveWorktreeKey, oid: Oid, command: HistoryCommand, mainline: Option<u32>, message: Arc<str>, destination: Option<crate::repository::HistoryDestination> },
     HistoryBranchChanged { key: ActiveWorktreeKey, name: String },
     CancelHistoryBranch,
     CreateHistoryBranch { key: ActiveWorktreeKey, oid: Oid, name: ValidatedBranchName },
@@ -6525,16 +6530,16 @@ fn context_controls<'a>(
 pub enum HistoryCommand { CopySha, CopyMessage, NewWorktree, CreateBranch, Revert, CherryPick }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand }
+struct HistoryContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a CommitRow, command: HistoryCommand, destination: Option<&'a crate::repository::HistoryDestination> }
 
 impl widget::menu::Action for HistoryContextCommand<'_> {
     type Message = SidebarAction;
     fn message(&self) -> SidebarAction {
-        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message) }
+        SidebarAction::HistoryCommand { key: self.key.clone(), oid: self.row.oid.clone(), command: self.command, mainline: self.row.mainline, message: Arc::clone(&self.row.message), destination: self.destination.cloned() }
     }
 }
 
-fn history_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a CommitRow, blocked: bool) -> Element<'a, SidebarAction> {
+fn history_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a CommitRow, destination: Option<&'a crate::repository::HistoryDestination>, blocked: bool) -> Element<'a, SidebarAction> {
     if blocked { return content; }
     let entries = [
         ("Copy SHA", HistoryCommand::CopySha),
@@ -6543,7 +6548,7 @@ fn history_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a Ac
         ("Create branch here…", HistoryCommand::CreateBranch),
         (if row.mainline.is_some() { "Revert commit (first parent)" } else { "Revert commit" }, HistoryCommand::Revert),
         (if row.mainline.is_some() { "Cherry-pick into this worktree (first parent)" } else { "Cherry-pick into this worktree" }, HistoryCommand::CherryPick),
-    ].into_iter().map(|(label, command)| widget::menu::Item::Button(label.to_owned(), None, HistoryContextCommand { key, row, command })).collect();
+    ].into_iter().map(|(label, command)| widget::menu::Item::Button(label.to_owned(), None, HistoryContextCommand { key, row, command, destination })).collect();
     crate::interaction::context_menu(content, widget::menu::items(&std::collections::HashMap::new(), entries))
 }
 
@@ -9492,7 +9497,7 @@ fn history_section<'a>(
                 modal_open,
             ))
             .width(Length::Fill),
-        ), key, row, modal_open));
+        ), key, row, source.history_destination.as_ref(), modal_open));
     }
     column = column.push(rows);
     column = column.push(slot((!source.history_complete && !source.unborn).then(
@@ -16139,6 +16144,7 @@ pub(crate) mod tests {
     /// the four change areas and one unmeasured (binary) count.
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
+            history_destination: None,
             operation: None,
             stashes: Vec::new(),
             last_fetch_unix_ms: None,
@@ -16382,6 +16388,7 @@ pub(crate) mod tests {
         let mut source = SourceControlModel::ready(
             main_key(),
             &RepositorySnapshot {
+                history_destination: None,
                 operation: None,
                 stashes: Vec::new(),
                 last_fetch_unix_ms: None,
@@ -17754,7 +17761,7 @@ pub(crate) mod tests {
         let identity = CommitIdentity { name: "Author".into(), email: "author@example.invalid".into(), timestamp: 0, offset_minutes: 0 };
         let row = CommitRow::new(&CommitSummary { oid: oid_of(3), parents: vec![oid_of(1), oid_of(2)], author: identity.clone(), committer: identity, subject: "Merge subject".into(), body: "Body line\n".into() });
         let key = main_key();
-        let action = widget::menu::Action::message(&HistoryContextCommand { key: &key, row: &row, command: HistoryCommand::Revert });
+        let action = widget::menu::Action::message(&HistoryContextCommand { key: &key, row: &row, command: HistoryCommand::Revert, destination: None });
         let message = Arc::clone(&row.message);
         drop(row);
         let SidebarAction::HistoryCommand { oid, mainline, message: captured, .. } = action else { panic!("expected a history command"); };

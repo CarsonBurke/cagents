@@ -4725,7 +4725,8 @@ fn git_operation_history_revert_cherry_pick_and_branch() {
                 &fixture.work(),
                 &GitOperation::CherryPick {
                     oid: incoming,
-                    mainline: None
+                    mainline: None,
+                    destination: fixture.snapshot().history_destination.expect("local destination"),
                 },
                 &cancellation
             )
@@ -4742,7 +4743,8 @@ fn git_operation_history_revert_cherry_pick_and_branch() {
                 &fixture.work(),
                 &GitOperation::RevertCommit {
                     oid: fixture.head(),
-                    mainline: None
+                    mainline: None,
+                    destination: fixture.snapshot().history_destination.expect("local destination"),
                 },
                 &cancellation
             )
@@ -4871,6 +4873,57 @@ fn git_operation_sync_handles_divergence_rebase_and_conflict_handoff() {
 }
 
 #[test]
+fn history_destination_refuses_replaced_worktree_or_git_admin_namespace() {
+    use cagents::repository::GitOperation;
+    for replace_admin_only in [false, true] {
+        let fixture = Fixture::new().expect("Git is required for the destination regression");
+        fixture.write("file.txt", b"base\n");
+        fixture.git_in_work(&["add", "file.txt"]);
+        fixture.commit("base");
+        fixture.write("file.txt", b"incoming\n");
+        fixture.git_in_work(&["add", "file.txt"]);
+        let target = fixture.commit("incoming");
+        let original = fixture.snapshot().history_destination.expect("original local destination");
+        let saved = fixture.root.path().join("retained-original");
+        if replace_admin_only {
+            let replacement = fixture.root.path().join("replacement");
+            fixture.run(fixture.root.path(), &[
+                OsStr::new("clone"), OsStr::new("--quiet"), OsStr::new("--no-hardlinks"),
+                fixture.work().as_os_str(), replacement.as_os_str(),
+            ]);
+            fs::rename(fixture.work().join(".git"), &saved).unwrap();
+            fs::rename(replacement.join(".git"), fixture.work().join(".git")).unwrap();
+        } else {
+            fs::rename(fixture.work(), &saved).unwrap();
+            fixture.run(fixture.root.path(), &[
+                OsStr::new("clone"), OsStr::new("--quiet"), OsStr::new("--no-hardlinks"),
+                saved.as_os_str(), fixture.work().as_os_str(),
+            ]);
+        }
+        assert_eq!(fixture.head(), target, "the replacement deliberately has equal HEAD");
+        let refs = fixture.git_in_work(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+        let head = fs::read(fixture.work().join(".git/HEAD")).unwrap();
+        let index = fs::read(fixture.work().join(".git/index")).unwrap();
+        let contents = fs::read(fixture.work().join("file.txt")).unwrap();
+        let outcome = fixture.service().git_operation(
+            &fixture.work(),
+            &GitOperation::RevertCommit { oid: target, mainline: None, destination: original },
+            &CancellationToken::new(),
+        ).unwrap();
+        assert!(matches!(outcome, MutationOutcome::NotApplied {
+            failure: MutationFailure::Rejected { ref reason }
+        } if reason.contains("destination")));
+        assert_eq!(fs::read(fixture.work().join(".git/HEAD")).unwrap(), head);
+        assert_eq!(fs::read(fixture.work().join(".git/index")).unwrap(), index);
+        assert_eq!(fs::read(fixture.work().join("file.txt")).unwrap(), contents);
+        assert_eq!(fixture.git_in_work(&["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+        for marker in ["CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_HEAD", "sequencer"] {
+            assert!(!fixture.work().join(".git").join(marker).exists());
+        }
+    }
+}
+
+#[test]
 fn git_operation_explicit_merge_parent_and_patch_application() {
     use cagents::repository::GitOperation;
     let Some(fixture) = Fixture::new() else {
@@ -4894,7 +4947,8 @@ fn git_operation_explicit_merge_parent_and_patch_application() {
                 &fixture.work(),
                 &GitOperation::RevertCommit {
                     oid: merge.clone(),
-                    mainline: Some(1)
+                    mainline: Some(1),
+                    destination: fixture.snapshot().history_destination.expect("local destination"),
                 },
                 &cancellation
             )
@@ -4908,7 +4962,8 @@ fn git_operation_explicit_merge_parent_and_patch_application() {
                 &fixture.work(),
                 &GitOperation::CherryPick {
                     oid: merge,
-                    mainline: Some(1)
+                    mainline: Some(1),
+                    destination: fixture.snapshot().history_destination.expect("local destination"),
                 },
                 &cancellation
             )

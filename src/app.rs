@@ -14811,7 +14811,7 @@ impl Application for Cagents {
                         Self::source_control_history_task(self.history_ui.next_page_request(), key,
                             Some(head), 0, query, self.history_ui.page_cancellation())
                     }
-                    SidebarAction::HistoryCommand { key, oid, command, mainline, message } => {
+                    SidebarAction::HistoryCommand { key, oid, command, mainline, message, destination } => {
                         if !self.source_control_is_bound(&key) { return Task::none(); }
                         match command {
                             sidebar::HistoryCommand::CopySha => iced::clipboard::write(oid.as_str().to_owned()).map(cosmic::Action::App),
@@ -14821,8 +14821,20 @@ impl Application for Cagents {
                                 self.open_worktree_dialog(key.project_id, project.repository.clone(), WorktreeDraft { base: oid.as_str().to_owned(), ..WorktreeDraft::default() }, None)
                             }
                             sidebar::HistoryCommand::CreateBranch => Task::none(),
-                            sidebar::HistoryCommand::Revert => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::RevertCommit { oid, mainline } })),
-                            sidebar::HistoryCommand::CherryPick => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::CherryPick { oid, mainline } })),
+                            sidebar::HistoryCommand::Revert | sidebar::HistoryCommand::CherryPick => {
+                                let Some(destination) = destination else {
+                                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                                        source.error = Some("This view cannot verify where to apply the commit. Open Changes on the worktree's local device, refresh it, then choose the commit again.".into());
+                                    }
+                                    return Task::none();
+                                };
+                                let operation = if command == sidebar::HistoryCommand::Revert {
+                                    crate::repository::GitOperation::RevertCommit { oid, mainline, destination }
+                                } else {
+                                    crate::repository::GitOperation::CherryPick { oid, mainline, destination }
+                                };
+                                cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation }))
+                            }
                         }
                     }
                     SidebarAction::CreateHistoryBranch { key, oid, name } => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::CreateBranch { oid, name } })),
@@ -28157,6 +28169,189 @@ mod tests {
         );
         let _ = project;
     }
+    fn history_queue_fixture_git(worktree: &Path, arguments: &[&str]) -> Vec<u8> {
+        let output = std::process::Command::new("git")
+            .current_dir(worktree)
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "History Contract")
+            .env("GIT_AUTHOR_EMAIL", "history@example.invalid")
+            .env("GIT_COMMITTER_NAME", "History Contract")
+            .env("GIT_COMMITTER_EMAIL", "history@example.invalid")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .output()
+            .expect("fixture Git must run");
+        assert!(output.status.success(), "fixture Git {arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+        output.stdout
+    }
+
+    async fn one_history_queue_message(task: Task<Message>) -> Message {
+        let mut stream = iced::runtime::task::into_stream(task).expect("one real queue task");
+        let mut message = None;
+        while let Some(action) = stream.next().await {
+            let iced::runtime::Action::Output(cosmic::Action::App(next)) = action else {
+                panic!("unexpected non-message queue task effect");
+            };
+            assert!(message.replace(next).is_none(), "a queue task completed twice");
+        }
+        message.expect("queue task must complete")
+    }
+
+    async fn exercise_history_queue_destination(cherry_pick: bool, switch_branch: bool) {
+        // The scheduled fixture lane also isolates Git's global/system config
+        // for the production worker, which deliberately uses its normal service.
+        // No provider, daemon, desktop or developer checkout is involved.
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().canonicalize().unwrap();
+        history_queue_fixture_git(&worktree, &["init", "--quiet", "-b", "main"]);
+        for (name, value) in [
+            ("user.name", "History Contract"),
+            ("user.email", "history@example.invalid"),
+            ("commit.gpgsign", "false"),
+            ("core.hooksPath", "/dev/null"),
+            ("core.fsmonitor", "false"),
+        ] {
+            history_queue_fixture_git(&worktree, &["config", name, value]);
+        }
+        std::fs::write(worktree.join("file.txt"), b"base\n").unwrap();
+        history_queue_fixture_git(&worktree, &["add", "file.txt"]);
+        history_queue_fixture_git(&worktree, &["commit", "--quiet", "-m", "base"]);
+        if cherry_pick {
+            history_queue_fixture_git(&worktree, &["switch", "--quiet", "-c", "incoming"]);
+        }
+        std::fs::write(worktree.join("file.txt"), b"incoming\n").unwrap();
+        history_queue_fixture_git(&worktree, &["add", "file.txt"]);
+        history_queue_fixture_git(&worktree, &["commit", "--quiet", "-m", "incoming"]);
+        let source_oid = crate::repository::Oid::parse_object(
+            String::from_utf8(history_queue_fixture_git(&worktree, &["rev-parse", "HEAD"])).unwrap().trim(),
+        ).unwrap();
+        if cherry_pick {
+            history_queue_fixture_git(&worktree, &["switch", "--quiet", "main"]);
+        }
+        history_queue_fixture_git(&worktree, &["branch", "equal-tip"]);
+        let service = RepositoryService::system("git");
+        let snapshot = service.snapshot(&worktree, &CancellationToken::new()).unwrap();
+        let original = snapshot.history_destination.clone().expect("original local destination");
+        let original_head = service.resolve_head(&worktree, &CancellationToken::new()).unwrap().unwrap();
+
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        let mut key = app.sidebar_model.source_control.as_ref().unwrap().key.clone();
+        key.canonical_path = worktree.clone();
+        let repository_id = app.sidebar_model.projects[0].repository_id;
+        app.sidebar_model = sidebar::SidebarModel::ready(sidebar::SidebarMode::Expanded, vec![
+            sidebar::SidebarProject::new(key.project_id, repository_id, "History fixture".into(), worktree.clone(), vec![
+                sidebar::SidebarWorktree::new(key.worktree_id, worktree.clone(), Some("main".into()), false, false, Some(snapshot.status.dirty.clone()), None, None),
+            ], Vec::new()),
+        ]).with_source_control(Some(sidebar::SourceControlModel::ready(key.clone(), &snapshot)));
+        assert!(app.sidebar_state.sync_active_worktree(&app.sidebar_model, &sidebar::SidebarFocus::Repository { worktree: worktree.clone() }));
+        assert!(sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state).is_some());
+        assert_eq!(app.sidebar_state.active_worktree(), Some(&key));
+        app.active_workspace = Some(worktree.clone());
+        let held = app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Operation(
+            crate::repository::GitOperation::CreateBranch {
+                oid: original_head.clone(),
+                name: crate::repository::ValidatedBranchName::parse("queue-marker").unwrap(),
+            },
+        ));
+        let first_operation = app.source_control_mutations[&worktree].id;
+        let action = SidebarAction::HistoryCommand {
+            key: key.clone(), oid: source_oid, mainline: None, message: "incoming".into(),
+            command: if cherry_pick { sidebar::HistoryCommand::CherryPick } else { sidebar::HistoryCommand::Revert },
+            destination: Some(original.clone()),
+        };
+        // Deliver the real History effect while the earlier normal operation
+        // is unpolled. Its resulting Git operation must join the existing queue.
+        let history = app.update(Message::Sidebar(action));
+        let enqueue = one_history_queue_message(history).await;
+        drop(app.update(enqueue));
+        let active = &app.source_control_mutations[&worktree];
+        assert_eq!(active.id, first_operation);
+        assert_eq!(active.pending.len(), 1);
+        let QueuedGitMutation::Operation(operation) = &active.pending[0] else { panic!("queued History operation"); };
+        let (crate::repository::GitOperation::RevertCommit { destination, .. }
+            | crate::repository::GitOperation::CherryPick { destination, .. }) = operation else { panic!("captured commit operation"); };
+        assert_eq!(destination, &original, "queue must retain the rendered witness");
+        if switch_branch {
+            history_queue_fixture_git(&worktree, &["switch", "--quiet", "equal-tip"]);
+        }
+        assert_eq!(service.resolve_head(&worktree, &CancellationToken::new()).unwrap(), Some(original_head.clone()));
+
+        // Finish the earlier real service operation, then pause at the normal
+        // completion-to-next-task seam before the History worker starts.
+        let completed = one_history_queue_message(held).await;
+        assert!(matches!(&completed, Message::SourceControlMutated { operation, report: None, .. } if *operation == first_operation));
+        let next = app.update(completed);
+        assert!(app.source_control_mutations[&worktree].pending.is_empty());
+        let refs = history_queue_fixture_git(&worktree, &["for-each-ref", "--format=%(refname) %(objectname)"]);
+        let index = std::fs::read(worktree.join(".git/index")).unwrap();
+        let head = std::fs::read(worktree.join(".git/HEAD")).unwrap();
+        let contents = std::fs::read(worktree.join("file.txt")).unwrap();
+        let completed = one_history_queue_message(next).await;
+        let Message::SourceControlMutated { report, .. } = &completed else { panic!("real History worker completion"); };
+        if switch_branch {
+            assert!(report.as_ref().is_some_and(|text| text.to_ascii_lowercase().contains("destination")), "{report:?}");
+            assert_eq!(std::fs::read(worktree.join(".git/index")).unwrap(), index);
+            assert_eq!(std::fs::read(worktree.join(".git/HEAD")).unwrap(), head);
+            assert_eq!(std::fs::read(worktree.join("file.txt")).unwrap(), contents);
+            assert_eq!(history_queue_fixture_git(&worktree, &["for-each-ref", "--format=%(refname) %(objectname)"]), refs);
+        } else {
+            assert!(report.is_none(), "unchanged destination must execute: {report:?}");
+            assert_ne!(service.resolve_head(&worktree, &CancellationToken::new()).unwrap(), Some(original_head.clone()));
+            assert_eq!(std::fs::read(worktree.join("file.txt")).unwrap(), if cherry_pick { b"incoming\n".as_slice() } else { b"base\n".as_slice() });
+            assert_eq!(history_queue_fixture_git(&worktree, &["rev-parse", "equal-tip"]), format!("{original_head}\n").as_bytes());
+        }
+        for marker in ["CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_HEAD", "sequencer"] {
+            assert!(!worktree.join(".git").join(marker).exists(), "no stale operation state: {marker}");
+        }
+        // Apply the normal completion, retaining the visible refusal. The
+        // subsequent refresh is intentionally unpolled, not a service retry.
+        drop(app.update(completed));
+        assert!(app.source_control_mutations.is_empty());
+        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().error.is_some(), switch_branch);
+    }
+
+    #[test]
+    fn queued_history_actions_refuse_an_equal_tip_destination_branch_switch() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for cherry_pick in [false, true] {
+                exercise_history_queue_destination(cherry_pick, true).await;
+            }
+        });
+    }
+
+    #[test]
+    fn queued_history_actions_apply_to_the_unchanged_original_destination() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for cherry_pick in [false, true] {
+                exercise_history_queue_destination(cherry_pick, false).await;
+            }
+        });
+    }
+
+    #[test]
+    fn history_write_without_original_destination_reports_recovery_without_queueing() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        assert!(sidebar::bound_source_control(&app.sidebar_model, &app.sidebar_state).is_some());
+        let key = app.sidebar_model.source_control.as_ref().unwrap().key.clone();
+        for command in [sidebar::HistoryCommand::Revert, sidebar::HistoryCommand::CherryPick] {
+            let task = app.update(Message::Sidebar(SidebarAction::HistoryCommand {
+                key: key.clone(), oid: crate::repository::Oid::parse_object("ab".repeat(20)).unwrap(),
+                mainline: None, message: "unavailable authority".into(), command, destination: None,
+            }));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            assert!(app.source_control_mutations.is_empty());
+            assert!(app.sidebar_model.source_control.as_ref().unwrap().error.as_deref().is_some_and(|text| text.contains("worktree's local device")));
+        }
+    }
+
     #[test]
     fn git_mutation_queue_keeps_ten_clicks_and_refreshes_once_at_drain() {
         let mut app = context_inspector_test_app(false);
