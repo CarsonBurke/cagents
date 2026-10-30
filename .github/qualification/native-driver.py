@@ -811,7 +811,7 @@ def exercise_image_only(pid, window, root, label, receipt, before_loss):
                     return owners[0] if owners else None
                 observed_owner = wait(lambda: accessibility_snapshot(captured_owner))
                 assert observed_owner == owner, 'Capture moved or changed the actual tooltip owner'
-                assert chip() and no_pending_paste()
+                assert accessibility_snapshot(lambda: chip() and no_pending_paste())
                 event({'event': 'native-tooltip-dwell', 'phase': phase, 'kind': kind,
                        'viewport': list(size), 'owner': owner, 'pointer': location,
                        'captured_owner': observed_owner, 'captured_pointer': actual_pointer,
