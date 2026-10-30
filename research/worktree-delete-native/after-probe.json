@@ -3,7 +3,7 @@
   "mode": "AFTER_ONLY_CANCEL_NO_REMOVE",
   "never_merge": true,
   "status": "CORRECTIVE_SOURCE_CANDIDATE_FROZEN_HELPER_FRESH_CALLER_REVIEW_REQUIRED_UNGRANTED_UNRUN",
-  "parent_control_head": "ab3f335a8910838edc6f03fe83c659bd3476cee0",
+  "parent_control_head": "e5df18083991feeef58fd054de500afd404ef822",
   "after": {
     "head": "24d0474e250bcc4acc0958cf3abbf53ee1125581",
     "tree": "7d84da268933045b1add2ad310ce45c84be751db"
@@ -246,8 +246,8 @@
     "status": "FROZEN_SHARED_CAPSULE_FRESH_REVIEW_REQUIRED",
     "author": "/root/editor_recovery",
     "source": ".github/qualification/native-return-terminal-primitives.py",
-    "helper_head": "2b30c85569a0fc1d0a569359ec765eb60471b1e4",
-    "helper_sha256": "659324372442c46b56fc3a76bb9b995eef2a45cb0abdbefc24b793a504e8309a",
+    "helper_head": "9c45e8e503386d91001bb31056447e9a78073d2e",
+    "helper_sha256": "44e41a68f92daa76662f33f49669de2414b8c2299744c7b19187e6120bee7e3e",
     "contract": "Refuse all inherited desktop/session/accessibility endpoints unchanged. Prove owned authenticated Xvfb/displayfd/cookie/PID-start/executable/socket/auth inode plus private session and accessibility buses before any desktop client/settings/import/input. No external wrapper, hosted flag or README may substitute for custody.",
     "user_prohibition": "Never connect to, read, mutate, focus or inject into any live user desktop/input/clipboard/state. Private owned fixture resources only; no endpoint fallback.",
     "caller_scope": "Minimal bootstrap/isolation/caller absolute deadline and effect guards. Preserve Cancel-only fixture flow,39 planned frames,7 conservation checkpoints,4 synthetic terminal IDs and all product pins.",
@@ -261,13 +261,13 @@
     "review": "Fresh exact successor source review required before any actual EC lease.",
     "runtime_path": ".github/qualification/native-worktree-delete-runtime.py",
     "runtime_binding": "Exact shared29def capsule owns scan/live/close_owned and pidfd admission/signals/original-wait release; same original OWNED/CHILDREN/EVENTS and same PIDFDS/PIDFD_FAILURES, no numeric signal/reap fallback. PR1984 binding supplies original absolute work/final/cleanup budget and source/input guards only.",
-    "helper_tree": "49419314e9c18a54e7e221bbc71c07e223f4d47d",
+    "helper_tree": "bfc07242e1e65c62d5c7d9049a83c8e13b2e431c",
     "capsule_path": ".github/qualification/native-worktree-delete-private-desktop.py",
-    "capsule_sha256": "e711a1319ec37721f8e9701d198940df9445d378850c0cde680e911094ccd71d",
-    "contract_path": "/tmp/coord-b9-1994-isolation-dl1-evidence/integration-contract.json",
-    "contract_sha256": "c40dafe1bc6b33d1d77cc18313fec632edbc42b2ebd74010a472b76174119ee0",
-    "helper_source_receipt": "/tmp/coord-b9-1994-isolation-dl1-evidence/source-receipt.json",
-    "helper_source_receipt_sha256": "bb3b6d23e2fd42a64b9f0edaa9de4ff30823f0b0102eb3772f69a4ca1f9fc1ae",
+    "capsule_sha256": "a200698d97d0a6043565676feac542705a22c3db53f5897a06dc5db0ca9cbd22",
+    "contract_path": "/tmp/coord-b9-1994-descendant-exit-evidence/integration-contract.json",
+    "contract_sha256": "80320919b348059ee49db0189cb5b6ebd6f770fb6d5f1a544a67f1ee786f20d1",
+    "helper_source_receipt": "/tmp/coord-b9-1994-descendant-exit-evidence/source-receipt.json",
+    "helper_source_receipt_sha256": "8c11941fd2b6be9d0390ab74fc383744b954df3cefb33457a00d6258a67078ce",
     "definition_sha256": {
       "refuse_inherited_desktop": "7813ac595b5cee9679cb8088e732bf1ab55522cda8dc985fa484fe26aef3adab",
       "socket_inodes": "81209cb3ec5f70c3d79e827fc95295883352430319d9393e1f996ff8fa5c529c",
@@ -281,12 +281,12 @@
       "private_desktop": "057bf7cffc1462fc8c19071bcda8d002ae09a4453d7ad0d2aab3d941bda17e03",
       "private_accessibility": "476f34254300a1e171be4392a10e73af31679d91ddb9061fff8a1eae6769e9d6",
       "bootstrap": "5c0ac285d2bfc7ee5cfb97dd4c0162d96306e9c61a99a3002a40e4b8d9567dc2",
-      "admit_owned": "c51e348972b766ddd4daaf517bc908d53ec6634452c6fa86abb12ee53f17bc23",
-      "pidfd_exited": "559694601bb06f160fb98fe53bdbed96aed22ac2697415b9132aa64f2a4a0053",
+      "admit_owned": "6eb9b5dbdfaff8f28a7dbd55c23a30d62d3b437675633e75bceeaf7d155855da",
+      "pidfd_exited": "47e47878d859a51dc2ac7dfcf8fc7a8580229817ec65d65939843b9148055f3c",
       "signal_owned": "b33d7f3f8ab8fa4faeb8c328e9d676d6340c6718e75e4250a1528a97a2e48610",
       "settle_direct": "83b51cbbcf3b0b064f15a7acca45c038d3b9ce23b7c5e23359b6535abb0f3156",
-      "settle_descendant": "00b38b38fc091c29b440ced6c57babe51ca17b3fc3b8b32713668bd57df5cf7f",
-      "release_settled_pidfd": "85fad5d16c047c03740b80ecb97bd5d22380b57ec13ccf8104aa9ec2678dcbea",
+      "settle_descendant": "971921ef1022a1265682dceedc2ccaf6d1caddbb9de69a3e7314a6e12c6bb604",
+      "release_settled_pidfd": "4f399bd272206e5468e63fe0607ea9021f40c4aa77314c9127b90e396d918813",
       "scan": "21953692b1e63fd9e0b83c69267e1ae9aee22d768182955a6cf80adfb49f747d",
       "live": "a582ea8d1470c4b10e3f468a46d76b5911d344bc857a84dcb1d765850c0035b5",
       "close_owned": "7428f6561e4d00076fe5d08ab74a6df40e82be81dd877dd15a3fdaadddabd440",
@@ -320,7 +320,24 @@
       "DBUS_SESSION_BUS_WINDOWID"
     ],
     "helper_review": "FRESH_INDEPENDENT_CORE_AND_CALLER_REVIEW_REQUIRED",
-    "pidfd_hold": "Every failed admission/release or unclosed/unsettled original pin forces UNQUALIFIED physical handback. Natural-parent wait not observed by controller remains an explicit retained-FD gap, never inferred clean.",
-    "unused_optional_scope": "No headless PATH or Wayland capability is admitted or invoked by this X11 browserless Cancel-only caller."
+    "pidfd_hold": "Every failed admission/release or unclosed original descriptor forces UNQUALIFIED physical handback. Direct CHILDREN require the original retained Popen wait; non-direct descriptors require the exact shared positive pidfd-exit proof plus raw ECHILD or a separately named control waitid receipt. Natural-parent wait/status remains UNOBSERVED; no numeric fallback or direct-wait fiction.",
+    "unused_optional_scope": "No headless PATH or Wayland capability is admitted or invoked by this X11 browserless Cancel-only caller.",
+    "descendant_exit_policy": {
+      "authority": "Source-explicit descriptor release qualification only; no signal authority or original-parent wait inference.",
+      "original_directs": "Every CHILDREN identity is excluded inside settle_descendant AND descendant release path; unchanged settle_direct requires original retained Popen object/known returncode. Original wait/FD custody never replaced by a descendant proof.",
+      "positive_proof": "Unfailed validated original pin object/key/pid/start, fd==admission_fd, no prior close attempt; original pidfd positive exit poll before and after os.waitid(P_PIDFD,fd,WEXITED|WNOHANG); same pin object/fd/stamp afterward; deadline checks before/after waitid and before one close.",
+      "ECHILD": "Require typed ChildProcessError with errno==ECHILD plus positive exit proof. Record original error type/errno/strerror/text/repr. descendant_exit_status=UNKNOWN_UNOBSERVED, original_parent_wait=UNOBSERVED, original_wait_settled remains false. ECHILD alone is never exit evidence.",
+      "control_wait": "A real atomic control waitid result for same pinned task records descendant control_wait_receipt only, never the natural parent wait or original direct ledger.",
+      "release": "Only that validated owned dead descriptor may close exactly once. Admission fd number remains retained metadata. Interrupted/failed claimed close stays HOLD with no retry or numeric fallback; confirmed closed descendant proof remains an exit marker without fabricating a wait.",
+      "handback": "Qualification requires ALL direct-original waits known plus explicit descendant pidfd exit proofs. It never claims every natural-parent wait/status was observed or proves universal process absence."
+    },
+    "preserved_candidate": {
+      "head": "e5df18083991feeef58fd054de500afd404ef822",
+      "tree": "9e6432ad7c07bbb6ff706114dc29d7be79c6a69f",
+      "scope": "Immutable prior2b30 caller candidate; independent R1 negative for multi-call delegation after deadline. This child requires fresh exact caller composition and separate descendant-policy review.",
+      "review": "/tmp/coord-b9-1984-e5df-independent-private-desktop-caller-review.json",
+      "review_sha256": "9689a90c61e31da7f7ed475e602313c43efe9786c638311587354541105d7c1f"
+    },
+    "caller_effect_guards": "Private endpoint and original absolute-budget guard immediately before each fresh Xlib/XTest effect/query. Closed AX adapter exposes only existing read APIs with pre/post guard, no fallback or per-read retry; complete read-only query owns existing stale retry. Input key/click/shortcut and XQueryTree buffers release on successful sequential paths only, never in an effect finally after BaseException."
   }
 }

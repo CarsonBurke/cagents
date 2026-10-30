@@ -1,8 +1,12 @@
 The After-only probe is implemented in
 `.github/qualification/native-worktree-delete-after-probe.py`. It is a direct
-child control of `ab3f335a8910838edc6f03fe83c659bd3476cee0`, preserving that
-head's C1 correction while adding the newly required private desktop and bus
-custody boundary. The original preserved base is
+child control of `e5df18083991feeef58fd054de500afd404ef822`, preserving that
+head's private desktop, bus and C1 boundaries while pinning the root-authorized
+shared descendant-exit descriptor policy. Both predecessors remain immutable.
+The e5 R1 source negative remains at
+`/tmp/coord-b9-1984-e5df-independent-private-desktop-caller-review.json`,
+SHA256 `9689a90c61e31da7f7ed475e602313c43efe9786c638311587354541105d7c1f`.
+It is preserved evidence of the previous caller gap, not a successor clearance. The original preserved base is
 `77647db730fd0d5b6ec7f2fc984d5edc94d42a3c`; all of that base's files,
 matched Before `94c3cef719f5cb27637899dfd13e67baca3cbc34` and product After
 `24d0474e250bcc4acc0958cf3abbf53ee1125581` are unchanged. No Before executable
@@ -26,9 +30,9 @@ must establish and bind its own authenticated Xvfb display and private session
 and accessibility buses before any desktop client, accessibility settings,
 native imports or input. The sole shared isolator is authored by
 `/root/editor_recovery`; its exact 29-definition capsule from
-`2b30c85569a0fc1d0a569359ec765eb60471b1e4` is retained unchanged in
+`9c45e8e503386d91001bb31056447e9a78073d2e` is retained unchanged in
 `.github/qualification/native-worktree-delete-private-desktop.py`, SHA256
-`e711a1319ec37721f8e9701d198940df9445d378850c0cde680e911094ccd71d`.
+`a200698d97d0a6043565676feac542705a22c3db53f5897a06dc5db0ca9cbd22`.
 The full source/API provenance is in `after-probe.json`. No external `xvfb-run`/`dbus-run-session`
 wrapper, hosted environment flag or documentation substitutes for custody. No
 fallback to another desktop endpoint is permitted. Both the shared core and
@@ -42,8 +46,14 @@ admission, signals, original waits and pidfd release use the single shared
 lifecycle. No numeric PID signal/reap fallback is reachable through the bound
 controller. The caller supplies budget-only file/process reads, explicit child
 environment checks, one original work/final/cleanup deadline and epoch, and
-guarded input/query connections. Original primitive, fixture and capture source
-files remain unchanged. The Cancel-only flow and 39 planned frames are
+guarded input/query connections. Each fresh Xlib/XTest call has an immediate
+private-endpoint and absolute-budget guard, including constructor sequences,
+keysym lookup, injection and synchronization. A closed read-only AX adapter
+checks each of the existing node/state/component reads before and after the
+call; it has no protocol fallback and preserves complete-query stale retry.
+Input releases and XQueryTree buffer release are sequential success-path calls,
+with no later native effect in an exception finally. Original primitive,
+fixture and capture source files remain unchanged. The Cancel-only flow and 39 planned frames are
 preserved; no scanner-confirm, Before or full-suite mode is admitted.
 
 The exact product development runner first receives its supported forwarded UI
@@ -153,12 +163,18 @@ Source conservation runs after observer handles close while the private endpoint
 servers are still alive, using the same supervised Git child custody. Endpoint
 servers close afterward; subsequent checks are budget-only retained process/fd
 observations. Failed pidfd admission/release or any unclosed/unsettled original
-pin leaves physical custody UNCONFIRMED and the probe FAILED_UNQUALIFIED. A
-natural parent may already have waited a descendant; absent an approved original
-wait receipt, the shared policy retains that fd and reports the gap. The caller
-does not infer clean custody from an empty numeric process list or weaken this
-policy. Actual successful build/terminal handback may need that explicit proof
-before native qualification can be claimed.
+descriptor leaves physical custody UNCONFIRMED and the probe FAILED_UNQUALIFIED.
+Every original direct child still requires its retained Popen object and actual
+original wait receipt. The exact shared policy can release a non-direct owned
+pidfd only after positive exit observations before and after its atomic waitid,
+with raw ECHILD or a separately named control wait receipt, and one confirmed
+close. Its natural-parent wait remains UNOBSERVED; ECHILD retains unknown exit
+status and never becomes a direct wait. The caller asks that same shared core
+to validate a closed descriptor's recorded proof. Unknown/stale/live descriptors,
+failed close and interrupted custody remain HOLD with no retry or numeric
+fallback. Neither an empty process list nor this source policy proves actual
+handback. Fresh separate descendant-policy and caller-composition source review
+is required; actual physical cleanup and native UX remain unobserved.
 
 G1 remains explicit: this probe observes a valid existing target's real dialog,
 then cancels. It does not establish that a missing/prunable row stays reachable

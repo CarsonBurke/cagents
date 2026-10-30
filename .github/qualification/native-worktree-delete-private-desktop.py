@@ -3,6 +3,7 @@ Standard-library imports and definitions only. Explicit supervisor bindings
 required by integration-contract.json; never connect to an inherited endpoint.
 """
 import ast
+import errno
 import json
 import os
 from pathlib import Path
@@ -366,6 +367,7 @@ def admit_owned(pid, row, arm):
         before = processes().get(pid)
         assert before and all(before[name] == row[name] for name in ('start', 'parent', 'group'))
         pin['fd'] = os.pidfd_open(pid, 0)
+        pin['admission_fd'] = pin['fd']
         check_native_budget()
         after = processes().get(pid)
         assert after and all(after[name] == before[name] for name in ('start', 'parent', 'group')), 'Identity changed during pidfd admission'
@@ -382,9 +384,18 @@ def pidfd_exited(row):
     key = str(row['pid']) + ':' + row['start']
     pin = PIDFDS[key]
     assert pin['validated'], 'Unknown pidfd custody cannot be signalled'
+    assert pin['identity'] == key and pin['pid'] == row['pid'] and pin['start'] == row['start'], 'Retained pidfd stamp differs'
     if pin['original_wait_settled']:
         return True
-    assert pin['fd'] is not None and not pin['closed']
+    if pin.get('descendant_exit_proof') and pin['closed']:
+        proof = pin['descendant_exit_proof']
+        assert proof['identity'] == key and proof['retained_fd'] == pin['admission_fd'] and proof['positive_exit_poll_before'] and proof['positive_exit_poll_after']
+        assert proof['kind'] in ('PINNED_DESCENDANT_EXIT_ECHILD', 'PINNED_DESCENDANT_EXIT_CONTROL_WAIT')
+        assert pin.get('close_attempted') and pin['fd'] is None
+        assert all(hasattr(child, 'native_identity') for child in CHILDREN)
+        assert not any(str(child.native_identity['pid']) + ':' + child.native_identity['start'] == key for child in CHILDREN)
+        return True
+    assert pin['fd'] is not None and pin['fd'] == pin['admission_fd'] and not pin['closed']
     check_native_budget()
     poller = select.poll()
     poller.register(pin['fd'], select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL)
@@ -425,26 +436,64 @@ def settle_direct(child):
 
 def settle_descendant(row):
     key = str(row['pid']) + ':' + row['start']
-    pin = PIDFDS[key]
-    if not pin['validated'] or pin['original_wait_settled'] or not pidfd_exited(row):
-        return
-    check_native_budget()
     try:
-        receipt = os.waitid(os.P_PIDFD, pin['fd'], os.WEXITED | os.WNOHANG)
-    except ChildProcessError:
-        # A natural parent may already have waited. Retain the original fd and
-        # report missing direct wait custody; no fd/PID reuse or clean claim.
-        pin['original_wait_receipt'] = 'NOT_OBSERVED_BY_CONTROL_FD_RETAINED'
-        return
-    if receipt is not None:
-        assert receipt.si_pid == row['pid']
-        pin['original_wait_settled'] = True
-        pin['original_wait_receipt'] = dict(pid=receipt.si_pid, code=receipt.si_code, status=receipt.si_status)
+        assert all(hasattr(child, 'native_identity') for child in CHILDREN), 'Original direct identity unknown'
+        assert not any(str(child.native_identity['pid']) + ':' + child.native_identity['start'] == key for child in CHILDREN), 'Original direct Popen requires its original wait'
+        assert not any(item['identity'] == key for item in PIDFD_FAILURES), 'Original descriptor custody remains HOLD'
+        pin = PIDFDS[key]
+        assert pin['validated'] and pin['identity'] == key and pin['pid'] == row['pid'] and pin['start'] == row['start'], 'Unvalidated/stale descendant pin'
+        assert not pin['original_wait_settled'], 'Descendant cannot claim an original direct wait'
+        if pin.get('descendant_exit_proof') and pin['closed']:
+            assert pidfd_exited(row)
+            return
+        fd = pin['fd']
+        assert fd is not None and fd == pin['admission_fd'] and not pin['closed'] and not pin.get('close_attempted'), 'Original descriptor not retained'
+        assert pidfd_exited(row), 'A live/unknown descendant cannot use exit proof'
+        check_native_budget()
+        raw_error, receipt = None, None
+        try:
+            receipt = os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
+        except ChildProcessError as error:
+            check_native_budget()
+            assert error.errno == errno.ECHILD, 'Only raw ECHILD may accompany positive pidfd exit proof'
+            raw_error = dict(type=type(error).__name__, errno=error.errno, strerror=error.strerror,
+                             text=str(error), representation=repr(error))
+        check_native_budget()
+        assert PIDFDS.get(key) is pin and pin['fd'] == fd == pin['admission_fd'] and pin['validated'] and pin['identity'] == key
+        assert pin['pid'] == row['pid'] and pin['start'] == row['start']
+        assert not pin['closed'] and not pin.get('close_attempted') and not pin['original_wait_settled']
+        assert pidfd_exited(row), 'Original retained descriptor must still positively report exit'
+        proof = dict(identity=key, retained_fd=fd, direct_original=False,
+                     positive_exit_poll_before=True, positive_exit_poll_after=True,
+                     original_parent_wait='UNOBSERVED')
+        if raw_error is not None:
+            proof.update(kind='PINNED_DESCENDANT_EXIT_ECHILD', raw_waitid_error=raw_error,
+                         descendant_exit_status='UNKNOWN_UNOBSERVED')
+        else:
+            assert receipt is not None and receipt.si_pid == row['pid'], 'Descendant wait result unknown/wrong identity'
+            proof.update(kind='PINNED_DESCENDANT_EXIT_CONTROL_WAIT',
+                         control_wait_receipt=dict(pid=receipt.si_pid, code=receipt.si_code, status=receipt.si_status),
+                         descendant_exit_status='OBSERVED_BY_CONTROL_WAITID')
+        pin['descendant_exit_proof'] = proof
+        # This qualifies only descriptor release. It never fabricates a parent
+        # wait or promotes a descendant into the original CHILDREN ledger.
         release_settled_pidfd(pin)
+    except Exception as error:
+        PIDFD_FAILURES.append(dict(identity=key, hold=True, error='Descendant exit proof refused: ' + str(error)))
+        raise
 
 
 def release_settled_pidfd(pin):
-    assert pin['original_wait_settled']
+    if not pin['original_wait_settled']:
+        key = pin['identity']
+        assert PIDFDS.get(key) is pin and pin['validated']
+        proof = pin['descendant_exit_proof']
+        assert proof['identity'] == key and proof['retained_fd'] == pin['fd'] == pin['admission_fd']
+        assert proof['positive_exit_poll_before'] and proof['positive_exit_poll_after']
+        assert proof['kind'] in ('PINNED_DESCENDANT_EXIT_ECHILD', 'PINNED_DESCENDANT_EXIT_CONTROL_WAIT')
+        assert proof['direct_original'] is False
+        assert all(hasattr(child, 'native_identity') for child in CHILDREN)
+        assert not any(str(child.native_identity['pid']) + ':' + child.native_identity['start'] == key for child in CHILDREN)
     if pin.get('close_attempted') or pin['fd'] is None:
         return
     check_native_budget()

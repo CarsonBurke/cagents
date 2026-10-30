@@ -113,6 +113,58 @@ def bind(native, desktop, context):
         guard()
         return value
 
+    def ax_read(function):
+        desktop.require_private_desktop()
+        value = function()
+        desktop.require_private_desktop()
+        return value
+
+    class GuardedState:
+        """Only the existing read-only state query; no protocol fallback."""
+        def __init__(self, value):
+            self.value = value
+
+        def contains(self, flag):
+            return ax_read(lambda: self.value.contains(flag))
+
+    class GuardedComponent:
+        def __init__(self, value):
+            self.value = value
+
+        def getExtents(self, coordinates):
+            return ax_read(lambda: self.value.getExtents(coordinates))
+
+    class GuardedNode:
+        """Exact AX reads used by this probe, individually guarded."""
+        def __init__(self, value):
+            self.value = value
+
+        @property
+        def name(self):
+            return ax_read(lambda: self.value.name)
+
+        @property
+        def childCount(self):
+            return ax_read(lambda: self.value.childCount)
+
+        def getChildAtIndex(self, index):
+            return GuardedNode(ax_read(lambda: self.value.getChildAtIndex(index)))
+
+        def get_process_id(self):
+            return ax_read(self.value.get_process_id)
+
+        def getRole(self):
+            return ax_read(self.value.getRole)
+
+        def getRoleName(self):
+            return ax_read(self.value.getRoleName)
+
+        def getState(self):
+            return GuardedState(ax_read(self.value.getState))
+
+        def queryComponent(self):
+            return GuardedComponent(ax_read(self.value.queryComponent))
+
     def a11y_read(function):
         def query(*args, **kwargs):
             desktop.require_private_desktop()
@@ -149,7 +201,7 @@ def bind(native, desktop, context):
         @a11y_read
         def read_tree():
             desktop.require_private_desktop()
-            root = native.pyatspi.Registry.getDesktop(0)
+            root = GuardedNode(ax_read(lambda: native.pyatspi.Registry.getDesktop(0)))
             apps = []
             for index in range(root.childCount):
                 desktop.require_private_desktop()
@@ -279,11 +331,14 @@ def bind(native, desktop, context):
             desktop.require_private_desktop()
             self.x = ctypes.CDLL('libX11.so.6')
             self.x.XOpenDisplay.argtypes, self.x.XOpenDisplay.restype = [ctypes.c_char_p], ctypes.c_void_p
+            desktop.require_private_desktop()
             self.display = self.x.XOpenDisplay(os.environ['DISPLAY'].encode('ascii'))
             assert self.display
             self.x.XDefaultRootWindow.argtypes, self.x.XDefaultRootWindow.restype = [ctypes.c_void_p], ctypes.c_ulong
+            desktop.require_private_desktop()
             self.root = self.x.XDefaultRootWindow(self.display)
             self.x.XDefaultScreen.argtypes, self.x.XDefaultScreen.restype = [ctypes.c_void_p], ctypes.c_int
+            desktop.require_private_desktop()
             assert self.x.XDefaultScreen(self.display) == 0
             self.x.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(native.WindowAttributes)]
             self.x.XTranslateCoordinates.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int,
@@ -306,29 +361,42 @@ def bind(native, desktop, context):
 
         def checked(self, status):
             desktop.require_private_desktop()
-            return super().checked(status)
+            self.x.XSync(self.display, 0)
+            desktop.require_private_desktop()
+            if self.errors:
+                native.put(native.OUT / 'x11-query-errors.json', self.errors)
+            assert status and not self.errors, 'Ambiguous/stale X11 query; no native capture acceptance'
 
         def attributes(self, window):
+            attributes = native.WindowAttributes()
             desktop.require_private_desktop()
-            return super().attributes(window)
+            self.checked(self.x.XGetWindowAttributes(self.display, window, ctypes.byref(attributes)))
+            assert attributes.root == self.root
+            return attributes
 
         def client(self, window):
+            window = int(window)
+            attributes = self.attributes(window)
+            x, y, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
             desktop.require_private_desktop()
-            return super().client(window)
+            self.checked(self.x.XTranslateCoordinates(self.display, window, self.root, 0, 0,
+                ctypes.byref(x), ctypes.byref(y), ctypes.byref(child)))
+            assert attributes.map_state == 2 and attributes.window_class == 1, 'Client is not viewable InputOutput'
+            return dict(X=x.value, Y=y.value, WIDTH=attributes.width, HEIGHT=attributes.height, SCREEN=0)
 
         def children(self, window):
             desktop.require_private_desktop()
             root, parent, count = ctypes.c_ulong(), ctypes.c_ulong(), ctypes.c_uint()
             children = ctypes.POINTER(ctypes.c_ulong)()
-            try:
-                self.checked(self.x.XQueryTree(self.display, window, ctypes.byref(root), ctypes.byref(parent),
-                    ctypes.byref(children), ctypes.byref(count)))
-                assert root.value == self.root and count.value < 10000
-                return parent.value, [children[i] for i in range(count.value)]
-            finally:
-                if children:
-                    desktop.require_private_desktop()
-                    self.x.XFree(children)
+            desktop.require_private_desktop()
+            self.checked(self.x.XQueryTree(self.display, window, ctypes.byref(root), ctypes.byref(parent),
+                ctypes.byref(children), ctypes.byref(count)))
+            assert root.value == self.root and count.value < 10000
+            result = parent.value, [children[i] for i in range(count.value)]
+            if children:
+                desktop.require_private_desktop()
+                self.x.XFree(children)
+            return result
 
         def state(self, window):
             desktop.require_private_desktop()
@@ -347,6 +415,7 @@ def bind(native, desktop, context):
             desktop.require_private_desktop()
             self.x, self.t = ctypes.CDLL('libX11.so.6'), ctypes.CDLL('libXtst.so.6')
             self.x.XOpenDisplay.argtypes, self.x.XOpenDisplay.restype = [ctypes.c_char_p], ctypes.c_void_p
+            desktop.require_private_desktop()
             self.display = self.x.XOpenDisplay(os.environ['DISPLAY'].encode('ascii'))
             assert self.display
             self.x.XStringToKeysym.argtypes, self.x.XStringToKeysym.restype = [ctypes.c_char_p], ctypes.c_ulong
@@ -363,24 +432,56 @@ def bind(native, desktop, context):
             self.keys, self.buttons = set(), set()
 
         def event(self, kind, value, down, purpose='control'):
+            if native.CRITICAL:
+                assert (purpose == 'wheel' and kind == 'button' and value in (4, 5)) or (purpose == 'activation' and
+                    ((kind == 'key' and value in ('Return', 'space')) or (kind == 'button' and value == 1)))
+            if kind == 'key':
+                desktop.require_private_desktop()
+                symbol = self.x.XStringToKeysym(value.encode('ascii'))
+                desktop.require_private_desktop()
+                code = self.x.XKeysymToKeycode(self.display, symbol)
+                assert symbol and code
+                pressed = self.keys
+                if down:
+                    pressed.add(value)
+                desktop.require_private_desktop()
+                result = self.t.XTestFakeKeyEvent(self.display, code, int(down), 0)
+            else:
+                code, pressed = value, self.buttons
+                if down:
+                    pressed.add(value)
+                desktop.require_private_desktop()
+                result = self.t.XTestFakeButtonEvent(self.display, code, int(down), 0)
             desktop.require_private_desktop()
-            return super().event(kind, value, down, purpose)
+            self.x.XSync(self.display, 0)
+            if result and not down:
+                pressed.discard(value)
+            desktop.require_private_desktop()
+            native.EVENTS.append(dict(arm=native.ACTIVE, monotonic=time.monotonic(), kind=kind, value=value,
+                actual_code=code, pressed=down, injection_return=result, purpose=purpose, critical=native.CRITICAL,
+                pointer=native.pointer(), focus=native.query(['getwindowfocus'])))
+            native.put(native.OUT / 'inputs.json', native.EVENTS)
+            assert result, 'XTest injection refused'
 
         def key(self, value, purpose='control'):
-            try:
-                self.event('key', value, True, purpose)
-                sleep(.04)
-            finally:
-                if value in self.keys:
-                    self.event('key', value, False, purpose)
+            self.event('key', value, True, purpose)
+            sleep(.04)
+            if value in self.keys:
+                self.event('key', value, False, purpose)
 
         def click(self, button, purpose='control'):
-            try:
-                self.event('button', button, True, purpose)
-                sleep(.04)
-            finally:
-                if button in self.buttons:
-                    self.event('button', button, False, purpose)
+            self.event('button', button, True, purpose)
+            sleep(.04)
+            if button in self.buttons:
+                self.event('button', button, False, purpose)
+
+        def shortcut(self, keys):
+            assert not native.CRITICAL
+            for key in keys:
+                self.event('key', key, True)
+            for key in reversed(keys):
+                if key in self.keys:
+                    self.event('key', key, False)
 
         def wheel(self, button, count):
             assert button in (4, 5) and 0 < count <= 80

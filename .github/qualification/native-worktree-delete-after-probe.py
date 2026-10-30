@@ -22,7 +22,7 @@ import sys
 import time
 
 CONTROL_BASE = '77647db730fd0d5b6ec7f2fc984d5edc94d42a3c'
-PARENT = 'ab3f335a8910838edc6f03fe83c659bd3476cee0'
+PARENT = 'e5df18083991feeef58fd054de500afd404ef822'
 AFTER = '24d0474e250bcc4acc0958cf3abbf53ee1125581'
 AFTER_TREE = '7d84da268933045b1add2ad310ce45c84be751db'
 NATIVE, CONTEXT, INPUTS = None, None, None
@@ -67,8 +67,8 @@ def gates(args):
     assert manifest['mode'] == 'AFTER_ONLY_CANCEL_NO_REMOVE'
     assert set(git(control, 'diff', '--name-only', CONTROL_BASE, 'HEAD').splitlines()) == set(manifest['control_paths_from_base'])
     # Every original base control/product entry, including Before pins, is
-    # retained. The exact direct predecessor is the separately preserved ab3;
-    # its earlier source clearance does not establish private desktop custody.
+    # retained. The direct predecessor is the separately preserved e5 candidate;
+    # historical source clearance does not establish this exact composition.
     removed_or_modified = git(control, 'diff', '--name-only', '--diff-filter=DMRTUXB', CONTROL_BASE, 'HEAD')
     assert removed_or_modified == ''
     hashes = {path: digest(control / path) for path in manifest['review_paths']}
@@ -639,8 +639,11 @@ def cleanup(context):
     remaining = p.live()
     if remaining:
         errors.append(dict(stage='owned-processes-remain', identities=remaining))
+    # The shared core alone validates direct-original waits or the separately
+    # named positive descendant-exit proof. A descendant never claims its
+    # natural parent's wait/status; descriptor closure is still mandatory.
     unsettled_pins = {key: value for key, value in p.PIDFDS.items()
-                     if not value['original_wait_settled'] or not value['closed']}
+                     if not value['closed'] or not p.PRIVATE_DESKTOP.pidfd_exited(p.OWNED[key])}
     if unsettled_pins or p.PIDFD_FAILURES:
         errors.append(dict(stage='original-pidfd-custody-retained', pins=unsettled_pins,
             admission_or_release_failures=list(p.PIDFD_FAILURES)))
