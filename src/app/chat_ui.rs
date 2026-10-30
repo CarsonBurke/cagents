@@ -5976,6 +5976,55 @@ impl Cagents {
         }
     }
 
+    /// Shows and launches in draft `card` the launch options another window
+    /// chose for it, which the shared view brought here.
+    ///
+    /// The shared pane keeps the draft's conversation, so its runtime stays
+    /// attached, but the runtime still holds the options this window had: it
+    /// would show them, start the conversation on them, and build any later
+    /// choice of its own from them, dropping the other window's. A draft
+    /// already sending its first message keeps the launch it is sending.
+    pub(super) fn adopt_shared_draft_session(
+        &mut self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> Task<Message> {
+        let fresh = self.chat_draft_snapshot(session.launch.provider);
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
+        // A conversation another window started is not a launch option; it
+        // is attached, or recovered, as the conversation it is.
+        if !runtime.choosing()
+            || !session.is_unstarted()
+            || runtime.session.id != session.id
+            || runtime.session == *session
+        {
+            return Task::none();
+        }
+        let provider = session.launch.provider;
+        let previous = std::mem::replace(&mut runtime.session, session.clone());
+        let moved = previous.launch.provider != provider;
+        // Skills are found from the provider's home and directory.
+        let rediscover = moved
+            || previous.launch.recipe.environment != session.launch.recipe.environment
+            || previous.launch.recipe.working_directory != session.launch.recipe.working_directory;
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        if moved {
+            *snapshot = fresh;
+        } else if rediscover {
+            snapshot.skills.clear();
+        }
+        snapshot.permission_mode = draft_permission_mode(&session.launch.recipe, provider);
+        runtime.error = None;
+        if !rediscover {
+            return Task::none();
+        }
+        runtime.completion.restart(true);
+        let target = runtime.target;
+        self.load_draft_skills(target)
+    }
+
     pub(super) fn chat_scroll_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         let keyboard::Event::KeyPressed {
             key: keyboard::Key::Named(key),
@@ -12279,6 +12328,42 @@ impl Cagents {
         }
         Task::none()
     }
+}
+
+/// The permission mode draft `card` shows in its footer, and the launch its
+/// first message would start.
+#[cfg(test)]
+pub(super) fn draft_launch_for_test(
+    app: &Cagents,
+    card: CardId,
+) -> (Option<String>, chat::Session) {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    assert!(runtime.choosing(), "the draft can still change its options");
+    (
+        runtime.snapshot.permission_mode.clone(),
+        runtime.session.clone(),
+    )
+}
+
+/// Sends draft `card`'s first message, returning the launch it starts.
+#[cfg(test)]
+pub(super) fn start_draft_for_test(app: &mut Cagents, card: CardId) -> chat::Session {
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a draft has a chat runtime");
+    };
+    let target = runtime.target;
+    drop(app.start_chat_draft(target));
+    let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+        panic!("a starting draft keeps its chat runtime");
+    };
+    runtime
+        .queued
+        .as_ref()
+        .expect("the first message waits for its conversation")
+        .draft
+        .clone()
 }
 
 #[cfg(test)]

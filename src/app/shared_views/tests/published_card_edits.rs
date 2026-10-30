@@ -156,3 +156,61 @@ fn a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projecti
     assert_eq!(saved.kind, handed);
     assert_eq!(saved.title, "Renamed elsewhere");
 }
+
+/// Launch options another window chose for a draft both windows show reach
+/// this window's draft too: it shows them, starts on them, and builds its own
+/// next choice on them rather than on the options it had.
+#[test]
+fn a_draft_shows_and_starts_on_options_chosen_in_another_window() {
+    let (mut app, scope, _directory) = shared_channel_app();
+    let _ = app.new_native_chat(Provider::Claude, Some("/workspace/chat-fixture".into()));
+    let card = app.workspace.focused().unwrap();
+    let original = chat_session(&app, card);
+    assert!(original.is_unstarted());
+    let (shown, _) = crate::app::chat_ui::draft_launch_for_test(&app, card);
+    assert_ne!(shown.as_deref(), Some("plan"));
+    let mut view = accept_local_view(&mut app, &scope);
+
+    // The other window picks another account and the plan mode.
+    let mut chosen = original.clone();
+    chosen
+        .launch
+        .recipe
+        .environment
+        .insert("CLAUDE_CONFIG_DIR".into(), "/accounts/claude/other".into());
+    crate::chat::apply_claude_permission_mode(&mut chosen.launch.recipe, "plan");
+    view.revision += 1;
+    view.panes[0].kind = CardKind::Chat(chosen.clone());
+    app.workspace_model.views = vec![view];
+    drop(app.reconcile_shared_views());
+
+    assert_eq!(chat_session(&app, card), chosen);
+    let (shown, session) = crate::app::chat_ui::draft_launch_for_test(&app, card);
+    assert_eq!(shown.as_deref(), Some("plan"));
+    assert_eq!(session, chosen);
+    assert!(
+        app.shared_views.pending.is_empty(),
+        "nothing is published back"
+    );
+
+    // This window's own next choice keeps the other window's account.
+    let target = match app.cards.get(&card) {
+        Some(CardRuntime::Chat(runtime)) => runtime.target,
+        _ => panic!("the card opens as a draft"),
+    };
+    let _ = app.update(Message::ChatUi(Action::PermissionMode(
+        target,
+        "acceptEdits".into(),
+    )));
+    let (shown, session) = crate::app::chat_ui::draft_launch_for_test(&app, card);
+    assert_eq!(shown.as_deref(), Some("acceptEdits"));
+    assert_eq!(
+        session.launch.recipe.environment.get("CLAUDE_CONFIG_DIR"),
+        chosen.launch.recipe.environment.get("CLAUDE_CONFIG_DIR")
+    );
+    assert_eq!(stored(&app, card).kind, CardKind::Chat(session.clone()));
+
+    // Its first message starts on them.
+    let started = crate::app::chat_ui::start_draft_for_test(&mut app, card);
+    assert_eq!(started.launch.recipe, session.launch.recipe);
+}
