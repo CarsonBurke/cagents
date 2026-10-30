@@ -1,4 +1,5 @@
 //! Interactive, scoped setup after a journaled worktree has fully settled.
+use super::worktree_choices::SetupConsent;
 use super::*;
 use crate::{
     model::OperationId,
@@ -18,6 +19,7 @@ pub(super) struct Review {
     path: PathBuf,
     expected: SetupIntent,
     current: SetupIntent,
+    consent: Option<SetupConsent>,
     remote: Option<PathBuf>,
     active: bool,
     loading: bool,
@@ -31,6 +33,7 @@ pub(super) struct ReviewSnapshot {
     creation: OperationId,
     expected: SetupIntent,
     current: SetupIntent,
+    consent: Option<SetupConsent>,
     trusted: bool,
     active: bool,
     error: Option<String>,
@@ -651,6 +654,7 @@ impl Cagents {
             path: path.clone(),
             expected: intent.clone(),
             current: intent.clone(),
+            consent: None,
             remote: remote.clone(),
             active: false,
             loading: true,
@@ -676,31 +680,7 @@ impl Cagents {
                     .request
                     .and_then(|request| request.setup_intent)
                     .ok_or("The saved setup intent is unavailable")?;
-                let primary = intent
-                    .primary
-                    .as_ref()
-                    .ok_or("The primary checkout is unavailable")?;
-                let plan =
-                    crate::worktree_setup::load(primary).map_err(|error| error.to_string())?;
-                let trusted = match &plan {
-                    Some(plan) => crate::worktree_setup::is_trusted(primary, plan, &token)
-                        .map_err(|error| error.to_string())?,
-                    None => true,
-                };
-                let current = SetupIntent {
-                    plan,
-                    skip: false,
-                    copy_done: false,
-                    ..intent.clone()
-                };
-                Ok(ReviewSnapshot {
-                    creation,
-                    expected: intent,
-                    current,
-                    trusted,
-                    active: false,
-                    error: None,
-                })
+                load_local_setup_review_snapshot(creation, intent, &token)
             })
             .await
             .map_err(|error| error.to_string())
@@ -734,6 +714,7 @@ impl Cagents {
                 review.creation = snapshot.creation;
                 review.expected = snapshot.expected;
                 review.current = snapshot.current;
+                review.consent = snapshot.consent;
                 review.trusted = snapshot.trusted;
                 review.active = snapshot.active;
                 review.error = snapshot.error;
@@ -783,6 +764,7 @@ impl Cagents {
         let approve = review.approved;
         let token = review.token.clone();
         let remote = review.remote.clone();
+        let consent = review.consent.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 if token.is_cancelled() {
@@ -822,14 +804,7 @@ impl Cagents {
                 }
                 let store = store.ok_or("The setup journal is unavailable")?;
                 verify_local_setup_resume(&store, creation, &path, &expected, &token)?;
-                if !intent.skip
-                    && let (Some(primary), Some(plan)) = (&intent.primary, &intent.plan)
-                {
-                    if approve {
-                        crate::worktree_setup::trust(primary, plan, &token)
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
+                apply_reviewed_setup_trust(consent.as_ref(), &intent, approve, &token)?;
                 RepositoryService::system("git")
                     .update_worktree_setup_intent_guarded(
                         &store,
@@ -1007,6 +982,71 @@ fn daemon_setup_review(repository: &Path, path: &Path) -> Result<ReviewSnapshot,
     decode_daemon_setup_review(reply)
 }
 
+fn load_local_setup_review_snapshot(
+    creation: OperationId,
+    intent: SetupIntent,
+    token: &CancellationToken,
+) -> Result<ReviewSnapshot, String> {
+    if token.is_cancelled() {
+        return Err("Setup review was cancelled".into());
+    }
+    let primary = intent
+        .primary
+        .as_ref()
+        .ok_or("The primary checkout is unavailable")?;
+    let consent = SetupConsent::capture(primary, token)?;
+    let plan = crate::worktree_setup::load(primary).map_err(|error| error.to_string())?;
+    let trusted = match &plan {
+        Some(plan) => crate::worktree_setup::is_trusted(primary, plan, token)
+            .map_err(|error| error.to_string())?,
+        None => true,
+    };
+    consent.check(primary, token)?;
+    let current = SetupIntent {
+        plan,
+        skip: false,
+        copy_done: false,
+        ..intent.clone()
+    };
+    Ok(ReviewSnapshot {
+        creation,
+        expected: intent,
+        current,
+        consent: Some(consent),
+        trusted,
+        active: false,
+        error: None,
+    })
+}
+
+/// Keep the displayed project even when it was already trusted. The caller
+/// still owns journal, creation, previous-terminal and execution-lease admission.
+fn apply_reviewed_setup_trust(
+    consent: Option<&SetupConsent>,
+    intent: &SetupIntent,
+    approve: bool,
+    token: &CancellationToken,
+) -> Result<(), String> {
+    if intent.skip {
+        return Ok(());
+    }
+    let Some(plan) = &intent.plan else {
+        return Ok(());
+    };
+    let primary = intent
+        .primary
+        .as_ref()
+        .ok_or("The displayed primary checkout is unavailable; reopen setup review")?;
+    let consent = consent.ok_or(
+        "The displayed primary checkout could not be verified; reopen setup review before trusting it",
+    )?;
+    if approve {
+        consent.trust(primary, plan, token)
+    } else {
+        consent.check(primary, token)
+    }
+}
+
 fn decode_daemon_setup_review(
     reply: crate::worktree_control::Reply,
 ) -> Result<ReviewSnapshot, String> {
@@ -1041,6 +1081,7 @@ fn decode_daemon_setup_review(
         creation: creation_id,
         expected,
         current,
+        consent: None,
         trusted,
         active,
         error: plan_error.or_else(|| {
@@ -1471,6 +1512,212 @@ pub(super) fn review_view(review: &Review) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn setup_review_fixture_git(
+        primary: &Path,
+        arguments: &[&str],
+    ) -> crate::process::ProcessOutput {
+        use crate::process::{ProcessExecutor, SystemProcessExecutor};
+        let command = RepositoryService::system("git")
+            .git_base(primary, false)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(arguments.iter().copied());
+        SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap()
+            .require_success("git")
+            .unwrap()
+    }
+
+    fn loaded_setup_review_fixture() -> (tempfile::TempDir, Cagents, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("primary");
+        std::fs::create_dir_all(primary.join(".cagents")).unwrap();
+        setup_review_fixture_git(&primary, &["init", "-q", "--initial-branch=main"]);
+        setup_review_fixture_git(
+            &primary,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        std::fs::write(
+            primary.join(".cagents/worktree.toml"),
+            "setup = 'printf reviewed'\n",
+        )
+        .unwrap();
+        let creation = OperationId::new();
+        let request = OperationId::new();
+        let path = directory.path().join("destination");
+        let token = CancellationToken::new();
+        let intent = SetupIntent {
+            primary: Some(primary.clone()),
+            plan: crate::worktree_setup::load(&primary).unwrap(),
+            run_id: Some(OperationId::new()),
+            ..Default::default()
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.project_ui.setup_review = Some(Review {
+            request,
+            creation,
+            path: path.clone(),
+            expected: intent.clone(),
+            current: intent.clone(),
+            consent: None,
+            remote: None,
+            active: false,
+            loading: true,
+            trusted: false,
+            approved: false,
+            error: None,
+            token: token.clone(),
+        });
+        // This is the actual local snapshot loader and callback, supplied a
+        // fixture intent. It does not claim journal or daemon resume admission.
+        let snapshot = load_local_setup_review_snapshot(creation, intent.clone(), &token).unwrap();
+        app.setup_review_loaded(OperationId::new(), Ok(snapshot.clone()));
+        assert!(app.project_ui.setup_review.as_ref().unwrap().loading);
+        assert!(
+            app.project_ui
+                .setup_review
+                .as_ref()
+                .unwrap()
+                .consent
+                .is_none()
+        );
+        app.setup_review_loaded(request, Ok(snapshot));
+        let review = app.project_ui.setup_review.as_ref().unwrap();
+        assert!(!review.loading);
+        assert!(!review.trusted);
+        assert!(review.consent.is_some());
+        assert_eq!(review.expected, intent);
+        assert_eq!(review.current.plan, intent.plan);
+        assert_eq!(app.setup_ui.current_run(&path), intent.run_id);
+        drop(
+            app.handle_project_action(project_ui::Action::SetupReviewTrust {
+                request,
+                approved: true,
+            }),
+        );
+        assert!(app.project_ui.setup_review.as_ref().unwrap().approved);
+        (directory, app, primary)
+    }
+
+    #[test]
+    fn local_setup_review_consent_refuses_replaced_primary_with_original_git_admin() {
+        use std::os::unix::fs::MetadataExt;
+        let (directory, app, primary) = loaded_setup_review_fixture();
+        let review = app.project_ui.setup_review.as_ref().unwrap();
+        let consent = review.consent.clone().unwrap();
+        let intent = review.current.clone();
+        let token = review.token.clone();
+        let config = std::fs::read(primary.join(".git/config")).unwrap();
+        let admin = std::fs::metadata(primary.join(".git")).unwrap();
+        let original = directory.path().join("original-primary");
+        std::fs::rename(&primary, &original).unwrap();
+        std::fs::create_dir_all(primary.join(".cagents")).unwrap();
+        std::fs::write(
+            primary.join(".cagents/worktree.toml"),
+            std::fs::read(original.join(".cagents/worktree.toml")).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(original.join(".git"), primary.join(".git")).unwrap();
+        let same_admin = std::fs::metadata(primary.join(".git")).unwrap();
+        assert_eq!(
+            (admin.dev(), admin.ino()),
+            (same_admin.dev(), same_admin.ino())
+        );
+        assert_eq!(crate::worktree_setup::load(&primary).unwrap(), intent.plan);
+        // The worker's clone still names the original root. Keep the review
+        // alive: dropping it would cancel the token and mask the identity check.
+        for approve in [true, false] {
+            assert!(!token.is_cancelled());
+            let error =
+                apply_reviewed_setup_trust(Some(&consent), &intent, approve, &token).unwrap_err();
+            assert!(error.contains("changed"));
+            assert_eq!(std::fs::read(primary.join(".git/config")).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn local_setup_review_consent_refuses_replaced_git_admin() {
+        let (_directory, app, primary) = loaded_setup_review_fixture();
+        let review = app.project_ui.setup_review.as_ref().unwrap();
+        let consent = review.consent.clone().unwrap();
+        let intent = review.current.clone();
+        let token = review.token.clone();
+        let original = primary.join(".git-original");
+        let original_config = std::fs::read(primary.join(".git/config")).unwrap();
+        std::fs::rename(primary.join(".git"), &original).unwrap();
+        setup_review_fixture_git(&primary, &["init", "-q", "--initial-branch=main"]);
+        let replacement_config = std::fs::read(primary.join(".git/config")).unwrap();
+        assert_eq!(crate::worktree_setup::load(&primary).unwrap(), intent.plan);
+        for approve in [true, false] {
+            assert!(!token.is_cancelled());
+            let error =
+                apply_reviewed_setup_trust(Some(&consent), &intent, approve, &token).unwrap_err();
+            assert!(error.contains("changed"));
+            assert_eq!(
+                std::fs::read(primary.join(".git/config")).unwrap(),
+                replacement_config
+            );
+            assert_eq!(
+                std::fs::read(original.join("config")).unwrap(),
+                original_config
+            );
+        }
+    }
+
+    #[test]
+    fn local_setup_review_consent_accepts_ordinary_file_edits() {
+        let (_directory, app, primary) = loaded_setup_review_fixture();
+        let review = app.project_ui.setup_review.as_ref().unwrap();
+        let consent = review.consent.clone().unwrap();
+        let intent = review.current.clone();
+        let token = review.token.clone();
+        std::fs::write(
+            primary.join("ordinary.txt"),
+            "normal work while reviewing\n",
+        )
+        .unwrap();
+        let config = std::fs::read(primary.join(".git/config")).unwrap();
+        apply_reviewed_setup_trust(Some(&consent), &intent, false, &token).unwrap();
+        assert_eq!(std::fs::read(primary.join(".git/config")).unwrap(), config);
+        apply_reviewed_setup_trust(Some(&consent), &intent, true, &token).unwrap();
+        assert!(
+            crate::worktree_setup::is_trusted(&primary, intent.plan.as_ref().unwrap(), &token)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn local_setup_review_missing_consent_refuses_trust_but_preserves_skip() {
+        let (_directory, mut app, primary) = loaded_setup_review_fixture();
+        let review = app.project_ui.setup_review.as_mut().unwrap();
+        review.consent = None;
+        let mut intent = review.current.clone();
+        let token = review.token.clone();
+        let config = std::fs::read(primary.join(".git/config")).unwrap();
+        for approve in [true, false] {
+            let error =
+                apply_reviewed_setup_trust(review.consent.as_ref(), &intent, approve, &token)
+                    .unwrap_err();
+            assert!(error.contains("reopen setup review"));
+            assert_eq!(std::fs::read(primary.join(".git/config")).unwrap(), config);
+        }
+        intent.skip = true;
+        apply_reviewed_setup_trust(None, &intent, true, &token).unwrap();
+        assert_eq!(std::fs::read(primary.join(".git/config")).unwrap(), config);
+    }
 
     fn prepared_setup_selection_fixture() -> (
         tempfile::TempDir,
@@ -2070,6 +2317,7 @@ mod tests {
             path: "/repo".into(),
             expected: SetupIntent::default(),
             current: SetupIntent::default(),
+            consent: None,
             remote: None,
             active: false,
             loading: false,
@@ -2437,6 +2685,7 @@ mod tests {
             active: true,
         };
         let review = decode_daemon_setup_review(reply).unwrap();
+        assert!(review.consent.is_none());
         assert_eq!(review.expected.run_id, Some(run));
         assert_eq!(review.current.primary.as_deref(), Some(Path::new("/repo")));
         assert_eq!(review.current.plan, Some(plan));

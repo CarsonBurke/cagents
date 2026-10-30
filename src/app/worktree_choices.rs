@@ -54,7 +54,10 @@ impl CheckoutIdentity {
                 .symlink_metadata()
                 .map_err(|error| error.to_string())?;
             if !named.is_dir() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
-                return Err("The displayed checkout changed; reopen the worktree dialog and review it again".into());
+                return Err(
+                    "The displayed checkout changed; close and reopen this form to review it again"
+                        .into(),
+                );
             }
         }
         Ok(())
@@ -87,18 +90,54 @@ impl CheckoutIdentity {
     }
 }
 
+/// The same display-time project witness is used by initial creation and
+/// explicit local setup recovery. It is ephemeral and never grants replay.
+#[derive(Debug, Clone)]
+pub(super) struct SetupConsent {
+    identity: Arc<CheckoutIdentity>,
+}
+
+impl SetupConsent {
+    pub(super) fn capture(
+        primary: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            identity: Arc::new(CheckoutIdentity::capture(primary, cancellation)?),
+        })
+    }
+
+    pub(super) fn check(
+        &self,
+        primary: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        self.identity.check(primary, cancellation)
+    }
+
+    pub(super) fn trust(
+        &self,
+        primary: &Path,
+        plan: &crate::worktree_setup::SetupPlan,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        self.check(primary, cancellation)?;
+        crate::worktree_setup::trust(primary, plan, cancellation).map_err(|error| error.to_string())
+    }
+}
+
 #[derive(Debug)]
 struct ChoicesIdentity {
     repository: CheckoutIdentity,
-    primary: Option<CheckoutIdentity>,
+    primary: Option<SetupConsent>,
 }
 
 impl ChoicesIdentity {
     fn check(&self, repository: &Path, cancellation: &CancellationToken) -> Result<(), String> {
         self.repository.check(repository, cancellation)?;
         if let Some(primary) = &self.primary {
-            primary.check(primary.root.path(), cancellation)?;
-            if primary.common.path() != self.repository.common.path() {
+            primary.check(primary.identity.root.path(), cancellation)?;
+            if primary.identity.common.path() != self.repository.common.path() {
                 return Err(
                     "The primary checkout belongs to another repository; review it again".into(),
                 );
@@ -134,9 +173,7 @@ impl ReviewedConfig {
                 .primary
                 .as_ref()
                 .ok_or("The displayed primary checkout is unavailable; review it again")?;
-            original.check(primary, cancellation)?;
-            crate::worktree_setup::trust(primary, plan, cancellation)
-                .map_err(|error| error.to_string())?;
+            original.trust(primary, plan, cancellation)?;
         }
         if let Some(prefix) = &self.prefix {
             // Trust may have taken time. Retain the original witness and
@@ -233,7 +270,7 @@ impl Choices {
             .filter(|record| !record.bare)
             .map(|record| record.path.clone());
         if let Some(primary) = &choices.primary {
-            let primary_identity = CheckoutIdentity::capture(primary, cancellation)?;
+            let primary_identity = SetupConsent::capture(primary, cancellation)?;
             choices.identity = Some(Arc::new(ChoicesIdentity {
                 repository: repository_identity,
                 primary: Some(primary_identity),
