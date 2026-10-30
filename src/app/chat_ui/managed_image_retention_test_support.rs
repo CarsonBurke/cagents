@@ -48,6 +48,85 @@ pub(in crate::app) fn insert_image_only(app: &mut Cagents, card: CardId, image: 
     }
 }
 
+/// Exercises Draft clipboard reducers with a real stored image, then checks
+/// custody across `during`. The staging Task is deliberately not polled: this
+/// covers callback ownership and adoption, not clipboard storage-worker IO.
+pub(in crate::app) fn with_unstarted_image_only(
+    app: &mut Cagents,
+    card: CardId,
+    image: &Attachment,
+    during: impl FnOnce(&mut Cagents, Target, Message),
+) {
+    let _admission = attachment_draft::test_admission();
+    chat::attachment_assets::validate(image).unwrap();
+    let bytes = std::fs::read(&image.path).unwrap();
+    let target = {
+        let runtime = runtime(app, card);
+        assert!(matches!(runtime.connection, Connection::Draft));
+        assert!(runtime.session.is_unstarted());
+        assert!(runtime.accepts_draft_attachments());
+        assert!(runtime.handle().is_none());
+        runtime.target
+    };
+    let ticket = app
+        .chat_runtime_mut(target)
+        .unwrap()
+        .begin_attachment_insert();
+    let clipboard =
+        clipboard_image::Image::try_from((bytes.clone(), "image/png".to_owned())).unwrap();
+    // The stored fixture is the completed worker result. Dropping this actual
+    // PastedImage staging Task must not be reported as producer execution.
+    drop(app.update(Message::ChatUi(Action::PastedImage(
+        target,
+        ticket.clone(),
+        Some(clipboard),
+    ))));
+    assert_eq!(runtime(app, card).image_pastes_saving, 1);
+    assert_eq!(runtime(app, card).pastes_pending, 1);
+    drop(app.update(Message::ChatUi(Action::ImageSaved(
+        target,
+        ticket.clone(),
+        Ok(image.clone()),
+    ))));
+    assert_eq!(
+        runtime(app, card).composer.text(),
+        format!("{} ", image.reference.as_ref().unwrap().token())
+    );
+    for action in [
+        text_editor::Action::Move(text_editor::Motion::DocumentStart),
+        text_editor::Action::Select(text_editor::Motion::DocumentEnd),
+        text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(String::new()))),
+    ] {
+        drop(app.update(Message::ChatUi(Action::Composer(target, action))));
+    }
+    let allocation = assert_runtime_only_image(app, card, image, false, false);
+    let cursor = runtime(app, card).composer.cursor();
+    let settled = |app: &Cagents| {
+        let runtime = runtime(app, card);
+        assert!(matches!(runtime.connection, Connection::Draft));
+        assert!(runtime.session.is_unstarted());
+        assert_eq!(runtime.target, target);
+        assert_eq!(runtime.composer.cursor(), cursor);
+        assert!(runtime.attachment_order.is_empty());
+        assert!(runtime.attachment_chooser_pending.is_none());
+        assert!(runtime.submit_after_paste.is_none());
+        assert!(runtime.queued.is_none());
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(
+            assert_runtime_only_image(app, card, image, false, false),
+            allocation
+        );
+    };
+    settled(app);
+    during(
+        app,
+        target,
+        Message::ChatUi(Action::ImageSaved(target, ticket, Ok(image.clone()))),
+    );
+    settled(app);
+    assert_eq!(std::fs::read(&image.path).unwrap(), bytes);
+}
+
 pub(in crate::app) fn assert_runtime_only_image(
     app: &Cagents,
     card: CardId,

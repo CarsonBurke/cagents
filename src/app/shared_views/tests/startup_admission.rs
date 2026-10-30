@@ -1091,6 +1091,344 @@ fn ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection() {
     }
 }
 
+/// Shared Draft option adoption and managed-proof admission must compose:
+/// rejecting one raw sibling must not strand another pane's settled image.
+#[test]
+fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel() {
+    use crate::{
+        app::{
+            chat_ui::{self, Action, managed_image_retention_test_support as custody},
+            workspace_model_sync::ModelUpdate,
+        },
+        chat::{Attachment, attachment_assets},
+        session::SessionRuntime,
+    };
+    if isolated("mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel") {
+        return;
+    }
+
+    fn assert_stored(
+        app: &mut Cagents,
+        draft: &Pane,
+        source: &Session,
+        rejected: &Pane,
+        image: &Attachment,
+        rejected_image: &Attachment,
+    ) {
+        app.persist();
+        let writer = app.session.as_ref().unwrap();
+        writer.flush(Duration::from_secs(5)).unwrap();
+        assert_eq!(writer.last_error(), None);
+        let saved = writer
+            .operation_store()
+            .load_workspace(app.durable.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == draft.id)
+                .unwrap()
+                .kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == rejected.id)
+                .unwrap()
+                .kind,
+            rejected.kind
+        );
+        assert!(
+            saved
+                .cards
+                .iter()
+                .filter(|card| card.id == draft.id || card.id == rejected.id)
+                .all(|card| card.existence.is_open())
+        );
+        assert_eq!(
+            saved.quarantined_panes,
+            HashMap::from([(rejected.id, rejected.kind.clone())])
+        );
+        assert!(!saved.chat_drafts.contains_key(&draft.id));
+        assert_eq!(saved.chat_draft_attachments[&draft.id], vec![image.clone()]);
+        assert_eq!(
+            saved.chat_drafts[&rejected.id],
+            "Keep the rejected sibling's draft"
+        );
+        assert_eq!(
+            saved.chat_draft_attachments[&rejected.id],
+            vec![rejected_image.clone()]
+        );
+        attachment_assets::validate(&saved.chat_draft_attachments[&draft.id][0]).unwrap();
+    }
+
+    attachment_assets::with_test_image(|image| {
+        let rejected_image = attachment_assets::test_image("Rejected sibling image");
+        let (mut app, active, channel, mut rejected, identity) = cached_chat();
+        current_owner(&mut rejected);
+        app.card_state_mut(rejected.id).unwrap().kind = rejected.kind.clone();
+        let mut draft = sibling_chat(&rejected, "Unused shared image draft");
+        let CardKind::Chat(original) = &mut draft.kind else {
+            unreachable!()
+        };
+        original.launch.session_id = None;
+        original.proof = None;
+        original.terminal = None;
+        original.owned_codex_listener = None;
+        original.native_continuity = Default::default();
+        assert!(original.is_unstarted());
+        let original = original.clone();
+        install_held_pane(&mut app, channel, &draft);
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.active_channel = Some(channel);
+        durable.focused = Some(draft.id);
+        let owner = durable
+            .channels
+            .iter_mut()
+            .find(|entry| entry.id == channel)
+            .unwrap();
+        owner.cards = vec![draft.id, rejected.id];
+        owner.focused = Some(draft.id);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.chat_ui = chat_ui::State::with_draft_attachments(
+            HashMap::from([(rejected.id, "Keep the rejected sibling's draft".into())]),
+            HashMap::from([(rejected.id, vec![rejected_image.clone()])]),
+        );
+        let daemon = ScriptedDaemon::start();
+        let startup = app.initialize_runtimes();
+        settle(&mut app, startup);
+        assert!(!app.chat_awaiting_admission(draft.id));
+        assert!(app.chat_awaiting_admission(rejected.id));
+        let rejected_target = match app.cards.get(&rejected.id) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => panic!("cached rejected source awaits its real model"),
+        };
+        let viewport = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1200.0),
+        });
+        settle(&mut app, viewport);
+        let mut view = View::empty(channel);
+        view.revision = 7;
+        view.panes = vec![draft.clone(), rejected.clone()];
+        let mut full = model(identity, active, channel, view);
+        full.sequence = 10;
+        let mut issuer = managed_owner(&rejected, channel);
+        let Some(crate::agent_execution::HostedSession::Chat(issued)) = &mut issuer.session else {
+            unreachable!()
+        };
+        issued.proof.as_mut().unwrap().host_incarnation = "different-owner".into();
+        full.agents = vec![issuer];
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        assert_eq!(
+            app.workspace_model.identity,
+            crate::workspace_model::NO_REGISTRY
+        );
+        let connected = app.apply_workspace_model_update(ModelUpdate::Connected(full.clone()));
+        settle(&mut app, connected);
+        let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let seeds = edits
+            .iter()
+            .filter_map(|edit| match edit {
+                ModelEdit::SeedView {
+                    scope,
+                    panes,
+                    closed,
+                } => Some((scope.clone(), panes.clone(), closed.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let shared = seeds
+            .iter()
+            .filter(|(scope, _, _)| *scope == Scope::Channel(channel))
+            .collect::<Vec<_>>();
+        assert_eq!(shared.len(), 1, "one actual Draft-only seed: {edits:?}");
+        assert_eq!(shared[0].1, vec![draft.clone()]);
+        assert!(shared[0].2.is_empty());
+        assert!(app.shared_views.seeding.contains(&Scope::Channel(channel)));
+        assert!(
+            !app.shared_views
+                .initialized
+                .contains(&Scope::Channel(channel))
+        );
+        assert!(
+            !edits
+                .iter()
+                .any(|edit| matches!(edit, ModelEdit::ChangeView { .. }))
+        );
+        assert!(!edits.iter().any(
+            |edit| matches!(edit, ModelEdit::SeedView { panes, closed, .. }
+            if panes.iter().any(|pane| pane.id == rejected.id) || closed.contains(&rejected.id))
+        ));
+        assert_eq!(app.shared_views.quarantined, HashSet::from([rejected.id]));
+        // ACK only the scopes the production Connected reducer actually seeded.
+        for (scope, panes, closed) in seeds {
+            assert!(closed.is_empty());
+            if scope != Scope::Channel(channel) {
+                assert_eq!(scope, Scope::Channel(active));
+                assert!(panes.is_empty());
+            }
+            let ack = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope,
+                operation: None,
+                model: full.clone(),
+            });
+            settle(&mut app, ack);
+        }
+        assert!(
+            app.shared_views
+                .initialized
+                .contains(&Scope::Channel(channel))
+        );
+        assert!(!app.shared_views.seeding.contains(&Scope::Channel(channel)));
+        assert_eq!(chat_ui::draft_launch_for_test(&app, draft.id).1, original);
+        assert!(matches!(
+            app.cards.get(&rejected.id),
+            Some(CardRuntime::Failed(_))
+        ));
+        assert!(daemon.requests().is_empty());
+        assert!(daemon.resolutions().is_empty());
+
+        let project = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id == channel)
+            .unwrap()
+            .project_id;
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = SessionRuntime::open(
+            directory.path().join("mixed-draft-options.sqlite3"),
+            crate::model::BootId::new("boot"),
+        )
+        .unwrap();
+        writer.save_project(ProjectState {
+            id: project,
+            generation: 0,
+            name: "Mixed shared Draft".into(),
+            repository: "/fixture-project".into(),
+            kind: ProjectKind::Folder,
+            existence: Existence::Open,
+        });
+        app.session = Some(writer);
+        let mut chosen = original.clone();
+        chosen
+            .launch
+            .recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/accounts/claude/peer".into());
+        chosen
+            .launch
+            .recipe
+            .environment
+            .insert("SHARED_DRAFT".into(), "peer value".into());
+        chosen
+            .launch
+            .recipe
+            .unset_environment
+            .insert("OLD_DRAFT".into());
+        chosen.launch.recipe.working_directory = "/fixture-project/peer".into();
+        chosen
+            .launch
+            .recipe
+            .arguments
+            .extend(["--append-system-prompt".into(), "Peer draft options".into()]);
+        crate::chat::apply_claude_permission_mode(&mut chosen.launch.recipe, "plan");
+        assert!(chosen.is_unstarted());
+        assert_eq!(chosen.id, original.id);
+        custody::with_unstarted_image_only(&mut app, draft.id, &image, |app, target, mut late| {
+            assert_stored(app, &draft, &original, &rejected, &image, &rejected_image);
+            chat_ui::with_attachment_chooser_open_for_test(app, draft.id, |app| {
+                full.sequence += 1;
+                full.views[1].revision += 1;
+                full.views[1].panes[0].kind = CardKind::Chat(chosen.clone());
+                let peer = app.apply_workspace_model_update(ModelUpdate::Read(full.clone()));
+                settle(app, peer);
+                assert_eq!(
+                    app.workspace_model.views, full.views,
+                    "keep the untouched raw rejected sibling"
+                );
+                assert_eq!(app.workspace_model.agents, full.agents);
+                assert_eq!(
+                    app.card_state(draft.id).unwrap().kind,
+                    CardKind::Chat(chosen.clone())
+                );
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get(&draft.id) else {
+                    panic!("same Draft runtime")
+                };
+                assert_eq!(runtime.target, target);
+                assert_eq!(
+                    runtime.session, original,
+                    "chooser owns the earlier runtime until its cancellation callback"
+                );
+                assert_stored(app, &draft, &chosen, &rejected, &image, &rejected_image);
+            });
+            let (footer, shown) = chat_ui::draft_launch_for_test(app, draft.id);
+            assert_eq!(footer.as_deref(), Some("plan"));
+            assert_eq!(shown, chosen);
+            assert_eq!(
+                app.card_state(draft.id).unwrap().kind,
+                CardKind::Chat(chosen.clone())
+            );
+            assert_eq!(app.shared_views.quarantined, HashSet::from([rejected.id]));
+            assert!(matches!(
+                app.cards.get(&rejected.id),
+                Some(CardRuntime::Failed(_))
+            ));
+            // A late image completion with B's captured pre-quarantine Target
+            // cannot install payload, reopen it, or affect A's settled image.
+            let Message::ChatUi(Action::ImageSaved(reply, ..)) = &mut late else {
+                unreachable!()
+            };
+            *reply = rejected_target;
+            drop(app.update(late));
+            assert_stored(app, &draft, &chosen, &rejected, &image, &rejected_image);
+        });
+        let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!edits.iter().any(|edit| match edit {
+            ModelEdit::SeedView { panes, closed, .. } =>
+                panes.iter().any(|pane| pane.id == rejected.id) || closed.contains(&rejected.id),
+            ModelEdit::ChangeView { change, .. } => change_card(change) == Some(rejected.id),
+            _ => false,
+        }));
+        assert!(daemon.requests().is_empty());
+        assert!(daemon.resolutions().is_empty());
+        assert!(
+            !daemon
+                .controls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| matches!(
+                    request,
+                    ClientRequest::ChatStart { .. }
+                        | ClientRequest::ChatAttach { .. }
+                        | ClientRequest::ResolveUpgradeChat { .. }
+                        | ClientRequest::ChatPrepareResume { .. }
+                        | ClientRequest::ChatClose { .. }
+                        | ClientRequest::ChatCloseRetained { .. }
+                        | ClientRequest::CloseTerminalChecked { .. }
+                ))
+        );
+        assert!(!app.chat_start_pending(draft.id));
+        assert!(!app.chat_start_pending(rejected.id));
+        assert!(
+            !app.shared_views
+                .validated_managed
+                .contains_key(&rejected.id)
+        );
+        let mut writer = app.session.take().unwrap();
+        writer.shutdown();
+        assert_eq!(writer.last_error(), None);
+    });
+}
+
 #[test]
 fn mixed_scope_verified_retirement_preserves_runtime_only_managed_images() {
     use crate::{
