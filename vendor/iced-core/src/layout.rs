@@ -43,6 +43,12 @@ impl<'a> Layout<'a> {
         self
     }
 
+    /// Translates this layout and its descendants without changing its virtual offset.
+    pub fn translated(mut self, translation: Vector) -> Self {
+        self.position = self.position + translation;
+        self
+    }
+
     /// Returns the position of the [`Layout`].
     pub fn position(&self) -> Point {
         self.position
