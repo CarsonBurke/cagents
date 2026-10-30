@@ -217,6 +217,10 @@ impl Aod {
             self.vertical_direction,
         );
 
+        // Tall menus start at the window edge and scroll; ordinary menus
+        // flip and clamp so every visible item stays inside the parent.
+        let x = x.clamp(0.0, (viewport_size.width - children_size.width).max(0.0));
+        let y = y.clamp(0.0, (viewport_size.height - children_size.height).max(0.0));
         ([x, y].into(), [ox, oy].into())
     }
 }
@@ -259,8 +263,18 @@ impl MenuBounds {
         tree: &mut [Tree],
         is_overlay: bool,
     ) -> Self {
-        let (children_size, child_positions, child_sizes) =
-            get_children_layout(menu_tree, renderer, item_width, item_height, tree);
+        let width = match item_width {
+            ItemWidth::Uniform(width) => width,
+            ItemWidth::Static(fallback) => menu_tree.width.unwrap_or(fallback),
+        }
+        .min(viewport_size.width.max(1.0) as u16);
+        let (children_size, child_positions, child_sizes) = get_children_layout(
+            menu_tree,
+            renderer,
+            ItemWidth::Uniform(width),
+            item_height,
+            tree,
+        );
 
         // viewport space parent bounds
         let view_parent_bounds = parent_bounds + overlay_offset;
@@ -302,6 +316,8 @@ impl MenuBounds {
 pub(crate) struct MenuState {
     /// The index of the active menu item
     pub(crate) index: Option<usize>,
+    /// Keyboard selection is painted even without a pointer over the item.
+    keyboard: bool,
     scroll_offset: f32,
     pub menu_bounds: MenuBounds,
 }
@@ -575,6 +591,23 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         let viewport_size = viewport.size();
         let overlay_offset = Point::ORIGIN - viewport.position();
         let overlay_cursor = view_cursor.position().unwrap_or_default() - overlay_offset;
+        if matches!(event, event::Event::Keyboard(_)) {
+            init_root_menu(
+                self,
+                renderer,
+                shell,
+                overlay_cursor,
+                viewport_size,
+                overlay_offset,
+                self.bar_bounds,
+                self.main_offset as f32,
+            );
+            if let Some(submenu) =
+                process_keyboard_events(self, event, renderer, shell, viewport_size, overlay_offset)
+            {
+                return submenu;
+            }
+        }
         let menu_roots = match &mut self.menu_roots {
             Cow::Borrowed(_) => panic!(),
             Cow::Owned(o) => o.as_mut_slice(),
@@ -601,14 +634,33 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         );
 
         match event {
-            Mouse(WheelScrolled { delta }) => process_scroll_events(
-                self,
-                shell,
-                *delta,
-                overlay_cursor,
-                viewport_size,
-                overlay_offset,
-            ),
+            Mouse(WheelScrolled { delta }) => {
+                process_scroll_events(
+                    self,
+                    shell,
+                    *delta,
+                    overlay_cursor,
+                    viewport_size,
+                    overlay_offset,
+                );
+                // Scrolling moves a different row beneath a stationary pointer.
+                // Reuse motion's hit test after every scroll path has settled,
+                // including parent scrolling that moves an open submenu.
+                if view_cursor.position().is_some()
+                    && (self.is_overlay || view_cursor.is_over(viewport))
+                {
+                    return process_overlay_events(
+                        self,
+                        renderer,
+                        viewport_size,
+                        overlay_offset,
+                        view_cursor,
+                        overlay_cursor,
+                        self.cross_offset as f32,
+                        shell,
+                    );
+                }
+            }
 
             Mouse(ButtonPressed(Left)) | Touch(FingerPressed { .. }) => {
                 self.tree.inner.with_data_mut(|data| {
@@ -712,6 +764,63 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         None
     }
 
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &crate::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
+        self.tree.inner.with_data_mut(|state| {
+            if !state.open || state.active_root.len() <= self.depth {
+                return;
+            }
+            let root = state.active_root[0];
+            let depth = if self.is_overlay { 0 } else { self.depth };
+            let mut roots = state.active_root[1..=depth]
+                .iter()
+                .fold(&self.menu_roots[root].children, |roots, next| {
+                    &roots[*next].children
+                });
+            let item_trees = &mut state.tree.children[root].children;
+            let viewport = layout.bounds();
+            let overlay_offset = Point::ORIGIN - viewport.position();
+            let end = if self.is_overlay {
+                state.menu_states.len()
+            } else {
+                depth + 1
+            };
+            // Traverse precisely the item trees and clipped layouts drawn in
+            // this frame, including the current scroll slice. The default
+            // Overlay implementation otherwise hides every menu descendant
+            // from widget operations.
+            for (menu, children_layout) in
+                state.menu_states[depth..end].iter().zip(layout.children())
+            {
+                let slice = menu.slice(viewport.size(), overlay_offset, self.item_height);
+                operation.container(None, children_layout.bounds());
+                operation.traverse(&mut |operation| {
+                    for (item, item_layout) in roots[slice.start_index..=slice.end_index]
+                        .iter()
+                        .zip(children_layout.children())
+                    {
+                        item.item.element.with_data_mut(|element| {
+                            element.as_widget_mut().operate(
+                                &mut item_trees[item.index],
+                                item_layout,
+                                renderer,
+                                operation,
+                            );
+                        });
+                    }
+                });
+                let Some(active) = menu.index else {
+                    break;
+                };
+                roots = &roots[active].children;
+            }
+        });
+    }
+
     #[allow(unused_results, clippy::too_many_lines)]
     fn draw(
         &self,
@@ -806,7 +915,7 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
                             let menu_color = styling.background;
                             r.fill_quad(menu_quad, menu_color);
                             // draw path hightlight
-                            if let (true, Some(active)) = (draw_path, ms.index)
+                            if let (true, Some(active)) = (draw_path || ms.keyboard, ms.index)
                                 && let Some(active_layout) = children_layout
                                     .children()
                                     .nth(active.saturating_sub(start_index))
@@ -912,6 +1021,15 @@ impl<Message: Clone + 'static> overlay::Overlay<Message, crate::Theme, crate::Re
         self.update(event, layout, cursor, renderer, clipboard, shell);
     }
 
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &crate::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
+        Menu::operate(self, layout, renderer, operation);
+    }
+
     fn draw(
         &self,
         renderer: &mut crate::Renderer,
@@ -967,6 +1085,16 @@ impl<Message: std::clone::Clone + 'static> Widget<Message, crate::Theme, crate::
         _viewport: &Rectangle,
     ) {
         Menu::draw(self, renderer, theme, style, layout, cursor);
+    }
+
+    fn operate(
+        &mut self,
+        _tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &crate::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
+        Menu::operate(self, layout, renderer, operation);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1245,6 +1373,7 @@ pub(crate) fn init_root_menu<Message: Clone>(
                 state.active_root.push(i);
                 let ms = MenuState {
                     index: None,
+                    keyboard: false,
                     scroll_offset: 0.0,
                     menu_bounds,
                 };
@@ -1326,6 +1455,7 @@ pub(super) fn init_root_popup_menu<Message>(
 
         let ms = MenuState {
             index: None,
+            keyboard: false,
             scroll_offset: 0.0,
             menu_bounds,
         };
@@ -1334,6 +1464,208 @@ pub(super) fn init_root_popup_menu<Message>(
         // Hack to ensure menu opens properly
         shell.invalidate_layout();
     });
+}
+
+/// Keep a keyboard-selected row in the same clipped slice used by draw/hit tests.
+fn reveal_keyboard_item(state: &mut MenuState, index: usize, viewport: Size, offset: Vector) {
+    let bounds = state.menu_bounds.children_bounds + offset;
+    let top = bounds.y.max(0.0);
+    let bottom = (bounds.y + bounds.height).min(viewport.height);
+    let item_top = bounds.y + state.menu_bounds.child_positions[index] + state.scroll_offset;
+    let item_bottom = item_top + state.menu_bounds.child_sizes[index].height;
+    if item_top < top {
+        state.scroll_offset += top - item_top;
+    } else if item_bottom > bottom {
+        state.scroll_offset -= item_bottom - bottom;
+    }
+    state.scroll_offset = state.scroll_offset.clamp(
+        (viewport.height - bounds.y - bounds.height).min(0.0),
+        (-bounds.y).max(0.0),
+    );
+}
+
+/// `Some` owns the key; its value reuses the pointer path's submenu result.
+fn process_keyboard_events<Message: Clone + 'static>(
+    menu: &mut Menu<'_, Message>,
+    event: &event::Event,
+    renderer: &crate::Renderer,
+    shell: &mut Shell<'_, Message>,
+    viewport: Size,
+    offset: Vector,
+) -> Option<Option<(usize, MenuState)>> {
+    use iced_core::keyboard::{Event, Key, key::Named};
+    let (key, pressed) = match event {
+        event::Event::Keyboard(Event::KeyPressed { key, modifiers, .. })
+            if modifiers.is_empty() =>
+        {
+            (key, true)
+        }
+        event::Event::Keyboard(Event::KeyReleased { key, modifiers, .. })
+            if modifiers.is_empty() =>
+        {
+            (key, false)
+        }
+        _ => return None,
+    };
+    let key = match key {
+        Key::Named(key) => key,
+        // Pinned iced reports Space as Character, including release. It uses
+        // the same selected-item activation path as Enter.
+        Key::Character(text) if text.as_str() == " " => &Named::Enter,
+        _ => return None,
+    };
+    if !matches!(
+        key,
+        Named::ArrowDown
+            | Named::ArrowUp
+            | Named::Home
+            | Named::End
+            | Named::ArrowRight
+            | Named::ArrowLeft
+            | Named::Enter
+    ) {
+        return None;
+    }
+    let mut open_at = None;
+    let mut child_first = None;
+    let handled = menu.tree.inner.with_data_mut(|state| {
+        if !state.open || state.menu_states.is_empty() || state.active_root.is_empty() {
+            return false;
+        }
+        if !pressed {
+            return true;
+        }
+        let depth = if menu.is_overlay {
+            state.menu_states.len() - 1
+        } else {
+            menu.depth
+        };
+        if depth >= state.menu_states.len() || depth >= state.active_root.len() {
+            return true;
+        }
+        if *key == Named::ArrowLeft {
+            if depth > 0 {
+                #[cfg(wayland_platform)]
+                if !menu.is_overlay
+                    && matches!(WINDOWING_SYSTEM.get(), Some(WindowingSystem::Wayland))
+                    && let Some(handler) = &menu.on_surface_action
+                {
+                    state.popup_id.retain(|_, id| *id != menu.window_id);
+                    shell.publish(handler(crate::surface::Action::DestroyPopup(
+                        menu.window_id,
+                    )));
+                }
+                state.menu_states.truncate(depth);
+                state.active_root.truncate(depth);
+                state.menu_states[depth - 1].keyboard = true;
+            }
+            return true;
+        }
+        let roots = state.active_root[1..=depth].iter().fold(
+            &menu.menu_roots[state.active_root[0]].children,
+            |roots, index| &roots[*index].children,
+        );
+        let current = &mut state.menu_states[depth];
+        state.pressed = false;
+        if matches!(
+            key,
+            Named::ArrowDown | Named::ArrowUp | Named::Home | Named::End
+        ) {
+            let len = roots.len();
+            if len == 0 {
+                return true;
+            }
+            let reverse = matches!(key, Named::ArrowUp | Named::End);
+            let start = match key {
+                Named::Home => 0,
+                Named::End => len - 1,
+                _ if reverse => current.index.map_or(len - 1, |i| (i + len - 1) % len),
+                _ => current.index.map_or(0, |i| (i + 1) % len),
+            };
+            current.index = (0..len)
+                .map(|step| {
+                    if reverse {
+                        (start + len - step) % len
+                    } else {
+                        (start + step) % len
+                    }
+                })
+                .find(|index| roots[*index].keyboard_selectable());
+            current.keyboard = true;
+            if let Some(index) = current.index {
+                reveal_keyboard_item(current, index, viewport, offset);
+            }
+        } else if let Some(index) = current.index {
+            let item = &roots[index];
+            if !item.children.is_empty() {
+                reveal_keyboard_item(current, index, viewport, offset);
+                let bounds = current.menu_bounds.children_bounds;
+                open_at = Some(Point::new(
+                    bounds.center_x(),
+                    bounds.y
+                        + current.menu_bounds.child_positions[index]
+                        + current.scroll_offset
+                        + current.menu_bounds.child_sizes[index].height / 2.0,
+                ));
+                child_first = item.children.iter().position(MenuTree::keyboard_selectable);
+                // Reuse the existing submenu opener, which opens on a change.
+                current.index = None;
+            } else if *key != Named::ArrowRight
+                && let Some(message) = &item.keyboard_action
+            {
+                shell.publish(message.with_data(Clone::clone));
+                #[cfg(wayland_platform)]
+                if matches!(WINDOWING_SYSTEM.get(), Some(WindowingSystem::Wayland))
+                    && let Some(handler) = &menu.on_surface_action
+                {
+                    let mut root = menu.window_id;
+                    let mut depth = menu.depth;
+                    while let Some(parent) = state.popup_id.iter().find(|(_, id)| **id == root) {
+                        if depth == 0 {
+                            break;
+                        }
+                        root = *parent.0;
+                        depth -= 1;
+                    }
+                    shell.publish(handler(crate::surface::Action::DestroyPopup(root)));
+                }
+                state.reset();
+            }
+        }
+        true
+    });
+    if !handled {
+        return None;
+    }
+    shell.capture_event();
+    shell.invalidate_layout();
+    shell.request_redraw();
+    let cross_offset = menu.cross_offset as f32;
+    let mut submenu = open_at.and_then(|point| {
+        process_overlay_events(
+            menu,
+            renderer,
+            viewport,
+            offset,
+            Cursor::Available(point + offset),
+            point,
+            cross_offset,
+            shell,
+        )
+    });
+    if let Some((_, next)) = &mut submenu {
+        next.keyboard = true;
+        next.index = child_first;
+        if let Some(index) = child_first {
+            reveal_keyboard_item(next, index, viewport, offset);
+        }
+        menu.tree.inner.with_data_mut(|state| {
+            if let Some(last) = state.menu_states.last_mut() {
+                *last = next.clone();
+            }
+        });
+    }
+    Some(submenu)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1567,6 +1899,7 @@ where
         }
         let item = &active_menu[new_index];
         // set new index
+        last_menu_state.keyboard = false;
         let old_index = last_menu_state.index.replace(new_index);
 
         if old_index != Some(new_index) {
@@ -1598,6 +1931,7 @@ where
             };
             let ms = MenuState {
                 index: None,
+                keyboard: false,
                 scroll_offset: 0.0,
                 menu_bounds: MenuBounds::new(
                     item,
@@ -1705,6 +2039,7 @@ fn process_scroll_events<Message>(
             }
         }
         shell.capture_event();
+        shell.invalidate_layout();
         shell.request_redraw();
     });
 }

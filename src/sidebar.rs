@@ -6984,7 +6984,7 @@ fn channel_context_controls<'a>(
                 ),
                 _ => "Delete channel…".to_owned(),
             },
-            None,
+            Some(Icon::Delete.handle()),
             ChannelContextCommand(
                 channel_id,
                 selection_count.unwrap_or(1) > 1,
@@ -7004,7 +7004,7 @@ fn channel_context_controls<'a>(
                 0,
                 Item::Button(
                     "Rename channel…".into(),
-                    None,
+                    Some(Icon::Rename.handle()),
                     ChannelContextCommand(channel_id, false, ChannelMenuCommand::Rename),
                 ),
             );
@@ -7012,10 +7012,13 @@ fn channel_context_controls<'a>(
                 1,
                 Item::Button(
                     "Mark as read".into(),
-                    None,
+                    Some(Icon::Check.handle()),
                     ChannelContextCommand(channel_id, false, ChannelMenuCommand::MarkRead),
                 ),
             );
+        }
+        if selection_count == Some(1) {
+            entries.insert(2, Item::Divider);
         }
         items(&std::collections::HashMap::new(), entries)
     }) else {
@@ -7441,6 +7444,40 @@ fn project_channel_command_label(worktree: Option<WorktreeId>) -> &'static str {
     }
 }
 
+fn project_menu_group(command: &ProjectCommand) -> u8 {
+    match command {
+        ProjectCommand::NewTerminal
+        | ProjectCommand::NewChannel
+        | ProjectCommand::NewWorktree
+        | ProjectCommand::NewWorktreeFromBranch => 0,
+        ProjectCommand::CopyPath | ProjectCommand::CopyBranch => 1,
+        ProjectCommand::Reveal
+        | ProjectCommand::OpenEditor(_)
+        | ProjectCommand::RepositoryUrl
+        | ProjectCommand::PullRequest => 2,
+        ProjectCommand::MoveUp | ProjectCommand::MoveDown | ProjectCommand::ResetSidebarOrder => 3,
+        ProjectCommand::Delete | ProjectCommand::Remove => 4,
+    }
+}
+
+fn project_menu_icon(command: &ProjectCommand) -> Icon {
+    match command {
+        ProjectCommand::NewTerminal => Icon::Terminal,
+        ProjectCommand::NewChannel => Icon::ChannelAdd,
+        ProjectCommand::NewWorktree
+        | ProjectCommand::NewWorktreeFromBranch
+        | ProjectCommand::CopyBranch => Icon::Branch,
+        ProjectCommand::CopyPath => Icon::CopyPath,
+        ProjectCommand::Reveal | ProjectCommand::OpenEditor(_) => Icon::OpenFolder,
+        ProjectCommand::RepositoryUrl => Icon::Browser,
+        ProjectCommand::PullRequest => Icon::Changes,
+        ProjectCommand::MoveUp => Icon::ChevronUp,
+        ProjectCommand::MoveDown => Icon::ChevronDown,
+        ProjectCommand::ResetSidebarOrder => Icon::History,
+        ProjectCommand::Delete | ProjectCommand::Remove => Icon::Delete,
+    }
+}
+
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
@@ -7470,8 +7507,8 @@ fn context_controls<'a>(
         if git {
             commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
         }
+        commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
         if worktree_id.is_some() {
-            commands.push(("Copy path".into(), None, ProjectCommand::CopyPath));
             if git {
                 commands.push(("Copy branch".into(), None, ProjectCommand::CopyBranch));
                 commands.push((
@@ -7529,44 +7566,52 @@ fn context_controls<'a>(
             };
             commands.push((format!("{label}…"), None, command));
         }
-        let entries = commands
-            .iter()
-            .map(|(label, icon, command)| {
-                let item = if !has_branch
+        commands.sort_by_key(|(_, _, command)| project_menu_group(command));
+        let mut previous_group = None;
+        let mut entries = Vec::new();
+        for (label, icon, command) in &commands {
+            let group = project_menu_group(command);
+            if previous_group.is_some_and(|previous| previous != group) {
+                entries.push(Item::Divider);
+            }
+            previous_group = Some(group);
+            let item = if !has_branch
+                && matches!(
+                    command,
+                    ProjectCommand::CopyBranch
+                        | ProjectCommand::NewWorktreeFromBranch
+                        | ProjectCommand::PullRequest
+                ) {
+                Item::ButtonDisabled
+            } else {
+                Item::Button
+            };
+            entries.push(item(
+                if !has_branch
                     && matches!(
                         command,
                         ProjectCommand::CopyBranch
                             | ProjectCommand::NewWorktreeFromBranch
                             | ProjectCommand::PullRequest
-                    ) {
-                    Item::ButtonDisabled
+                    )
+                {
+                    format!("{label} (detached HEAD)")
                 } else {
-                    Item::Button
-                };
-                item(
-                    if !has_branch
-                        && matches!(
-                            command,
-                            ProjectCommand::CopyBranch
-                                | ProjectCommand::NewWorktreeFromBranch
-                                | ProjectCommand::PullRequest
-                        )
-                    {
-                        format!("{label} (detached HEAD)")
-                    } else {
-                        label.clone()
-                    },
-                    icon.clone(),
-                    ContextCommand(
-                        project_id,
-                        worktree_id,
-                        command,
-                        selection_count.is_some_and(|count| count > 1)
-                            && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove),
-                    ),
-                )
-            })
-            .collect();
+                    label.clone()
+                },
+                Some(
+                    icon.clone()
+                        .unwrap_or_else(|| project_menu_icon(command).handle()),
+                ),
+                ContextCommand(
+                    project_id,
+                    worktree_id,
+                    command,
+                    selection_count.is_some_and(|count| count > 1)
+                        && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove),
+                ),
+            ));
+        }
         items(&std::collections::HashMap::new(), entries)
     })
 }
@@ -7656,7 +7701,17 @@ fn file_context_controls<'a>(
     }
     let path = &row.path;
     let mut entries = Vec::with_capacity(5 + editors.len());
+    let mut previous_group = None;
     for (label, icon, command) in file_commands(row.directory, file_management) {
+        let group = match command {
+            FileCommand::Rename | FileCommand::CopyFile => 0,
+            FileCommand::CopyPath | FileCommand::CopyRelativePath => 1,
+            FileCommand::RevealInFileManager => 2,
+        };
+        if previous_group.is_some_and(|previous| previous != group) {
+            entries.push(widget::menu::Item::Divider);
+        }
+        previous_group = Some(group);
         entries.push(widget::menu::Item::Button(
             label.to_owned(),
             Some(icon.handle()),
@@ -13391,7 +13446,7 @@ pub(crate) mod tests {
         },
     };
     use cosmic::iced::{
-        Size,
+        Rectangle, Size,
         advanced::{Layout, layout, widget::Tree},
     };
     use uuid::Uuid;
@@ -15450,6 +15505,110 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn project_menu_renders_copy_path_and_dispatches_its_original_project() {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Vector,
+            advanced::{Shell, clipboard, widget::Operation},
+            mouse,
+        };
+        let renderer = headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(900.0, 900.0));
+        let mut element = context_controls(
+            widget::Space::new().width(900).height(900),
+            project_id(17),
+            None,
+            false,
+            true,
+            true,
+            false,
+            &[],
+            Some(1),
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, viewport.size()),
+        );
+        let mut messages = Vec::new();
+        let anchor = mouse::Cursor::Available(Point::new(850.0, 850.0));
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            Layout::new(&node),
+            anchor,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        let mut popup = element
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &viewport,
+                Vector::ZERO,
+            )
+            .unwrap();
+        let popup_node = popup.as_overlay_mut().layout(&renderer, viewport.size());
+        popup.as_overlay_mut().update(
+            &Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                std::time::Instant::now(),
+            )),
+            Layout::new(&popup_node),
+            anchor,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+        );
+        let popup_node = popup.as_overlay_mut().layout(&renderer, viewport.size());
+        #[derive(Default)]
+        struct Texts(Vec<(String, Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let mut texts = Texts::default();
+        popup
+            .as_overlay_mut()
+            .operate(Layout::new(&popup_node), &renderer, &mut texts);
+        let copy = texts
+            .0
+            .iter()
+            .find(|(text, _)| text == "Copy path")
+            .expect("project root offers Copy path")
+            .1;
+        assert!(viewport.contains(copy.center()));
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            popup.as_overlay_mut().update(
+                &Event::Mouse(event),
+                Layout::new(&popup_node),
+                mouse::Cursor::Available(copy.center()),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+            );
+        }
+        assert_eq!(
+            messages,
+            [SidebarAction::ProjectCommand {
+                project_id: project_id(17),
+                worktree_id: None,
+                command: ProjectCommand::CopyPath
+            }]
+        );
+    }
+
+    #[test]
     fn context_menu_preserves_child_cursors_and_primary_clicks() {
         use cosmic::iced::{
             Event, Point, Rectangle,
@@ -15736,6 +15895,64 @@ pub(crate) mod tests {
             );
         }
 
+        /// Measure the actual native popup, including its current clipped
+        /// slice, instead of assuming an entry sits below the click anchor.
+        fn menu_entry(&mut self, label: &str) -> (Rectangle, Rectangle) {
+            use cosmic::iced::advanced::widget::Operation;
+            struct Entry<'a> {
+                label: &'a str,
+                pending: Option<Rectangle>,
+                containers: Vec<Rectangle>,
+                matches: Vec<(Rectangle, Rectangle)>,
+            }
+            impl Operation for Entry<'_> {
+                fn container(&mut self, _: Option<&Id>, bounds: Rectangle) {
+                    self.pending = Some(bounds);
+                }
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    let container = self.pending.take();
+                    if let Some(bounds) = container {
+                        self.containers.push(bounds);
+                    }
+                    visit(self);
+                    if container.is_some() {
+                        self.containers.pop();
+                    }
+                }
+                fn text(&mut self, _: Option<&Id>, bounds: Rectangle, text: &str) {
+                    if text == self.label {
+                        // The runtime operates overlays separately from the
+                        // base tree. Menu::operate's outer container is the
+                        // native popup, not the sidebar behind it.
+                        let popup = *self.containers.first().expect("native popup container");
+                        self.matches.push((bounds, popup));
+                    }
+                }
+            }
+            let mut entry = Entry {
+                label,
+                pending: None,
+                containers: Vec::new(),
+                matches: Vec::new(),
+            };
+            let mut interface = interface(
+                &self.model,
+                &self.state,
+                &self.navigation,
+                self.bounds,
+                std::mem::take(&mut self.cache),
+                &mut self.renderer,
+            );
+            interface.operate(&self.renderer, &mut entry);
+            self.cache = interface.into_cache();
+            assert_eq!(
+                entry.matches.len(),
+                1,
+                "one visible native menu entry {label}"
+            );
+            entry.matches[0]
+        }
+
         /// The window rows an open row menu paints on, measured against the
         /// same frame with the menu closed and the pointer absent from both,
         /// so that neither the list's scroll position nor hover feedback can
@@ -15815,10 +16032,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_row_menu_in_a_scrolled_list_runs_the_entry_for_its_row() {
-        use cosmic::iced::{Point, advanced::mouse};
-        // The anchor is above the window's center, so the native popup picks
-        // the larger space below it. A short reach selects its first entry.
-        let entry_cursor = Point::new(86.0, MENU_ROW.y + 8.0);
+        use cosmic::iced::advanced::mouse;
         let mut outcomes = Vec::new();
         for scroll in [0.0, MENU_SCROLL] {
             let mut sidebar = Sidebar::scrolling();
@@ -15838,8 +16052,28 @@ pub(crate) mod tests {
                 )],
                 MENU_ROW,
             );
+            let (entry, popup) = sidebar.menu_entry("New terminal");
+            let viewport = Rectangle::with_size(sidebar.bounds);
+            assert!(viewport.contains(entry.center()));
+            assert_eq!(
+                popup.position(),
+                cosmic::iced::Point::ORIGIN,
+                "this tall, full-width popup clamps to the short window's origin"
+            );
+            assert!(popup.height > viewport.height);
+            assert!(popup.width <= viewport.width);
+            let entry_cursor = entry.center();
             sidebar.move_to(entry_cursor);
             let chosen = sidebar.click(mouse::Button::Left, entry_cursor);
+            assert_eq!(
+                chosen,
+                vec![SidebarAction::ProjectCommand {
+                    project_id: sidebar.model.projects[0].id,
+                    worktree_id: Some(under_pointer),
+                    command: ProjectCommand::NewTerminal,
+                }],
+                "the measured New terminal row must activate only its original worktree"
+            );
             let (worktree, command) = match chosen.first() {
                 Some(SidebarAction::ProjectCommand {
                     worktree_id,
@@ -15964,15 +16198,23 @@ pub(crate) mod tests {
     #[test]
     fn clicking_beside_an_open_row_menu_only_dismisses_it() {
         use cosmic::iced::{Point, advanced::mouse};
-        // A header control above the scrolled list, inside the band a menu
-        // anchored in window space leaves behind if it stops covering the
-        // whole window.
+        // Leave genuine space outside the popup. In a window shorter than
+        // this tall menu, clamping deliberately covers this header point.
         let beside = Point::new(24.0, 20.0);
         for scroll in [0.0, MENU_SCROLL] {
-            let mut sidebar = Sidebar::scrolling();
+            let mut closed = Sidebar::roomy();
+            closed.scroll(scroll, MENU_ROW);
+            let header_action = closed.click(mouse::Button::Left, beside);
+            assert!(!header_action.is_empty(), "the underlying header is active");
+            let mut sidebar = Sidebar::roomy();
             sidebar.scroll(scroll, MENU_ROW);
             sidebar.click(mouse::Button::Right, MENU_ROW);
             sidebar.move_to(MENU_ROW);
+            let (_, popup) = sidebar.menu_entry("New terminal");
+            assert!(
+                !popup.contains(beside),
+                "the dismissal point must be outside the actual native popup: {popup:?}"
+            );
             let dismissing = sidebar.click(mouse::Button::Left, beside);
             assert_eq!(
                 dismissing,
@@ -15981,8 +16223,8 @@ pub(crate) mod tests {
                  covers (scroll={scroll})"
             );
             let reachable = sidebar.click(mouse::Button::Left, beside);
-            assert!(
-                !reachable.is_empty(),
+            assert_eq!(
+                reachable, header_action,
                 "the dismissed menu leaves that control usable again (scroll={scroll})"
             );
         }
