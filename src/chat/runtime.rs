@@ -4028,6 +4028,26 @@ mod tests {
                 matches!(step.events.as_slice(), [Event::Error { message, fatal: false }] if message == "unbound failure")
             );
         }
+        let no_origin =
+            json!({"id":"","status":"failed","items":[],"error":{"message":"unbound completion"}});
+        let completed = adapter
+            .receive(json!({"method":"turn/completed","params":{
+                "threadId":"incident-thread","turn":no_origin.clone()
+            }}))
+            .unwrap();
+        assert!(completed.events.iter().any(|event| matches!(event,
+            Event::Error { message, fatal: false } if message == "unbound completion"
+        )));
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_)))
+        );
+        let (_empty_home, _empty_adapter, empty_history) = codex_incident_history(vec![no_origin]);
+        assert!(empty_history.iter().any(|event| matches!(event,
+            Event::LatestHistory { items, .. } if items.is_empty()
+        )));
         let retry = adapter.receive(json!({"method":"error","params":{
             "threadId":"incident-thread","turnId":"retrying-turn","willRetry":true,"error":{"message":"Reconnecting... 1/2"}
         }})).unwrap();

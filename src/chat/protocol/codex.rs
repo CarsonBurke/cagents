@@ -838,7 +838,7 @@ impl Codex {
                 step.events
                     .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
             }
-            if turn["error"].is_object() {
+            if !id.is_empty() && turn["error"].is_object() {
                 step.events.push(Event::Item(turn_error_item(
                     id,
                     error_message(&turn["error"]),
@@ -1301,7 +1301,7 @@ impl Codex {
                     items.push(item);
                 }
             }
-            if turn["error"].is_object() {
+            if !turn_id.is_empty() && turn["error"].is_object() {
                 items.push(turn_error_item(turn_id, error_message(&turn["error"])));
             }
         }
@@ -2945,8 +2945,10 @@ impl Adapter for Codex {
                 }
                 if turn["error"].is_object() {
                     let message = error_message(&turn["error"]);
-                    step.events
-                        .push(Event::Item(turn_error_item(turn_id, message.clone())));
+                    if !turn_id.is_empty() {
+                        step.events
+                            .push(Event::Item(turn_error_item(turn_id, message.clone())));
+                    }
                     step.events.push(Event::Error {
                         message,
                         fatal: false,
