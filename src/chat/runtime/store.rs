@@ -1,17 +1,13 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
+mod text_copy;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    io::Write,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    path::PathBuf,
-};
+use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 const PART_BYTES: usize = 128 * 1024;
 const WINDOW_BYTES: usize = 3 * 1024 * 1024;
@@ -50,6 +46,9 @@ pub(super) struct Window {
 }
 pub(crate) struct Store {
     db: Connection,
+    copy_cache: uuid::Uuid,
+    copy_revision: u64,
+    copy_projection: Vec<Option<crate::chat::TextCopySource>>,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -59,6 +58,7 @@ pub(crate) struct Store {
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
+    _lease: fs::File,
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
@@ -76,9 +76,18 @@ pub(crate) struct Store {
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
     /// Recognizes delivered messages as they enter the transcript.
-    messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+    messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
 }
 impl Store {
+    pub(super) fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+    #[cfg(test)]
+    pub(super) fn read_only_for_test(&mut self) -> Result<(), String> {
+        self.db
+            .pragma_update(None, "query_only", true)
+            .map_err(|error| error.to_string())
+    }
     /// Decode once at ingestion. Snapshots carry a small path, never megabytes
     /// of base64, and identical payloads share the same private file.
     fn image_file(&self, url: &str) -> Result<String, String> {
@@ -115,6 +124,88 @@ impl Store {
         }
         Ok(path.to_string_lossy().into_owned())
     }
+    /// Check every resident parent item and body chunk against a fresh provider
+    /// reload. Keep memory bounded to one metadata record or 128 KiB chunk;
+    /// paging windows alone cannot establish transcript preservation.
+    pub(super) fn is_covered_by(&mut self, reloaded: &Self) -> Result<bool, String> {
+        self.flush_text()?;
+        // Child sidecars are independent sources. Parent rows alone cannot
+        // establish that their transcript and edit index can be recovered.
+        if self.child_files_seen
+            || self.file_index_incomplete
+            || !self.presented_children.is_empty()
+        {
+            return Ok(false);
+        }
+        let mut items = self
+            .db
+            .prepare("SELECT id,metadata,len0,len1,len2,spans FROM items ORDER BY ordinal")
+            .map_err(|error| error.to_string())?;
+        let mut rows = items.query([]).map_err(|error| error.to_string())?;
+        let mut last_ordinal = None;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let id: String = row.get(0).map_err(|error| error.to_string())?;
+            let resident: (Vec<u8>, i64, i64, i64, Vec<u8>) = (
+                row.get(1).map_err(|error| error.to_string())?,
+                row.get(2).map_err(|error| error.to_string())?,
+                row.get(3).map_err(|error| error.to_string())?,
+                row.get(4).map_err(|error| error.to_string())?,
+                row.get(5).map_err(|error| error.to_string())?,
+            );
+            let loaded: Option<(i64, (Vec<u8>, i64, i64, i64, Vec<u8>))> = reloaded
+                .db
+                .query_row(
+                    "SELECT ordinal,metadata,len0,len1,len2,spans FROM items WHERE id=?1",
+                    [&id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            (
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ),
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((ordinal, contents)) = loaded else {
+                return Ok(false);
+            };
+            if contents != resident || last_ordinal.is_some_and(|previous| ordinal <= previous) {
+                return Ok(false);
+            }
+            last_ordinal = Some(ordinal);
+        }
+        let mut chunks = self
+            .db
+            .prepare("SELECT id,field,position,data FROM chunks")
+            .map_err(|error| error.to_string())?;
+        let mut rows = chunks.query([]).map_err(|error| error.to_string())?;
+        while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+            let id: String = row.get(0).map_err(|error| error.to_string())?;
+            let field: i64 = row.get(1).map_err(|error| error.to_string())?;
+            let position: i64 = row.get(2).map_err(|error| error.to_string())?;
+            let resident: Vec<u8> = row.get(3).map_err(|error| error.to_string())?;
+            let loaded: Option<Vec<u8>> = reloaded
+                .db
+                .query_row(
+                    "SELECT data FROM chunks WHERE id=?1 AND field=?2 AND position=?3",
+                    params![id, field, position],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if loaded.as_ref() != Some(&resident) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn new() -> Result<Self, String> {
         #[cfg(test)]
         let root = std::env::temp_dir();
@@ -125,11 +216,8 @@ impl Store {
         Self::at(root)
     }
     fn at(root: PathBuf) -> Result<Self, String> {
-        let directory = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|e| format!("Cannot create private transcript cache: {e}"))?;
+        let (directory, lease) = crate::transcript_cache::create(&root)
+            .map_err(|error| format!("Cannot create private transcript cache: {error}"))?;
         let path = directory.join("transcript.sqlite");
         let result = (|| {
             fs::OpenOptions::new()
@@ -144,7 +232,12 @@ impl Store {
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
+            db.execute_batch(text_copy::SCHEMA)
+                .map_err(|e| e.to_string())?;
             Ok(Self {
+                copy_cache: uuid::Uuid::new_v4(),
+                copy_revision: 0,
+                copy_projection: Default::default(),
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -155,6 +248,7 @@ impl Store {
                 presented_file_changes: None,
                 db,
                 directory: directory.clone(),
+                _lease: lease,
                 end: None,
                 first: None,
                 newest: None,
@@ -262,7 +356,9 @@ impl Store {
             }
         }
         let mut warning = None;
-        if let ItemContent::Image { path, description } = &mut item.content
+        if let ItemContent::Image {
+            path, description, ..
+        } = &mut item.content
             && path.starts_with("data:")
         {
             match self.image_file(path) {
@@ -308,7 +404,9 @@ impl Store {
             }
             // Descriptions and provider paths can grow; inline bytes have
             // already become a short private path above.
-            ItemContent::Image { description, path } => (
+            ItemContent::Image {
+                description, path, ..
+            } => (
                 std::mem::take(description),
                 String::new(),
                 std::mem::take(path),
@@ -353,6 +451,11 @@ impl Store {
         } else {
             body0.len() as i64
         };
+        let copy_prefix = if item.logical_copy_body().is_some() {
+            self.copy_parent_prefix(&item.id, &body0)?
+        } else {
+            false
+        };
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
@@ -369,7 +472,16 @@ impl Store {
         }
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
+        let copy_invalidated = Self::copy_parent_put(
+            &transaction,
+            &item.id,
+            item.logical_copy_body().is_some().then_some(len0 as usize),
+            copy_prefix,
+        )?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if copy_invalidated {
+            self.copy_revision = self.copy_revision.wrapping_add(1);
+        }
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
             self.files_removed(std::slice::from_ref(&item.id))?;
@@ -633,7 +745,7 @@ impl Store {
     /// next event on.
     pub(crate) fn recognize_messages(
         &mut self,
-        seal: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
+        seal: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
     ) {
         self.messages = seal;
     }
@@ -784,6 +896,7 @@ impl Store {
             }
             Event::ItemsRemoved { ids } => {
                 self.files_removed(&ids)?;
+                self.copy_remove(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
                     transaction
@@ -795,6 +908,12 @@ impl Store {
             }
             Event::Reset { reason } => {
                 self.files_reset()?;
+                self.db
+                    .execute("DELETE FROM copy_sources", [])
+                    .map_err(|e| e.to_string())?;
+                self.copy_cache = uuid::Uuid::new_v4();
+                self.copy_revision = self.copy_revision.wrapping_add(1);
+                self.copy_projection.clear();
                 self.db
                     .execute("DELETE FROM items", [])
                     .map_err(|e| e.to_string())?;
@@ -881,6 +1000,7 @@ impl Store {
                 },
                 false,
             )?;
+            self.copy_remove(&[id.to_owned()])?;
             if !self.exists(id)? {
                 // The identity itself could not be cached; the delta has nowhere to go.
                 return Ok(warning);
@@ -913,6 +1033,7 @@ impl Store {
                     params![id, delta.len() as i64, stamped],
                 )
                 .map_err(|e| e.to_string())?;
+            Self::copy_parent_append(&transaction, id, delta.len())?;
             transaction.commit().map_err(|e| e.to_string())?;
             self.changed(id);
         }
@@ -1024,6 +1145,12 @@ impl Store {
         previous: &mut Vec<std::sync::Arc<Item>>,
     ) -> Result<Window, String> {
         let _ = self.flush_text()?;
+        let mut copy_projection = Vec::new();
+        let old_copy: std::collections::HashMap<_, _> = previous
+            .iter()
+            .zip(&self.copy_projection)
+            .map(|(item, source)| (item.id.as_str(), source.clone()))
+            .collect();
         let old: std::collections::HashMap<_, _> = previous
             .iter()
             .map(|item| (item.id.as_str(), item))
@@ -1120,10 +1247,18 @@ impl Store {
                 {
                     break 'records;
                 }
+                let copy_source = if base.logical_copy_body().is_some() {
+                    self.copy_parent_source(&id)?
+                } else {
+                    None
+                };
                 if self
                     .changed
                     .as_ref()
                     .is_some_and(|changed| !changed.contains(&id))
+                    && old_copy
+                        .get(item_id.as_ref())
+                        .is_some_and(|source| *source == copy_source)
                     && let Some(previous) = old.get(item_id.as_ref())
                 {
                     reused.insert(item_id.into_owned());
@@ -1133,6 +1268,7 @@ impl Store {
                     first =
                         Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
                     bytes += size;
+                    copy_projection.push(copy_source);
                     items.push(std::sync::Arc::clone(previous));
                     continue;
                 }
@@ -1222,7 +1358,9 @@ impl Store {
                             *name = format!("{name} (part {}/{parts})", part + 1);
                         }
                     }
-                    ItemContent::Image { path, description } => {
+                    ItemContent::Image {
+                        path, description, ..
+                    } => {
                         *description = body0;
                         match attachment {
                             Some(data) => *path = data,
@@ -1250,6 +1388,7 @@ impl Store {
                     Some(newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))));
                 bytes += size;
                 first = Some(first.map_or((ordinal, part), |old: Cursor| old.min((ordinal, part))));
+                copy_projection.push(copy_source);
                 items.push(std::sync::Arc::new(item));
             }
         }
@@ -1275,6 +1414,7 @@ impl Store {
         }
         if self.forward.is_none() {
             items.reverse();
+            copy_projection.reverse();
         }
         self.cached_earlier = match first {
             Some((ordinal, part)) => {
@@ -1323,6 +1463,8 @@ impl Store {
             })
             .collect();
         drop(old);
+        drop(old_copy);
+        self.copy_projection = copy_projection;
         previous.clear();
         self.dirty = false;
         self.paging = false;
@@ -1337,9 +1479,10 @@ impl Store {
 }
 impl Drop for Store {
     fn drop(&mut self) {
-        // This UUID directory was created exclusively by this store, never discovered by a scan.
+        // This store owns the cache lease. Retained semantic evidence must outlive
+        // the reducer until its journal owner publishes a checked disposal permit.
         let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
-        let _ = fs::remove_dir_all(&self.directory);
+        let _ = crate::transcript_cache::remove_if_reclaimable(&self.directory);
     }
 }
 /// Bounds the identity fields a provider can make arbitrarily large so an
@@ -1489,6 +1632,163 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn dropping_a_store_removes_ordinary_cache_but_preserves_unretired_actor_evidence() {
+        use std::fs::OpenOptions;
+
+        let root = tempfile::tempdir().unwrap();
+        let ordinary = Store::at(root.path().to_owned()).unwrap();
+        let ordinary_directory = ordinary.directory().to_owned();
+        drop(ordinary);
+        assert!(!ordinary_directory.exists());
+
+        let retained = Store::at(root.path().to_owned()).unwrap();
+        let retained_directory = retained.directory().to_owned();
+        let mut journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(retained_directory.join("actor-journal.sqlite"))
+            .unwrap();
+        let retention =
+            crate::transcript_cache::ActorJournalRetention::create(&retained_directory, &journal)
+                .unwrap();
+        journal
+            .write_all(b"accepted input and unacknowledged outcome")
+            .unwrap();
+        journal.sync_all().unwrap();
+        drop(journal);
+        drop(retained);
+        assert!(retained_directory.join("transcript.sqlite").exists());
+        assert_eq!(
+            fs::read(retained_directory.join("actor-journal.sqlite")).unwrap(),
+            b"accepted input and unacknowledged outcome"
+        );
+        assert_eq!(
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            0
+        );
+
+        // Only the journal owner can assert retirement/drain. Dropping Store
+        // releases the lease, so its exact permit allows a later sweep.
+        retention.allow_removal().unwrap();
+        assert_eq!(
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            1
+        );
+        assert!(!retained_directory.exists());
+    }
+
+    #[test]
+    fn dropping_a_store_reclaims_an_exactly_retired_actor_journal() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::at(root.path().to_owned()).unwrap();
+        let directory = store.directory().to_owned();
+        let journal = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join("actor-journal.sqlite"))
+            .unwrap();
+        let retention =
+            crate::transcript_cache::ActorJournalRetention::create(&directory, &journal).unwrap();
+        retention.allow_removal().unwrap();
+        drop(journal);
+        drop(store);
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn history_coverage_checks_hidden_rows_and_every_chunk_not_only_the_window() {
+        let old = history_item("old-page", "older cached page");
+        let large = history_item("large-tail", &"x".repeat(4 * 1024 * 1024));
+        let mut resident = Store::new().unwrap();
+        resident
+            .apply(Event::History {
+                items: vec![old.clone(), large.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        let window = resident.window().unwrap();
+        assert!(
+            window
+                .items
+                .iter()
+                .all(|item| !item.id.starts_with("old-page"))
+        );
+        let empty = Store::new().unwrap();
+        assert!(!resident.is_covered_by(&empty).unwrap());
+        let mut missing_old = Store::new().unwrap();
+        missing_old
+            .apply(Event::History {
+                items: vec![large.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&missing_old).unwrap());
+        let mut changed = large.clone();
+        if let ItemContent::Text { text, .. } = &mut changed.content {
+            text.replace_range(..1, "y");
+        }
+        let mut changed_hidden_chunk = Store::new().unwrap();
+        changed_hidden_chunk
+            .apply(Event::History {
+                items: vec![old.clone(), changed],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&changed_hidden_chunk).unwrap());
+        let mut reordered = Store::new().unwrap();
+        reordered
+            .apply(Event::History {
+                items: vec![large.clone(), old.clone()],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(!resident.is_covered_by(&reordered).unwrap());
+        let mut unchanged = Store::new().unwrap();
+        unchanged
+            .apply(Event::History {
+                items: vec![
+                    old,
+                    large,
+                    history_item("additional", "new provider history"),
+                ],
+                has_earlier: false,
+            })
+            .unwrap();
+        assert!(resident.is_covered_by(&unchanged).unwrap());
+    }
+
+    #[test]
+    fn history_coverage_preserves_child_payload_outside_parent_sql_rows() {
+        let parent = history_item("parent", "saved parent body");
+        let mut resident = Store::new().unwrap();
+        let mut reloaded = Store::new().unwrap();
+        for store in [&mut resident, &mut reloaded] {
+            store
+                .apply(Event::History {
+                    items: vec![parent.clone()],
+                    has_earlier: false,
+                })
+                .unwrap();
+        }
+        assert!(resident.is_covered_by(&reloaded).unwrap());
+        assert!(!resident.child_files_seen);
+        assert!(!resident.file_index_incomplete);
+        resident.presented_children.insert(
+            "retained-child".into(),
+            vec![std::sync::Arc::new(history_item(
+                "child-item",
+                "child payload is outside the parent SQL coverage",
+            ))],
+        );
+        assert!(!resident.is_covered_by(&reloaded).unwrap());
+    }
+
     #[test]
     fn output_for_an_uncacheable_identity_remains_nonfatal() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
@@ -1782,6 +2082,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: "x".repeat(WINDOW_BYTES - 32 * 1024),
                     description: "image".into(),
+                    reference: None,
                 },
             }))
             .unwrap();
@@ -2302,6 +2603,7 @@ mod tests {
                 content: ItemContent::Image {
                     path: payload.clone(),
                     description: "screenshot".into(),
+                    reference: None,
                 },
                 started_at: None,
                 at: None,
@@ -2311,8 +2613,13 @@ mod tests {
         let window = store.window().unwrap();
         assert_eq!(window.items.len(), 1);
         match &window.items[0].content {
-            ItemContent::Image { path, description } => {
+            ItemContent::Image {
+                path, description, ..
+            } => {
                 assert!(path.starts_with(store.directory.to_str().unwrap()));
+                assert!(crate::chat::is_cached_inline_image(std::path::Path::new(
+                    path
+                )));
                 assert_eq!(fs::read(path).unwrap(), b"ABC".repeat(512 * 1024));
                 assert_eq!(description, "screenshot");
             }
@@ -2351,6 +2658,7 @@ mod tests {
                             "data:image/png;base64,QUJD".into()
                         },
                         description: id.into(),
+                        reference: None,
                     },
                 }))
                 .unwrap();

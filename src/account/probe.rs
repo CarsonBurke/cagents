@@ -68,6 +68,7 @@ const SCRUBBED_ENVIRONMENT: &[&str] = &[
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_SSE_PORT",
     crate::instance::UI_LAUNCH_HANDSHAKE_ENV,
+    crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV,
 ];
 
 /// What the reader's shell is asked to run: print its `PATH`, and nothing
@@ -1055,9 +1056,10 @@ mod tests {
         const CHILD: &str = "CAGENTS_ACCOUNT_ENV_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
+            // Preserve the caller's scope; override only these fixture inputs.
             let mut child = std::process::Command::new(std::env::current_exe().unwrap());
             child.args(["--exact", "account::probe::tests::selected_home_probes_remove_inherited_credentials_but_system_keeps_them", "--nocapture"])
-                .env_clear().env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
+                .env(CHILD, "1").env("HOME", directory.path()).env("PATH", "/usr/bin:/bin");
             for provider in Account::PROVIDERS {
                 for name in super::super::credential_overrides(provider) {
                     child.env(name, "fixture-only");

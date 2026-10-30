@@ -20,7 +20,9 @@ impl State {
 
     pub(super) fn cancel_pages(&mut self) {
         self.page_generation = self.page_generation.wrapping_add(1);
-        if let Some(cancellation) = self.page_cancellation.take() { cancellation.cancel(); }
+        if let Some(cancellation) = self.page_cancellation.take() {
+            cancellation.cancel();
+        }
     }
 
     pub(super) fn page_cancellation(&self) -> CancellationToken {

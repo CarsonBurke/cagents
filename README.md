@@ -4,57 +4,53 @@
 
 <h1 align="center">cagents</h1>
 
-<p align="center">A native Linux workspace for running coding agents across repositories and Git worktrees.</p>
+<p align="center">A native Linux workspace for coding agents.</p>
 
-cagents keeps every agent session, terminal, and worktree in one native
-Wayland application. Run Claude Code, Codex, and OMP in real terminals or
-native chat views, and review their changes and pull requests next to them. A
-per-user daemon owns the terminals and conversations, so they keep running when
-you close the window or restart the UI.
+> [!NOTE]
+> This product is in beta. Expect bugs.
 
-> [!IMPORTANT]
-> The repository is private (`CarsonBurke/cagents`). Downloading a release
-> needs a GitHub CLI account with access to it.
+Run Claude Code, Codex, and OMP across repositories and Git worktrees. Keep
+conversations, terminals, files, diffs, and pull requests together, with a
+separate workspace for each worktree.
 
-## Features
+A per-user daemon owns your terminals and conversations. Close the window or
+restart the UI while your agents keep working.
 
-- **Projects and worktrees.** Open repositories, create worktrees from a branch
-  name or Linear issue, and see which worktrees have working, waiting, or
-  unread agents at a glance.
-- **Persistent terminals.** Terminals and chats belong to the `cagentsd`
-  daemon, so they survive UI restarts, and supported sessions resume across
-  full upgrades.
-- **Native agent chat.** Switch a Claude, Codex, or OMP terminal into a native
-  chat view of the same conversation, and back.
-- **Keyboard-driven panes.** Each worktree is a horizontal strip of terminals,
-  chats, editors, and browsers you move through and resize from the keyboard.
-- **Source control and review.** Diffs, staging, commits, branch history, and a
-  pull request pane that syncs GitHub's viewed marks.
-- **Built-in editor.** Autosaving editor with syntax highlighting, editable
-  working-tree diffs, and optional language servers. It also ships separately
-  as `ceditor`.
-- **Embedded browser.** An optional Servo browser pane. The browserless build
-  opens links in your system browser instead.
-- **Scriptable CLI.** `cagents` controls the daemon, terminals, projects, and
-  channels with human-readable or JSON output. [Hosted agent execution](docs/agent-execution.md)
-  submits durable prompts and reads structured results without an open window,
-  and lets sessions message one another.
-- **Linear CLI.** Read, search, create, and update tickets with `cagents linear`,
-  attach PR links, and link each worktree's ticket for `--current` commands.
-  Uses a personal API key and works without an open window.
+## Work with your agents
+
+- **Terminal or native chat.** Switch a supported agent session between a real
+  terminal and a native chat view of the same conversation.
+- **Parallel worktrees.** Create a worktree from a branch name or Linear issue.
+  See which agents are working, waiting, or have unread output.
+- **Review in place.** Read diffs, stage changes, commit, browse branch history,
+  and review pull requests with GitHub's viewed marks kept in sync.
+- **Keyboard navigation.** Move through a horizontal strip of chats, terminals,
+  editors, and browsers. Resize panes without leaving the keyboard.
+- **Built-in editor.** Edit files and working-tree diffs with syntax highlighting,
+  autosave, and optional language servers. The editor also ships as `ceditor`.
+- **Browser panes.** Open pages in the optional Servo browser. Browserless
+  builds open links in your system browser.
+- **Remote workspaces.** Connect to another machine's daemon over SSH for
+  terminals, native chats, files, Git, and worktrees. See [device windows](docs/devices.md).
+- **CLI automation.** Control projects, terminals, and channels with text or JSON
+  output. [Submit prompts and read structured results](docs/agent-execution.md)
+  without an open window, or let sessions message one another. Use
+  `cagents linear` to work with tickets from the command line.
 
 ## Install
 
-Requirements: Linux x86_64 with glibc 2.35 or newer, a Wayland session, Git
-2.36 or newer, and an authenticated [GitHub CLI](https://cli.github.com/)
-(`gh auth login`) that supports `gh auth status --json hosts`.
+cagents runs on **Linux x86_64 with Wayland**, glibc 2.35 or newer, and Git 2.36
+or newer. The release installer also requires an authenticated
+[GitHub CLI](https://cli.github.com/) account (`gh auth login`).
 
-[docs/installation.md](docs/installation.md) has the recommended
-checksum-verified installer, a shorter convenience installer, the full and
-browserless Debian packages, the portable archive, and how to update and
-uninstall. The installer runs as your user and never needs root.
+Follow the [installation guide](docs/installation.md#install-with-the-verified-installer)
+for the checksum-verified installer. It installs as your user without root.
+You can also download full or browserless Debian packages and portable archives
+from [Releases](https://github.com/CarsonBurke/cagents/releases).
 
-## Getting started
+Install the agent CLIs you want to use and sign in with your own accounts.
+
+## Your first session
 
 Launch **cagents** from your application menu, or run:
 
@@ -62,15 +58,17 @@ Launch **cagents** from your application menu, or run:
 cagents ui
 ```
 
-Add a repository from the **Projects** pane, select a worktree, and press
-`Ctrl+Shift+T` for a terminal. Start your agent there, or use **New tab → New
-thread** for a native chat. Use **New tab → Resume conversation** to search saved
-native chats and configured provider history, including closed conversations from
-previous runs. Move between panes with `Ctrl+PageUp` and
-`Ctrl+PageDown`, and resize the focused pane with `Alt+R`. The
-[user guide](docs/user-guide.md#navigation) lists every shortcut.
+Add a repository in **Projects**, select a worktree, and press `Ctrl+Shift+T`
+to open a terminal. Start your agent there, or choose **New tab → New thread**
+for a native chat.
 
-The daemon is scriptable too:
+Choose **New tab → Resume conversation** to reopen a saved chat, including
+conversations from configured provider history. Move between panes with
+`Ctrl+PageUp` and `Ctrl+PageDown`; resize the focused pane with `Alt+R`.
+The [user guide](docs/user-guide.md#navigation) covers the rest of the workspace
+and its shortcuts.
+
+To inspect the daemon and its terminals:
 
 ```sh
 cagents daemon status
@@ -78,53 +76,36 @@ cagents --json terminal list
 cagents --help
 ```
 
-## Run from source
+## Build from source
 
-You need Rust 1.93, Zig 0.15.2, and the native build packages listed in
-[docs/development.md](docs/development.md#prerequisites).
-
-Run the app with the development runner. It builds the matched `cagents`,
-`cagents-ui`, and `cagentsd` executables with separate feature sets and uses an
-isolated development instance, so it runs beside an installed copy:
+You need Rust 1.93, Zig 0.15.2, and the
+[native build dependencies](docs/development.md#prerequisites).
 
 ```sh
-scripts/run-development --browserless   # without the embedded browser (faster to build)
-scripts/run-development                 # with the embedded Servo browser
+git clone https://github.com/CarsonBurke/cagents.git
+cd cagents
+scripts/run-development --browserless
 ```
 
-Useful options:
+The development runner builds the matched CLI, UI, and daemon separately and
+uses an isolated development instance that can run beside an installed copy.
+Omit `--browserless` to include the embedded Servo browser.
 
-```sh
-# Debug logs and backtraces, written to a file
-scripts/run-development --browserless --debug --log-file /tmp/cagents-ui.log
-
-# Restart the development daemon after changing daemon, terminal-host, or IPC code.
-# This terminates the development daemon's terminals.
-scripts/run-development --browserless --fresh-daemon
-```
-
-[docs/development.md](docs/development.md) covers the per-boundary
-`cargo check` commands, every runner option, test lanes, build memory use, and
-troubleshooting.
+See [development](docs/development.md) for build commands, tests, debugging,
+and runner options.
 
 ## Documentation
 
-- [Installation](docs/installation.md): requirements, verified install,
-  packages, updates, uninstalling
-- [User guide](docs/user-guide.md): workspace, navigation, review, chat,
-  editor, and `ceditor`
-- [Configuration](docs/configuration.md): data locations and every
-  `settings.toml` key
-- [Device windows](docs/devices.md): SSH connections to remote daemons, remote
-  terminals, native chats, files, Git, and worktrees
-- [Daemon and upgrades](docs/daemon.md): the daemon, control CLI, and how
-  sessions survive upgrades
-- [Development](docs/development.md): building, running, and testing from
-  source
-- [Performance](docs/performance.md): latency and throughput workloads and
-  reference results
-- [Releasing](docs/releasing.md): building and publishing release artifacts
+- [Installation](docs/installation.md): packages, updates, and uninstalling
+- [User guide](docs/user-guide.md): workspace, chat, review, editor, and shortcuts
+- [Configuration](docs/configuration.md): settings and data locations
+- [Device windows](docs/devices.md): work on remote machines over SSH
+- [Agent execution](docs/agent-execution.md): hosted prompts, results, and messaging
+- [Daemon and upgrades](docs/daemon.md): session ownership and upgrade behavior
+- [Development](docs/development.md): building, running, and testing
+- [Performance](docs/performance.md): workloads and reference results
+- [Releasing](docs/releasing.md): building and publishing releases
 
 ## License
 
-cagents is licensed under the MIT License. See [LICENSE](LICENSE).
+[MIT](LICENSE).

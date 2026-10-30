@@ -11,94 +11,147 @@ pub enum AutomationCommand {
     /// Save exact launch settings for approval in cagents, without creating a schedule.
     Propose {
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Uuid,
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
-        /// Wait for the user's decision so the requesting tool call resumes.
+        /// Wait for the decision. Exit: 0 approved, 3 timeout, 4 declined.
         #[arg(long)]
         wait: bool,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
     /// Read only this conversation's immutable approval request.
     Proposal {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Wait for the user decision before returning.")]
         wait: bool,
         #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        #[arg(help = "Maximum seconds to wait (1 through 3600).")]
         wait_seconds: u64,
     },
     /// Create a disabled automation from a JSON definition (use - for stdin).
     Create {
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
     },
-    /// List definitions, with a cursor for the next page.
+    /// List up to 100 definitions, ordered by ID; use --after for the next page.
     List {
         #[arg(long)]
+        #[arg(help = "Continue after the last automation UUID in the previous page.")]
         after: Option<Uuid>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+        #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
         limit: usize,
     },
+    /// Read the current saved definition and its revision.
     Show {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
     },
     /// Replace a definition at the exact revision shown by `show`.
     Edit {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
         #[arg(long)]
+        #[arg(help = "JSON definition file; use - for standard input.")]
         definition: PathBuf,
     },
     /// Confirm unattended execution of the displayed definition revision.
     Enable {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
         #[arg(long)]
+        #[arg(help = "Confirm unattended execution of the displayed settings.")]
         confirm: bool,
     },
+    /// Disable an automation at its exact revision.
     Disable {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
     },
     /// Remove a definition. Past runs remain in history.
     Remove {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact revision returned by show; stale edits are refused.")]
         revision: u64,
     },
     /// Run the exact execution revision once; reuse request-id for safe retry.
     RunNow {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Exact approved execution revision to run.")]
         execution_revision: u64,
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Uuid,
         #[arg(long)]
+        #[arg(help = "Confirm unattended execution of the displayed settings.")]
         confirm: bool,
     },
+    /// Request cancellation of one firing.
     Cancel {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "The firing ID reported by history.")]
         firing: Uuid,
     },
+    /// List immutable past firings, newest first.
     History {
         /// Omit to include all automations, including removed definitions.
         id: Option<Uuid>,
         #[arg(long, requires = "before_id")]
+        #[arg(help = "Creation time from the last history row; pair with --before-id.")]
         before_ms: Option<u64>,
         #[arg(long, requires = "before_ms")]
+        #[arg(help = "ID from the last history row; pair with --before-ms.")]
         before_id: Option<Uuid>,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
+        #[arg(help = "Maximum page size (1 through 100); larger values are refused.")]
+        limit: usize,
+    },
+    /// Inspect bounded lifecycle receipts (enable, disable, edits and system pauses).
+    Audit {
+        /// Automation ID, including a removed definition's retained audit.
+        id: Uuid,
+        /// Continue before the sequence returned as next by the previous page.
+        #[arg(long)]
+        before: Option<u64>,
+        /// Maximum page size (1 through 100); larger values are refused.
+        #[arg(long, default_value_t = 50, value_parser = parse_page_limit)]
         limit: usize,
     },
     /// Read one immutable firing, including its bounded execution result.
     Run {
+        #[arg(help = "The firing ID reported by history.")]
         firing: Uuid,
     },
+}
+
+fn parse_page_limit(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=100).contains(value))
+        .ok_or_else(|| "Choose a page size from 1 through 100".into())
 }
 
 impl ControlClient {
@@ -136,7 +189,15 @@ impl ControlClient {
 }
 
 pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppError> {
-    let authority = crate::agent_execution::Authority::from_environment();
+    execute_with_context(command, &ServiceRequestContext::capture())
+}
+
+pub(super) fn execute_with_context(
+    command: AutomationCommand,
+    context: &ServiceRequestContext,
+) -> Result<CommandOutput, AppError> {
+    context.admit_remote()?;
+    let authority = &context.authority;
     let wait = match &command {
         AutomationCommand::Propose {
             wait: true,
@@ -157,9 +218,7 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "An inherited agent capability cannot alter unattended schedules; use automation propose for user approval",
         ));
     }
-    let socket = terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e))?;
-    let mut client =
-        ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
+    let mut client = context.connect()?;
     let mut reply = client
         .automation(authority.clone(), request)
         .map_err(protocol_error)?;
@@ -178,16 +237,17 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             if Instant::now() >= deadline {
                 break;
             }
-            reply = client
-                .automation_until(
-                    authority.clone(),
-                    Request::Proposal { id },
-                    deadline.min(Instant::now() + IO_TIMEOUT),
-                )
-                .map_err(protocol_error)?;
+            match poll_proposal(&mut client, authority.clone(), id, deadline)? {
+                Some(current) => reply = current,
+                None => break,
+            }
         }
     }
-    let (data, human) = match reply {
+    let outcome = match (&reply, wait) {
+        (Response::Proposal(proposal), Some(_)) => Some(proposal_outcome(&proposal.state)),
+        _ => None,
+    };
+    let (mut data, human) = match reply {
         Response::Proposal(proposal) => {
             let human = match &proposal.state {
                 crate::automations::ProposalState::Pending => format!(
@@ -212,18 +272,7 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "Automation approval requests".into(),
         ),
         Response::Listed(entries) => {
-            let human = entries
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "{}\t{}\t{}",
-                        entry.id,
-                        if entry.enabled { "enabled" } else { "paused" },
-                        entry.name
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = list_human(&entries);
             (json!({"automations": entries}), human)
         }
         Response::Automation(automation) => {
@@ -241,23 +290,22 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             (json!({"automation": automation}), human)
         }
         Response::Firing(firing) => {
-            let human = format!("{}\t{:?}", firing.id, firing.state);
+            let human = format!("{}\t{}", firing.id, state_label(firing.state));
             (json!({"firing": firing}), human)
         }
         Response::History(history) => {
-            let human = history
-                .firings
-                .iter()
-                .map(|run| format!("{}\t{:?}", run.id, run.state))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = history_human(&history, now_ms());
             (json!({"history": history}), human)
+        }
+        Response::Audit(page) => {
+            let human = audit_human(&page, now_ms());
+            (json!({"audit": page}), human)
         }
         Response::Detail(detail) => {
             let human = format!(
-                "{}\t{:?}\n{}",
+                "{}\t{}\n{}",
                 detail.firing.id,
-                detail.firing.state,
+                state_label(detail.firing.state),
                 detail
                     .run
                     .as_ref()
@@ -276,11 +324,173 @@ pub(super) fn execute(command: AutomationCommand) -> Result<CommandOutput, AppEr
             "Cancellation requested; inspect the run for its confirmed outcome.".into(),
         ),
     };
+    if let Some(outcome) = outcome {
+        data["outcome"] = json!(outcome);
+    }
     Ok(CommandOutput {
         command: name,
         data,
         human,
     })
+}
+
+fn state_label(state: crate::automations::FiringState) -> &'static str {
+    use crate::automations::FiringState::*;
+    match state {
+        Prechecking => "Checking",
+        Accepted => "Queued",
+        Running => "Running",
+        Waiting => "Waiting for input",
+        Succeeded => "Succeeded",
+        Failed => "Failed",
+        Skipped => "Skipped",
+        Cancelled => "Cancelled",
+        Interrupted => "Outcome uncertain",
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+fn audit_human(page: &crate::automations::LifecyclePage, now_ms: u64) -> String {
+    let mut human = super::format::table(
+        ["SEQUENCE", "REVISION", "WHEN", "EVENT", "ACTOR", "STATE"],
+        page.events
+            .iter()
+            .map(|event| {
+                [
+                    event.sequence.to_string(),
+                    event.revision.to_string(),
+                    super::format::relative_time(event.occurred_ms, now_ms),
+                    event.cause.label().into(),
+                    event.actor.label().into(),
+                    if event.blocked {
+                        "Blocked"
+                    } else if event.enabled {
+                        "Enabled"
+                    } else {
+                        "Paused"
+                    }
+                    .into(),
+                ]
+            })
+            .collect(),
+        "No recorded lifecycle events",
+    );
+    if page.earlier_events_unavailable {
+        human.push_str(
+            "\nEarlier lifecycle events are unavailable; their actor and cause are unknown.",
+        );
+    }
+    if let Some(next) = page.next {
+        human.push_str(&format!("\nContinue with --before {next}"));
+    }
+    human
+}
+
+fn list_human(entries: &[crate::automations::Summary]) -> String {
+    super::format::table(
+        ["AUTOMATION", "NAME", "PROVIDER", "STATUS", "DIRECTORY"],
+        entries
+            .iter()
+            .map(|entry| {
+                [
+                    entry.id.to_string(),
+                    entry.name.clone(),
+                    entry.provider.executable().into(),
+                    if let Some(reason) = &entry.blocked {
+                        format!("Blocked: {reason}")
+                    } else if entry.enabled {
+                        "Enabled".into()
+                    } else {
+                        "Paused".into()
+                    },
+                    entry.directory.display().to_string(),
+                ]
+            })
+            .collect(),
+        "No automations",
+    )
+}
+
+fn history_human(history: &crate::automations::HistoryPage, now_ms: u64) -> String {
+    use crate::automations::SkipReason;
+    let mut human = super::format::table(
+        ["FIRING", "AUTOMATION", "NAME", "STATE", "CREATED", "DETAIL"],
+        history
+            .firings
+            .iter()
+            .map(|run| {
+                let reason = match run.skip {
+                    Some(SkipReason::PrecheckExit) => "Precheck refused",
+                    Some(SkipReason::MissedDeadline) => "Missed deadline",
+                    Some(SkipReason::Overlap) => "Previous run still owns the automation",
+                    Some(SkipReason::Capacity) => "At capacity",
+                    Some(SkipReason::DefinitionChanged) => "Definition changed",
+                    Some(SkipReason::Disabled) => "Automation disabled",
+                    None => "",
+                };
+                let mut detail = reason.to_owned();
+                if let Some(diagnostic) = &run.diagnostic {
+                    if !detail.is_empty() {
+                        detail.push_str(": ");
+                    }
+                    detail.push_str(diagnostic);
+                }
+                if run.release_pending {
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str("session release pending");
+                }
+                [
+                    run.id.to_string(),
+                    run.automation.to_string(),
+                    run.name.clone(),
+                    state_label(run.state).into(),
+                    super::format::relative_time(run.created_ms, now_ms),
+                    detail,
+                ]
+            })
+            .collect(),
+        "No automation history",
+    );
+    if history.next.is_some() {
+        human.push_str(
+            "\n\nMore history is available; use the cursor in --json output for the next page.",
+        );
+    }
+    human
+}
+
+fn poll_proposal(
+    client: &mut ControlClient,
+    authority: crate::agent_execution::Authority,
+    id: Uuid,
+    deadline: Instant,
+) -> Result<Option<Response>, AppError> {
+    match client.automation_until(
+        authority,
+        Request::Proposal { id },
+        deadline.min(Instant::now() + IO_TIMEOUT),
+    ) {
+        Ok(reply) => Ok(Some(reply)),
+        Err(error) if is_timeout_error(&error) && Instant::now() >= deadline => Ok(None),
+        Err(error) => Err(protocol_error(error)),
+    }
+}
+
+fn proposal_outcome(state: &crate::automations::ProposalState) -> WaitOutcome {
+    match state {
+        crate::automations::ProposalState::Pending => WaitOutcome::TimedOut,
+        crate::automations::ProposalState::Declined => WaitOutcome::Failed,
+        crate::automations::ProposalState::Approved { .. } => WaitOutcome::Succeeded,
+    }
 }
 
 fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppError> {
@@ -361,6 +571,9 @@ fn request(command: AutomationCommand) -> Result<(&'static str, Request), AppErr
         AutomationCommand::Cancel { id, firing } => {
             ("automation.cancel", Request::Cancel { id, firing })
         }
+        AutomationCommand::Audit { id, before, limit } => {
+            ("automation.audit", Request::Audit { id, before, limit })
+        }
         AutomationCommand::History {
             id,
             before_ms,
@@ -409,6 +622,169 @@ fn read_definition(path: &Path) -> Result<Definition, AppError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn readable_automation_lists_have_headers_empty_states_and_plain_values() {
+        assert_eq!(list_human(&[]), "No automations");
+        let entry = crate::automations::Summary {
+            id: Uuid::from_u128(1),
+            revision: 2,
+            name: "Morning check".into(),
+            provider: crate::agent::Provider::Claude,
+            directory: "/repo".into(),
+            enabled: true,
+            next: None,
+            active_firing: None,
+            last_state: None,
+            blocked: Some("Missing account\nrepair required".into()),
+        };
+        let human = list_human(&[entry]);
+        assert_eq!(human.lines().count(), 2);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["AUTOMATION", "NAME", "PROVIDER", "STATUS", "DIRECTORY"]
+        );
+        assert!(human.contains("Morning check"));
+        assert!(human.contains("Blocked: Missing account repair required"));
+        assert!(human.ends_with("/repo"));
+    }
+
+    #[test]
+    fn readable_automation_history_retains_name_skip_reason_and_uncertain_ownership() {
+        use crate::automations::{Firing, FiringState, HistoryPage, SkipReason, Trigger};
+        assert_eq!(
+            history_human(
+                &HistoryPage {
+                    firings: vec![],
+                    next: None
+                },
+                120_000
+            ),
+            "No automation history"
+        );
+        let firing = Firing {
+            id: Uuid::from_u128(1),
+            automation: Uuid::from_u128(2),
+            name: "Morning check".into(),
+            revision: 1,
+            trigger: Trigger::Manual {
+                request: Uuid::from_u128(3),
+            },
+            state: FiringState::Skipped,
+            release_pending: true,
+            cancel_requested: false,
+            created_ms: 60_000,
+            started_ms: None,
+            finished_ms: Some(61_000),
+            agent: None,
+            run: None,
+            skip: Some(SkipReason::Capacity),
+            diagnostic: Some("Try later".into()),
+        };
+        let page = HistoryPage {
+            firings: vec![firing],
+            next: Some(HistoryCursor {
+                created_ms: 60_000,
+                id: Uuid::from_u128(1),
+            }),
+        };
+        let human = history_human(&page, 120_000);
+        assert!(human.starts_with("FIRING"));
+        assert!(human.contains("Morning check"));
+        assert!(human.contains("Skipped"));
+        assert!(human.contains("1 min ago"));
+        assert!(human.contains("At capacity: Try later; session release pending"));
+        assert!(human.ends_with("use the cursor in --json output for the next page."));
+        for raw in ["Some(", "None", "created_ms", "60000", "SkipReason", "{ "] {
+            assert!(!human.contains(raw), "raw value {raw}: {human}");
+        }
+        assert_eq!(
+            serde_json::to_value(&page).unwrap()["firings"][0]["created_ms"],
+            60_000
+        );
+        assert_eq!(state_label(FiringState::Interrupted), "Outcome uncertain");
+        assert_eq!(state_label(FiringState::Waiting), "Waiting for input");
+    }
+
+    #[test]
+    fn stalled_pending_proposal_poll_preserves_pending_timeout_outcome() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("proposal-wait"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("incarnation"),
+        };
+        let id = Uuid::new_v4();
+        let server = thread::spawn(move || {
+            let connected: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(connected.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof,
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(request.request, ClientRequest::Automation { operation: Request::Proposal { id: received }, .. } if received == id)
+            );
+            thread::sleep(Duration::from_millis(150));
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        assert!(
+            poll_proposal(
+                &mut client,
+                Authority::default(),
+                id,
+                Instant::now() + Duration::from_millis(25)
+            )
+            .unwrap()
+            .is_none()
+        );
+        let outcome = proposal_outcome(&crate::automations::ProposalState::Pending);
+        assert_eq!(outcome.exit_code(), 3);
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn proposal_wait_uses_the_shared_exit_contract() {
+        use crate::automations::ProposalState;
+        for (state, code) in [
+            (ProposalState::Pending, 3),
+            (ProposalState::Declined, 4),
+            (
+                ProposalState::Approved {
+                    automation: Uuid::new_v4(),
+                    execution_revision: 1,
+                },
+                0,
+            ),
+        ] {
+            assert_eq!(
+                CommandOutput {
+                    command: "automation.propose",
+                    data: json!({"outcome": proposal_outcome(&state)}),
+                    human: String::new(),
+                }
+                .exit_code(),
+                ExitCode::from(code)
+            );
+        }
+    }
+
     fn parse(arguments: &[&str]) -> Result<AutomationCommand, clap::Error> {
         match Cli::try_parse_from(arguments)?.command {
             TopCommand::Automation { command } => Ok(command),
@@ -453,6 +829,83 @@ mod tests {
                 confirmed: true,
             }
         );
+    }
+
+    #[test]
+    fn automation_lifecycle_human_view_labels_actor_state_and_missing_history() {
+        use crate::automations::{LifecycleActor, LifecycleCause, LifecycleEvent, LifecyclePage};
+        let page = LifecyclePage {
+            events: vec![LifecycleEvent {
+                sequence: 42,
+                automation: Uuid::new_v4(),
+                revision: 7,
+                occurred_ms: 100,
+                cause: LifecycleCause::ReleaseBlocked,
+                actor: LifecycleActor::System,
+                enabled: false,
+                blocked: true,
+                firing: Some(Uuid::new_v4()),
+            }],
+            next: Some(42),
+            earlier_events_unavailable: true,
+        };
+        let human = audit_human(&page, 100);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["SEQUENCE", "REVISION", "WHEN", "EVENT", "ACTOR", "STATE"]
+        );
+        assert!(
+            human.contains("Session cleanup blocked")
+                && human.contains("System")
+                && human.contains("Blocked")
+        );
+        assert!(human.contains("actor and cause are unknown") && human.contains("--before 42"));
+        assert_eq!(
+            audit_human(
+                &LifecyclePage {
+                    events: vec![],
+                    next: None,
+                    earlier_events_unavailable: false
+                },
+                100
+            ),
+            "No recorded lifecycle events"
+        );
+    }
+
+    #[test]
+    fn automation_lifecycle_audit_is_read_only_scoped_and_has_a_bounded_cursor() {
+        let id = Uuid::new_v4().to_string();
+        assert!(parse(&["cagents", "automation", "audit"]).is_err());
+        assert!(parse(&["cagents", "automation", "audit", &id, "--limit", "101"]).is_err());
+        let (_, request) = request(
+            parse(&[
+                "cagents",
+                "automation",
+                "audit",
+                &id,
+                "--before",
+                "42",
+                "--limit",
+                "1",
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request,
+            Request::Audit {
+                id: id.parse().unwrap(),
+                before: Some(42),
+                limit: 1
+            }
+        );
+        assert!(request.allowed_from_hosted_conversation());
     }
 
     #[test]

@@ -26,9 +26,12 @@
 //! ```
 //!
 //! and keep the allowlist entry only if all three pass. The path must name the
-//! native executable, not a Node launcher: the fixture's `PATH` holds nothing
-//! but that one program. Codex itself may still reach the network for its own
+//! native executable, not a Node launcher: the fixture prepends that program
+//! to its standard utility paths. Codex may still reach the network for its own
 //! housekeeping; the model endpoint never leaves this process.
+
+#[path = "support/hosted_agent_cleanup.rs"]
+mod hosted_agent_cleanup;
 
 use cagents::{
     chat::{Command as ChatCommand, NativeContinuity, Session, Snapshot},
@@ -394,6 +397,7 @@ struct Fixture {
     daemon: Child,
     model: Model,
     version: String,
+    agents: hosted_agent_cleanup::Agents,
 }
 
 impl Fixture {
@@ -450,6 +454,16 @@ impl Fixture {
             fs::create_dir_all(root.path().join(directory)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        // Keep project discovery inside this fixture even when TMPDIR has
+        // enclosing Git metadata. This does not qualify the provider itself.
+        let initialized = Self::command(root.path(), Path::new("/usr/bin/git"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--quiet", "--template=", "--initial-branch=main"])
+            .arg(root.path().join("project"))
+            .output()
+            .unwrap();
+        assert!(initialized.status.success(), "{initialized:?}");
         symlink(&codex, root.path().join("bin/codex")).unwrap();
         let model = Model::start();
         // No sandbox, so a command's fate depends only on the approval policy
@@ -482,6 +496,7 @@ unified_exec = true
             daemon,
             model,
             version,
+            agents: Default::default(),
         };
         fixture.await_daemon();
         fixture
@@ -532,7 +547,9 @@ unified_exec = true
             }
             thread::sleep(Duration::from_millis(10));
         }
-        child.wait_with_output().unwrap()
+        let output = child.wait_with_output().unwrap();
+        self.agents.observe(&output);
+        output
     }
 
     fn cli(&self, arguments: &[&str]) -> Value {
@@ -628,34 +645,42 @@ unified_exec = true
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let preflight = self.output(&["daemon", "preflight"]);
-        if let Ok(value) = serde_json::from_slice::<Value>(&preflight.stdout)
-            && let Some(capability) = value["data"].get("capability")
-        {
-            let _ = self.output(&["daemon", "stop", "--confirm", &capability.to_string()]);
+        let panicking = thread::panicking();
+        if panicking {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
         }
-        let _ = self.daemon.kill();
+        // Recovery tests keep their deliberate daemon SIGKILL boundary above.
+        // Only after final assertions, retire the exact accepted private agents
+        // through the matched public CLI; never signal a process by a path match.
+        let result = self
+            .agents
+            .close(self.root.path())
+            .and_then(|()| hosted_agent_cleanup::stop(self.root.path()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.daemon.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let daemon_stopped = self.daemon.try_wait().ok().flatten().is_some();
+        if !daemon_stopped {
+            let _ = self.daemon.kill();
+        }
         let _ = self.daemon.wait();
-        // A failed assertion can leave the provider and its holder running:
-        // a durable holder is meant to outlive its daemon. Nothing outside
-        // this fixture runs in, or names, its directory.
-        let root = self.root.path().to_str().unwrap().to_owned();
-        for ((pid, _), command) in processes() {
-            if command.contains(&root) && pid != std::process::id() {
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if let Err(error) = result.and_then(|()| {
+            if daemon_stopped {
+                Ok(())
+            } else {
+                Err("Private daemon did not exit after public cleanup".into())
             }
-        }
-        if thread::panicking() {
-            // Both daemons append to these: what they printed, and their log.
-            for log in [
-                PathBuf::from("daemon.log"),
-                Path::new("data")
-                    .join(cagents::instance::STORAGE_NAME)
-                    .join("cagentsd.log"),
-            ] {
-                if let Ok(text) = fs::read_to_string(self.root.path().join(&log)) {
-                    eprintln!("--- fixture {} ---\n{text}", log.display());
-                }
+        }) {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+            eprintln!(
+                "Private cleanup evidence retained at {}: {error}",
+                self.root.path().display()
+            );
+            if !panicking {
+                panic!("private fixture cleanup failed: {error}");
             }
         }
     }

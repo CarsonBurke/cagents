@@ -2314,18 +2314,32 @@ fn bare_refs(fixture: &Fixture) -> Vec<String> {
         .collect()
 }
 
+/// Pathspec magic, whitespace, newlines and leading dashes remain literal
+/// paths in the NUL-delimited stdin protocol rather than becoming arguments.
 #[test]
-fn command_pathspecs_use_literal_nul_delimited_stdin() {
+fn staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin() {
     let service: RepositoryService<IsolatedExecutor> =
         RepositoryService::new("git", Arc::new(IsolatedExecutor(SystemProcessExecutor)));
     let command = service
-        .stage_command(Path::new("/repo"), &[path(":(top)magic.txt")])
+        .stage_command(
+            Path::new("/repo"),
+            &[
+                path(":(top)magic.txt"),
+                path("space name.txt"),
+                path("line\nbreak.txt"),
+                path("-leading.txt"),
+            ],
+        )
         .expect("stage command");
     assert_eq!(command.arguments[0], OsString::from("--literal-pathspecs"));
-    assert!(command.arguments.contains(&OsString::from("--pathspec-from-file=-")));
-    assert!(command.arguments.contains(&OsString::from("--pathspec-file-nul")));
-    assert!(!command.arguments.contains(&OsString::from(":(top)magic.txt")));
-    assert_eq!(command.stdin.as_deref(), Some(b":(top)magic.txt\0".as_slice()));
+    assert_eq!(
+        &command.arguments[command.arguments.len() - 4..],
+        ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"].map(OsString::from)
+    );
+    assert_eq!(
+        command.stdin.as_deref(),
+        Some(b":(top)magic.txt\0space name.txt\0line\nbreak.txt\0-leading.txt\0".as_slice())
+    );
 }
 
 /// A project remembers its Git common directory, so reopening one hands
@@ -3395,10 +3409,9 @@ fn discard_blocks_external_staging_under_the_correct_worktree_index_lock() {
                 && !self.attempted.swap(true, Ordering::Relaxed)
             {
                 assert!(output.success);
-                // Membership now reads the complete NUL-delimited index and
-                // filters selected paths in memory. The selected file is not
-                // tracked, while this unrelated tracked entry remains present.
-                assert_eq!(output.stdout, b"tracked.txt\0");
+                // Small selections query only their literal paths; selected.txt
+                // is untracked, so unrelated tracked entries are not returned.
+                assert!(output.stdout.is_empty());
                 assert!(
                     self.index_lock.is_file(),
                     "discard must hold this index lock"
@@ -4433,7 +4446,10 @@ fn git_operation_fetch_sync_and_stashes_round_trip() {
         service
             .git_operation(
                 &fixture.work(),
-                &GitOperation::Sync { rebase: false },
+                &GitOperation::Sync {
+                    rebase: false,
+                    destination: fixture.snapshot().sync_destination()
+                },
                 &cancellation
             )
             .unwrap(),
@@ -4592,7 +4608,14 @@ fn git_operation_conflict_detection_resolution_and_abort() {
             service
                 .git_operation(
                     &fixture.work(),
-                    &GitOperation::Abort { kind },
+                    &GitOperation::Abort {
+                        kind,
+                        witness: service
+                            .operation_state(&fixture.work(), &cancellation)
+                            .unwrap()
+                            .unwrap()
+                            .witness,
+                    },
                     &cancellation
                 )
                 .unwrap(),
@@ -4663,7 +4686,14 @@ fn git_operation_conflict_detection_resolution_and_abort() {
             service
                 .git_operation(
                     &fixture.work(),
-                    &GitOperation::Continue { kind },
+                    &GitOperation::Continue {
+                        kind,
+                        witness: service
+                            .operation_state(&fixture.work(), &cancellation)
+                            .unwrap()
+                            .unwrap()
+                            .witness,
+                    },
                     &cancellation
                 )
                 .unwrap(),
@@ -4684,6 +4714,277 @@ fn git_operation_conflict_detection_resolution_and_abort() {
     }
     assert!(has_conflict_markers(b"<<<<<<< HEAD\npartial block\n"));
     assert!(!has_conflict_markers(b"ordinary code\n"));
+}
+
+fn recovery_operation_fixture() -> Option<(Fixture, Oid, Oid)> {
+    let fixture = Fixture::new()?;
+    fixture.write("f.txt", b"base\n");
+    fixture.git_in_work(&["add", "."]);
+    let base = fixture.commit("base");
+    fixture.git_in_work(&["switch", "-c", "incoming-a"]);
+    fixture.write("f.txt", b"incoming a\n");
+    fixture.git_in_work(&["add", "."]);
+    let incoming_a = fixture.commit("incoming a");
+    fixture.git_in_work(&["switch", "-c", "incoming-b", base.as_str()]);
+    fixture.write("f.txt", b"incoming b\n");
+    fixture.git_in_work(&["add", "."]);
+    let incoming_b = fixture.commit("incoming b");
+    fixture.git_in_work(&["switch", "main"]);
+    fixture.write("f.txt", b"ours\n");
+    fixture.git_in_work(&["add", "."]);
+    fixture.commit("ours");
+    Some((fixture, incoming_a, incoming_b))
+}
+
+fn recovery_operation_command(kind: cagents::repository::GitOperationKind) -> &'static str {
+    use cagents::repository::GitOperationKind;
+    match kind {
+        GitOperationKind::Merge => "merge",
+        GitOperationKind::Rebase => "rebase",
+        GitOperationKind::CherryPick => "cherry-pick",
+        GitOperationKind::Revert => "revert",
+    }
+}
+
+fn start_recovery_operation(
+    fixture: &Fixture,
+    kind: cagents::repository::GitOperationKind,
+    incoming: &Oid,
+) {
+    if kind == cagents::repository::GitOperationKind::Revert {
+        fixture.run_failing(&fixture.work(), &["revert", "--no-edit", incoming.as_str()]);
+    } else {
+        fixture.run_failing(
+            &fixture.work(),
+            &[recovery_operation_command(kind), incoming.as_str()],
+        );
+    }
+    assert!(fixture.snapshot().status.dirty.conflicted > 0);
+}
+
+fn recovery_operation_observation(
+    fixture: &Fixture,
+) -> (String, Vec<u8>, Vec<u8>, Vec<(PathBuf, Option<Vec<u8>>)>) {
+    fn append(path: &Path, relative: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return;
+        };
+        assert!(!metadata.file_type().is_symlink());
+        if metadata.is_dir() {
+            entries.push((relative.to_owned(), None));
+            let mut children = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect::<Vec<_>>();
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                append(&child.path(), &relative.join(child.file_name()), entries);
+            }
+        } else {
+            entries.push((relative.to_owned(), Some(fs::read(path).unwrap())));
+        }
+    }
+    let admin = fixture.work().join(".git");
+    let mut markers = Vec::new();
+    for name in [
+        "HEAD",
+        "ORIG_HEAD",
+        "MERGE_HEAD",
+        "MERGE_MSG",
+        "MERGE_MODE",
+        "AUTO_MERGE",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+    ] {
+        append(&admin.join(name), Path::new(name), &mut markers);
+    }
+    (
+        fixture.text(&["show-ref"]),
+        fs::read(admin.join("index")).unwrap(),
+        fs::read(fixture.work().join("f.txt")).unwrap(),
+        markers,
+    )
+}
+
+#[test]
+fn git_operation_recovery_refuses_replaced_and_recreated_instances() {
+    use cagents::repository::{GitOperation, GitOperationKind};
+    for kind in [
+        GitOperationKind::Merge,
+        GitOperationKind::Rebase,
+        GitOperationKind::CherryPick,
+        GitOperationKind::Revert,
+    ] {
+        for recreate_same in [false, true] {
+            for continuing in [false, true] {
+                let Some((fixture, incoming_a, incoming_b)) = recovery_operation_fixture() else {
+                    return;
+                };
+                let service = fixture.service();
+                let cancellation = CancellationToken::new();
+                start_recovery_operation(&fixture, kind, &incoming_a);
+                if continuing {
+                    fixture.write("f.txt", b"original resolution\n");
+                    fixture.git_in_work(&["add", "f.txt"]);
+                    assert_eq!(fixture.snapshot().status.dirty.conflicted, 0);
+                }
+                let original = fixture.snapshot().operation.unwrap();
+                assert!(original.witness.is_some());
+                // This is the old rendered action, retained before replacing A.
+                let request = if continuing {
+                    GitOperation::Continue {
+                        kind,
+                        witness: original.witness.clone(),
+                    }
+                } else {
+                    GitOperation::Abort {
+                        kind,
+                        witness: original.witness.clone(),
+                    }
+                };
+                fixture.git_in_work(&[recovery_operation_command(kind), "--abort"]);
+                let replacement = if recreate_same {
+                    &incoming_a
+                } else {
+                    &incoming_b
+                };
+                start_recovery_operation(&fixture, kind, replacement);
+                let current = fixture.snapshot().operation.unwrap();
+                assert_eq!(current.kind, original.kind);
+                if recreate_same {
+                    assert_eq!(current.incoming_ref, original.incoming_ref);
+                } else {
+                    assert_ne!(current.incoming_ref, original.incoming_ref);
+                }
+                assert_ne!(current.witness, original.witness);
+                if continuing {
+                    // B must actually be continuable; unresolved-B failure is
+                    // not evidence that the old action was correctly refused.
+                    fixture.write("f.txt", b"replacement resolution\n");
+                    fixture.git_in_work(&["add", "f.txt"]);
+                    assert_eq!(fixture.snapshot().status.dirty.conflicted, 0);
+                }
+                let before = recovery_operation_observation(&fixture);
+                assert!(matches!(
+                    service
+                        .git_operation(&fixture.work(), &request, &cancellation)
+                        .unwrap(),
+                    MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected { .. }
+                    }
+                ));
+                assert_eq!(
+                    recovery_operation_observation(&fixture),
+                    before,
+                    "{kind:?}, same={recreate_same}, continue={continuing}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn git_operation_recovery_witness_allows_resolution_and_message_edits() {
+    use cagents::repository::{GitOperation, GitOperationKind};
+    for (kind, apply_rebase) in [
+        (GitOperationKind::Merge, false),
+        (GitOperationKind::Rebase, false),
+        (GitOperationKind::Rebase, true),
+        (GitOperationKind::CherryPick, false),
+        (GitOperationKind::Revert, false),
+    ] {
+        let Some((fixture, incoming, _)) = recovery_operation_fixture() else {
+            return;
+        };
+        if apply_rebase {
+            fixture.run_failing(&fixture.work(), &["rebase", "--apply", incoming.as_str()]);
+            assert!(fixture.snapshot().status.dirty.conflicted > 0);
+        } else {
+            start_recovery_operation(&fixture, kind, &incoming);
+        }
+        let original = fixture.snapshot().operation.unwrap();
+        assert!(original.witness.is_some());
+        let request = GitOperation::Continue {
+            kind,
+            witness: original.witness,
+        };
+        fixture.write("f.txt", b"user resolution\n");
+        fixture.git_in_work(&["add", "f.txt"]);
+        let message = match (kind, apply_rebase) {
+            (GitOperationKind::Rebase, true) => "rebase-apply/final-commit",
+            (GitOperationKind::Rebase, false) => "rebase-merge/message",
+            _ => "MERGE_MSG",
+        };
+        fs::write(
+            fixture.work().join(".git").join(message),
+            b"User edited operation message\n",
+        )
+        .unwrap();
+        let service = fixture.service();
+        let cancellation = CancellationToken::new();
+        assert!(matches!(
+            service
+                .git_operation(&fixture.work(), &request, &cancellation)
+                .unwrap(),
+            MutationOutcome::Applied { .. }
+        ));
+        assert_eq!(
+            fs::read(fixture.work().join("f.txt")).unwrap(),
+            b"user resolution\n"
+        );
+        assert!(
+            service
+                .operation_state(&fixture.work(), &cancellation)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn git_operation_recovery_requires_local_matching_authority() {
+    use cagents::repository::{GitOperation, GitOperationKind, GitOperationState};
+    let Some((fixture, incoming, _)) = recovery_operation_fixture() else {
+        return;
+    };
+    start_recovery_operation(&fixture, GitOperationKind::Merge, &incoming);
+    let original = fixture.snapshot().operation.unwrap();
+    assert!(original.witness.is_some());
+    let serialized = serde_json::to_value(&original).unwrap();
+    assert!(serialized.get("witness").is_none());
+    let remote: GitOperationState = serde_json::from_value(serialized).unwrap();
+    assert!(remote.witness.is_none());
+    let service = fixture.service();
+    let cancellation = CancellationToken::new();
+    for request in [
+        GitOperation::Abort {
+            kind: remote.kind,
+            witness: remote.witness.clone(),
+        },
+        GitOperation::Continue {
+            kind: remote.kind,
+            witness: remote.witness,
+        },
+        GitOperation::Abort {
+            kind: GitOperationKind::Rebase,
+            witness: original.witness,
+        },
+    ] {
+        let before = recovery_operation_observation(&fixture);
+        assert!(matches!(
+            service
+                .git_operation(&fixture.work(), &request, &cancellation)
+                .unwrap(),
+            MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { .. }
+            }
+        ));
+        assert_eq!(recovery_operation_observation(&fixture), before);
+    }
 }
 
 #[test]
@@ -4798,7 +5099,10 @@ fn git_operation_sync_handles_divergence_rebase_and_conflict_handoff() {
         let refusal = service
             .git_operation(
                 &fixture.work(),
-                &GitOperation::Sync { rebase: false },
+                &GitOperation::Sync {
+                    rebase: false,
+                    destination: fixture.snapshot().sync_destination(),
+                },
                 &cancellation,
             )
             .unwrap();
@@ -4813,7 +5117,10 @@ fn git_operation_sync_handles_divergence_rebase_and_conflict_handoff() {
         let rebased = service
             .git_operation(
                 &fixture.work(),
-                &GitOperation::Sync { rebase: true },
+                &GitOperation::Sync {
+                    rebase: true,
+                    destination: fixture.snapshot().sync_destination(),
+                },
                 &cancellation,
             )
             .unwrap();
@@ -4846,7 +5153,12 @@ fn git_operation_sync_handles_divergence_rebase_and_conflict_handoff() {
                     .git_operation(
                         &fixture.work(),
                         &GitOperation::Continue {
-                            kind: GitOperationKind::Rebase
+                            kind: GitOperationKind::Rebase,
+                            witness: service
+                                .operation_state(&fixture.work(), &cancellation)
+                                .unwrap()
+                                .unwrap()
+                                .witness,
                         },
                         &cancellation
                     )
@@ -5588,7 +5900,10 @@ fn sync_reports_the_completed_pull_when_the_push_is_rejected() {
         .service()
         .git_operation(
             &fixture.work(),
-            &GitOperation::Sync { rebase: true },
+            &GitOperation::Sync {
+                rebase: true,
+                destination: fixture.snapshot().sync_destination(),
+            },
             &CancellationToken::new(),
         )
         .unwrap();
@@ -5609,6 +5924,224 @@ fn sync_reports_the_completed_pull_when_the_push_is_rejected() {
         fixture.run(&fixture.origin(), &["rev-parse", "refs/heads/main"]),
         remote_before
     );
+}
+
+#[test]
+fn sync_preserves_its_original_destination_across_the_completed_pull() {
+    use cagents::repository::GitOperation;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ChangeAfterPull {
+        change: &'static str,
+        worktree: PathBuf,
+        alternate: PathBuf,
+        origin: PathBuf,
+        pushes: AtomicUsize,
+    }
+    impl ProcessExecutor for ChangeAfterPull {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if command.arguments.iter().any(|argument| argument == "push") {
+                self.pushes.fetch_add(1, Ordering::SeqCst);
+            }
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if output.success && command.arguments.iter().any(|argument| argument == "pull") {
+                // This boundary is after a real successful pull and its wait,
+                // before the service observes state or attempts any push.
+                let arguments: Vec<OsString> = match self.change {
+                    "unchanged" => Vec::new(),
+                    "checkout" => vec!["checkout".into(), "other".into()],
+                    "upstream" => vec!["branch".into(), "--set-upstream-to=origin/other".into()],
+                    "pushurl" => vec![
+                        "remote".into(),
+                        "set-url".into(),
+                        "--push".into(),
+                        "origin".into(),
+                        self.alternate.clone().into_os_string(),
+                    ],
+                    "root" => {
+                        fs::rename(&self.worktree, &self.alternate).unwrap();
+                        let replacement = CommandSpec::new(&command.program).args([
+                            OsString::from("clone"),
+                            self.origin.clone().into_os_string(),
+                            self.worktree.clone().into_os_string(),
+                        ]);
+                        let replaced = SystemProcessExecutor
+                            .execute(&isolate(replacement), &CancellationToken::new())?;
+                        assert!(
+                            replaced.success,
+                            "real replacement clone failed: {replaced:?}"
+                        );
+                        Vec::new()
+                    }
+                    _ => unreachable!(),
+                };
+                if !arguments.is_empty() {
+                    let change = CommandSpec::new(&command.program)
+                        .cwd(&self.worktree)
+                        .args(arguments);
+                    let changed = SystemProcessExecutor
+                        .execute(&isolate(change), &CancellationToken::new())?;
+                    assert!(
+                        changed.success,
+                        "real intervening Git change failed: {changed:?}"
+                    );
+                }
+            }
+            Ok(output)
+        }
+    }
+
+    for change in ["unchanged", "checkout", "upstream", "pushurl", "root"] {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let base = publish_main(&fixture);
+        fixture.git_in_work(&["checkout", "-b", "other"]);
+        fixture.write("other.txt", b"published other\n");
+        fixture.git_in_work(&["add", "."]);
+        fixture.commit("published other");
+        fixture.git_in_work(&["push", "-u", "origin", "other"]);
+        let other_remote_before =
+            fixture.run(&fixture.origin(), &["rev-parse", "refs/heads/other"]);
+        fixture.write("other.txt", b"unpublished other\n");
+        fixture.git_in_work(&["add", "."]);
+        let other_local = fixture.commit("unpublished other");
+        fixture.git_in_work(&["checkout", "main"]);
+        fixture.run(
+            fixture.root.path(),
+            &["clone", fixture.origin().to_str().unwrap(), "peer"],
+        );
+        let peer = fixture.root.path().join("peer");
+        fs::write(peer.join("remote.txt"), b"pulled remote change\n").unwrap();
+        fixture.run(&peer, &["add", "."]);
+        fixture.run(&peer, &["commit", "-m", "remote advance"]);
+        fixture.run(&peer, &["push", "origin", "main"]);
+        let pulled = fixture.run(&fixture.origin(), &["rev-parse", "refs/heads/main"]);
+        let destination = fixture
+            .snapshot()
+            .sync_destination()
+            .expect("local admitted Sync");
+        let executor = Arc::new(ChangeAfterPull {
+            change,
+            worktree: fixture.work(),
+            alternate: fixture.root.path().join("alternate"),
+            origin: fixture.origin(),
+            pushes: AtomicUsize::new(0),
+        });
+        let service = RepositoryService::new("git", executor.clone());
+        let outcome = service
+            .git_operation(
+                &fixture.work(),
+                &GitOperation::Sync {
+                    rebase: false,
+                    destination: Some(destination),
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        if change == "unchanged" {
+            assert!(
+                matches!(&outcome, MutationOutcome::Applied { .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(executor.pushes.load(Ordering::SeqCst), 1);
+        } else {
+            assert!(
+                matches!(&outcome, MutationOutcome::PartiallyApplied { failures, .. }
+                if failures.iter().any(|failure| failure.to_string().contains("Pull completed"))
+                && failures.iter().any(|failure| failure.to_string().contains("destination changed"))),
+                "{change}: {outcome:?}"
+            );
+            assert_eq!(executor.pushes.load(Ordering::SeqCst), 0, "{change}");
+        }
+        assert_ne!(
+            fixture.run(&fixture.origin(), &["rev-parse", "refs/heads/main"]),
+            format!("{}\n", base.as_str()).as_bytes()
+        );
+        assert_eq!(
+            fixture.run(&fixture.origin(), &["rev-parse", "refs/heads/main"]),
+            pulled
+        );
+        assert_eq!(
+            fixture.run(&fixture.origin(), &["rev-parse", "refs/heads/other"]),
+            other_remote_before
+        );
+        if change == "checkout" {
+            assert_eq!(fixture.head(), other_local);
+        }
+        let original = if change == "root" {
+            fixture.root.path().join("alternate")
+        } else {
+            fixture.work()
+        };
+        assert_eq!(
+            fixture.run(&original, &["rev-parse", "refs/heads/main"]),
+            pulled
+        );
+        assert_eq!(
+            fixture.run(&original, &["show", "refs/heads/main:remote.txt"]),
+            b"pulled remote change\n"
+        );
+    }
+}
+
+#[test]
+fn queued_sync_refuses_a_changed_checkout_before_pulling() {
+    use cagents::repository::GitOperation;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountWrites(AtomicUsize);
+    impl ProcessExecutor for CountWrites {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if command
+                .arguments
+                .iter()
+                .any(|argument| argument == "pull" || argument == "push")
+            {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)
+        }
+    }
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    publish_main(&fixture);
+    let destination = fixture
+        .snapshot()
+        .sync_destination()
+        .expect("local admitted Sync");
+    fixture.git_in_work(&["checkout", "-b", "other"]);
+    fixture.git_in_work(&["branch", "--set-upstream-to=origin/main"]);
+    let executor = Arc::new(CountWrites(AtomicUsize::new(0)));
+    let service = RepositoryService::new("git", executor.clone());
+    for destination in [Some(destination), None] {
+        let outcome = service
+            .git_operation(
+                &fixture.work(),
+                &GitOperation::Sync {
+                    rebase: false,
+                    destination,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { .. }
+            }
+        ));
+    }
+    assert_eq!(executor.0.load(Ordering::SeqCst), 0);
+    assert_eq!(fixture.text(&["branch", "--show-current"]), "other");
 }
 
 #[test]
@@ -5655,7 +6188,10 @@ fn cancelling_sync_after_pull_reports_the_completed_local_step() {
     let result = service
         .git_operation(
             &fixture.work(),
-            &GitOperation::Sync { rebase: false },
+            &GitOperation::Sync {
+                rebase: false,
+                destination: fixture.snapshot().sync_destination(),
+            },
             &cancellation,
         )
         .unwrap();
