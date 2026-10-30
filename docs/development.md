@@ -261,6 +261,144 @@ sequentially with other Cargo workloads. Its historical-producer control also
 demonstrates the supported package bootstrap below and checks that unrelated
 dependency bytes and mtimes remain unchanged.
 
+The maintained isolated HOST qualification consumer is
+`scripts/qualification/run-host-lane.py`. It follows the PR1239 R3 direct-ELF
+workflow: HOST daemon check, HOST library test compilation with Cargo JSON,
+complete inventory of the just-reported ELF, then an ordered set of exact test
+parents from that same unchanged ELF. It accepts no arbitrary commands or
+feature sets. Each parent needs the original zero exit, one exact terminal row,
+one running-test block and the matching complete-inventory filtered count.
+Inventory and compilation count as zero parent passes; nested output is never
+added to the outer result. Original combined output, exits and cleanup
+dispositions remain available for independent raw-evidence review.
+
+This consumer uses the existing `validation-three-lanes/lane-c.lock`,
+`lane-c-target` and jobs2. Its proposed persistent detached source slot is
+`validation-three-lanes/lane-c-checkout`, with helper owner `validation-lane-c`.
+These paths are fixed relative to the reviewed plan's explicit `workspace_root`,
+never inferred from the driver's own worktree. The plan separately pins an
+owned persistent `control_repository`, its actual `common_git_dir`, and the
+existing device/inode identities of the workspace, control/common directories,
+C directory, lock and target. Preserve the common Git directory and its identity
+for the slot's lifetime. Before staging, Git must report that exact control root
+and common directory; the original candidate and prepared checkout must also
+report that common directory. Candidate objects must already exist there
+through normal source delivery. An independent clone cannot adopt the slot by
+changing an argument. Do not delete/recreate the slot, registry or target between
+candidates, clear caches or remove the checkout identity anchor to obtain reuse.
+
+The coordinator must independently verify a fresh C allocation and the previous
+owner's positive whole-family return, then supply its original return receipt
+and SHA-256. The receipt is a pinned coordinator statement, not an unforgeable
+process capability or an execution grant. The driver accepts the R3-compatible
+final custody fields: `lock_acquired: true`, `state: "own family positively
+settled; fixed packet ended"`, `lease: "closed only after positive owned-family
+settlement and pidfd closure"`, `all_owned_pidfds_closed: true`, `exit_code`,
+`finished_utc`, and `custody_final` with verified subreaper/empty-initial-child
+claims and every retained node settled. A failed test may still have a positive
+family return; its nonzero result and forced-cleanup dispositions are retained.
+Unknown or contradictory return evidence blocks admission. No global process
+discovery, receipt synthesis or successor retargeting is a recovery mechanism.
+
+Freeze and review an external JSON plan with exactly this shape (placeholders
+below must be replaced with full reviewed paths and digests):
+
+```json
+{
+  "version": 1,
+  "workspace_root": "/absolute/owned/workspace",
+  "control_repository": "/absolute/owned/workspace/persistent-control",
+  "common_git_dir": "/absolute/owned/workspace/persistent-control/.git",
+  "identities": {
+    "workspace_root": [123, 1001],
+    "control_repository": [123, 1002],
+    "common_git_dir": [123, 1003],
+    "lane_directory": [123, 1004],
+    "lane_lock": [123, 1005],
+    "lane_target": [123, 1006]
+  },
+  "source": {
+    "original_checkout": "/absolute/original-candidate-worktree",
+    "head": "FULL_40_HEX_COMMIT",
+    "tree": "FULL_40_HEX_TREE",
+    "parent": "FULL_40_HEX_FIRST_PARENT",
+    "expect_current": "absent",
+    "sha256": {
+      "Cargo.toml": "SHA256",
+      "Cargo.lock": "SHA256",
+      ".cargo/config.toml": "SHA256",
+      "build.rs": "SHA256",
+      "src/lib.rs": "SHA256",
+      "src/bin/cagentsd.rs": "SHA256",
+      "src/path/containing/the/owning/tests.rs": "SHA256"
+    }
+  },
+  "artifacts": {
+    "checkout_helper": {"path": "/immutable/main-2005/prepare-validation-checkout", "sha256": "SHA256"},
+    "custody": {"path": "/immutable/reviewed/process_custody.py", "sha256": "SHA256"}
+  },
+  "tools": {
+    "python": {"path": "/absolute/physical/python", "sha256": "SHA256", "device_inode": [123, 2001]},
+    "git": {"path": "/absolute/physical/git", "sha256": "SHA256", "device_inode": [123, 2002]},
+    "env": {"path": "/absolute/physical/env", "sha256": "SHA256", "device_inode": [123, 2003]},
+    "cargo": {"path": "/absolute/physical/cargo", "sha256": "SHA256", "device_inode": [123, 2004]},
+    "rustc": {"path": "/absolute/physical/rustc", "sha256": "SHA256", "device_inode": [123, 2005]},
+    "rustdoc": {"path": "/absolute/physical/rustdoc", "sha256": "SHA256", "device_inode": [123, 2006]},
+    "zig": {"path": "/absolute/physical/zig", "sha256": "SHA256", "device_inode": [123, 2007]}
+  },
+  "selectors": ["module::tests::exact_owning_parent"],
+  "evidence_directory": "/absolute/new-private-execution-evidence",
+  "total_workload_seconds": 2100
+}
+```
+
+Use `expect_current: "absent"` only for explicitly admitted first creation. On
+reuse, copy the exact head from the previous owner-controlled preparation
+receipt; never substitute a freshly observed arbitrary slot HEAD. Replace the
+example device/inode numbers with the existing reviewed identities; they are
+not requests to create directories, locks, targets or tools. Pin the allocation's
+same physical Cargo/rustc/rustdoc, Python, Git, env and Zig files by absolute
+canonical path, SHA-256 and device/inode. The current qualification profile uses
+Rust1.93.0 and Zig0.15.2; changing tool bytes requires a separately reviewed plan.
+No private installation layout or session-specific repository path is built
+into the driver. It validates owned protected directory routes and ancestors,
+preserves natural HOME/XDG and opaque authority, refuses conflicting
+Git/startup/build routing by environment name, records the canonical checkout's
+actual ancestor Cargo configurations and inherited build-value hashes, and
+stops on context changes. An inherited Git route is not silently removed.
+Helper/custody, driver, plan and prior receipt must remain pinned outside the
+checkout the helper changes.
+
+Only after a separately authorized allocation, invoke the reviewed driver with
+`/absolute/physical/python -I -B /immutable/run-host-lane.py --plan /immutable/plan.json
+--plan-sha256 SHA256 --driver-sha256 SHA256 --allocation FRESH_REFERENCE
+--prior-return /immutable/prior-receipt.json --prior-return-sha256 SHA256`.
+It creates its new evidence directory, establishes custody for its own new
+children and acquires the actual existing nonblocking C flock before invoking
+the checkout helper. Every child uses the unchanged reviewed custody module.
+No next launch is admitted until all original owned processes and descendants
+have positively settled. Helper refusal, uncertain mutation or mismatching
+prepared fields blocks Cargo and retains the original helper output for owner
+recovery; there is no reset, clean, retry or alternate owner/path. C remains held
+through final positive settlement and pidfd closure, including failures.
+
+Fixed budgets are helper60s, HOST check600s, compilation1200s, inventory30s and
+120s per parent. The plan must reserve `1980 + 120 * parent_count` seconds,
+including90s overhead; each primary launch requires its entire fixed budget
+plus90s still available. This is3660s for14 parents. A deadline closes admission
+without shortening or replaying a phase; mandatory cleanup retains C until
+settlement rather than using that deadline as permission to abandon children.
+
+`tests/qualification/test_host_lane_driver.py` contains offline protocol
+fixtures with injected lock/custody/source observations. They start no children
+and never open C, prepare a checkout or run Cargo/an ELF. They cannot establish
+actual lane use, kernel supervision, production qualification or cache reuse.
+The maintained consumer still needs independently reviewed actual admitted
+execution; issue2002 remains open until that outcome is qualified. Comparable
+before/after cache measurement is separate, and no speedup is claimed here.
+The frozen R3, B9 #1726 and #1955 packets retain their original bindings and
+results; this successor inherits no allocation, pass or independent review.
+
 A historical checkout without the compile-time checkout anchor can replace a
 shared build-script executable. Returning to an anchored checkout can then
 rerun that historical body without recompiling it, even though relative inputs
