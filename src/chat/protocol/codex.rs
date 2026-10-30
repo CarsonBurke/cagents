@@ -451,6 +451,7 @@ fn create_inner(
             suggestion_turn: None,
             prediction_turn: None,
             predictions_unsupported: false,
+            subagent_name_origin: ChildNameOrigin::Unknown,
             subagent_status: None,
             subagent_waiting: false,
             subagent_detail: String::new(),
@@ -604,6 +605,7 @@ struct Codex {
     suggestion_turn: Option<String>,
     prediction_turn: Option<String>,
     predictions_unsupported: bool,
+    subagent_name_origin: ChildNameOrigin,
     subagent_status: Option<ToolStatus>,
     subagent_waiting: bool,
     subagent_detail: String,
@@ -630,6 +632,14 @@ struct Codex {
     branch_points: Vec<chat::BranchPoint>,
     is_child: bool,
     child_buffer: BTreeMap<String, Vec<Value>>,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum ChildNameOrigin {
+    #[default]
+    Unknown,
+    Historical,
+    Current,
 }
 
 #[derive(Clone, Default)]
@@ -663,6 +673,16 @@ impl Codex {
         &mut self,
         id: &str,
         metadata: &Value,
+        step: &mut Step,
+    ) -> Result<(), String> {
+        self.discover_child_metadata(id, metadata, ChildNameOrigin::Current, step)
+    }
+
+    fn discover_child_metadata(
+        &mut self,
+        id: &str,
+        metadata: &Value,
+        name_origin: ChildNameOrigin,
         step: &mut Step,
     ) -> Result<(), String> {
         if self.is_child || id.is_empty() || id.len() > 256 || self.thread.as_deref() == Some(id) {
@@ -727,16 +747,30 @@ impl Codex {
             // Sparse collab metadata must not reset a known terminal outcome.
             child.subagent_status = Some(status);
         }
+        // History and list replies can arrive after a newer live name. They
+        // may fill an unknown name, but only live metadata or exact hydration
+        // can replace a name already shown.
+        let nickname = agent_nickname(metadata).filter(|_| {
+            name_origin == ChildNameOrigin::Current
+                || self
+                    .children
+                    .get(id)
+                    .is_some_and(|child| child.subagent_name_origin == ChildNameOrigin::Unknown)
+        });
+        if nickname.is_some()
+            && let Some(child) = self.children.get_mut(id)
+        {
+            child.subagent_name_origin = name_origin;
+        }
         step.events.push(Event::Subagent {
             model,
             waiting: None,
             detail: None,
             id: id.into(),
-            kind: metadata["agentNickname"]
-                .as_str()
-                .or_else(|| metadata["agentRole"].as_str())
-                .unwrap_or(if discovered { "Codex agent" } else { "" })
-                .into(),
+            // Roles describe capabilities, not identity. Empty sparse metadata
+            // preserves a known nickname in the runtime; an unnamed child
+            // otherwise leaves its identity to the navigation fallback.
+            kind: nickname.unwrap_or_default().into(),
             description: metadata["message"]
                 .as_str()
                 .or_else(|| metadata["preview"].as_str())
@@ -1279,7 +1313,12 @@ impl Codex {
                             metadata.remove("status");
                             metadata.remove("model");
                         }
-                        self.discover_child(id, &metadata, step)?;
+                        self.discover_child_metadata(
+                            id,
+                            &metadata,
+                            ChildNameOrigin::Historical,
+                            step,
+                        )?;
                     }
                 }
                 let mut windows = BTreeMap::new();
@@ -2542,7 +2581,12 @@ impl Adapter for Codex {
                                 continue;
                             }
                             if let Some(id) = thread["id"].as_str() {
-                                self.discover_child(id, thread, &mut step)?;
+                                self.discover_child_metadata(
+                                    id,
+                                    thread,
+                                    ChildNameOrigin::Historical,
+                                    &mut step,
+                                )?;
                             }
                         }
                         if deferred.len() == before {
@@ -2600,6 +2644,23 @@ impl Adapter for Codex {
                             {
                                 child.history(&mut content, None)?;
                             }
+                        }
+                        // Hydration can fill an identity absent from discovery,
+                        // but cannot replace any genuine name already seen live.
+                        if child.subagent_name_origin != ChildNameOrigin::Current
+                            && let Some(nickname) = agent_nickname(&result["thread"])
+                        {
+                            child.subagent_name_origin = ChildNameOrigin::Current;
+                            step.events.push(Event::Subagent {
+                                id: id.clone(),
+                                kind: nickname.into(),
+                                description: String::new(),
+                                status: None,
+                                background: None,
+                                model: None,
+                                waiting: None,
+                                detail: None,
+                            });
                         }
                         self.child_step(&id, content, &mut step)?;
                     }
@@ -3324,6 +3385,13 @@ impl Codex {
         Ok(())
     }
 }
+fn agent_nickname(metadata: &Value) -> Option<&str> {
+    metadata["agentNickname"]
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
 fn agent_status(status: &Value) -> Option<ToolStatus> {
     match status.as_str().or_else(|| status["type"].as_str()) {
         Some("completed" | "idle" | "shutdown") => Some(ToolStatus::Succeeded),
@@ -5846,6 +5914,7 @@ mod tests {
             suggestion_turn: None,
             prediction_turn: None,
             predictions_unsupported: false,
+            subagent_name_origin: ChildNameOrigin::Unknown,
             subagent_status: None,
             subagent_waiting: false,
             subagent_detail: String::new(),
@@ -6212,6 +6281,32 @@ mod tests {
         assert!(sparse.events.iter().any(
             |event| matches!(event, Event::Subagent {kind, status:None, ..} if kind.is_empty())
         ));
+    }
+
+    #[test]
+    fn child_identity_uses_only_reported_nonblank_nickname_without_guessing_roles() {
+        let mut parent = adapter();
+        for (nickname, expected) in [
+            (Value::Null, ""),
+            (json!(""), ""),
+            (json!(" \t\n"), ""),
+            (json!(" Scout "), "Scout"),
+            // A real nickname may happen to equal a role or the old default.
+            (json!("worker"), "worker"),
+            (json!("Codex agent"), "Codex agent"),
+        ] {
+            let mut step = Step::default();
+            parent
+                .discover_child(
+                    "child",
+                    &json!({"agentNickname":nickname,"agentRole":"worker"}),
+                    &mut step,
+                )
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(event,
+                Event::Subagent { id, kind, .. } if id == "child" && kind == expected
+            )));
+        }
     }
 
     #[test]
@@ -6610,6 +6705,145 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    fn child_name_snapshot_request(parent: &mut Codex, list: bool) -> Value {
+        let hello = parent.initialize().unwrap();
+        let home = parent.expected_home.to_str().unwrap().to_owned();
+        let initialized = parent
+            .receive(json!({"id":hello.writes[0]["id"],"result":{"codexHome":home,"userAgent":"codex-child-name-fixture"}}))
+            .unwrap();
+        let attach = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/resume")
+            .unwrap();
+        let attached = parent.receive(json!({"id":attach["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":"older"}}})).unwrap();
+        let skills = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        let ready = parent
+            .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(ready.events.contains(&Event::Ready(true)));
+        if list {
+            attached
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/list")
+                .unwrap()["id"]
+                .clone()
+        } else {
+            parent.command(Command::LoadEarlier).unwrap().writes[0]["id"].clone()
+        }
+    }
+
+    fn child_name_snapshot_reply(
+        parent: &mut Codex,
+        request: Value,
+        list: bool,
+        threads: Vec<Value>,
+    ) -> Step {
+        let result = if list {
+            json!({"data":threads})
+        } else {
+            let mut ids = Vec::new();
+            let mut states = serde_json::Map::new();
+            for thread in threads {
+                let id = thread["id"].as_str().unwrap().to_owned();
+                ids.push(id.clone());
+                states.insert(id, thread);
+            }
+            json!({"data":[{"id":"older","status":"completed","items":[{"id":"spawn","type":"collabAgentToolCall","tool":"spawnAgent","status":"completed","senderThreadId":"thread-exact","receiverThreadIds":ids,"agentsStates":states}]}],"nextCursor":"older-still"})
+        };
+        parent
+            .receive(json!({"id":request,"result":result}))
+            .unwrap()
+    }
+
+    #[test]
+    fn delayed_child_snapshots_cannot_replace_live_names_or_prevent_live_renames() {
+        for list in [false, true] {
+            for nickname in [
+                None,
+                Some(Value::Null),
+                Some(json!("")),
+                Some(json!(" \t\n")),
+                Some(json!("Scout")),
+            ] {
+                let mut parent = adapter();
+                let request = child_name_snapshot_request(&mut parent, list);
+                for (id, name) in [("child", "Navigator"), ("other", "Mapper")] {
+                    let started = parent.receive(json!({"method":"thread/started","params":{"thread":{"id":id,"parentThreadId":"thread-exact","agentNickname":name}}})).unwrap();
+                    assert!(started.events.iter().any(|event| matches!(event, Event::Subagent { id: actual, kind, .. } if actual == id && kind == name)));
+                }
+                let mut old =
+                    json!({"id":"child","parentThreadId":"thread-exact","agentRole":"worker"});
+                if let Some(nickname) = nickname {
+                    old["agentNickname"] = nickname;
+                }
+                let snapshot = child_name_snapshot_reply(
+                    &mut parent,
+                    request,
+                    list,
+                    vec![
+                        old,
+                        json!({"id":"other","parentThreadId":"thread-exact","agentNickname":"Old mapper"}),
+                    ],
+                );
+                for id in ["child", "other"] {
+                    assert!(snapshot.events.iter().any(|event| matches!(event, Event::Subagent { id: actual, kind, .. } if actual == id && kind.is_empty())), "list={list}: {:?}", snapshot.events);
+                    assert!(!snapshot.events.iter().any(|event| matches!(event, Event::Subagent { id: actual, kind, .. } if actual == id && !kind.is_empty())));
+                }
+                let renamed = parent.receive(json!({"method":"thread/started","params":{"thread":{"id":"child","parentThreadId":"thread-exact","agentNickname":"Pilot"}}})).unwrap();
+                assert!(renamed.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, .. } if id == "child" && kind == "Pilot")));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_child_names_fill_once_and_exact_hydration_can_upgrade_them() {
+        for list in [false, true] {
+            let mut parent = adapter();
+            let request = child_name_snapshot_request(&mut parent, list);
+            let snapshot = child_name_snapshot_reply(
+                &mut parent,
+                request,
+                list,
+                vec![
+                    json!({"id":"child","parentThreadId":"thread-exact","agentNickname":"Scout"}),
+                    json!({"id":"other","parentThreadId":"thread-exact","agentRole":"worker","message":"A task is not a name"}),
+                ],
+            );
+            assert!(snapshot.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, .. } if id == "child" && kind == "Scout")));
+            assert!(snapshot.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, .. } if id == "other" && kind.is_empty())));
+
+            let older = parent.command(Command::LoadEarlier).unwrap();
+            let older = child_name_snapshot_reply(
+                &mut parent,
+                older.writes[0]["id"].clone(),
+                false,
+                vec![
+                    json!({"id":"child","parentThreadId":"thread-exact","agentNickname":"Even older"}),
+                ],
+            );
+            assert!(!older.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, .. } if id == "child" && !kind.is_empty())));
+
+            for (id, name) in [("child", "Navigator"), ("other", "Mapper")] {
+                let resume = snapshot
+                    .writes
+                    .iter()
+                    .find(|frame| {
+                        frame["method"] == "thread/resume" && frame["params"]["threadId"] == id
+                    })
+                    .unwrap();
+                let hydrated = parent.receive(json!({"id":resume["id"],"result":{"thread":{"id":id,"agentNickname":format!(" {name} "),"status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+                assert!(hydrated.events.iter().any(|event| matches!(event, Event::Subagent { id: actual, kind, .. } if actual == id && kind == name)), "list={list}: {:?}", hydrated.events);
+                assert!(!hydrated.events.iter().any(|event| matches!(event, Event::Subagent { id: actual, kind, .. } if actual != id && !kind.is_empty())));
+            }
+        }
     }
 
     #[test]
