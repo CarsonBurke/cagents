@@ -5989,38 +5989,48 @@ impl Cagents {
         card: CardId,
         session: &chat::Session,
     ) -> Task<Message> {
-        let fresh = self.chat_draft_snapshot(session.launch.provider);
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+        // A conversation another window started is not a launch option; it
+        // is attached, or recovered, as the conversation it is. An operation
+        // already under way on the card keeps the launch it began with.
+        if !session.is_unstarted() || self.chat_start_pending(card) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return Task::none();
         };
-        // A conversation another window started is not a launch option; it
-        // is attached, or recovered, as the conversation it is.
-        if !runtime.choosing()
-            || !session.is_unstarted()
-            || runtime.session.id != session.id
-            || runtime.session == *session
-        {
+        if !runtime.choosing() || runtime.session.id != session.id || runtime.session == *session {
             return Task::none();
         }
         let provider = session.launch.provider;
+        let moved = runtime.session.launch.provider != provider;
+        let fresh = moved.then(|| self.chat_draft_snapshot(provider));
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
+            return Task::none();
+        };
         let previous = std::mem::replace(&mut runtime.session, session.clone());
-        let moved = previous.launch.provider != provider;
-        // Skills are found from the provider's home and directory.
-        let rediscover = moved
+        // Which skills exist depends on the provider's home and directory, so
+        // a list found for others is wrong until discovery answers again.
+        let rehomed = moved
             || previous.launch.recipe.environment != session.launch.recipe.environment
             || previous.launch.recipe.working_directory != session.launch.recipe.working_directory;
-        let snapshot = Arc::make_mut(&mut runtime.snapshot);
-        if moved {
-            *snapshot = fresh;
-        } else if rediscover {
-            snapshot.skills.clear();
+        if let Some(fresh) = fresh {
+            // Pickers listed the earlier provider's choices.
+            runtime.model_picker = None;
+            runtime.account_picker = false;
+            runtime.reasoning_picker = false;
+            runtime.permission_picker = false;
+            runtime.footer_picker = false;
+            runtime.snapshot = Arc::new(fresh);
+        } else if rehomed {
+            Arc::make_mut(&mut runtime.snapshot).skills.clear();
         }
-        snapshot.permission_mode = draft_permission_mode(&session.launch.recipe, provider);
-        runtime.error = None;
-        if !rediscover {
-            return Task::none();
+        Arc::make_mut(&mut runtime.snapshot).permission_mode =
+            draft_permission_mode(&session.launch.recipe, provider);
+        if rehomed {
+            // A failed start's reason belongs to the account it failed on.
+            runtime.error = None;
+            runtime.completion.restart(true);
         }
-        runtime.completion.restart(true);
         let target = runtime.target;
         self.load_draft_skills(target)
     }
@@ -11908,7 +11918,9 @@ impl Cagents {
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);
-                    return Task::none();
+                    // Skills found for the earlier launch are not accepted for
+                    // this one, so a discovery under way would be dropped.
+                    return self.load_draft_skills(target);
                 }
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }
