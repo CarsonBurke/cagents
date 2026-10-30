@@ -36,6 +36,8 @@ pub(super) struct State {
     indexing: Option<(usize, usize)>,
     /// Whether a chosen conversation is being prepared to resume.
     pub(super) loading: bool,
+    /// The exact caller preparing this generation; never persisted with a row.
+    preparing_caller: Option<(u64, crate::control::CallerContext)>,
     pub(super) error: Option<String>,
     limit: usize,
     selected: usize,
@@ -611,6 +613,15 @@ impl Cagents {
                     return Task::none();
                 }
                 self.resume_ui.loading = false;
+                let Some((_, caller)) = self
+                    .resume_ui
+                    .preparing_caller
+                    .take()
+                    .filter(|(owner, _)| *owner == generation)
+                else {
+                    self.resume_error("The saved conversation caller context is unavailable. Its original identity was retained; choose it again.");
+                    return Task::none();
+                };
                 match result {
                     Ok(session) => {
                         if !prepared_resume_matches(&entry.session, &session) {
@@ -621,7 +632,7 @@ impl Cagents {
                         if self.existing_conversation_card(&entry.session).is_some() {
                             return self.resume_saved_conversation(entry);
                         }
-                        self.insert_resumed_conversation(entry, true)
+                        self.insert_resumed_conversation(caller, entry, true)
                     }
                     Err(error) => {
                         self.resume_error(&error);
@@ -747,6 +758,7 @@ impl Cagents {
         if self.resume_ui.loading {
             return Task::none();
         }
+        let caller = crate::control::CallerContext::capture();
         self.resume_ui.error = None;
         let existing = self.existing_conversation_card(&entry.session);
         if let Some(card) = existing {
@@ -780,13 +792,12 @@ impl Cagents {
         if session.native_continuity.retains_provider() {
             let generation = self.resume_ui.generation;
             self.resume_ui.loading = true;
+            self.resume_ui.preparing_caller = Some((generation, caller.clone()));
             return cosmic::task::future(async move {
                 let source = entry.session.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let socket = crate::terminal::ipc::daemon_socket_path()
-                        .map_err(|error| error.to_string())?;
-                    crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?
+                    caller
+                        .connect_control()?
                         .prepare_chat_resume(source)
                         .map_err(|error| error.to_string())
                 })
@@ -795,11 +806,12 @@ impl Cagents {
                 Message::ResumeConversation(Action::Prepared(generation, entry, result))
             });
         }
-        self.insert_resumed_conversation(entry, false)
+        self.insert_resumed_conversation(caller, entry, false)
     }
 
     fn insert_resumed_conversation(
         &mut self,
+        caller: crate::control::CallerContext,
         entry: SavedConversation,
         prepared: bool,
     ) -> Task<Message> {
@@ -829,7 +841,7 @@ impl Cagents {
         let replace = replace.filter(|card| {
             self.chat_is_unused(*card) && self.workspace.order().any(|id| id == *card)
         });
-        let insert = self.insert_chat_card(session, replace, None);
+        let insert = self.insert_chat_card_as(caller, session, replace, None);
         if let Some(card) = self.workspace.focused() {
             self.apply_reported_title(card, entry.title);
         }
@@ -842,6 +854,7 @@ impl Cagents {
     fn close_resume(&mut self) {
         let state = &mut self.resume_ui;
         state.open = false;
+        state.preparing_caller = None;
         state.indexing = None;
         state.replace = None;
         state.cancel.store(true, Ordering::Relaxed);

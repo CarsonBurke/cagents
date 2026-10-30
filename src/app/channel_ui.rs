@@ -8,14 +8,21 @@ use std::collections::BTreeMap;
 /// daemon itself reports rather than the saved descriptors, together with the
 /// source terminal a converted chat keeps running.
 pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
+    close_sessions_as(&crate::control::CallerContext::capture(), sessions)
+}
+
+pub(super) fn close_sessions_as(
+    caller: &crate::control::CallerContext,
+    sessions: Vec<CardKind>,
+) -> Result<(), String> {
     if !sessions
         .iter()
         .any(|kind| matches!(kind, CardKind::Terminal(_) | CardKind::Chat(_)))
     {
         return Ok(());
     }
-    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let Some(mut client) = connect(&socket)? else {
+    let socket = caller.socket(crate::control::NativeReadiness::Existing)?;
+    let Some(mut client) = connect(&socket, caller)? else {
         return no_daemon_close_result(&sessions);
     };
     // Query live identities: a saved descriptor can predate an upgrade or handoff.
@@ -37,7 +44,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 // Only a fresh inventory may turn a close error into success,
                 // read on a fresh connection: a failed request can leave this
                 // one out of step with the daemon.
-                let Some(fresh) = connect(&socket)? else {
+                let Some(fresh) = connect(&socket, caller)? else {
                     return if may_have_retained_owner(live) {
                         Err(error.to_string())
                     } else {
@@ -75,7 +82,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
                 other => Err(format!("Channel terminal could not be closed: {other:?}")),
             });
         if let Err(error) = result {
-            let Some(fresh) = connect(&socket)? else {
+            let Some(fresh) = connect(&socket, caller)? else {
                 return no_daemon_close_result(&sessions);
             };
             client = fresh;
@@ -116,14 +123,25 @@ fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {
 
 /// A connection to the daemon, or `None` when no daemon is running. Retained
 /// native owners can outlive it, so callers must not treat this as their exit.
-fn connect(socket: &std::path::Path) -> Result<Option<crate::control::ControlClient>, String> {
+fn connect(
+    socket: &std::path::Path,
+    caller: &crate::control::CallerContext,
+) -> Result<Option<crate::control::ControlClient>, String> {
     match crate::control::ControlClient::connect(socket) {
-        Ok(client) => Ok(Some(client)),
+        Ok(mut client) => {
+            if let Some(authority) = caller.authentication() {
+                client
+                    .authenticate(authority)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(Some(client))
+        }
         Err(crate::control::ControlError::Connect(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
+            if caller.authentication().is_none()
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
         {
             Ok(None)
         }
