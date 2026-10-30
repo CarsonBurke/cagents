@@ -1123,13 +1123,18 @@ impl Runtime {
         }
     }
     pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
+        // The adapter's reported name (or type when no name is available) is
+        // identity. A task description may change independently of the agent.
+        let name = agent.kind.trim();
+        if name.is_empty() { "Subagent" } else { name }
+    }
+
+    pub(super) fn native_child_task(agent: &chat::Subagent) -> Option<&str> {
         agent
             .description
             .lines()
             .map(str::trim)
             .find(|line| !line.is_empty())
-            .or_else(|| (!agent.kind.trim().is_empty()).then_some(agent.kind.trim()))
-            .unwrap_or("Subagent")
     }
 
     pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
@@ -1161,6 +1166,10 @@ impl Runtime {
             Self::short_description(model, 80),
             Self::native_child_status(agent)
         );
+        if let Some(task) = Self::native_child_task(agent) {
+            identity.push_str(" · Task: ");
+            identity.push_str(&Self::short_description(task, 120));
+        }
         if !agent.detail.trim().is_empty() {
             identity.push_str(" · ");
             identity.push_str(&Self::short_description(agent.detail.trim(), 120));
@@ -1696,7 +1705,7 @@ impl Runtime {
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .unwrap_or("Model not reported");
-            let heading: Element<'_, Message> = widget::column::with_children(vec![
+            let mut heading_rows = vec![
                 widget::row::with_children(vec![
                     chat_title(Self::short_description(Self::native_child_name(agent), 80))
                         .width(Length::Fill)
@@ -1716,10 +1725,16 @@ impl Runtime {
                     self.native_child_identity(agent),
                 )
                 .into(),
-            ])
-            .spacing(step::GAP_XS)
-            .width(Length::Fill)
-            .into();
+            ];
+            if let Some(task) = Self::native_child_task(agent) {
+                heading_rows.push(
+                    design::caption(format!("Task: {}", Self::short_description(task, 120))).into(),
+                );
+            }
+            let heading: Element<'_, Message> = widget::column::with_children(heading_rows)
+                .spacing(step::GAP_XS)
+                .width(Length::Fill)
+                .into();
             selected_identity = Some(
                 if agent.status == chat::ToolStatus::Running && snapshot.capabilities.stop_subagent
                 {
@@ -6826,6 +6841,223 @@ mod tests {
         );
         runtime.disconnected = true;
         assert_eq!(runtime.conversation_status(false).1, "Disconnected");
+    }
+
+    #[test]
+    fn native_child_names_use_reported_identity_without_promoting_task_or_status() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        for (reported, expected) in [
+            (" Scout ", "Scout"),
+            ("Navigator", "Navigator"),
+            ("worker", "worker"),
+            ("Codex agent", "Codex agent"),
+            ("reviewer", "reviewer"),
+            (" \n\t ", "Subagent"),
+        ] {
+            for status in [
+                chat::ToolStatus::Running,
+                chat::ToolStatus::Succeeded,
+                chat::ToolStatus::Failed,
+                chat::ToolStatus::Denied,
+                chat::ToolStatus::Stopped,
+            ] {
+                let child = chat::Subagent {
+                    kind: reported.into(),
+                    description: "\n  Inspect repository  \nTask instructions".into(),
+                    status,
+                    ..native_child_fixture()
+                };
+                Arc::make_mut(&mut runtime.snapshot).subagents = vec![child.clone()];
+                assert_eq!(Runtime::native_child_name(&child), expected);
+                assert_eq!(runtime.agent_name(&child.id), expected);
+                let identity = runtime.native_child_identity(&child);
+                assert!(
+                    identity.contains(&format!(" · {expected} · ")),
+                    "{identity}"
+                );
+                assert!(
+                    identity.contains(" · Task: Inspect repository"),
+                    "{identity}"
+                );
+                assert_eq!(
+                    child.description,
+                    "\n  Inspect repository  \nTask instructions"
+                );
+            }
+        }
+        assert_eq!(runtime.agent_name("unknown-child-id"), "unknown-child-id");
+        assert_eq!(
+            runtime.agent_name("01234567-89ab-4cde-8fab-0123456789ab"),
+            "01234567"
+        );
+        let blank = chat::Subagent {
+            description: " \n\t ".into(),
+            ..native_child_fixture()
+        };
+        assert!(!runtime.native_child_identity(&blank).contains(" · Task:"));
+    }
+
+    fn native_child_surface_labels(mut element: Element<'_, Message>, width: f32) -> Vec<String> {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
+        );
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .flat_map(|node| [node.node().label(), node.node().value()])
+            .flatten()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn native_child_picker_searches_names_and_tasks_without_using_tasks_as_names() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let scout = chat::Subagent {
+            kind: " Scout ".into(),
+            description: "\n  Inspect repository \nHidden instructions".into(),
+            ..native_child_fixture()
+        };
+        let navigator = chat::Subagent {
+            id: "other-child".into(),
+            kind: "Navigator".into(),
+            description: "Compare recovery paths".into(),
+            ..native_child_fixture()
+        };
+        Arc::make_mut(&mut runtime.snapshot).subagents = vec![scout.clone(), navigator];
+        runtime.selected_subagent = Some(scout.id.clone());
+        let mut picker = child_navigation::Picker::new(&runtime.snapshot.subagents);
+        for query in ["scout", "INSPECT repository", "native-child"] {
+            picker.query = query.into();
+            assert_eq!(
+                picker
+                    .rows(&runtime.snapshot.subagents)
+                    .iter()
+                    .map(|child| child.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec![scout.id.as_str()],
+                "query {query} keeps the exact child identity"
+            );
+        }
+        picker.query = "Hidden instructions".into();
+        assert!(
+            picker.rows(&runtime.snapshot.subagents).is_empty(),
+            "task search keeps its existing first-line scope"
+        );
+        picker.query.clear();
+        runtime.child_picker = Some(picker);
+        for width in [260.0, 900.0] {
+            let labels = native_child_surface_labels(runtime.child_picker_view().unwrap(), width);
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label == "Scout · Working · native-child"),
+                "{labels:?}"
+            );
+            assert!(
+                labels
+                    .iter()
+                    .any(|label| label == "Navigator · Working · other-child"),
+                "{labels:?}"
+            );
+            assert!(
+                !labels
+                    .iter()
+                    .any(|label| label.starts_with("Inspect repository ·")),
+                "{labels:?}"
+            );
+            let trigger = native_child_surface_labels(runtime.child_navigation(width), width);
+            assert!(
+                trigger
+                    .iter()
+                    .any(|label| label.starts_with("Choose subagent:")
+                        && label.contains(" · Scout · ")
+                        && label.contains("Task: Inspect repository")),
+                "{trigger:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_native_child_keeps_named_header_and_secondary_task_after_updates() {
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        let child = chat::Subagent {
+            kind: "Scout".into(),
+            description: "Inspect repository".into(),
+            ..native_child_fixture()
+        };
+        let selected_id = child.id.clone();
+        let mut snapshot = runtime.snapshot.as_ref().clone();
+        snapshot.generation += 1;
+        snapshot.subagents = vec![child];
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        runtime.selected_subagent = Some(selected_id.clone());
+        let shortcuts = crate::settings::KeyboardShortcuts::default();
+        for (name, task, status) in [
+            ("Scout", "Inspect repository", chat::ToolStatus::Running),
+            (
+                "Navigator",
+                "Compare recovery paths",
+                chat::ToolStatus::Succeeded,
+            ),
+        ] {
+            let mut snapshot = runtime.snapshot.as_ref().clone();
+            snapshot.generation += 1;
+            snapshot.subagents[0].kind = name.into();
+            snapshot.subagents[0].description = task.into();
+            snapshot.subagents[0].status = status;
+            handle.publish_snapshot_for_test(snapshot);
+            runtime.refresh();
+            for width in [260.0, 900.0] {
+                let labels = native_child_surface_labels(
+                    runtime.view(
+                        None,
+                        false,
+                        true,
+                        &shortcuts,
+                        width,
+                        Place {
+                            name: "project".into(),
+                            branch: None,
+                            channel: Some("Review".into()),
+                        },
+                        true,
+                        None,
+                        vec![],
+                    ),
+                    width,
+                );
+                assert!(
+                    labels.iter().any(|label| label == name),
+                    "reported name is the selected heading: {labels:?}"
+                );
+                assert!(
+                    labels.iter().any(|label| label == &format!("Task: {task}")),
+                    "task remains visible as secondary information: {labels:?}"
+                );
+                assert!(
+                    !labels.iter().any(|label| label == task),
+                    "task is never an unlabeled identity: {labels:?}"
+                );
+            }
+            assert_eq!(
+                runtime.selected_subagent.as_deref(),
+                Some(selected_id.as_str())
+            );
+            assert_eq!(runtime.agent_name(&selected_id), name);
+        }
     }
 
     #[test]

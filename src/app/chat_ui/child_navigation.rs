@@ -58,6 +58,7 @@ impl Picker {
                     && (query.is_empty()
                         || [
                             Runtime::native_child_name(child),
+                            Runtime::native_child_task(child).unwrap_or_default(),
                             &child.id,
                             child.model.as_deref().unwrap_or_default(),
                             Runtime::native_child_status(child),
