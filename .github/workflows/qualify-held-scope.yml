@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
-      PRODUCT_SHA: bc8e25b4557040872f3f264f9b272766b1f3e2b8
-      PRODUCT_TREE: 7e43f15f663485614a6a51bb7161e4fcd240ccfd
+      PRODUCT_SHA: d50500f7e7dc19f5aa63c22de39043c27c17f73d
+      PRODUCT_TREE: 71c2651b7f6d68c530a47f3fcb41d837ff486b08
       CARGO_BUILD_JOBS: '2'
       RUSTUP_TOOLCHAIN: 1.93.0
     steps:
