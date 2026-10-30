@@ -2848,34 +2848,8 @@ impl Cagents {
         let navigation = widget::row::with_children(navigation)
             .spacing(space::XXS)
             .align_y(Alignment::Center);
-        let identity = widget::column::with_children(vec![
-            design::caption("CHANNEL").into(),
-            design::heading(if title.is_empty() {
-                "Untitled channel".to_owned()
-            } else {
-                title
-            })
-            .width(Length::Fill)
-            .into(),
-        ])
-        .spacing(space::XXS)
-        .width(Length::Fill);
-        let content: Element<'_, Message> = if work {
-            // Work's fixed leaf header already displays the captured channel
-            // title. Do not repeat it or narrow it beside the navigation.
-            navigation.into()
-        } else if compact {
-            widget::column::with_children(vec![identity.into(), navigation.into()])
-                .spacing(space::XS)
-                .into()
-        } else {
-            widget::row::with_children(vec![identity.into(), navigation.into()])
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into()
-        };
         Some(
-            widget::container(content)
+            widget::container(navigation)
                 .padding([space::XS, space::S])
                 .width(Length::Fill)
                 .into(),

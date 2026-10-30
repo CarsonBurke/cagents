@@ -2235,6 +2235,129 @@ mod tests {
         }
 
         #[test]
+        fn channel_header_omits_duplicate_identity_but_keeps_owned_navigation() {
+            #[derive(Default, Debug)]
+            struct Texts(Vec<String>);
+            impl Operation for Texts {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                    self.0.push(text.to_owned());
+                }
+            }
+
+            for width in [300.0, 700.0, 900.0] {
+                for title in [
+                    "A long channel identity already shown in its own context",
+                    "",
+                ] {
+                    for work in [false, true] {
+                        let (mut app, home) = main_fixture();
+                        two_channels(&mut app, home);
+                        app.window_width = width;
+                        app.channel_work.main = work;
+                        app.channel_work.title = title.into();
+                        app.workspace_model.channels[0].title = title.into();
+                        app.channel_work.view.set_title(home, title.into());
+                        let before = (
+                            app.durable.active_channel,
+                            app.workspace.order().collect::<Vec<_>>(),
+                            app.workspace.focused(),
+                        );
+                        let expected = Navigation {
+                            home,
+                            generation: app.channel_home_generation(),
+                            workspace: app.workspace_view_generation,
+                            surface: if work {
+                                Surface::Conversations
+                            } else {
+                                Surface::Work
+                            },
+                        };
+                        let mut renderer = super::super::super::tests::headless_renderer();
+                        // Mount the actual outer chrome with an inert body: a
+                        // pane or Work leaf cannot supply the omitted identity.
+                        let mut frame = iced::runtime::UserInterface::build(
+                            app.workspace_chrome(widget::Space::new().height(Length::Fill).into())
+                                .map(cosmic::Action::App),
+                            iced::Size::new(width, 600.0),
+                            Cache::new(),
+                            &mut renderer,
+                        );
+                        draw(&mut frame, &mut renderer);
+                        let mut text = Texts::default();
+                        frame.operate(&renderer, &mut text);
+                        for redundant in ["CHANNEL", "Untitled channel", title] {
+                            if !redundant.is_empty() {
+                                assert!(!text.0.iter().any(|text| text == redundant), "{text:?}");
+                            }
+                        }
+                        let nodes = frame.a11y_nodes(iced::mouse::Cursor::Unavailable);
+                        for (label, selected) in [("Conversations", !work), ("Work", work)] {
+                            let name = format!("{label} for channel {title}");
+                            let controls = nodes
+                                .root()
+                                .iter()
+                                .chain(nodes.children())
+                                .filter(|node| {
+                                    node.node().role()
+                                        == iced_accessibility::accesskit::Role::Button
+                                        && node.node().label() == Some(name.as_str())
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(controls.len(), 1, "one owned {name} control");
+                            assert_eq!(controls[0].node().is_selected(), Some(selected));
+                            let bounds = controls[0].node().bounds().unwrap();
+                            assert!(bounds.x0 >= 0.0 && bounds.x1 <= f64::from(width) + 0.1);
+                            assert!(bounds.y0 >= 0.0 && bounds.y1 <= 600.0);
+                            assert!(bounds.x1 > bounds.x0 && bounds.y1 > bounds.y0);
+                        }
+                        drop(nodes);
+                        let label = if work { "Conversations" } else { "Work" };
+                        let name = format!("{label} for channel {title}");
+                        let (id, area) = labelled(&mut frame, &renderer, &name);
+                        let pointer = click(&mut frame, &mut renderer, area.center());
+                        // Reuse the real Tab adapter, then activate the same
+                        // traversed control with Enter rather than injecting it.
+                        tab(&mut frame, &mut renderer, true);
+                        seek(&mut frame, &mut renderer, &id);
+                        let keyboard = event(
+                            &mut frame,
+                            &mut renderer,
+                            &[key(
+                                keyboard::Key::Named(keyboard::key::Named::Enter),
+                                keyboard::key::Code::Enter,
+                                None,
+                            )],
+                            iced::mouse::Cursor::Unavailable,
+                        )
+                        .0;
+                        for messages in [pointer, keyboard] {
+                            let [cosmic::Action::App(Message::ChannelWorkNavigation(actual))] =
+                                messages.as_slice()
+                            else {
+                                panic!("actual owned header callback: {messages:?}");
+                            };
+                            assert_eq!(*actual, expected);
+                        }
+                        drop(frame.into_cache());
+                        drop(app.update(Message::ChannelWorkNavigation(expected)));
+                        assert_eq!(app.channel_work_is_main(), !work);
+                        assert_eq!(
+                            (
+                                app.durable.active_channel,
+                                app.workspace.order().collect::<Vec<_>>(),
+                                app.workspace.focused(),
+                            ),
+                            before
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
         fn full_window_tab_cycle_reaches_work_fields_roles_and_submit_after_cached_frames() {
             for number_click in [false, true] {
                 let mut renderer = super::super::super::tests::headless_renderer();
