@@ -12439,6 +12439,17 @@ impl Cagents {
     /// The dialogs `dialog` mounts above the form dialogs, besides the
     /// update confirmation, which `modal_is_open` adds.
     fn modal_over_form_dialogs(&self) -> bool {
+        self.transient_work_close.is_some()
+            || self.modal_over_form_dialogs_without_transient_close()
+    }
+
+    fn modal_under_transient_close(&self) -> bool {
+        self.update_ui.confirmation.is_some()
+            || self.form_dialog_is_open()
+            || self.modal_over_form_dialogs_without_transient_close()
+    }
+
+    fn modal_over_form_dialogs_without_transient_close(&self) -> bool {
         #[cfg(feature = "integrated-browser")]
         if self.browser_import.open() {
             return true;
@@ -12447,7 +12458,6 @@ impl Cagents {
             || self.daemon_health_ui.confirmation
             || self.automation_approval_open()
             || self.dirty_repository_close.is_some()
-            || self.transient_work_close.is_some()
             || self.automation_ui.draft_dialog_open()
             || self.chat_ui.image_viewer.is_some()
             || self.terminal_paste.is_some()
@@ -16424,7 +16434,10 @@ impl Application for Cagents {
                 })
             }
             Message::ReviewChatCleanupBeforeClose => {
-                if self.transient_work_close.is_none() || !self.chat_ui.cleanup_unresolved() {
+                if self.transient_work_close.is_none()
+                    || !self.chat_ui.cleanup_unresolved()
+                    || self.modal_under_transient_close()
+                {
                     return Task::none();
                 }
                 self.transient_work_close = None;
@@ -18275,7 +18288,7 @@ impl Application for Cagents {
                     .on_press(Message::CancelTransientWorkClose)
                     .into(),
             ];
-            if self.chat_ui.cleanup_unresolved() {
+            if self.chat_ui.cleanup_unresolved() && !self.modal_under_transient_close() {
                 controls.push(
                     crate::ui_controls::button::primary("Review cleanup")
                         .id(widget::Id::new("dialog.transient-close.cleanup"))
@@ -18315,9 +18328,11 @@ impl Application for Cagents {
                             "Keep unsaved work before closing"
                         })
                         .into(),
-                        notice_detail(self.window_close_transient_blocker().unwrap_or(
-                            "The pending work is complete. Cancel this dialog and close again.",
-                        )),
+                        notice_detail(if self.chat_ui.cleanup_unresolved() && self.modal_under_transient_close() {
+                            "Cancel close to finish the open dialog, then review conversation cleanup in Application notices."
+                        } else {
+                            self.window_close_transient_blocker().unwrap_or("The pending work is complete. Cancel this dialog and close again.")
+                        }),
                         widget::row::with_children(controls)
                             .spacing(space::S)
                             .wrap()

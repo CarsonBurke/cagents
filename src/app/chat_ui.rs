@@ -12454,6 +12454,44 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_review_preserves_a_lower_modal_until_the_user_finishes_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let caller = crate::control::CallerContext::for_test(
+            crate::agent_execution::Authority::session("synthetic-stacked-cleanup".into()),
+            false,
+            true,
+        );
+        drop(app.retire_chat_as(caller, card, None, Some(source)));
+        let close = retired(&mut app, card);
+        drop(app.update(Message::ChatUi(Action::Retired(
+            close,
+            Err("cleanup uncertain".into()),
+        ))));
+        app.device_ui.open = true;
+        let window = window::Id::unique();
+        drop(app.update(Message::WindowCloseRequested(window)));
+        assert_eq!(app.transient_work_close, Some(window));
+        assert!(app.modal_under_transient_close());
+        // A delayed callback from the previously visible Review button must
+        // not abandon the lower dialog or remove its current close owner.
+        drop(app.update(Message::ReviewChatCleanupBeforeClose));
+        assert_eq!(app.transient_work_close, Some(window));
+        assert!(app.device_ui.open);
+        assert!(app.chrome_ui.popup.is_none());
+        drop(app.update(Message::CancelTransientWorkClose));
+        assert!(app.device_ui.open);
+        assert!(app.transient_work_close.is_none());
+        app.device_ui.open = false;
+        drop(app.update(Message::WindowCloseRequested(window)));
+        drop(app.update(Message::ReviewChatCleanupBeforeClose));
+        assert!(app.transient_work_close.is_none());
+        assert!(app.chrome_ui.popup.is_some());
+        assert!(app.chat_ui.retiring.failure(close).is_some());
+    }
+
+    #[test]
     fn failed_retirement_retains_the_captured_owner_after_notices_are_dismissed() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
