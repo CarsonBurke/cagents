@@ -75,8 +75,21 @@ jobs:
           key: held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}
           restore-keys: |
             held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-
+      - name: Require an actual warm hosted debug UI cache
+        id: warm_cache
+        if: ${{ !cancelled() && steps.cache.outcome != 'skipped' }}
+        shell: bash
+        env:
+          CACHE_RESTORE_OUTCOME: ${{ steps.cache.outcome }}
+          CACHE_PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+          CACHE_MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          CACHE_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+          CACHE_LOCK_HASH: ${{ hashFiles('product/Cargo.lock') }}
+        run: python3 control/.github/qualification/cache-restore-gate.py "$GITHUB_WORKSPACE/product"
       - name: Check exact UI source and execute focused User regressions
         id: focus
+        if: ${{ success() && steps.warm_cache.outcome == 'success' }}
         shell: bash
         run: python3 control/.github/qualification/held-scope.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --focused-only
       - name: Capture actual native X11 before and after evidence
@@ -119,7 +132,7 @@ jobs:
         # Keep a focused build fallback when native capture never started.
         # Skip another archive after native/three-boundary execution grows
         # the target. Build artifacts are never passing-result evidence.
-        if: always() && steps.cache.outcome == 'success' && steps.native.outcome == 'skipped'
+        if: always() && steps.cache.outcome == 'success' && steps.warm_cache.outcome == 'success' && steps.native.outcome == 'skipped'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
