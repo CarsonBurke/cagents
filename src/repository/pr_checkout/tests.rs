@@ -703,6 +703,8 @@ fn hidden_submodule_edits_refuse_checkout_advance_without_changing_display_prefe
         run_git(&fixture.root, &["commit", "-qam", "add child"]);
         run_git(&fixture.root, &["push", "origin", "feature"]);
         run_git(&fixture.root, &["config", "submodule.module.ignore", "all"]);
+        let child = fixture.root.join("module");
+        run_git(&child, &["config", "status.showUntrackedFiles", "no"]);
         let cancellation = CancellationToken::default();
         assert!(
             !fixture
@@ -715,7 +717,6 @@ fn hidden_submodule_edits_refuse_checkout_advance_without_changing_display_prefe
         );
         let original = git_text(&fixture.root, &["rev-parse", "HEAD"]);
         let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
-        let child = fixture.root.join("module");
         let local = child.join(if untracked { "private-note" } else { "tracked" });
         fs::write(&local, "preserve local child data\n").unwrap();
         assert!(
@@ -742,6 +743,10 @@ fn hidden_submodule_edits_refuse_checkout_advance_without_changing_display_prefe
                 .contains("local changes")
         );
         assert_eq!(fs::read(&local).unwrap(), b"preserve local child data\n");
+        assert_eq!(
+            git_text(&child, &["config", "--get", "status.showUntrackedFiles"]),
+            "no"
+        );
         assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"old\n");
         assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), original);
         assert_eq!(
@@ -751,6 +756,274 @@ fn hidden_submodule_edits_refuse_checkout_advance_without_changing_display_prefe
             ),
             "all"
         );
+    }
+}
+
+// Both the root and intermediate repository deliberately hide child changes.
+// Only an explicit status in the selected populated leaf can observe them.
+fn hidden_nested_checkout(fixture: &Fixture, linked: bool) -> (PathBuf, PathBuf) {
+    let leaf_source = fixture.temporary.path().join("leaf-source");
+    let child_source = fixture.temporary.path().join("child-source");
+    for source in [&leaf_source, &child_source] {
+        fs::create_dir(source).unwrap();
+        run_git(source, &["init", "--initial-branch=main"]);
+        fs::write(source.join("tracked"), "original child\n").unwrap();
+        run_git(source, &["add", "tracked"]);
+        run_git(source, &["commit", "-qm", "child"]);
+    }
+    run_git(
+        &child_source,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            leaf_source.to_str().unwrap(),
+            "nested",
+        ],
+    );
+    run_git(&child_source, &["commit", "-qam", "nested child"]);
+    run_git(
+        &fixture.root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            child_source.to_str().unwrap(),
+            "module",
+        ],
+    );
+    run_git(&fixture.root, &["commit", "-qam", "add child"]);
+    run_git(&fixture.root, &["push", "origin", "feature"]);
+    run_git(&fixture.root, &["config", "submodule.module.ignore", "all"]);
+    let worktree = if linked {
+        let worktree = fixture.temporary.path().join("linked-checkout");
+        run_git(&fixture.root, &["switch", "-c", "parking"]);
+        run_git(
+            &fixture.root,
+            &["worktree", "add", worktree.to_str().unwrap(), "feature"],
+        );
+        worktree
+    } else {
+        fixture.root.clone()
+    };
+    run_git(
+        &worktree,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ],
+    );
+    let child = worktree.join("module");
+    let leaf = child.join("nested");
+    run_git(&child, &["config", "submodule.nested.ignore", "all"]);
+    run_git(&leaf, &["config", "status.showUntrackedFiles", "no"]);
+    run_git(&leaf, &["config", "status.showStash", "true"]);
+    fs::write(leaf.join("tracked"), "saved child work\n").unwrap();
+    run_git(&leaf, &["stash", "push", "-qm", "saved for later"]);
+    (worktree, leaf)
+}
+
+#[test]
+fn recursive_submodule_census_refuses_hidden_work_at_preparation_and_effect() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::recursive_submodule_census_refuses_hidden_work_at_preparation_and_effect"
+    )) {
+        return;
+    }
+    for linked in [false, true] {
+        for untracked in [false, true] {
+            for late in [false, true] {
+                let fixture = Fixture::new(true);
+                let (worktree, leaf) = hidden_nested_checkout(&fixture, linked);
+                let original = git_text(&worktree, &["rev-parse", "HEAD"]);
+                let child_head = git_text(&leaf, &["rev-parse", "HEAD"]);
+                let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
+                let mut request = fixture.request(new);
+                request.worktree = worktree.clone();
+                // A clean selected child, including its saved stash, must admit.
+                let plan = fixture.prepare(&request);
+                let local = leaf.join(if untracked { "private-note" } else { "tracked" });
+                if late {
+                    let local = local.clone();
+                    let mut injected = false;
+                    fixture.intercept(move |command| {
+                        if is_effect(command) && !injected {
+                            fs::write(&local, "preserve nested work\n").unwrap();
+                            injected = true;
+                        }
+                    });
+                    let failure = fixture.apply(&plan).unwrap_err();
+                    assert_eq!(failure.kind, PrCheckoutFailureKind::Refused, "{failure:?}");
+                } else {
+                    fs::write(&local, "preserve nested work\n").unwrap();
+                    assert!(
+                        fixture
+                            .service
+                            .prepare_existing_pr_checkout(&request, &CancellationToken::default())
+                            .unwrap_err()
+                            .detail
+                            .contains("local changes")
+                    );
+                }
+                assert_eq!(fs::read(&local).unwrap(), b"preserve nested work\n");
+                assert_eq!(fs::read(worktree.join("file")).unwrap(), b"old\n");
+                assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"old\n");
+                assert_eq!(git_text(&worktree, &["rev-parse", "HEAD"]), original);
+                assert_eq!(git_text(&leaf, &["rev-parse", "HEAD"]), child_head);
+                assert_eq!(
+                    git_text(&leaf, &["config", "--get", "status.showUntrackedFiles"]),
+                    "no"
+                );
+                assert_eq!(
+                    git_text(
+                        &worktree.join("module"),
+                        &["config", "--get", "submodule.nested.ignore"]
+                    ),
+                    "all"
+                );
+                assert_eq!(
+                    git_text(&worktree, &["config", "--get", "submodule.module.ignore"]),
+                    "all"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn recursive_checkout_census_preserves_clean_stashed_children_and_quoted_git_path() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::recursive_checkout_census_preserves_clean_stashed_children_and_quoted_git_path"
+    )) {
+        return;
+    }
+    for linked in [false, true] {
+        let mut fixture = Fixture::new(true);
+        let (worktree, leaf) = hidden_nested_checkout(&fixture, linked);
+        let child_head = git_text(&leaf, &["rev-parse", "HEAD"]);
+        let stash = git_text(&leaf, &["rev-parse", "refs/stash"]);
+        let executable = fixture.temporary.path().join("configured git ; literal");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" >> \"${0%/*}/git-calls\"\nexec git \"$@\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.service = RepositoryService::new(executable, fixture.executor.clone());
+        let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
+        let mut request = fixture.request(new.clone());
+        request.worktree = worktree.clone();
+        let plan = fixture.prepare(&request);
+        assert_eq!(fixture.apply(&plan).unwrap().head(), &new);
+        assert_eq!(fs::read(worktree.join("file")).unwrap(), b"PR\n");
+        assert_eq!(fs::read(leaf.join("tracked")).unwrap(), b"original child\n");
+        assert_eq!(git_text(&leaf, &["rev-parse", "HEAD"]), child_head);
+        assert_eq!(git_text(&leaf, &["rev-parse", "refs/stash"]), stash);
+        assert_eq!(
+            git_text(&leaf, &["config", "--get", "status.showStash"]),
+            "true"
+        );
+        assert_eq!(
+            git_text(&leaf, &["config", "--get", "status.showUntrackedFiles"]),
+            "no"
+        );
+        assert_eq!(
+            git_text(
+                &worktree.join("module"),
+                &["config", "--get", "submodule.nested.ignore"]
+            ),
+            "all"
+        );
+        assert!(
+            fs::read_to_string(fixture.temporary.path().join("git-calls"))
+                .unwrap()
+                .lines()
+                .any(|line| Path::new(line) == leaf),
+            "the configured executable must run inside the nested child"
+        );
+    }
+}
+
+#[test]
+fn recursive_census_refuses_redirected_child_worktrees_before_preparation_and_effect() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::recursive_census_refuses_redirected_child_worktrees_before_preparation_and_effect"
+    )) {
+        return;
+    }
+    for ancestor in [false, true] {
+        for late in [false, true] {
+            let fixture = Fixture::new(true);
+            let (worktree, leaf) = hidden_nested_checkout(&fixture, false);
+            let original = git_text(&worktree, &["rev-parse", "HEAD"]);
+            let child_head = git_text(&leaf, &["rev-parse", "HEAD"]);
+            let new = fixture.advance(|root| fs::write(root.join("file"), "PR\n").unwrap());
+            let request = fixture.request(new);
+            let plan = fixture.prepare(&request);
+            let alternate = if ancestor {
+                leaf.parent().unwrap().to_owned()
+            } else {
+                let path = fixture.temporary.path().join("clean-alternate-child");
+                fs::create_dir(&path).unwrap();
+                fs::write(path.join("tracked"), "original child\n").unwrap();
+                path
+            };
+            let inject = {
+                let leaf = leaf.clone();
+                let alternate = alternate.clone();
+                move || {
+                    fs::write(leaf.join("private-note"), "preserve selected child\n").unwrap();
+                    run_git(
+                        &leaf,
+                        &["config", "core.worktree", alternate.to_str().unwrap()],
+                    );
+                }
+            };
+            if late {
+                let mut inject = Some(inject);
+                fixture.intercept(move |command| {
+                    if is_effect(command)
+                        && let Some(inject) = inject.take()
+                    {
+                        inject();
+                    }
+                });
+                assert_eq!(
+                    fixture.apply(&plan).unwrap_err().kind,
+                    PrCheckoutFailureKind::Refused
+                );
+            } else {
+                inject();
+                assert_eq!(
+                    fixture
+                        .service
+                        .prepare_existing_pr_checkout(&request, &CancellationToken::default())
+                        .unwrap_err()
+                        .kind,
+                    PrCheckoutFailureKind::Refused
+                );
+            }
+            assert_eq!(
+                fs::read(leaf.join("private-note")).unwrap(),
+                b"preserve selected child\n"
+            );
+            assert_eq!(fs::read(worktree.join("file")).unwrap(), b"old\n");
+            assert_eq!(git_text(&worktree, &["rev-parse", "HEAD"]), original);
+            assert_eq!(git_text(&leaf, &["rev-parse", "HEAD"]), child_head);
+            assert_eq!(
+                git_text(&leaf, &["config", "--get", "core.worktree"]),
+                alternate.to_str().unwrap()
+            );
+        }
     }
 }
 
