@@ -6897,8 +6897,25 @@ mod tests {
         assert!(!runtime.native_child_identity(&blank).contains(" · Task:"));
     }
 
-    fn native_child_surface_labels(mut element: Element<'_, Message>, width: f32) -> Vec<String> {
-        use iced::advanced::{Layout, layout, widget::Tree};
+    #[derive(Default)]
+    struct NativeChildSurface {
+        text: Vec<String>,
+        accessible: Vec<String>,
+    }
+
+    fn native_child_surface(mut element: Element<'_, Message>, width: f32) -> NativeChildSurface {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        impl Operation for NativeChildSurface {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.text.push(text.to_owned());
+            }
+        }
         let renderer = crate::app::tests::headless_renderer();
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -6906,19 +6923,34 @@ mod tests {
             &renderer,
             &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 800.0)),
         );
+        let mut surface = NativeChildSurface::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut surface);
         let accessible = element.as_widget().a11y_nodes(
             Layout::new(&node),
             &tree,
             iced::mouse::Cursor::Unavailable,
         );
-        accessible
+        surface.accessible = accessible
             .root()
             .iter()
             .chain(accessible.children())
-            .flat_map(|node| [node.node().label(), node.node().value()])
+            .flat_map(|node| {
+                [
+                    node.node().label(),
+                    node.node().value(),
+                    node.node().description(),
+                ]
+            })
             .flatten()
             .map(str::to_owned)
-            .collect()
+            .collect();
+        surface
+    }
+
+    fn native_child_surface_labels(element: Element<'_, Message>, width: f32) -> Vec<String> {
+        native_child_surface(element, width).accessible
     }
 
     #[test]
@@ -7032,6 +7064,130 @@ mod tests {
         assert_eq!(Runtime::native_child_name(child), "Scout");
         let task = Runtime::native_child_task(child).unwrap();
         assert_eq!(Runtime::short_description(task, 120).chars().count(), 121);
+    }
+
+    #[test]
+    fn native_child_picker_distinguishes_unnamed_and_duplicate_names_before_selection() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let data = [
+            (
+                "12345678-alpha",
+                "",
+                "Inspect first checkout",
+                "12345678-alph",
+            ),
+            (
+                "12345678-alpine",
+                " \t ",
+                "Inspect second checkout",
+                "12345678-alpi",
+            ),
+            ("same-prefix", "Scout", "Compare first route", "same-prefix"),
+            (
+                "same-prefix-long",
+                " Scout ",
+                "Compare second route",
+                "same-prefix-",
+            ),
+            ("unique-child", "Mapper", "Summarize findings", ""),
+        ];
+        Arc::make_mut(&mut runtime.snapshot).subagents = data
+            .iter()
+            .map(|(id, name, task, _)| chat::Subagent {
+                id: (*id).into(),
+                kind: (*name).into(),
+                description: (*task).into(),
+                ..native_child_fixture()
+            })
+            .collect();
+        let common_name = "LongAgent".repeat(12);
+        for (id, ending) in [("long-one", "A"), ("long-two", "B")] {
+            Arc::make_mut(&mut runtime.snapshot)
+                .subagents
+                .push(chat::Subagent {
+                    id: id.into(),
+                    kind: format!("{common_name}{ending}"),
+                    description: "Review identical long-name task".into(),
+                    ..native_child_fixture()
+                });
+        }
+        runtime.child_picker = Some(child_navigation::Picker::new(&runtime.snapshot.subagents));
+        for width in [260.0, 900.0] {
+            let surface = native_child_surface(runtime.child_picker_view().unwrap(), width);
+            for (id, name, task, suffix) in &data {
+                let label = if name.trim().is_empty() {
+                    "Subagent"
+                } else {
+                    name.trim()
+                };
+                assert!(
+                    surface.text.iter().any(|text| text == label),
+                    "reported identity stays primary: {:?}",
+                    surface.text
+                );
+                assert!(
+                    surface.text.contains(&format!("Task: {task}")),
+                    "task is visible before selection: {:?}",
+                    surface.text
+                );
+                assert!(
+                    surface.accessible.contains(&format!("Task: {task}")),
+                    "task is an accessible description: {:?}",
+                    surface.accessible
+                );
+                assert!(
+                    surface
+                        .accessible
+                        .contains(&format!("{label} · Working · {id}")),
+                    "exact child ID remains in its button name"
+                );
+                if !suffix.is_empty() {
+                    assert!(
+                        surface.text.contains(&format!("Working · ID: {suffix}")),
+                        "ambiguous names have distinct visible source IDs: {:?}",
+                        surface.text
+                    );
+                }
+            }
+            assert!(
+                !surface
+                    .text
+                    .iter()
+                    .any(|text| text == "Working · ID: unique-c"),
+                "unambiguous reported name needs no suffix"
+            );
+            for id in ["long-one", "long-two"] {
+                assert!(
+                    surface.text.contains(&format!("Working · ID: {id}")),
+                    "names differing beyond visible truncation are also disambiguated"
+                );
+            }
+        }
+        runtime.child_picker.as_mut().unwrap().query = "first checkout".into();
+        let filtered = native_child_surface(runtime.child_picker_view().unwrap(), 260.0);
+        assert!(
+            filtered
+                .text
+                .contains(&"Working · ID: 12345678-alph".to_owned()),
+            "filtering does not shorten a disambiguating prefix"
+        );
+        runtime.child_picker.as_mut().unwrap().query.clear();
+        Arc::make_mut(&mut runtime.snapshot).subagents.reverse();
+        let reversed = native_child_surface(runtime.child_picker_view().unwrap(), 260.0);
+        assert!(
+            reversed
+                .text
+                .contains(&"Working · ID: 12345678-alph".to_owned())
+        );
+        assert!(
+            reversed
+                .text
+                .contains(&"Working · ID: 12345678-alpi".to_owned())
+        );
+        assert!(
+            runtime.selected_subagent.is_none(),
+            "the user can distinguish choices before choosing one"
+        );
     }
 
     #[test]
