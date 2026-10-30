@@ -214,3 +214,74 @@ fn a_draft_shows_and_starts_on_options_chosen_in_another_window() {
     let started = crate::app::chat_ui::start_draft_for_test(&mut app, card);
     assert_eq!(started.launch.recipe, session.launch.recipe);
 }
+
+#[test]
+fn an_adopted_draft_keeps_its_failure_reason_until_its_account_changes() {
+    let (mut app, scope, _directory) = shared_channel_app();
+    let _ = app.new_native_chat(Provider::Claude, Some("/workspace/chat-fixture".into()));
+    let card = app.workspace.focused().unwrap();
+    let mut chosen = chat_session(&app, card);
+    let mut view = accept_local_view(&mut app, &scope);
+    let reason = Some("Claude is not signed in.".to_owned());
+    *crate::app::chat_ui::draft_error_for_test(&mut app, card) = reason.clone();
+    let mut publish = |app: &mut crate::app::Cagents, session: &crate::chat::Session| {
+        view.revision += 1;
+        view.panes[0].kind = CardKind::Chat(session.clone());
+        app.workspace_model.views = vec![view.clone()];
+        drop(app.reconcile_shared_views());
+        assert_eq!(chat_session(app, card), *session);
+    };
+
+    // Another permission mode is still the account that failed.
+    crate::chat::apply_claude_permission_mode(&mut chosen.launch.recipe, "plan");
+    publish(&mut app, &chosen);
+    assert_eq!(
+        *crate::app::chat_ui::draft_error_for_test(&mut app, card),
+        reason
+    );
+
+    // Another account may not fail the same way.
+    chosen
+        .launch
+        .recipe
+        .environment
+        .insert("CLAUDE_CONFIG_DIR".into(), "/accounts/claude/other".into());
+    publish(&mut app, &chosen);
+    assert_eq!(
+        *crate::app::chat_ui::draft_error_for_test(&mut app, card),
+        None
+    );
+}
+
+#[test]
+fn a_draft_choosing_a_file_takes_up_options_chosen_meanwhile_in_another_window() {
+    let (mut app, scope, _directory) = shared_channel_app();
+    let _ = app.new_native_chat(Provider::Claude, Some("/workspace/chat-fixture".into()));
+    let card = app.workspace.focused().unwrap();
+    let original = chat_session(&app, card);
+    let mut view = accept_local_view(&mut app, &scope);
+    let mut chosen = original.clone();
+    chosen
+        .launch
+        .recipe
+        .environment
+        .insert("CLAUDE_CONFIG_DIR".into(), "/accounts/claude/other".into());
+    crate::chat::apply_claude_permission_mode(&mut chosen.launch.recipe, "plan");
+
+    crate::app::chat_ui::with_attachment_chooser_open_for_test(&mut app, card, |app| {
+        view.revision += 1;
+        view.panes[0].kind = CardKind::Chat(chosen.clone());
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        assert_eq!(stored(app, card).kind, CardKind::Chat(chosen.clone()));
+    });
+
+    // Once the chooser closes the draft shows, and would start on, the other
+    // window's options, rather than publishing its own older ones over them.
+    let (shown, session) = crate::app::chat_ui::draft_launch_for_test(&app, card);
+    assert_eq!(shown.as_deref(), Some("plan"));
+    assert_eq!(session, chosen);
+    assert!(app.shared_views.pending.is_empty());
+    let started = crate::app::chat_ui::start_draft_for_test(&mut app, card);
+    assert_eq!(started.launch.recipe, chosen.launch.recipe);
+}
