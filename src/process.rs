@@ -1302,43 +1302,127 @@ sys.exit(7)
     #[cfg(unix)]
     #[test]
     fn a_descendant_holding_a_pipe_cannot_outlive_the_deadline() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        struct PipeHolder {
+            started: PathBuf,
+            release: PathBuf,
+            finished: PathBuf,
+            worker: Option<thread::JoinHandle<()>>,
+        }
+
+        impl PipeHolder {
+            fn settle(&mut self) -> Vec<String> {
+                let mut errors = Vec::new();
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&self.release)
+                {
+                    Ok(_) => {}
+                    Err(error)
+                        if error.kind() == io::ErrorKind::AlreadyExists
+                            && fs::symlink_metadata(&self.release)
+                                .is_ok_and(|metadata| metadata.is_file()) => {}
+                    Err(error) => errors.push(format!("release detached pipe holder: {error}")),
+                }
+
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while (self.started.is_file() && !self.finished.is_file())
+                    || self
+                        .worker
+                        .as_ref()
+                        .is_some_and(|worker| !worker.is_finished())
+                {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if self.started.is_file() && !self.finished.is_file() {
+                    errors.push("detached holder did not acknowledge closing its pipes".into());
+                }
+                if self
+                    .worker
+                    .as_ref()
+                    .is_some_and(thread::JoinHandle::is_finished)
+                {
+                    if self.worker.take().unwrap().join().is_err() {
+                        errors.push("executor test worker panicked".into());
+                    }
+                } else if self.worker.is_some() {
+                    errors.push("executor test worker did not settle within cleanup bound".into());
+                }
+                errors
+            }
+        }
+
+        impl Drop for PipeHolder {
+            fn drop(&mut self) {
+                // Release before the private directory drops, including on
+                // panic. Never join an unfinished test thread without a bound.
+                for error in self.settle() {
+                    eprintln!("pipe-holder fixture cleanup unconfirmed: {error}");
+                }
+            }
+        }
+
         let directory = tempfile::tempdir().unwrap();
-        let holder = directory.path().join("holder.pid");
+        let mut holder = PipeHolder {
+            started: directory.path().join("holder.started"),
+            release: directory.path().join("holder.release"),
+            finished: directory.path().join("holder.finished"),
+            worker: None,
+        };
         let command = CommandSpec::new("/bin/sh")
             .args([
                 OsString::from("-c"),
-                // `setsid` puts the sleeper in its own session, so the process
+                // `setsid` puts the holder in its own session, so the process
                 // group signalled at the deadline does not contain it, and it
                 // inherits the stdout and stderr this executor is reading.
                 OsString::from(
-                    "setsid sh -c 'printf %s \"$$\" > \"$HOLDER\"; exec sleep 300' & exit 0",
+                    r#"setsid sh -c '
+    root=$1
+    : > "$root/holder.started" || exit 1
+    remaining=600
+    while [ -d "$root" ] && [ ! -f "$root/holder.release" ] && [ "$remaining" -gt 0 ]; do
+        sleep 0.1 || exit 1
+        remaining=$((remaining - 1))
+    done
+    exec >/dev/null 2>&1
+    : > "$root/holder.finished"
+' holder "$1" & exit 0"#,
                 ),
+                OsString::from("pipe-holder-fixture"),
+                directory.path().as_os_str().to_os_string(),
             ])
-            .env("HOLDER", holder.as_os_str())
             .timeout(Duration::from_millis(200));
 
         let (report, results) = mpsc::channel();
-        thread::spawn(move || {
+        holder.worker = Some(thread::spawn(move || {
             let outcome = SystemProcessExecutor.execute(&command, &CancellationToken::new());
             let _ = report.send(outcome.map(|_| ()).map_err(|failure| failure.kind));
-        });
+        }));
         let outcome = results
             .recv_timeout(Duration::from_secs(20))
             .expect("the executor never returned while a descendant held its pipes");
 
         assert_eq!(outcome.unwrap_err(), ProcessFailureKind::TimedOut);
+        assert!(
+            holder.started.is_file(),
+            "fixture never launched its detached pipe holder"
+        );
+        assert!(
+            !holder.release.exists() && !holder.finished.exists(),
+            "the detached holder stopped holding its pipes before the timeout result"
+        );
 
-        // The sleeper is deliberately outside every group this executor may
-        // signal, so the test is what has to end it.
-        for _ in 0..200 {
-            if let Ok(text) = fs::read_to_string(&holder)
-                && let Ok(pid) = text.trim().parse::<u32>()
-            {
-                signal_process_group(pid, SIGKILL);
-                return;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
+        // The finite loop exceeds the 20s hang guard without an early release,
+        // and root disappearance also ends it after an interrupted test. Its
+        // acknowledgement follows pipe closure; it does not prove exit or reaping.
+        let errors = holder.settle();
+        assert!(errors.is_empty(), "pipe-holder fixture cleanup: {errors:?}");
     }
 
     #[cfg(unix)]
