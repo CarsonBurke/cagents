@@ -5395,7 +5395,7 @@ pub struct Cagents {
     settings_pending: HashMap<SettingsField, (u64, String)>,
     settings_generation: u64,
     settings_invalid: HashMap<SettingsField, String>,
-    settings_save_error: Option<String>,
+    settings_save_error: Option<(u64, String)>,
     status: Option<TransientNotice>,
 }
 
@@ -13654,7 +13654,7 @@ impl Cagents {
     }
 
     fn refresh_settings_feedback(&mut self) {
-        self.settings_feedback = if let Some(error) = &self.settings_save_error {
+        self.settings_feedback = if let Some((_, error)) = &self.settings_save_error {
             Some(SettingsFeedback::Error(error.clone()))
         } else if !self.settings_invalid.is_empty() {
             Some(SettingsFeedback::Invalid)
@@ -16205,16 +16205,27 @@ impl Application for Cagents {
             Message::SettingsSaved { generation, result } => {
                 match result {
                     Ok(saved) => {
-                        if saved.generation >= self.settings_ack_generation {
+                        if saved.generation >= self.settings_ack_generation
+                            && self
+                                .settings_save_error
+                                .as_ref()
+                                .is_none_or(|(failed, _)| saved.generation >= *failed)
+                        {
                             self.settings_save_error = None;
                         }
                         self.acknowledge_settings_save(saved);
                     }
-                    Err(error) if generation >= self.settings_ack_generation => {
+                    Err(error)
+                        if generation >= self.settings_ack_generation
+                            && self
+                                .settings_save_error
+                                .as_ref()
+                                .is_none_or(|(failed, _)| generation >= *failed) =>
+                    {
                         self.status = Some(TransientNotice::warning(format!(
                             "Could not save settings: {error}"
                         )));
-                        self.settings_save_error = Some(error);
+                        self.settings_save_error = Some((generation, error));
                     }
                     Err(_) => {}
                 }
@@ -21359,6 +21370,137 @@ mod tests {
         assert_eq!(app.settings.terminal_font_size, 22.0);
         app.save_settings_now().unwrap();
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, 22.0);
+
+        for older_fails in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("settings.toml");
+            let recovery = directory.path().join("last-good-settings.toml");
+            let mut app = context_inspector_test_app(false);
+            app.settings_path = Some(path.clone());
+            app.settings_write_blocked = false;
+            app.settings.terminal_font_family = "Terminal Mono".into();
+            app.settings.terminal_font_size = 22.0;
+            app.settings.editor_font_family = Some("Original Editor".into());
+            app.settings.editor_font_size = Some(18.0);
+            app.settings_base = app.settings.clone();
+            settings::save(&path, &app.settings).unwrap();
+
+            app.settings.editor_font_family = Some("Earlier Editor".into());
+            app.settings.editor_font_size = Some(20.0);
+            app.settings_draft = SettingsDraft::from_settings(&app.settings);
+            let older = app.capture_settings_save().unwrap();
+            let older_generation = older.generation;
+            app.settings.editor_font_family = None;
+            app.settings.editor_font_size = None;
+            app.settings_draft = SettingsDraft::from_settings(&app.settings);
+            let newer = app.capture_settings_save().unwrap();
+            let newer_generation = newer.generation;
+
+            // Preserve a real private file for recovery. Both failure cases
+            // run production storage; no SettingsSaved receipt is fabricated.
+            if older_fails {
+                std::fs::copy(&path, &recovery).unwrap();
+                std::fs::write(&path, "not valid toml").unwrap();
+            }
+            let older_result = older.run();
+            if older_fails {
+                assert!(older_result.is_err());
+            } else {
+                assert!(older_result.is_ok());
+                std::fs::copy(&path, &recovery).unwrap();
+            }
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            let newer_error = newer.run().unwrap_err();
+            if let Err(older_error) = &older_result {
+                assert_ne!(older_error, &newer_error);
+            }
+
+            drop(app.update(Message::SettingsSaved {
+                generation: newer_generation,
+                result: Err(newer_error.clone()),
+            }));
+            drop(app.update(Message::SettingsSaved {
+                generation: older_generation,
+                result: older_result,
+            }));
+            assert!(
+                matches!(&app.settings_feedback, Some(SettingsFeedback::Error(error))
+                    if error == &newer_error),
+                "an older completion cannot hide or replace the latest failed save"
+            );
+            assert_eq!(app.settings.editor_font_family, None);
+            assert_eq!(app.settings.editor_font_size, None);
+            assert!(app.settings_draft.editor_font_family.is_empty());
+            assert!(app.settings_draft.editor_font_size.is_empty());
+            assert_eq!(app.settings.editor_font_family(), "Terminal Mono");
+            assert_eq!(app.settings.editor_font_size(), 22.0);
+            assert!(app.settings_pending.is_empty());
+
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::rename(&recovery, &path).unwrap();
+            let retry = app.apply_setting_input(SettingsField::EditorFontSize, String::new());
+            settle_settings_task(&mut app, retry);
+            let saved = settings::load(&path).unwrap();
+            assert_eq!(saved.editor_font_family, None);
+            assert_eq!(saved.editor_font_size, None);
+            assert_eq!(saved.editor_font_family(), "Terminal Mono");
+            assert_eq!(saved.editor_font_size(), 22.0);
+            assert!(matches!(
+                app.settings_feedback,
+                Some(SettingsFeedback::Saved)
+            ));
+        }
+    }
+
+    #[test]
+    fn stale_settings_save_lane_preserves_cleared_editor_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let original = AppSettings {
+            editor_font_family: Some("Editor Mono".into()),
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        settings::save(&path, &original).unwrap();
+        let mut clearing_window = context_inspector_test_app(false);
+        let mut stale_window = context_inspector_test_app(false);
+        for window in [&mut clearing_window, &mut stale_window] {
+            window.settings_path = Some(path.clone());
+            window.settings_write_blocked = false;
+            window.settings = original.clone();
+            window.settings_base = original.clone();
+        }
+
+        clearing_window.settings.editor_font_family = None;
+        clearing_window.settings.editor_font_size = None;
+        clearing_window.save_settings_now().unwrap();
+
+        // Both saves capture the stale snapshot before either acknowledgment.
+        // The second save must use the lane's first successful baseline without
+        // treating either old editor override as a deliberate local change.
+        stale_window.settings.terminal_font_size = 21.0;
+        let first = stale_window.capture_settings_save().unwrap();
+        stale_window.settings.terminal_font_family = "Terminal Mono".into();
+        let second = stale_window.capture_settings_save().unwrap();
+        let first_ack = first.run().unwrap();
+        let second_ack = second.run().unwrap();
+        stale_window.acknowledge_settings_save(second_ack);
+        stale_window.acknowledge_settings_save(first_ack);
+
+        let reopened = settings::load(&path).unwrap();
+        assert_eq!(reopened.editor_font_family, None);
+        assert_eq!(reopened.editor_font_size, None);
+        assert_eq!(reopened.editor_font_family(), "Terminal Mono");
+        assert_eq!(reopened.editor_font_size(), 21.0);
+
+        // A later intentional override must still win after the stale saves.
+        stale_window.settings.editor_font_size = Some(22.0);
+        stale_window.save_settings_now().unwrap();
+        let reopened = settings::load(&path).unwrap();
+        assert_eq!(reopened.editor_font_size(), 22.0);
+        assert_eq!(reopened.editor_font_family(), "Terminal Mono");
+        assert_eq!(reopened.editor_font_family, None);
     }
 
     #[test]
