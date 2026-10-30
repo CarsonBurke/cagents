@@ -1297,12 +1297,24 @@ impl Claude {
         } else {
             Vec::new()
         };
-        // Claude injects skill bodies as meta messages during a turn.
-        // They are context for the agent, not conversation messages.
+        // Explicit meta context is model-only. The wire isSynthetic marker is
+        // broader: it also covers intentionally visible compact summaries.
         if delivered.is_empty() && frame["isMeta"].as_bool() == Some(true) {
             self.track_carrier(carrier, Vec::new(), child);
             return Ok(());
         }
+        // Raw transcripts retain the more specific summary/transcript-only
+        // flags that stream-json folds into isSynthetic. All preserve their
+        // text under the same honest, generic provider-context disclosure.
+        let context = role == Role::User
+            && [
+                "isSynthetic",
+                "isCompactSummary",
+                "isVisibleInTranscriptOnly",
+            ]
+            .iter()
+            .any(|key| frame[*key].as_bool() == Some(true));
+        let content_role = if context { Role::System } else { role };
         let message = &frame["message"];
         let id = message["id"]
             .as_str()
@@ -1319,16 +1331,20 @@ impl Claude {
                 }));
             }
         } else if let Some(content) = message["content"].as_str() {
-            step.events.push(Event::Item(text_item(
-                format!("{id}:0"),
-                role,
-                if role == Role::User {
-                    slash_command_prompt(content).unwrap_or_else(|| content.into())
-                } else {
-                    content.into()
-                },
-                false,
-            )));
+            step.events.push(Event::Item(if context {
+                context_item(format!("{id}:0"), content.into())
+            } else {
+                text_item(
+                    format!("{id}:0"),
+                    role,
+                    if role == Role::User {
+                        slash_command_prompt(content).unwrap_or_else(|| content.into())
+                    } else {
+                        content.into()
+                    },
+                    false,
+                )
+            }));
         } else if let Some(content) = message["content"].as_array() {
             let message_key = ScopedId::new(child, id);
             let base = frame["_cagents_block_base"]
@@ -1428,12 +1444,11 @@ impl Claude {
                         } else {
                             string(block, if thinking { "thinking" } else { "text" })
                         };
-                        step.events.push(Event::Item(text_item(
-                            format!("{id}:{index}"),
-                            role,
-                            text.into(),
-                            thinking,
-                        )));
+                        step.events.push(Event::Item(if context {
+                            context_item(format!("{id}:{index}"), text.into())
+                        } else {
+                            text_item(format!("{id}:{index}"), role, text.into(), thinking)
+                        }));
                     }
                     "tool_use" | "server_tool_use" => {
                         let tool_id = required(block, "id")?.to_owned();
@@ -1599,7 +1614,7 @@ impl Claude {
                     }
                     "image" => step.events.push(Event::Item(Item {
                         id: format!("{id}:{index}"),
-                        role,
+                        role: content_role,
                         content: match image_content(block) {
                             ItemContent::Image {
                                 path, description, ..
@@ -1624,7 +1639,7 @@ impl Claude {
                     })),
                     "document" => step.events.push(Event::Item(Item {
                         id: format!("{id}:{index}"),
-                        role,
+                        role: content_role,
                         content: ItemContent::Image {
                             reference: None,
                             path: String::new(),
@@ -3237,9 +3252,28 @@ fn delivery(frame: &Value) -> Vec<ItemContent> {
 
 /// Claude marks as meta what it injects for the model alone, such as a
 /// skill's body. A peer's delivery is marked too, being meta to the model,
-/// but is a message to the reader.
+/// but is a message to the reader. The broader isSynthetic flag cannot prove
+/// model-only intent: visible compact summaries carry that flag as well.
 fn model_only(frame: &Value) -> bool {
     frame["isMeta"].as_bool() == Some(true) && string(&frame["origin"], "kind") != "peer"
+}
+
+/// Preserve opaque provider context without attributing it to the user, a
+/// particular tool, or another agent. System notices are explicit disclosures.
+fn context_item(id: String, body: String) -> Item {
+    Item {
+        id,
+        role: Role::System,
+        content: ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "Claude context".into(),
+            body,
+        },
+        started_at: None,
+        at: None,
+    }
 }
 
 /// The text of a message whose content is a string or a list of text blocks.
@@ -9437,6 +9471,7 @@ mod tests {
                 "type": "user",
                 "uuid": "skill-context",
                 "isMeta": true,
+                "isSynthetic": true,
                 "turnCompanion": true,
                 "message": {"role": "user", "content": [{"type": "text", "text": "Base directory for this skill: /skills/example"}]}
             }))
@@ -9457,6 +9492,312 @@ mod tests {
             .unwrap();
         assert!(user.events.iter().any(|event| matches!(event, Event::Item(item)
             if item.role == Role::User && matches!(&item.content, ItemContent::Text { text, .. } if text == "Use the skill"))));
+    }
+
+    #[test]
+    fn synthetic_context_live_preserves_skill_calls_results_and_user_quotes() {
+        let body = "Base directory for this skill: /skills/example\n\nInternal instructions";
+        for marker in [
+            "isMeta",
+            "isSynthetic",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ] {
+            for content in [json!(body), json!([{"type":"text","text":body}])] {
+                let mut adapter = Claude::default();
+                let call = adapter.receive(json!({"type":"assistant","uuid":"call","message":{"id":"call-message","content":[{"type":"tool_use","id":"skill-1","name":"Skill","input":{"skill":"example"}}]}})).unwrap();
+                assert!(
+                    matches!(&items(&call)[..], [ItemContent::Tool { name, input, status: ToolStatus::Running, .. }]
+                    if name == "Skill" && serde_json::from_str::<Value>(input).unwrap()["skill"] == "example")
+                );
+                let call_id = call
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
+                            Some(item.id.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(call_id, "skill-1");
+
+                let mut frame = json!({"type":"user","uuid":"internal","message":{"role":"user","content":content}});
+                frame[marker] = json!(true);
+                // Stream-json omits the other internal fields, including
+                // turnCompanion and sourceToolUseID, so do not depend on them.
+                let context = adapter.receive(frame).unwrap();
+                if marker == "isMeta" {
+                    assert!(context.events.is_empty(), "{marker}: {context:?}");
+                    assert!(adapter.carrier_items["internal"].is_empty());
+                } else {
+                    assert_eq!(
+                        deliveries(&context),
+                        vec![(
+                            Role::System,
+                            context_item("internal:0".into(), body.into()).content
+                        )]
+                    );
+                    assert_eq!(adapter.carrier_items["internal"], vec!["internal:0"]);
+                }
+
+                for flag in [
+                    None,
+                    Some(json!(false)),
+                    Some(Value::Null),
+                    Some(json!("true")),
+                ] {
+                    let mut quoted = json!({"type":"user","uuid":"quoted","message":{"role":"user","content":body}});
+                    if let Some(flag) = flag {
+                        quoted[marker] = flag;
+                    }
+                    let visible = adapter.receive(quoted).unwrap();
+                    assert!(
+                        matches!(&deliveries(&visible)[..], [(Role::User, ItemContent::Text { text, .. })] if text == body)
+                    );
+                }
+                let result = adapter.receive(json!({"type":"user","uuid":"result","message":{"content":[{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}})).unwrap();
+                assert!(
+                    matches!(&items(&result)[..], [ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. }]
+                    if name == "Skill" && output == "Launching skill: example")
+                );
+                let result_id = result
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Item(item) if matches!(item.content, ItemContent::Tool { .. }) => {
+                            Some(item.id.as_str())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(result_id, call_id);
+                let replacement = adapter.receive(json!({"type":"user","uuid":"replacement","supersedes":["internal"],"message":{"content":"Continue"}})).unwrap();
+                assert!(
+                    !replacement
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, Event::Error { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_context_history_preserves_opaque_context_without_rewriting_source() {
+        let body = "Base directory for this skill: /skills/example\n\nInternal instructions";
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        let mut source = file.try_clone().unwrap();
+        for frame in [
+            json!({"type":"user","uuid":"root","parentUuid":null,"sessionId":id,"message":{"content":"Use the example skill"}}),
+            json!({"type":"assistant","uuid":"call","parentUuid":"root","sessionId":id,"message":{"id":"call-message","content":[{"type":"tool_use","id":"skill-1","name":"Skill","input":{"skill":"example"}}]}}),
+            json!({"type":"user","uuid":"legacy","parentUuid":"call","sessionId":id,"isMeta":true,"turnCompanion":true,"sourceToolUseID":"skill-1","message":{"content":body}}),
+            json!({"type":"user","uuid":"wire","parentUuid":"legacy","sessionId":id,"isSynthetic":true,"message":{"content":[{"type":"text","text":body}]}}),
+            json!({"type":"user","uuid":"raw-summary","parentUuid":"wire","sessionId":id,"isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"content":body}}),
+            json!({"type":"user","uuid":"result","parentUuid":"raw-summary","sessionId":id,"message":{"content":[{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}}),
+            json!({"type":"assistant","uuid":"answer","parentUuid":"result","sessionId":id,"message":{"content":"Skill completed"}}),
+        ] {
+            writeln!(file, "{frame}").unwrap();
+        }
+        let mut expected = vec![
+            "root".to_owned(),
+            "call".into(),
+            "wire".into(),
+            "raw-summary".into(),
+            "result".into(),
+            "answer".into(),
+        ];
+        let mut parent = "answer".to_owned();
+        for marker in [
+            "isMeta",
+            "isSynthetic",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ] {
+            for (index, flag) in [
+                None,
+                Some(json!(false)),
+                Some(Value::Null),
+                Some(json!("true")),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let uuid = format!("quoted-{marker}-{index}");
+                let mut frame = json!({"type":"user","uuid":uuid,"parentUuid":parent,"sessionId":id,"message":{"content":body}});
+                if let Some(flag) = flag {
+                    frame[marker] = flag;
+                }
+                writeln!(file, "{frame}").unwrap();
+                parent = uuid.clone();
+                expected.push(uuid);
+            }
+        }
+        writeln!(file, "{}", json!({"type":"user","uuid":"tail","parentUuid":parent,"sessionId":id,"isSynthetic":true,"message":{"content":body}})).unwrap();
+        expected.push("tail".into());
+        source.rewind().unwrap();
+        let mut before = String::new();
+        source.read_to_string(&mut before).unwrap();
+        file.rewind().unwrap();
+        let mut history = History::index(file, id).unwrap();
+        let records = history.page().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|frame| frame["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        let mut adapter = Claude::default();
+        let mut replay = Step::default();
+        for record in &records {
+            adapter.history_message(record, &mut replay).unwrap();
+        }
+        assert_eq!(
+            deliveries(&replay)
+                .iter()
+                .filter(|(role, content)| *role == Role::User
+                    && matches!(content, ItemContent::Text { text, .. } if text == body))
+                .count(),
+            16
+        );
+        assert!(items(&replay).iter().any(|content| matches!(content, ItemContent::Tool { name, output, status: ToolStatus::Succeeded, .. } if name == "Skill" && output == "Launching skill: example")));
+        let skill_ids = replay.events.iter().filter_map(|event| match event {
+            Event::Item(item) if matches!(&item.content, ItemContent::Tool { name, .. } if name == "Skill") => Some(item.id.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(skill_ids, vec!["skill-1", "skill-1"]);
+        let contexts = replay
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(item) if item.role == Role::System => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wire:0", "raw-summary:0", "tail:0"]
+        );
+        assert!(contexts.iter().all(|item| matches!(&item.content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && summary == "Claude context" && original.as_bytes() == body.as_bytes())));
+        source.rewind().unwrap();
+        let mut after = String::new();
+        source.read_to_string(&mut after).unwrap();
+        assert_eq!(after, before, "raw provider evidence must remain intact");
+    }
+
+    #[test]
+    fn synthetic_context_peer_delivery_and_assistant_text_remain_visible() {
+        let mut frame = json!({"type":"user","uuid":"peer","isSynthetic":true,"origin":{"kind":"peer","from":"worker","body":"Skill findings"},"message":{"content":"Skill findings"}});
+        let mut adapter = Claude::default();
+        let step = adapter.receive(frame.clone()).unwrap();
+        assert!(
+            matches!(&deliveries(&step)[..], [(Role::User, ItemContent::Delivery { body, .. })] if body == "Skill findings")
+        );
+        let mut history = correlation_history(vec![frame.clone()]);
+        let records = history.page().unwrap();
+        assert_eq!(records.len(), 1);
+        let mut replay = Step::default();
+        Claude::default()
+            .history_message(&records[0], &mut replay)
+            .unwrap();
+        assert_eq!(deliveries(&replay), deliveries(&step));
+
+        frame["type"] = json!("assistant");
+        frame["uuid"] = json!("answer");
+        frame.as_object_mut().unwrap().remove("origin");
+        let answer = adapter.receive(frame).unwrap();
+        assert!(
+            matches!(&deliveries(&answer)[..], [(Role::Assistant, ItemContent::Text { text, .. })] if text == "Skill findings")
+        );
+    }
+
+    #[test]
+    fn synthetic_context_compact_summary_wire_forms_preserve_full_text_and_history() {
+        // Installed Claude 2.1.289: Hen keeps string content, Ule normalizes
+        // it to text blocks, and Py adds isReplay:false for a compact summary.
+        // None preserves the flags distinguishing that summary from a Skill
+        // injection. These are producer-shaped fixtures, not a live capture.
+        let body = "Conversation summary\nObjective: preserve the conversation\nDecisions and unfinished work remain available.\nTranscript: /fixture/session.jsonl";
+        for (content, replay) in [
+            (json!(body), None),
+            (json!([{"type":"text","text":body}]), None),
+            (json!(body), Some(false)),
+        ] {
+            let mut frame = json!({"type":"user","uuid":"summary","session_id":"00000000-0000-4000-8000-000000000001","parent_tool_use_id":null,"isSynthetic":true,"message":{"role":"user","content":content}});
+            if let Some(replay) = replay {
+                frame["isReplay"] = json!(replay);
+            }
+            let live = Claude::default().receive(frame.clone()).unwrap();
+            let expected = context_item("summary:0".into(), body.into());
+            assert!(
+                matches!(&live.events[..], [Event::Session { .. }, Event::Item(item)] if item == &expected),
+                "{:#?}",
+                live.events
+            );
+            let mut history = correlation_history(vec![frame]);
+            let records = history.page().unwrap();
+            assert_eq!(
+                records.len(),
+                1,
+                "opaque synthetic context stays in the history index"
+            );
+            let mut replay = Step::default();
+            Claude::default()
+                .history_message(&records[0], &mut replay)
+                .unwrap();
+            assert_eq!(deliveries(&replay), deliveries(&live));
+        }
+    }
+
+    #[test]
+    fn synthetic_context_does_not_wrap_or_erase_correlated_tool_results() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"call","message":{"content":[{"type":"tool_use","id":"skill-1","name":"Skill","input":{"skill":"example"}}]}})).unwrap();
+        let body = "Opaque provider context";
+        let result = adapter.receive(json!({"type":"user","uuid":"result","isSynthetic":true,"message":{"content":[{"type":"text","text":body},{"type":"tool_result","tool_use_id":"skill-1","content":"Launching skill: example"}]}})).unwrap();
+        assert!(
+            matches!(&result.events[..], [Event::Item(context), Event::Item(tool)] if context == &context_item("result:0".into(), body.into()) && tool.id == "skill-1" && tool.role == Role::Assistant && matches!(&tool.content, ItemContent::Tool { name, input, output, status: ToolStatus::Succeeded } if name == "Skill" && serde_json::from_str::<Value>(input).unwrap()["skill"] == "example" && output == "Launching skill: example"))
+        );
+    }
+
+    #[test]
+    fn synthetic_context_raw_compact_summary_history_matches_wire_presentation() {
+        // Actual raw compaction constructors retain these explicit flags;
+        // partial summaries with kept messages use summarizeMetadata instead
+        // of isVisibleInTranscriptOnly. The SDK folds either case to synthetic.
+        let body = "Conversation summary\nImportant decisions\nUnfinished work and the transcript recovery path remain available.";
+        for flags in [
+            json!({"isCompactSummary":true,"isVisibleInTranscriptOnly":true}),
+            json!({"isCompactSummary":true,"summarizeMetadata":{"messagesSummarized":3,"userContext":"fixture","direction":"up_to"}}),
+            json!({"isVisibleInTranscriptOnly":true}),
+        ] {
+            let mut raw =
+                json!({"type":"user","uuid":"summary","message":{"role":"user","content":body}});
+            raw.as_object_mut()
+                .unwrap()
+                .extend(flags.as_object().unwrap().clone());
+            let mut history = correlation_history(vec![raw]);
+            let records = history.page().unwrap();
+            assert_eq!(records.len(), 1);
+            let mut restored = Step::default();
+            Claude::default()
+                .history_message(&records[0], &mut restored)
+                .unwrap();
+            let wire = Claude::default().receive(json!({"type":"user","uuid":"summary","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":body}]}})).unwrap();
+            assert_eq!(deliveries(&restored), deliveries(&wire));
+            assert_eq!(
+                deliveries(&restored),
+                vec![(
+                    Role::System,
+                    context_item("summary:0".into(), body.into()).content
+                )]
+            );
+        }
     }
 
     /// The framing Claude Code wraps a subagent's hand-back in, as recorded.

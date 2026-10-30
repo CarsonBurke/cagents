@@ -3,8 +3,8 @@ use crate::{
     account::AccountId,
     agent::Provider,
     agent_execution::{
-        Agent, Authority, Control, Destination, Operation, Reply, Run, Spec, Submit, Summary,
-        Surface, Target, directory::Scope,
+        Accepted, Agent, Authority, Control, Destination, Operation, Reply, Run, Spec, Submit,
+        Summary, Surface, Target, directory::Scope,
     },
     model::{AgentId, RunId},
 };
@@ -1178,6 +1178,9 @@ fn submitted(
         .validate()
         .map_err(|e| AppError::new("agent_request", e))?;
     let key = request.idempotency_key.clone();
+    let device = crate::device::selected()
+        .map(|device| device.name.as_str())
+        .unwrap_or("local");
     // Whether a failed submission was accepted is unknown, so the key that
     // makes retrying it safe goes with the error.
     let (reply, retried) = session.submit(request).map_err(|mut error| {
@@ -1214,7 +1217,9 @@ fn submitted(
         "idempotency_key": key,
     });
     if wait.wait {
-        let waited = session.wait(&[accepted.run.id], false, wait.timeout)?;
+        let waited = session
+            .wait(&[accepted.run.id], false, wait.timeout)
+            .map_err(|error| accepted_wait_error(error, &accepted, &key, device))?;
         data["ended_by"] = json!(waited.ended_by());
         let Waited {
             mut replies,
@@ -1222,7 +1227,8 @@ fn submitted(
             messages,
         } = waited;
         let (agent, run) = match replies.pop() {
-            Some(reply) => status_reply(reply)?,
+            Some(reply) => status_reply(reply)
+                .map_err(|error| accepted_wait_error(error, &accepted, &key, device))?,
             None => (accepted.agent, accepted.run),
         };
         human = status_lines(&agent, &run, timed_out, show);
@@ -1245,6 +1251,36 @@ fn submitted(
         data,
         human,
     })
+}
+
+/// A failed observation must not hide work the daemon already accepted.
+fn accepted_wait_error(
+    mut error: AppError,
+    accepted: &Accepted,
+    key: &str,
+    device: &str,
+) -> AppError {
+    let mut details = match error.details.take() {
+        Some(Value::Object(details)) => details,
+        Some(cause) => serde_json::Map::from_iter([("cause_details".into(), cause)]),
+        None => serde_json::Map::new(),
+    };
+    details.insert(
+        "acceptance".into(),
+        json!({
+            "agent": accepted.agent,
+            "run": accepted.run,
+            "created": accepted.created,
+            "idempotency_key": key,
+            "device": device,
+        }),
+    );
+    error.details = Some(Value::Object(details));
+    error.message = format!(
+        "{}; work was accepted as agent {} run {} with idempotency key {key:?}; recover with cagents --device={device} agent wait {}; repeat the submission only with the same idempotency key",
+        error.message, accepted.agent.id, accepted.run.id, accepted.run.id
+    );
+    error
 }
 
 fn run_outcome(state: crate::agent_execution::State) -> WaitOutcome {
@@ -1468,6 +1504,58 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_wait_recovery_keeps_device_routing_and_original_error_details() {
+        let (_, reply) = running();
+        let (agent, run) = status_reply(reply).unwrap();
+        let accepted = Accepted {
+            agent,
+            run,
+            created: false,
+        };
+        for device in ["remote-a", "-secondary"] {
+            for cause in [
+                json!({"code": "fixture", "retryable": true}),
+                json!(["opaque", 17]),
+            ] {
+                let error = accepted_wait_error(
+                    AppError {
+                        kind: "protocol",
+                        message: "original observation failure".into(),
+                        details: Some(cause.clone()),
+                    },
+                    &accepted,
+                    "same supplied key",
+                    device,
+                );
+                assert_eq!(error.kind, "protocol");
+                assert!(error.message.starts_with("original observation failure;"));
+                let details = error.details.unwrap();
+                assert_eq!(details["acceptance"]["device"], device);
+                assert_eq!(details["acceptance"]["run"], json!(accepted.run));
+                if cause.is_object() {
+                    assert_eq!(details["code"], cause["code"]);
+                    assert_eq!(details["retryable"], cause["retryable"]);
+                } else {
+                    assert_eq!(details["cause_details"], cause);
+                }
+                let selection = format!("--device={device}");
+                let run = accepted.run.id.to_string();
+                assert!(
+                    error
+                        .message
+                        .contains(&format!("cagents {selection} agent wait {run}"))
+                );
+                let cli =
+                    Cli::try_parse_from(["cagents", &selection, "agent", "wait", &run]).unwrap();
+                assert_eq!(cli.device.as_deref(), Some(device));
+                assert!(
+                    matches!(cli.command, TopCommand::Agent { command: AgentCommand::Wait { handles, .. } } if handles == [run])
+                );
+            }
+        }
+    }
 
     #[test]
     fn readable_provider_flags_accept_cli_and_legacy_json_casing() {
