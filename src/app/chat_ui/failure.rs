@@ -1021,10 +1021,20 @@ impl Runtime {
                 }
             }
         }
-        widget::column::with_children(rows)
+        let body: Element<'static, Message> = widget::column::with_children(rows)
             .spacing(space::S)
             .width(Length::Fill)
-            .into()
+            .into();
+        // Detail-only child failures have no named transcript item around
+        // these buttons. A replacement incident must not inherit a held press
+        // and release it into the replacement's Details or Copy callback.
+        use sha2::Digest;
+        let mut owner = sha2::Sha256::new();
+        owner.update(b"chat-failure-controls\0");
+        owner.update(target.card.to_string().as_bytes());
+        owner.update(target.generation.to_le_bytes());
+        owner.update(incident.key.as_bytes());
+        crate::interaction::keyed_list_rows(vec![(owner.finalize().into(), body)])
     }
 }
 
