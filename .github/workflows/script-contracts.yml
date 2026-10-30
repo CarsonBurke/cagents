@@ -110,6 +110,41 @@ jobs:
                   raise SystemExit(result.returncode)
           PY
 
+      - name: Check HOST lane driver contracts
+        run: |
+          python3 -I -B - <<'PY'
+          from pathlib import Path
+          import stat
+          import subprocess
+          import sys
+
+          def present(path):
+              current = Path()
+              for index, part in enumerate(path.parts):
+                  current /= part
+                  try:
+                      mode = current.lstat().st_mode
+                  except FileNotFoundError:
+                      return False
+                  expected = stat.S_ISREG if index == len(path.parts) - 1 else stat.S_ISDIR
+                  if not expected(mode):
+                      print(f"Invalid contract path: {current} must be a regular file or real directory, never a symlink", file=sys.stderr)
+                      raise SystemExit(2)
+              return True
+
+          source = Path("scripts/qualification/run-host-lane.py")
+          fixture = Path("tests/qualification/test_host_lane_driver.py")
+          source_present = present(source)
+          fixture_present = present(fixture)
+          if not source_present and not fixture_present:
+              print("Not applicable: HOST lane driver (source and fixture both absent at this head)", flush=True)
+          elif not source_present or not fixture_present:
+              print(f"Incomplete contract pair: {source} and {fixture} must both exist", file=sys.stderr)
+              raise SystemExit(2)
+          else:
+              raise SystemExit(subprocess.run([sys.executable, "-I", "-B", str(fixture), "-v"]).returncode)
+          PY
+
       - name: Check all formatter contracts
         env:
           CHECK_FORMAT_CARGO_FIXTURE: "1"
