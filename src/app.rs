@@ -28140,6 +28140,8 @@ mod tests {
                     kind,
                     incoming_ref: None,
                     message: None,
+                    witness: None,
+                    recovery_unavailable: None,
                 });
             drop(app.update(Message::Sidebar(SidebarAction::Commit {
                 key: key.clone(),
@@ -28221,6 +28223,374 @@ mod tests {
                 .contains_key(&key.canonical_path)
         );
         assert_eq!(app.refresh_ui.source_generation, generation + 1);
+    }
+
+    struct GitOperationQueueFixture {
+        root: PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    impl GitOperationQueueFixture {
+        fn new() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            let fixture = Self {
+                root,
+                _directory: directory,
+            };
+            fixture.git(&["init", "-b", "main"], true);
+            for (key, value) in [
+                ("user.name", "Queue fixture"),
+                ("user.email", "queue@example.invalid"),
+                ("commit.gpgsign", "false"),
+                ("core.hooksPath", "/dev/null"),
+                ("core.fsmonitor", "false"),
+                ("merge.autoStash", "false"),
+                ("rerere.enabled", "false"),
+            ] {
+                fixture.git(&["config", "--local", key, value], true);
+            }
+            std::fs::write(fixture.root.join("tracked.txt"), "base\n").unwrap();
+            fixture.git(&["add", "tracked.txt"], true);
+            fixture.git(&["commit", "-m", "base"], true);
+            fixture.git(&["checkout", "-b", "incoming"], true);
+            std::fs::write(fixture.root.join("tracked.txt"), "incoming\n").unwrap();
+            fixture.git(&["commit", "-am", "incoming"], true);
+            fixture.git(&["checkout", "main"], true);
+            std::fs::write(fixture.root.join("tracked.txt"), "main\n").unwrap();
+            fixture.git(&["commit", "-am", "main"], true);
+            fixture.git(&["merge", "--no-edit", "incoming"], false);
+            assert!(fixture.root.join(".git/MERGE_HEAD").is_file());
+            fixture
+        }
+
+        fn git(&self, arguments: &[&str], success: bool) {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.root)
+                .args(arguments)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                success,
+                "{arguments:?}: {output:?}"
+            );
+            if !success {
+                assert_eq!(output.status.code(), Some(1), "{output:?}");
+            }
+        }
+
+        fn operation(&self) -> crate::repository::GitOperationState {
+            RepositoryService::system("git")
+                .operation_state(&self.root, &CancellationToken::new())
+                .unwrap()
+                .expect("the real conflicted merge must have a captured operation")
+        }
+
+        fn snapshot(&self, operation: &crate::repository::GitOperationState) -> RepositorySnapshot {
+            let mut snapshot = RepositoryService::system("git")
+                .snapshot(&self.root, &CancellationToken::new())
+                .unwrap();
+            // Keep the exact positive witness from operation_state(), rather
+            // than constructing one or rearming serialized presentation data.
+            assert_eq!(snapshot.operation.as_ref(), Some(operation));
+            snapshot.operation = Some(operation.clone());
+            snapshot
+        }
+
+        fn app(
+            &self,
+            operation: &crate::repository::GitOperationState,
+        ) -> (Cagents, ActiveWorktreeKey) {
+            let key = ActiveWorktreeKey {
+                project_id: ProjectId::new(),
+                worktree_id: WorktreeId::new(),
+                canonical_path: self.root.clone(),
+            };
+            let worktree = sidebar::SidebarWorktree::new(
+                key.worktree_id,
+                self.root.clone(),
+                Some("main".into()),
+                false,
+                false,
+                None,
+                None,
+                None,
+            );
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model = sidebar::SidebarModel::ready(
+                sidebar::SidebarMode::Expanded,
+                vec![sidebar::SidebarProject::new(
+                    key.project_id,
+                    crate::repository::RepositoryId(uuid::Uuid::new_v4()),
+                    "Queue fixture".into(),
+                    self.root.clone(),
+                    vec![worktree],
+                    Vec::new(),
+                )],
+            )
+            .with_source_control(Some(SourceControlModel::ready(
+                key.clone(),
+                &self.snapshot(operation),
+            )));
+            app.sidebar_state = sidebar::SidebarState::default();
+            assert!(app.sidebar_state.sync_active_worktree(
+                &app.sidebar_model,
+                &sidebar::SidebarFocus::Repository {
+                    worktree: self.root.clone()
+                },
+            ));
+            app.active_workspace = Some(self.root.clone());
+            (app, key)
+        }
+
+        fn operation_bytes(&self) -> Vec<Vec<u8>> {
+            [
+                ".git/HEAD",
+                ".git/refs/heads/main",
+                ".git/MERGE_HEAD",
+                ".git/ORIG_HEAD",
+                ".git/MERGE_MSG",
+                ".git/index",
+                "tracked.txt",
+            ]
+            .into_iter()
+            .map(|path| std::fs::read(self.root.join(path)).unwrap())
+            .collect()
+        }
+    }
+
+    #[test]
+    fn git_operation_queue_keeps_rendered_witness_through_replacement_and_late_receipts() {
+        for replace in [false, true] {
+            let fixture = GitOperationQueueFixture::new();
+            let original = fixture.operation();
+            let expected = original
+                .abort_request()
+                .expect("a real merge can offer Abort");
+            let (mut app, key) = fixture.app(&original);
+            let action = sidebar::tests::operation_action_for_test(
+                app.sidebar_model.source_control.as_ref().unwrap(),
+                true,
+            );
+            assert!(
+                matches!(&action, SidebarAction::GitOperation { key: shown, operation }
+                if shown == &key && operation == &expected)
+            );
+            // Capture the actual enabled control from the preceding frame,
+            // then model an earlier busy owner without another Git command.
+            // Its synthetic completion below drives only queue bookkeeping.
+            let busy = app.begin_mutation(&key, MutationKind::Other, None).unwrap();
+            drop(app.update(Message::Sidebar(action)));
+            let active = &app.source_control_mutations[&key.canonical_path];
+            assert_eq!(active.pending.len(), 1);
+            let cloned = active.pending[0].clone();
+            assert!(
+                matches!(cloned, super::QueuedGitMutation::Operation(ref request) if request == &expected)
+            );
+
+            if replace {
+                fixture.git(&["merge", "--abort"], true);
+                fixture.git(&["merge", "--no-edit", "incoming"], false);
+            }
+            let current = fixture.operation();
+            assert_eq!(original.kind, current.kind);
+            assert_eq!(original.incoming_ref, current.incoming_ref);
+            assert_eq!(original.message, current.message);
+            assert_eq!(
+                original == current,
+                !replace,
+                "same-recipe replacement must still have different retained operation identity"
+            );
+            let snapshot = fixture.snapshot(&current);
+            let model = SourceControlModel::ready(key.clone(), &snapshot);
+            drop(app.update(Message::SourceControlLoaded {
+                key: key.clone(),
+                request: app.refresh_ui.source_generation,
+                result: Ok(Some(Box::new((snapshot, model)))),
+            }));
+            assert_eq!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .operation
+                    .as_ref(),
+                Some(&current)
+            );
+            let before = fixture.operation_bytes();
+            let mut elsewhere = key.clone();
+            elsewhere.canonical_path = fixture.root.join("other-worktree");
+            for (finished_key, receipt) in [(elsewhere, busy), (key.clone(), uuid::Uuid::new_v4())]
+            {
+                drop(app.update(Message::SourceControlMutated {
+                    key: finished_key,
+                    operation: receipt,
+                    report: Some("unrelated stale failure".into()),
+                    committed: false,
+                }));
+                let active = &app.source_control_mutations[&key.canonical_path];
+                assert_eq!(active.id, busy);
+                assert_eq!(active.pending.len(), 1);
+                assert!(
+                    matches!(&active.pending[0], super::QueuedGitMutation::Operation(request) if request == &expected)
+                );
+            }
+            let generation = app.refresh_ui.source_generation;
+            let task = app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation: busy,
+                report: None,
+                committed: false,
+            });
+            let active = &app.source_control_mutations[&key.canonical_path];
+            let dispatched = active.id;
+            assert_ne!(dispatched, busy);
+            assert!(active.pending.is_empty());
+            assert!(
+                matches!(&active.request, Some(super::QueuedGitMutation::Operation(request)) if request == &expected)
+            );
+            assert_eq!(app.refresh_ui.source_generation, generation);
+            drop(app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation: busy,
+                report: Some("late original completion".into()),
+                committed: true,
+            }));
+            let active = &app.source_control_mutations[&key.canonical_path];
+            assert_eq!(active.id, dispatched);
+            assert!(
+                matches!(&active.request, Some(super::QueuedGitMutation::Operation(request)) if request == &expected)
+            );
+
+            // Poll the task returned by the real completion path exactly once:
+            // queued_git_task -> mutation_task -> actual system Git service.
+            let completion = task_app_message(task);
+            let Message::SourceControlMutated {
+                key: finished_key,
+                operation,
+                report,
+                committed,
+            } = &completion
+            else {
+                panic!("queued operation did not produce its owning completion");
+            };
+            assert_eq!(finished_key, &key);
+            assert_eq!(*operation, dispatched);
+            assert!(!*committed);
+            if replace {
+                assert!(
+                    report
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("Git operation changed")
+                            && reason.contains("reload Git state")),
+                    "{report:?}"
+                );
+                assert_eq!(
+                    fixture.operation_bytes(),
+                    before,
+                    "a stale A action must not abort the replacement B"
+                );
+                assert_eq!(fixture.operation(), current);
+            } else {
+                assert!(
+                    report.is_none(),
+                    "the actual worker must be able to abort original A: {report:?}"
+                );
+                assert!(!fixture.root.join(".git/MERGE_HEAD").exists());
+                assert!(
+                    RepositoryService::system("git")
+                        .operation_state(&fixture.root, &CancellationToken::new(),)
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    std::fs::read(fixture.root.join("tracked.txt")).unwrap(),
+                    b"main\n"
+                );
+            }
+            drop(app.update(completion));
+            assert!(
+                !app.source_control_mutations
+                    .contains_key(&key.canonical_path)
+            );
+            assert!(!app.sidebar_model.source_control.as_ref().unwrap().busy());
+            assert_eq!(app.refresh_ui.source_generation, generation + 1);
+            drop(app.update(Message::SourceControlMutated {
+                key: key.clone(),
+                operation: dispatched,
+                report: Some("duplicate drained completion".into()),
+                committed: false,
+            }));
+            assert_eq!(app.refresh_ui.source_generation, generation + 1);
+        }
+    }
+
+    #[test]
+    fn cancelling_git_operation_queue_drops_pending_witness_without_dispatch() {
+        let fixture = GitOperationQueueFixture::new();
+        let original = fixture.operation();
+        let (mut app, key) = fixture.app(&original);
+        let action = sidebar::tests::operation_action_for_test(
+            app.sidebar_model.source_control.as_ref().unwrap(),
+            true,
+        );
+        let busy = app.begin_mutation(&key, MutationKind::Other, None).unwrap();
+        drop(app.update(Message::Sidebar(action)));
+        assert_eq!(
+            app.source_control_mutations[&key.canonical_path]
+                .pending
+                .len(),
+            1
+        );
+        let cancellation = app.source_control_mutations[&key.canonical_path]
+            .cancellation
+            .clone();
+        let before = fixture.operation_bytes();
+        drop(
+            app.update(Message::Sidebar(SidebarAction::CancelGitMutation {
+                key: key.clone(),
+            })),
+        );
+        assert!(cancellation.is_cancelled());
+        assert!(
+            app.source_control_mutations[&key.canonical_path]
+                .pending
+                .is_empty()
+        );
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: uuid::Uuid::new_v4(),
+            report: None,
+            committed: false,
+        }));
+        assert_eq!(app.source_control_mutations[&key.canonical_path].id, busy);
+        assert!(
+            app.source_control_mutations[&key.canonical_path]
+                .pending
+                .is_empty()
+        );
+        // Only the original owner can drain; no queued operation Task is made.
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: busy,
+            report: None,
+            committed: false,
+        }));
+        assert!(
+            !app.source_control_mutations
+                .contains_key(&key.canonical_path)
+        );
+        assert_eq!(fixture.operation_bytes(), before);
+        assert_eq!(fixture.operation(), original);
     }
 
     #[test]

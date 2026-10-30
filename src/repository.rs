@@ -49,6 +49,10 @@ pub use crate::process::{
 #[path = "repository_stash.rs"]
 mod stash_mutations;
 
+#[path = "repository_operation_witness.rs"]
+mod operation_witness;
+pub use operation_witness::GitOperationWitness;
+
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
 
 /// Commits returned by one [`RepositoryService::history`] page.
@@ -776,12 +780,30 @@ fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileI
         "MERGE_MSG",
         "CHERRY_PICK_HEAD",
         "REVERT_HEAD",
+        "REBASE_HEAD",
+        "sequencer",
+        "sequencer/head",
+        "sequencer/todo",
+        "sequencer/abort-safety",
+        "sequencer/opts",
         "rebase-merge",
         "rebase-merge/message",
         "rebase-merge/onto",
+        "rebase-merge/head-name",
+        "rebase-merge/orig-head",
+        "rebase-merge/msgnum",
+        "rebase-merge/done",
+        "rebase-merge/git-rebase-todo",
+        "rebase-merge/stopped-sha",
         "rebase-apply",
         "rebase-apply/final-commit",
         "rebase-apply/onto",
+        "rebase-apply/head-name",
+        "rebase-apply/orig-head",
+        "rebase-apply/next",
+        "rebase-apply/last",
+        "rebase-apply/original-commit",
+        "rebase-apply/abort-safety",
     ] {
         let path = git_dir.join(name);
         paths.insert(
@@ -1097,6 +1119,8 @@ pub enum GitOperationKind {
     Rebase,
     CherryPick,
     Revert,
+    /// Display-only state. Recovery authority for git-am is not implemented.
+    Am,
 }
 
 impl GitOperationKind {
@@ -1106,6 +1130,7 @@ impl GitOperationKind {
             Self::Rebase => "Rebase",
             Self::CherryPick => "Cherry-pick",
             Self::Revert => "Revert",
+            Self::Am => "Patch application",
         }
     }
     fn command(self) -> &'static str {
@@ -1114,6 +1139,7 @@ impl GitOperationKind {
             Self::Rebase => "rebase",
             Self::CherryPick => "cherry-pick",
             Self::Revert => "revert",
+            Self::Am => "am",
         }
     }
 }
@@ -1123,6 +1149,35 @@ pub struct GitOperationState {
     pub kind: GitOperationKind,
     pub incoming_ref: Option<String>,
     pub message: Option<String>,
+    /// Local authority retained from the operation that produced this state.
+    /// Serialized display state cannot recreate authority to mutate Git.
+    #[serde(skip)]
+    pub witness: Option<GitOperationWitness>,
+    /// Bounded recovery guidance when the displayed operation has no authority.
+    #[serde(default)]
+    pub recovery_unavailable: Option<String>,
+}
+
+impl GitOperationState {
+    pub fn abort_request(&self) -> Option<GitOperation> {
+        let expected = self
+            .witness
+            .as_ref()
+            .filter(|witness| witness.kind() == self.kind)?;
+        Some(GitOperation::Abort {
+            expected: expected.clone(),
+        })
+    }
+
+    pub fn continue_request(&self) -> Option<GitOperation> {
+        let expected = self
+            .witness
+            .as_ref()
+            .filter(|witness| witness.kind() == self.kind)?;
+        Some(GitOperation::Continue {
+            expected: expected.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1168,10 +1223,10 @@ pub enum GitOperation {
         ours: bool,
     },
     Continue {
-        kind: GitOperationKind,
+        expected: GitOperationWitness,
     },
     Abort {
-        kind: GitOperationKind,
+        expected: GitOperationWitness,
     },
     ApplyPatch {
         patch: Vec<u8>,
@@ -4211,6 +4266,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         cache: &mut SnapshotCache,
     ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
+        // Porcelain can stay identical when a sequencer advances or an
+        // operation's markers are replaced. Do not keep issuing actions from
+        // a cached witness merely because status did not change.
+        if cache
+            .control_metadata
+            .as_ref()
+            .and_then(|control| control.operation.as_ref())
+            .is_some_and(|operation| {
+                operation
+                    .witness
+                    .as_ref()
+                    .is_none_or(|witness| witness.revalidate(worktree, cancellation).is_err())
+            })
+        {
+            cache.invalidate(true);
+        }
         let admin = snapshot_admin_fingerprint(worktree);
         if !cache.admin.is_empty() && cache.admin != admin {
             cache.invalidate(true);
@@ -4366,19 +4437,38 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         directory: Option<&Path>,
         cancellation: &CancellationToken,
     ) -> Result<Option<GitOperationState>, RepositoryError> {
-        let mut state = directory.and_then(Self::operation_state_from_git_dir);
+        let mut state = directory
+            .map(|directory| {
+                operation_witness::capture_state(self, worktree, directory, cancellation)
+            })
+            .transpose()
+            .map_err(ValidationError::Io)?
+            .flatten();
         if let Some(message) = state.as_ref().and_then(|state| state.message.as_ref()) {
             let command = self
                 .git_read(worktree, ["stripspace", "--strip-comments"])
                 .stdin(message.as_bytes().to_vec());
-            let output = self.run_checked(&command, cancellation)?;
+            let output = match self.run_checked(&command, cancellation) {
+                Ok(output) => Some(output),
+                Err(error)
+                    if cancellation.is_cancelled()
+                        || error.kind == ProcessFailureKind::Cancelled =>
+                {
+                    return Err(error.into());
+                }
+                // Generated text is optional presentation. A comment-policy
+                // read failure must not erase Changes or recovery authority.
+                Err(_) => None,
+            };
             if let Some(state) = state.as_mut() {
-                state.message = Some(
-                    String::from_utf8_lossy(&output.stdout)
-                        .trim_end_matches('\n')
-                        .to_owned(),
-                )
-                .filter(|message| !message.is_empty());
+                state.message = output.and_then(|output| {
+                    Some(
+                        String::from_utf8_lossy(&output.stdout)
+                            .trim_end_matches('\n')
+                            .to_owned(),
+                    )
+                    .filter(|message| !message.is_empty())
+                });
             }
         }
         Ok(state)
@@ -4390,54 +4480,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Option<GitOperationState>, RepositoryError> {
         let directory = self.git_dir(worktree, cancellation)?;
-        Ok(Self::operation_state_from_git_dir(&directory))
+        operation_witness::capture_state(self, worktree, &directory, cancellation)
+            .map_err(|reason| ValidationError::Io(reason).into())
     }
 
+    /// Display-only directory inspection. Only a service read with a bound
+    /// worktree can retain authority for Abort or Continue.
     pub fn operation_state_from_git_dir(directory: &Path) -> Option<GitOperationState> {
-        let read = |path: &str| {
-            fs::read_to_string(directory.join(path))
-                .ok()
-                .map(|text| text.trim().to_owned())
-                .filter(|text| !text.is_empty())
-        };
-        let (kind, incoming_ref, message) =
-            if directory.join("rebase-merge").is_dir() || directory.join("rebase-apply").is_dir() {
-                let prefix = if directory.join("rebase-merge").is_dir() {
-                    "rebase-merge"
-                } else {
-                    "rebase-apply"
-                };
-                (
-                    GitOperationKind::Rebase,
-                    read(&format!("{prefix}/onto")),
-                    read(&format!("{prefix}/message")).or_else(|| read("MERGE_MSG")),
-                )
-            } else if directory.join("MERGE_HEAD").exists() {
-                (
-                    GitOperationKind::Merge,
-                    read("MERGE_HEAD"),
-                    read("MERGE_MSG"),
-                )
-            } else if directory.join("CHERRY_PICK_HEAD").exists() {
-                (
-                    GitOperationKind::CherryPick,
-                    read("CHERRY_PICK_HEAD"),
-                    read("MERGE_MSG"),
-                )
-            } else if directory.join("REVERT_HEAD").exists() {
-                (
-                    GitOperationKind::Revert,
-                    read("REVERT_HEAD"),
-                    read("MERGE_MSG"),
-                )
-            } else {
-                return None;
-            };
-        Some(GitOperationState {
-            kind,
-            incoming_ref,
-            message,
-        })
+        operation_witness::display_state(directory).ok().flatten()
     }
 
     pub fn stashes(
@@ -4486,6 +4536,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<MutationOutcome, RepositoryError> {
         let _protection = crate::worktree_cleanup::protect(worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let operation_witness = match operation {
+            GitOperation::Continue { expected } | GitOperation::Abort { expected } => {
+                Some(expected)
+            }
+            _ => None,
+        };
+        if let Some(expected) = operation_witness
+            && let Err(reason) = expected.check_git_context(self, worktree, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
+        }
         if let GitOperation::ApplyPatch {
             expected_head: Some(expected),
             ..
@@ -4723,11 +4786,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ],
                 )
             }
-            GitOperation::Continue { kind } => self
-                .git_mutation(worktree, [kind.command(), "--continue"])
+            GitOperation::Continue { expected } => self
+                .git_mutation(worktree, [expected.kind().command(), "--continue"])
                 .env("GIT_EDITOR", "true"),
-            GitOperation::Abort { kind } => {
-                self.git_mutation(worktree, [kind.command(), "--abort"])
+            GitOperation::Abort { expected } => {
+                self.git_mutation(worktree, [expected.kind().command(), "--abort"])
             }
             GitOperation::ApplyPatch {
                 patch,
@@ -4774,6 +4837,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
         };
         command = command.without_timeout();
+        if let Some(expected) = operation_witness {
+            // Git's configured worktree may change after preflight. Recovery
+            // must still act on the original admitted worktree.
+            command = expected.pin_worktree(command);
+        }
+        // No Git read or asynchronous boundary may intervene between this
+        // filesystem check and dispatch of the captured operation.
+        if let Some(expected) = operation_witness
+            && let Err(reason) = expected.revalidate(worktree, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
+        }
         if let Some(outcome) = self.operation_failure(&command, cancellation)? {
             return Ok(outcome);
         }

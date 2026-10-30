@@ -305,12 +305,67 @@ pub fn open_beneath_writable(root: &Root, relative: &Path) -> Result<Option<File
 /// symlink or would leave `root`, and [`ResolveError::Io`] for every other
 /// failure.
 pub fn metadata_beneath(root: &Root, relative: &Path) -> Result<Metadata, ResolveError> {
+    retain_entry_beneath(root, relative)?
+        .metadata()
+        .map_err(|error| ResolveError::io(&root.path.join(relative), &error))
+}
+
+/// An entry opened without following its final symbolic link.
+///
+/// Retaining the descriptor keeps the original inode alive after its name is
+/// replaced. This does not establish that the original name still refers to
+/// it; callers must compare the current named entry before acting on that name.
+#[derive(Debug)]
+pub struct RetainedEntry {
+    descriptor: OwnedFd,
+}
+
+impl RetainedEntry {
+    /// Returns the metadata of the retained object, without resolving its name.
+    pub fn metadata(&self) -> io::Result<Metadata> {
+        metadata_of_descriptor(&self.descriptor)
+    }
+
+    /// Reads this retained symbolic link, even after its name is replaced.
+    ///
+    /// Like this module's existing `O_PATH` handles, this uses the Linux
+    /// descriptor API. An empty `readlinkat` path reads the link held by the
+    /// descriptor, rather than resolving its old name a second time.
+    pub fn read_link(&self) -> io::Result<PathBuf> {
+        let mut buffer = vec![0_u8; libc::PATH_MAX as usize];
+        // SAFETY: the descriptor remains owned for the call, the empty C
+        // string is terminated, and the output is bounded by buffer.len().
+        let written = unsafe {
+            libc::readlinkat(
+                self.descriptor.as_raw_fd(),
+                c"".as_ptr(),
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+            )
+        };
+        if written < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written as usize == buffer.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the symbolic link target is longer than PATH_MAX",
+            ));
+        }
+        buffer.truncate(written as usize);
+        Ok(PathBuf::from(OsString::from_vec(buffer)))
+    }
+}
+
+/// Retains an entry beneath `root` without following its final symbolic link.
+/// Every parent component must stay beneath the root and must not be a link.
+pub fn retain_entry_beneath(root: &Root, relative: &Path) -> Result<RetainedEntry, ResolveError> {
     let reported = root.path.join(relative);
     let (directory, name) = open_parent_beneath(root, relative)?;
     let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let entry = open_at(directory.descriptor(), &name, flags)
         .map_err(|error| classify(&reported, &error))?;
-    metadata_of_descriptor(&entry).map_err(|error| ResolveError::io(&reported, &error))
+    Ok(RetainedEntry { descriptor: entry })
 }
 
 /// Reads the target of the symbolic link `relative` beneath `root`.
@@ -1372,6 +1427,76 @@ pub(crate) mod tests {
         let error = metadata_beneath(&root, Path::new("missing.txt")).expect_err("missing");
 
         assert!(error.is_not_found(), "{error:?}");
+    }
+
+    #[test]
+    fn retained_link_target_survives_removal_and_same_name_replacement() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let link = directory.path().join(".git");
+        std::os::unix::fs::symlink("original-admin", &link).expect("original link");
+        let root = Root::open(directory.path()).expect("root");
+        let original = retain_entry_beneath(&root, Path::new(".git")).expect("retain");
+        let identity = original.metadata().expect("original metadata");
+
+        fs::remove_file(&link).expect("remove original link");
+        assert_eq!(
+            original.read_link().expect("unlinked target"),
+            Path::new("original-admin")
+        );
+        std::os::unix::fs::symlink("replacement-admin", &link).expect("replacement link");
+        let replacement = retain_entry_beneath(&root, Path::new(".git")).expect("replacement");
+        let replacement_identity = replacement.metadata().expect("replacement metadata");
+
+        assert_eq!(
+            original.read_link().expect("retained target"),
+            Path::new("original-admin")
+        );
+        assert_eq!(
+            replacement.read_link().expect("new target"),
+            Path::new("replacement-admin")
+        );
+        assert_eq!(
+            original.metadata().expect("retained metadata").ino(),
+            identity.ino()
+        );
+        assert_ne!(
+            (identity.dev(), identity.ino()),
+            (replacement_identity.dev(), replacement_identity.ino())
+        );
+    }
+
+    #[test]
+    fn retained_entry_refuses_symlinked_parents_and_separates_absence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("marker"), b"outside").expect("marker");
+        std::os::unix::fs::symlink(outside.path(), directory.path().join("redirect"))
+            .expect("parent link");
+        let root = Root::open(directory.path()).expect("root");
+
+        assert!(matches!(
+            retain_entry_beneath(&root, Path::new("redirect/marker")),
+            Err(ResolveError::Escaped { .. })
+        ));
+        assert!(
+            retain_entry_beneath(&root, Path::new("missing"))
+                .expect_err("missing")
+                .is_not_found()
+        );
+    }
+
+    #[test]
+    fn retained_regular_entry_does_not_supply_a_link_target() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        fs::write(directory.path().join("gitfile"), b"gitdir: admin\n").expect("write");
+        let root = Root::open(directory.path()).expect("root");
+        let entry = retain_entry_beneath(&root, Path::new("gitfile")).expect("retain");
+
+        assert!(entry.metadata().expect("metadata").is_file());
+        assert!(
+            entry.read_link().is_err(),
+            "a regular file has no link target"
+        );
     }
 
     #[test]

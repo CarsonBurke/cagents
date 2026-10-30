@@ -7148,12 +7148,15 @@ fn source_control_notices<'a>(
         notices = notices.push(
             widget::row::with_children(vec![
                 widget::button::text("Abort")
-                    .on_press_maybe((!source.busy()).then(|| SidebarAction::GitOperation {
-                        key: source.key.clone(),
-                        operation: GitOperation::Abort {
-                            kind: operation.kind,
-                        },
-                    }))
+                    .on_press_maybe(
+                        (!source.busy())
+                            .then(|| operation.abort_request())
+                            .flatten()
+                            .map(|operation| SidebarAction::GitOperation {
+                                key: source.key.clone(),
+                                operation,
+                            }),
+                    )
                     .into(),
                 widget::button::text("Continue")
                     .on_press_maybe(
@@ -7161,17 +7164,33 @@ fn source_control_notices<'a>(
                             && source
                                 .group(ChangeArea::Conflict)
                                 .is_none_or(ChangeGroup::is_empty))
-                        .then(|| SidebarAction::GitOperation {
+                        .then(|| operation.continue_request())
+                        .flatten()
+                        .map(|operation| SidebarAction::GitOperation {
                             key: source.key.clone(),
-                            operation: GitOperation::Continue {
-                                kind: operation.kind,
-                            },
+                            operation,
                         }),
                     )
                     .into(),
             ])
             .spacing(space::XS),
         );
+        if operation.witness.is_none() {
+            notices = notices
+                .push(design::caption(
+                    operation
+                        .recovery_unavailable
+                        .as_deref()
+                        .unwrap_or("Reload repository state before continuing or aborting."),
+                ))
+                .push(
+                    widget::button::text("Reload").on_press_maybe((!source.busy()).then(|| {
+                        SidebarAction::RefreshWorktree {
+                            key: source.key.clone(),
+                        }
+                    })),
+                );
+        }
     }
     if source.pending_marker_stage.is_some() {
         let names = source
@@ -11605,10 +11624,386 @@ pub(crate) mod tests {
             kind: crate::repository::GitOperationKind::Merge,
             incoming_ref: None,
             message: Some("Merge fixture".into()),
+            witness: None,
+            recovery_unavailable: None,
         });
         assert!(source.can_commit("Merge fixture"));
         source.operation = None;
         assert!(!source.can_commit("Merge fixture"));
+    }
+
+    /// Authority comes from the same real Git observation as the panel's
+    /// operation. No display initializer can manufacture its witness.
+    struct OperationNoticeFixture {
+        root: tempfile::TempDir,
+    }
+
+    struct OperationNoticeExecutor;
+
+    fn isolate_operation_notice_command(
+        command: crate::repository::CommandSpec,
+    ) -> crate::repository::CommandSpec {
+        command
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_AUTHOR_NAME", "Cagents Sidebar")
+            .env("GIT_AUTHOR_EMAIL", "sidebar@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Cagents Sidebar")
+            .env("GIT_COMMITTER_EMAIL", "sidebar@example.invalid")
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+    }
+
+    impl crate::repository::ProcessExecutor for OperationNoticeExecutor {
+        fn execute(
+            &self,
+            command: &crate::repository::CommandSpec,
+            cancellation: &crate::repository::CancellationToken,
+        ) -> Result<crate::repository::ProcessOutput, crate::repository::ProcessFailure> {
+            crate::repository::ProcessExecutor::execute(
+                &crate::repository::SystemProcessExecutor,
+                &isolate_operation_notice_command(command.clone()),
+                cancellation,
+            )
+        }
+    }
+
+    impl OperationNoticeFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let fixture = Self {
+                root: tempfile::Builder::new()
+                    .prefix("cagents-sidebar-operation-")
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir()
+                    .expect("private operation fixture"),
+            };
+            fixture.git(&["init", "--quiet", "-b", "main"], true);
+            // Local policy as well as isolated child configuration: neither
+            // setup nor service commands may consult a user's signing/hooks.
+            for (name, value) in [("commit.gpgsign", "false"), ("core.hooksPath", "/dev/null")] {
+                fixture.git(&["config", name, value], true);
+            }
+            for (branch, contents) in [(None, "base\n"), (Some("incoming"), "incoming\n")] {
+                if let Some(branch) = branch {
+                    fixture.git(&["switch", "--quiet", "-c", branch], true);
+                }
+                std::fs::write(fixture.root.path().join("f.txt"), contents).unwrap();
+                fixture.git(&["add", "f.txt"], true);
+                fixture.git(&["commit", "--quiet", "-m", "fixture"], true);
+            }
+            fixture.git(&["switch", "--quiet", "main"], true);
+            std::fs::write(fixture.root.path().join("f.txt"), "ours\n").unwrap();
+            fixture.git(&["add", "f.txt"], true);
+            fixture.git(&["commit", "--quiet", "-m", "ours"], true);
+            fixture.conflict();
+            fixture
+        }
+
+        fn git(&self, arguments: &[&str], success: bool) {
+            use crate::repository::ProcessExecutor;
+
+            let command = crate::repository::CommandSpec::new("git")
+                .cwd(self.root.path())
+                .args(arguments.iter().copied());
+            let output = OperationNoticeExecutor
+                .execute(&command, &crate::repository::CancellationToken::new())
+                .expect("original Git fixture command completed");
+            assert_eq!(
+                output.success,
+                success,
+                "git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !success {
+                assert_eq!(output.exit_code, Some(1), "expected a merge conflict");
+            }
+        }
+
+        fn conflict(&self) {
+            self.git(&["merge", "--no-edit", "incoming"], false);
+        }
+
+        fn resolve(&self) {
+            std::fs::write(self.root.path().join("f.txt"), "resolved\n").unwrap();
+            self.git(&["add", "f.txt"], true);
+        }
+
+        fn snapshot(&self) -> RepositorySnapshot {
+            let snapshot =
+                crate::repository::RepositoryService::new("git", Arc::new(OperationNoticeExecutor))
+                    .snapshot(
+                        self.root.path(),
+                        &crate::repository::CancellationToken::new(),
+                    )
+                    .expect("real operation snapshot");
+            let operation = snapshot.operation.as_ref().expect("merge in progress");
+            assert_eq!(operation.kind, crate::repository::GitOperationKind::Merge);
+            assert!(
+                operation.witness.is_some(),
+                "service retained original authority"
+            );
+            snapshot
+        }
+
+        fn source(&self, snapshot: &RepositorySnapshot) -> SourceControlModel {
+            SourceControlModel::ready(
+                ActiveWorktreeKey {
+                    canonical_path: self.root.path().canonicalize().unwrap(),
+                    ..main_key()
+                },
+                snapshot,
+            )
+        }
+    }
+
+    /// Lets the owning app regression enqueue what the real control emitted,
+    /// rather than constructing an action or acquiring different authority.
+    pub(crate) fn operation_action_for_test(
+        source: &SourceControlModel,
+        abort: bool,
+    ) -> SidebarAction {
+        let renderer = headless_renderer();
+        let actions = frame_enter_presses(&renderer, source_control_notices(source, false).into());
+        let mut matching = actions.into_iter().filter(|action| match action {
+            SidebarAction::GitOperation { operation, .. } => matches!(
+                (abort, operation),
+                (true, GitOperation::Abort { .. }) | (false, GitOperation::Continue { .. })
+            ),
+            _ => false,
+        });
+        let action = matching
+            .next()
+            .expect("the actual operation button is enabled");
+        assert!(
+            matching.next().is_none(),
+            "exactly one matching button action"
+        );
+        action
+    }
+
+    #[test]
+    fn operation_buttons_keep_the_observed_witness_after_a_same_kind_replacement() {
+        let fixture = OperationNoticeFixture::new();
+        fixture.resolve();
+        let original = fixture.snapshot();
+        let observed = original.operation.as_ref().unwrap();
+        let expected = observed.witness.as_ref().unwrap().clone();
+        let mut source = fixture.source(&original);
+        let key = source.key.clone();
+        let renderer = headless_renderer();
+        let captured =
+            frame_enter_presses(&renderer, source_control_notices(&source, false).into());
+        assert_eq!(
+            captured,
+            vec![
+                SidebarAction::GitOperation {
+                    key: key.clone(),
+                    operation: GitOperation::Abort {
+                        expected: expected.clone()
+                    },
+                },
+                SidebarAction::GitOperation {
+                    key: key.clone(),
+                    operation: GitOperation::Continue {
+                        expected: expected.clone()
+                    },
+                },
+            ],
+            "both actual buttons capture authority from the shown operation"
+        );
+
+        // Keep the original actions/handles alive across a real external
+        // abort and restart of the very same incoming commit. Labels and
+        // operation kind cannot distinguish these two operations.
+        fixture.git(&["merge", "--abort"], true);
+        fixture.conflict();
+        fixture.resolve();
+        let replacement = fixture.snapshot();
+        let current = replacement.operation.as_ref().unwrap();
+        assert_eq!(current.kind, observed.kind);
+        assert_eq!(current.incoming_ref, observed.incoming_ref);
+        assert_ne!(current.witness.as_ref(), Some(&expected));
+        source = fixture.source(&replacement);
+        let newer = frame_enter_presses(&renderer, source_control_notices(&source, false).into());
+        assert_eq!(newer.len(), 2, "replacement has its own enabled controls");
+        for action in &captured {
+            match action {
+                SidebarAction::GitOperation {
+                    key: actual_key,
+                    operation:
+                        GitOperation::Abort { expected: held }
+                        | GitOperation::Continue { expected: held },
+                } => {
+                    assert_eq!(actual_key, &key);
+                    assert_eq!(held, &expected);
+                    assert_ne!(
+                        Some(held),
+                        source.operation.as_ref().unwrap().witness.as_ref()
+                    );
+                }
+                other => panic!("unexpected generated control: {other:?}"),
+            }
+        }
+        assert_ne!(
+            captured, newer,
+            "refresh cannot retarget an earlier button action"
+        );
+    }
+
+    #[test]
+    fn operation_buttons_preserve_busy_and_conflict_guards_with_real_authority() {
+        let fixture = OperationNoticeFixture::new();
+        let snapshot = fixture.snapshot();
+        let mut source = fixture.source(&snapshot);
+        assert!(!source.group(ChangeArea::Conflict).unwrap().is_empty());
+        let expected = source
+            .operation
+            .as_ref()
+            .unwrap()
+            .witness
+            .as_ref()
+            .unwrap()
+            .clone();
+        let renderer = headless_renderer();
+        assert_eq!(
+            frame_enter_presses(&renderer, source_control_notices(&source, false).into()),
+            vec![SidebarAction::GitOperation {
+                key: source.key.clone(),
+                operation: GitOperation::Abort {
+                    expected: expected.clone()
+                },
+            }],
+            "unresolved conflicts disable Continue but permit Abort"
+        );
+        source.set_mutation(Some(MutationKind::Other));
+        assert!(
+            frame_enter_presses(&renderer, source_control_notices(&source, false).into())
+                .is_empty()
+        );
+
+        fixture.resolve();
+        source = fixture.source(&fixture.snapshot());
+        assert!(
+            source
+                .group(ChangeArea::Conflict)
+                .is_none_or(ChangeGroup::is_empty)
+        );
+        assert_eq!(
+            source.operation.as_ref().unwrap().witness.as_ref(),
+            Some(&expected)
+        );
+        assert_eq!(
+            frame_enter_presses(&renderer, source_control_notices(&source, false).into()),
+            vec![
+                SidebarAction::GitOperation {
+                    key: source.key.clone(),
+                    operation: GitOperation::Abort {
+                        expected: expected.clone()
+                    },
+                },
+                SidebarAction::GitOperation {
+                    key: source.key.clone(),
+                    operation: GitOperation::Continue { expected },
+                },
+            ],
+            "resolving the real conflict enables Continue"
+        );
+        source.set_mutation(Some(MutationKind::Other));
+        assert!(
+            frame_enter_presses(&renderer, source_control_notices(&source, false).into())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn display_only_operation_controls_request_reload_and_publish_no_mutation() {
+        use cosmic::iced::advanced::widget::Operation;
+
+        #[derive(Default)]
+        struct NoticeText(Vec<String>);
+        impl Operation for NoticeText {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn text(&mut self, _id: Option<&Id>, _bounds: cosmic::iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+
+        let fixture = OperationNoticeFixture::new();
+        fixture.resolve();
+        let snapshot = fixture.snapshot();
+        let observed = snapshot.operation.as_ref().unwrap();
+        let serialized = serde_json::to_value(observed).unwrap();
+        assert!(
+            serialized.get("witness").is_none(),
+            "authority is never serialized"
+        );
+        let restored: crate::repository::GitOperationState =
+            serde_json::from_value(serialized).unwrap();
+        let directory_only = crate::repository::RepositoryService::<OperationNoticeExecutor>::operation_state_from_git_dir(
+            &fixture.root.path().join(".git"),
+        ).expect("display-only merge state");
+        let renderer = headless_renderer();
+        let unavailable = "Recovery controls are unavailable for this operation. Use Git in a terminal to continue or abort.";
+        for (mut display, reason) in [(restored, None), (directory_only, Some(unavailable))] {
+            assert_eq!(display.kind, observed.kind);
+            assert!(display.witness.is_none());
+            display.recovery_unavailable = reason.map(str::to_owned);
+            let mut source = fixture.source(&snapshot);
+            source.operation = Some(display);
+            assert_eq!(
+                frame_enter_presses(&renderer, source_control_notices(&source, false).into()),
+                vec![SidebarAction::RefreshWorktree {
+                    key: source.key.clone(),
+                }],
+                "the actual Reload control targets this worktree and publishes no Git mutation"
+            );
+
+            let mut element: Element<'_, SidebarAction> =
+                source_control_notices(&source, false).into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(320.0, 400.0)),
+            );
+            let mut text = NoticeText::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut text);
+            match reason {
+                Some(reason) => {
+                    assert!(text.0.iter().any(|line| line == reason));
+                    assert!(!text.0.iter().any(|line| {
+                        line == "Reload repository state before continuing or aborting."
+                    }));
+                }
+                None => assert!(text.0.iter().any(|line| {
+                    line == "Reload repository state before continuing or aborting."
+                })),
+            }
+            assert!(
+                text.0
+                    .iter()
+                    .any(|line| line.starts_with("Merge in progress"))
+            );
+            assert!(text.0.iter().any(|line| line == "Reload"));
+            drop(element);
+            source.set_mutation(Some(MutationKind::Other));
+            assert!(
+                frame_enter_presses(&renderer, source_control_notices(&source, false).into())
+                    .is_empty(),
+                "Reload and operation controls remain disabled while busy"
+            );
+        }
     }
 
     #[test]
