@@ -200,7 +200,7 @@ pub enum Action {
     ConfirmDelete,
     Dismiss,
     SessionsClosed(ChannelId, uuid::Uuid, Result<(), String>),
-    RetryDelete(ChannelId),
+    RetryDelete(ChannelId, crate::control::CallerContext),
     /// Runs a deletion that failed again, from the channel's row.
     RetryFailed(ChannelId),
 }
@@ -214,7 +214,7 @@ impl Action {
     pub fn answers_own_dialog(&self) -> bool {
         matches!(
             self,
-            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(_)
+            Self::ConfirmDelete | Self::Dismiss | Self::SessionsClosed(..) | Self::RetryDelete(..)
         )
     }
 }
@@ -243,6 +243,7 @@ pub struct State {
 #[derive(Debug)]
 struct ChannelCloseAttempt {
     operation: uuid::Uuid,
+    caller: crate::control::CallerContext,
     registry: uuid::Uuid,
     project: ProjectId,
     members: Vec<CardId>,
@@ -377,12 +378,12 @@ impl Cagents {
     }
 
     pub(super) fn handle_channel_ui(&mut self, action: Action) -> Task<Message> {
-        if let Action::RetryDelete(id) = action {
+        if let Action::RetryDelete(id, caller) = action {
             if self.channel_ui.closing.contains_key(&id) {
                 return Task::none();
             }
             self.channel_ui.deleting.remove(&id);
-            return self.delete_channel(id);
+            return self.delete_channel_as(caller, id);
         }
         if let Action::SessionsClosed(id, operation, result) = action {
             if !self
@@ -431,7 +432,7 @@ impl Cagents {
             return Task::none();
         }
         match action {
-            Action::SessionsClosed(..) | Action::RetryDelete(_) => unreachable!(),
+            Action::SessionsClosed(..) | Action::RetryDelete(..) => unreachable!(),
             Action::RetryFailed(id) => {
                 if !self.channel_ui.failed.contains_key(&id) {
                     return Task::none();
@@ -656,6 +657,14 @@ impl Cagents {
     /// show - the same treatment worktree deletion gives the cards of the
     /// directory it removes.
     pub(super) fn delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.delete_channel_as(crate::control::CallerContext::capture(), id)
+    }
+
+    fn delete_channel_as(
+        &mut self,
+        caller: crate::control::CallerContext,
+        id: ChannelId,
+    ) -> Task<Message> {
         let Some(cards) = self
             .durable
             .channels
@@ -698,7 +707,7 @@ impl Cagents {
         {
             let retry = cosmic::task::future(async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                Message::ChannelUi(Action::RetryDelete(id))
+                Message::ChannelUi(Action::RetryDelete(id, caller))
             });
             return Task::batch([leave, retry]);
         }
@@ -752,6 +761,7 @@ impl Cagents {
             id,
             ChannelCloseAttempt {
                 operation,
+                caller,
                 registry: self.workspace_model.identity,
                 project,
                 members: cards,
@@ -759,8 +769,9 @@ impl Cagents {
                 panes,
             },
         );
+        let caller = self.channel_ui.closing.get(&id).unwrap().caller.clone();
         let close = cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || close_sessions(sessions))
+            let result = tokio::task::spawn_blocking(move || close_sessions_as(&caller, sessions))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
@@ -1278,6 +1289,32 @@ fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> 
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn deferred_channel_deletion_keeps_the_original_caller_before_session_dispatch() {
+        let (mut app, channel, _survivor, card) = channel_with_a_conversation();
+        let original = app.card_state(card).unwrap().kind.clone();
+        let expected =
+            crate::agent_execution::Authority::session("synthetic-channel-caller".into());
+        let caller = crate::control::CallerContext::for_test(expected.clone(), false, true);
+        app.channel_ui.deleting.insert(channel);
+        // Exercise the real deferred continuation; its background session
+        // cleanup is deliberately not executed by this reducer test.
+        drop(app.handle_channel_ui(Action::RetryDelete(channel, caller)));
+        let attempt = app
+            .channel_ui
+            .closing
+            .get(&channel)
+            .expect("session close is staged");
+        assert_eq!(attempt.caller.authentication(), Some(expected));
+        assert!(
+            attempt
+                .panes
+                .iter()
+                .any(|(id, source, _)| *id == card && source == &original)
+        );
+        assert_eq!(app.card_state(card).unwrap().kind, original);
+    }
 
     #[test]
     fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
