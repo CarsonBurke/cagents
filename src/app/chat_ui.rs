@@ -41,6 +41,7 @@ mod preparation;
 mod prompt;
 mod prose;
 mod prose_document;
+mod provider_exit;
 mod reader_source;
 mod retained;
 pub(super) use closed_draft::closed_draft_source_matches;
@@ -271,6 +272,12 @@ pub enum Action {
     Copy(Target, String, CopyPart),
     CopyMessage(Target, String, Option<chat::TextCopySource>),
     MessageCopied(Target, String, text_copy::Request, Result<String, String>),
+    ToggleReportOutput(Target, String, chat::TextCopySource),
+    LoadReportOutput(Target, String, chat::TextCopySource),
+    ReportOutputLoaded(Target, provider_exit::Request, Result<Arc<String>, String>),
+    ReportOutputPage(Target, bool),
+    CopyReportSelection(Target, provider_exit::Key, usize, Arc<str>),
+    SelectReportPage(Target, provider_exit::Key, usize),
     MarkdownPrepared(Target, String, u64, preparation::Ready),
     LocalPromptPrepared(Target, u64, preparation::Ready),
     RetryMarkdown(Target),
@@ -433,6 +440,7 @@ impl Action {
                 | Self::ChangesLoaded(..)
                 | Self::ChangedFileResolved(..)
                 | Self::MessageCopied(..)
+                | Self::ReportOutputLoaded(..)
                 | Self::Attached(..)
                 | Self::PastedImage(..)
                 | Self::PastedText(..)
@@ -2031,6 +2039,7 @@ pub(super) struct Runtime {
     find_index: usize,
     find_navigation: find_navigation::State,
     copied: Option<(String, Instant)>,
+    provider_exit: provider_exit::State,
     /// When a cancel that would also stop background subagents was pressed,
     /// until it is pressed again or lapses.
     pub(super) interrupt_armed: Option<Instant>,
@@ -2990,6 +2999,7 @@ impl Runtime {
             find_index: 0,
             find_navigation: find_navigation::State::default(),
             copied: None,
+            provider_exit: provider_exit::State::default(),
             interrupt_armed: None,
             drop_hover: false,
             cache: HashMap::new(),
@@ -4456,6 +4466,8 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         if !visible {
+            let reloadable = self.handle().is_some_and(|handle| handle.is_connected());
+            self.provider_exit.hide(reloadable);
             self.find_navigation.cancel_all();
             self.preparation.clear_local();
             if let Some(queued) = &mut self.queued {
@@ -4463,6 +4475,7 @@ impl Runtime {
             }
         }
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
+        self.admit_report_output();
         images::sync(self);
         let result = self.present();
         if visible {
@@ -8887,6 +8900,7 @@ impl Cagents {
                             == Some(VisibilityClass::Visible)
                             && self.workspace_surfaces_visible();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            runtime.provider_exit = provider_exit::State::default();
                             runtime.preparation.clear();
                             if let Some(queued) = &mut runtime.queued {
                                 queued.presentation = prompt::LocalPresentation::default();
@@ -9326,6 +9340,7 @@ impl Cagents {
                             self.persist();
                         }
                         return Task::batch([
+                            self.reload_report_output(target),
                             self.list_chat_models(target.card),
                             self.resume_current_find(target, true),
                             self.dispatch_queued(target),
@@ -10485,6 +10500,11 @@ impl Cagents {
                             }
                         )
                     }) {
+                        if !runtime.item_expanded(&id) {
+                            runtime
+                                .provider_exit
+                                .collapse(&id, runtime.selected_subagent.as_deref());
+                        }
                         let snapshot = runtime.snapshot.clone();
                         runtime.prepare_transcript_cache(&snapshot);
                         return Task::none();
@@ -10649,6 +10669,7 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     if selected != runtime.selected_subagent {
+                        runtime.provider_exit = provider_exit::State::default();
                         runtime.restore_find_disclosures();
                         runtime.find_matches.clear();
                         runtime.find_index = 0;
@@ -10670,6 +10691,24 @@ impl Cagents {
                     runtime.refresh_find();
                     images::sync(runtime);
                 }
+            }
+            Action::ToggleReportOutput(target, id, source) => {
+                return self.toggle_report_output(target, id, source);
+            }
+            Action::LoadReportOutput(target, id, source) => {
+                return self.load_report_output(target, id, source);
+            }
+            Action::ReportOutputLoaded(target, request, result) => {
+                return self.report_output_loaded(target, request, result);
+            }
+            Action::ReportOutputPage(target, forward) => {
+                self.report_output_page(target, forward);
+            }
+            Action::CopyReportSelection(target, key, page, text) => {
+                return self.report_page_selection(target, key, page, Some(text));
+            }
+            Action::SelectReportPage(target, key, page) => {
+                return self.report_page_selection(target, key, page, None);
             }
             Action::CopyMessage(target, id, source) => {
                 return self.start_message_copy(target, id, source);

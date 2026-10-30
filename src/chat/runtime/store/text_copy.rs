@@ -9,13 +9,16 @@ CREATE TABLE copy_sources(
 
 impl Store {
     pub(super) fn copy_parent_source(&self, id: &str) -> Result<Option<TextCopySource>, String> {
+        let Some(cache) = self.copy_cache else {
+            return Ok(None);
+        };
         self.db
             .query_row(
                 "SELECT token,revision,bytes FROM copy_sources WHERE item=?1",
                 [id],
                 |row| {
                     Ok(TextCopySource {
-                        cache: self.copy_cache,
+                        cache,
                         scope: TextCopyScope::Conversation,
                         token: row.get(0)?,
                         revision: row.get(1)?,
@@ -108,7 +111,7 @@ impl Store {
         source: &TextCopySource,
         offset: u64,
     ) -> Result<TextCopyPage, String> {
-        if source.scope != TextCopyScope::Conversation || source.cache != self.copy_cache {
+        if source.scope != TextCopyScope::Conversation || Some(source.cache) != self.copy_cache {
             return Err("Full message is unavailable in this owned cache".into());
         }
         if source.bytes > crate::chat::TEXT_COPY_LIMIT_BYTES as u64 {
