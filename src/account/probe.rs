@@ -141,8 +141,7 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     };
     let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &program)).await;
     let outcome = match probed {
-        Ok(Ok(probed)) => probed.into_outcome(),
-        Ok(Err(message)) => Outcome::Failed(message),
+        Ok(result) => completed_probe(result),
         Err(_) => Outcome::Failed(format!(
             "{} did not answer within {} seconds",
             cli_name(account.provider),
@@ -277,6 +276,15 @@ impl Probed {
             snapshot: self.snapshot,
             catalog: self.catalog,
         }
+    }
+}
+
+/// Share the production success/failure mapping with collector regressions.
+/// Only Answered reaches the cache-publication branch in `run`.
+fn completed_probe(result: Result<Probed, String>) -> Outcome {
+    match result {
+        Ok(probed) => probed.into_outcome(),
+        Err(message) => Outcome::Failed(message),
     }
 }
 
@@ -823,7 +831,7 @@ fn finish_claude_probe(
     let usage = usage?;
     let observed_at = usage.observed_at;
     let snapshot = match usage.value {
-        Ok(response) => super::claude::parse_usage(&response, observed_at),
+        Ok(response) => super::claude::probe_usage(&response, observed_at)?,
         Err(message) => match super::claude::error_status(&message) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
                 UsageStatus::NeedsLogin,
@@ -999,7 +1007,7 @@ fn finish_codex_probe(result: Result<CodexSession, String>) -> Result<Probed, St
     };
     let observed_at = limits_read.observed_at;
     let snapshot = match limits_read.value {
-        Ok(result) => super::codex::parse_rate_limits(&result, observed_at),
+        Ok(result) => super::codex::probe_rate_limits(&result, observed_at)?,
         Err(error) => match super::codex::error_status(&error) {
             Some(UsageStatus::NeedsLogin) => UsageSnapshot::state(
                 UsageStatus::NeedsLogin,
@@ -1219,6 +1227,31 @@ pub(crate) mod collector_fixture {
             _ => return Err("fixture provider does not match the original account".into()),
         };
         Ok(probed.into_outcome())
+    }
+
+    /// The UI fixture receives the same completion policy as `run`, including
+    /// an actual Failed outcome when a collected probe has no usable quota.
+    pub(crate) async fn held_completion(
+        account: Account,
+        frames: Frames,
+        now: impl Fn() -> u64,
+        quota_observed: oneshot::Sender<()>,
+        nonquota_ready: oneshot::Receiver<()>,
+        close_ready: oneshot::Receiver<()>,
+    ) -> Outcome {
+        match held_outcome(
+            account,
+            frames,
+            now,
+            quota_observed,
+            nonquota_ready,
+            close_ready,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(message) => completed_probe(Err(message)),
+        }
     }
 }
 
@@ -1634,6 +1667,234 @@ mod tests {
         assert_eq!(probed.snapshot.observed_at, 4);
         assert!(probed.catalog.is_none());
         assert_eq!(calls.get(), 4);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_sparse_quota_fails_without_publishing_a_replacement_after_late_auth() {
+        for (quota, expected) in [
+            (Ok(json!({})), None),
+            (Ok(json!({"rate_limits": null})), None),
+            (
+                Ok(json!({"rate_limits":{"limits":[{"kind":"weekly_scoped","percent":20}]}})),
+                None,
+            ),
+            (
+                Ok(json!({"rate_limits": {"limits": []}, "subscription_type": "max"})),
+                None,
+            ),
+            (
+                Ok(json!({"rate_limits": {"limits": [{"kind":"session","percent":"unknown"}]}})),
+                None,
+            ),
+            (
+                Ok(json!({"rate_limits_available": false, "rate_limits": null})),
+                Some(UsageStatus::Unavailable),
+            ),
+            (
+                Ok(json!({"rate_limits": {"five_hour": {"utilization": 25}}})),
+                Some(UsageStatus::Ok),
+            ),
+            (
+                Err("Unsupported control request subtype: get_usage"),
+                Some(UsageStatus::Unavailable),
+            ),
+            (Err("Not logged in"), Some(UsageStatus::NeedsLogin)),
+        ] {
+            // None is an auth-transport failure, not a signed-out answer.
+            for signed_in in [Some(true), Some(false), None] {
+                let clock = std::cell::Cell::new(5);
+                let initialized = observed_control_response(
+                    &claude_reply("initialize", json!({"models":[{"value":"opus"}]})),
+                    "initialize",
+                    || clock.get(),
+                )
+                .unwrap();
+                let catalog = claude_catalog(&initialized);
+                clock.set(10);
+                let frame = match &quota {
+                    Ok(value) => claude_reply("usage", value.clone()),
+                    Err(message) => json!({"type":"control_response", "response": {
+                        "subtype":"error", "request_id":"usage", "error": message,
+                    }}),
+                };
+                let usage = observed_control_response(&frame, "usage", || clock.get()).unwrap();
+                assert_eq!(usage.observed_at, 10);
+                let (auth_ready, auth_wait) = tokio::sync::oneshot::channel::<()>();
+                let (close_ready, close_wait) = tokio::sync::oneshot::channel::<()>();
+                let auth_clock = &clock;
+                let auth = async move {
+                    auth_wait.await.unwrap();
+                    match signed_in {
+                        Some(logged_in) => observed_json(&serde_json::to_vec(&json!({
+                            "loggedIn": logged_in, "email":"user@example.com", "subscriptionType":"max",
+                        })).unwrap(), || auth_clock.get()),
+                        None => Err("synthetic auth transport failure".into()),
+                    }
+                };
+                let usage = after_close(Ok(ClaudeSession { catalog, usage }), async {
+                    close_wait.await.unwrap();
+                });
+                let mut completion = Box::pin(join_claude(auth, usage));
+                assert_pending(completion.as_mut());
+                clock.set(30);
+                auth_ready.send(()).unwrap();
+                assert_pending(completion.as_mut());
+                clock.set(40);
+                close_ready.send(()).unwrap();
+                let outcome = completed_probe(completion.await);
+                let expected = if signed_in == Some(false) {
+                    Some(UsageStatus::NeedsLogin)
+                } else {
+                    expected
+                };
+                match (expected, outcome) {
+                    (None, Outcome::Failed(message)) => assert!(!message.is_empty()),
+                    (
+                        Some(status),
+                        Outcome::Answered {
+                            identity,
+                            snapshot,
+                            catalog,
+                        },
+                    ) => {
+                        assert_eq!(snapshot.status, status);
+                        assert_eq!(
+                            snapshot.observed_at,
+                            if signed_in == Some(false) { 30 } else { 10 }
+                        );
+                        assert_eq!(catalog.unwrap().observed_at, 5);
+                        assert_eq!(identity.is_some(), signed_in == Some(true));
+                    }
+                    (_, other) => panic!("unexpected sparse-quota/auth result: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_sparse_quota_fails_without_publishing_a_replacement_after_late_models() {
+        for (quota, expected) in [
+            (Ok(json!({})), None),
+            (Ok(json!({"rateLimits": null})), None),
+            (
+                Ok(
+                    json!({"rateLimitsByLimitId":{"spark":{"limitName":"Spark","secondary":{"usedPercent":20,"windowDurationMins":10080}}}}),
+                ),
+                None,
+            ),
+            (
+                Ok(
+                    json!({"rateLimitsByLimitId": {"codex": {"primary":{"usedPercent":"unknown"}}}}),
+                ),
+                None,
+            ),
+            (
+                Ok(json!({"ordinaryUsageAllowed": true, "rateLimits": null})),
+                Some(UsageStatus::Ok),
+            ),
+            (
+                Ok(json!({"ordinaryUsageAllowed": false, "rateLimits": null})),
+                Some(UsageStatus::Limited),
+            ),
+            (
+                Ok(json!({"rateLimits":{"rateLimitReachedType":"rate_limit_reached"}})),
+                Some(UsageStatus::Limited),
+            ),
+            (
+                Ok(json!({"rateLimits":{"primary":{"usedPercent":25}}})),
+                Some(UsageStatus::Ok),
+            ),
+            (
+                Err(json!({"code":-32601,"message":"method not found"})),
+                Some(UsageStatus::Unavailable),
+            ),
+            (
+                Err(json!({"code":-1,"message":"401 unauthorized"})),
+                Some(UsageStatus::NeedsLogin),
+            ),
+        ] {
+            // Signed-in, signed-out, API-key and failed account/read controls.
+            for account_kind in 0..4 {
+                let clock = std::cell::Cell::new(10);
+                let mut answers = CodexAnswers::default();
+                answers.take(
+                    match &quota {
+                        Ok(value) => json!({"id":3,"result":value}),
+                        Err(error) => json!({"id":3,"error":error}),
+                    },
+                    || clock.get(),
+                );
+                assert_eq!(answers.limits.as_ref().unwrap().observed_at, 10);
+                let (nonquota_ready, nonquota_wait) = tokio::sync::oneshot::channel::<()>();
+                let (close_ready, close_wait) = tokio::sync::oneshot::channel::<()>();
+                let nonquota_clock = &clock;
+                let collected = async move {
+                    nonquota_wait.await.unwrap();
+                    let account = match account_kind {
+                        0 => {
+                            json!({"id":2,"result":{"account":{"type":"chatgpt","email":"user@example.com","planType":"pro"}}})
+                        }
+                        1 => json!({"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}),
+                        2 => {
+                            json!({"id":2,"result":{"account":{"type":"apiKey"},"requiresOpenaiAuth":true}})
+                        }
+                        _ => {
+                            json!({"id":2,"error":{"code":-1,"message":"synthetic account transport failure"}})
+                        }
+                    };
+                    answers.take(account, || nonquota_clock.get());
+                    answers.take(
+                        json!({"id":4,"result":{"data":[{"model":"gpt-5"}]}}),
+                        || nonquota_clock.get(),
+                    );
+                    Ok(answers.finish())
+                };
+                let mut completion = Box::pin(async {
+                    finish_codex_probe(
+                        after_close(collected.await, async {
+                            close_wait.await.unwrap();
+                        })
+                        .await,
+                    )
+                });
+                assert_pending(completion.as_mut());
+                clock.set(30);
+                nonquota_ready.send(()).unwrap();
+                assert_pending(completion.as_mut());
+                clock.set(40);
+                close_ready.send(()).unwrap();
+                let outcome = completed_probe(completion.await);
+                let expected = match account_kind {
+                    1 => Some(UsageStatus::NeedsLogin),
+                    2 => Some(UsageStatus::Unavailable),
+                    _ => expected,
+                };
+                match (expected, outcome) {
+                    (None, Outcome::Failed(message)) => assert!(!message.is_empty()),
+                    (
+                        Some(status),
+                        Outcome::Answered {
+                            identity,
+                            snapshot,
+                            catalog,
+                        },
+                    ) => {
+                        assert_eq!(snapshot.status, status);
+                        assert_eq!(
+                            snapshot.observed_at,
+                            if matches!(account_kind, 1 | 2) {
+                                30
+                            } else {
+                                10
+                            }
+                        );
+                        assert_eq!(catalog.unwrap().observed_at, 30);
+                        assert_eq!(identity.is_some(), account_kind == 0);
+                    }
+                    (_, other) => panic!("unexpected sparse-quota/account result: {other:?}"),
+                }
+            }
+        }
     }
 
     /// A fake CLI stands in for the provider's: the probe has to speak the

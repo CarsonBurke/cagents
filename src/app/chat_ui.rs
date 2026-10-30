@@ -15237,7 +15237,10 @@ mod tests {
                 outcome: account::probe::Outcome::Answered {
                     identity: None,
                     catalog: None,
-                    snapshot: account::UsageSnapshot::state(status, "", now),
+                    snapshot: account::codex::parse_rate_limits(
+                        &serde_json::json!({"ordinaryUsageAllowed": status == account::UsageStatus::Ok}),
+                        now,
+                    ),
                 },
             }));
         }

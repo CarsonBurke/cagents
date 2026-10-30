@@ -5382,7 +5382,10 @@ mod tests {
             now,
         ));
         app.account_ui.account_mut(&managed).unwrap().snapshot =
-            Some(UsageSnapshot::state(UsageStatus::Ok, "", now));
+            Some(account::codex::parse_rate_limits(
+                &serde_json::json!({"ordinaryUsageAllowed": true}),
+                now,
+            ));
         assert_eq!(app.default_account(Provider::Codex).id(), managed);
         app.account_ui.account_mut(&system.id()).unwrap().snapshot = Some(UsageSnapshot::state(
             UsageStatus::Unavailable,
@@ -7960,6 +7963,263 @@ mod app_tests {
                 .unwrap()
                 .same(&c)
         );
+    }
+
+    fn quota_retention_frames(
+        provider: Provider,
+        quota: serde_json::Value,
+    ) -> probe::collector_fixture::Frames {
+        use probe::collector_fixture::Frames;
+        match provider {
+            Provider::Claude => Frames::Claude {
+                initialize: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage-initialize",
+                    "response":{"models":[{"value":"opus"}]}}}),
+                quota: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage","response":quota}}),
+                auth: serde_json::json!({"loggedIn":true,"email":"system@fixture.invalid",
+                    "subscriptionType":"max"}),
+            },
+            Provider::Codex => Frames::Codex {
+                quota: serde_json::json!({"id":3,"result":quota}),
+                account: serde_json::json!({"id":2,"result":{"account":{
+                    "type":"chatgpt","email":"system@fixture.invalid","planType":"pro"},
+                    "requiresOpenaiAuth":true}}),
+                models: Some(serde_json::json!({"id":4,"result":{"data":[{"model":"gpt-5"}]}})),
+            },
+            _ => unreachable!("the two scheduled quota providers"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sparse_quota_completions_retain_known_system_usage_and_recover_on_current_answer() {
+        use probe::collector_fixture::held_completion;
+        use std::{cell::RefCell, collections::VecDeque};
+        use tokio::sync::oneshot;
+
+        for provider in [Provider::Claude, Provider::Codex] {
+            for case in ["known-unknown", "known-malformed", "empty-unknown"] {
+                let known = case != "empty-unknown";
+                let mut app = context_inspector_test_app(false);
+                app.refresh_ui.focused = true;
+                assert!(app.account_ui.cache.is_none() && app.account_ui.store.is_none());
+                let exhausted = app.account_ui.add_managed_fixture(provider, 1938005);
+                // This remains a SYSTEM row, with a literal synthetic host
+                // path so routing checks never resolve the user's home.
+                let system = Account {
+                    provider,
+                    home: account::AccountHome::SystemAt {
+                        path: PathBuf::from(format!(
+                            "/cagents-fixture/quota-retention/{}",
+                            provider.executable()
+                        )),
+                    },
+                };
+                let id = system.id();
+                assert!(system.is_system());
+                app.account_ui.account_mut(&id).unwrap().account = system.clone();
+                app.account_ui.registry.set_default(&system);
+                app.account_ui.installed.insert(provider, true);
+                let now = now_ms();
+                let first = now - schedule::MANUAL_DEBOUNCE - 1;
+                let prior = now - schedule::STALE_AFTER - 1_000;
+                app.account_ui.account_mut(&exhausted).unwrap().snapshot = Some(match provider {
+                    Provider::Claude => account::claude::parse_usage(
+                        &serde_json::json!({
+                            "rate_limits":{"limits":[{"kind":"session","percent":100.0}]},
+                        }),
+                        now,
+                    ),
+                    Provider::Codex => account::codex::parse_rate_limits(
+                        &serde_json::json!({
+                            "ordinaryUsageAllowed":false,"rateLimits":{"limitId":"codex",
+                                "primary":{"usedPercent":100.0,"windowDurationMins":300}},
+                        }),
+                        now,
+                    ),
+                    _ => unreachable!(),
+                });
+                let current = app.account_ui.account(&exhausted).unwrap().account.clone();
+                let valid = match provider {
+                    Provider::Claude => serde_json::json!({"subscription_type":"max",
+                        "rate_limits_available":true,"rate_limits":{
+                            "limits":[{"kind":"session","percent":20.0}],
+                            "spend":{"enabled":true,"percent":25.0,
+                                "used":{"amount_minor":250,"exponent":2,"currency":"USD"},
+                                "limit":{"amount_minor":1000,"exponent":2,"currency":"USD"}}}}),
+                    Provider::Codex => serde_json::json!({"ordinaryUsageAllowed":true,
+                        "rateLimits":{"limitId":"codex","planType":"pro",
+                            "primary":{"usedPercent":20.0,"windowDurationMins":300},
+                            "credits":{"hasCredits":true,"unlimited":false,"balance":"$12.34"}}}),
+                    _ => unreachable!(),
+                };
+                let malformed = match provider {
+                    Provider::Claude => serde_json::json!({"subscription_type":"unusable new plan",
+                        "rate_limits":{"limits":[{"kind":"session","percent":"not a number"}],
+                            "five_hour":{"utilization":"not a number"}}}),
+                    Provider::Codex => serde_json::json!({"rateLimits":{"limitId":"codex",
+                        "planType":"unusable new plan","primary":{"usedPercent":"not a number"}}}),
+                    _ => unreachable!(),
+                };
+                // Seed and recovery also use actual collectors and the real
+                // reducer. No Outcome::Failed/Answered is built in this test.
+                for phase in [0, 1, 2].into_iter().filter(|phase| known || *phase != 0) {
+                    let admitted_at = match phase {
+                        0 => prior - schedule::MANUAL_DEBOUNCE - 1,
+                        1 => first,
+                        _ => now_ms(),
+                    };
+                    let observed_at = match phase {
+                        0 => prior,
+                        1 => now - 200,
+                        _ => admitted_at,
+                    };
+                    let quota = if phase != 1 {
+                        valid.clone()
+                    } else if case == "known-malformed" {
+                        malformed.clone()
+                    } else {
+                        serde_json::json!({})
+                    };
+                    let (owner, ticket) = admit_actual_ticket(&mut app, &id, admitted_at);
+                    let state = app.account_ui.account(&id).unwrap();
+                    let retained = (
+                        state.snapshot.clone(),
+                        state.identity.clone(),
+                        state.present,
+                    );
+                    let retained_catalog = app.account_ui.catalog(provider).cloned();
+                    let waiting = probe_reply_effects(&app);
+                    let clock = RefCell::new(VecDeque::from(match provider {
+                        Provider::Claude => vec![observed_at - 1, observed_at, observed_at + 1],
+                        Provider::Codex => vec![observed_at, observed_at + 1, observed_at + 2],
+                        _ => unreachable!(),
+                    }));
+                    let (seen, mut observed) = oneshot::channel();
+                    let (ready, wait) = oneshot::channel();
+                    let (closed, close) = oneshot::channel();
+                    let mut completion = Box::pin(held_completion(
+                        system.clone(),
+                        quota_retention_frames(provider, quota),
+                        || {
+                            clock
+                                .borrow_mut()
+                                .pop_front()
+                                .expect("matched collector observation")
+                        },
+                        seen,
+                        wait,
+                        close,
+                    ));
+                    assert_collected_probe_pending(completion.as_mut());
+                    assert!(observed.try_recv().is_ok());
+                    assert_eq!(probe_reply_effects(&app), waiting);
+                    ready.send(()).unwrap();
+                    assert_collected_probe_pending(completion.as_mut());
+                    assert!(clock.borrow().is_empty());
+                    assert_eq!(probe_reply_effects(&app), waiting);
+                    closed.send(()).unwrap();
+                    let outcome = completion.await;
+                    let produced = outcome.clone();
+                    drop(app.update(Message::AccountUi(Action::Probed {
+                        owner,
+                        id: id.clone(),
+                        ticket,
+                        outcome,
+                    })));
+                    let finished = app.account_ui.now_ms;
+                    let state = app.account_ui.account(&id).unwrap();
+                    assert_eq!(state.account, system);
+                    assert_eq!(state.owner, owner);
+                    assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+                    assert!(!state.schedule.in_flight(finished));
+                    assert_eq!(app.known_account(&id).as_ref(), Some(&system));
+                    assert_eq!(app.default_account(provider), system);
+                    assert!(
+                        app.default_account_choices()
+                            .iter()
+                            .find(|(p, _)| *p == provider)
+                            .unwrap()
+                            .1
+                            .iter()
+                            .any(|choice| choice.id == id && choice.selected)
+                    );
+                    assert!(
+                        app.automation_account_choices()
+                            .iter()
+                            .any(|choice| choice.id == id)
+                    );
+                    if phase == 1 {
+                        let Outcome::Failed(message) = produced else {
+                            panic!(
+                                "sparse/malformed quota must use the actual transient completion"
+                            );
+                        };
+                        assert!(!message.is_empty());
+                        assert_eq!(
+                            (
+                                state.snapshot.clone(),
+                                state.identity.clone(),
+                                state.present
+                            ),
+                            retained,
+                            "{provider:?} {case}"
+                        );
+                        assert_eq!(state.failure.as_deref(), Some(message.as_str()));
+                        assert_eq!(state.schedule.failures(), 1);
+                        assert!(!state.schedule.should_probe(
+                            Trigger::Focus,
+                            finished + schedule::BACKOFF_BASE - 1,
+                            true
+                        ));
+                        assert!(state.schedule.should_probe(
+                            Trigger::Focus,
+                            finished + schedule::BACKOFF_BASE,
+                            true
+                        ));
+                        assert!(state.schedule.manual_ready(finished));
+                        assert_eq!(app.account_ui.catalog(provider), retained_catalog.as_ref());
+                        assert!(app.automatic_account(&current).is_none());
+                        if known {
+                            let previous = state.snapshot.as_ref().unwrap();
+                            assert_eq!(previous.observed_at, prior);
+                            assert!(!previous.windows.is_empty());
+                            assert!(previous.plan.is_some() && previous.credits.is_some());
+                            assert!(state.identity.is_some() && state.present);
+                            assert!(app.account_ui.shown_in_switcher(state));
+                            assert_eq!(app.account_ui.account_origin(state), "System default");
+                            assert!(app.provider_chip(provider, finished, false).is_some());
+                            assert!(chip(state, "Fixture system", finished).gauge.is_some());
+                        } else {
+                            assert!(state.snapshot.is_none() && state.identity.is_none());
+                            assert!(!state.present);
+                        }
+                    } else {
+                        let Outcome::Answered {
+                            identity,
+                            snapshot,
+                            catalog,
+                        } = produced
+                        else {
+                            panic!("current valid quota must recover through the real finisher");
+                        };
+                        assert_eq!(snapshot.status, UsageStatus::Ok);
+                        assert_eq!(snapshot.source, UsageSource::Probe);
+                        assert_eq!(snapshot.observed_at, observed_at);
+                        assert!(!snapshot.windows.is_empty());
+                        assert!(snapshot.plan.is_some() && snapshot.credits.is_some());
+                        assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+                        assert_eq!(state.identity, identity);
+                        assert!(state.present && state.failure.is_none());
+                        assert_eq!(state.schedule.failures(), 0);
+                        assert_eq!(app.account_ui.catalog(provider), catalog.as_ref());
+                        assert!(app.account_ui.shown_in_switcher(state));
+                        assert!(app.provider_chip(provider, finished, false).is_some());
+                        assert_eq!(app.automatic_account(&current).unwrap().id(), id);
+                    }
+                }
+            }
+        }
     }
 
     fn claude_report(used: f64) -> LiveReport {
