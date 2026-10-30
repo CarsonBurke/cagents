@@ -347,3 +347,242 @@ async fn clean_clones_diverge_without_sharing_language_edits_and_retry_after_own
     );
     app.lsp.begin_shutdown().await;
 }
+
+async fn repository_message(task: Task<Message>) -> Message {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = iced::runtime::task::into_stream(task).expect("repository worker task");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(
+                message @ Message::Repository(_),
+            )) = action
+            {
+                return message;
+            }
+        }
+        panic!("actual repository worker must answer");
+    })
+    .await
+    .expect("repository answer is bounded")
+}
+
+/// Preserve the actual returned widget operations as well as reducing the
+/// real file-worker messages. The caller probes focus outside Tokio, using
+/// the existing App widget-tree operation reader rather than inventing focus.
+async fn settle_navigation(app: &mut Cagents, task: Task<Message>) -> Task<Message> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut pending = std::collections::VecDeque::from([task]);
+        let mut focus = Vec::new();
+        let mut count = 0;
+        while let Some(task) = pending.pop_front() {
+            count += 1;
+            assert!(count < 64, "navigation callbacks must settle");
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                continue;
+            };
+            while let Some(action) = stream.next().await {
+                match action {
+                    iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ Message::Repository(_),
+                    )) => pending.push_back(app.update(message)),
+                    iced::runtime::Action::Widget(operation) => focus.push(
+                        iced::runtime::task::widget(operation)
+                            .map(|()| cosmic::Action::App(Message::LifecycleSweep)),
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        Task::batch(focus)
+    })
+    .await
+    .expect("actual navigation workers and callbacks finish")
+}
+
+#[test]
+fn cross_file_jump_uses_loaded_clone_buffer_without_taking_its_language_owner() {
+    const TARGET_TEXT: &str = "header\nx🦀target\nlast\n";
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let fixture = executor.block_on(CloneLspFixture::new());
+    std::fs::write(fixture.root.join("other.rs"), TARGET_TEXT).unwrap();
+    let (manager, holder) = executor.block_on(crate::lsp::tests::progress_fixture());
+    let (mut app, source) = executor.block_on(fixture.app(manager, holder.doc.0 + 1));
+    let task = app.clone_focused_pane();
+    let owner = app.workspace.focused().unwrap();
+    executor.block_on(settle_repository(&mut app, task));
+    assert_ne!(owner, source);
+    let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+        card: owner,
+        path: "other.rs".into(),
+    }));
+    executor.block_on(settle_repository(&mut app, task));
+    executor.block_on(wait_for_language_ready(&mut app, owner));
+    let doc = app.lsp_document(owner).unwrap();
+    // Make the owning pane's current snapshot observably different from the
+    // disk text A is about to load: the same UTF-16 coordinate means (1,3)
+    // there, but (1,2) in A after its astral character is counted correctly.
+    prefix(&mut app, owner, "🌳\n");
+    let owner_text = format!("🌳\n{TARGET_TEXT}");
+    let owner_version = app.lsp.document_version(doc).unwrap();
+    assert_eq!(
+        app.lsp
+            .scalar_position(doc, LspPosition::new(1, 3))
+            .unwrap(),
+        LspPosition::new(1, 3)
+    );
+    let next_document = app.next_lsp_document;
+    drop(app.update(Message::FocusCard(source)));
+    app.workspace.resize_viewport(1200.0);
+    let _ = app.workspace.take_widget_focus_request();
+    assert!(runtime(&app, source).can_open_file(Path::new("other.rs")));
+    let task = app.update(Message::ContextInspector(
+        InspectorAction::JumpToLspLocation {
+            card: source,
+            path: fixture.root.join("other.rs"),
+            at: LspPosition::new(1, 3),
+            coordinates: LspCoordinates::Utf16,
+        },
+    ));
+    assert!(app.lsp_pending_jumps.contains_key(&source));
+    let focus = executor.block_on(settle_navigation(&mut app, task));
+    assert_eq!(
+        runtime(&app, source).selected_path(),
+        Some(Path::new("other.rs"))
+    );
+    assert_eq!(
+        runtime(&app, source).editor_text().as_deref(),
+        Some(TARGET_TEXT)
+    );
+    assert_eq!(
+        runtime(&app, source).cursor_position(),
+        Some(LspPosition::new(1, 2))
+    );
+    assert!(!app.lsp_pending_jumps.contains_key(&source));
+    assert_blocked(&app, source, owner, doc);
+    assert_eq!(
+        focused(&app, focus),
+        Some(repository_widget::editor_focus_id(source))
+    );
+    assert_eq!(app.next_lsp_document, next_document);
+
+    // An ordinary later open has no parked position to replay. Opening the
+    // same refused file through Files must not revive the earlier jump.
+    let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+        card: source,
+        path: "main.rs".into(),
+    }));
+    executor.block_on(settle_repository(&mut app, task));
+    let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+        card: source,
+        path: "other.rs".into(),
+    }));
+    executor.block_on(settle_repository(&mut app, task));
+    assert_eq!(
+        runtime(&app, source).cursor_position(),
+        Some(LspPosition::new(0, 0))
+    );
+    assert!(!app.lsp_pending_jumps.contains_key(&source));
+
+    // Retain an actual earlier read, start a newer jump/open, then deliver
+    // the obsolete callback. Its rejected generation must not consume the
+    // newer parked jump or publish an Open from the wrong read.
+    let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+        card: source,
+        path: "main.rs".into(),
+    }));
+    executor.block_on(settle_repository(&mut app, task));
+    let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+        card: source,
+        path: "other.rs".into(),
+    }));
+    let obsolete_read = executor.block_on(repository_message(task));
+    assert!(matches!(
+        &obsolete_read,
+        Message::Repository(RepositoryAction::FileLoadedAt { .. })
+    ));
+    let task = app.update(Message::ContextInspector(
+        InspectorAction::JumpToLspLocation {
+            card: source,
+            path: fixture.root.join("other.rs"),
+            at: LspPosition::new(1, 3),
+            coordinates: LspCoordinates::Utf16,
+        },
+    ));
+    let open = executor.block_on(repository_message(task));
+    assert!(
+        matches!(&open, Message::Repository(RepositoryAction::OpenFile { card, path })
+        if *card == source && path == Path::new("other.rs"))
+    );
+    let current_read = app.update(open);
+    drop(app.update(obsolete_read));
+    assert!(runtime(&app, source).editor_text().is_none());
+    assert_eq!(
+        app.lsp_pending_jumps[&source].path,
+        fixture.root.join("other.rs")
+    );
+    assert_eq!(app.lsp_pending_jumps[&source].at, LspPosition::new(1, 3));
+    let focus = executor.block_on(settle_navigation(&mut app, current_read));
+    assert_eq!(
+        runtime(&app, source).cursor_position(),
+        Some(LspPosition::new(1, 2))
+    );
+    assert!(!app.lsp_pending_jumps.contains_key(&source));
+    assert_eq!(
+        focused(&app, focus),
+        Some(repository_widget::editor_focus_id(source))
+    );
+    assert_blocked(&app, source, owner, doc);
+    assert_eq!(app.lsp.document_version(doc), Some(owner_version));
+    assert_eq!(
+        runtime(&app, owner).editor_text().as_deref(),
+        Some(owner_text.as_str())
+    );
+    assert!(runtime(&app, owner).is_dirty());
+    assert!(!runtime(&app, source).is_dirty());
+    assert_eq!(
+        app.lsp
+            .scalar_position(doc, LspPosition::new(1, 3))
+            .unwrap(),
+        LspPosition::new(1, 3)
+    );
+    assert_eq!(
+        app.lsp
+            .scalar_position(doc, LspPosition::new(2, 3))
+            .unwrap(),
+        LspPosition::new(2, 2)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("other.rs")).unwrap(),
+        TARGET_TEXT
+    );
+    executor.block_on(app.lsp.begin_shutdown());
+}
+
+#[test]
+fn loaded_jump_coordinates_reject_surrogate_splits_and_invalid_lines() {
+    let native: repository_widget::text_editor::Content<cosmic::Renderer> =
+        repository_widget::text_editor::Content::with_text("header\r\nx🦀target\r\n");
+    let snapshot = native.text_snapshot();
+    for source in [
+        repository_widget::LspChangeText::Text("header\r\nx🦀target\r\n".into()),
+        repository_widget::LspChangeText::Snapshot(snapshot),
+    ] {
+        assert_eq!(
+            Cagents::loaded_lsp_scalar_position(&source, LspPosition::new(1, 3)),
+            Ok(LspPosition::new(1, 2))
+        );
+        assert!(
+            Cagents::loaded_lsp_scalar_position(&source, LspPosition::new(1, 2))
+                .unwrap_err()
+                .contains("splits a surrogate pair")
+        );
+        assert!(Cagents::loaded_lsp_scalar_position(&source, LspPosition::new(1, 100)).is_err());
+        assert!(Cagents::loaded_lsp_scalar_position(&source, LspPosition::new(99, 0)).is_err());
+        assert_eq!(
+            Cagents::loaded_lsp_scalar_position(&source, LspPosition::new(2, 0)),
+            Ok(LspPosition::new(2, 0))
+        );
+    }
+}

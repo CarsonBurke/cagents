@@ -11144,8 +11144,7 @@ impl Cagents {
             // no server rather than reporting one that is broken.
             let state = self.lsp_contexts.entry(card).or_default();
             state.context.status = Some(LspStatus::Disabled);
-            self.lsp_pending_jumps.remove(&card);
-            return Task::none();
+            return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
         };
         if self.lsp_contexts.iter().any(|(other, state)| {
             *other != card && state.document.is_some() && state.path.as_deref() == Some(path)
@@ -11155,8 +11154,7 @@ impl Cagents {
             state.context.status = Some(LspStatus::Unavailable {
                 reason: "This file is already open for language tools in another pane. Close that file there, then restart the language server here.".into(),
             });
-            self.lsp_pending_jumps.remove(&card);
-            return Task::none();
+            return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
         }
         let doc = LspDocumentId(self.next_lsp_document);
         self.next_lsp_document += 1;
@@ -11220,6 +11218,15 @@ impl Cagents {
 
     /// Applies a parked jump now that `path` is the card's open buffer.
     fn flush_pending_lsp_jump(&mut self, card: CardId, path: &Path) -> Task<Message> {
+        self.flush_pending_lsp_jump_with_source(card, path, None)
+    }
+
+    fn flush_pending_lsp_jump_with_source(
+        &mut self,
+        card: CardId,
+        path: &Path,
+        source: Option<&repository_widget::LspChangeText>,
+    ) -> Task<Message> {
         // Taken on *any* open, not only a matching one. A jump is answered by
         // the open it asked for or by nothing: leaving it parked would let the
         // caret be yanked minutes later, when the user opens that file
@@ -11235,12 +11242,20 @@ impl Cagents {
             LspCoordinates::Scalar => jump.at,
             // The column arrived in protocol code units because the file was
             // not open when the server answered. It is open now, so the
-            // manager can place it against the text it actually indexes.
+            // loaded buffer can place it even when another independent pane
+            // owns this path's language tools. Never borrow that pane's text.
             LspCoordinates::Utf16 => {
-                let Some(doc) = self.lsp_document(card) else {
-                    return Task::none();
+                let converted = if let Some(source) = source {
+                    Self::loaded_lsp_scalar_position(source, jump.at)
+                } else {
+                    let Some(doc) = self.lsp_document(card) else {
+                        return Task::none();
+                    };
+                    self.lsp
+                        .scalar_position(doc, jump.at)
+                        .map_err(|error| error.to_string())
                 };
-                match self.lsp.scalar_position(doc, jump.at) {
+                match converted {
                     Ok(at) => at,
                     Err(error) => {
                         self.status = Some(TransientNotice::warning(format!(
@@ -11252,6 +11267,62 @@ impl Cagents {
             }
         };
         self.move_lsp_caret(card, at)
+    }
+
+    /// Convert only the destination buffer's text, without acquiring an LSP
+    /// attachment or serializing a normal native snapshot's other lines.
+    fn loaded_lsp_scalar_position(
+        source: &repository_widget::LspChangeText,
+        at: LspPosition,
+    ) -> Result<LspPosition, String> {
+        let outside = || {
+            format!(
+                "line {} UTF-16 character {} is outside this buffer",
+                at.line, at.character
+            )
+        };
+        let convert = |line: &str| {
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let mut units = 0;
+            let mut scalars = 0;
+            for character in line.chars() {
+                if units == at.character {
+                    return Ok(LspPosition::new(at.line, scalars));
+                }
+                let width = character.len_utf16() as u32;
+                if at.character > units && at.character < units + width {
+                    return Err(format!(
+                        "UTF-16 offset {} on line {} splits a surrogate pair",
+                        at.character, at.line
+                    ));
+                }
+                units += width;
+                scalars += 1;
+            }
+            if units == at.character {
+                Ok(LspPosition::new(at.line, scalars))
+            } else {
+                Err(outside())
+            }
+        };
+        let from_text = |text: &str| {
+            text.split('\n')
+                .nth(at.line as usize)
+                .ok_or_else(outside)
+                .and_then(convert)
+        };
+        match source {
+            repository_widget::LspChangeText::Text(text) => from_text(text),
+            repository_widget::LspChangeText::Snapshot(source)
+                if source.protocol_compatible_lines() =>
+            {
+                source
+                    .line(at.line as usize)
+                    .ok_or_else(outside)
+                    .and_then(|line| convert(&line.text))
+            }
+            repository_widget::LspChangeText::Snapshot(source) => from_text(&source.text()),
+        }
     }
 
     /// Places the caret and gives the editor the keyboard.
