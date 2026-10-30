@@ -2852,15 +2852,40 @@ pub(crate) fn read_migration_session_at(
                 });
             }
             let (origin, listener, predecessor) = terminal_provenance_columns(version);
-            // Check lengths in SQLite before allocating any descriptor fields
+            // The loader parses this raw UUID before looking up a transcript
+            // by its canonical spelling. Bound the raw String first, then
+            // budget the same canonical transcript key in this read snapshot.
+            let raw: Option<Option<String>> = connection
+                .query_row(
+                    "SELECT length(CAST(terminal_id AS BLOB)) <= ?2, terminal_id
+                     FROM terminal_recipes WHERE card_id = ?1",
+                    params![card.to_string(), MAX_DESCRIPTOR_BYTES as u64],
+                    |row| {
+                        if row.get::<_, bool>(0)? {
+                            row.get::<_, String>(1).map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    },
+                )
+                .optional()?;
+            let Some(Some(raw)) = raw else {
+                return Err(StoreError::corrupt_row(
+                    format!("migration terminal card {card}"),
+                    "missing or oversized immutable descriptor",
+                ));
+            };
+            let terminal: TerminalId = parse_id("terminal", &raw)?;
+            drop(raw);
+            // Check lengths in SQLite before allocating the remaining fields
             // in Rust, including the nullable provenance and transcript path.
             let bounded:Option<bool>=connection.query_row(
                 &format!("SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
                     + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
                     + coalesce(length(CAST({origin} AS BLOB)),0) + coalesce(length(CAST({listener} AS BLOB)),0)
                     + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
-                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1"),
-                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
+                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=?3 WHERE r.card_id=?1"),
+                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64,terminal.to_string()],|row|row.get(0)).optional()?;
             if bounded != Some(true) {
                 return Err(StoreError::corrupt_row(
                     format!("migration terminal card {card}"),
@@ -5574,79 +5599,6 @@ fn load_terminal(
     Ok(terminal)
 }
 
-/// Decode the exact row inside an existing read-only inspection transaction.
-/// Terminal ownership lives in normalized tables, not cards.content_json.
-/// The caller must read and validate this card's kind/existence in that same
-/// transaction; this helper never opens a store or changes its schema/state.
-pub(crate) fn read_migration_session_at(
-    connection: &Connection,
-    card: CardId,
-    kind: &str,
-    content: Option<&str>,
-) -> Result<CardKind> {
-    const MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
-    match kind {
-        "terminal" => {
-            // The loader parses this raw UUID before looking up a transcript
-            // by its canonical spelling. Bound the raw String first, then
-            // budget the same canonical transcript key in this read snapshot.
-            let raw: Option<Option<String>> = connection
-                .query_row(
-                    "SELECT length(CAST(terminal_id AS BLOB)) <= ?2, terminal_id
-                     FROM terminal_recipes WHERE card_id = ?1",
-                    params![card.to_string(), MAX_DESCRIPTOR_BYTES as u64],
-                    |row| {
-                        if row.get::<_, bool>(0)? {
-                            row.get::<_, String>(1).map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    },
-                )
-                .optional()?;
-            let Some(Some(raw)) = raw else {
-                return Err(StoreError::corrupt_row(
-                    format!("migration terminal card {card}"),
-                    "missing or oversized immutable descriptor",
-                ));
-            };
-            let terminal: TerminalId = parse_id("terminal", &raw)?;
-            drop(raw);
-            // Check lengths in SQLite before allocating the remaining fields
-            // in Rust, including the nullable provenance and transcript path.
-            let bounded:Option<bool>=connection.query_row(
-                "SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
-                    + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
-                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
-                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
-                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=?3 WHERE r.card_id=?1",
-                params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64,terminal.to_string()],|row|row.get(0)).optional()?;
-            if bounded != Some(true) {
-                return Err(StoreError::corrupt_row(
-                    format!("migration terminal card {card}"),
-                    "missing or oversized immutable descriptor",
-                ));
-            }
-            load_terminal_record(connection, card).map(CardKind::Terminal)
-        }
-        "chat" => from_json(
-            "migration chat",
-            content
-                .filter(|value| value.len() <= MAX_DESCRIPTOR_BYTES)
-                .ok_or_else(|| {
-                    StoreError::corrupt_row(
-                        format!("migration chat card {card}"),
-                        "missing or oversized session descriptor",
-                    )
-                })?,
-        )
-        .map(CardKind::Chat),
-        _ => Err(StoreError::InvalidState(
-            "Migration inspection requires a saved native or terminal pane".into(),
-        )),
-    }
-}
-
 fn load_terminal_record(connection: &Connection, card_id: CardId) -> Result<TerminalSession> {
     load_terminal_record_at_schema(connection, card_id, CURRENT_SCHEMA_VERSION)
 }
@@ -6492,6 +6444,9 @@ mod tests {
              CREATE TABLE transcript_metadata(terminal_id TEXT PRIMARY KEY,path_json TEXT);",
             )
             .unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
+            .unwrap();
         let state = workspace_with_terminal(&boot("migration-inspection"));
         let card = state.cards[0].id;
         let CardKind::Terminal(mut terminal) = state.cards[0].kind.clone() else {
@@ -6605,6 +6560,9 @@ mod tests {
              owned_codex_listener TEXT, predecessor TEXT);
              CREATE TABLE transcript_metadata(terminal_id TEXT PRIMARY KEY,path_json TEXT);",
             )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
             .unwrap();
         let card = CardId::new();
         connection
