@@ -2288,6 +2288,9 @@ mod tests {
                             app.window_height = 900.0;
                             app.core.set_main_window_id(Some(window::Id::RESERVED));
                             app.chrome_ui.projects_collapsed = compact;
+                            // This helper starts with the inspector open. The
+                            // interactive header belongs to the unobscured shell.
+                            app.context_inspector_open = false;
                             app.channel_work.main = work;
                             app.channel_work.title = title.into();
                             app.workspace_model.channels[0].title = title.into();
@@ -2376,6 +2379,11 @@ mod tests {
                             app.workspace.resize_viewport(viewport);
                             app.refresh_sidebar_channels();
                             drop(app.sync_chrome());
+                            assert!(!app.context_inspector_open);
+                            assert!(app.context_inspector_transition.is_none());
+                            assert!(!app.context_inspector_visible());
+                            assert!(app.context_inspector_mount().is_none());
+                            assert!(!app.shell_inputs_blocked());
                             if let Some(id) = focused {
                                 let actual = app.card_display_title(app.card_state(id).unwrap());
                                 if scene == "renamed-chat"
@@ -2452,8 +2460,14 @@ mod tests {
                                             && node.node().label() == Some(name.as_str())
                                     })
                                     .collect::<Vec<_>>();
-                                assert_eq!(controls.len(), 1);
-                                assert_eq!(controls[0].node().is_selected(), Some(selected));
+                                assert_eq!(
+                                    controls.len(),
+                                    1,
+                                    "interactive {label} in {scene}/{compact}/{width}/{work}"
+                                );
+                                // Selection keeps its visual style while the
+                                // active surface publishes no navigation action.
+                                assert_eq!(controls[0].node().is_disabled(), selected);
                                 let b = controls[0].node().bounds().unwrap();
                                 assert!(
                                     b.x0 >= 0.0
@@ -2512,6 +2526,13 @@ mod tests {
                                         && bounds.y + bounds.height <= 900.0
                                 );
                             }
+                            let selected = navigation[usize::from(work)];
+                            let selected_press =
+                                click(&mut frame, &mut renderer, selected.center());
+                            assert!(
+                                selected_press.is_empty(),
+                                "the selected surface must not navigate: {selected_press:?}"
+                            );
                             let name = format!(
                                 "{} for channel {title}",
                                 if work { "Conversations" } else { "Work" }
