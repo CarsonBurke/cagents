@@ -3,6 +3,7 @@
 use cagents::{
     model::*,
     persistence::{SnapshotBase, StateStore},
+    repository::{CancellationToken, RepositoryService},
     session::SessionRuntime,
 };
 use std::{
@@ -62,8 +63,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("Private environment directories must have mode0700".into());
         }
     }
-    let repository = root.join("project");
-    private_directory(&root, &repository.join(".git"), owner)?;
+    let checkout = root.join("project");
+    private_directory(&root, &checkout.join(".git"), owner)?;
+    let discovered =
+        RepositoryService::system("git").discover(&checkout, &CancellationToken::new())?;
+    let repository = discovered.common_dir;
+    private_directory(&root, &repository, owner)?;
+    if repository != checkout.join(".git")
+        || discovered.git_dir != repository
+        || discovered.worktree_root.as_ref() != Some(&checkout)
+        || discovered.is_bare
+    {
+        return Err("The private checkout's discovered Git identity changed".into());
+    }
     let database = SessionRuntime::default_database_path()?;
     let data = PathBuf::from(std::env::var_os("XDG_DATA_HOME").ok_or("Private data required")?);
     if !database.starts_with(&data) || database == data || fs::symlink_metadata(&database).is_ok() {
@@ -121,7 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         id: project,
         generation: 0,
         name: "Private review fixture".into(),
-        repository,
+        repository: repository.clone(),
         kind: ProjectKind::Git,
         existence: Existence::Open,
     })?;
@@ -135,6 +147,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // create_new atomically refuses existing regular files and symlinks.
     for (name, contents) in [
         ("review-workspace-id", workspace.id.to_string()),
+        (
+            "review-repository-path",
+            repository.to_string_lossy().into_owned(),
+        ),
         (
             "review-database-path",
             database.to_string_lossy().into_owned(),

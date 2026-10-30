@@ -67,8 +67,32 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
     git('update-ref', 'refs/remotes/origin/fixture/native-review', head_oid)
     raw_config = subprocess.check_output(['git', '-C', str(project), 'config', '--get', 'remote.origin.url'], env=env, text=True).strip()
     assert raw_config == raw_origin
+    repository_probe = ['git', '-C', str(project), 'rev-parse', '--path-format=absolute', '--git-common-dir']
+    discovered = subprocess.check_output(repository_probe, env=env, text=True, timeout=5)
+    repository = Path(discovered.removesuffix('\n'))
+    assert discovered == str(repository) + '\n' and repository == project / '.git'
+    assert repository.is_absolute() and repository.resolve(strict=True) == repository
+    current = repository
+    while True:
+        info = current.lstat()
+        assert stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid()
+        if current == root:
+            break
+        assert current.is_relative_to(root) and current != current.parent
+        current = current.parent
     data_source = api['control'] / '.github/qualification/review-data.json'
     data = json.loads(data_source.read_text().replace('$BASE_OID', base_oid).replace('$HEAD_OID', head_oid))
+    required = {'discover-repository', 'discover-unauthenticated', 'browser-list', 'review-context',
+                'review-metadata', 'review-files', 'conversation-reviewThreads',
+                'conversation-comments', 'conversation-reviews'}
+    background = {'daemon-authored-open', 'daemon-authored-all'}
+    contracts = {case['case']: case for case in data['allowlist']}
+    assert len(contracts) == len(data['allowlist']) and set(contracts) == required | background
+    cwd_bindings = {'$REPOSITORY': str(repository), '$WORKTREE': str(project), '$CHECKOUT': str(checkout)}
+    for name, case in contracts.items():
+        assert case['required'] is (name in required)
+        assert case['consumer'] == ('daemon-background' if name in background else 'native-review')
+        case['cwd'] = [cwd_bindings[value] for value in case['cwd']]
     directory, binary = root / 'gh-data', root / 'bin'
     directory.mkdir(mode=0o700)
     binary.mkdir(mode=0o700)
@@ -83,13 +107,19 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
             if case['response'] == name:
                 case['response_sha256'] = hashlib.sha256(payload).hexdigest()
     private_write(directory / 'manifest.json', (json.dumps({
-        'allowlist': data['allowlist'], 'allowed_cwd': [str(checkout), str(project)]}, indent=2) + '\n').encode())
+        'allowlist': data['allowlist'], 'allowed_cwd': [str(checkout), str(project), str(repository)],
+        'repository': str(repository), 'working_checkout': str(project),
+        'ui_executable': str((target / 'dev-runtime/cagents-ui').resolve(strict=True)),
+        'daemon_executable': str((target / 'dev-runtime/cagentsd').resolve(strict=True))}, indent=2) + '\n').encode())
     private_write(binary / 'gh', (api['control'] / '.github/qualification/private-review-gh.py').read_bytes(), 0o500)
     private_write(root / 'gh-calls.jsonl', b'')
     env['PATH'] = str(binary) + os.pathsep + os.environ['PATH']
     trace = root / 'git-trace.jsonl'
     env['GIT_TRACE2_EVENT'] = str(trace)
     run([str(helper), str(root)], env=env)
+    repository_receipt = root / 'review-repository-path'
+    repository_receipt_identity = api['private_inspection_file'](root, repository_receipt)
+    assert repository_receipt.read_text() == str(repository)
     with (out / (label + '-runner.log')).open('w') as log:
         ui = subprocess.Popen(['scripts/run-development', '--browserless', '--debug', '--log-file',
                                str(out / (label + '-ui.log'))], cwd=checkout, env=env,
@@ -113,6 +143,9 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
               'script_sha256': api['digest'](binary / 'gh'), 'data_source_sha256': api['digest'](data_source),
               'manifest_sha256': api['digest'](directory / 'manifest.json'),
               'base_oid': base_oid, 'head_oid': head_oid, 'raw_origin': raw_origin,
+              'working_checkout': str(project), 'repository': str(repository),
+              'repository_probe': repository_probe, 'repository_receipt': repository_receipt_identity,
+              'daemon_executable': str((target / 'dev-runtime/cagentsd').resolve(strict=True)),
               'local_origin': str(origin), 'discovery': 'Unauthenticated; synthetic viewer is read DTO data only.'}
     (out / (label + '-launch.json')).write_text(json.dumps(launch, indent=2) + '\n')
     run(['xdotool', 'windowactivate', '--sync', window])
@@ -123,7 +156,7 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
         # The global inspector and this review's internal file panel are
         # separate. Observe their actual controls; do not infer toggle state.
         nodes = live_tree(pid)
-        header_names = tuple('Pull requests pane Private review fixture, ' + str(project) + ', ' + state
+        header_names = tuple('Pull requests pane Private review fixture, ' + str(repository) + ', ' + state
                              for state in ('focused', 'not focused'))
         controls = {}
         for key, names, role, present in [
@@ -153,7 +186,7 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
                                  'bounds': [bounds.x, bounds.y, bounds.width, bounds.height],
                                  'enabled': enabled}
         return {'panel_controls_visible': panel_visible, 'controls': controls,
-                'repository': str(project), 'internal_file_panel_open_control': 'Hide review files'}
+                'repository': str(repository), 'internal_file_panel_open_control': 'Hide review files'}
     setup_before = wait(lambda: snapshot(lambda: inspector_setup(True)))
     setup_focus = int(subprocess.check_output(['xdotool', 'getwindowfocus'], text=True, timeout=5).strip())
     setup_pid = int(subprocess.check_output(['xdotool', 'getwindowpid', str(setup_focus)], text=True, timeout=5).strip())
@@ -269,9 +302,15 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
         assert request['event'] == 'request' and delivered['event'] == 'delivered'
         assert {k: v for k, v in request.items() if k != 'event'} == {k: v for k, v in delivered.items() if k != 'event'}
         assert request['case'] != 'UNEXPECTED' and request['exit_code'] == 0
+        case = contracts[request['case']]
+        assert request['argv'] == case['argv'] and request['cwd'] in case['cwd']
+        assert request['response'] == str(directory / case['response'])
+        assert request['response_sha256'] == case['response_sha256']
         assert request['script_sha256'] == launch['script_sha256']
         assert any(parent['pid'] == pid and parent.get('executable') == launch['executable'] for parent in request['ancestry'])
-    required = {case['case'] for case in data['allowlist']}
+        if request['case'] in background:
+            assert any(parent['pid'] == request['ppid'] and parent.get('parent') == pid
+                       and parent.get('executable') == launch['daemon_executable'] for parent in request['ancestry'])
     assert required <= {call['case'] for call in calls}, 'Native flow never received all exact fixture DTOs'
     (out / (label + '-gh-calls.jsonl')).write_bytes((root / 'gh-calls.jsonl').read_bytes())
     traces = [json.loads(line) for line in trace.read_text().splitlines()]
@@ -288,6 +327,8 @@ def exercise(api, checkout, helper, variant, revision, expected_tree):
     assert subprocess.check_output(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}'], text=True).strip() == expected_tree
     assert not subprocess.check_output(['git', '-C', str(checkout), 'status', '--porcelain=v1'], text=True).strip()
     result = {'launch': launch, 'frames': frames, 'delivered_cases': sorted(required),
+              'optional_background_cases': sorted(background),
+              'delivered_background_cases': sorted(background & {call['case'] for call in calls}),
               'pointer_selection': pointer_selection, 'before_keyboard': before_keyboard,
               'keyboard_selection': keyboard_selection, 'keyboard_started_boottime_ns': keyboard_started,
               'scope': 'Actual native saved-card/list/review/conversation/count/hover/row interaction with synthetic unauthenticated data. Independent pixel UX review required; no real GitHub auth/tracking or mutations claimed.'}

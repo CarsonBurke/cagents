@@ -10,10 +10,15 @@
         "nameWithOwner,url"
       ],
       "response": "repo.json",
-      "cwd": "$ARM/project",
+      "cwd": [
+        "$REPOSITORY",
+        "$WORKTREE"
+      ],
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "required": true,
+      "consumer": "native-review"
     },
     {
       "case": "discover-unauthenticated",
@@ -29,7 +34,12 @@
       "response": "auth-none.json",
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
     },
     {
       "case": "browser-list",
@@ -48,7 +58,12 @@
       "response": "list.json",
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
     },
     {
       "case": "review-context",
@@ -69,7 +84,12 @@
       "response": "context.json",
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
     },
     {
       "case": "review-metadata",
@@ -85,7 +105,12 @@
       "response": "pr.json",
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
     },
     {
       "case": "review-files",
@@ -106,7 +131,12 @@
       "response": "files.json",
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
     },
     {
       "case": "conversation-reviewThreads",
@@ -127,7 +157,12 @@
       "response": "threads.json",
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
     },
     {
       "case": "conversation-comments",
@@ -148,7 +183,12 @@
       "response": "comments.json",
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
     },
     {
       "case": "conversation-reviews",
@@ -169,7 +209,68 @@
       "response": "reviews.json",
       "exit_code": 0,
       "stderr": "",
-      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline"
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "daemon-authored-open",
+      "argv": [
+        "pr",
+        "list",
+        "-R",
+        "github.com/fixture-native/tooltip-data",
+        "--author",
+        "@me",
+        "--state",
+        "open",
+        "--search",
+        "sort:updated-desc",
+        "--limit",
+        "50",
+        "--json",
+        "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url,reviewDecision,statusCheckRollup"
+      ],
+      "response": "authored-empty.json",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": false,
+      "consumer": "daemon-background",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact synthetic empty JSON array plus newline; no authenticated @me identity"
+    },
+    {
+      "case": "daemon-authored-all",
+      "argv": [
+        "pr",
+        "list",
+        "-R",
+        "github.com/fixture-native/tooltip-data",
+        "--author",
+        "@me",
+        "--state",
+        "all",
+        "--search",
+        "sort:updated-desc",
+        "--limit",
+        "100",
+        "--json",
+        "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url"
+      ],
+      "response": "authored-empty.json",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": false,
+      "consumer": "daemon-background",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact synthetic empty JSON array plus newline; no authenticated @me identity"
     }
   ],
   "responses": {
@@ -446,6 +547,7 @@
           }
         }
       }
-    }
+    },
+    "authored-empty.json": []
   }
 }

@@ -48,15 +48,27 @@ def main():
         assert stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
         assert stat.S_IMODE(info.st_mode) == 0o700
     config = json.loads(private_file(root / 'gh-data' / 'manifest.json'))
+    repository, checkout = Path(config['repository']), Path(config['working_checkout'])
+    assert checkout == root / 'project' and repository == checkout / '.git'
+    assert repository.resolve(strict=True) == repository
+    for directory in (checkout, repository):
+        info = directory.lstat()
+        assert stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid()
     argv, cwd = sys.argv[1:], str(Path.cwd())
     choices = [case for case in config['allowlist'] if case['argv'] == argv]
     case = choices[0] if len(choices) == 1 else None
-    allowed_cwd = cwd in config['allowed_cwd'] and (
-        case is None or case['case'] != 'discover-repository' or cwd == str(root / 'project'))
+    allowed_cwd = case is not None and cwd in config['allowed_cwd'] and cwd in case['cwd']
     if not allowed_cwd:
         case = None
+    parents = ancestry()
+    if case and case['consumer'] == 'daemon-background':
+        daemon = next((parent for parent in parents if parent['pid'] == os.getppid()
+                       and parent.get('executable') == config['daemon_executable']), None)
+        if daemon is None or not any(parent['pid'] == daemon['parent']
+                                     and parent.get('executable') == config['ui_executable'] for parent in parents):
+            case = None
     record = {'argv': argv, 'cwd': cwd, 'pid': os.getpid(), 'ppid': os.getppid(),
-              'ancestry': ancestry(), 'monotonic': time.monotonic(), 'unix_ns': time.time_ns(),
+              'ancestry': parents, 'monotonic': time.monotonic(), 'unix_ns': time.time_ns(),
               'script_sha256': hashlib.sha256(script.read_bytes()).hexdigest(),
               'case': case['case'] if case else 'UNEXPECTED',
               'scope': 'Synthetic local read data; discovery remains unauthenticated.'}
