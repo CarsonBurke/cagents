@@ -573,5 +573,183 @@ class ValidationCheckout(unittest.TestCase):
                 self.refused(code, **arguments)
 
 
+class ScriptContractsApplicability(unittest.TestCase):
+    """Run the exact CI block against private fake pairs, without Git or helpers."""
+
+    pairs = (
+        ("validation checkout", "scripts/prepare-validation-checkout", "tests/prepare_validation_checkout.py"),
+        ("process custody", "scripts/qualification/process_custody.py", "tests/qualification/test_process_custody.py"),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        workflow = HELPER.parents[1] / ".github/workflows/script-contracts.yml"
+        lines = workflow.read_text().splitlines(keepends=True)
+        step = "      - name: Check validation checkout and process custody contracts\n"
+        starts = [index for index, line in enumerate(lines) if line == step]
+        if len(starts) != 1 or lines[starts[0] + 1] != "        run: |\n":
+            raise AssertionError("expected exactly one inline applicability step")
+        body = []
+        for line in lines[starts[0] + 2:]:
+            if line.startswith("          "):
+                body.append(line[10:])
+            elif not line.strip():
+                body.append("\n")
+            else:
+                break
+        cls.run_block = "".join(body)
+        if not cls.run_block.startswith("python3 -I -B - <<'PY'\n"):
+            raise AssertionError("applicability step must run its inline isolated Python")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="script-contract-applicability-", dir="/var/tmp")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def case(self, name):
+        root = self.root / name
+        root.mkdir(mode=0o700)
+        return root
+
+    def pair(self, root, index, *, exit_code=0):
+        name, source, fixture = self.pairs[index]
+        source = root / source
+        fixture = root / fixture
+        source.parent.mkdir(parents=True, exist_ok=True)
+        fixture.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("fixture source placeholder; never execute this file\n")
+        fixture.write_text(
+            "import json\nfrom pathlib import Path\nimport sys\n"
+            f"entry = {{'fixture': {name!r}, 'arguments': sys.argv[1:], "
+            "'isolated': sys.flags.isolated, 'bytecode': sys.flags.dont_write_bytecode}\n"
+            "with Path('calls.jsonl').open('a') as output:\n"
+            "    output.write(json.dumps(entry) + '\\n')\n"
+            f"raise SystemExit({exit_code})\n"
+        )
+
+    def invoke_block(self, root):
+        # The block is passed unchanged to a shell; the only executed Python
+        # fixtures are those this test placed beneath the private cwd. No env
+        # override, helper import, real Git repository or build is involved.
+        return subprocess.run(
+            ["/bin/sh", "-e", "-c", self.run_block], cwd=root,
+            capture_output=True, text=True, timeout=15,
+        )
+
+    def calls(self, root):
+        path = root / "calls.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def expected_calls(self, *indexes):
+        return [
+            {"fixture": self.pairs[index][0], "arguments": ["-v"], "isolated": 1, "bytecode": 1}
+            for index in indexes
+        ]
+
+    def test_old_head_with_both_pairs_absent_is_explicitly_not_applicable(self):
+        root = self.case("old-head")
+        result = self.invoke_block(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [
+            f"Not applicable: {name} (source and fixture both absent at this head)"
+            for name, _, _ in self.pairs
+        ])
+        self.assertEqual(self.calls(root), [])
+        self.assertEqual(list(root.iterdir()), [])
+
+    def test_complete_pairs_run_in_order_with_existing_isolated_verbose_argv(self):
+        root = self.case("current-head")
+        self.pair(root, 0)
+        self.pair(root, 1)
+        result = self.invoke_block(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs])
+        self.assertEqual(self.calls(root), self.expected_calls(0, 1))
+
+    def test_each_partial_pair_fails_instead_of_being_skipped(self):
+        for index, (_, source, fixture) in enumerate(self.pairs):
+            for missing in (source, fixture):
+                with self.subTest(pair=index, missing=missing):
+                    root = self.case(f"partial-{index}-{Path(missing).name}")
+                    self.pair(root, index)
+                    (root / missing).unlink()
+                    result = self.invoke_block(root)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("Incomplete contract pair:", result.stderr)
+                    self.assertEqual(self.calls(root), [])
+
+    def test_each_pair_can_be_applicable_independently(self):
+        for index in range(len(self.pairs)):
+            with self.subTest(pair=index):
+                root = self.case(f"independent-{index}")
+                self.pair(root, index)
+                result = self.invoke_block(root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls(root), self.expected_calls(index))
+                self.assertIn(f"Checking: {self.pairs[index][0]}\n", result.stdout)
+                self.assertIn(f"Not applicable: {self.pairs[1 - index][0]} ", result.stdout)
+
+    def test_original_failure_status_stops_later_pairs(self):
+        for index, exit_code in ((0, 7), (1, 9)):
+            with self.subTest(failing_pair=index):
+                root = self.case(f"failure-{index}")
+                self.pair(root, 0, exit_code=exit_code if index == 0 else 0)
+                self.pair(root, 1, exit_code=exit_code if index == 1 else 0)
+                result = self.invoke_block(root)
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertEqual(self.calls(root), self.expected_calls(*range(index + 1)))
+                if index == 0:
+                    self.assertNotIn("Checking: process custody", result.stdout)
+
+    def test_symlink_and_dangling_pair_members_fail_without_following_them(self):
+        for index, (_, source, fixture) in enumerate(self.pairs):
+            for member_index, member in enumerate((source, fixture)):
+                for dangling in (False, True):
+                    with self.subTest(pair=index, member=member, dangling=dangling):
+                        root = self.case(f"symlink-{index}-{member_index}-{dangling}")
+                        self.pair(root, index)
+                        path = root / member
+                        target = root / "private-link-target"
+                        if not dangling:
+                            target.write_bytes(path.read_bytes())
+                        path.unlink()
+                        path.symlink_to(target)
+                        result = self.invoke_block(root)
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn("Invalid contract path:", result.stderr)
+                        self.assertTrue(path.is_symlink())
+                        self.assertEqual(self.calls(root), [])
+
+    def test_nonregular_members_and_parent_components_fail_closed(self):
+        for index, (_, source, fixture) in enumerate(self.pairs):
+            for member_index, member in enumerate((source, fixture)):
+                with self.subTest(pair=index, directory_member=member):
+                    root = self.case(f"directory-{index}-{member_index}")
+                    self.pair(root, index)
+                    path = root / member
+                    path.unlink()
+                    path.mkdir()
+                    result = self.invoke_block(root)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("Invalid contract path:", result.stderr)
+                    self.assertEqual(self.calls(root), [])
+        for index, (_, source, fixture) in enumerate(self.pairs):
+            for member_index, member in enumerate((source, fixture)):
+                for kind in ("file", "symlink"):
+                    with self.subTest(pair=index, parent_of=member, kind=kind):
+                        root = self.case(f"parent-{index}-{member_index}-{kind}")
+                        parent = root / Path(member).parts[0]
+                        if kind == "file":
+                            parent.write_text("non-directory fixture parent\n")
+                        else:
+                            target = root / "private-directory-target"
+                            target.mkdir()
+                            parent.symlink_to(target, target_is_directory=True)
+                        result = self.invoke_block(root)
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn("Invalid contract path:", result.stderr)
+                        self.assertEqual(self.calls(root), [])
+
+
 if __name__ == "__main__":
     unittest.main()
