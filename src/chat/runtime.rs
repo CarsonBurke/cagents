@@ -3783,6 +3783,142 @@ mod tests {
     }
 
     #[test]
+    fn codex_history_keeps_the_latest_name_in_a_page_without_rewinding_known_names() {
+        for old_name in ["Scout", " \t\n"] {
+            for failed_hydration in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut adapter = codex_child_name_adapter(directory.path());
+                let mut state = Snapshot::default();
+                let mut indices = BTreeMap::new();
+                let hello = adapter.initialize().unwrap();
+                let initialized = adapter.receive(json!({"id":hello.writes[0]["id"],"result":{
+                    "codexHome":directory.path().to_str().unwrap(),"userAgent":"codex-history-name-fixture"
+                }})).unwrap();
+                let attach = initialized
+                    .writes
+                    .iter()
+                    .find(|frame| frame["method"] == "thread/resume")
+                    .unwrap();
+                let attached = adapter
+                    .receive(json!({"id":attach["id"],"result":{
+                        "thread":{"id":"parent-exact","status":{"type":"idle"}},
+                        "initialTurnsPage":{"data":[],"nextCursor":"older"}
+                    }}))
+                    .unwrap();
+                let skills = initialized
+                    .writes
+                    .iter()
+                    .find(|frame| frame["method"] == "skills/list")
+                    .unwrap();
+                let ready = adapter
+                    .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+                    .unwrap();
+                assert!(ready.events.contains(&Event::Ready(true)));
+                for event in attached.events.into_iter().chain(ready.events) {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                let turn = |id: &str, name: &str| {
+                    json!({
+                        "id":id,"status":"completed","itemsView":"full","items":[{
+                            "id":format!("spawn-{id}"),"type":"collabAgentToolCall","tool":"spawnAgent",
+                            "status":"completed","senderThreadId":"parent-exact","receiverThreadIds":["child-exact"],
+                            "agentsStates":{"child-exact":{"agentNickname":name}}
+                        }]
+                    })
+                };
+                let request = adapter.command(Command::LoadEarlier).unwrap();
+                let history = adapter.receive(json!({"id":request.writes[0]["id"],"result":{
+                    "data":[turn("newest", " \t\n"),turn("renamed", "Navigator"),turn("oldest", old_name)],
+                    "nextCursor":"older-still"
+                }})).unwrap();
+                let names = history
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Subagent { id, kind, .. }
+                            if id == "child-exact" && !kind.is_empty() =>
+                        {
+                            Some(kind.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    if old_name == "Scout" {
+                        vec!["Scout", "Navigator"]
+                    } else {
+                        vec!["Navigator"]
+                    }
+                );
+                let resumes = history
+                    .writes
+                    .iter()
+                    .filter(|frame| {
+                        frame["method"] == "thread/resume"
+                            && frame["params"]["threadId"] == "child-exact"
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    resumes.len(),
+                    1,
+                    "the original child hydration request must be retained"
+                );
+                let resume = resumes[0]["id"].clone();
+                for event in history.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents.len(), 1);
+                assert_eq!(state.subagents[0].kind, "Navigator");
+                let response = if failed_hydration {
+                    json!({"id":resume,"error":{"message":"Child hydration unavailable"}})
+                } else {
+                    json!({"id":resume,"result":{
+                        "thread":{"id":"child-exact","status":{"type":"idle"}},
+                        "initialTurnsPage":{"data":[],"nextCursor":null}
+                    }})
+                };
+                for event in adapter.receive(response).unwrap().events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents[0].kind, "Navigator");
+                let older = adapter.command(Command::LoadEarlier).unwrap();
+                let older = adapter
+                    .receive(json!({"id":older.writes[0]["id"],"result":{
+                        "data":[turn("older-again", "Earlier name")],"nextCursor":"oldest-page"
+                    }}))
+                    .unwrap();
+                assert!(!older.events.iter().any(|event| matches!(event,
+                    Event::Subagent { kind, .. } if !kind.is_empty()
+                )));
+                for event in older.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents[0].kind, "Navigator");
+                let live = adapter
+                    .receive(json!({"method":"thread/started","params":{"thread":{
+                        "id":"child-exact","parentThreadId":"parent-exact","agentNickname":"Pilot"
+                    }}}))
+                    .unwrap();
+                for event in live.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                let older = adapter.command(Command::LoadEarlier).unwrap();
+                let older = adapter.receive(json!({"id":older.writes[0]["id"],"result":{
+                    "data":[turn("older-live-new", "Stale rename"),turn("older-live-old", "Stale name")],
+                    "nextCursor":null
+                }})).unwrap();
+                for event in older.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents.len(), 1);
+                assert_eq!(state.subagents[0].id, "child-exact");
+                assert_eq!(state.subagents[0].kind, "Pilot");
+            }
+        }
+    }
+
+    #[test]
     fn codex_child_hydration_backfills_only_reported_nonblank_nicknames() {
         for (nickname, expected) in [
             (Value::Null, ""),

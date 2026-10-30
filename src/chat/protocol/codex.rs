@@ -12,7 +12,10 @@ use crate::chat::{
 };
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 mod images;
 
@@ -675,7 +678,7 @@ impl Codex {
         metadata: &Value,
         step: &mut Step,
     ) -> Result<(), String> {
-        self.discover_child_metadata(id, metadata, ChildNameOrigin::Current, step)
+        self.discover_child_metadata(id, metadata, ChildNameOrigin::Current, false, step)
     }
 
     fn discover_child_metadata(
@@ -683,6 +686,7 @@ impl Codex {
         id: &str,
         metadata: &Value,
         name_origin: ChildNameOrigin,
+        replace_page_name: bool,
         step: &mut Step,
     ) -> Result<(), String> {
         if self.is_child || id.is_empty() || id.len() > 256 || self.thread.as_deref() == Some(id) {
@@ -748,14 +752,15 @@ impl Codex {
             child.subagent_status = Some(status);
         }
         // History and list replies can arrive after a newer live name. They
-        // may fill an unknown name, but only live metadata or exact hydration
-        // can replace a name already shown.
+        // may fill an unknown name. A page can advance names it learned itself
+        // in chronological order; prior pages and live names remain protected.
         let nickname = agent_nickname(metadata).filter(|_| {
             name_origin == ChildNameOrigin::Current
-                || self
-                    .children
-                    .get(id)
-                    .is_some_and(|child| child.subagent_name_origin == ChildNameOrigin::Unknown)
+                || self.children.get(id).is_some_and(|child| {
+                    child.subagent_name_origin == ChildNameOrigin::Unknown
+                        || (replace_page_name
+                            && child.subagent_name_origin == ChildNameOrigin::Historical)
+                })
         });
         if nickname.is_some()
             && let Some(child) = self.children.get_mut(id)
@@ -1264,6 +1269,7 @@ impl Codex {
 
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
         let mut items = Vec::new();
+        let mut page_names = BTreeSet::new();
         for turn in array(page, "data")?.iter().rev() {
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
@@ -1313,12 +1319,23 @@ impl Codex {
                             metadata.remove("status");
                             metadata.remove("model");
                         }
+                        let unknown_name = self.children.get(id).is_none_or(|child| {
+                            child.subagent_name_origin == ChildNameOrigin::Unknown
+                        });
                         self.discover_child_metadata(
                             id,
                             &metadata,
                             ChildNameOrigin::Historical,
+                            page_names.contains(id),
                             step,
                         )?;
+                        if unknown_name
+                            && self.children.get(id).is_some_and(|child| {
+                                child.subagent_name_origin == ChildNameOrigin::Historical
+                            })
+                        {
+                            page_names.insert(id.to_owned());
+                        }
                     }
                 }
                 let mut windows = BTreeMap::new();
@@ -2585,6 +2602,7 @@ impl Adapter for Codex {
                                     id,
                                     thread,
                                     ChildNameOrigin::Historical,
+                                    false,
                                     &mut step,
                                 )?;
                             }
