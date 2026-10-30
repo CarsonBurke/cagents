@@ -170,6 +170,25 @@ class PrepareDeliveryTask(unittest.TestCase):
         self.assertIn("HOST parents @ " + COMPILE1954 + ": PASSED", result.stdout)
         self.assertIn("selected parents only: passed=24", result.stdout)
 
+    def test_superseded_same_head_compile_failure_cannot_suppress_actual_later_pass(self):
+        pr, brief = case(1990, PASS1990)
+        for stale in (dict(status="superseded"), dict(status="failed", superseded_by="corrected actual compile receipt")):
+            with self.subTest(stale=stale):
+                brief["outcomes"] = [outcome(PASS1990, "compile", exit_code=101, **stale),
+                                     outcome(PASS1990, "compile", "passed", exit_code=0),
+                                     outcome(PASS1990, "test", "passed", parents_passed=2, parents_failed=0)]
+                result = self.run_cli(pr, brief)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("recorded exit 101", result.stdout)
+                self.assertIn("REFERENCE ONLY; no current-head transfer", result.stdout)
+                self.assertIn("selected parents only: passed=2, failed=0", result.stdout)
+                self.assertNotIn("UNRUN (compilation failed", result.stdout)
+
+    def test_assigned_worker_cannot_be_its_own_independent_reviewer(self):
+        pr, brief = case()
+        brief["reviewer"] = brief["worker"]
+        self.rejected(pr, brief, "worker and independent reviewer must be different")
+
     def test_1988_superseded_foundation_never_becomes_completed_recovery(self):
         pr, brief = case(1988, NEW1988)
         brief["task"] = "Mount readable saved history with explicit exact-session recovery."

@@ -98,6 +98,7 @@ def prepare(pr, brief):
                 "different working_base needs explicit extraction_from")
 
     names = {k: text(brief[k], k) for k in ("worker", "delivery_owner", "reviewer")}
+    require(names["worker"] != names["reviewer"], "worker and independent reviewer must be different")
     task = phrase(brief["task"], "task")
     scope = strings(brief["scope"], "scope", True)
     dependencies = strings(brief.get("dependencies", []), "dependencies")
@@ -148,7 +149,9 @@ def prepare(pr, brief):
         if "exit_code" in outcome:
             require(type(outcome["exit_code"]) is int, "exit_code must be an integer")
 
-    failed_compiles = {(o["head"], o["boundary"]) for o in outcomes if o["kind"] == "compile" and
+    failed_compiles = {(o["head"], o["boundary"]) for o in outcomes if not extraction and
+                       o["head"] == head and o["kind"] == "compile" and
+                       o["status"] != "superseded" and "superseded_by" not in o and
                        (o["status"] == "failed" or o.get("exit_code", 0) != 0)}
     lines = [f"Task for {names['worker']} — {url}",
              f"Accountable delivery owner: {names['delivery_owner']}; independent reviewer: {names['reviewer']}.",
