@@ -55,6 +55,8 @@ def case(number=1651, head=PUBLIC):
 
 
 def outcome(head, kind, status, scope="ui-lib", **extra):
+    if kind in ("compile", "test"):
+        extra.setdefault("boundary", "ui")
     return dict(head=head, kind=kind, status=status, scope=scope,
                 reference="captured diagnosis.json exact-head record", **extra)
 
@@ -89,7 +91,8 @@ class PrepareDeliveryTask(unittest.TestCase):
         self.assertNotIn("merge immediately", result.stdout)
         for expected in (brief["task"], brief["interaction"]["flow"], brief["interaction"]["before"],
                          brief["interaction"]["after"], "Stop and selection", "spacing, hit areas",
-                         "selection, truncation and keyboard", "NOT SUPPLIED/UNQUALIFIED"):
+                         "selection, truncation and keyboard", "hover and narrow layouts", "assembled native flow",
+                         "NOT SUPPLIED/UNQUALIFIED"):
             self.assertIn(expected, result.stdout)
 
     def test_new_extraction_distinguishes_donor_and_main_without_result_transfer(self):
@@ -154,6 +157,18 @@ class PrepareDeliveryTask(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("REFERENCE ONLY; no current-head transfer", result.stdout)
         self.assertIn("test / ui-lib @ " + CORRECT1954 + ": UNRUN", result.stdout)
+
+    def test_compile_failure_uses_boundary_not_matching_prose_and_preserves_host_pass(self):
+        pr, brief = case(1954, COMPILE1954)
+        brief["outcomes"] = [outcome(COMPILE1954, "compile", "failed", "UI lib compilation", exit_code=101),
+                             outcome(COMPILE1954, "test", "passed", "UI103 parents", parents_passed=103),
+                             outcome(COMPILE1954, "test", "passed", "HOST parents", boundary="host", parents_passed=24)]
+        result = self.run_cli(pr, brief)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("UI103 parents @ " + COMPILE1954 + ": UNRUN", result.stdout)
+        self.assertNotIn("passed=103", result.stdout)
+        self.assertIn("HOST parents @ " + COMPILE1954 + ": PASSED", result.stdout)
+        self.assertIn("selected parents only: passed=24", result.stdout)
 
     def test_1988_superseded_foundation_never_becomes_completed_recovery(self):
         pr, brief = case(1988, NEW1988)
