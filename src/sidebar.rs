@@ -14986,6 +14986,29 @@ pub(crate) mod tests {
 
     #[test]
     fn navigation_rows_share_one_content_grid() {
+        use cosmic::iced::{
+            Rectangle,
+            advanced::widget::{Operation, operation},
+        };
+
+        #[derive(Default)]
+        struct Controls(Vec<(Id, Rectangle)>);
+        impl Operation for Controls {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if let Some(id) = id {
+                    self.0.push((id.clone(), bounds));
+                }
+            }
+        }
+
         let renderer = headless_renderer();
         let model = grid_fixture();
         let state = SidebarState::default();
@@ -14998,7 +15021,14 @@ pub(crate) mod tests {
             );
             let mut rows = Vec::new();
             navigation_rows(Layout::new(&node), &mut rows);
-            rows
+            let mut controls = Controls::default();
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut controls,
+            );
+            (rows, controls)
         };
         // `RowInteraction::group` stashes its header's layout for sticky
         // positioning and leaves a childless node in its place, so the header
@@ -15034,8 +15064,8 @@ pub(crate) mod tests {
         };
 
         let width = design::NAVIGATION_DEFAULT_WIDTH;
-        let expanded_header = header(false, width);
-        let expanded = members(false, width);
+        let (expanded_header, header_controls) = header(false, width);
+        let (expanded, member_controls) = members(false, width);
         // The channel, then both worktrees.
         assert_eq!((expanded_header.len(), expanded.len()), (1, 3));
         let (head, channel, primary) = (&expanded_header[0].1, &expanded[0].1, &expanded[1].1);
@@ -15045,7 +15075,36 @@ pub(crate) mod tests {
             "project, channel and worktree glyphs and labels share columns",
         );
         assert_eq!(expanded[0].0.x, expanded_header[0].0.x);
-        assert_eq!(expanded[0].0.width, expanded_header[0].0.width);
+        let bounds = |controls: &Controls, target: &Id| {
+            controls
+                .0
+                .iter()
+                .find_map(|(id, bounds)| (id == target).then_some(*bounds))
+                .expect("actual row control bounds")
+        };
+        let project = &model.projects[0];
+        let header_surface = bounds(&header_controls, &project.chrome.open_id);
+        assert_eq!(header_surface.width, width);
+        for target in std::iter::once(&project.channels[0].open_id).chain(
+            project
+                .worktrees
+                .iter()
+                .map(|worktree| &worktree.chrome.open_id),
+        ) {
+            let surface = bounds(&member_controls, target);
+            assert_eq!((surface.x, surface.width), (header_surface.x, width));
+            assert_eq!(surface.height, design::ROW_HEIGHT);
+        }
+        let action = bounds(&member_controls, &project.channels[0].delete_id);
+        assert_eq!(
+            expanded[0].0.width + action.width - ROW_GUTTER,
+            expanded_header[0].0.width,
+            "eligible channel content reserves its measured action instead of the ordinary gutter",
+        );
+        assert_eq!(
+            expanded[1].0.width, expanded_header[0].0.width,
+            "the primary worktree keeps the ordinary content budget",
+        );
         assert_eq!(
             (channel[0].x, channel[1].x),
             (primary[0].x, primary[1].x),
@@ -15061,8 +15120,8 @@ pub(crate) mod tests {
             assert_eq!(row.height, design::ROW_HEIGHT);
         }
 
-        let compact_header = header(true, COMPACT_ROW_WIDTH);
-        let compact = members(true, COMPACT_ROW_WIDTH);
+        let (compact_header, _) = header(true, COMPACT_ROW_WIDTH);
+        let (compact, _) = members(true, COMPACT_ROW_WIDTH);
         // Quiet children and creation controls do not fill the compact rail.
         assert_eq!((compact_header.len(), compact.len()), (1, 0));
         for (row, slots) in compact_header.iter().chain(&compact) {
