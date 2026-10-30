@@ -586,12 +586,17 @@ fn validate_terminal_ownership_recovery(
 
 /// What storage holds after a workspace snapshot commits. The writer lane keeps
 /// this as the base for its next snapshot.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct WorkspaceCommit {
     pub generation: u64,
     /// Every card row the workspace owns after the commit, tombstones included,
     /// so a later snapshot that still carries a closed card has a valid base.
     pub card_generations: BTreeMap<CardId, u64>,
+    /// Open cards whose content storage refused while the rest of the snapshot
+    /// committed, each as a [`StoreError::Card`]. Storage keeps what it held
+    /// for each of them, so they stay unsaved until a later snapshot lands
+    /// their content or closes them.
+    pub refused: Vec<StoreError>,
 }
 
 /// The generations storage holds right now for a workspace and every card row
@@ -822,7 +827,7 @@ impl StateStore {
             ..
         } = &mut *inner;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let commit = save_workspace_transaction(&transaction, state, base, refused_closures)?;
+        let commit = save_workspace_transaction(&transaction, state, base, refused_closures, true)?;
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
@@ -1076,6 +1081,7 @@ impl StateStore {
         Ok(Some(WorkspaceCommit {
             generation,
             card_generations,
+            refused: Vec::new(),
         }))
     }
 
@@ -1251,6 +1257,7 @@ impl StateStore {
             transaction.execute(INVALIDATE_CARD_HASH, [adoption.canonical.to_string()])?;
             generations.insert(adoption.alias, next);
         }
+        // An ownership transfer commits with its whole window or not at all.
         let commit = save_workspace_transaction(
             &transaction,
             &prepared,
@@ -1259,6 +1266,7 @@ impl StateStore {
                 cards: &generations,
             },
             refused_closures,
+            false,
         )?;
         transaction.commit()?;
         Ok(commit)
@@ -1571,6 +1579,7 @@ impl StateStore {
                     .into_iter()
                     .map(|(id, card)| (id, card.generation))
                     .collect(),
+                refused: Vec::new(),
             });
         }
         if transaction
@@ -1649,6 +1658,7 @@ impl StateStore {
         Ok(WorkspaceCommit {
             generation: next,
             card_generations,
+            refused: Vec::new(),
         })
     }
 
@@ -2745,7 +2755,8 @@ pub(crate) fn read_open_migration_sessions_with_budget(
             supported: CURRENT_SCHEMA_VERSION,
         });
     }
-    let mut statement = transaction.prepare(
+    let (origin, listener, predecessor) = terminal_provenance_columns(version);
+    let mut statement = transaction.prepare(&format!(
         "SELECT CASE WHEN length(CAST(c.card_id AS BLOB)) <= 128 THEN c.card_id ELSE NULL END, c.kind_tag,
          CASE WHEN length(CAST(c.content_json AS BLOB)) <= 4194304 THEN c.content_json ELSE NULL END,
          CASE WHEN length(CAST(c.existence_json AS BLOB)) <= 4096 THEN c.existence_json ELSE 'null' END,
@@ -2753,14 +2764,14 @@ pub(crate) fn read_open_migration_sessions_with_budget(
          CASE WHEN c.kind_tag = 'chat' THEN length(CAST(c.content_json AS BLOB))
          ELSE (SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
                     + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
-                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
-                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
+                    + coalesce(length(CAST({origin} AS BLOB)),0) + coalesce(length(CAST({listener} AS BLOB)),0)
+                    + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
                FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
          END,
          CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
-         WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id",
-    )?;
+         WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id"
+    ))?;
     let mut rows = statement.query([])?;
     let mut sessions = Vec::new();
     let mut retained =
@@ -2832,14 +2843,23 @@ pub(crate) fn read_migration_session_at(
     const MAX_DESCRIPTOR_BYTES: usize = 4 * 1024 * 1024;
     match kind {
         "terminal" => {
+            let version: u32 =
+                connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if version > CURRENT_SCHEMA_VERSION {
+                return Err(StoreError::UnsupportedSchema {
+                    found: version,
+                    supported: CURRENT_SCHEMA_VERSION,
+                });
+            }
+            let (origin, listener, predecessor) = terminal_provenance_columns(version);
             // Check lengths in SQLite before allocating any descriptor fields
             // in Rust, including the nullable provenance and transcript path.
             let bounded:Option<bool>=connection.query_row(
-                "SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
+                &format!("SELECT length(CAST(r.terminal_id AS BLOB)) + length(CAST(r.recipe_json AS BLOB))
                     + length(CAST(r.continuity_json AS BLOB)) + coalesce(length(CAST(r.resume_hint AS BLOB)),0)
-                    + coalesce(length(CAST(r.recovery_origin AS BLOB)),0) + coalesce(length(CAST(r.owned_codex_listener AS BLOB)),0)
-                    + coalesce(length(CAST(r.predecessor AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
-                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1",
+                    + coalesce(length(CAST({origin} AS BLOB)),0) + coalesce(length(CAST({listener} AS BLOB)),0)
+                    + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0) <= ?2
+                 FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=?1"),
                 params![card.to_string(),MAX_DESCRIPTOR_BYTES as u64],|row|row.get(0)).optional()?;
             if bounded != Some(true) {
                 return Err(StoreError::corrupt_row(
@@ -2847,7 +2867,7 @@ pub(crate) fn read_migration_session_at(
                     "missing or oversized immutable descriptor",
                 ));
             }
-            load_terminal_record(connection, card).map(CardKind::Terminal)
+            load_terminal_record_at_schema(connection, card, version).map(CardKind::Terminal)
         }
         "chat" => from_json(
             "migration chat",
@@ -3862,11 +3882,15 @@ const BROWSER_PAYLOAD_IDENTITY: PayloadIdentity = PayloadIdentity {
     payload_by_card: "SELECT browser_id FROM browser_restore WHERE card_id = ?1",
 };
 
+/// `isolate_refused_cards` lets the window commit around an open card whose
+/// content storage refuses, as [`save_open_card`] describes; without it, such
+/// a card refuses the whole snapshot.
 fn save_workspace_transaction(
     transaction: &Transaction<'_>,
     state: &WorkspaceState,
     base: SnapshotBase<'_>,
     refused_closures: &mut RefusedClosures,
+    isolate_refused_cards: bool,
 ) -> Result<WorkspaceCommit> {
     validate_workspace(state)?;
     let workspace_id = state.id.to_string();
@@ -3995,11 +4019,23 @@ fn save_workspace_transaction(
         .map(|card| card.id)
         .collect::<BTreeSet<_>>();
     let mut card_generations = BTreeMap::new();
+    let mut refused = Vec::new();
 
     for (ordinal, card) in state.cards.iter().enumerate() {
         let expected = base.cards.get(&card.id).copied().unwrap_or(0);
         let stored = existing.get(&card.id);
-        let generation = if card.existence.is_open() {
+        let generation = if card.existence.is_open() && isolate_refused_cards {
+            save_open_card(
+                transaction,
+                &workspace_id,
+                ordinal,
+                card,
+                expected,
+                stored,
+                timestamp,
+                &mut refused,
+            )
+        } else if card.existence.is_open() {
             save_card(
                 transaction,
                 &workspace_id,
@@ -4024,6 +4060,21 @@ fn save_workspace_transaction(
         .map_err(|error| error.in_card(card.id))?;
         card_generations.insert(card.id, generation);
     }
+    // A refused card keeps what storage holds for it, which may be its
+    // tombstone, and the window cannot be stored focusing a closed card.
+    if let Some(focused) = state.focused
+        && refused
+            .iter()
+            .any(|error| matches!(error, StoreError::Card { card, .. } if *card == focused))
+        && existing
+            .get(&focused)
+            .is_some_and(|stored| !stored.existence.is_open())
+    {
+        transaction.execute(
+            "UPDATE workspaces SET focused_card_id = NULL WHERE workspace_id = ?1",
+            [&workspace_id],
+        )?;
+    }
 
     for (card_id, stored) in &existing {
         if incoming_ids.contains(card_id) {
@@ -4043,7 +4094,68 @@ fn save_workspace_transaction(
     Ok(WorkspaceCommit {
         generation: next,
         card_generations,
+        refused,
     })
+}
+
+/// Writes a card the snapshot holds open.
+///
+/// Storage refuses content that would break what a stored card promises - a
+/// conversation re-pointed without its replacement, a conversion it cannot
+/// make. Each snapshot is the whole window, so refusing it for one such card
+/// would leave every other pane's changes unsaved for as long as that card
+/// stays as it is. A card storage already holds instead keeps exactly what is
+/// stored for it, generation included, and the rest of the window commits.
+/// The refusal is returned in `refused` so the writer goes on reporting the
+/// card until a later snapshot saves it or closes it.
+///
+/// Only content is isolated this way. A stale base still fails the snapshot,
+/// which the writer rebases, and a card storage has never held has nothing to
+/// keep, so its refusal still refuses the window. A card kept this way also
+/// keeps the terminal or browser it holds, so a later card in the same
+/// snapshot that takes that identity over is refused in turn.
+#[allow(clippy::too_many_arguments)]
+fn save_open_card(
+    transaction: &Transaction<'_>,
+    workspace_id: &str,
+    ordinal: usize,
+    card: &CardState,
+    expected: u64,
+    stored: Option<&ExistingCard>,
+    timestamp: i64,
+    refused: &mut Vec<StoreError>,
+) -> Result<u64> {
+    let Some(stored) = stored else {
+        return save_card(
+            transaction,
+            workspace_id,
+            ordinal,
+            card,
+            expected,
+            None,
+            timestamp,
+        );
+    };
+    transaction.execute_batch("SAVEPOINT open_card")?;
+    match save_card(
+        transaction,
+        workspace_id,
+        ordinal,
+        card,
+        expected,
+        Some(stored),
+        timestamp,
+    ) {
+        Err(error) if error.refuses_content() => {
+            transaction.execute_batch("ROLLBACK TO open_card; RELEASE open_card")?;
+            refused.push(error.in_card(card.id));
+            Ok(stored.generation)
+        }
+        written => {
+            transaction.execute_batch("RELEASE open_card")?;
+            written
+        }
+    }
 }
 
 /// Writes one card of a workspace snapshot, returning the generation storage
@@ -4437,6 +4549,9 @@ fn validate_chat_identity(
         {
             Some("owned listener")
         } else if stored.launch.recipe != session.launch.recipe
+            // Before it begins, a chat's recipe holds only launch options -
+            // account, model, permissions - and no conversation to protect.
+            && !(stored.is_unstarted() && session.is_unstarted())
             // The daemon gives a new Codex thread its own listener as it
             // starts it, so the started thread comes back naming that
             // endpoint where it had asked for one.
@@ -5460,13 +5575,44 @@ fn load_terminal(
 }
 
 fn load_terminal_record(connection: &Connection, card_id: CardId) -> Result<TerminalSession> {
+    load_terminal_record_at_schema(connection, card_id, CURRENT_SCHEMA_VERSION)
+}
+
+// Read-only upgrade inspection must not run DDL against old window copies.
+// Missing historical fields mean no recorded provenance, never new authority.
+fn terminal_provenance_columns(version: u32) -> (&'static str, &'static str, &'static str) {
+    (
+        if version >= 5 {
+            "r.recovery_origin"
+        } else {
+            "NULL"
+        },
+        if version >= 8 {
+            "r.owned_codex_listener"
+        } else {
+            "NULL"
+        },
+        if version >= 11 {
+            "r.predecessor"
+        } else {
+            "NULL"
+        },
+    )
+}
+
+fn load_terminal_record_at_schema(
+    connection: &Connection,
+    card_id: CardId,
+    version: u32,
+) -> Result<TerminalSession> {
+    let (origin, listener, predecessor) = terminal_provenance_columns(version);
     // `.optional()` rather than `?`: a terminal card whose recipe row is gone
     // is a per-card restore failure the caller can report, not a raw
     // `QueryReturnedNoRows` that used to abort the whole workspace restore.
     let recipe = connection
         .query_row(
-            "SELECT terminal_id, recipe_json, continuity_json, resume_hint, recovery_origin, owned_codex_listener, predecessor
-             FROM terminal_recipes WHERE card_id = ?1",
+            &format!("SELECT r.terminal_id, r.recipe_json, r.continuity_json, r.resume_hint, {origin}, {listener}, {predecessor}
+             FROM terminal_recipes r WHERE r.card_id = ?1"),
             [card_id.to_string()],
             |row| {
                 Ok((
@@ -5826,10 +5972,18 @@ mod tests {
 
     use super::*;
 
-    /// The refusal storage attributed to `card` within a failed snapshot.
-    fn card_refusal<T: std::fmt::Debug>(result: Result<T>, card: CardId) -> StoreError {
-        match result {
-            Err(StoreError::Card {
+    /// The refusal storage attributed to `card`: within a failed snapshot, or
+    /// within one that committed the rest of the window around that card.
+    fn card_refusal(result: Result<WorkspaceCommit>, card: CardId) -> StoreError {
+        let refused = match result {
+            Err(error) => Some(error),
+            Ok(commit) => {
+                assert_eq!(commit.refused.len(), 1, "{commit:?}");
+                commit.refused.into_iter().next()
+            }
+        };
+        match refused {
+            Some(StoreError::Card {
                 card: refused,
                 error,
             }) if refused == card => *error,
@@ -6457,7 +6611,7 @@ mod tests {
             .unwrap();
         assert_eq!(after_metadata, before_metadata);
         drop(inner);
-        assert_eq!(
+        assert!(
             StateStore::repair_closed_terminal_pane_owner(
                 &path,
                 &boot_id,
@@ -6468,8 +6622,8 @@ mod tests {
                     cards: &commit.card_generations
                 }
             )
-            .unwrap(),
-            None
+            .unwrap()
+            .is_none()
         );
         assert_eq!(
             store
@@ -7532,7 +7686,11 @@ mod tests {
             };
             let committed = store.preserve_chat_copy(&copy).unwrap();
             let retry = store.preserve_chat_copy(&copy).unwrap();
-            assert_eq!(retry, committed, "{stage}");
+            assert_eq!(
+                (retry.generation, retry.card_generations),
+                (committed.generation, committed.card_generations),
+                "{stage}"
+            );
             assert_eq!(
                 store.load_card(original, None).unwrap().unwrap(),
                 before,
@@ -7753,9 +7911,10 @@ mod tests {
         let committed = store.preserve_chat_copy(&old_request).unwrap();
         drop(store);
         let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let replayed = reopened.preserve_chat_copy(&copy).unwrap();
         assert_eq!(
-            reopened.preserve_chat_copy(&copy).unwrap(),
-            committed,
+            (replayed.generation, replayed.card_generations),
+            (committed.generation, committed.card_generations),
             "legacy receipt remains replayable after reopening"
         );
     }
@@ -7975,6 +8134,62 @@ mod tests {
             if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION)
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn migration_inspection_reads_schema4_without_migrating_and_open_migrates_it() {
+        let directory = tempdir().unwrap();
+        let fixture = directory.path().join("current.sqlite3");
+        let path = directory.path().join("september-window.sqlite3");
+        let store = StateStore::open(&fixture, boot("recorded-boot")).unwrap();
+        let mut workspace = workspace_with_terminal(&boot("recorded-boot"));
+        let card = workspace.cards[0].id;
+        workspace
+            .chat_drafts
+            .insert(card, "unsent retained draft".into());
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        migrate_to_v1(&transaction).unwrap();
+        migrate_to_v2(&transaction).unwrap();
+        migrate_to_v3(&transaction).unwrap();
+        migrate_to_v4(&transaction).unwrap();
+        transaction.pragma_update(None, "user_version", 4).unwrap();
+        transaction.commit().unwrap();
+        connection
+            .execute("ATTACH DATABASE ?1 AS fixture", [fixture.to_str().unwrap()])
+            .unwrap();
+        connection.execute_batch(
+            "INSERT INTO workspaces SELECT * FROM fixture.workspaces;
+             INSERT INTO cards SELECT * FROM fixture.cards;
+             INSERT INTO terminal_recipes SELECT terminal_id,card_id,generation,recipe_json,continuity_json,resume_hint,updated_at_unix_ms FROM fixture.terminal_recipes;
+             INSERT INTO transcript_metadata SELECT * FROM fixture.transcript_metadata;
+             INSERT INTO metadata SELECT * FROM fixture.metadata;
+             DETACH DATABASE fixture;"
+        ).unwrap();
+        drop(connection);
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            read_open_migration_sessions(&path).unwrap(),
+            vec![(card, workspace.cards[0].kind.clone())]
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "preview must leave the historical store byte-for-byte intact"
+        );
+        let reopened = StateStore::open(&path, boot("recorded-boot")).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+        let loaded = reopened
+            .load_workspace(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.chat_drafts.get(&card),
+            Some(&"unsent retained draft".to_owned())
+        );
+        assert_eq!(loaded.cards[0].id, card);
     }
 
     #[test]
@@ -8850,7 +9065,10 @@ mod tests {
             ],
         );
         workspace.cards[0].kind = CardKind::Chat(replacement.clone());
-        assert!(lane.save(&store, &workspace).is_err());
+        assert!(matches!(
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
         let mut stale = source.clone();
         stale
             .launch
@@ -9055,7 +9273,10 @@ mod tests {
         }
         workspace.cards[0].kind = CardKind::Chat(replacement.clone());
         assert!(
-            lane.save(&store, &workspace).is_err(),
+            matches!(
+                card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+                StoreError::InvalidState(_)
+            ),
             "ordinary save cannot learn a paired upgrade identity"
         );
         store
@@ -9093,7 +9314,10 @@ mod tests {
         let mut wrong_thread = replacement.clone();
         wrong_thread.launch.session_id = Some("00000000-0000-4000-8000-000000000002".into());
         workspace.cards[0].kind = CardKind::Chat(wrong_thread.clone());
-        assert!(lane.save(&store, &workspace).is_err());
+        assert!(matches!(
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
         assert!(
             store
                 .rebind_chat_upgrade(card, &source, &wrong_thread)
@@ -9240,7 +9464,10 @@ mod tests {
         );
         workspace.cards[0].kind = CardKind::Chat(replacement.clone());
         assert!(
-            lane.save(&store, &workspace).is_err(),
+            matches!(
+                card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+                StoreError::InvalidState(_)
+            ),
             "ordinary snapshots cannot rebind an account"
         );
         for altered in 0..5 {
@@ -9413,6 +9640,235 @@ mod tests {
         assert!(matches!(
             reopened.replace_chat_identity(card, managed.id, &paired),
             Err(StoreError::InvalidState(_))
+        ));
+    }
+
+    /// A chat that has not begun has only launch options to change: its
+    /// account, model or permissions. A snapshot saves those over the stored
+    /// draft like any other pane edit, together with the rest of the window,
+    /// while a started conversation and the draft's own identity stay fenced.
+    #[test]
+    fn an_unstarted_chat_saves_new_launch_options_with_the_window() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("chat.sqlite3");
+        let store = StateStore::open(&database, boot("chat-boot")).unwrap();
+        let (mut workspace, begun) = agent_workspace(crate::agent::Provider::Claude);
+        let mut draft = begun.clone();
+        draft.id = TerminalId::new();
+        draft.launch.recipe.arguments.clear();
+        draft
+            .launch
+            .recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/accounts/claude/a".into());
+        draft.launch.session_id = None;
+        draft.proof = None;
+        draft.terminal = None;
+        assert!(draft.is_unstarted());
+        let mut sibling = workspace.cards[0].clone();
+        sibling.id = CardId::new();
+        sibling.title = "sibling".into();
+        workspace.cards[0].kind = CardKind::Chat(draft.clone());
+        workspace.cards.push(sibling);
+        let card = workspace.cards[0].id;
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+
+        let mut retargeted = draft.clone();
+        retargeted
+            .launch
+            .recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/accounts/claude/b".into());
+        crate::chat::apply_claude_permission_mode(&mut retargeted.launch.recipe, "plan");
+        retargeted
+            .launch
+            .recipe
+            .arguments
+            .extend(["--model".into(), "fixture-model".into()]);
+        workspace.cards[0].kind = CardKind::Chat(retargeted.clone());
+        workspace.cards[1].title = "sibling renamed".into();
+        workspace.focused = Some(workspace.cards[1].id);
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let reopened = StateStore::open(&database, boot("chat-boot")).unwrap();
+        let saved = reopened
+            .load_workspace(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.cards[0].kind, CardKind::Chat(retargeted.clone()));
+        assert_eq!(saved.cards[1].title, "sibling renamed");
+        assert_eq!(saved.focused, Some(workspace.cards[1].id));
+
+        // Its identity and provider still change only through replacement.
+        let refused = |lane: &mut SaveLane, workspace: &WorkspaceState, session| {
+            let mut workspace = workspace.clone();
+            workspace.cards[0].kind = CardKind::Chat(session);
+            match card_refusal(lane.save(&reopened, &workspace), card) {
+                StoreError::InvalidState(message) => message,
+                other => panic!("expected a refused identity, got {other:?}"),
+            }
+        };
+        let renewed = crate::chat::Session {
+            id: TerminalId::new(),
+            ..retargeted.clone()
+        };
+        assert!(refused(&mut lane, &workspace, renewed).contains("(identity)"));
+        let mut codex = retargeted.clone();
+        codex.launch.provider = crate::agent::Provider::Codex;
+        assert!(refused(&mut lane, &workspace, codex).contains("(provider)"));
+
+        // Once begun, the conversation keeps the launch it began with: a
+        // started descriptor neither takes nor leaves another account.
+        let mut started = retargeted.clone();
+        started.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        started.proof = begun.terminal.as_ref().unwrap().continuity.live_proof();
+        workspace.cards[0].kind = CardKind::Chat(started.clone());
+        lane.save(&reopened, &workspace).unwrap();
+        let other_account = |mut session: crate::chat::Session| {
+            session
+                .launch
+                .recipe
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), "/accounts/claude/a".into());
+            session
+        };
+        assert!(
+            refused(&mut lane, &workspace, other_account(started.clone()))
+                .contains("(launch recipe)")
+        );
+        assert!(
+            refused(&mut lane, &workspace, other_account(retargeted)).contains("(launch recipe)")
+        );
+
+        // Closing a pane whose recipe storage refuses stores its tombstone
+        // over the recipe storage holds.
+        workspace.cards[0].kind = CardKind::Chat(other_account(started.clone()));
+        workspace.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 785,
+                reason: Some("user closed".into()),
+            },
+        };
+        assert!(lane.save(&reopened, &workspace).unwrap().refused.is_empty());
+        let closed = reopened.load_card(card, None).unwrap().unwrap();
+        assert!(matches!(closed.existence, Existence::Closed { .. }));
+        assert_eq!(closed.kind, CardKind::Chat(started));
+    }
+
+    /// One pane storage refuses does not strand the rest of its window. The
+    /// refused pane keeps exactly what storage held for it while every other
+    /// change commits, and the refusal is returned so the writer goes on
+    /// reporting the pane. Closing it stores its tombstone.
+    #[test]
+    fn a_refused_pane_keeps_its_stored_content_while_the_window_saves() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("chat.sqlite3");
+        let store = StateStore::open(&database, boot("chat-boot")).unwrap();
+        let (mut workspace, begun) = agent_workspace(crate::agent::Provider::Claude);
+        let mut draft = begun.clone();
+        draft.id = TerminalId::new();
+        draft.launch.session_id = None;
+        draft.proof = None;
+        draft.terminal = None;
+        let mut sibling = workspace.cards[0].clone();
+        sibling.id = CardId::new();
+        workspace.cards[0].kind = CardKind::Chat(draft.clone());
+        workspace.cards.push(sibling);
+        let (card, sibling) = (workspace.cards[0].id, workspace.cards[1].id);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        let held = store.load_card(card, None).unwrap().unwrap();
+
+        // A conversation re-pointed without its replacement, beside ordinary
+        // edits to the window and another pane.
+        workspace.cards[0].kind = CardKind::Chat(crate::chat::Session {
+            id: TerminalId::new(),
+            ..draft.clone()
+        });
+        workspace.cards[0].title = "re-pointed".into();
+        workspace.cards[1].title = "sibling renamed".into();
+        workspace.focused = Some(sibling);
+        workspace.chat_drafts.insert(card, "unsent text".into());
+        let previous = lane.workspace;
+        let commit = lane.save(&store, &workspace).unwrap();
+        assert!(commit.generation > previous);
+        assert_eq!(commit.card_generations[&card], held.generation);
+        assert!(matches!(
+            commit.refused.as_slice(),
+            [StoreError::Card { card: refused, error }]
+                if *refused == card
+                    && matches!(&**error, StoreError::InvalidState(message)
+                        if message.contains("(identity)"))
+        ));
+        drop(store);
+        let store = StateStore::open(&database, boot("chat-boot")).unwrap();
+        assert_eq!(store.load_card(card, None).unwrap().unwrap(), held);
+        let saved = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(saved.cards[1].title, "sibling renamed");
+        assert_eq!(saved.focused, Some(sibling));
+        assert_eq!(saved.chat_drafts[&card], "unsent text");
+
+        // A terminal re-pointed without its relaunch is refused only after
+        // its row is written, and the row comes back exactly as stored.
+        let kept = store.load_card(sibling, None).unwrap().unwrap();
+        let mut repointed = workspace.clone();
+        let CardKind::Terminal(terminal) = &mut repointed.cards[1].kind else {
+            unreachable!()
+        };
+        terminal.id = TerminalId::new();
+        repointed.cards[1].title = "relaunch renamed".into();
+        repointed.chat_drafts.insert(card, "later text".into());
+        let commit = lane.save(&store, &repointed).unwrap();
+        assert!(matches!(
+            commit.refused.as_slice(),
+            [StoreError::Card { card, .. }, StoreError::Card { card: other, .. }]
+                if (*card, *other) == (workspace.cards[0].id, sibling)
+        ));
+        assert_eq!(commit.card_generations[&sibling], kept.generation);
+        assert_eq!(store.load_card(sibling, None).unwrap().unwrap(), kept);
+        let saved = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(saved.chat_drafts[&card], "later text");
+
+        // A card storage never held has nothing to keep, so refusing it still
+        // refuses the window.
+        let mut unsaved = workspace.clone();
+        let mut fresh = unsaved.cards[1].clone();
+        fresh.id = CardId::new();
+        let CardKind::Terminal(source) = &fresh.kind else {
+            unreachable!()
+        };
+        fresh.kind = CardKind::Chat(crate::chat::Session {
+            id: TerminalId::new(),
+            terminal: Some(source.clone()),
+            ..draft.clone()
+        });
+        let fresh_id = fresh.id;
+        unsaved.cards.push(fresh);
+        unsaved.cards[1].title = "not saved".into();
+        assert!(matches!(
+            lane.save(&store, &unsaved),
+            Err(StoreError::Card { card, .. }) if card == fresh_id
+        ));
+        assert_eq!(
+            store.load_card(sibling, None).unwrap().unwrap().title,
+            "sibling renamed"
+        );
+
+        // Closing the refused pane is the remedy, and storage takes it.
+        workspace.cards[0].existence = Existence::Closed {
+            tombstone: Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 784,
+                reason: Some("user closed".into()),
+            },
+        };
+        let commit = lane.save(&store, &workspace).unwrap();
+        assert!(commit.refused.is_empty());
+        assert!(matches!(
+            store.load_card(card, None).unwrap().unwrap().existence,
+            Existence::Closed { .. }
         ));
     }
 
@@ -9843,6 +10299,7 @@ mod tests {
                 cards: &BTreeMap::new(),
             },
             &mut RefusedClosures::new(),
+            false,
         )
         .unwrap();
         transaction.pragma_update(None, "user_version", 3).unwrap();
@@ -9928,6 +10385,7 @@ mod tests {
                 cards: &BTreeMap::new(),
             },
             &mut RefusedClosures::new(),
+            false,
         )
         .unwrap();
         // The v5 table must refuse the new kinds, or this test proves nothing.
@@ -11574,7 +12032,10 @@ mod tests {
         let mut downgraded = reset.clone();
         downgraded.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
         workspace.cards[0].kind = CardKind::Chat(downgraded);
-        assert!(lane.save(&store, &workspace).is_err());
+        assert!(matches!(
+            card_refusal(lane.save(&store, &workspace), workspace.cards[0].id),
+            StoreError::InvalidState(_)
+        ));
         let mut unproved = source.clone();
         unproved.proof.as_mut().unwrap().host_incarnation = "another-daemon".into();
         assert!(store.rebind_chat_upgrade(card, &reset, &unproved).is_err());

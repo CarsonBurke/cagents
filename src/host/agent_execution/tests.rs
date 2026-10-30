@@ -36,7 +36,9 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         return None;
     }
     let directory = tempfile::tempdir().unwrap();
-    let root = directory.path();
+    // Ordinary fixture paths must agree with canonical project keys even when
+    // the caller's temporary directory has a symlinked parent.
+    let root = directory.path().canonicalize().unwrap();
     for path in [
         "bin",
         "home/.claude",
@@ -78,7 +80,7 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
                 "absent"
             },
         )
-        .env("CAGENTS_EXECUTION_FIXTURE", root)
+        .env("CAGENTS_EXECUTION_FIXTURE", &root)
         .env("HOME", root.join("home"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CONFIG_HOME", root.join("config"))
@@ -3483,6 +3485,154 @@ fn a_relaunched_parent_keeps_its_agents_and_a_rival_keeps_its_own() {
     close(&host, &rival_next_authority, rival_child.agent.id).unwrap();
     exit(second);
     exit(rival_next);
+}
+
+#[test]
+fn full_mailbox_replies_are_retryable_without_reclassifying_invalid_requests() {
+    use crate::{
+        agent_execution::{
+            AcceptanceError, Lineage,
+            mailbox::{
+                Inbox, MAX_PENDING, Message, Outgoing, Party, Receipt, State as Delivery, To,
+            },
+        },
+        model::MessageId,
+        terminal::ipc::{ClientRequest, ProtocolErrorCode, ServerResponse},
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    let host = crate::host::service::test_host();
+    host.lock()
+        .unwrap()
+        .install_model(Registry::at(&directory.path().join("mailbox.sqlite3")).unwrap());
+    let store = registry(&host).unwrap();
+    let recipient = Party {
+        lineage: Some(Lineage(TerminalId::new())),
+        session: None,
+        title: Some("Busy recipient".into()),
+    };
+    let message = |from, to, created_ms| Message {
+        id: MessageId::new(),
+        from,
+        to,
+        reply_to: None,
+        body: "Retain this fixture message".into(),
+        wait_until_ms: None,
+        state: Delivery::Pending,
+        created_ms,
+    };
+    let incoming = message(recipient.clone(), Party::user(), 0);
+    store.lock().unwrap().post_message(&incoming).unwrap();
+    for at in 0..MAX_PENDING {
+        store
+            .lock()
+            .unwrap()
+            .post_message(&message(Party::user(), recipient.clone(), at as u64))
+            .unwrap();
+    }
+    let query = Inbox {
+        all: false,
+        replies_to: None,
+    };
+    let pending = || {
+        store
+            .lock()
+            .unwrap()
+            .peek_messages(recipient.lineage, &query)
+            .unwrap()
+    };
+    let before = pending();
+    let outgoing = Outgoing {
+        to: To::Sender(incoming.id.to_string()),
+        body: "A reply must wait for an actual mailbox slot".into(),
+        wait_ms: None,
+    };
+    // Synthetic User scope resolves normally in this temporary registry. This
+    // fixture neither removes inherited authority nor proves a deployed caller.
+    assert!(matches!(
+        process_request(
+            &host,
+            Authority::default(),
+            Operation::SendMessage(outgoing.clone())
+        ),
+        Err(AcceptanceError::MailboxFull(_))
+    ));
+    let invoke = |authority, outgoing| {
+        crate::host::client::process_request(
+            &host,
+            1,
+            ClientRequest::Agent {
+                authority,
+                operation: Operation::SendMessage(outgoing),
+            },
+        )
+        .map(|(reply, _, _)| reply)
+    };
+    let refusal = invoke(Authority::default(), outgoing.clone()).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::QueueFull);
+    assert!(refusal.retryable);
+    assert!(refusal.message.contains(&recipient.short().unwrap()));
+    assert!(refusal.message.contains(&MAX_PENDING.to_string()));
+    assert!(refusal.message.contains("once it has read them"));
+
+    let mut empty = outgoing.clone();
+    empty.body.clear();
+    let mut unknown = outgoing.clone();
+    unknown.to = To::Session(TerminalId::new().to_string());
+    let mut foreign_reply = outgoing.clone();
+    foreign_reply.to = To::Sender(MessageId::new().to_string());
+    for (authority, outgoing) in [
+        (Authority::default(), empty),
+        (Authority::default(), unknown),
+        (Authority::default(), foreign_reply),
+        // A fresh unregistered fixture token must not disclose queue capacity.
+        (
+            Authority::session(uuid::Uuid::new_v4().to_string()),
+            outgoing.clone(),
+        ),
+    ] {
+        let refusal = invoke(authority, outgoing).unwrap_err();
+        assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+        assert!(!refusal.retryable);
+    }
+    assert_eq!(pending(), before, "no refusal inserts or consumes mail");
+    assert_eq!(
+        store.lock().unwrap().message(incoming.id).unwrap(),
+        Some(incoming.clone())
+    );
+    // Only an exact recipient receipt frees a slot. The service has no courier
+    // or provider here; explicit resubmission must durably fill just that slot.
+    store
+        .lock()
+        .unwrap()
+        .acknowledge_messages(
+            recipient.lineage,
+            None,
+            &Receipt {
+                ids: vec![before[0].id],
+            },
+            now(),
+        )
+        .unwrap();
+    let ServerResponse::Agent(Reply::Sent(sent)) =
+        invoke(Authority::default(), outgoing.clone()).unwrap()
+    else {
+        panic!("one exact read must permit one explicit reply");
+    };
+    assert_eq!(sent.message.reply_to, Some(incoming.id));
+    let after = pending();
+    assert_eq!(after.len(), MAX_PENDING);
+    assert!(after.contains(&sent.message));
+    assert!(before[1..].iter().all(|message| after.contains(message)));
+    let refusal = invoke(Authority::default(), outgoing.clone()).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::QueueFull);
+    assert!(refusal.retryable);
+    assert_eq!(pending(), after);
+
+    host.lock().unwrap().execution_registry = None;
+    let refusal = invoke(Authority::default(), outgoing).unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+    assert!(!refusal.retryable);
 }
 
 #[test]

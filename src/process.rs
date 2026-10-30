@@ -1391,10 +1391,31 @@ sys.exit(7)
 
     #[cfg(unix)]
     #[test]
-    fn a_quick_command_returns_without_any_polling_latency() {
-        // The old 15 ms poll interval cost at least one sleep per invocation, so
-        // twenty of these could not have come in under ~300 ms. The wait now
-        // blocks on the child, so the only cost is fork/exec.
+    fn repeated_quick_commands_preserve_output_status_and_unregister_cancellation() {
+        let command = CommandSpec::new("/bin/sh")
+            .args(["-c", "printf quick; printf diagnostic >&2"])
+            .timeout(Duration::from_secs(5));
+        let cancellation = CancellationToken::new();
+
+        for _ in 0..20 {
+            let output = SystemProcessExecutor
+                .execute(&command, &cancellation)
+                .unwrap();
+            assert!(output.success);
+            assert_eq!(output.exit_code, Some(0));
+            assert_eq!(output.signal, None);
+            assert_eq!(output.stdout, b"quick");
+            assert_eq!(output.stderr, b"diagnostic");
+            assert!(lock_wakers(&cancellation.0).is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "wall-clock performance benchmark; run explicitly on an idle host"]
+    fn quick_command_latency_benchmark() {
+        // This diagnostic includes fork/exec and scheduler latency. The
+        // deterministic readiness-wait tests cover the poll timeout policy.
         let command = CommandSpec::new("/bin/sh")
             .args(["-c", "exit 0"])
             .timeout(Duration::from_secs(5));
@@ -1409,7 +1430,7 @@ sys.exit(7)
 
         assert!(
             elapsed < Duration::from_millis(250),
-            "20 trivial commands took {elapsed:?}, which suggests a polling wait"
+            "20 trivial commands took {elapsed:?}, exceeding the 250 ms benchmark budget"
         );
     }
 

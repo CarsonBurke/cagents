@@ -36,6 +36,7 @@ mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
+mod saved_terminal;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
@@ -853,6 +854,12 @@ fn quarantined_write_line<'a>(
             || "Window layout and panes (one pane was refused)".to_owned(),
             |title| format!("Window layout and panes (pane “{title}” was refused)"),
         ),
+        WriteSubject::Pane { card } => card_title(*card).map_or_else(
+            || "Latest changes to a pane (storage keeps its last saved state)".to_owned(),
+            |title| {
+                format!("Latest changes to pane “{title}” (storage keeps its last saved state)")
+            },
+        ),
         WriteSubject::CardIdentity {
             card,
             kind: ReplacedIdentity::Terminal,
@@ -882,7 +889,9 @@ fn quarantined_write_line<'a>(
     // itself, so name the remedy the generic guidance only implies.
     if matches!(
         write.subject,
-        WriteSubject::CardIdentity { .. } | WriteSubject::Workspace { card: Some(_) }
+        WriteSubject::CardIdentity { .. }
+            | WriteSubject::Workspace { card: Some(_) }
+            | WriteSubject::Pane { .. }
     ) {
         line.push_str(" · closing the pane clears it");
     }
@@ -1062,6 +1071,40 @@ fn save_lane_view(health: &SaveHealthState, path: String) -> Option<Element<'_, 
 struct TerminalWakeup {
     card: CardId,
     generation: u64,
+}
+
+/// How much of the workspace projection an update has to rebuild. Busy
+/// terminals wake about once per frame each, so a wake that changed nothing a
+/// projection reads must not pay for every card's sidebar, chrome and
+/// protection bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Projection {
+    /// Nothing any projection reads changed: grid output, repaint ticks.
+    Unchanged,
+    /// Only a runtime-reported card title changed. Card chrome and the window
+    /// title are the only projections that read it.
+    Chrome,
+    /// Anything else, including every user action.
+    Full,
+}
+
+/// Runtime-reported terminal titles can animate several times a second
+/// (spinners, step counters). The durable card follows each one at once, so
+/// chrome stays current, but saving it, and publishing it to shared views,
+/// waits for this window: a burst of reported titles costs at most one save
+/// per window, and the last title is saved within one window of the burst
+/// ending. Any earlier save carries the titles with it.
+const REPORTED_TITLE_SAVE_DELAY: Duration = Duration::from_secs(3);
+
+/// Saving of runtime-reported titles, deferred by [`REPORTED_TITLE_SAVE_DELAY`].
+#[derive(Debug, Default)]
+struct ReportedTitleSave {
+    /// Cards whose reported title changed since the last save that published
+    /// titles. Shared views hold those titles back until that save.
+    cards: HashSet<CardId>,
+    /// A `ReportedTitleSaveDue` timer is outstanding. Kept apart from
+    /// `cards` so a burst interleaved with other saves still arms one timer.
+    scheduled: bool,
 }
 
 #[derive(Clone)]
@@ -2542,6 +2585,24 @@ fn window_geometry_message(event: &window::Event) -> Option<Message> {
     }
 }
 
+/// Whether a Wayland compositor fills the screen with a window or tiles its
+/// right edge, either of which removes the shell's resize border along it.
+fn window_edge_message(event: &iced::Event, window: window::Id) -> Option<Message> {
+    use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+    use iced::event::{PlatformSpecific, wayland};
+
+    match event {
+        iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
+            wayland::WindowEvent::WindowState(state),
+        ))) => Some(Message::WindowEdgeState {
+            window,
+            filled: state.intersects(WindowState::MAXIMIZED | WindowState::FULLSCREEN),
+            right_edge_tiled: state.contains(WindowState::TILED_RIGHT),
+        }),
+        _ => None,
+    }
+}
+
 fn is_tab_press(event: &keyboard::Event) -> Option<bool> {
     match event {
         keyboard::Event::KeyPressed {
@@ -2562,6 +2623,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::FileLoadedAt { .. }
+            | RepositoryAction::DocumentChanged { .. }
+            | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -2674,6 +2737,7 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::TerminalFailure(action) => action.is_user_action(),
+        Message::SavedTerminal(action) => action.is_user_action(),
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
@@ -2732,6 +2796,17 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::FocusBrowserAddress(_)
         | Message::BrowserAddressChanged { .. }
         | Message::BrowserNavigate(_) => true,
+        _ => false,
+    }
+}
+
+/// Timers that exist only to repaint elapsed time or a progress animation.
+/// Their handlers change nothing a workspace projection reads.
+fn repaint_tick(message: &Message) -> bool {
+    match message {
+        Message::ChatUi(chat_ui::Action::Tick) => true,
+        #[cfg(feature = "integrated-browser")]
+        Message::BrowserProgressTick => true,
         _ => false,
     }
 }
@@ -2808,6 +2883,9 @@ fn resolve_restore_card(
 }
 
 fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
+    if let Message::SavedTerminal(action) = message {
+        return action.is_user_action();
+    }
     // The channel deletion dialog is the one channel command that navigates
     // nowhere, so a save in flight must not strand it with no way out.
     if let Message::ChannelUi(action) = message {
@@ -4216,6 +4294,7 @@ pub enum Message {
     },
     NewTerminal,
     TerminalFailure(terminal_failure::Action),
+    SavedTerminal(saved_terminal::Action),
     TerminalStarted {
         card: CardId,
         terminal: TerminalId,
@@ -4378,6 +4457,8 @@ pub enum Message {
     LifecycleSweepElapsed(u64),
     /// The delay on saving a change of focus alone has passed.
     FocusSaveDue,
+    /// The delay on saving runtime-reported card titles has passed.
+    ReportedTitleSaveDue,
     /// The hold that began at this instant has lasted long enough to draw the
     /// workspace switcher.
     WorkspaceSwitcherDue(Instant),
@@ -4409,6 +4490,12 @@ pub enum Message {
     },
     WindowScaleFactorChanged(f32),
     WindowResized(f32, f32),
+    WindowEdgeState {
+        window: window::Id,
+        filled: bool,
+        right_edge_tiled: bool,
+    },
+    WindowFilled(window::Id, bool),
     ActivateUi {
         token: Option<String>,
     },
@@ -5069,6 +5156,9 @@ pub struct Cagents {
     terminal_paste: Option<(CardId, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
+    /// The workspace `card_indices` was built from. Holding it weakly pins
+    /// its allocation, so a changed workspace always has a different address.
+    card_indices_source: std::sync::Weak<WorkspaceState>,
     navigation_cache: sidebar::NavigationCache,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
@@ -5099,6 +5189,8 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
     focus_save_pending: bool,
+    /// See [`REPORTED_TITLE_SAVE_DELAY`].
+    reported_title_save: ReportedTitleSave,
     /// Where the camera was heading when the last sweep found cards on screen
     /// that it was only passing, which that sweep left cold. The camera
     /// coming to rest or heading elsewhere is then a reason to sweep again.
@@ -5118,6 +5210,7 @@ pub struct Cagents {
     /// concurrency: every mutation happens on the update thread.
     terminal_starts: std::sync::Mutex<HashMap<CardId, usize>>,
     terminal_failure: terminal_failure::State,
+    saved_terminals: saved_terminal::State,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
     /// Restored agent terminals that are not on screen, attached one at a
@@ -5178,6 +5271,17 @@ pub struct Cagents {
     /// it has been mapped. The native Opened and Resized events replace it.
     window_width: f32,
     window_height: f32,
+    /// Whether the main window is maximized or fullscreen, so the shell offers
+    /// no resize border. Tracked here rather than read from `core`, which only
+    /// learns it from Wayland window states.
+    window_filled: bool,
+    /// Whether a Wayland window state has arrived for the main window. Those
+    /// events then report maximized and fullscreen, so only a backend without
+    /// them, such as X11, needs `query_window_filled` on every resize.
+    window_state_observed: bool,
+    /// Whether the compositor reports the main window's right edge as tiled,
+    /// so the shell offers no resize border there.
+    right_edge_tiled: bool,
     core: Core,
     settings_path: Option<PathBuf>,
     settings_write_blocked: bool,
@@ -5627,6 +5731,10 @@ impl Cagents {
                 restored_runtime_residency(&card.kind, card.exposure, &card.residency);
             match card.kind {
                 CardKind::Terminal(session) => {
+                    if self.prepare_saved_terminal(card.id, &session) {
+                        repository_tasks.push(self.inspect_saved_terminal(card.id));
+                        continue;
+                    }
                     let terminal_residency =
                         terminal_residency.expect("terminal restore has lifecycle residency");
                     self.lifecycle.register(
@@ -5742,6 +5850,11 @@ impl Cagents {
                 && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
                 && !explicit_retry)
         {
+            return Task::none();
+        }
+        // A restored recipe is presentation until its exact attachment has
+        // been resolved; visibility alone must never execute it.
+        if !explicit_retry && self.saved_terminal_current(card).is_some() {
             return Task::none();
         }
         // Recovery can replace the identity this start ends up with, so
@@ -6056,6 +6169,56 @@ impl Cagents {
         }
     }
 
+    /// The trailing inset that keeps the interface out of the window's resize
+    /// border.
+    ///
+    /// While the right window edge is free, the shell starts a resize from any
+    /// press within [`design::WINDOW_RESIZE_BORDER`] of it, before the press
+    /// reaches a widget. Panes put their scrollbars at their right edge, so the
+    /// rightmost pane's scrollbar would lie wholly in that border. Maximized,
+    /// fullscreen and right-tiled windows have no border there and stay flush.
+    fn window_edge_inset(&self) -> f32 {
+        if self.window_filled || self.right_edge_tiled {
+            0.0
+        } else {
+            design::WINDOW_RESIZE_BORDER / self.settings.ui_scale
+        }
+    }
+
+    /// The window width left to the interface beside the resize border.
+    fn content_width(&self) -> f32 {
+        (self.window_width - self.window_edge_inset()).max(0.0)
+    }
+
+    /// Re-derives what depends on [`Self::content_width`], such as whether the
+    /// inspector docks or overlays, after the window or its inset changes.
+    fn content_width_changed(&mut self) -> Task<Message> {
+        if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
+            self.context_inspector_open = false;
+            self.context_inspector_transition = None;
+        }
+        self.sync_context_overlay_state()
+    }
+
+    /// Reads whether the main window is maximized or fullscreen from the
+    /// windowing backend, which is what the shell's resize border consults.
+    /// Wayland reports this through window states, which make the query
+    /// redundant; X11 has no such event, so there every resize asks again.
+    fn query_window_filled(&self) -> Task<Message> {
+        if self.window_state_observed {
+            return Task::none();
+        }
+        let Some(window) = self.core.main_window_id() else {
+            return Task::none();
+        };
+        iced::window::is_maximized(window)
+            .then(move |maximized| {
+                iced::window::mode(window)
+                    .map(move |mode| maximized || mode == iced::window::Mode::Fullscreen)
+            })
+            .map(move |filled| cosmic::Action::App(Message::WindowFilled(window, filled)))
+    }
+
     fn new_pane_fraction(&self, configured: f32) -> f32 {
         let width = if self.workspace.cards().is_empty() {
             // The welcome view has no WorkspaceSurface to replace the startup
@@ -6069,12 +6232,12 @@ impl Cagents {
                 self.settings
                     .inspector_width
                     .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                    .min(self.window_width.max(0.0))
+                    .min(self.content_width())
                     * self.context_inspector_progress()
             } else {
                 0.0
             };
-            (self.window_width - sidebar - inspector).max(0.0)
+            (self.content_width() - sidebar - inspector).max(0.0)
         } else {
             self.workspace.viewport_width()
         };
@@ -7375,7 +7538,15 @@ impl Cagents {
         Arc::make_mut(&mut self.durable).focused = focused;
     }
 
+    /// Saves the workspace and publishes its views, reported titles included.
     fn persist(&mut self) {
+        self.reported_title_save.cards.clear();
+        self.save_workspace();
+    }
+
+    /// [`Self::persist`] that leaves reported titles waiting for their
+    /// deferred save held back from shared views.
+    fn save_workspace(&mut self) {
         self.shared_views.prune_restoration_requests(&self.durable);
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
@@ -7392,9 +7563,9 @@ impl Cagents {
                 .retain(|id| open.contains(id));
         }
         self.focus_save_pending = false;
-        self.snapshot_workspace_scope();
-        self.publish_view_changes();
-        let saved = self.persistent_workspace();
+        #[cfg(test)]
+        terminal_output_tests::record_persist();
+        let saved = self.shared_window_snapshot();
         if let Some(session) = &self.session {
             let adoptions = std::mem::take(&mut self.shared_views.adoptions);
             let restorations = std::mem::take(&mut self.shared_views.restorations);
@@ -7405,12 +7576,20 @@ impl Cagents {
             }
         }
     }
+    /// The window to save, after publishing this window's own edits to the
+    /// shared views it shows. An edit saved but not published is undone by
+    /// the next shared projection, and storage refuses the snapshot that
+    /// projection saves when it reverts what storage already holds.
+    fn shared_window_snapshot(&mut self) -> Arc<WorkspaceState> {
+        self.snapshot_workspace_scope();
+        self.publish_view_changes();
+        self.persistent_workspace()
+    }
+
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
         match self.install_chat_session(card, session) {
             Some(true) => {
-                self.snapshot_workspace_scope();
-                self.publish_view_changes();
-                let saved = self.persistent_workspace();
+                let saved = self.shared_window_snapshot();
                 if let Some(writer) = &self.session {
                     writer.snapshot_conversion(saved);
                 }
@@ -7479,7 +7658,8 @@ impl Cagents {
     /// Storage refuses a snapshot that re-points a chat card at another
     /// conversation, so the replacement is recorded explicitly, together with
     /// the snapshot that shows it, the way a terminal relaunch records its new
-    /// identity.
+    /// identity. Like any other edit, the new conversation is published to
+    /// the card's shared view.
     fn replace_chat_conversation(&mut self, card: CardId, session: crate::chat::Session) {
         let expected = match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(current)) if current != &session => current.id,
@@ -7488,8 +7668,7 @@ impl Cagents {
         if self.install_chat_session(card, session.clone()).is_none() {
             return;
         }
-        self.snapshot_workspace_scope();
-        let saved = self.persistent_workspace();
+        let saved = self.shared_window_snapshot();
         if let Some(writer) = &self.session {
             writer.replace_chat_identity(card, expected, session, saved);
         }
@@ -7519,7 +7698,7 @@ impl Cagents {
         self.closed_terminal_cards.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
-        let saved = self.persistent_workspace();
+        let saved = self.shared_window_snapshot();
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(saved);
         }
@@ -7892,13 +8071,16 @@ impl Cagents {
         false
     }
 
-    /// Builds chrome for cards that appeared or were renamed, drops entries for
-    /// cards the workspace no longer holds, and renames the window.
-    fn sync_chrome(&mut self) -> Task<Message> {
-        self.terminal_working_directories
-            .retain(|card, _| self.cards.contains_key(card));
-        self.terminal_find
-            .retain(|card, _| self.cards.contains_key(card));
+    /// Rebuilds `card_indices` when the durable workspace is not the one it was
+    /// built from. Copy-on-write gives every changed workspace a new address,
+    /// and the weak reference keeps the old address from being reused.
+    fn index_cards(&mut self) {
+        if self.card_indices_source.as_ptr() == Arc::as_ptr(&self.durable) {
+            return;
+        }
+        #[cfg(test)]
+        terminal_output_tests::record_card_index();
+        self.card_indices_source = Arc::downgrade(&self.durable);
         self.card_indices.clear();
         self.card_indices.extend(
             self.durable
@@ -7907,6 +8089,18 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+    }
+
+    /// Builds chrome for cards that appeared or were renamed, drops entries for
+    /// cards the workspace no longer holds, and renames the window.
+    fn sync_chrome(&mut self) -> Task<Message> {
+        #[cfg(test)]
+        terminal_output_tests::record_chrome();
+        self.terminal_working_directories
+            .retain(|card, _| self.cards.contains_key(card));
+        self.terminal_find
+            .retain(|card, _| self.cards.contains_key(card));
+        self.index_cards();
         // A moved worktree keeps its pane numbers. Reconcile its new scope's
         // counter before minting a number, including when insertion precedes
         // an existing pane in the saved order.
@@ -7946,10 +8140,27 @@ impl Cagents {
                 self.chrome_ui.terminal_ordinals.insert(card.id, *next);
             }
         }
+        // The first titled channel holding each card, as `card_display_title`
+        // finds it, in one pass rather than one channel scan per chat.
+        let mut titled_channels = HashMap::new();
+        for channel in self
+            .durable
+            .channels
+            .iter()
+            .filter(|channel| !channel.title.is_empty())
+        {
+            for card in &channel.cards {
+                titled_channels.entry(*card).or_insert(channel);
+            }
+        }
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
-            let (title, file_caption) = self.repository_chrome(card);
+            let (title, file_caption) = self.repository_chrome_with(card, || {
+                self.card_display_title_with_chat_title(card, || {
+                    self.chat_channel_title(card, titled_channels.get(&card.id).copied())
+                })
+            });
             if matches!(card.kind, CardKind::Browser(_))
                 && self
                     .workspace
@@ -8023,6 +8234,16 @@ impl Cagents {
         &'a self,
         card: &'a CardState,
     ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
+        self.repository_chrome_with(card, || self.card_display_title(card))
+    }
+
+    /// `repository_chrome` with the card's display title supplied, so a pass
+    /// over every card can resolve channel titles once.
+    fn repository_chrome_with<'a>(
+        &'a self,
+        card: &'a CardState,
+        display_title: impl FnOnce() -> &'a str,
+    ) -> (Cow<'a, str>, Option<Cow<'a, str>>) {
         if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card.id)
             && let Some(path) = runtime.selected_path()
             && let Some(name) = path.file_name()
@@ -8037,7 +8258,7 @@ impl Cagents {
                 )),
             );
         }
-        let title = self.card_display_title(card);
+        let title = display_title();
         if let CardKind::Terminal(session) = &card.kind
             && !self.chrome_ui.user_titles.contains_key(&card.id)
         {
@@ -8074,18 +8295,32 @@ impl Cagents {
     /// Provider activity belongs in the status icon, including restored titles.
     fn card_display_title<'a>(&'a self, card: &'a CardState) -> &'a str {
         self.card_display_title_with_chat_title(card, || {
-            let CardKind::Chat(session) = &card.kind else {
-                return None;
-            };
-            let channel =
-                self.durable.channels.iter().find(|channel| {
-                    channel.cards.contains(&card.id) && !channel.title.is_empty()
-                })?;
-            (card.title == chat_ui::chat_card_title(session.launch.provider)
-                || (channel.title_source == crate::model::ChannelTitleSource::Manual
-                    && self.channel_primary_chat(channel) == Some(card.id)))
-            .then_some(channel.title.as_str())
+            self.chat_channel_title(
+                card,
+                self.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty()),
+            )
         })
+    }
+
+    /// The title a chat card shows from `channel`, the first titled channel
+    /// holding it: a provider-default chat, or the primary chat of a channel
+    /// the user named, is presented by its channel's name.
+    fn chat_channel_title<'a>(
+        &self,
+        card: &CardState,
+        channel: Option<&'a crate::model::ProjectChannel>,
+    ) -> Option<&'a str> {
+        let CardKind::Chat(session) = &card.kind else {
+            return None;
+        };
+        let channel = channel?;
+        (card.title == chat_ui::chat_card_title(session.launch.provider)
+            || (channel.title_source == crate::model::ChannelTitleSource::Manual
+                && self.channel_primary_chat(channel) == Some(card.id)))
+        .then_some(channel.title.as_str())
     }
 
     /// Batch projections can resolve channel membership once while sharing the
@@ -8362,6 +8597,10 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::utility(&state.kind));
             return Task::none();
         }
+        if self.saved_terminal_current(card).is_some() {
+            return self.inspect_saved_terminal(card);
+        }
+        self.saved_terminals.entries.remove(&card);
         let retry_details = self.terminal_details(card);
         let terminal_replacement = if let CardKind::Terminal(session) = &mut state.kind
             && session.continuity.live_proof().is_none()
@@ -8441,7 +8680,10 @@ impl Cagents {
             }
             CardKind::Repository(view) => self.attach_repository_pane(card, view),
             CardKind::PullRequests(view) => self.attach_pull_request_pane(card, view),
-            CardKind::Chat(session) => self.open_chat(card, session, crate::chat::Intent::Restore),
+            CardKind::Chat(session) => {
+                let intent = self.chat_retry_intent(card, &session);
+                self.open_chat(card, session, intent)
+            }
             CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes return before a retry registers them")
             }
@@ -8806,6 +9048,19 @@ impl Cagents {
         })
     }
 
+    /// Saves runtime-reported titles within [`REPORTED_TITLE_SAVE_DELAY`],
+    /// together with whatever else changes by then.
+    fn save_reported_titles_soon(&mut self, card: CardId) -> Task<Message> {
+        self.reported_title_save.cards.insert(card);
+        if std::mem::replace(&mut self.reported_title_save.scheduled, true) {
+            return Task::none();
+        }
+        cosmic::task::future(async {
+            tokio::time::sleep(REPORTED_TITLE_SAVE_DELAY).await;
+            Message::ReportedTitleSaveDue
+        })
+    }
+
     /// Arms a timer for `deadline`, superseding any timer already pending.
     fn arm_lifecycle_sweep(&mut self, deadline: Instant) -> Task<Message> {
         self.lifecycle_sweep_deadline = Some(deadline);
@@ -9108,20 +9363,27 @@ impl Cagents {
     }
 
     /// Drain controls and lifecycle events on every wake, independently of grid
-    /// repaint. Only actual metadata changes need the workspace projection tail.
-    fn drain_terminal_update(&mut self, card: CardId, _generation: u64) -> (Task<Message>, bool) {
+    /// repaint. Answers how much of the workspace projection the wake changed.
+    fn drain_terminal_update(
+        &mut self,
+        card: CardId,
+        _generation: u64,
+    ) -> (Task<Message>, Projection) {
         if self.chat_start_pending(card) {
-            return (Task::none(), false);
+            return (Task::none(), Projection::Unchanged);
         }
         let (proof, collected) = {
             let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
-                return (Task::none(), false);
+                return (Task::none(), Projection::Unchanged);
             };
             let events = handle.events();
             (handle.host_proof(), events.try_iter().collect::<Vec<_>>())
         };
         let mut durable_changed = false;
         let mut metadata_changed = false;
+        // A reported title is durable, but only chrome reads it and its save
+        // can wait; see `REPORTED_TITLE_SAVE_DELAY`.
+        let mut title_changed = false;
         let mut recovery = None;
         let mut clipboard_task = Task::none();
         if let Some(proof) = proof
@@ -9159,7 +9421,7 @@ impl Cagents {
                     }
                 }
                 TerminalEvent::TitleChanged(title) => {
-                    durable_changed |= self.apply_reported_title(card, title);
+                    title_changed |= self.apply_reported_title(card, title);
                 }
                 TerminalEvent::WorkingDirectoryChanged(path) => {
                     if self.terminal_working_directories.get(&card) != Some(&path) {
@@ -9326,9 +9588,15 @@ impl Cagents {
             }
         }
         // Attention follows semantic agent transitions, not ordinary terminal output.
-        if durable_changed {
+        // A save now carries any reported title with it.
+        let title_save = if durable_changed {
             self.persist();
-        }
+            Task::none()
+        } else if title_changed {
+            self.save_reported_titles_soon(card)
+        } else {
+            Task::none()
+        };
         if let Some((session, visible, hibernated)) = recovery {
             // A hibernated agent kept attached for its row goes back to
             // waiting for its card: it may be attached again, but launching it
@@ -9343,7 +9611,10 @@ impl Cagents {
                 }
                 self.cards.insert(card, CardRuntime::Loading);
                 self.restored_agent_attaches.push_back(card);
-                return (self.attach_next_restored_agent(), true);
+                return (
+                    Task::batch([title_save, self.attach_next_restored_agent()]),
+                    Projection::Full,
+                );
             }
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,
@@ -9362,11 +9633,28 @@ impl Cagents {
                 Instant::now(),
             );
             self.cards.insert(card, CardRuntime::Loading);
-            return (self.start_terminal(card, session, visible, false), true);
+            return (
+                Task::batch([
+                    title_save,
+                    self.start_terminal(card, session, visible, false),
+                ]),
+                Projection::Full,
+            );
         }
+        let projection = if metadata_changed || durable_changed {
+            Projection::Full
+        } else if title_changed {
+            Projection::Chrome
+        } else {
+            Projection::Unchanged
+        };
         (
-            Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
-            metadata_changed || durable_changed,
+            Task::batch([
+                clipboard_task,
+                title_save,
+                self.refresh_live_terminal_find(card),
+            ]),
+            projection,
         )
     }
 
@@ -9767,7 +10055,10 @@ impl Cagents {
         } else {
             "Retry"
         };
-        let content: Element<'a, Message> = match self.cards.get(&id) {
+        let content: Element<'a, Message> = if let Some(view) = self.saved_terminal_view(id) {
+            view
+        } else {
+            match self.cards.get(&id) {
             Some(CardRuntime::Chat(_)) => self.chat_view(id).map(move |message| match message {
                 Message::ChatUi(chat_ui::Action::OpenUrl(uri)) => {
                     Message::OpenDocumentLink(id, uri)
@@ -10066,6 +10357,7 @@ impl Cagents {
             .center(Length::Fill)
             .padding(space::XL)
             .into(),
+        }
         };
 
         let mut rows: Vec<Element<'a, Message>> = Vec::with_capacity(3);
@@ -12266,7 +12558,7 @@ impl Cagents {
             .inspector_width
             .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
         Some(
-            if self.window_width - navigation - inspector
+            if self.content_width() - navigation - inspector
                 >= crate::workspace::WidthLimits::default().minimum
             {
                 InspectorLayout::Docked
@@ -12364,6 +12656,16 @@ impl Cagents {
     }
 
     fn inspector_runtime_status(&self, card: CardId) -> InspectorRuntimeStatus {
+        if self.saved_terminal_current(card).is_some() {
+            return if self
+                .saved_terminal_status(card)
+                .is_some_and(|(_, busy)| busy)
+            {
+                InspectorRuntimeStatus::Starting
+            } else {
+                InspectorRuntimeStatus::Unavailable
+            };
+        }
         match self.cards.get(&card) {
             Some(CardRuntime::Loading) | None => InspectorRuntimeStatus::Starting,
             Some(CardRuntime::Failed(_)) => InspectorRuntimeStatus::Unavailable,
@@ -12382,7 +12684,7 @@ impl Cagents {
                     InspectorRuntimeStatus::Ready
                 }
             },
-            Some(CardRuntime::Chat(_)) => InspectorRuntimeStatus::Ready,
+            Some(CardRuntime::Chat(runtime)) => runtime.inspector_runtime_status(),
             Some(CardRuntime::Completed)
             | Some(CardRuntime::Terminal(_))
             | Some(CardRuntime::PullRequests(_))
@@ -12415,6 +12717,7 @@ impl Cagents {
             }
             InspectorAction::ResizeFinished => self.save_settings_task(false),
             InspectorAction::CopyLspDiagnostic(diagnostic) => {
+                chat_ui::invalidate_copy_intent();
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
             }
             // A request's answer is rendered by this very panel, so dismissing
@@ -13842,6 +14145,7 @@ impl Application for Cagents {
             terminal_paste: None,
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            card_indices_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -13860,6 +14164,7 @@ impl Application for Cagents {
             hosted_terminals_rx,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
+            saved_terminals: saved_terminal::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
@@ -13902,6 +14207,9 @@ impl Application for Cagents {
             window_scale_factor,
             window_width: 1_600.0,
             window_height: 900.0,
+            window_filled: false,
+            window_state_observed: false,
+            right_edge_tiled: false,
             settings_path,
             settings_write_blocked,
             notices: NoticeLog::default(),
@@ -14014,6 +14322,7 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
         };
@@ -14060,7 +14369,7 @@ impl Application for Cagents {
             };
         let _ = app
             .workspace
-            .resize_viewport((app.window_width - sidebar_width - inspector_width).max(0.0));
+            .resize_viewport((app.content_width() - sidebar_width - inspector_width).max(0.0));
         #[cfg(feature = "latency-harness")]
         if app.latency_fixture.is_some() {
             app.cards = app
@@ -14271,9 +14580,14 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut terminal_metadata_unchanged = false;
+        let mut projection = if repaint_tick(&message) {
+            Projection::Unchanged
+        } else {
+            Projection::Full
+        };
         let task = match message {
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
+            Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
             Message::Palette(action) => self.update_palette(action),
             Message::RunCommand(command) => {
@@ -14322,7 +14636,9 @@ impl Application for Cagents {
             }
             Message::WorkspaceModelObserved(update) => {
                 let (task, changed) = self.apply_workspace_model_update_effect(update);
-                terminal_metadata_unchanged = !changed;
+                if !changed {
+                    projection = Projection::Unchanged;
+                }
                 task
             }
             Message::TerminalStarted {
@@ -14357,8 +14673,8 @@ impl Application for Cagents {
                 let started =
                     tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::DEBUG)
                         .then(Instant::now);
-                let (task, metadata_changed) = self.drain_terminal_update(card, generation);
-                terminal_metadata_unchanged = !metadata_changed;
+                let (task, wake_projection) = self.drain_terminal_update(card, generation);
+                projection = wake_projection;
                 if let Some(started) = started {
                     let activity_sequence = match self.cards.get(&card) {
                         Some(CardRuntime::Terminal(handle)) => {
@@ -16328,6 +16644,13 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::ReportedTitleSaveDue => {
+                self.reported_title_save.scheduled = false;
+                if !self.reported_title_save.cards.is_empty() {
+                    self.persist();
+                }
+                Task::none()
+            }
             #[cfg(feature = "integrated-browser")]
             Message::InitializeBrowserFactory => self.browser_factory_task(),
             #[cfg(feature = "integrated-browser")]
@@ -16357,6 +16680,36 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::WindowEdgeState {
+                window,
+                filled,
+                right_edge_tiled,
+            } => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                let inset = self.window_edge_inset();
+                self.window_state_observed = true;
+                self.window_filled = filled;
+                self.right_edge_tiled = right_edge_tiled;
+                if self.window_edge_inset() == inset {
+                    Task::none()
+                } else {
+                    self.content_width_changed()
+                }
+            }
+            Message::WindowFilled(window, filled) => {
+                if self.core.main_window_id() != Some(window) {
+                    return Task::none();
+                }
+                let inset = self.window_edge_inset();
+                self.window_filled = filled;
+                if self.window_edge_inset() == inset {
+                    Task::none()
+                } else {
+                    self.content_width_changed()
+                }
+            }
             Message::WindowResized(width, height) => {
                 if height.is_finite() && height > 0.0 {
                     self.window_height = height;
@@ -16364,11 +16717,7 @@ impl Application for Cagents {
                 if width.is_finite() && width > 0.0 {
                     self.window_width = width;
                 }
-                if self.focused_repository_is_saving() && self.context_inspector_is_overlay() {
-                    self.context_inspector_open = false;
-                    self.context_inspector_transition = None;
-                }
-                self.sync_context_overlay_state()
+                Task::batch([self.content_width_changed(), self.query_window_filled()])
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
@@ -16821,7 +17170,9 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
-                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, .. } = &event
+                // A held chord copies once, so its repeats must not cancel the
+                // copy its first press started.
+                if let keyboard::Event::KeyPressed { key: keyboard::Key::Character(key), modifiers, repeat: false, .. } = &event
                     && modifiers.command() && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("x"))
                 {
                     chat_ui::invalidate_copy_intent();
@@ -16842,12 +17193,38 @@ impl Application for Cagents {
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
                 }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
+                if let Some(gallery) = &self.chat_ui.image_viewer {
+                    if let keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        modifiers,
+                        repeat,
+                        ..
+                    } = &event
+                    {
                         match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
+                            // Layout-independent, like the other Ctrl chords.
+                            keyboard::Key::Character(_)
+                                if modifiers.command()
+                                    && !modifiers.shift()
+                                    && !modifiers.alt()
+                                    && !modifiers.logo()
+                                    && key
+                                        .to_latin(*physical_key)
+                                        .is_some_and(|key| key.eq_ignore_ascii_case(&'c')) =>
+                            {
+                                // A held chord copies once.
+                                if *repeat {
+                                    return Task::none();
+                                }
+                                let image = gallery.selected_image();
+                                return self.handle_chat_ui(chat_ui::Action::Image(
+                                    image,
+                                    chat_ui::images::ImageCommand::Copy,
+                                ));
                             }
+                            // Escape is the viewer's own (`Gallery::view`), so that
+                            // one an open context menu claims closes only the menu.
                             keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
                                 self.chat_ui.image_viewer.as_mut().unwrap().next(false);
                             }
@@ -17058,6 +17435,22 @@ impl Application for Cagents {
                 // The dialog is an overlay, so it has already seen the
                 // keystroke by the time this runs, and what it does with one
                 // is its own affair.
+                // The inspector's advertised toggle closes this foreground
+                // surface; it must not be blocked with the workspace behind it.
+                if self.context_inspector_is_overlay()
+                    && !self.modal_is_open()
+                    && workspace_widget::global_shortcut(
+                        &event,
+                        &self.settings.keyboard_shortcuts,
+                        self.focused_pane(),
+                    ) == Some(workspace_widget::GlobalShortcut::ToggleInspector)
+                    && let keyboard::Event::KeyPressed { modifiers, .. } = &event
+                {
+                    return self.run_workspace_command(
+                        workspace_widget::GlobalShortcut::ToggleInspector,
+                        *modifiers,
+                    );
+                }
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
@@ -17604,7 +17997,7 @@ impl Application for Cagents {
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
         let task = Task::batch([task, self.flush_settings_on_blur()]);
-        if !terminal_metadata_unchanged {
+        if projection == Projection::Full {
             self.sync_worktree_protections();
         }
         self.sync_popup_keyboard_nav();
@@ -17644,12 +18037,27 @@ impl Application for Cagents {
         if self.latency_focus != self.workspace.focused() {
             self.latency.abandon_pending();
         }
-        if terminal_metadata_unchanged {
-            return Task::batch([
-                task,
-                self.reconcile_notice_popup(),
-                self.release_deferred_navigation_if_unblocked(),
-            ]);
+        match projection {
+            Projection::Unchanged => {
+                return Task::batch([
+                    task,
+                    self.reconcile_notice_popup(),
+                    self.release_deferred_navigation_if_unblocked(),
+                ]);
+            }
+            // A reported title reaches the tabs and window title; nothing in
+            // the sidebar, worktree ownership or protections reads it.
+            Projection::Chrome => {
+                let notices = self.reconcile_notice_popup();
+                let chrome = self.sync_chrome();
+                return Task::batch([
+                    task,
+                    chrome,
+                    notices,
+                    self.release_deferred_navigation_if_unblocked(),
+                ]);
+            }
+            Projection::Full => {}
         }
         if camera_only {
             return Task::batch([task, self.release_deferred_navigation_if_unblocked()]);
@@ -17777,6 +18185,9 @@ impl Application for Cagents {
                     refresh_ui::Action::Focused(event_window, false),
                 )),
                 iced::Event::Window(event) => window_geometry_message(&event),
+                event @ iced::Event::PlatformSpecific(_) => {
+                    window_edge_message(&event, event_window)
+                }
                 _ => None,
             }),
         ];
@@ -17795,6 +18206,16 @@ impl Application for Cagents {
                 lsp_event_stream,
             )
             .map(Message::Lsp),
+        );
+        subscriptions.extend(
+            self.cards
+                .iter()
+                .filter_map(|(&card, runtime)| match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        Some(runtime.document_subscription(card).map(Message::Repository))
+                    }
+                    _ => None,
+                }),
         );
         subscriptions.extend(operation_subscriptions);
         if let Some(window) = self.core.main_window_id()
@@ -18188,7 +18609,7 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let window_width = self.window_width;
+        let content_width = self.content_width();
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
             &self.sidebar_model,
@@ -18442,7 +18863,7 @@ impl Application for Cagents {
                 .settings
                 .inspector_width
                 .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH)
-                .min(window_width.max(0.0));
+                .min(content_width);
             let progress = self.context_inspector_progress();
             let visible_width = width * progress;
             let splitter: Element<'_, Message> = Splitter::new(
@@ -18560,6 +18981,11 @@ impl Application for Cagents {
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
+        // Only the inset changes with the window state, so the tree, and
+        // every scroll offset and focus in it, survives a maximize.
+        let surface: Element<'_, Message> = widget::container(surface)
+            .padding(iced::Padding::ZERO.right(self.window_edge_inset()))
+            .into();
         let switcher = self
             .palette_surface()
             .or_else(|| self.pane_rename_surface())
@@ -19789,6 +20215,18 @@ mod tests {
         let line = quarantined_write_line(&snapshot, &untitled);
         assert!(line.contains("(one pane was refused)"), "{line}");
 
+        let pane = write(WriteSubject::Pane { card });
+        let line = quarantined_write_line(&pane, &titled);
+        assert!(
+            line.starts_with(
+                "Latest changes to pane “build” (storage keeps its last saved state) —"
+            ),
+            "{line}"
+        );
+        assert!(line.contains("closing the pane clears it"), "{line}");
+        let line = quarantined_write_line(&pane, &untitled);
+        assert!(line.starts_with("Latest changes to a pane ("), "{line}");
+
         let relaunch = write(WriteSubject::CardIdentity {
             card,
             kind: ReplacedIdentity::Terminal,
@@ -19814,10 +20252,12 @@ mod tests {
 
     #[test]
     fn first_pane_width_uses_current_empty_window_and_preserves_measured_panes() {
+        // A free right edge keeps `WINDOW_RESIZE_BORDER` of the window from the
+        // content, so the third case sits exactly at the narrow threshold.
         for (window, seed, with_project, inspector_open, expected, measured) in [
             (1280.0, 1340.0, false, false, 1.0, 1020.0),
             (1600.0, 600.0, false, false, 0.5, 1340.0),
-            (1360.0, 1340.0, false, false, 0.5, 1100.0),
+            (1368.0, 1340.0, false, false, 0.5, 1100.0),
             (1600.0, 1340.0, true, true, 1.0, 960.0),
             (2000.0, 600.0, true, true, 0.5, 1360.0),
             (900.0, 1340.0, true, true, 1.0, 640.0),
@@ -21245,7 +21685,163 @@ mod tests {
 
     #[test]
     fn resetting_settings_restores_autosave_for_an_already_open_editor() {
-        async fn settle_repository_tasks(app: &mut Cagents, task: Task<Message>) {
+        if crate::repository_widget::retained_save_tests::isolated_test(
+            "app::tests::resetting_settings_restores_autosave_for_an_already_open_editor",
+        ) {
+            return;
+        }
+
+        #[derive(Debug, Default)]
+        struct SaveDiagnostics {
+            auto_save_due_delivered: usize,
+            events: Vec<String>,
+        }
+
+        fn editor_state(app: &Cagents, card: CardId) -> String {
+            let editor = match app.cards.get(&card) {
+                Some(CardRuntime::Repository(runtime)) => {
+                    let context = runtime.inspector_context();
+                    format!(
+                        "document={:?}, document_error={:?}, text={:?}, dirty={}, saving={}, save_error={:?}, editor_recovery={}, blocks_navigation={}",
+                        context.document,
+                        context.document_error,
+                        runtime.editor_text(),
+                        runtime.is_dirty(),
+                        runtime.is_saving(),
+                        runtime.save_error(),
+                        runtime.has_editor_recovery(),
+                        runtime.blocks_navigation(),
+                    )
+                }
+                Some(_) => "non-repository runtime".into(),
+                None => "runtime missing".into(),
+            };
+            format!(
+                "{editor}, window_custody_pending={}",
+                app.operation_recovery_pending(),
+            )
+        }
+
+        impl SaveDiagnostics {
+            fn before_message(
+                &mut self,
+                app: &Cagents,
+                card: CardId,
+                phase: &str,
+                message: &Message,
+            ) {
+                let detail = match message {
+                    Message::Repository(RepositoryAction::FileLoadedAt { identity, result }) => {
+                        let disposition = match result {
+                            Err(error) => format!("Err({error:?})"),
+                            Ok(read) => {
+                                let same_worktree = read.worktree() == identity.worktree;
+                                // Inspect a clone of this fixture's actual read
+                                // result; leave the original message/root intact.
+                                // Cloning performs no new file read or admission.
+                                let (_, loaded) = read.clone().into_parts();
+                                let content = match loaded {
+                                    Err(error) => format!("inner Err({error:?})"),
+                                    Ok(loaded) => match loaded.content {
+                                        crate::editor::FileContent::Editable { text, .. } => {
+                                            format!("Editable {{ bytes: {} }}", text.len())
+                                        }
+                                        crate::editor::FileContent::Image {
+                                            width, height, ..
+                                        } => {
+                                            format!("Image {{ width: {width}, height: {height} }}")
+                                        }
+                                        crate::editor::FileContent::Pdf { pages, .. } => {
+                                            format!("Pdf {{ pages: {pages} }}")
+                                        }
+                                        crate::editor::FileContent::ReadOnly(reason) => {
+                                            format!("ReadOnly({reason:?})")
+                                        }
+                                    },
+                                };
+                                format!(
+                                    "Ok(FileRead {{ same_worktree: {same_worktree}, content: {content} }})"
+                                )
+                            }
+                        };
+                        Some(format!(
+                            "FileLoadedAt card_matches={}, generation={}, disposition={disposition}",
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::Repository(RepositoryAction::AutoSaveDue {
+                        identity,
+                        revision,
+                        ticket,
+                    }) => {
+                        self.auto_save_due_delivered += 1;
+                        Some(format!(
+                            "AutoSaveDue delivered={} card_matches={}, generation={}, revision={revision}, ticket={ticket}",
+                            self.auto_save_due_delivered,
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::Repository(RepositoryAction::RetainedSaveFinished {
+                        identity,
+                        ticket,
+                        revision,
+                        saved_text,
+                        result,
+                    }) => {
+                        // Match before the runtime flattens retained errors.
+                        // Never Debug-print a live recovery authority/owner.
+                        let disposition = match result {
+                            Ok(outcome) => format!(
+                                "Ok({:?}), recovery_present={}",
+                                outcome.outcome(),
+                                outcome.recovery_authority().is_some(),
+                            ),
+                            Err(crate::editor::retained_save::RetainedSaveError::Io(error)) => {
+                                format!("Err(Io({error:?})), recovery_present=false")
+                            }
+                            Err(crate::editor::retained_save::RetainedSaveError::Recovery {
+                                message,
+                                ..
+                            }) => {
+                                format!("Err(Recovery({message:?})), recovery_present=true")
+                            }
+                        };
+                        Some(format!(
+                            "RetainedSaveFinished card_matches={}, generation={}, ticket={ticket}, revision={revision}, saved_text={saved_text:?}, result={disposition}",
+                            identity.card == card,
+                            identity.generation,
+                        ))
+                    }
+                    Message::SettingsSaved { result, .. } => Some(format!(
+                        "SettingsSaved success={}, error={:?}",
+                        result.is_ok(),
+                        result.as_ref().err(),
+                    )),
+                    _ => None,
+                };
+                if let Some(detail) = detail {
+                    self.events.push(format!(
+                        "{phase}: before consumption: {detail}; {}",
+                        editor_state(app, card),
+                    ));
+                }
+            }
+
+            fn checkpoint(&mut self, app: &Cagents, card: CardId, phase: &str) {
+                self.events
+                    .push(format!("{phase}: {}", editor_state(app, card)));
+            }
+        }
+
+        async fn settle_repository_tasks(
+            app: &mut Cagents,
+            task: Task<Message>,
+            diagnostics: &mut SaveDiagnostics,
+            card: CardId,
+            phase: &str,
+        ) {
             let mut pending = VecDeque::from([task]);
             while let Some(task) = pending.pop_front() {
                 let Some(mut stream) = iced::runtime::task::into_stream(task) else {
@@ -21256,10 +21852,13 @@ mod tests {
                         message @ (Message::Repository(_) | Message::SettingsSaved { .. }),
                     )) = action
                     {
+                        diagnostics.before_message(app, card, phase, &message);
                         pending.push_back(app.update(message));
+                        diagnostics.checkpoint(app, card, "after message consumption");
                     }
                 }
             }
+            diagnostics.checkpoint(app, card, phase);
         }
 
         tokio::runtime::Builder::new_current_thread()
@@ -21274,6 +21873,7 @@ mod tests {
                 app.settings_path = Some(directory.path().join("settings.toml"));
                 app.settings_write_blocked = false;
                 let card = CardId::new();
+                let mut diagnostics = SaveDiagnostics::default();
                 app.cards.insert(
                     card,
                     CardRuntime::Repository(Box::new(RepositoryRuntime::file_list_fixture(
@@ -21290,27 +21890,45 @@ mod tests {
                     card,
                     path: PathBuf::from("notes.txt"),
                 }));
-                settle_repository_tasks(&mut app, task).await;
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after open").await;
 
                 let task = app.apply_setting_input(SettingsField::EditorAutoSave, "false".into());
-                settle_repository_tasks(&mut app, task).await;
+                settle_repository_tasks(
+                    &mut app,
+                    task,
+                    &mut diagnostics,
+                    card,
+                    "after disabling autosave",
+                )
+                .await;
                 let task = app.update(Message::Repository(RepositoryAction::EditorAction {
                     card,
                     action: cosmic::widget::text_editor::Action::Edit(
                         cosmic::widget::text_editor::Edit::Insert('a'),
                     ),
                 }));
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after typing a")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "",
+                    "save diagnostics: {diagnostics:#?}",
+                );
 
                 // Reset schedules the dirty buffer without requiring another edit.
                 let task = app.reset_settings();
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "a");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after reset")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "a",
+                    "save diagnostics: {diagnostics:#?}",
+                );
                 assert!(
                     settings::load(app.settings_path.as_ref().unwrap())
                         .unwrap()
-                        .editor_auto_save
+                        .editor_auto_save,
+                    "save diagnostics: {diagnostics:#?}",
                 );
 
                 // The same open editor must keep saving subsequent changes.
@@ -21320,8 +21938,13 @@ mod tests {
                         cosmic::widget::text_editor::Edit::Insert('b'),
                     ),
                 }));
-                settle_repository_tasks(&mut app, task).await;
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), "ab");
+                settle_repository_tasks(&mut app, task, &mut diagnostics, card, "after typing b")
+                    .await;
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "ab",
+                    "save diagnostics: {diagnostics:#?}",
+                );
             });
     }
 
@@ -22973,6 +23596,111 @@ mod tests {
     }
 
     #[test]
+    fn content_stays_out_of_the_resize_border_of_a_free_right_edge() {
+        use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+        use iced::event::{PlatformSpecific, wayland};
+
+        let state = |state| {
+            iced::Event::PlatformSpecific(PlatformSpecific::Wayland(wayland::Event::Window(
+                wayland::WindowEvent::WindowState(state),
+            )))
+        };
+        let mut app = context_inspector_test_app(false);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.settings.ui_scale = 1.0;
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        // The border is in compositor pixels; the interface scale enlarges
+        // every interface pixel.
+        app.settings.ui_scale = 1.25;
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER / 1.25);
+        app.settings.ui_scale = 1.0;
+
+        // Another window's state does not move the main window's content.
+        let other = window_edge_message(&state(WindowState::TILED), window::Id::unique())
+            .expect("window state event");
+        let _ = app.update(other);
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+
+        // A tiled right edge has no border, so content returns to the edge.
+        // Other tiled edges leave the right border in place.
+        for (flags, inset) in [
+            (
+                WindowState::TILED_LEFT | WindowState::TILED_TOP,
+                design::WINDOW_RESIZE_BORDER,
+            ),
+            (WindowState::TILED_RIGHT | WindowState::ACTIVATED, 0.0),
+            (WindowState::ACTIVATED, design::WINDOW_RESIZE_BORDER),
+        ] {
+            let message = window_edge_message(&state(flags), main).expect("window state event");
+            let _ = app.update(message);
+            assert_eq!(app.window_edge_inset(), inset, "{flags:?}");
+        }
+
+        // A maximized or fullscreen window has no border at all, whether the
+        // Wayland state or the backend query reports it.
+        let maximized =
+            window_edge_message(&state(WindowState::MAXIMIZED), main).expect("window state event");
+        let _ = app.update(maximized);
+        assert_eq!(app.window_edge_inset(), 0.0);
+        let _ = app.update(Message::WindowFilled(main, false));
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        let _ = app.update(Message::WindowFilled(window::Id::unique(), true));
+        assert_eq!(app.window_edge_inset(), design::WINDOW_RESIZE_BORDER);
+        let _ = app.update(Message::WindowFilled(main, true));
+        assert_eq!(app.window_edge_inset(), 0.0);
+        assert!(window_edge_message(&iced::Event::Window(window::Event::Focused), main).is_none());
+    }
+
+    #[test]
+    fn resizes_query_the_window_state_only_until_wayland_reports_it() {
+        use cosmic::cctk::sctk::reexports::csd_frame::WindowState;
+        use iced::event::{PlatformSpecific, wayland};
+
+        let mut app = context_inspector_test_app(false);
+        let resize = |app: &mut Cagents| app.update(Message::WindowResized(1600.0, 900.0)).units();
+        let without_query = resize(&mut app);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        // X11 sends no window states, so every resize asks the backend.
+        assert!(resize(&mut app) > without_query);
+        assert!(resize(&mut app) > without_query);
+
+        let state = iced::Event::PlatformSpecific(PlatformSpecific::Wayland(
+            wayland::Event::Window(wayland::WindowEvent::WindowState(WindowState::ACTIVATED)),
+        ));
+        let _ = app.update(window_edge_message(&state, main).expect("window state event"));
+        assert_eq!(resize(&mut app), without_query);
+    }
+
+    #[test]
+    fn a_resize_border_change_alone_redocks_the_inspector() {
+        let mut app = context_inspector_test_app(true);
+        let main = window::Id::unique();
+        app.core.set_main_window_id(Some(main));
+        app.settings.ui_scale = 1.0;
+        let _ = app.update(Message::WindowFilled(main, true));
+        // The narrowest window that still docks the inspector without a
+        // border, so the border's width alone decides between the layouts.
+        let docked = (600..3000)
+            .map(|width| width as f32)
+            .find(|&width| {
+                app.window_width = width;
+                !app.context_inspector_is_overlay()
+            })
+            .expect("a width that docks the inspector");
+        let _ = app.update(Message::WindowResized(docked, 900.0));
+        assert!(!app.context_inspector_overlay_active);
+
+        let _ = app.update(Message::WindowFilled(main, false));
+        assert!(app.context_inspector_is_overlay());
+        assert!(app.context_inspector_overlay_active);
+
+        let _ = app.update(Message::WindowFilled(main, true));
+        assert!(!app.context_inspector_overlay_active);
+    }
+
+    #[test]
     fn initial_native_window_size_replaces_estimated_inspector_geometry() {
         for event in [
             window::Event::Opened {
@@ -24107,6 +24835,82 @@ mod tests {
     }
 
     #[test]
+    fn context_overlay_toggle_shortcut_honors_bindings_capture_and_modal_priority() {
+        let press = |key: &str, modifiers, repeat| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(key.into()),
+            modified_key: keyboard::Key::Character(key.into()),
+            physical_key: keyboard::key::Physical::Code(if key == "t" {
+                keyboard::key::Code::KeyT
+            } else {
+                keyboard::key::Code::KeyI
+            }),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat,
+        };
+        let default = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        for captured in [false, true] {
+            for custom in [false, true] {
+                let mut app = context_inspector_test_app(true);
+                let modifiers = if custom {
+                    app.settings.keyboard_shortcuts.toggle_inspector = vec!["Ctrl+Alt+I".into()];
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT
+                } else {
+                    default
+                };
+                let _ = app.update(Message::WindowResized(902.0, 800.0));
+                assert!(app.context_inspector_is_overlay());
+                assert!(app.workspace_inputs_blocked());
+                let focused = app.workspace.focused();
+                let count = app.workspace.order().count();
+
+                // Other workspace commands and retired/default bindings do not
+                // escape through the inspector's one permitted close action.
+                let _ = app.update(Message::KeyEvent {
+                    event: press("t", keyboard::Modifiers::CTRL, false),
+                    captured,
+                });
+                assert_eq!(app.workspace.order().count(), count);
+                if custom {
+                    let _ = app.update(Message::KeyEvent {
+                        event: press("i", default, false),
+                        captured,
+                    });
+                    assert!(app.context_inspector_open);
+                }
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, true),
+                    captured,
+                });
+                assert!(app.context_inspector_open, "repeat must not toggle twice");
+
+                // A real form dialog above the inspector owns keyboard input.
+                app.device_ui.open = true;
+                assert!(app.modal_is_open());
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, false),
+                    captured,
+                });
+                assert!(app.device_ui.open);
+                assert!(app.context_inspector_open);
+                app.device_ui.open = false;
+
+                let _ = app.update(Message::KeyEvent {
+                    event: press("i", modifiers, false),
+                    captured,
+                });
+                assert!(!app.context_inspector_open);
+                settle_context_inspector_transition(&mut app);
+                assert!(!app.context_inspector_is_overlay());
+                assert!(!app.workspace_inputs_blocked());
+                assert_eq!(app.workspace.focused(), focused);
+                assert_eq!(app.workspace.order().count(), count);
+            }
+        }
+    }
+
+    #[test]
     fn context_inspector_resize_persists_only_when_the_gesture_finishes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -24484,70 +25288,49 @@ mod tests {
         card
     }
 
-    /// An agent's row reports what it is doing only through an attached
-    /// terminal, so a restored agent off screen is attached without waiting
-    /// for its card to be opened, while a plain shell stays detached.
+    /// All saved owners, including plain shells, use one metadata-only lane.
     #[test]
     fn restored_agents_attach_one_at_a_time_after_visible_cards_start() {
         let mut app = context_inspector_test_app(false);
         let visible = restored_live_terminal("/bin/sh", Exposure::Visible);
-        let agents = [
+        let cards = [
+            visible.clone(),
+            restored_live_terminal("/bin/sh", Exposure::Offscreen),
             restored_live_terminal("/usr/bin/claude", Exposure::Offscreen),
             restored_live_terminal("/usr/bin/codex", Exposure::Offscreen),
         ];
-        let shell = restored_live_terminal("/bin/sh", Exposure::Offscreen);
         app.durable = Arc::new(WorkspaceState {
             focused: Some(visible.id),
-            cards: [visible.clone(), shell.clone()]
-                .into_iter()
-                .chain(agents.clone())
-                .collect(),
+            cards: cards.to_vec(),
             ..WorkspaceState::default()
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
-        let terminal = |card: &CardState| match &card.kind {
-            CardKind::Terminal(session) => session.id,
-            _ => unreachable!("terminal fixture"),
-        };
+        let focus = app.workspace.focused();
+        let strip = app.workspace.order().collect::<Vec<_>>();
         drop(app.initialize_runtimes());
-        // The card on screen starts first; agents wait for its recovery lease.
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches, [agents[0].id, agents[1].id]);
-        let _ = app.update(Message::TerminalStarted {
-            card: visible.id,
-            terminal: terminal(&visible),
-            result: Err("fixture".into()),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches, [agents[1].id]);
         let notices = app.notices.entries.len();
-
-        // A terminal that would have to be launched again stays detached, and
-        // so does one that cannot be attached; neither is a failure anyone
-        // has to see.
-        let _ = app.update(Message::RestoredAgentAttached {
-            card: agents[0].id,
-            terminal: terminal(&agents[0]),
-            result: Ok(None),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert!(app.restored_agent_attaches.is_empty());
-        let _ = app.update(Message::RestoredAgentAttached {
-            card: agents[1].id,
-            terminal: terminal(&agents[1]),
-            result: Err("the daemon is unavailable".into()),
-        });
-        assert_eq!(app.terminal_starts_in_flight(), 0);
-        for card in agents.iter().chain([&shell]) {
+        for (index, card) in cards.iter().enumerate() {
+            assert_eq!(app.terminal_starts_in_flight(), 1);
+            assert!(app.terminal_start_in_flight(card.id));
+            assert!(app.restored_agent_attaches.is_empty());
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
+            let result = if index == cards.len() - 1 {
+                Err("the daemon is unavailable".into())
+            } else {
+                Ok(None)
+            };
+            saved_terminal::tests::complete_inspection(&mut app, card.id, result);
+            assert_eq!(app.saved_terminal_ready(card.id), index != cards.len() - 1);
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
             assert!(matches!(
                 app.cards.get(&card.id),
                 Some(CardRuntime::Loading)
             ));
-            assert_eq!(
-                app.lifecycle.state(card.id).map(|(_, residency)| residency),
-                Some(&Residency::Hibernated)
-            );
+            assert!(app.lifecycle.state(card.id).is_none());
+            assert_eq!(app.workspace.focused(), focus);
+            assert_eq!(app.workspace.order().collect::<Vec<_>>(), strip);
         }
+        assert_eq!(app.terminal_starts_in_flight(), 0);
         assert_eq!(app.notices.entries.len(), notices);
     }
 
@@ -24562,49 +25345,21 @@ mod tests {
         });
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         drop(app.initialize_runtimes());
-        assert_eq!(
-            app.terminal_starts_in_flight(),
-            1,
-            "the identified Omp agent already observes background metadata"
-        );
-        assert!(app.terminal_start_in_flight(terminals[1].id));
-        assert!(!app.terminal_start_in_flight(terminals[0].id));
-        assert!(!app.terminal_start_in_flight(terminals[2].id));
-        assert!(app.restored_agent_attaches.is_empty());
-        let CardKind::Terminal(omp) = &terminals[1].kind else {
-            unreachable!()
-        };
-        drop(app.update(Message::RestoredAgentAttached {
-            card: terminals[1].id,
-            terminal: omp.id,
-            result: Ok(None),
-        }));
+        for card in &terminals {
+            assert_eq!(app.terminal_starts_in_flight(), 1);
+            assert!(app.terminal_start_in_flight(card.id));
+            assert!(app.restored_agent_attaches.is_empty());
+            assert_ne!(
+                app.startup_pane_check(),
+                Ok(true),
+                "pending inspection cannot qualify"
+            );
+            saved_terminal::tests::complete_inspection(&mut app, card.id, Ok(None));
+            assert!(app.saved_terminal_ready(card.id));
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
+        }
         assert_eq!(app.terminal_starts_in_flight(), 0);
-        // An unavailable original remains unqualified; the explicit startup
-        // check then uses the same serial attach-only path for every owner.
-        drop(app.qualify_startup_terminals());
-        assert_eq!(app.terminal_starts_in_flight(), 1);
-        assert_eq!(app.restored_agent_attaches.len(), 2);
-        assert_eq!(app.startup_pane_check(), Ok(false));
-        let CardKind::Terminal(first) = &terminals[0].kind else {
-            unreachable!()
-        };
-        drop(app.update(Message::RestoredAgentAttached {
-            card: terminals[0].id,
-            terminal: first.id,
-            result: Ok(None),
-        }));
-        assert_eq!(
-            app.terminal_starts_in_flight(),
-            1,
-            "one next attach uses the existing bounded queue"
-        );
-        assert_eq!(app.restored_agent_attaches.len(), 1);
-        assert_ne!(
-            app.startup_pane_check(),
-            Ok(true),
-            "unattached owners never qualify"
-        );
+        assert_eq!(app.startup_pane_check(), Ok(true));
     }
 
     #[test]
@@ -27822,6 +28577,7 @@ mod tests {
         // says so far better than an unwrap would.
         if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
             let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
                 .build()
                 .expect("executor");
             while let Some(action) = executor.block_on(stream.next()) {
@@ -27962,6 +28718,62 @@ mod tests {
         assert_eq!(
             focused(&app, ready),
             Some(repository_widget::editor_focus_id(pane))
+        );
+    }
+
+    #[test]
+    fn fresh_editor_load_returns_keyboard_without_saved_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "fresh source\n").unwrap();
+        let (mut app, pane) = editing_repository_app();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: directory.path().into(),
+            worktree: directory.path().into(),
+            selected_file: None,
+        };
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|card| card.id == pane)
+            .unwrap()
+            .kind = CardKind::Repository(view.clone());
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        // This is the public action emitted after sidebar navigation resolves
+        // its file list, without saved caret or viewport metadata.
+        let load = runtime.update(RepositoryAction::OpenFile {
+            card: pane,
+            path: "notes.txt".into(),
+        });
+        app.cards
+            .insert(pane, CardRuntime::Repository(Box::new(runtime)));
+        app.window_width = 1900.0;
+        let update = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(update, false, false));
+        assert!(app.card_holds_keyboard(pane));
+        let placeholder = app.card_header_widget_id(pane);
+        let mut messages = cosmic::iced::runtime::task::into_stream(load).unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut tasks = Vec::new();
+        let mut completed_read = false;
+        while let Some(action) = executor.block_on(messages.next()) {
+            if let cosmic::iced::runtime::Action::Output(action) = action {
+                completed_read |= matches!(&action, RepositoryAction::FileLoadedAt { .. });
+                tasks.push(app.update(Message::Repository(action)));
+            }
+        }
+        assert!(
+            completed_read,
+            "the actual file worker must answer the open"
+        );
+        let initial = iced::widget::operation::focus(placeholder).map(cosmic::Action::App);
+        assert_eq!(
+            focused(&app, initial.chain(Task::batch(tasks))),
+            Some(repository_widget::editor_focus_id(pane)),
+            "a freshly opened editor must receive typing without a body click"
         );
     }
 
@@ -28385,6 +29197,7 @@ mod tests {
                 .unwrap_or_default(),
             card_chrome: HashMap::new(),
             card_indices: HashMap::new(),
+            card_indices_source: std::sync::Weak::new(),
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
@@ -28401,6 +29214,7 @@ mod tests {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
             terminal_wake_tx,
@@ -28408,6 +29222,7 @@ mod tests {
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
+            saved_terminals: saved_terminal::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
             relaunched_terminals: HashSet::new(),
@@ -28457,6 +29272,9 @@ mod tests {
             window_scale_factor: 1.0,
             window_width: 1_600.0,
             window_height: 900.0,
+            window_filled: false,
+            window_state_observed: false,
+            right_edge_tiled: false,
             core,
             settings_path: None,
             uncertain_terminal_proofs: HashMap::new(),

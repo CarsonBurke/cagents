@@ -21,6 +21,8 @@ use crate::{
 };
 
 const PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
+// A busy window must keep saving even when changes never leave a debounce gap.
+const PERSIST_MAX_DELAY: Duration = Duration::from_secs(1);
 const PERSIST_RETRY_INITIAL: Duration = Duration::from_millis(100);
 const PERSIST_RETRY_MAX: Duration = Duration::from_secs(2);
 const PERSIST_MAX_AUTOMATIC_ATTEMPTS: u32 = 4;
@@ -196,6 +198,11 @@ pub enum WriteSubject {
     Workspace {
         card: Option<CardId>,
     },
+    /// The latest content of one open pane. The rest of the window saved
+    /// around it; storage keeps what it last held for this pane.
+    Pane {
+        card: CardId,
+    },
     /// The fresh identity a card's payload was rebound to: a relaunched
     /// terminal, or a new conversation in a chat card.
     CardIdentity {
@@ -225,7 +232,10 @@ impl WriteSubject {
     /// state a restart restores and a terminal handoff has to be committed in.
     /// A refused catalog row loses that row alone.
     pub fn is_window_state(&self) -> bool {
-        matches!(self, Self::Workspace { .. } | Self::CardIdentity { .. })
+        matches!(
+            self,
+            Self::Workspace { .. } | Self::Pane { .. } | Self::CardIdentity { .. }
+        )
     }
 
     /// The subject as a refused barrier names it: what kind of write it was
@@ -238,6 +248,7 @@ impl WriteSubject {
             Self::Workspace { card: Some(card) } => {
                 format!("the window's layout and panes, at pane {card}")
             }
+            Self::Pane { card } => format!("the latest changes to pane {card}"),
             Self::CardIdentity {
                 card,
                 kind: ReplacedIdentity::Terminal,
@@ -268,6 +279,7 @@ pub struct QuarantinedWrite {
 #[derive(Debug, Clone, Copy)]
 struct PersistenceConfig {
     debounce: Duration,
+    max_delay: Duration,
     retry_initial: Duration,
     retry_max: Duration,
     max_automatic_attempts: u32,
@@ -278,6 +290,7 @@ impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
             debounce: PERSIST_DEBOUNCE,
+            max_delay: PERSIST_MAX_DELAY,
             retry_initial: PERSIST_RETRY_INITIAL,
             retry_max: PERSIST_RETRY_MAX,
             max_automatic_attempts: PERSIST_MAX_AUTOMATIC_ATTEMPTS,
@@ -1101,6 +1114,11 @@ struct Quarantine {
     /// refused within it when it named one. Every snapshot is the whole
     /// window, so any later one that lands supersedes it.
     workspace: Option<(Arc<WorkspaceState>, Option<CardId>, Refusal)>,
+    /// Open panes whose content storage refused within the newest snapshot
+    /// that landed, which is kept for an explicit retry. Storage still holds
+    /// each pane's earlier content; any later snapshot that lands supersedes
+    /// the set.
+    panes: Option<(Arc<WorkspaceState>, BTreeMap<CardId, Refusal>)>,
     identity_replacements: HashMap<CardId, (IdentityReplacement, Refusal)>,
     projects: HashMap<ProjectId, (ProjectState, Refusal)>,
     worktrees: HashMap<WorktreeId, (WorktreeState, Refusal)>,
@@ -1213,6 +1231,7 @@ fn superseded(subject: Option<WriteSubject>) {
 impl Quarantine {
     fn is_empty(&self) -> bool {
         self.workspace.is_none()
+            && self.panes.is_none()
             && self.identity_replacements.is_empty()
             && self.projects.is_empty()
             && self.worktrees.is_empty()
@@ -1224,6 +1243,7 @@ impl Quarantine {
         self.workspace
             .iter()
             .map(|(_, _, refusal)| refusal)
+            .chain(self.panes.iter().flat_map(|(_, panes)| panes.values()))
             .chain(
                 self.identity_replacements
                     .values()
@@ -1264,34 +1284,64 @@ impl Quarantine {
     }
 
     /// Clears what a snapshot storage accepted settles: the refused snapshot it
-    /// replaces, and every refused identity replacement whose card it no
-    /// longer holds open at the identity that replacement would replace.
+    /// replaces, the panes it refused before and saved now, and every refused
+    /// identity replacement whose card it no longer holds open at the
+    /// identity that replacement would replace. `refused` names the open panes
+    /// storage kept at their earlier content instead, which stay refused.
     ///
     /// Storage rejects a snapshot that rebinds a card's payload to an identity
     /// other than the one it holds, so the card's identity in a landed
-    /// snapshot is the one storage holds. Anything but the replaced identity
-    /// leaves the refusal with nothing to replace - the card closed, converted,
-    /// or first stored at its new identity - and nothing else could clear it:
-    /// it would fail every barrier and the clean shutdown for the rest of the
-    /// session.
-    fn snapshot_landed(&mut self, snapshot: &WorkspaceState) {
+    /// snapshot is the one storage holds, unless storage refused that card.
+    /// Anything but the replaced identity leaves the refusal with nothing to
+    /// replace - the card closed, converted, or first stored at its new
+    /// identity - and nothing else could clear it: it would fail every
+    /// barrier and the clean shutdown for the rest of the session.
+    fn snapshot_landed(&mut self, snapshot: &Arc<WorkspaceState>, refused: &[StoreError]) {
         superseded(
             self.workspace
                 .take()
                 .map(|(_, card, _)| WriteSubject::Workspace { card }),
         );
-        self.identity_replacements.retain(|card, (refused, _)| {
-            let outstanding = snapshot.cards.iter().any(|state| {
-                state.id == *card && state.existence.is_open() && refused.replaces(&state.kind)
-            });
+        let mut previous = self
+            .panes
+            .take()
+            .map(|(_, panes)| panes)
+            .unwrap_or_default();
+        let panes = refused
+            .iter()
+            .filter_map(|error| match error {
+                StoreError::Card { card, .. } => Some((
+                    *card,
+                    record_refusal(
+                        previous.remove(card),
+                        WriteSubject::Pane { card: *card },
+                        error,
+                    ),
+                )),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        for card in previous.into_keys() {
+            superseded(Some(WriteSubject::Pane { card }));
+        }
+        self.identity_replacements.retain(|card, (replacement, _)| {
+            let outstanding = panes.contains_key(card)
+                || snapshot.cards.iter().any(|state| {
+                    state.id == *card
+                        && state.existence.is_open()
+                        && replacement.replaces(&state.kind)
+                });
             if !outstanding {
                 tracing::info!(
-                    subject = ?identity_subject(refused),
+                    subject = ?identity_subject(replacement),
                     "a refused identity replacement no longer applies to the saved window"
                 );
             }
             outstanding
         });
+        if !panes.is_empty() {
+            self.panes = Some((Arc::clone(snapshot), panes));
+        }
     }
 
     fn refuse_replacement(&mut self, replacement: IdentityReplacement, error: &StoreError) {
@@ -1355,6 +1405,13 @@ impl Quarantine {
         let mut report = Vec::new();
         if let Some((_, card, refusal)) = &self.workspace {
             report.push(entry(WriteSubject::Workspace { card: *card }, refusal, 0));
+        }
+        if let Some((_, panes)) = &self.panes {
+            report.extend(
+                panes
+                    .iter()
+                    .map(|(card, refusal)| entry(WriteSubject::Pane { card: *card }, refusal, 0)),
+            );
         }
         let mut replacements = self.identity_replacements.values().collect::<Vec<_>>();
         replacements.sort_by_key(|(replacement, _)| replacement.card_id);
@@ -1791,7 +1848,12 @@ impl PendingWrites {
     /// asked to retry. A subject with a newer write pending is already being
     /// retried by that write, so its refused one is not reinstated.
     fn rearm_quarantine(&mut self) {
-        if let Some((snapshot, _, _)) = &self.quarantine.workspace
+        if let Some(snapshot) = self
+            .quarantine
+            .workspace
+            .as_ref()
+            .map(|(snapshot, _, _)| snapshot)
+            .or_else(|| self.quarantine.panes.as_ref().map(|(snapshot, _)| snapshot))
             && self.workspace.is_none()
             && self.conversions.is_empty()
         {
@@ -1983,15 +2045,32 @@ impl PendingWrites {
                         let _ = reply.send(Err(error.to_string()));
                         continue;
                     }
-                    let refused = self.quarantine.workspace.as_ref().filter(|(state, card, _)| {
+                    let holds_refused_terminal = |state: &WorkspaceState| {
                         state.id == snapshot.id
-                            && *card == Some(recovery.canonical)
                             && state.cards.iter().any(|card| {
                                 card.id == recovery.canonical
                                     && card.existence.is_open()
                                     && matches!(&card.kind, CardKind::Terminal(session) if session.id == recovery.terminal)
                             })
-                    }).map(|(state, _, _)| Arc::clone(state));
+                    };
+                    let refused = self
+                        .quarantine
+                        .workspace
+                        .as_ref()
+                        .filter(|(state, card, _)| {
+                            *card == Some(recovery.canonical) && holds_refused_terminal(state)
+                        })
+                        .map(|(state, _, _)| Arc::clone(state))
+                        .or_else(|| {
+                            self.quarantine
+                                .panes
+                                .as_ref()
+                                .filter(|(state, panes)| {
+                                    panes.contains_key(&recovery.canonical)
+                                        && holds_refused_terminal(state)
+                                })
+                                .map(|(state, _)| Arc::clone(state))
+                        });
                     let result = match refused {
                         None => Err("The exact refused terminal pane changed; review the current save notice.".into()),
                         Some(refused) => match store.recover_terminal_ownership(
@@ -2012,7 +2091,7 @@ impl PendingWrites {
                                 if self.workspace.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, &refused)) {
                                     self.workspace = None;
                                 }
-                                self.quarantine.snapshot_landed(&snapshot);
+                                self.quarantine.snapshot_landed(&snapshot, &commit.refused);
                                 self.acknowledge_retained_copy_closures(&snapshot);
                                 Ok(())
                             }
@@ -2124,7 +2203,7 @@ impl PendingWrites {
                         Ok(commit) => {
                             self.workspace_generation = commit.generation;
                             self.card_generations = commit.card_generations;
-                            self.quarantine.snapshot_landed(&snapshot);
+                            self.quarantine.snapshot_landed(&snapshot, &commit.refused);
                             self.acknowledge_retained_copy_closures(&snapshot);
                         }
                         Err(error) if error.refuses_content() => {
@@ -2442,6 +2521,7 @@ fn persistence_loop(
     config: PersistenceConfig,
 ) -> WriterExit {
     let mut due: Option<Instant> = None;
+    let mut oldest_change: Option<Instant> = None;
     let mut retry_delay = config.retry_initial;
     let mut attempts_this_cycle = 0_u32;
     let mut retry_exhausted = false;
@@ -2525,7 +2605,8 @@ fn persistence_loop(
                 retry_exhausted,
                 attempts_this_cycle,
                 Instant::now(),
-                config.debounce,
+                config,
+                &mut oldest_change,
             );
         }
         let shutdown = state.shutdown;
@@ -2552,6 +2633,7 @@ fn persistence_loop(
                 // work once the sidecar has grown past its threshold.
                 store.checkpoint_wal_if_large();
                 due = None;
+                oldest_change = None;
                 retry_delay = config.retry_initial;
                 attempts_this_cycle = 0;
                 rebases_remaining = PERSIST_REBASES_PER_BATCH;
@@ -2764,13 +2846,15 @@ fn schedule_flush_after_changes(
     retry_exhausted: bool,
     attempts_this_cycle: u32,
     now: Instant,
-    debounce: Duration,
+    config: PersistenceConfig,
+    oldest_change: &mut Option<Instant>,
 ) -> Option<Instant> {
     if received_changes && !retry_exhausted && attempts_this_cycle == 0 {
-        // Preserve the trailing debounce for ordinary changes. Once a flush
-        // has failed, keep its retry deadline stable instead of letting a
-        // stream of new snapshots postpone recovery forever.
-        Some(now + debounce)
+        // Preserve the trailing debounce for short bursts, but never move the
+        // oldest pending batch's cap, even if this arrival is already overdue.
+        // A failed flush keeps its existing retry deadline and backoff instead.
+        let first = oldest_change.get_or_insert(now);
+        Some((now + config.debounce).min(*first + config.max_delay))
     } else {
         current_due
     }
@@ -2850,7 +2934,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
-    use rusqlite::Connection;
+    use rusqlite::{Connection, OptionalExtension};
 
     use tempfile::tempdir;
 
@@ -2949,6 +3033,7 @@ mod tests {
             Ok(crate::persistence::WorkspaceCommit {
                 generation: 1,
                 card_generations: BTreeMap::from([(copy.source_card, 1), (copy.copy.id, 1)]),
+                refused: Vec::new(),
             })
         }
 
@@ -3043,6 +3128,7 @@ mod tests {
     fn fast_persistence_config(max_automatic_attempts: u32) -> PersistenceConfig {
         PersistenceConfig {
             debounce: Duration::ZERO,
+            max_delay: PERSIST_MAX_DELAY,
             retry_initial: Duration::from_millis(1),
             retry_max: Duration::from_millis(1),
             max_automatic_attempts,
@@ -3115,6 +3201,8 @@ mod tests {
     #[test]
     fn new_changes_trail_debounce_without_postponing_an_active_retry() {
         let now = Instant::now();
+        let config = PersistenceConfig::default();
+        let mut oldest_change = Some(now - Duration::from_millis(100));
         let old_debounce = now + Duration::from_millis(10);
         let new_debounce = now + Duration::from_millis(250);
         assert_eq!(
@@ -3124,7 +3212,8 @@ mod tests {
                 false,
                 0,
                 now,
-                Duration::from_millis(250),
+                config,
+                &mut oldest_change,
             ),
             Some(new_debounce)
         );
@@ -3137,10 +3226,158 @@ mod tests {
                 false,
                 1,
                 now,
-                Duration::from_millis(250),
+                config,
+                &mut oldest_change,
             ),
             Some(retry_due)
         );
+        assert_eq!(oldest_change, Some(now - Duration::from_millis(100)));
+        assert_eq!(
+            schedule_flush_after_changes(None, true, true, 4, now, config, &mut oldest_change,),
+            None,
+            "new changes must not restart an exhausted retry cycle"
+        );
+    }
+
+    #[test]
+    fn continuous_changes_cannot_postpone_the_oldest_pending_save() {
+        let start = Instant::now();
+        let config = PersistenceConfig::default();
+        let mut oldest_change = None;
+        let mut due = None;
+        for elapsed_ms in [0, 200, 400, 600, 800, 1_000, 1_200] {
+            let now = start + Duration::from_millis(elapsed_ms);
+            due =
+                schedule_flush_after_changes(due, true, false, 0, now, config, &mut oldest_change);
+            assert_eq!(
+                due,
+                Some((now + config.debounce).min(start + config.max_delay))
+            );
+            assert_eq!(oldest_change, Some(start));
+            if elapsed_ms >= 1_000 {
+                assert!(due.unwrap() <= now, "an overdue arrival must still flush");
+            }
+        }
+        let overdue = due;
+        assert_eq!(
+            schedule_flush_after_changes(
+                due,
+                false,
+                false,
+                0,
+                start + Duration::from_secs(2),
+                config,
+                &mut oldest_change,
+            ),
+            overdue,
+            "a timer wake must preserve the pending deadline"
+        );
+    }
+
+    #[test]
+    fn idle_wakes_do_not_start_a_save_batch() {
+        let now = Instant::now();
+        let config = PersistenceConfig::default();
+        let mut oldest_change = None;
+        assert_eq!(
+            schedule_flush_after_changes(None, false, false, 0, now, config, &mut oldest_change),
+            None
+        );
+        assert_eq!(oldest_change, None);
+        let next = now + Duration::from_secs(10);
+        assert_eq!(
+            schedule_flush_after_changes(None, true, false, 0, next, config, &mut oldest_change),
+            Some(next + config.debounce)
+        );
+        assert_eq!(oldest_change, Some(next));
+    }
+
+    #[test]
+    fn continuous_snapshots_commit_before_the_producer_stops() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("continuous.sqlite3");
+        let boot = BootId::new("continuous-save");
+        let store = StateStore::open(&path, boot.clone()).unwrap();
+        let mut state = workspace();
+        let mut first = state.clone();
+        first.cards[0].title = "ordered first".into();
+        let mut second = state.clone();
+        second.cards[0].title = "ordered second".into();
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                conversions: VecDeque::from([
+                    ConversionCheckpoint::Snapshot(Arc::new(first)),
+                    ConversionCheckpoint::Snapshot(Arc::new(second)),
+                ]),
+                ..QueueState::default()
+            }),
+            Condvar::new(),
+        ));
+        let last_error = Arc::new(Mutex::new(None));
+        let worker_queue = Arc::clone(&queue);
+        let worker_error = Arc::clone(&last_error);
+        let worker = thread::spawn(move || {
+            let (health_tx, _health_rx) = async_channel::unbounded();
+            persistence_loop(
+                store,
+                empty_writes(),
+                worker_queue,
+                worker_error,
+                &mut HealthPublisher::new(health_tx),
+                PersistenceConfig {
+                    // A deadline shorter than this trailing gap proves the cap,
+                    // even if a loaded test host pauses the producer briefly.
+                    debounce: Duration::from_secs(30),
+                    max_delay: Duration::from_millis(50),
+                    ..PersistenceConfig::default()
+                },
+            )
+        });
+        let reader = Connection::open(&path).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut committed_while_producing = false;
+        let mut sequence = 0;
+        while Instant::now() < deadline {
+            state.cards[0].title = format!("streaming {sequence}");
+            sequence += 1;
+            {
+                let mut pending = queue.0.lock().unwrap();
+                pending.latest = Some(Arc::new(state.clone()));
+                queue.1.notify_one();
+            }
+            let generation = reader
+                .query_row(
+                    "SELECT generation FROM workspaces WHERE workspace_id = ?1",
+                    [state.id.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap();
+            // Both ordered snapshots and a coalesced autosave must have
+            // committed while updates continue, without a flush barrier.
+            if generation.is_some_and(|generation| generation >= 3) {
+                committed_while_producing = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        state.cards[0].title = "final snapshot".into();
+        {
+            let mut pending = queue.0.lock().unwrap();
+            pending.latest = Some(Arc::new(state.clone()));
+            pending.shutdown = true;
+            queue.1.notify_one();
+        }
+        assert!(matches!(worker.join().unwrap(), WriterExit::Shutdown(_)));
+        assert!(last_error.lock().unwrap().is_none());
+        assert!(
+            committed_while_producing,
+            "continuous changes starved saves until the producer stopped"
+        );
+        let reopened = StateStore::open(&path, boot).unwrap();
+        let restored = reopened.load_workspace(state.id, None).unwrap().unwrap();
+        assert_eq!(restored.cards[0].title, "final snapshot");
+        reopened.shutdown().unwrap();
     }
 
     #[test]
@@ -5457,18 +5694,20 @@ mod tests {
         runtime.snapshot(Arc::new(state.clone()));
         runtime.flush(timeout).unwrap();
 
-        // Bringing a closed card back is refused by construction.
+        // Bringing a closed card back is refused by construction. Storage
+        // keeps its tombstone, and the rest of the window saves around it,
+        // without focusing a closed card.
         let resurrected = card.id;
         state.cards.push(card);
+        state.focused = Some(resurrected);
+        state.chat_drafts.insert(resurrected, "first draft".into());
         runtime.snapshot(Arc::new(state.clone()));
         let refusal = runtime
             .flush(timeout)
             .expect_err("a barrier cannot vouch for a window storage refused");
         assert!(refusal.contains("refused part of the window"), "{refusal}");
         assert!(
-            refusal.contains(&format!(
-                "the window's layout and panes, at pane {resurrected}"
-            )),
+            refusal.contains(&format!("the latest changes to pane {resurrected}")),
             "a refused barrier names what the reader has to change: {refusal}"
         );
         assert!(refusal.contains(QUARANTINE_GUIDANCE), "{refusal}");
@@ -5480,9 +5719,50 @@ mod tests {
                 .iter()
                 .map(|write| &write.subject)
                 .collect::<Vec<_>>(),
-            vec![&WriteSubject::Workspace {
-                card: Some(resurrected)
-            }]
+            vec![&WriteSubject::Pane { card: resurrected }]
+        );
+        let saved = runtime
+            .operation_store()
+            .load_workspace(state.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.focused, None);
+        assert_eq!(
+            saved.chat_drafts.get(&resurrected).map(String::as_str),
+            Some("first draft")
+        );
+        assert!(matches!(
+            saved
+                .cards
+                .iter()
+                .find(|card| card.id == resurrected)
+                .map(|card| &card.existence),
+            Some(Existence::Closed { .. })
+        ));
+
+        // Later edits to the window keep saving while the pane stays refused,
+        // and an explicit retry offers the pane again without clearing it.
+        state.chat_drafts.insert(resurrected, "kept draft".into());
+        runtime.snapshot(Arc::new(state.clone()));
+        runtime.flush(timeout).unwrap_err();
+        assert!(runtime.retry_save());
+        runtime.flush(timeout).unwrap_err();
+        let saved = runtime
+            .operation_store()
+            .load_workspace(state.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.chat_drafts.get(&resurrected).map(String::as_str),
+            Some("kept draft")
+        );
+        assert_eq!(
+            latest_health(&health)
+                .quarantined
+                .iter()
+                .map(|write| &write.subject)
+                .collect::<Vec<_>>(),
+            vec![&WriteSubject::Pane { card: resurrected }]
         );
 
         // The catalog still saves beside it.
@@ -6098,8 +6378,8 @@ mod tests {
             }]
         );
 
-        // The window moves on to the relaunch, and storage refuses every
-        // snapshot that rebinds the card to it.
+        // The window moves on to the relaunch, and storage refuses that pane
+        // of every snapshot that rebinds the card to it.
         state.cards[0].kind = CardKind::Terminal(refused);
         runtime.snapshot(Arc::new(state.clone()));
         runtime.flush(timeout).unwrap_err();
@@ -6110,9 +6390,7 @@ mod tests {
                 .map(|write| &write.subject)
                 .collect::<Vec<_>>(),
             vec![
-                &WriteSubject::Workspace {
-                    card: Some(card_id)
-                },
+                &WriteSubject::Pane { card: card_id },
                 &WriteSubject::CardIdentity {
                     card: card_id,
                     kind: ReplacedIdentity::Terminal,
