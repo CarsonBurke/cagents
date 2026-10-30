@@ -169,7 +169,8 @@ pub(super) fn isolated() -> Option<PrivateHost> {
 
 #[test]
 fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
-    use crate::chat::protocol::{Adapter, Event, ProcessSpec, Step};
+    use crate::chat::Event;
+    use crate::chat::protocol::{Adapter, ProcessSpec, Step};
     let Some(fixture) = isolated() else {
         return;
     };
@@ -290,7 +291,7 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
     host.lock().unwrap().retire_terminal(terminal.id);
     for _ in 0..2 {
         assert!(
-            matches!(process(&host, 3, ClientRequest::ChatClose { chat_id }).unwrap(), ServerResponse::ChatClosed { chat_id: closed } if closed == chat_id)
+            matches!(process(&host, 3, ClientRequest::ChatClose { chat_id }).unwrap(), ServerResponse::ChatClosed { chat_id: closed, .. } if closed == chat_id)
         );
     }
     assert!(process(&host, 3, ClientRequest::ChatReturnTerminal { chat_id }).is_err());
