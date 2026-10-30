@@ -1178,7 +1178,9 @@ fn inspect_source_panes_mode(
 ) -> Result<(), UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
     let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
-    let before = fs::symlink_metadata(&helper)?;
+    let before = fs::symlink_metadata(&helper).map_err(|_| {
+        invalid("The matched source inspector is unavailable; source windows remain usable. Reinstall the matched CLI and daemon together, then retry.")
+    })?;
     if !before.is_file()
         || !crate::install_guard::trusted_executable_owner(before.uid())
         || before.mode() & 0o022 != 0
@@ -1207,7 +1209,9 @@ fn inspect_source_panes_mode(
         Duration::from_secs(35),
         &CancellationToken::new(),
     )?;
-    let after = fs::symlink_metadata(helper)?;
+    let after = fs::symlink_metadata(helper).map_err(|_| {
+        invalid("The source inspector became unavailable during inspection; source windows remain usable")
+    })?;
     if before.dev() != after.dev()
         || before.ino() != after.ino()
         || before.len() != after.len()

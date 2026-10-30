@@ -652,6 +652,14 @@ CANDIDATE_COORDINATOR=$DOWNLOAD_DIR/cagents-install-coordinator
 tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagents" > "$CANDIDATE_COORDINATOR" \
     || fail 'could not extract the verified update coordinator'
 chmod 0700 "$CANDIDATE_COORDINATOR"
+# Source-pane inspection belongs to the matched host implementation. Keep the
+# verified candidate's pair together when no installed coordinator is usable.
+# Extraction reads only the regular members already admitted above; it never
+# searches PATH or borrows another installation's daemon.
+CANDIDATE_INSPECTOR=$DOWNLOAD_DIR/cagentsd
+tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagentsd" > "$CANDIDATE_INSPECTOR" \
+    || fail 'could not extract the verified source inspector'
+chmod 0700 "$CANDIDATE_INSPECTOR"
 supports_install_guard() {
     [ -x "$1" ] \
         && "$1" coordinate-install --help >/dev/null 2>&1 \

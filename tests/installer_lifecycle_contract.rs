@@ -200,6 +200,238 @@ print(json.dumps({'Ok':None}))
     );
 }
 
+fn fixture_sha256(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).unwrap();
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).unwrap();
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+// Exercise the real archive coordinator, not the older fixture's forwarding
+// CLI. The inspector is a labeled process-boundary fixture: it verifies the
+// actual inherited fence and its same-archive sibling, not SQLite/provider data.
+fn verified_archive_coordinator_fixture(installed: bool, refuse_source: bool) {
+    let home = tempfile::tempdir().unwrap();
+    for leaf in ["data", "config", "cache", "runtime", "tmp", "external"] {
+        fs::create_dir(home.path().join(leaf)).unwrap();
+        fs::set_permissions(home.path().join(leaf), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let data = home.path().join("data");
+    let sentinel = data.join("retained-source-sentinel");
+    fs::write(&sentinel, "original source data\n").unwrap();
+    let prefix = home.path().join("installation with spaces");
+    let old_bin = prefix.join("versions/old/bin");
+    if installed {
+        fs::create_dir_all(&old_bin).unwrap();
+        fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        executable(
+            &old_bin.join("cagents"),
+            "#!/bin/sh\ncase \"$*\" in\n  '--json daemon status') printf '%s\\n' '{\"ok\":true,\"command\":\"daemon.status\",\"data\":{\"running\":false}}' ;;\n  *) exit 64 ;;\nesac\n",
+        );
+        for name in ["cagentsd", "cagents-ui"] {
+            executable(&old_bin.join(name), "#!/bin/sh\nexit 97\n");
+        }
+        std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
+    } else {
+        assert!(
+            !prefix.exists(),
+            "fresh install must not seed an old version"
+        );
+    }
+    let old_cli = installed.then(|| fs::read(old_bin.join("cagents")).unwrap());
+    let external = home.path().join("external/cagents");
+    executable(
+        &external,
+        "#!/bin/sh\nprintf 'unexpected external CLI\\n' >> \"$FIXTURE_EXTERNAL_CALLED\"\nexit 96\n",
+    );
+    assert!(!external.with_file_name("cagentsd").exists());
+
+    let archive_root = home.path().join("archive");
+    let candidate = archive_root.join("cagents-9.9.9");
+    let candidate_bin = candidate.join("bin");
+    fs::create_dir_all(&candidate_bin).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), candidate_bin.join("cagents")).unwrap();
+    executable(
+        &candidate_bin.join("cagentsd"),
+        r#"#!/usr/bin/python3
+import hashlib, json, os, pathlib, stat, subprocess, sys
+def digest(path):
+    result=hashlib.sha256()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(65536), b''):
+            result.update(chunk)
+    return result.hexdigest()
+assert len(sys.argv)==3 and sys.argv[1]=='--inspect-upgrade-source'
+request=json.loads(sys.argv[2])
+assert request=={'protocol':int(os.environ['FIXTURE_SOURCE_PROTOCOL']),
+    'proof':None, 'require_resumable':False, 'reconcile_retained':False}
+assert not any(key in os.environ for key in ['CAGENTS_INSTALL_RESULT_FD',
+    'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY'])
+inspector=pathlib.Path(sys.argv[0]).resolve(strict=True)
+coordinator=inspector.with_name('cagents-install-coordinator')
+assert inspector.parent.is_relative_to(pathlib.Path(os.environ['TMPDIR']).resolve())
+assert stat.S_IMODE(inspector.stat().st_mode)==0o700
+assert stat.S_IMODE(coordinator.stat().st_mode)==0o700
+assert digest(inspector)==os.environ['FIXTURE_INSPECTOR_SHA256']
+assert digest(coordinator)==os.environ['FIXTURE_COORDINATOR_SHA256']
+fd=int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD'])
+verified=subprocess.run([str(coordinator), 'verify-install-guard', '--stage-only'],
+    pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+if verified.returncode:
+    sys.stderr.buffer.write(verified.stderr)
+    sys.exit(91)
+with pathlib.Path(os.environ['FIXTURE_INSPECTOR_RECEIPT']).open('a') as receipt:
+    receipt.write(json.dumps({'inspector':str(inspector), 'coordinator':str(coordinator),
+        'inspector_sha256':digest(inspector), 'coordinator_sha256':digest(coordinator),
+        'inspector_mode':stat.S_IMODE(inspector.stat().st_mode),
+        'coordinator_mode':stat.S_IMODE(coordinator.stat().st_mode), 'request':request})+'\n')
+print(json.dumps({'Err':'fixture managed pane refused'}
+    if os.environ['FIXTURE_REFUSE_SOURCE']=='true' else {'Ok':None}))
+"#,
+    );
+    for name in ["cagents-ui", "cagents-uninstall"] {
+        executable(&candidate_bin.join(name), "#!/bin/sh\nexit 0\n");
+    }
+    fs::write(candidate_bin.join(".cagents-ui-lease-v1"), "").unwrap();
+    for relative in [
+        "share/applications/dev.cagents.Cagents.desktop",
+        "share/autostart/dev.cagents.Cagents.Daemon.desktop",
+        "share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg",
+        "share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
+        "share/metainfo/dev.cagents.Cagents.metainfo.xml",
+        "share/doc/cagents/LICENSE",
+    ] {
+        let file = candidate.join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "[Desktop Entry]\nExec=cagents ui\nIcon=cagents\n").unwrap();
+    }
+    let coordinator_hash = fixture_sha256(&candidate_bin.join("cagents"));
+    let inspector_hash = fixture_sha256(&candidate_bin.join("cagentsd"));
+    let archive = home
+        .path()
+        .join("cagents-9.9.9-x86_64-unknown-linux-gnu.tar.gz");
+    assert!(
+        Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&archive_root)
+            .arg("cagents-9.9.9")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let checksums = home.path().join("SHA256SUMS");
+    fs::write(
+        &checksums,
+        format!(
+            "{}  {}\n",
+            fixture_sha256(&archive),
+            archive.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let receipt_path = home.path().join("inspector-receipt");
+    let external_called = home.path().join("external-called");
+    let output = Command::new("sh")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+        .arg("--prefix")
+        .arg(&prefix)
+        .env("HOME", home.path())
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", home.path().join("config"))
+        .env("XDG_CACHE_HOME", home.path().join("cache"))
+        .env("XDG_RUNTIME_DIR", home.path().join("runtime"))
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("PATH", "/usr/bin:/bin")
+        .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
+        .env("CAGENTS_ARCHIVE", &archive)
+        .env("CAGENTS_CHECKSUMS", &checksums)
+        .env("FIXTURE_REAL_CLI", &external)
+        .env("FIXTURE_EXTERNAL_CALLED", &external_called)
+        .env(
+            "FIXTURE_SOURCE_PROTOCOL",
+            cagents::terminal_ipc::PROTOCOL_VERSION.to_string(),
+        )
+        .env("FIXTURE_INSPECTOR_SHA256", &inspector_hash)
+        .env("FIXTURE_COORDINATOR_SHA256", &coordinator_hash)
+        .env("FIXTURE_INSPECTOR_RECEIPT", &receipt_path)
+        .env("FIXTURE_REFUSE_SOURCE", refuse_source.to_string())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.success(), !refuse_source, "{output:?}");
+    assert!(
+        !external_called.exists(),
+        "the archive CLI must not delegate to FIXTURE_REAL_CLI"
+    );
+    let receipts = fs::read_to_string(&receipt_path).unwrap_or_else(|error| {
+        panic!("same-archive inspector was not reached: {error}; {output:?}")
+    });
+    assert_eq!(receipts.lines().count(), 1, "{receipts}");
+    let receipt: serde_json::Value = serde_json::from_str(receipts.trim()).unwrap();
+    let inspector = Path::new(receipt["inspector"].as_str().unwrap());
+    let coordinator = Path::new(receipt["coordinator"].as_str().unwrap());
+    assert_eq!(inspector.parent(), coordinator.parent());
+    assert_eq!(inspector.file_name().unwrap(), "cagentsd");
+    assert_eq!(
+        coordinator.file_name().unwrap(),
+        "cagents-install-coordinator"
+    );
+    assert_eq!(receipt["inspector_sha256"], inspector_hash);
+    assert_eq!(receipt["coordinator_sha256"], coordinator_hash);
+    assert_eq!(receipt["inspector_mode"], 0o700);
+    assert_eq!(receipt["coordinator_mode"], 0o700);
+    assert_eq!(
+        fs::read_to_string(&sentinel).unwrap(),
+        "original source data\n"
+    );
+    if refuse_source {
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("fixture managed pane refused"),
+            "{output:?}"
+        );
+        assert!(!prefix.join("versions/9.9.9").exists());
+        if installed {
+            assert_eq!(
+                fs::read_link(prefix.join("current")).unwrap(),
+                Path::new("versions/old")
+            );
+        } else {
+            assert!(!prefix.join("current").exists());
+        }
+    } else {
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/9.9.9")
+        );
+        assert_eq!(
+            fixture_sha256(&prefix.join("current/bin/cagents")),
+            coordinator_hash
+        );
+        assert_eq!(
+            fixture_sha256(&prefix.join("current/bin/cagentsd")),
+            inspector_hash
+        );
+    }
+    if let Some(old_cli) = old_cli {
+        assert_eq!(fs::read(old_bin.join("cagents")).unwrap(), old_cli);
+    }
+}
+
 // The fixture CLI records every destructive request, not merely its final
 // status: a stop/start pair would otherwise look like preserved sessions.
 fn upgrade_fixture(
@@ -887,6 +1119,20 @@ exec sh "$@""#,
 #[test]
 fn candidate_coordinator_supports_upgrading_an_older_installed_cli() {
     coordinated_release_fixture(true, 2, None, None, None, "candidate");
+}
+
+#[test]
+fn fresh_install_uses_the_verified_archive_cli_and_matched_inspector() {
+    for refuse_source in [false, true] {
+        verified_archive_coordinator_fixture(false, refuse_source);
+    }
+}
+
+#[test]
+fn unsupported_installed_cli_uses_the_verified_archive_pair_without_external_forwarding() {
+    for refuse_source in [false, true] {
+        verified_archive_coordinator_fixture(true, refuse_source);
+    }
 }
 
 #[test]
