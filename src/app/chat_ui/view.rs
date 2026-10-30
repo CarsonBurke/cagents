@@ -6144,18 +6144,26 @@ mod tests {
                         &renderer,
                         &mut operation::focusable::focus::<()>(remove_id.clone()),
                     );
-                    assert!(
-                        tooltip_consumer_event(
-                            &mut element,
-                            &node,
-                            &mut tree,
-                            &renderer,
-                            &viewport,
-                            tooltip_consumer_a11y(remove.id.clone(), A11yAction::Focus),
-                            iced::mouse::Cursor::Unavailable
-                        )
-                        .is_empty()
+                    let focused = tooltip_consumer_event(
+                        &mut element,
+                        &node,
+                        &mut tree,
+                        &renderer,
+                        &viewport,
+                        tooltip_consumer_a11y(remove.id.clone(), A11yAction::Focus),
+                        iced::mouse::Cursor::Unavailable,
                     );
+                    if transitioning {
+                        assert!(focused.is_empty(), "switching has no editable composer");
+                    } else {
+                        // Public focus unfocuses the other focusables. The
+                        // editor publishes its pending selection cleanup here.
+                        assert!(
+                            matches!(focused.as_slice(), [Message::ChatUi(Action::Composer(target, text_editor::Action::ClearSelection))]
+                            if *target == runtime.target),
+                            "public focus emits only the exact editor's selection cleanup"
+                        );
+                    }
                     for rerender in [false, true] {
                         if rerender {
                             // Rebuild the actual consumer against the retained
@@ -6228,18 +6236,26 @@ mod tests {
                         &remove_id
                     ));
                     for pressed in [true, false] {
-                        assert!(
-                            tooltip_consumer_event(
-                                &mut element,
-                                &node,
-                                &mut tree,
-                                &renderer,
-                                &viewport,
-                                enter(pressed),
-                                iced::mouse::Cursor::Unavailable
-                            )
-                            .is_empty()
+                        let messages = tooltip_consumer_event(
+                            &mut element,
+                            &node,
+                            &mut tree,
+                            &renderer,
+                            &viewport,
+                            enter(pressed),
+                            iced::mouse::Cursor::Unavailable,
                         );
+                        if !transitioning && pressed {
+                            // Global unfocus queues the same editor cleanup;
+                            // the first event flushes it without activating Remove.
+                            assert!(
+                                matches!(messages.as_slice(), [Message::ChatUi(Action::Composer(target, text_editor::Action::ClearSelection))]
+                                if *target == runtime.target),
+                                "unfocused Enter emits only the exact editor's selection cleanup"
+                            );
+                        } else {
+                            assert!(messages.is_empty(), "unfocused Remove stays inert");
+                        }
                     }
                 }
             }
