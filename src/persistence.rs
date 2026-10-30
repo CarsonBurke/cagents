@@ -9666,19 +9666,17 @@ mod tests {
             ));
             let mut stale_cards = lane.cards.clone();
             stale_cards.insert(card, 0);
-            assert!(matches!(
-                card_refusal(
-                    store.save_workspace(
-                        &workspace,
-                        SnapshotBase {
-                            workspace: lane.workspace,
-                            cards: &stale_cards
-                        }
-                    ),
-                    card
-                ),
-                StoreError::StaleGeneration { .. }
-            ));
+            let stale = store.save_workspace(
+                &workspace,
+                SnapshotBase {
+                    workspace: lane.workspace,
+                    cards: &stale_cards,
+                },
+            );
+            assert!(
+                matches!(&stale, Err(StoreError::StaleGeneration { entity, expected: 0, actual: 1 }) if entity == &format!("card {card}")),
+                "card CAS returned {stale:?}"
+            );
             assert_eq!(
                 store.load_workspace(workspace.id, None).unwrap().unwrap(),
                 baseline
