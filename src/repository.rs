@@ -65,6 +65,13 @@ pub use crate::process::{
     ProcessFailureKind, ProcessOutput, SystemProcessExecutor,
 };
 
+#[path = "repository_stash.rs"]
+mod stash_mutations;
+
+#[path = "repository_operation_witness.rs"]
+mod operation_witness;
+pub use operation_witness::GitOperationWitness;
+
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
 
 /// Commits returned by one [`RepositoryService::history`] page.
@@ -656,7 +663,7 @@ pub fn pull_request_refs(
 
 /// Independent source-control and file-browser demand. Neither collapsed changes
 /// nor background branch/HEAD checks need an untracked scan.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotOptions {
     pub untracked_changes: bool,
     pub untracked_files: bool,
@@ -667,6 +674,254 @@ impl Default for SnapshotOptions {
         Self {
             untracked_changes: true,
             untracked_files: true,
+        }
+    }
+}
+
+/// One bound panel's cache. Dropping it on a binding change releases retained
+/// file lists and untracked measurements rather than keeping every visited tree.
+#[derive(Debug, Default)]
+pub struct SnapshotCache {
+    digest: Option<[u8; 32]>,
+    dirty: bool,
+    fsmonitor: Option<OsString>,
+    fsmonitor_checked: bool,
+    options: Option<SnapshotOptions>,
+    metadata: Option<(
+        WorkingFiles,
+        Vec<RemoteRecord>,
+        Vec<LocalRefRecord>,
+        Vec<RemoteRefRecord>,
+        Vec<RemoteHead>,
+    )>,
+    control_metadata: Option<ControlMetadata>,
+    lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
+    observed: BTreeMap<RepoPath, Option<FileIdentity>>,
+    browse_root: Option<FileIdentity>,
+    admin: BTreeMap<PathBuf, Option<FileIdentity>>,
+}
+
+#[derive(Debug, Clone)]
+struct ControlMetadata {
+    operation: Option<GitOperationState>,
+    stashes: Vec<StashEntry>,
+    last_fetch_unix_ms: Option<u64>,
+}
+
+/// Resolve administrative metadata locally, including linked worktree gitfiles.
+fn local_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let path = worktree.join(".git");
+    if path.is_dir() {
+        return Some(path);
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > 4096 {
+        return None;
+    }
+    let value = bytes.strip_prefix(b"gitdir: ")?;
+    let value = value.strip_suffix(b"\n").unwrap_or(value);
+    let value = value.strip_suffix(b"\r").unwrap_or(value);
+    use std::os::unix::ffi::OsStrExt;
+    let directory = Path::new(OsStr::from_bytes(value));
+    Some(if directory.is_absolute() {
+        directory.to_owned()
+    } else {
+        worktree.join(directory)
+    })
+}
+
+type FileIdentity = (u64, u64, u64, i64, i64, i64, i64);
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+/// Filesystem-only metadata observations keep the missed-event fallback
+/// authoritative without extra Git commands on an unchanged snapshot.
+fn snapshot_admin_fingerprint(worktree: &Path) -> BTreeMap<PathBuf, Option<FileIdentity>> {
+    let read_path = |path: &Path| -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(4097)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= 4096).then_some(bytes)
+    };
+    let marker = worktree.join(".git");
+    let git_dir = if marker.is_dir() {
+        marker.clone()
+    } else {
+        let Some(bytes) = read_path(&marker) else {
+            return BTreeMap::new();
+        };
+        let Some(relative) = bytes.strip_prefix(b"gitdir: ") else {
+            return BTreeMap::new();
+        };
+        worktree.join(bytes_to_path(trim_one_line_ending(relative)))
+    };
+    let git_dir = fs::canonicalize(&git_dir).unwrap_or(git_dir);
+    let common = read_path(&git_dir.join("commondir"))
+        .map(|bytes| git_dir.join(bytes_to_path(trim_one_line_ending(&bytes))))
+        .and_then(|path| fs::canonicalize(path).ok())
+        .unwrap_or_else(|| git_dir.clone());
+    let mut paths = BTreeMap::new();
+    for root in [&git_dir, &common] {
+        // Lock creation/removal changes directory times without changing Git
+        // state. For the admin roots only their directory identity matters.
+        let identity = fs::metadata(root).ok().map(|metadata| {
+            let (device, inode, ..) = file_identity(&metadata);
+            (device, inode, 0, 0, 0, 0, 0)
+        });
+        paths.insert(root.clone(), identity);
+    }
+    for name in [
+        "HEAD",
+        "index",
+        "commondir",
+        "config.worktree",
+        "FETCH_HEAD",
+        "MERGE_HEAD",
+        "MERGE_MSG",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "REBASE_HEAD",
+        "sequencer",
+        "sequencer/head",
+        "sequencer/todo",
+        "sequencer/abort-safety",
+        "sequencer/opts",
+        "rebase-merge",
+        "rebase-merge/message",
+        "rebase-merge/onto",
+        "rebase-merge/head-name",
+        "rebase-merge/orig-head",
+        "rebase-merge/msgnum",
+        "rebase-merge/done",
+        "rebase-merge/git-rebase-todo",
+        "rebase-merge/stopped-sha",
+        "rebase-apply",
+        "rebase-apply/final-commit",
+        "rebase-apply/onto",
+        "rebase-apply/head-name",
+        "rebase-apply/orig-head",
+        "rebase-apply/next",
+        "rebase-apply/last",
+        "rebase-apply/original-commit",
+        "rebase-apply/abort-safety",
+    ] {
+        let path = git_dir.join(name);
+        paths.insert(
+            path.clone(),
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+    }
+    for name in [
+        "config",
+        "packed-refs",
+        "info/exclude",
+        "refs/stash",
+        "logs/refs/stash",
+    ] {
+        let path = common.join(name);
+        paths.insert(
+            path.clone(),
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata)),
+        );
+    }
+    let mut pending = vec![common.join("refs"), git_dir.join("refs")];
+    while let Some(path) = pending.pop() {
+        if paths.contains_key(&path) {
+            continue;
+        }
+        // Child identities below detect real ref additions/removals. Ignore
+        // directory times, which also change for unpublished *.lock files.
+        let identity = fs::metadata(&path).ok().map(|metadata| {
+            let (device, inode, ..) = file_identity(&metadata);
+            (device, inode, 0, 0, 0, 0, 0)
+        });
+        paths.insert(path.clone(), identity);
+        if let Ok(entries) = fs::read_dir(&path) {
+            for entry in entries.flatten() {
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "lock")
+                {
+                    continue;
+                }
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    pending.push(entry.path());
+                } else {
+                    let path = entry.path();
+                    paths.insert(
+                        path.clone(),
+                        fs::symlink_metadata(path)
+                            .ok()
+                            .map(|metadata| file_identity(&metadata)),
+                    );
+                }
+            }
+        }
+    }
+    paths
+}
+
+impl SnapshotCache {
+    /// Ignored-folder expansion is independent of porcelain status. Observe
+    /// its directory membership too, so the slow fallback repairs missed events.
+    pub fn observe_browse(&mut self, worktree: &Path, files: &WorkingFiles) {
+        let Ok(root) = fs_safety::Root::open(worktree) else {
+            return;
+        };
+        self.browse_root = fs::symlink_metadata(worktree)
+            .ok()
+            .map(|metadata| file_identity(&metadata));
+        for path in files
+            .paths
+            .iter()
+            .chain(&files.ignored)
+            .chain(&files.ignored_directories)
+        {
+            for ancestor in path.as_path().ancestors() {
+                let Ok(path) = RepoPath::parse(ancestor) else {
+                    continue;
+                };
+                if self.observed.contains_key(&path) {
+                    continue;
+                }
+                let metadata = fs_safety::metadata_beneath(&root, path.as_path())
+                    .ok()
+                    .map(|metadata| file_identity(&metadata));
+                self.observed.insert(path, metadata);
+            }
+        }
+    }
+
+    pub fn invalidate(&mut self, metadata: bool) {
+        self.dirty = true;
+        if metadata {
+            self.metadata = None;
+            self.control_metadata = None;
+            self.fsmonitor_checked = false;
         }
     }
 }
@@ -886,9 +1141,217 @@ pub struct IndexPaths {
     pub gitlinks: bool,
 }
 
+/// A sequenced operation in the worktree's administrative directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GitOperationKind {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    /// Display-only state. Recovery authority for git-am is not implemented.
+    Am,
+}
+
+impl GitOperationKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Merge => "Merge",
+            Self::Rebase => "Rebase",
+            Self::CherryPick => "Cherry-pick",
+            Self::Revert => "Revert",
+            Self::Am => "Patch application",
+        }
+    }
+    fn command(self) -> &'static str {
+        match self {
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::Revert => "revert",
+            Self::Am => "am",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitOperationState {
+    pub kind: GitOperationKind,
+    pub incoming_ref: Option<String>,
+    pub message: Option<String>,
+    /// Local authority retained from the operation that produced this state.
+    /// Serialized display state cannot recreate authority to mutate Git.
+    #[serde(skip)]
+    pub witness: Option<GitOperationWitness>,
+    /// Bounded recovery guidance when the displayed operation has no authority.
+    #[serde(default)]
+    pub recovery_unavailable: Option<String>,
+}
+
+impl GitOperationState {
+    pub fn abort_request(&self) -> Option<GitOperation> {
+        let expected = self
+            .witness
+            .as_ref()
+            .filter(|witness| witness.kind() == self.kind)?;
+        Some(GitOperation::Abort {
+            expected: expected.clone(),
+        })
+    }
+
+    pub fn continue_request(&self) -> Option<GitOperation> {
+        let expected = self
+            .witness
+            .as_ref()
+            .filter(|witness| witness.kind() == self.kind)?;
+        Some(GitOperation::Continue {
+            expected: expected.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashEntry {
+    pub reference: String,
+    pub oid: Oid,
+    pub message: String,
+}
+
+/// The HEAD state a rendered patch was prepared against. No commit is a real
+/// precondition for an unborn repository, rather than an absent guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHeadGuard {
+    Unborn,
+    Commit(Oid),
+}
+
+/// Commands share cancellation, ordering, failure output and refresh semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitOperation {
+    Fetch {
+        remote: String,
+        prune: bool,
+    },
+    Sync {
+        rebase: bool,
+    },
+    StashPush {
+        message: Option<String>,
+        include_untracked: bool,
+    },
+    StashApply {
+        reference: String,
+        expected_oid: Oid,
+        pop: bool,
+    },
+    StashDrop {
+        reference: String,
+        expected_oid: Oid,
+    },
+    ResolveConflict {
+        path: RepoPath,
+        ours: bool,
+    },
+    Continue {
+        expected: GitOperationWitness,
+    },
+    Abort {
+        expected: GitOperationWitness,
+    },
+    ApplyPatch {
+        patch: Vec<u8>,
+        cached: bool,
+        reverse: bool,
+        expected_head: Option<GitHeadGuard>,
+    },
+    RevertCommit {
+        oid: Oid,
+        mainline: Option<u32>,
+    },
+    CherryPick {
+        oid: Oid,
+        mainline: Option<u32>,
+    },
+    CreateBranch {
+        oid: Oid,
+        name: ValidatedBranchName,
+    },
+}
+
+impl GitOperation {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Fetch { .. } => "Fetch",
+            Self::Sync { .. } => "Sync",
+            Self::StashPush { .. } => "Stash",
+            Self::StashApply { pop: true, .. } => "Pop stash",
+            Self::StashApply { .. } => "Apply stash",
+            Self::StashDrop { .. } => "Drop stash",
+            Self::ResolveConflict { .. } => "Resolve conflict",
+            Self::Continue { .. } => "Continue",
+            Self::Abort { .. } => "Abort",
+            Self::ApplyPatch { .. } => "Apply patch",
+            Self::RevertCommit { .. } => "Revert commit",
+            Self::CherryPick { .. } => "Cherry-pick",
+            Self::CreateBranch { .. } => "Create branch",
+        }
+    }
+}
+
+/// Identity of the exact file contents presented in a marker confirmation.
+pub type ConflictMarkerVersion = (u64, u64, u64, i64, i64, i64, i64);
+
+/// Recognize complete or incomplete conflict marker blocks conservatively.
+pub fn has_conflict_markers(bytes: &[u8]) -> bool {
+    bytes.split(|byte| *byte == b'\n').any(|line| {
+        [b"<<<<<<<".as_slice(), b"|||||||", b"=======", b">>>>>>>"]
+            .iter()
+            .any(|marker| line.starts_with(marker))
+    })
+}
+
+/// Scan line prefixes in bounded chunks so even a very large conflicted file
+/// cannot hide markers beyond an editor preview limit or allocate a giant line.
+pub fn scan_conflict_markers(
+    reader: &mut impl Read,
+    cancellation: &CancellationToken,
+) -> io::Result<bool> {
+    let mut chunk = [0u8; 64 * 1024];
+    let mut prefix = [0u8; 7];
+    let mut used = 0;
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "conflict marker scan cancelled",
+            ));
+        }
+        let length = reader.read(&mut chunk)?;
+        if length == 0 {
+            return Ok(false);
+        }
+        for byte in &chunk[..length] {
+            if *byte == b'\n' {
+                used = 0;
+            } else if used < prefix.len() {
+                prefix[used] = *byte;
+                used += 1;
+                if used == prefix.len() && has_conflict_markers(&prefix) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+}
+
 /// Everything the source-control surfaces need about one worktree in one shot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
+    #[serde(default)]
+    pub operation: Option<GitOperationState>,
+    #[serde(default)]
+    pub stashes: Vec<StashEntry>,
+    #[serde(default)]
+    pub last_fetch_unix_ms: Option<u64>,
     pub status: StatusSnapshot,
     pub files: WorkingFiles,
     pub remotes: Vec<RemoteRecord>,
@@ -1352,7 +1815,14 @@ pub enum MutationFailure {
 impl fmt::Display for MutationFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Process(failure) => write!(formatter, "{failure}"),
+            Self::Process(failure) => {
+                write!(formatter, "{failure}")?;
+                let output = failure.full_output();
+                if !output.is_empty() {
+                    write!(formatter, "\n\nGit output:\n{output}")?;
+                }
+                Ok(())
+            }
             Self::Path { path, reason } => write!(formatter, "{path}: {reason}"),
             Self::Rejected { reason } | Self::Reconciliation { reason } => {
                 formatter.write_str(reason)
@@ -2787,11 +3257,28 @@ fn read_worktree_side(root: &fs_safety::Root, path: &RepoPath) -> DiffSide {
 /// Measures untracked text without one Git process (or allocation) per file.
 /// The same descriptor-relative resolver and per-side limit as the diff reader
 /// apply; failed, changing, and budget-exhausted reads leave honest unknowns.
+#[cfg(test)]
 fn measure_untracked(
     worktree: &Path,
     entries: &mut [ChangedPath],
     cancellation: &CancellationToken,
 ) {
+    measure_untracked_cached(worktree, entries, cancellation, &mut BTreeMap::new());
+}
+
+fn measure_untracked_cached(
+    worktree: &Path,
+    entries: &mut [ChangedPath],
+    cancellation: &CancellationToken,
+    cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>,
+) {
+    let current = entries
+        .iter()
+        .filter(|entry| entry.area == ChangeArea::Untracked && !entry.submodule)
+        .take(MAX_UNTRACKED_STATUS_FILES)
+        .map(|entry| &entry.path)
+        .collect::<std::collections::BTreeSet<_>>();
+    cache.retain(|path, _| current.contains(path));
     let mut untracked = entries
         .iter_mut()
         .filter(|entry| entry.area == ChangeArea::Untracked && !entry.submodule)
@@ -2809,9 +3296,22 @@ fn measure_untracked(
         if cancellation.is_cancelled() || remaining == 0 {
             break;
         }
-        if let Some(lines) =
+        let identity = fs_safety::metadata_beneath(&root, entry.path.as_path())
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| file_identity(&metadata));
+        let cached = identity.and_then(|identity| {
+            cache
+                .get(&entry.path)
+                .filter(|(previous, _)| *previous == identity)
+                .map(|(_, lines)| *lines)
+        });
+        if let Some(lines) = cached.or_else(|| {
             untracked_line_count(&root, &entry.path, cancellation, &mut remaining, &mut bytes)
-        {
+        }) {
+            if let Some(identity) = identity {
+                cache.insert(entry.path.clone(), (identity, lines));
+            }
             entry.added_lines = Some(lines);
             entry.removed_lines = Some(0);
         }
@@ -3550,6 +4050,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(files)
     }
 
+    /// Watch membership includes untracked directories, so later edits and
+    /// creations within them produce native events too.
+    pub fn watch_files(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<WorkingFiles, RepositoryError> {
+        let output = self.run_checked(&self.working_files_command(worktree), cancellation)?;
+        invalid_output(parse_working_files(&output.stdout), output)
+    }
+
     /// What the index of `worktree` tracks, for watching it. Entry modes tell
     /// submodules apart without a `stat` per path.
     pub fn index_paths(
@@ -3786,38 +4297,640 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         options: SnapshotOptions,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, RepositoryError> {
-        let mut status =
-            self.status_with_untracked(worktree, options.untracked_changes, cancellation)?;
+        self.snapshot_cached(
+            worktree,
+            options,
+            cancellation,
+            &mut SnapshotCache::default(),
+        )
+        .map(|snapshot| snapshot.expect("a fresh cache always returns a snapshot"))
+    }
+
+    /// Only status runs for an unchanged refresh; callers invalidate content on
+    /// file events, since porcelain does not encode modified file contents.
+    pub fn snapshot_cached(
+        &self,
+        worktree: &Path,
+        options: SnapshotOptions,
+        cancellation: &CancellationToken,
+        cache: &mut SnapshotCache,
+    ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
+        // Porcelain can stay identical when a sequencer advances or an
+        // operation's markers are replaced. Do not keep issuing actions from
+        // a cached witness merely because status did not change.
+        if cache
+            .control_metadata
+            .as_ref()
+            .and_then(|control| control.operation.as_ref())
+            .is_some_and(|operation| {
+                operation
+                    .witness
+                    .as_ref()
+                    .is_none_or(|witness| witness.revalidate(worktree, cancellation).is_err())
+            })
+        {
+            cache.invalidate(true);
+        }
+        let admin = snapshot_admin_fingerprint(worktree);
+        if !cache.admin.is_empty() && cache.admin != admin {
+            cache.invalidate(true);
+        }
+        if cache.options != Some(options) {
+            cache.invalidate(true);
+            cache.options = Some(options);
+        }
+        let git_dir = local_git_dir(worktree);
+        if !cache.fsmonitor_checked {
+            let mut command = self.git_read(
+                worktree,
+                ["config", "--show-scope", "--get", "core.fsmonitor"],
+            );
+            // `git config` never refreshes an index or invokes fsmonitor. Read
+            // its scope without the safety override that normal commands use.
+            remove_fsmonitor_override(&mut command);
+            let output = self.run(&command, cancellation)?;
+            cache.fsmonitor = if output.success {
+                trusted_fsmonitor(&output.stdout, worktree)
+            } else if output.exit_code == Some(1) {
+                None
+            } else {
+                return Err(git_failure(&command, output).into());
+            };
+            cache.fsmonitor_checked = true;
+        }
+        let output = self.run_checked(
+            &snapshot_fsmonitor(
+                self.status_command_with_untracked(worktree, options.untracked_changes),
+                cache.fsmonitor.as_deref(),
+            ),
+            cancellation,
+        )?;
+        use sha2::Digest;
+        let digest: [u8; 32] = sha2::Sha256::digest(&output.stdout).into();
+        if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some() {
+            let root = fs_safety::Root::open(worktree).ok();
+            let unchanged = cache.observed.iter().all(|(path, previous)| {
+                let current = root
+                    .as_ref()
+                    .and_then(|root| fs_safety::metadata_beneath(root, path.as_path()).ok())
+                    .map(|metadata| file_identity(&metadata));
+                current == *previous
+            });
+            let root_unchanged = !options.untracked_files
+                || fs::symlink_metadata(worktree)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+                    == cache.browse_root;
+            if unchanged && root_unchanged {
+                return Ok(None);
+            }
+        }
+        let mut status = invalid_output(parse_status(&output.stdout), output)?;
+        status.untracked_omitted = !options.untracked_changes;
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
-            let output = self.run_checked(&self.numstat_command(worktree, staged), cancellation)?;
-            let parsed = parse_numstat(&output.stdout);
-            let records = invalid_output(parsed, output)?;
+            let output = self.run_checked(
+                &snapshot_fsmonitor(
+                    self.numstat_command(worktree, staged),
+                    cache.fsmonitor.as_deref(),
+                ),
+                cancellation,
+            )?;
+            let records = invalid_output(parse_numstat(&output.stdout), output)?;
             merge_numstat(&mut status.entries, area, &records);
         }
-        measure_untracked(worktree, &mut status.entries, cancellation);
-
-        let files_command = if options.untracked_files {
-            self.working_files_command(worktree)
-        } else {
-            self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
-        };
-        let output = self.run_checked(&files_command, cancellation)?;
-        let parsed = parse_working_files(&output.stdout);
-        let files = invalid_output(parsed, output)?;
-
-        let remotes = self.remotes(worktree, cancellation)?;
-
-        let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
-        let parsed = parse_refs(&output.stdout);
-        let refs = invalid_output(parsed, output)?;
-
-        Ok(RepositorySnapshot {
+        measure_untracked_cached(
+            worktree,
+            &mut status.entries,
+            cancellation,
+            &mut cache.lines,
+        );
+        if options.untracked_files
+            && let Some((files, ..)) = cache.metadata.as_mut()
+        {
+            let output = self.run_checked(&self.working_files_command(worktree), cancellation)?;
+            *files = invalid_output(parse_working_files(&output.stdout), output)?;
+        }
+        if cache.metadata.is_none() {
+            let files_command = if options.untracked_files {
+                self.working_files_command(worktree)
+            } else {
+                self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
+            };
+            let output = self.run_checked(&files_command, cancellation)?;
+            let files = invalid_output(parse_working_files(&output.stdout), output)?;
+            let remotes = self.remotes(worktree, cancellation)?;
+            let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
+            let refs = invalid_output(parse_refs(&output.stdout), output)?;
+            cache.metadata = Some((files, remotes, refs.local, refs.remote, refs.remote_heads));
+        }
+        if cache.control_metadata.is_none() {
+            cache.control_metadata = Some(ControlMetadata {
+                operation: self.snapshot_operation_state(
+                    worktree,
+                    git_dir.as_deref(),
+                    cancellation,
+                )?,
+                stashes: self.stashes(worktree, cancellation)?,
+                last_fetch_unix_ms: git_dir
+                    .as_ref()
+                    .and_then(|directory| fs::metadata(directory.join("FETCH_HEAD")).ok())
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64),
+            });
+        }
+        let control = cache.control_metadata.as_ref().unwrap();
+        let (files, remotes, local_refs, remote_refs, remote_heads) =
+            cache.metadata.as_ref().unwrap();
+        let root = fs_safety::Root::open(worktree).ok();
+        cache.observed = status
+            .entries
+            .iter()
+            .map(|entry| {
+                let identity = root
+                    .as_ref()
+                    .and_then(|root| fs_safety::metadata_beneath(root, entry.path.as_path()).ok())
+                    .map(|metadata| file_identity(&metadata));
+                (entry.path.clone(), identity)
+            })
+            .collect();
+        cache.browse_root = options
+            .untracked_files
+            .then(|| {
+                fs::symlink_metadata(worktree)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata))
+            })
+            .flatten();
+        cache.admin = admin;
+        cache.digest = Some(digest);
+        cache.dirty = false;
+        Ok(Some(RepositorySnapshot {
+            operation: control.operation.clone(),
+            stashes: control.stashes.clone(),
+            last_fetch_unix_ms: control.last_fetch_unix_ms,
             status,
-            files,
-            remotes,
-            local_refs: refs.local,
-            remote_refs: refs.remote,
-            remote_heads: refs.remote_heads,
+            files: files.clone(),
+            remotes: remotes.clone(),
+            local_refs: local_refs.clone(),
+            remote_refs: remote_refs.clone(),
+            remote_heads: remote_heads.clone(),
+        }))
+    }
+
+    /// Generated operation drafts follow Git's configured comment policy.
+    /// Explicitly authored composer messages keep their separate cleanup rules.
+    fn snapshot_operation_state(
+        &self,
+        worktree: &Path,
+        directory: Option<&Path>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GitOperationState>, RepositoryError> {
+        let mut state = directory
+            .map(|directory| {
+                operation_witness::capture_state(self, worktree, directory, cancellation)
+            })
+            .transpose()
+            .map_err(ValidationError::Io)?
+            .flatten();
+        if let Some(message) = state.as_ref().and_then(|state| state.message.as_ref()) {
+            let command = self
+                .git_read(worktree, ["stripspace", "--strip-comments"])
+                .stdin(message.as_bytes().to_vec());
+            let output = match self.run_checked(&command, cancellation) {
+                Ok(output) => Some(output),
+                Err(error)
+                    if cancellation.is_cancelled()
+                        || error.kind == ProcessFailureKind::Cancelled =>
+                {
+                    return Err(error.into());
+                }
+                // Generated text is optional presentation. A comment-policy
+                // read failure must not erase Changes or recovery authority.
+                Err(_) => None,
+            };
+            if let Some(state) = state.as_mut() {
+                state.message = output.and_then(|output| {
+                    Some(
+                        String::from_utf8_lossy(&output.stdout)
+                            .trim_end_matches('\n')
+                            .to_owned(),
+                    )
+                    .filter(|message| !message.is_empty())
+                });
+            }
+        }
+        Ok(state)
+    }
+
+    pub fn operation_state(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<GitOperationState>, RepositoryError> {
+        let directory = self.git_dir(worktree, cancellation)?;
+        operation_witness::capture_state(self, worktree, &directory, cancellation)
+            .map_err(|reason| ValidationError::Io(reason).into())
+    }
+
+    /// Display-only directory inspection. Only a service read with a bound
+    /// worktree can retain authority for Abort or Continue.
+    pub fn operation_state_from_git_dir(directory: &Path) -> Option<GitOperationState> {
+        operation_witness::display_state(directory).ok().flatten()
+    }
+
+    pub fn stashes(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<StashEntry>, RepositoryError> {
+        // NUL separators preserve subjects containing tabs, with a separate
+        // record terminator supplied by Git's -z option.
+        let output = self.run_checked(
+            &self.git_read(
+                worktree,
+                ["stash", "list", "-z", "--format=%gd%x00%H%x00%s"],
+            ),
+            cancellation,
+        )?;
+        let fields = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for record in fields.chunks(3) {
+            if record.len() < 3 || record[0].is_empty() {
+                continue;
+            }
+            let reference = String::from_utf8_lossy(record[0]).into_owned();
+            let oid = Oid::parse_object(String::from_utf8_lossy(record[1]).into_owned()).map_err(
+                |error| RepositoryError::InvalidOutput {
+                    field: "stash object id",
+                    reason: error.to_string(),
+                },
+            )?;
+            entries.push(StashEntry {
+                reference,
+                oid,
+                message: String::from_utf8_lossy(record[2]).into_owned(),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Execute a non-path mutation under the same worktree lifetime protection
+    /// as commit/push. On failure the next snapshot reads any conflict state.
+    pub fn git_operation(
+        &self,
+        worktree: &Path,
+        operation: &GitOperation,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        let _protection = crate::worktree_cleanup::protect(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let operation_witness = match operation {
+            GitOperation::Continue { expected } | GitOperation::Abort { expected } => {
+                Some(expected)
+            }
+            _ => None,
+        };
+        if let Some(expected) = operation_witness
+            && let Err(reason) = expected.check_git_context(self, worktree, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
+        }
+        if let GitOperation::ApplyPatch {
+            expected_head: Some(expected),
+            ..
+        } = operation
+        {
+            let expected = match expected {
+                GitHeadGuard::Unborn => None,
+                GitHeadGuard::Commit(oid) => Some(oid),
+            };
+            if self.resolve_head(worktree, cancellation)?.as_ref() != expected {
+                return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason: "HEAD changed after this patch was prepared; reload the diff before applying it".into() } });
+            }
+        }
+        let mut command = match operation {
+            GitOperation::Fetch { remote, prune } => {
+                self.checked_remote(worktree, remote, cancellation)?;
+                let mut command = self.git_mutation(worktree, ["fetch"]);
+                if *prune {
+                    command = command.arg("--prune");
+                }
+                command.arg("--").arg(remote)
+            }
+            GitOperation::Sync { rebase } => {
+                let pull = self
+                    .git_mutation(
+                        worktree,
+                        ["pull", if *rebase { "--rebase" } else { "--ff-only" }],
+                    )
+                    .without_timeout();
+                if let Some(outcome) = self.operation_failure(&pull, cancellation)? {
+                    return Ok(outcome);
+                }
+                let after_pull = (|| -> Result<MutationOutcome, RepositoryError> {
+                    // Resolve the exact upstream destination through the same
+                    // checked push path; never depend on push.default.
+                    let snapshot = self.snapshot(worktree, cancellation)?;
+                    let Some(reference) =
+                        snapshot.local_refs.iter().find(|reference| reference.head)
+                    else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "Sync requires a checked-out branch".into(),
+                            },
+                        });
+                    };
+                    let Some(upstream) = reference.upstream.as_ref() else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "Sync requires an upstream".into(),
+                            },
+                        });
+                    };
+                    let Some(remote_ref) = snapshot
+                        .remote_refs
+                        .iter()
+                        .find(|candidate| candidate.name == *upstream)
+                    else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "The upstream does not name a remote branch".into(),
+                            },
+                        });
+                    };
+                    let branch = ValidatedBranchName::parse(
+                        reference
+                            .name
+                            .as_str()
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(reference.name.as_str()),
+                    )?;
+                    Ok(
+                        match self.push(
+                            &PushRequest {
+                                worktree: worktree.to_owned(),
+                                branch,
+                                target: PushTarget::Upstream {
+                                    remote: remote_ref.remote.clone(),
+                                    remote_ref: remote_ref.name.clone(),
+                                },
+                            },
+                            cancellation,
+                        )? {
+                            PushOutcome::Pushed { .. } => {
+                                MutationOutcome::Applied { paths: Vec::new() }
+                            }
+                            PushOutcome::NotPushed { failure } => {
+                                MutationOutcome::PartiallyApplied {
+                                    paths: Vec::new(),
+                                    failures: vec![
+                                        MutationFailure::Reconciliation {
+                                            reason: "Pull completed, but the push did not complete"
+                                                .into(),
+                                        },
+                                        failure,
+                                    ],
+                                }
+                            }
+                            PushOutcome::OutcomeUnknown { failure } => {
+                                MutationOutcome::OutcomeUnknown { failure }
+                            }
+                        },
+                    )
+                })();
+                let completed = || MutationFailure::Reconciliation {
+                    reason: "Pull completed, but the push did not complete".into(),
+                };
+                return Ok(match after_pull {
+                    Ok(MutationOutcome::NotApplied { failure }) => {
+                        MutationOutcome::PartiallyApplied {
+                            paths: Vec::new(),
+                            failures: vec![completed(), failure],
+                        }
+                    }
+                    Ok(MutationOutcome::OutcomeUnknown { failure }) => {
+                        MutationOutcome::OutcomeUnknown {
+                            failure: MutationFailure::Reconciliation {
+                                reason: format!(
+                                    "Pull completed; the push outcome is unconfirmed: {failure}"
+                                ),
+                            },
+                        }
+                    }
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let failure = match error {
+                            RepositoryError::Process(failure) => MutationFailure::Process(failure),
+                            error => MutationFailure::Reconciliation {
+                                reason: format!("Could not prepare the push: {error}"),
+                            },
+                        };
+                        MutationOutcome::PartiallyApplied {
+                            paths: Vec::new(),
+                            failures: vec![completed(), failure],
+                        }
+                    }
+                });
+            }
+            GitOperation::StashPush {
+                message,
+                include_untracked,
+            } => {
+                let mut command = self.git_mutation(worktree, ["stash", "push"]);
+                if *include_untracked {
+                    command = command.arg("--include-untracked");
+                }
+                if let Some(message) = message {
+                    command = command.arg("--message").arg(message);
+                }
+                command
+            }
+            GitOperation::StashApply {
+                reference,
+                expected_oid,
+                pop,
+            } => {
+                let apply = self
+                    .git_mutation(worktree, ["stash", "apply", expected_oid.as_str()])
+                    .without_timeout();
+                if let Some(outcome) = self.operation_failure(&apply, cancellation)? {
+                    return Ok(outcome);
+                }
+                if *pop
+                    && let Err(failure) =
+                        self.drop_stash_at(worktree, reference, expected_oid, cancellation)
+                {
+                    let reason = match failure {
+                        stash_mutations::StashDropFailure::Refused(reason) => format!(
+                            "The selected stash was applied, but its entry was preserved: {reason}"
+                        ),
+                        stash_mutations::StashDropFailure::Uncertain(reason) => format!(
+                            "The selected stash was applied, but deletion is unconfirmed; check the stash list before retrying: {reason}"
+                        ),
+                    };
+                    return Ok(MutationOutcome::PartiallyApplied {
+                        paths: Vec::new(),
+                        failures: vec![MutationFailure::Reconciliation { reason }],
+                    });
+                }
+                return Ok(MutationOutcome::Applied { paths: Vec::new() });
+            }
+            GitOperation::StashDrop {
+                reference,
+                expected_oid,
+            } => {
+                return Ok(
+                    match self.drop_stash_at(worktree, reference, expected_oid, cancellation) {
+                        Ok(()) => MutationOutcome::Applied { paths: Vec::new() },
+                        Err(stash_mutations::StashDropFailure::Refused(reason)) => {
+                            MutationOutcome::NotApplied {
+                                failure: MutationFailure::Rejected { reason },
+                            }
+                        }
+                        Err(stash_mutations::StashDropFailure::Uncertain(reason)) => {
+                            MutationOutcome::OutcomeUnknown {
+                                failure: MutationFailure::Reconciliation { reason },
+                            }
+                        }
+                    },
+                );
+            }
+            GitOperation::ResolveConflict { path, ours } => {
+                let entries = self.index_entries(worktree, path, cancellation)?;
+                if !entries.iter().any(|entry| entry.stage > 0) {
+                    return Ok(MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected {
+                            reason: format!("{path} is no longer conflicted"),
+                        },
+                    });
+                }
+                if !entries
+                    .iter()
+                    .any(|entry| entry.stage == if *ours { 2 } else { 3 })
+                {
+                    // A modify/delete conflict has no blob on the chosen side.
+                    // Git's rm records that deletion as resolved.
+                    let command = self.git_pathspec_mutation(
+                        worktree,
+                        ["rm", "--force"],
+                        std::slice::from_ref(path),
+                    );
+                    if let Some(outcome) = self.operation_failure(&command, cancellation)? {
+                        return Ok(outcome);
+                    }
+                    return Ok(MutationOutcome::Applied {
+                        paths: vec![path.clone()],
+                    });
+                }
+                self.git_literal_mutation(
+                    worktree,
+                    [
+                        OsString::from("checkout"),
+                        OsString::from(if *ours { "--ours" } else { "--theirs" }),
+                        OsString::from("--"),
+                        path.as_os_str().to_owned(),
+                    ],
+                )
+            }
+            GitOperation::Continue { expected } => self
+                .git_mutation(worktree, [expected.kind().command(), "--continue"])
+                .env("GIT_EDITOR", "true"),
+            GitOperation::Abort { expected } => {
+                self.git_mutation(worktree, [expected.kind().command(), "--abort"])
+            }
+            GitOperation::ApplyPatch {
+                patch,
+                cached,
+                reverse,
+                ..
+            } => {
+                let mut command = self.git_mutation(worktree, ["apply", "--whitespace=nowarn"]);
+                if *cached {
+                    command = command.arg("--cached");
+                }
+                if *reverse {
+                    command = command.arg("--reverse");
+                }
+                command.arg("-").stdin(patch.clone())
+            }
+            GitOperation::RevertCommit { oid, mainline }
+            | GitOperation::CherryPick { oid, mainline } => {
+                if *mainline == Some(0) {
+                    return Ok(MutationOutcome::NotApplied {
+                        failure: MutationFailure::Rejected {
+                            reason: "Choose a positive parent number for the merge commit".into(),
+                        },
+                    });
+                }
+                let mut command = self.git_mutation(
+                    worktree,
+                    [
+                        if matches!(operation, GitOperation::RevertCommit { .. }) {
+                            "revert"
+                        } else {
+                            "cherry-pick"
+                        },
+                        "--no-edit",
+                    ],
+                );
+                if let Some(parent) = mainline {
+                    command = command.arg("--mainline").arg(parent.to_string());
+                }
+                command.arg(oid.as_str())
+            }
+            GitOperation::CreateBranch { oid, name } => {
+                self.git_mutation(worktree, ["branch", "--", name.as_str(), oid.as_str()])
+            }
+        };
+        command = command.without_timeout();
+        if let Some(expected) = operation_witness {
+            // Git's configured worktree may change after preflight. Recovery
+            // must still act on the original admitted worktree.
+            command = expected.pin_worktree(command);
+        }
+        // No Git read or asynchronous boundary may intervene between this
+        // filesystem check and dispatch of the captured operation.
+        if let Some(expected) = operation_witness
+            && let Err(reason) = expected.revalidate(worktree, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
+        }
+        if let Some(outcome) = self.operation_failure(&command, cancellation)? {
+            return Ok(outcome);
+        }
+        if let GitOperation::ResolveConflict { path, .. } = operation {
+            return self.stage(
+                &StageRequest {
+                    worktree: worktree.to_owned(),
+                    selection: vec![PathSelection::new(path.clone())],
+                },
+                cancellation,
+            );
+        }
+        Ok(MutationOutcome::Applied { paths: Vec::new() })
+    }
+
+    fn operation_failure(
+        &self,
+        command: &CommandSpec,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<MutationOutcome>, RepositoryError> {
+        Ok(match self.run(command, cancellation) {
+            Ok(output) if output.success => None,
+            Ok(output) => Some(MutationOutcome::OutcomeUnknown {
+                failure: git_failure(command, output).into(),
+            }),
+            Err(failure) if !failure.started => Some(MutationOutcome::NotApplied {
+                failure: failure.into(),
+            }),
+            Err(failure) => Some(MutationOutcome::OutcomeUnknown {
+                failure: failure.into(),
+            }),
         })
     }
 
@@ -4529,6 +5642,82 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(self.git_pathspec_mutation(worktree, ["add", "-A"], paths))
     }
 
+    /// Check the current unmerged index at queue execution, never at the time
+    /// a row was clicked. An explicit approval applies only to those exact
+    /// scanned file identities, so editing a waiting file requires a new answer.
+    pub fn check_stage_markers(
+        &self,
+        request: &StageRequest,
+        approved: &BTreeMap<RepoPath, ConflictMarkerVersion>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<BTreeMap<RepoPath, ConflictMarkerVersion>>, RepositoryError> {
+        use std::os::unix::fs::MetadataExt;
+        let command = self.git_read(&request.worktree, ["ls-files", "--unmerged", "-z"]);
+        let output = self.run_checked(&command, cancellation)?;
+        let entries = invalid_output(parse_index_entries(&output.stdout), output)?;
+        let mut conflicted = entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<HashSet<_>>();
+        conflicted.extend(approved.keys().cloned());
+        let paths = selection_pathspecs(&request.selection);
+        if !paths.iter().any(|path| conflicted.contains(path)) {
+            return Ok(None);
+        }
+        let root = fs_safety::Root::open(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let version = |metadata: &fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let mut markers = BTreeMap::new();
+        for path in paths.into_iter().filter(|path| conflicted.contains(path)) {
+            let metadata = match fs_safety::metadata_beneath(&root, path.as_path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.is_not_found() => continue,
+                Err(error) => return Err(ValidationError::Io(error.to_string()).into()),
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let mut file = fs_safety::open_beneath(&root, path.as_path())
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let opened = file
+                .metadata()
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let remaining = scan_conflict_markers(&mut file, cancellation)
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let after = file
+                .metadata()
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let named = fs_safety::metadata_beneath(&root, path.as_path())
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            if version(&metadata) != version(&opened)
+                || version(&opened) != version(&after)
+                || version(&after) != version(&named)
+            {
+                return Err(ValidationError::Io(format!(
+                    "{path} changed while checking conflict markers; retry staging"
+                ))
+                .into());
+            }
+            if remaining {
+                markers.insert(path, version(&after));
+            }
+        }
+        Ok(markers
+            .iter()
+            .any(|(path, version)| approved.get(path) != Some(version))
+            .then_some(markers))
+    }
+
     /// Stages the selected paths, including the deletion half of a rename the
     /// index still has.
     pub fn stage(
@@ -4952,7 +6141,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 // such lines would be committed as empty.
                 ["commit", "--file=-", "--cleanup=whitespace"],
             )
-            .stdin(request.message.clone().into_bytes()))
+            .stdin(request.message.clone().into_bytes())
+            .without_timeout())
     }
 
     /// True when the index differs from HEAD.
@@ -5292,6 +6482,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // Force is never offered.
         arguments.push(push_refspec(&request.branch, destination).into());
         self.git_mutation(&request.worktree, arguments)
+            .without_timeout()
     }
 
     /// Pushes one branch, reconciling an uncertain outcome against the remote.
@@ -5401,6 +6592,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 MutationFailure::from(failure)
             }
         };
+        // Explicit cancellation must release the panel promptly. A new remote
+        // observation could hang on the very credential helper just cancelled;
+        // retain the uncertain result instead of starting another network call.
+        if cancellation.is_cancelled() {
+            return Ok(PushOutcome::OutcomeUnknown { failure });
+        }
         // The push may have completed at the remote before the local process
         // died, so the remote's own ref is consulted under a fresh token —
         // reconciliation has to run even when the original token is cancelled.
@@ -6191,6 +7388,70 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 }
 
+/// A repository may request Git's builtin monitor (boolean true), but it may
+/// not select a hook program. Programs explicitly configured by the user in
+/// global/system configuration may retain authority when their absolute
+/// executable is outside repository content and contains no shell syntax.
+fn trusted_fsmonitor(output: &[u8], worktree: &Path) -> Option<OsString> {
+    let text = std::str::from_utf8(output).ok()?.trim_end_matches('\n');
+    let (scope, value) = text.split_once('\t')?;
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(OsString::from("true")),
+        "false" | "no" | "off" | "0" | "" => None,
+        _ if matches!(scope, "global" | "system" | "command") => {
+            // Git interprets hook values as commands. Relative commands and
+            // shell syntax can select code supplied by the current checkout.
+            if !Path::new(value).is_absolute()
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+            {
+                return None;
+            }
+            let executable = fs::canonicalize(value).ok()?;
+            let worktree = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+            if executable.starts_with(&worktree)
+                || executable
+                    .ancestors()
+                    .skip(1)
+                    .any(|parent| parent.join(".git").exists())
+            {
+                return None;
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::metadata(&executable).ok()?;
+            (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                .then(|| executable.into_os_string())
+        }
+        _ => None,
+    }
+}
+
+fn remove_fsmonitor_override(command: &mut CommandSpec) {
+    if let Some(index) = command
+        .arguments
+        .iter()
+        .position(|argument| argument == OsStr::new("core.fsmonitor=false"))
+    {
+        command.arguments.remove(index);
+        command.arguments.remove(index - 1);
+    }
+}
+
+fn snapshot_fsmonitor(mut command: CommandSpec, configured: Option<&OsStr>) -> CommandSpec {
+    if let Some(configured) = configured
+        && let Some(argument) = command
+            .arguments
+            .iter_mut()
+            .find(|argument| **argument == OsStr::new("core.fsmonitor=false"))
+    {
+        let mut value = OsString::from("core.fsmonitor=");
+        value.push(configured);
+        *argument = value;
+    }
+    command
+}
+
 /// The ten NUL-separated fields [`parse_history`] expects, in order.
 const HISTORY_FORMAT: &str = "%H%x00%P%x00%an%x00%ae%x00%ad%x00%cn%x00%ce%x00%cd%x00%s%x00%b";
 
@@ -6849,6 +8110,322 @@ mod tests {
     }
 
     #[test]
+    fn marker_scan_is_bounded_and_finds_markers_after_a_large_line() {
+        let mut reader = io::repeat(b'x')
+            .take(17 * 1024 * 1024)
+            .chain(io::Cursor::new(b"\n<<<<<<< incoming\n"));
+        assert!(scan_conflict_markers(&mut reader, &CancellationToken::new()).unwrap());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            scan_conflict_markers(&mut io::Cursor::new(b"safe"), &cancel)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+
+    #[test]
+    fn snapshot_fsmonitor_honours_user_configuration_without_trusting_repository_hooks() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+        let trusted = directory.path().join("monitor");
+        fs::write(&trusted, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&trusted, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            trusted_fsmonitor(b"local\ttrue\n", &worktree),
+            Some("true".into())
+        );
+        for scope in ["global", "system", "command"] {
+            let config = format!("{scope}\t{}\n", trusted.display());
+            assert_eq!(
+                trusted_fsmonitor(config.as_bytes(), &worktree),
+                Some(trusted.clone().into_os_string())
+            );
+        }
+        for config in [
+            "local\t./malicious-hook\n",
+            "worktree\t./malicious-hook\n",
+            "global\t./hooks/monitor\n",
+            "global\t/bin/true;./hook\n",
+            "local\tfalse\n",
+        ] {
+            assert_eq!(trusted_fsmonitor(config.as_bytes(), &worktree), None);
+        }
+        fs::create_dir(worktree.join(".git")).unwrap();
+        let untrusted = worktree.join("monitor");
+        fs::copy(&trusted, &untrusted).unwrap();
+        assert_eq!(
+            trusted_fsmonitor(
+                format!("global\t{}\n", untrusted.display()).as_bytes(),
+                &worktree
+            ),
+            None
+        );
+    }
+
+    fn snapshot_status(entries: &[u8]) -> Vec<u8> {
+        let mut status = b"# branch.oid (initial)\0# branch.head main\0".to_vec();
+        status.extend_from_slice(entries);
+        status
+    }
+
+    fn cached_snapshot_outputs(
+        entries: &[u8],
+        files: &[u8],
+    ) -> Vec<Result<ProcessOutput, ProcessFailure>> {
+        vec![
+            exit(1, b""), // no configured fsmonitor
+            success(&snapshot_status(entries)),
+            success(b""), // staged numstat
+            success(b""), // unstaged numstat
+            success(files),
+            exit(1, b""), // no remotes
+            success(b""), // no refs
+            success(b""), // no stash entries
+        ]
+    }
+
+    #[test]
+    fn snapshot_cache_unchanged_reads_only_status_and_metadata_invalidation_rereads() {
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.push(success(&snapshot_status(b"")));
+        outputs.extend(cached_snapshot_outputs(b"", b""));
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::default();
+        let root = Path::new("/snapshot-cache-test");
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 8);
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 9);
+        cache.invalidate(true);
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 17);
+    }
+
+    #[test]
+    fn snapshot_cache_status_or_content_change_reuses_metadata() {
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        for _ in 0..2 {
+            outputs.extend([
+                success(&snapshot_status(b"? new.txt\0")),
+                success(b""),
+                success(b""),
+            ]);
+        }
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let mut cache = SnapshotCache::default();
+        let cancel = CancellationToken::default();
+        let root = Path::new("/snapshot-cache-test");
+        git.snapshot_cached(
+            root,
+            SnapshotOptions {
+                untracked_changes: true,
+                untracked_files: false,
+            },
+            &cancel,
+            &mut cache,
+        )
+        .unwrap();
+        let changed = git
+            .snapshot_cached(
+                root,
+                SnapshotOptions {
+                    untracked_changes: true,
+                    untracked_files: false,
+                },
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.status.entries.len(), 1);
+        cache.invalidate(false);
+        assert!(
+            git.snapshot_cached(
+                root,
+                SnapshotOptions {
+                    untracked_changes: true,
+                    untracked_files: false
+                },
+                &cancel,
+                &mut cache
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 14);
+    }
+
+    #[test]
+    fn snapshot_cache_fallback_detects_content_changes_with_identical_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("new.txt");
+        fs::write(&file, "abc\n").unwrap();
+        let mut outputs = cached_snapshot_outputs(b"? new.txt\0", b"? new.txt\0");
+        outputs.extend([
+            success(&snapshot_status(b"? new.txt\0")),
+            success(b""),
+            success(b""),
+            success(&snapshot_status(b"? new.txt\0")),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let options = SnapshotOptions {
+            untracked_changes: true,
+            untracked_files: false,
+        };
+        let cancel = CancellationToken::default();
+        let mut cache = SnapshotCache::default();
+        let first = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status.entries[0].added_lines, Some(1));
+        // Same size and same porcelain; only descriptor metadata detects this
+        // when the native event was lost.
+        fs::write(&file, "a\nb\n").unwrap();
+        fs::File::open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let second = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.status.entries[0].added_lines, Some(2));
+        assert!(
+            git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 12);
+    }
+
+    #[test]
+    fn snapshot_cache_browse_creation_refreshes_files_without_untracked_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.extend([
+            success(&snapshot_status(b"")),
+            success(b""),
+            success(b""),
+            success(b"? new.txt\0"),
+            success(&snapshot_status(b"")),
+        ]);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let options = SnapshotOptions {
+            untracked_changes: false,
+            untracked_files: true,
+        };
+        let cancel = CancellationToken::default();
+        let mut cache = SnapshotCache::default();
+        git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap();
+        fs::write(directory.path().join("new.txt"), "new\n").unwrap();
+        fs::File::open(directory.path())
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let next = git
+            .snapshot_cached(directory.path(), options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.files.paths, vec![path("new.txt")]);
+        assert!(
+            git.snapshot_cached(directory.path(), options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.commands.lock().unwrap().len(), 13);
+    }
+
+    #[test]
+    fn snapshot_admin_fingerprint_tracks_refs_config_and_index_without_lock_noise() {
+        let directory = tempfile::tempdir().unwrap();
+        let gitdir = directory.path().join(".git");
+        fs::create_dir_all(gitdir.join("refs/heads/feature")).unwrap();
+        fs::write(gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let first = snapshot_admin_fingerprint(directory.path());
+        fs::write(gitdir.join("index.lock"), "temporary").unwrap();
+        fs::remove_file(gitdir.join("index.lock")).unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::write(gitdir.join("refs/heads/main.lock"), "unpublished").unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::remove_file(gitdir.join("refs/heads/main.lock")).unwrap();
+        assert_eq!(first, snapshot_admin_fingerprint(directory.path()));
+        fs::write(
+            gitdir.join("config"),
+            "[remote \"origin\"]\nurl = example\n",
+        )
+        .unwrap();
+        let configured = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(first, configured);
+        fs::write(gitdir.join("index"), "new-index").unwrap();
+        let indexed = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(configured, indexed);
+        fs::write(gitdir.join("refs/heads/feature/new"), "oid\n").unwrap();
+        fs::File::open(gitdir.join("refs/heads/feature"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
+        let created = snapshot_admin_fingerprint(directory.path());
+        assert_ne!(indexed, created);
+        fs::write(gitdir.join("refs/heads/feature/new"), "updated-oid\n").unwrap();
+        assert_ne!(created, snapshot_admin_fingerprint(directory.path()));
+    }
+
+    #[test]
+    fn untracked_measurement_cache_invalidates_size_mtime_and_inode() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("new.txt");
+        fs::write(&file, "one\n").unwrap();
+        let mut cache = BTreeMap::new();
+        let measure = |cache: &mut BTreeMap<RepoPath, (FileIdentity, u64)>| {
+            let mut entries = parse_status(&snapshot_status(b"? new.txt\0"))
+                .unwrap()
+                .entries;
+            measure_untracked_cached(
+                directory.path(),
+                &mut entries,
+                &CancellationToken::default(),
+                cache,
+            );
+            entries[0].added_lines.unwrap()
+        };
+        assert_eq!(measure(&mut cache), 1);
+        let original = cache[&path("new.txt")].0;
+        assert_eq!(measure(&mut cache), 1);
+        fs::write(&file, "one\ntwo\n").unwrap();
+        assert_eq!(measure(&mut cache), 2);
+        assert_ne!(cache[&path("new.txt")].0, original);
+        let second = cache[&path("new.txt")].0;
+        let replacement = directory.path().join("replacement");
+        fs::write(&replacement, "one two\n").unwrap();
+        fs::rename(replacement, &file).unwrap();
+        assert_eq!(measure(&mut cache), 1);
+        assert_ne!(cache[&path("new.txt")].0, second);
+    }
+
+    #[test]
     fn parses_worktree_porcelain_and_ignores_future_fields() {
         let input = b"worktree /repo\0HEAD 0123456789012345678901234567890123456789\0branch refs/heads/main\0locked reason\0future value\0\0worktree /repo/wt\0HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0detached\0prunable missing\0\0";
         let records = parse_worktree_list(input).unwrap();
@@ -7135,6 +8712,146 @@ mod tests {
                     .head_tree_paths(root, &head, &paths.iter().collect::<Vec<_>>(), &cancel)
                     .unwrap(),
                 expected
+            );
+        }
+
+        #[test]
+        fn large_literal_pathspec_mutations_roundtrip_without_argv_limits() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            let names = [
+                "space name",
+                "line\nname",
+                "-leading",
+                "[glob]*",
+                ":(glob)magic",
+            ];
+            let selection: Vec<_> = names
+                .iter()
+                .map(|name| PathSelection {
+                    path: path(name),
+                    old_path: None,
+                })
+                .collect();
+            for name in names {
+                fs::write(root.join(name), "base").unwrap();
+            }
+            let service = service();
+            let cancel = CancellationToken::new();
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            git(root, &["commit", "-m", "initial"]);
+            for name in names {
+                fs::write(root.join(name), "changed").unwrap();
+            }
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .discard(
+                        &DiscardRequest {
+                            worktree: root.into(),
+                            tracked: selection,
+                            untracked: vec![],
+                            confirmed: true
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            for name in names {
+                assert_eq!(fs::read_to_string(root.join(name)).unwrap(), "base");
+            }
+
+            // 40k names exceed Linux ARG_MAX even before argv pointer overhead.
+            let mut selection = Vec::with_capacity(40_000);
+            for index in 0..40_000 {
+                let name = format!(
+                    "generated_component_file_with_an_extraordinarily_long_name_{index:05}.txt"
+                );
+                fs::write(root.join(&name), "generated").unwrap();
+                selection.push(PathSelection {
+                    path: path(&name),
+                    old_path: None,
+                });
+            }
+            assert!(pathspec_input(&selection_pathspecs(&selection)).len() > 2_097_152);
+            assert!(matches!(
+                service
+                    .stage(
+                        &StageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .unstage(
+                        &UnstageRequest {
+                            worktree: root.into(),
+                            selection: selection.clone()
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(matches!(
+                service
+                    .discard(
+                        &DiscardRequest {
+                            worktree: root.into(),
+                            tracked: vec![],
+                            untracked: selection.into_iter().map(|entry| entry.path).collect(),
+                            confirmed: true
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert!(
+                !root
+                    .join("generated_component_file_with_an_extraordinarily_long_name_00000.txt")
+                    .exists()
             );
         }
 
@@ -8478,6 +10195,9 @@ mod tests {
         // The join the two fields exist for: every branch of a remote that has
         // a pointer finds that remote's own pointer, and never another's.
         let snapshot = RepositorySnapshot {
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: StatusSnapshot::default(),
             files: WorkingFiles::default(),
             remotes: Vec::new(),
@@ -10703,6 +12423,7 @@ mod tests {
         refs.extend_from_slice(oid(1).as_str().as_bytes());
         refs.extend_from_slice(b"\0\0\0*\n");
         let service = fake_service(vec![
+            exit(1, b""), // no configured fsmonitor
             success(&status),
             success(b"4\t1\tsrc/main.rs\0"),
             success(b""),
@@ -10710,6 +12431,7 @@ mod tests {
             // No remotes configured.
             exit(1, b""),
             success(&refs),
+            success(b""),
         ]);
         let snapshot = service
             .snapshot(worktree.path(), &CancellationToken::new())
@@ -10735,9 +12457,9 @@ mod tests {
         assert!(snapshot.remotes.is_empty());
         assert_eq!(snapshot.local_refs.len(), 1);
         let commands = service.executor.commands.lock().unwrap();
-        assert!(commands[1].arguments.contains(&OsString::from("--cached")));
-        assert!(!commands[2].arguments.contains(&OsString::from("--cached")));
-        assert_eq!(commands[3].arguments.last(), Some(&OsString::from("-z")));
+        assert!(commands[2].arguments.contains(&OsString::from("--cached")));
+        assert!(!commands[3].arguments.contains(&OsString::from("--cached")));
+        assert_eq!(commands[4].arguments.last(), Some(&OsString::from("-z")));
     }
 
     #[test]
@@ -10827,6 +12549,7 @@ mod tests {
         let mut status = status_headers();
         status.extend_from_slice(b"? new.txt\0");
         let service = fake_service(vec![
+            exit(1, b""), // no configured fsmonitor
             success(&status),
             success(b""),
             success(b""),
@@ -10834,6 +12557,7 @@ mod tests {
             // No remotes configured.
             exit(1, b""),
             success(b""),
+            success(b""), // stash list
         ]);
         let snapshot = service
             .snapshot(Path::new("/repo"), &CancellationToken::new())
