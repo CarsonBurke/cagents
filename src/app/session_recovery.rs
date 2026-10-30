@@ -85,7 +85,9 @@ impl Cagents {
             return None;
         }
         health.quarantined.iter().find_map(|write| {
-            let WriteSubject::Workspace { card: Some(id) } = write.subject else {
+            let (WriteSubject::Workspace { card: Some(id) } | WriteSubject::Pane { card: id }) =
+                write.subject
+            else {
                 return None;
             };
             if self.shared_views.defaults.contains_key(&id) || self.chat_is_unused_default(id) {
