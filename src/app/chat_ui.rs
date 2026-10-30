@@ -43,6 +43,7 @@ mod prose;
 mod prose_document;
 mod reader_source;
 mod retained;
+mod retirement;
 pub(super) use closed_draft::closed_draft_source_matches;
 mod scroll;
 mod selectable_prose;
@@ -580,6 +581,33 @@ impl Phase {
     }
 }
 
+/// Volatile cleanup custody, captured before dispatch or surface removal.
+/// Neither a resource ID nor a current replacement card can recreate it.
+#[derive(Clone)]
+struct RetirementOwner {
+    id: uuid::Uuid,
+    card: CardId,
+    title: String,
+    caller: crate::control::CallerContext,
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+    after: RetirementAfter,
+}
+
+#[derive(Clone, Copy)]
+enum RetirementAfter {
+    None,
+    CloseChat,
+    CloseTerminal,
+}
+
+pub(super) struct CleanupNotice {
+    pub(super) id: uuid::Uuid,
+    pub(super) title: String,
+    pub(super) detail: String,
+    pub(super) retry: bool,
+}
+
 pub(super) struct State {
     channel_names: HashMap<Target, ChannelNameObservation>,
     pub(super) image_viewer: Option<images::Gallery>,
@@ -587,6 +615,7 @@ pub(super) struct State {
     sender: async_channel::Sender<(Target, Wake)>,
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
+    retirement_allocator_exhausted: bool,
     phases: HashMap<CardId, Phase>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
@@ -599,7 +628,10 @@ pub(super) struct State {
     /// what retires it.
     abandoned: HashMap<Target, (chat::Session, crate::control::CallerContext)>,
     /// Conversations being given up in the background after their card left.
-    retiring: HashSet<Target>,
+    retiring: retirement::Ledger<RetirementOwner>,
+    /// Admission refusal must retain the same owner too, including after
+    /// generation exhaustion. These records never authorize an effect.
+    retirement_refusals: HashMap<uuid::Uuid, RetirementOwner>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
     ///
@@ -635,10 +667,12 @@ impl Default for State {
             sender,
             receiver,
             generation: 0,
+            retirement_allocator_exhausted: false,
             phases: HashMap::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
-            retiring: HashSet::new(),
+            retiring: retirement::Ledger::new(),
+            retirement_refusals: HashMap::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
             default_chats: HashSet::new(),
@@ -672,7 +706,81 @@ impl State {
 
 impl State {
     pub(super) fn transition_pending(&self) -> bool {
-        !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty()
+        !self.phases.is_empty() || !self.abandoned.is_empty() || self.cleanup_unresolved()
+    }
+
+    pub(super) fn cleanup_unresolved(&self) -> bool {
+        !self.retiring.is_empty() || !self.retirement_refusals.is_empty()
+    }
+
+    fn cleanup_owners(&self) -> impl Iterator<Item = &RetirementOwner> {
+        self.retiring
+            .owners()
+            .chain(self.retirement_refusals.values())
+    }
+
+    fn cleanup_blocks(&self, card: CardId, session: &chat::Session) -> bool {
+        self.cleanup_owners().any(|owner| {
+            owner.card == card
+                || owner
+                    .session
+                    .as_ref()
+                    .is_some_and(|source| source.id == session.id)
+        })
+    }
+
+    fn failed_cleanup(&self, card: CardId, session: &chat::Session) -> Option<uuid::Uuid> {
+        self.retiring.failed().find_map(|(_, owner, _)| {
+            (owner.card == card
+                || owner
+                    .session
+                    .as_ref()
+                    .is_some_and(|source| source.id == session.id))
+            .then_some(owner.id)
+        })
+    }
+
+    pub(super) fn cleanup_notices(&self) -> Vec<CleanupNotice> {
+        let mut rows: Vec<_> =
+            self.retiring
+                .failed()
+                .map(|(_, owner, failure)| CleanupNotice {
+                    id: owner.id,
+                    title: owner.title.clone(),
+                    detail: failure.to_owned(),
+                    retry: true,
+                })
+                .chain(self.retiring.pending().map(|(_, owner)| CleanupNotice {
+                    id: owner.id,
+                    title: owner.title.clone(),
+                    detail: "Waiting for confirmation that this conversation stopped.".into(),
+                    retry: false,
+                }))
+                .chain(self.retirement_refusals.values().map(|owner| {
+                    CleanupNotice {
+                        id: owner.id,
+                        title: owner.title.clone(),
+                        detail:
+                            "Cleanup could not be scheduled. Its original conversation is retained."
+                                .into(),
+                        retry: true,
+                    }
+                }))
+                .collect();
+        rows.sort_by(|a, b| a.title.cmp(&b.title).then(a.id.cmp(&b.id)));
+        rows
+    }
+
+    pub(super) fn cleanup_needs_retry(&self) -> bool {
+        self.retiring.failed().next().is_some() || !self.retirement_refusals.is_empty()
+    }
+
+    fn retirement_target(&mut self, card: CardId) -> Option<Target> {
+        if self.retirement_allocator_exhausted || self.generation == u64::MAX {
+            self.retirement_allocator_exhausted = true;
+            return None;
+        }
+        Some(self.next_target(card))
     }
 
     fn attempt(&self, card: CardId) -> Option<&Attempt> {
@@ -694,7 +802,15 @@ impl State {
 
     /// A target no runtime or attempt holds, for a request of its own.
     fn next_target(&mut self, card: CardId) -> Target {
-        self.generation = self.generation.wrapping_add(1).max(1);
+        self.generation = match self.generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                // Other chat targets historically wrap. Never let that
+                // reuse admit a new retirement or consume an old receipt.
+                self.retirement_allocator_exhausted = true;
+                1
+            }
+        };
         Target {
             card,
             generation: self.generation,
@@ -5757,6 +5873,9 @@ impl Cagents {
             return Task::none();
         };
         let source = source.clone();
+        if self.refuse_chat_cleanup_reuse(card, &source) {
+            return Task::none();
+        }
         let mut replacement = source.clone();
         replacement.native_continuity = chat::NativeContinuity::ReconnectOnly;
         replacement.reset_owned_codex_listener();
@@ -6582,6 +6701,9 @@ impl Cagents {
         session: chat::Session,
         intent: chat::Intent,
     ) -> Task<Message> {
+        if self.refuse_chat_cleanup_reuse(card, &session) {
+            return Task::none();
+        }
         if self.chat_awaiting_admission(card) {
             return Task::none();
         }
@@ -6784,7 +6906,9 @@ impl Cagents {
                     .insert(attempt.target, (attempt.session, attempt.caller));
             }
             Some(Phase::Closing { target, caller, .. }) => {
-                if let Some(session) = self.chat_return_session(card) {
+                if self.chat_ui.retiring.owner(target).is_none()
+                    && let Some(session) = self.chat_return_session(card)
+                {
                     self.chat_ui.abandoned.insert(target, (session, caller));
                 }
             }
@@ -7063,10 +7187,26 @@ impl Cagents {
         if let Some(runtime) = self.chat_ui.parked.get(&card)
             && let Some(handle) = runtime.handle().cloned()
         {
-            let target = runtime.target;
+            let session = runtime.session.clone();
             if self.chat_ui.phases.contains_key(&card) {
                 return Task::none();
             }
+            if let Some(id) = self.chat_ui.failed_cleanup(card, &session) {
+                return self.retry_chat_retirement(id);
+            }
+            if self.refuse_chat_cleanup_reuse(card, &session) {
+                return Task::none();
+            }
+            let owner = self.retirement_owner(
+                caller.clone(),
+                card,
+                Some(handle.clone()),
+                Some(session),
+                RetirementAfter::CloseTerminal,
+            );
+            let Some((target, _)) = self.reserve_retirement(owner) else {
+                return Task::none();
+            };
             self.chat_ui.phases.insert(
                 card,
                 Phase::Closing {
@@ -7092,6 +7232,12 @@ impl Cagents {
         let Some(session) = self.chat_return_session(card) else {
             return Task::none();
         };
+        if let Some(id) = self.chat_ui.failed_cleanup(card, &session) {
+            return self.retry_chat_retirement(id);
+        }
+        if self.refuse_chat_cleanup_reuse(card, &session) {
+            return Task::none();
+        }
         // Capture the retirement capability before the synchronous removal
         // drops the surface. In-flight operations move to the detached ledger
         // only after commit succeeds, and retire when their own answer lands.
@@ -7107,7 +7253,16 @@ impl Cagents {
             && session.proof.is_some()
             && (session.owns_codex_listener() || session.native_continuity.retains_provider())
         {
-            let target = self.chat_ui.next_target(card);
+            let owner = self.retirement_owner(
+                caller.clone(),
+                card,
+                handle.clone(),
+                Some(session.clone()),
+                RetirementAfter::CloseChat,
+            );
+            let Some((target, _)) = self.reserve_retirement(owner) else {
+                return Task::none();
+            };
             self.chat_ui.phases.insert(
                 card,
                 Phase::Closing {
@@ -7160,17 +7315,157 @@ impl Cagents {
         handle: Option<Arc<ClientHandle>>,
         session: Option<chat::Session>,
     ) -> Task<Message> {
-        let target = self.chat_ui.next_target(card);
-        self.chat_ui.retiring.insert(target);
+        let owner = self.retirement_owner(caller, card, handle, session, RetirementAfter::None);
+        let Some((target, owner)) = self.reserve_retirement(owner) else {
+            return Task::none();
+        };
+        Self::dispatch_retirement(target, owner)
+    }
+
+    fn retirement_owner(
+        &self,
+        caller: crate::control::CallerContext,
+        card: CardId,
+        handle: Option<Arc<ClientHandle>>,
+        session: Option<chat::Session>,
+        after: RetirementAfter,
+    ) -> RetirementOwner {
+        let title = self
+            .card_state(card)
+            .map(|state| self.card_display_title(state).to_owned())
+            .unwrap_or_else(|| {
+                session
+                    .as_ref()
+                    .map(|session| format!("{} conversation", session.launch.provider.label()))
+                    .unwrap_or_else(|| "Conversation".into())
+            });
+        RetirementOwner {
+            id: uuid::Uuid::new_v4(),
+            card,
+            title,
+            caller,
+            handle,
+            session,
+            after,
+        }
+    }
+
+    fn reserve_retirement(&mut self, owner: RetirementOwner) -> Option<(Target, RetirementOwner)> {
+        if let Some(target) = self.chat_ui.retirement_target(owner.card)
+            && self.chat_ui.retiring.begin(target, owner.clone()).is_ok()
+        {
+            return Some((target, owner));
+        }
+        // Refusal is not completion. Keep even an owner that could not get a
+        // dispatch generation; no task, new context or effect is authorized.
+        self.chat_ui.retirement_refusals.insert(owner.id, owner);
+        None
+    }
+
+    fn dispatch_retirement(target: Target, owner: RetirementOwner) -> Task<Message> {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                retire_conversation_as(caller, handle, session)
+                retire_conversation_as(owner.caller, owner.handle, owner.session)
             })
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
             Message::ChatUi(Action::Retired(target, result))
         })
+    }
+
+    pub(super) fn retry_chat_retirement(&mut self, id: uuid::Uuid) -> Task<Message> {
+        let failed = self
+            .chat_ui
+            .retiring
+            .failed()
+            .find_map(|(target, owner, _)| (owner.id == id).then_some(target));
+        if let Some(failed) = failed {
+            let Some(next) = self.chat_ui.retirement_target(failed.card) else {
+                return Task::none();
+            };
+            let Some(owner) = self.chat_ui.retiring.retry(failed, next) else {
+                return Task::none();
+            };
+            return self.dispatch_retirement_retry(next, owner);
+        }
+        if let Some(owner) = self.chat_ui.retirement_refusals.remove(&id)
+            && let Some((target, owner)) = self.reserve_retirement(owner)
+        {
+            return self.dispatch_retirement_retry(target, owner);
+        }
+        Task::none()
+    }
+
+    fn dispatch_retirement_retry(
+        &mut self,
+        target: Target,
+        owner: RetirementOwner,
+    ) -> Task<Message> {
+        if !matches!(owner.after, RetirementAfter::None)
+            && self.chat_return_session(owner.card).as_ref() == owner.session.as_ref()
+            && !self.chat_ui.phases.contains_key(&owner.card)
+        {
+            self.chat_ui.phases.insert(
+                owner.card,
+                Phase::Closing {
+                    target,
+                    caller: owner.caller.clone(),
+                    restart: None,
+                },
+            );
+        }
+        Self::dispatch_retirement(target, owner)
+    }
+
+    fn refuse_chat_cleanup_reuse(&mut self, card: CardId, session: &chat::Session) -> bool {
+        if !self.chat_ui.cleanup_blocks(card, session) {
+            return false;
+        }
+        self.status = Some(TransientNotice::warning(
+            "This conversation is still closing. Resolve its cleanup in Application notices before starting it again.",
+        ));
+        true
+    }
+
+    fn finish_retirement(&mut self, target: Target, result: Result<(), String>) -> Task<Message> {
+        let owner = self.chat_ui.retiring.owner(target).cloned();
+        let succeeded = result.is_ok();
+        if !self.chat_ui.retiring.complete(target, result) {
+            return Task::none();
+        }
+        self.chat_ui.finish(target, |phase| {
+            matches!(phase, Phase::Closing { restart: None, .. })
+        });
+        let Some(owner) = owner else {
+            return Task::none();
+        };
+        if !succeeded {
+            // The retained row owns both the error and its retry. A second,
+            // dismissible log entry would outlive positive settlement and
+            // keep offering a retry that is no longer necessary.
+            return self.refocus_notices();
+        }
+        let remove = if self.chat_return_session(owner.card).as_ref() == owner.session.as_ref() {
+            match owner.after {
+                RetirementAfter::None => Task::none(),
+                RetirementAfter::CloseChat => self
+                    .remove_chat_card(owner.card, None)
+                    .unwrap_or_else(Task::none),
+                RetirementAfter::CloseTerminal => {
+                    self.chat_ui.parked.remove(&owner.card);
+                    self.observe_agent_activity_for_card(owner.card, None);
+                    self.begin_card_close(owner.card)
+                }
+            }
+        } else {
+            Task::none()
+        };
+        Task::batch([
+            remove,
+            self.reconcile_notice_popup(),
+            self.refocus_notices(),
+        ])
     }
 
     /// Replaces a chat card that has no daemon handoff to take with a
@@ -7184,6 +7479,9 @@ impl Cagents {
         let Some(session) = self.chat_return_session(card) else {
             return Task::none();
         };
+        if self.refuse_chat_cleanup_reuse(card, &session) {
+            return Task::none();
+        }
         let mut launch = match local_return_launch(&session) {
             Ok(launch) => launch,
             Err(error) => {
@@ -7438,6 +7736,9 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        if self.refuse_chat_cleanup_reuse(card, &session) {
+            return Task::none();
+        }
         if intent == chat::Intent::Start
             && source.is_none()
             && !terminate_source
@@ -8140,6 +8441,11 @@ impl Cagents {
         step: Option<QueuedStep>,
         latest_reader: LatestReader,
     ) -> Task<Message> {
+        if matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
+            if runtime.target == target && self.chat_ui.cleanup_blocks(target.card, &runtime.session))
+        {
+            return Task::none();
+        }
         if self.chat_start_pending(target.card) || self.chat_closed_elsewhere(target.card) {
             return Task::none();
         }
@@ -8864,21 +9170,21 @@ impl Cagents {
                     // hold it. Leaving it alone left a daemon writer and its
                     // provider process running with nothing on screen able to
                     // reach them, so the start is undone here.
-                    if let Ok(handle) = result {
-                        if self.shared_views.attached.contains(&target.card) {
-                            // This was an attachment to a daemon-owned shared actor.
-                            // A peer removing its pane only detaches this client.
-                            drop(handle);
-                            return Task::none();
-                        }
-                        return self.retire_chat_as(
-                            attempt.caller,
-                            target.card,
-                            Some(handle),
-                            None,
-                        );
+                    if self.shared_views.attached.contains(&target.card) {
+                        // This was an attachment to a daemon-owned shared actor.
+                        // A peer removing its pane only detaches this client.
+                        drop(result);
+                        return Task::none();
                     }
-                    return Task::none();
+                    // An error, including a lost reply, does not establish
+                    // that an owned start had no effect. Retain its original
+                    // caller and source as well as any exact returned handle.
+                    return self.retire_chat_as(
+                        attempt.caller,
+                        target.card,
+                        result.ok(),
+                        Some(attempt.session),
+                    );
                 }
                 if result.is_err() && attempt.upgrade_admission.is_some() {
                     // Unproved lineage cannot bind the saved Content to the
@@ -9312,15 +9618,7 @@ impl Cagents {
                 }
             }
             Action::Retired(target, result) => {
-                // Nothing is on screen for this conversation, so only a
-                // failure to end it is worth saying anything about.
-                if self.chat_ui.retiring.remove(&target)
-                    && let Err(error) = result
-                {
-                    self.status = Some(TransientNotice::error(format!(
-                        "A conversation this app gave up could not be confirmed stopped: {error}"
-                    )));
-                }
+                return self.finish_retirement(target, result);
             }
             Action::ReturnedLocally(target, result) => {
                 let Some(Phase::Returning {
@@ -9644,6 +9942,10 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                let source = session.clone();
+                if self.refuse_chat_cleanup_reuse(card, &source) {
+                    return Task::none();
+                }
                 // Dropping the saved conversation is what this does, and storage
                 // takes it as given, so it acts only while the card still
                 // offers it: a late or repeated press after the conversation
@@ -9661,7 +9963,7 @@ impl Cagents {
                 // conversation it was resuming dropped. That is what makes
                 // this a new conversation in the same place rather than a
                 // different launch.
-                let mut session = session.clone();
+                let mut session = source;
                 session.launch.session_id = None;
                 session.proof = None;
                 self.chat_ui.fresh_offers.remove(&card);
@@ -11628,6 +11930,24 @@ impl Cagents {
                 };
             }
             Action::RetainedCloseFinished(target, session, result) => {
+                if let Some(owner) = self.chat_ui.retiring.owner(target) {
+                    if owner.session.as_ref() != Some(&session) {
+                        return Task::none();
+                    }
+                    self.chat_ui.finish(target, |phase| {
+                        matches!(phase, Phase::Closing { restart: None, .. })
+                    });
+                    // A discarded card cannot consume the owner: settlement
+                    // still belongs to its original pending cleanup record.
+                    self.chat_ui.abandoned.remove(&target);
+                    return self.finish_retirement(target, result);
+                }
+                if let Some((source, caller)) = self.chat_ui.abandoned.remove(&target) {
+                    return match result {
+                        Ok(()) => Task::none(),
+                        Err(_) => self.retire_chat_as(caller, target.card, None, Some(source)),
+                    };
+                }
                 if self
                     .chat_ui
                     .finish(target, |phase| {
@@ -11649,6 +11969,13 @@ impl Cagents {
                     .unwrap_or_else(Task::none);
             }
             Action::CloseFinished(target, result) => {
+                if self.chat_ui.retiring.owner(target).is_some() {
+                    self.chat_ui.finish(target, |phase| {
+                        matches!(phase, Phase::Closing { restart: None, .. })
+                    });
+                    self.chat_ui.abandoned.remove(&target);
+                    return self.finish_retirement(target, result);
+                }
                 if let Some((session, caller)) = self.chat_ui.abandoned.remove(&target) {
                     // A restart's close whose card has since been closed. It
                     // was already the retirement; only a failure leaves
@@ -11919,6 +12246,215 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failed_retirement_retains_the_captured_owner_after_notices_are_dismissed() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let authority =
+            crate::agent_execution::Authority::session("synthetic-cleanup-owner".into());
+        let caller = crate::control::CallerContext::for_test(authority.clone(), false, true);
+        drop(app.retire_chat_as(caller, card, Some(handle.clone()), Some(source.clone())));
+        let target = retired(&mut app, card);
+        drop(app.update(Message::ChatUi(Action::Retired(
+            target,
+            Err("original close uncertainty".into()),
+        ))));
+        drop(app.update(Message::DismissAllNotices));
+        let owner = app
+            .chat_ui
+            .retiring
+            .owner(target)
+            .expect("the log never owns cleanup");
+        assert_eq!(owner.caller.authentication(), Some(authority));
+        assert_eq!(owner.session.as_ref(), Some(&source));
+        assert!(Arc::ptr_eq(owner.handle.as_ref().unwrap(), &handle));
+        assert_eq!(
+            app.chat_ui.retiring.failure(target),
+            Some("original close uncertainty")
+        );
+        assert!(app.chat_ui.transition_pending());
+        assert!(
+            app.window_close_transient_blocker()
+                .unwrap()
+                .contains("Application notices")
+        );
+        assert!(
+            app.chat_ui
+                .cleanup_notices()
+                .iter()
+                .any(|row| row.id == owner.id && row.retry)
+        );
+    }
+
+    #[test]
+    fn explicit_cleanup_retry_keeps_its_owner_and_rejects_old_or_neighbor_receipts() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let neighbor = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let authority =
+            crate::agent_execution::Authority::session("synthetic-explicit-retry".into());
+        let caller = crate::control::CallerContext::for_test(authority.clone(), false, true);
+        drop(app.retire_chat_as(
+            caller.clone(),
+            card,
+            Some(handle.clone()),
+            Some(source.clone()),
+        ));
+        drop(app.retire_chat_as(caller, neighbor, None, app.chat_return_session(neighbor)));
+        let old = retired(&mut app, card);
+        let other = retired(&mut app, neighbor);
+        drop(app.update(Message::ChatUi(Action::Retired(
+            old,
+            Err("not confirmed".into()),
+        ))));
+        let id = app.chat_ui.retiring.owner(old).unwrap().id;
+        // A stale control from a closed popup cannot dispatch cleanup.
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::RetryCleanup(id))));
+        assert!(app.chat_ui.retiring.failure(old).is_some());
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleNotices)));
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::RetryCleanup(id))));
+        let retry = retired(&mut app, card);
+        assert_ne!(old, retry);
+        let owner = app.chat_ui.retiring.owner(retry).unwrap();
+        assert_eq!(owner.id, id);
+        assert_eq!(owner.caller.authentication(), Some(authority));
+        assert_eq!(owner.session.as_ref(), Some(&source));
+        assert!(Arc::ptr_eq(owner.handle.as_ref().unwrap(), &handle));
+        drop(app.update(Message::ChatUi(Action::Retired(old, Ok(())))));
+        assert!(app.chat_ui.retiring.is_pending(retry));
+        drop(app.update(Message::ChatUi(Action::Retired(other, Ok(())))));
+        assert!(app.chat_ui.retiring.owner(other).is_none());
+        assert!(app.chat_ui.retiring.is_pending(retry));
+        drop(app.update(Message::ChatUi(Action::Retired(retry, Ok(())))));
+        assert!(!app.chat_ui.cleanup_unresolved());
+    }
+
+    #[test]
+    fn unresolved_cleanup_fences_the_same_source_without_blocking_another_conversation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let neighbor = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let other = app.chat_return_session(neighbor).unwrap();
+        let caller = crate::control::CallerContext::for_test(
+            crate::agent_execution::Authority::session("synthetic-reuse-fence".into()),
+            false,
+            true,
+        );
+        drop(app.retire_chat_as(caller.clone(), card, None, Some(source.clone())));
+        drop(app.start_chat_as(
+            caller.clone(),
+            neighbor,
+            source,
+            chat::Intent::RetryStart,
+            None,
+            false,
+        ));
+        assert!(
+            app.chat_ui.attempt(neighbor).is_none(),
+            "a new card cannot reuse the unresolved source"
+        );
+        drop(app.start_chat_as(caller, neighbor, other, chat::Intent::Restore, None, false));
+        assert!(
+            app.chat_ui.attempt(neighbor).is_some(),
+            "unrelated work remains available"
+        );
+    }
+
+    #[test]
+    fn stale_failed_owned_ready_retains_the_original_source_and_caller() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        let authority = crate::agent_execution::Authority::session("synthetic-stale-ready".into());
+        let caller = crate::control::CallerContext::for_test(authority.clone(), false, true);
+        drop(app.start_chat_as(
+            caller,
+            card,
+            source.clone(),
+            chat::Intent::Restore,
+            None,
+            false,
+        ));
+        let target = chat_runtime_attempt(&app, card);
+        let mut replacement = source.clone();
+        replacement.id = TerminalId::new();
+        app.replace_chat_conversation(card, replacement);
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure::retry("reply was lost")),
+        );
+        let retirement = retired(&mut app, card);
+        let owner = app.chat_ui.retiring.owner(retirement).unwrap();
+        assert_eq!(owner.session.as_ref(), Some(&source));
+        assert_eq!(owner.caller.authentication(), Some(authority));
+        assert!(owner.handle.is_none());
+    }
+
+    #[test]
+    fn discarded_retained_close_settles_its_original_owner_and_fences_a_late_success() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let source = app.chat_return_session(card).unwrap();
+        let caller = crate::control::CallerContext::for_test(
+            crate::agent_execution::Authority::session("synthetic-discarded-close".into()),
+            false,
+            true,
+        );
+        drop(app.begin_chat_close_as(caller, card));
+        let close = app.chat_ui.phases[&card].target();
+        let id = app.chat_ui.retiring.owner(close).unwrap().id;
+        drop(app.remove_chat_card(card, None));
+        assert!(
+            !app.chat_ui.abandoned.contains_key(&close),
+            "the pending ledger already holds custody"
+        );
+        drop(app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            close,
+            source.clone(),
+            Err("close reply lost".into()),
+        ))));
+        assert!(app.chat_ui.retiring.failure(close).is_some());
+        assert!(!app.chat_ui.phases.contains_key(&card));
+        drop(app.retry_chat_retirement(id));
+        let retry = retired(&mut app, card);
+        drop(app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            close,
+            source,
+            Ok(()),
+        ))));
+        assert!(app.chat_ui.retiring.is_pending(retry));
+        drop(app.update(Message::ChatUi(Action::Retired(retry, Ok(())))));
+        assert!(!app.chat_ui.transition_pending());
+    }
+
+    #[test]
+    fn exhausted_global_generation_retains_undispatched_cleanup_even_after_other_targets_wrap() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let source = app.chat_return_session(card).unwrap();
+        app.chat_ui.generation = u64::MAX;
+        let _ = app.chat_ui.next_target(card);
+        let caller = crate::control::CallerContext::for_test(
+            crate::agent_execution::Authority::session("synthetic-exhausted-owner".into()),
+            false,
+            true,
+        );
+        drop(app.retire_chat_as(caller, card, None, Some(source.clone())));
+        assert!(app.chat_ui.retiring.is_empty());
+        let owner = app.chat_ui.retirement_refusals.values().next().unwrap();
+        let id = owner.id;
+        assert_eq!(owner.session.as_ref(), Some(&source));
+        drop(app.retry_chat_retirement(id));
+        assert!(app.chat_ui.retirement_refusals.contains_key(&id));
+        assert!(app.chat_ui.transition_pending());
+    }
+
     #[test]
     fn restart_completion_keeps_the_closing_callers_original_scope() {
         let mut app = crate::app::tests::context_inspector_test_app(false);

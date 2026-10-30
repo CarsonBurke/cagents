@@ -1407,6 +1407,7 @@ pub enum Action {
     ToggleAttention,
     AttentionPage(usize),
     ShowNoticesFor(CardId),
+    RetryCleanup(uuid::Uuid),
     Close,
     TabsScrolled(f32),
     Launch(NewTab),
@@ -1626,6 +1627,10 @@ fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
 
+fn cleanup_retry_id(id: uuid::Uuid) -> String {
+    format!("chrome.notices.cleanup.{id}")
+}
+
 fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
@@ -1736,6 +1741,13 @@ impl Cagents {
                         .recent()
                         .map(|entry| Cow::Owned(notice_dismiss_id(entry.id))),
                 );
+                ring.extend(
+                    self.chat_ui
+                        .cleanup_notices()
+                        .into_iter()
+                        .filter(|notice| notice.retry)
+                        .map(|notice| Cow::Owned(cleanup_retry_id(notice.id))),
+                );
                 // In the order the notices draw them: the lane's own notice,
                 // then the refused writes. Only one of them offers a retry.
                 let health = self.save_health.as_ref();
@@ -1822,6 +1834,13 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::RetryCleanup(id) => {
+                if self.chrome_ui.popup != Some(Popup::Notices) {
+                    return Task::none();
+                }
+                let retry = self.retry_chat_retirement(id);
+                Task::batch([retry, self.refocus_notices()])
+            }
             Action::HoverTab(card) => {
                 self.chrome_ui.hovered_tab = card;
                 Task::none()
@@ -2145,6 +2164,7 @@ impl Cagents {
 
     fn has_chrome_notices(&self) -> bool {
         !self.notices.is_empty()
+            || self.chat_ui.cleanup_unresolved()
             || self
                 .save_health
                 .as_ref()
@@ -2248,7 +2268,15 @@ impl Cagents {
         // From the log, not `self.status`: `update` drains that slot into the
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
-        let recorded_severity = self.notices.severity().max(health_severity);
+        let cleanup_severity = self
+            .chat_ui
+            .cleanup_needs_retry()
+            .then_some(NoticeSeverity::Error);
+        let recorded_severity = self
+            .notices
+            .severity()
+            .max(health_severity)
+            .max(cleanup_severity);
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
     }
 
@@ -2472,6 +2500,34 @@ impl Cagents {
                         )),
                         false,
                     ));
+                }
+                for cleanup in self.chat_ui.cleanup_notices() {
+                    let severity = if cleanup.retry {
+                        NoticeSeverity::Error
+                    } else {
+                        NoticeSeverity::Warning
+                    };
+                    let message = if cleanup.retry {
+                        format!("Could not finish closing {}", cleanup.title)
+                    } else {
+                        format!("Closing {}", cleanup.title)
+                    };
+                    let body = widget::column::with_children(vec![
+                        super::notice_body(message),
+                        super::notice_surface_details(severity, cleanup.detail),
+                    ])
+                    .spacing(space::XS)
+                    .into();
+                    let retry = cleanup.retry.then(|| {
+                        super::notice_surface_action(
+                            severity,
+                            "Retry close",
+                            format!("Retry closing {}", cleanup.title),
+                            widget::Id::new(cleanup_retry_id(cleanup.id)),
+                            Message::ChromeUi(Action::RetryCleanup(cleanup.id)),
+                        )
+                    });
+                    notices.push(super::notice_surface(severity, body, retry, false));
                 }
                 if let Some(health) = &self.save_health {
                     notices.extend(save_health_views(

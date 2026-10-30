@@ -94,6 +94,20 @@ impl<Owner: Clone> Ledger<Owner> {
         })
     }
 
+    pub(in crate::app) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(in crate::app) fn iter(&self) -> impl Iterator<Item = &Target> {
+        self.entries.keys()
+    }
+
+    pub(in crate::app) fn owners(&self) -> impl Iterator<Item = &Owner> {
+        self.entries.values().map(|entry| match entry {
+            Entry::Pending(owner) | Entry::Failed { owner, .. } => owner,
+        })
+    }
+
     pub(in crate::app) fn failure(&self, target: Target) -> Option<&str> {
         match self.entries.get(&target)? {
             Entry::Failed { failure, .. } => Some(failure),

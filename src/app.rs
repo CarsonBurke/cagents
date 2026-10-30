@@ -812,7 +812,7 @@ fn notice_surface_button(severity: NoticeSeverity) -> cosmic::theme::Button {
 fn notice_surface_action<'a>(
     severity: NoticeSeverity,
     label: &'a str,
-    accessible_name: &'a str,
+    accessible_name: impl Into<Cow<'a, str>> + 'a,
     id: widget::Id,
     message: Message,
 ) -> Element<'a, Message> {
@@ -12924,6 +12924,12 @@ impl Cagents {
             ));
             return Task::none();
         }
+        if self.chat_ui.cleanup_unresolved() {
+            self.status = Some(TransientNotice::error(
+                "Resolve conversation cleanup in Application notices before closing this window.",
+            ));
+            return Task::none();
+        }
 
         if self.exit.is_some() {
             return Task::none();
@@ -13080,6 +13086,11 @@ impl Cagents {
         }
         if self.device_ui.busy() {
             return Some("Wait for the device operation to finish before closing the window.");
+        }
+        if self.chat_ui.cleanup_unresolved() {
+            return Some(
+                "Resolve conversation cleanup in Application notices before closing this window.",
+            );
         }
         if self.chat_ui.transition_pending() {
             return Some(
