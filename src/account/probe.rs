@@ -1121,6 +1121,107 @@ fn rpc_result(mut frame: Value) -> RpcResult {
     }
 }
 
+#[cfg(all(test, feature = "ui"))]
+pub(crate) mod collector_fixture {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    pub(crate) enum Frames {
+        Claude {
+            initialize: Value,
+            quota: Value,
+            auth: Value,
+        },
+        Codex {
+            quota: Value,
+            account: Value,
+            models: Option<Value>,
+        },
+    }
+
+    // Exercise the production observers/finishers without preparing an account,
+    // opening a session, invoking a CLI, or starting a detached cache writer.
+    pub(crate) async fn held_outcome(
+        account: Account,
+        frames: Frames,
+        now: impl Fn() -> u64,
+        quota_observed: oneshot::Sender<()>,
+        nonquota_ready: oneshot::Receiver<()>,
+        close_ready: oneshot::Receiver<()>,
+    ) -> Result<Outcome, String> {
+        let probed = match frames {
+            Frames::Claude {
+                initialize,
+                quota,
+                auth,
+            } if account.provider == Provider::Claude => {
+                let initialized =
+                    observed_control_response(&initialize, "cagents-usage-initialize", &now)
+                        .ok_or("fixture initialize did not match the original request")?;
+                if initialized.value.is_err() {
+                    return Err("fixture initialization did not admit a quota request".into());
+                }
+                let catalog = claude_catalog(&initialized);
+                let usage = observed_control_response(&quota, "cagents-usage", &now)
+                    .ok_or("fixture quota did not match the original request")?;
+                quota_observed
+                    .send(())
+                    .map_err(|_| "fixture quota observer was dropped")?;
+                let status = async {
+                    nonquota_ready
+                        .await
+                        .map_err(|_| "fixture auth gate was dropped".to_owned())?;
+                    let bytes = serde_json::to_vec(&auth).map_err(|error| error.to_string())?;
+                    observed_json(&bytes, &now)
+                };
+                let usage = after_close(Ok(ClaudeSession { catalog, usage }), async {
+                    close_ready
+                        .await
+                        .expect("fixture close gate must be released");
+                });
+                join_claude(status, usage).await?
+            }
+            Frames::Codex {
+                quota,
+                account: account_frame,
+                models,
+            } if account.provider == Provider::Codex => {
+                let mut answers = CodexAnswers::default();
+                answers.take(quota, &now);
+                if answers.limits.is_none() {
+                    return Err("fixture quota did not match the original request".into());
+                }
+                quota_observed
+                    .send(())
+                    .map_err(|_| "fixture quota observer was dropped")?;
+                let collected = async {
+                    nonquota_ready
+                        .await
+                        .map_err(|_| "fixture account/models gate was dropped".to_owned())?;
+                    answers.take(account_frame, &now);
+                    if answers.account.is_none() {
+                        return Err("fixture account did not match the original request".into());
+                    }
+                    if let Some(models) = models {
+                        answers.take(models, &now);
+                    }
+                    Ok::<CodexSession, String>(answers.finish())
+                };
+                finish_codex_probe(
+                    after_close(collected.await, async {
+                        close_ready
+                            .await
+                            .expect("fixture close gate must be released");
+                    })
+                    .await,
+                )?
+            }
+            _ => return Err("fixture provider does not match the original account".into()),
+        };
+        Ok(probed.into_outcome())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

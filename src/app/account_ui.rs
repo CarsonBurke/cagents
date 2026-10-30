@@ -7078,6 +7078,368 @@ mod app_tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum CollectedProbeCase {
+        Delayed,
+        DelayedPastSlackWithNewerCatalog,
+        Newer,
+        ClockRollback,
+        SignedOut,
+        MissingCatalog,
+    }
+
+    fn assert_collected_probe_pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.poll(&mut context).is_pending());
+    }
+
+    async fn collected_quota_interleaving(provider: Provider, case: CollectedProbeCase) {
+        use probe::collector_fixture::{Frames, held_outcome};
+        use std::{cell::RefCell, collections::VecDeque};
+        use tokio::sync::oneshot;
+
+        let mut app = context_inspector_test_app(false);
+        assert!(app.account_ui.cache.is_none());
+        assert!(app.account_ui.store.is_none());
+        let id = app.account_ui.add_managed_fixture(provider, 2017);
+        let recipe = recipe_on(&app, &id);
+        let account = app.account_ui.account(&id).unwrap().account.clone();
+        let current = Account::system(provider);
+        let now = now_ms();
+        let delay = if matches!(case, CollectedProbeCase::DelayedPastSlackWithNewerCatalog) {
+            schedule::CLOCK_SLACK + 1_000
+        } else {
+            1_000
+        };
+        let quota_at = if matches!(
+            case,
+            CollectedProbeCase::Newer | CollectedProbeCase::ClockRollback
+        ) {
+            now
+        } else {
+            now - delay
+        };
+        let live_at = match case {
+            CollectedProbeCase::Newer => now - 1_000,
+            CollectedProbeCase::ClockRollback => now + 10 * schedule::CLOCK_SLACK,
+            _ => now,
+        };
+        let auth_at = now + 1_000;
+        let models_at = auth_at + 1;
+        let signed_out = matches!(case, CollectedProbeCase::SignedOut);
+        let missing_catalog = matches!(case, CollectedProbeCase::MissingCatalog);
+        let keep_live = matches!(
+            case,
+            CollectedProbeCase::Delayed
+                | CollectedProbeCase::DelayedPastSlackWithNewerCatalog
+                | CollectedProbeCase::MissingCatalog
+        );
+        app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+            Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+        let key = account.registry_key().unwrap();
+        let mut identity = app.account_ui.registry.find(key).unwrap().identity();
+        identity.plan = Some("retained plan".into());
+        let email = identity.email.clone().unwrap();
+        let quota = match provider {
+            Provider::Claude => serde_json::json!({
+                "subscription_type":"collected plan",
+                "rate_limits":{"limits":[{"kind":"session","percent":20.0}]},
+            }),
+            Provider::Codex => serde_json::json!({
+                "ordinaryUsageAllowed":true,
+                "rateLimits":{"limitId":"codex","primary":{
+                    "usedPercent":20.0,"windowDurationMins":300}},
+            }),
+            _ => unreachable!("this fixture exercises the two real collectors"),
+        };
+        let previous = match provider {
+            Provider::Claude => account::claude::parse_usage(&quota, quota_at - 1_000),
+            Provider::Codex => account::codex::parse_rate_limits(&quota, quota_at - 1_000),
+            _ => unreachable!(),
+        };
+        let owner = {
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.identity = Some(identity.clone());
+            state.snapshot = Some(previous.clone());
+            state.schedule.succeed(previous.observed_at);
+            state.schedule.start(Trigger::Focus, quota_at);
+            state.owner
+        };
+        assert_eq!(
+            app.automatic_account(&current).unwrap().id(),
+            id,
+            "{case:?}"
+        );
+        let catalog = |observed_at, name: &str| Catalog {
+            observed_at,
+            models: vec![crate::chat::Model {
+                id: name.into(),
+                label: name.into(),
+                reasoning: Vec::new(),
+            }],
+        };
+        let known_catalog = catalog(
+            if matches!(case, CollectedProbeCase::DelayedPastSlackWithNewerCatalog) {
+                models_at + 10
+            } else {
+                quota_at - 2
+            },
+            "fixture-known-model",
+        );
+        assert!(app.account_ui.take_catalog(provider, known_catalog.clone()));
+        let other_provider = if provider == Provider::Claude {
+            Provider::Codex
+        } else {
+            Provider::Claude
+        };
+        let other_catalog = catalog(now, "fixture-unrelated-model");
+        assert!(
+            app.account_ui
+                .take_catalog(other_provider, other_catalog.clone())
+        );
+        let (frames, observations) = match provider {
+            Provider::Claude => (
+                Frames::Claude {
+                    initialize: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage-initialize",
+                    "response":{"models":if missing_catalog { serde_json::json!([]) } else {
+                        serde_json::json!([{"value":"opus"}])
+                    }}}}),
+                    quota: serde_json::json!({"type":"control_response","response":{
+                        "subtype":"success","request_id":"cagents-usage","response":quota}}),
+                    auth: serde_json::json!({"loggedIn":!signed_out,"email":email,
+                        "subscriptionType":"collected auth plan"}),
+                },
+                vec![quota_at - 1, quota_at, auth_at],
+            ),
+            Provider::Codex => (
+                Frames::Codex {
+                    quota: serde_json::json!({"id":3,"result":quota}),
+                    account: if signed_out {
+                        serde_json::json!({"id":2,"result":{"account":null,"requiresOpenaiAuth":true}})
+                    } else {
+                        serde_json::json!({"id":2,"result":{"account":{
+                            "type":"chatgpt","email":email,"planType":"collected auth plan"},
+                            "requiresOpenaiAuth":true}})
+                    },
+                    models: (!missing_catalog).then(|| {
+                        serde_json::json!({"id":4,"result":{
+                        "data":[{"model":"gpt-5"}]}})
+                    }),
+                },
+                if missing_catalog {
+                    vec![quota_at, auth_at]
+                } else {
+                    vec![quota_at, auth_at, models_at]
+                },
+            ),
+            _ => unreachable!(),
+        };
+        // Only actual matched collector observations consume this local clock.
+        // No system/provider clock changes and no completion-time stamping.
+        let clock = RefCell::new(VecDeque::from(observations));
+        let (quota_seen, mut quota_observed) = oneshot::channel();
+        let (nonquota_ready, nonquota_wait) = oneshot::channel();
+        let (close_ready, close_wait) = oneshot::channel();
+        let mut completion = Box::pin(held_outcome(
+            account.clone(),
+            frames,
+            || {
+                clock
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("unexpected collector clock read")
+            },
+            quota_seen,
+            nonquota_wait,
+            close_wait,
+        ));
+        assert_collected_probe_pending(completion.as_mut());
+        assert!(quota_observed.try_recv().is_ok());
+        assert_eq!(
+            clock.borrow().len(),
+            if provider == Provider::Codex && !missing_catalog {
+                2
+            } else {
+                1
+            }
+        );
+        let rejection = match provider {
+            Provider::Claude => LiveReport::Claude(
+                account::claude::parse_rate_limit_event(
+                    &serde_json::json!({"status":"rejected","unifiedWindows":{
+                    "five_hour":{"utilization":1.0}}}),
+                )
+                .unwrap(),
+            ),
+            Provider::Codex => LiveReport::CodexLimits(
+                account::codex::parse_update(&serde_json::json!({"rateLimits":{"limitId":"codex",
+                    "rateLimitReachedType":"fixture-exhausted",
+                    "primary":{"usedPercent":100.0,"windowDurationMins":300}}}))
+                .unwrap(),
+            ),
+            _ => unreachable!(),
+        };
+        drop(app.account_reported(provider, &recipe, vec![(rejection, live_at)]));
+        let state = app.account_ui.account(&id).unwrap();
+        let live = state.snapshot.clone().unwrap();
+        assert_eq!(live.status, UsageStatus::Limited, "{case:?}");
+        assert_eq!(live.source, UsageSource::Live);
+        assert_eq!(live.observed_at, live_at);
+        assert_eq!(state.owner, owner);
+        assert!(state.schedule.in_flight(now));
+        assert!(app.automatic_account(&current).is_none());
+
+        nonquota_ready.send(()).unwrap();
+        assert_collected_probe_pending(completion.as_mut());
+        assert!(clock.borrow().is_empty());
+        assert_eq!(
+            app.account_ui.account(&id).unwrap().snapshot.as_ref(),
+            Some(&live)
+        );
+        close_ready.send(()).unwrap();
+        let outcome = completion.await.unwrap();
+        let (produced_identity, produced_snapshot, produced_catalog) = match &outcome {
+            Outcome::Answered {
+                identity,
+                snapshot,
+                catalog,
+            } => (identity.clone(), snapshot.clone(), catalog.clone()),
+            _ => panic!("actual collector/finisher must build the answer"),
+        };
+        assert_eq!(produced_snapshot.source, UsageSource::Probe);
+        assert_eq!(
+            produced_snapshot.observed_at,
+            if signed_out { auth_at } else { quota_at }
+        );
+        assert_eq!(
+            produced_snapshot.status,
+            if signed_out {
+                UsageStatus::NeedsLogin
+            } else {
+                UsageStatus::Ok
+            }
+        );
+        assert!(clock.borrow().is_empty());
+        if signed_out {
+            assert!(produced_identity.is_none());
+        } else {
+            assert_eq!(produced_identity.as_ref().unwrap().email, identity.email);
+            assert!(!produced_snapshot.windows.is_empty());
+        }
+        if missing_catalog {
+            assert!(produced_catalog.is_none());
+        } else {
+            let listed = produced_catalog.as_ref().unwrap();
+            assert_eq!(
+                listed.observed_at,
+                if provider == Provider::Claude {
+                    quota_at - 1
+                } else {
+                    models_at
+                }
+            );
+            assert_eq!(
+                listed.models[0].id,
+                if provider == Provider::Claude {
+                    "opus"
+                } else {
+                    "gpt-5"
+                }
+            );
+        }
+        // The Outcome is untouched: only the actual production finisher built
+        // it. Returned UI/provider/cache Tasks remain unpolled.
+        drop(app.update(Message::AccountUi(Action::Probed {
+            owner,
+            id: id.clone(),
+            outcome,
+        })));
+        let state = app.account_ui.account(&id).unwrap();
+        assert_eq!(state.owner, owner);
+        assert_eq!(state.account, account);
+        assert!(state.present);
+        assert!(state.failure.is_none());
+        assert!(!state.schedule.in_flight(now));
+        assert_eq!(state.schedule.failures(), 0);
+        if keep_live {
+            assert_eq!(state.snapshot.as_ref(), Some(&live), "{case:?}");
+            assert_eq!(state.identity.as_ref(), Some(&identity));
+            assert!(app.automatic_account(&current).is_none());
+        } else {
+            assert_eq!(
+                state.snapshot.as_ref(),
+                Some(&produced_snapshot),
+                "{case:?}"
+            );
+            assert_eq!(
+                state.identity.as_ref(),
+                produced_identity.as_ref().or(Some(&identity))
+            );
+            if signed_out {
+                assert!(app.automatic_account(&current).is_none());
+            } else {
+                assert_eq!(
+                    app.automatic_account(&current).unwrap().id(),
+                    id,
+                    "{case:?}"
+                );
+            }
+        }
+        let observed_at = if keep_live {
+            live_at
+        } else {
+            produced_snapshot.observed_at
+        };
+        assert!(!state.schedule.should_probe(
+            Trigger::Tick,
+            observed_at + schedule::REFRESH_INTERVAL - 1,
+            true
+        ));
+        assert!(state.schedule.should_probe(
+            Trigger::Tick,
+            observed_at + schedule::REFRESH_INTERVAL,
+            true
+        ));
+        let expected_catalog = if missing_catalog
+            || matches!(case, CollectedProbeCase::DelayedPastSlackWithNewerCatalog)
+        {
+            known_catalog
+        } else {
+            produced_catalog.expect("this case must publish its independently observed list")
+        };
+        assert_eq!(app.account_ui.catalog(provider), Some(&expected_catalog));
+        assert_eq!(app.account_ui.catalog(other_provider), Some(&other_catalog));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_collected_quota_does_not_rewind_newer_live_rejection() {
+        for case in [
+            CollectedProbeCase::Delayed,
+            CollectedProbeCase::DelayedPastSlackWithNewerCatalog,
+            CollectedProbeCase::Newer,
+            CollectedProbeCase::ClockRollback,
+            CollectedProbeCase::SignedOut,
+            CollectedProbeCase::MissingCatalog,
+        ] {
+            collected_quota_interleaving(Provider::Claude, case).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_collected_quota_does_not_rewind_newer_live_rejection() {
+        for case in [
+            CollectedProbeCase::Delayed,
+            CollectedProbeCase::DelayedPastSlackWithNewerCatalog,
+            CollectedProbeCase::Newer,
+            CollectedProbeCase::ClockRollback,
+            CollectedProbeCase::SignedOut,
+            CollectedProbeCase::MissingCatalog,
+        ] {
+            collected_quota_interleaving(Provider::Codex, case).await;
+        }
+    }
+
     fn claude_report(used: f64) -> LiveReport {
         LiveReport::Claude(
             account::claude::parse_rate_limit_event(&serde_json::json!({
