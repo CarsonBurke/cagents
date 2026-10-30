@@ -6566,6 +6566,7 @@ impl Cagents {
         );
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
         PullRequestPane {
             repository: view.repository.clone(),
             review: pull_request_review::State::new(
@@ -6900,7 +6901,13 @@ impl Cagents {
             self.worktree_owners.insert(card_id, scope);
         }
         self.register_channel_card(card_id);
-        let pane = self.pull_request_pane(&view);
+        let mut pane = self.pull_request_pane(&view);
+        pane.runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card_id).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         self.cards
             .insert(card_id, CardRuntime::PullRequests(Box::new(pane)));
         let index = self.workspace.cards().len();
@@ -7295,10 +7302,17 @@ impl Cagents {
         );
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
         if let Some(navigation) = self.durable.repository_navigation.get(&card) {
             runtime.restore_navigation(navigation);
         }
+        runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -7319,7 +7333,13 @@ impl Cagents {
             );
             return Task::none();
         }
-        let pane = self.pull_request_pane(&view);
+        let mut pane = self.pull_request_pane(&view);
+        pane.runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         self.cards
             .insert(card, CardRuntime::PullRequests(Box::new(pane)));
         self.open_pending_pull_request(card)
@@ -8982,6 +9002,18 @@ impl Cagents {
                 Some(CardRuntime::Chat(runtime)) => {
                     let _ = runtime
                         .set_visible(transition.to == VisibilityClass::Visible && surfaces_visible);
+                }
+                Some(CardRuntime::Repository(runtime)) => {
+                    tasks.push(repository_task(runtime.refresh_diff_visibility(
+                        transition.id,
+                        transition.to == VisibilityClass::Visible && surfaces_visible,
+                    )))
+                }
+                Some(CardRuntime::PullRequests(pane)) => {
+                    tasks.push(repository_task(pane.runtime.refresh_diff_visibility(
+                        transition.id,
+                        transition.to == VisibilityClass::Visible && surfaces_visible,
+                    )))
                 }
                 #[cfg(feature = "integrated-browser")]
                 Some(CardRuntime::Browser(browser)) => {
@@ -11228,8 +11260,13 @@ impl Cagents {
     /// told about while the application shows results for it.
     fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
         self.reconcile_completion_intent(card);
+        let visible = self.workspace_surfaces_visible()
+            && self.durable.cards.iter().any(|state| {
+                state.id == card && state.existence.is_open() && state.exposure == Exposure::Visible
+            });
         let (intents, edits, auto_save) = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => {
+                runtime.set_diff_surface_visible(visible);
                 let intents = runtime.take_lsp_intents();
                 // Strictly after `take_lsp_intents`, which is what materialises
                 // the `Change` these edits describe.
@@ -12257,7 +12294,8 @@ impl Cagents {
         self.notices.resolve(key);
     }
 
-    fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+    fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) -> Task<Message> {
+        let mut tasks = Vec::new();
         let visible_cards = self
             .durable
             .cards
@@ -12282,6 +12320,18 @@ impl Cagents {
                     Err(error) => Err(error.to_string()),
                 },
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
+                CardRuntime::Repository(runtime) => {
+                    tasks.push(repository_task(
+                        runtime.refresh_diff_visibility(*id, visible),
+                    ));
+                    Ok(())
+                }
+                CardRuntime::PullRequests(pane) => {
+                    tasks.push(repository_task(
+                        pane.runtime.refresh_diff_visibility(*id, visible),
+                    ));
+                    Ok(())
+                }
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
@@ -12290,8 +12340,6 @@ impl Cagents {
                 CardRuntime::Loading
                 | CardRuntime::Failed(_)
                 | CardRuntime::Completed
-                | CardRuntime::Repository(_)
-                | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
                 | CardRuntime::Accounts
                 | CardRuntime::Automations
@@ -12302,6 +12350,7 @@ impl Cagents {
             }
         }
         self.report_surface_visibility(failures);
+        Task::batch(tasks)
     }
 
     /// Reports the panes one visibility pass could not reach, each as
@@ -12602,11 +12651,12 @@ impl Cagents {
         let was_overlay = self.context_inspector_overlay_active;
         let is_overlay = self.context_inspector_is_overlay();
         self.context_inspector_overlay_active = is_overlay;
-        if was_overlay != is_overlay {
-            let visible = self.workspace_surfaces_visible();
-            self.set_workspace_surfaces_visible(visible);
-        }
-        match context_overlay_change(was_overlay, is_overlay) {
+        let visibility = if was_overlay != is_overlay {
+            self.set_workspace_surfaces_visible(self.workspace_surfaces_visible())
+        } else {
+            Task::none()
+        };
+        let focus = match context_overlay_change(was_overlay, is_overlay) {
             ContextOverlayChange::Entered => self.enter_context_overlay(),
             ContextOverlayChange::Exited
                 if !self.context_inspector_open || self.workspace.focused().is_none() =>
@@ -12625,7 +12675,8 @@ impl Cagents {
                 Task::none()
             }
             ContextOverlayChange::Unchanged => Task::none(),
-        }
+        };
+        Task::batch([visibility, focus])
     }
 
     fn set_context_inspector_open(&mut self, open: bool) -> Task<Message> {
@@ -13781,12 +13832,15 @@ impl Cagents {
         {
             let font = crate::terminal::monospace_font(self.settings.editor_font_family());
             let size = self.settings.editor_font_size();
-            for runtime in self.cards.values_mut() {
-                match runtime {
-                    CardRuntime::Repository(runtime) => runtime.set_editor_font(font, size),
-                    CardRuntime::PullRequests(pane) => pane.runtime.set_editor_font(font, size),
-                    _ => {}
-                }
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    _ => continue,
+                };
+                runtime.set_editor_font(font, size);
+                tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+                tasks.push(repository_task(runtime.restore_font_viewport()));
             }
         }
         if previous.editor_find_options != self.settings.editor_find_options
@@ -14447,6 +14501,25 @@ impl Application for Cagents {
         let (message, pane_origin) = match message {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
+        };
+        // Include the common postlude as well as repository dispatch. Layout,
+        // redraw and worker execution remain separate measurements.
+        let editor_performance = if cfg!(debug_assertions)
+            && tracing::enabled!(target: "cagents::editor_performance", tracing::Level::DEBUG)
+            && let Message::Repository(action) = &message
+        {
+            let kind = match action {
+                RepositoryAction::EditorAction {
+                    action: repository_widget::EditorAction::Edit(_),
+                    ..
+                } => Some("edit"),
+                RepositoryAction::WorkingDiffDue { .. } => Some("pause"),
+                RepositoryAction::WorkingDiffLoaded { .. } => Some("result"),
+                _ => None,
+            };
+            kind.map(|kind| (action.card(), kind, Instant::now()))
+        } else {
+            None
         };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
@@ -15212,6 +15285,30 @@ impl Application for Cagents {
                     self.open_file_in_editor(path, caret, editor_id)
                 })
             }
+            Message::Repository(RepositoryAction::RevertFile { identity, request }) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let card = identity.card;
+                let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                if !runtime.accepts_revert(&identity, &request) {
+                    return Task::none();
+                }
+                let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+                else {
+                    return Task::none();
+                };
+                self.update(Message::Sidebar(SidebarAction::RequestDiscard {
+                    key: source.key.clone(),
+                    request,
+                }))
+            }
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {
                     return Task::none();
@@ -15254,6 +15351,22 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::Review { card, action }) => {
                 self.handle_pull_request_review(card, action)
+            }
+            Message::Repository(RepositoryAction::ToggleDiffWhitespace { .. }) => {
+                self.settings.diff_ignore_whitespace = !self.settings.diff_ignore_whitespace;
+                let enabled = self.settings.diff_ignore_whitespace;
+                let mut tasks = Vec::new();
+                for (&card, runtime) in self.cards.iter_mut() {
+                    let runtime = match runtime {
+                        CardRuntime::Repository(runtime) => runtime,
+                        CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                        _ => continue,
+                    };
+                    runtime.set_diff_ignore_whitespace(enabled);
+                    tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+                }
+                tasks.push(self.save_settings_task(false));
+                Task::batch(tasks)
             }
             Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
                 self.update(Message::ZoomFont {
@@ -17507,6 +17620,28 @@ impl Application for Cagents {
                 if !captured && let Some(task) = self.chat_scroll_key(&event) {
                     return task;
                 }
+                if !captured
+                    && let keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        modifiers,
+                        ..
+                    } = &event
+                    && let Some(card) = self.workspace.focused()
+                    && match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => runtime.shows_diff(),
+                        Some(CardRuntime::PullRequests(pane)) => pane.runtime.shows_diff(),
+                        _ => false,
+                    }
+                    && let Some(delta) =
+                        crate::interaction::font_zoom_chord(key, *physical_key, *modifiers)
+                {
+                    return self.update(Message::ZoomFont {
+                        card,
+                        delta,
+                        editor: true,
+                    });
+                }
                 if is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
@@ -18110,6 +18245,11 @@ impl Application for Cagents {
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
+        if let Some((card, kind, started)) = editor_performance {
+            tracing::debug!(target: "cagents::editor_performance", %card, kind,
+                update_us = started.elapsed().as_secs_f64() * 1_000_000.0,
+                "repository owning-thread update");
+        }
         Task::batch([task, activation, visibility])
     }
 
@@ -28673,6 +28813,61 @@ mod tests {
     }
 
     #[test]
+    fn viewport_transitions_hide_and_reveal_diff_work_without_a_repository_action() {
+        use crate::workspace::VisibilityTransition;
+        let (mut app, card) = editing_repository_app();
+        for (from, to, expected) in [
+            (VisibilityClass::Visible, VisibilityClass::Overscan, false),
+            (VisibilityClass::Overscan, VisibilityClass::Offscreen, false),
+            (VisibilityClass::Offscreen, VisibilityClass::Visible, true),
+        ] {
+            drop(app.apply_viewport(
+                ViewportUpdate {
+                    offset_changed: false,
+                    transitions: vec![VisibilityTransition { id: card, from, to }],
+                },
+                false,
+                false,
+            ));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("repository fixture")
+            };
+            assert_eq!(runtime.diff_surface_is_visible(), expected);
+        }
+    }
+
+    #[test]
+    fn refresh_tick_preserves_diff_visibility_under_context_overlay() {
+        let (mut app, card) = editing_repository_app();
+        app.workspace.resize_viewport(1200.0);
+        app.refresh_ui.focused = true;
+
+        drop(app.update(Message::WindowResized(900.0, 900.0)));
+        assert!(app.context_inspector_is_overlay());
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible),
+            "the overlay covers a card still visible in the workspace strip"
+        );
+        let diff_visible = |app: &Cagents| {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("repository fixture")
+            };
+            runtime.diff_surface_is_visible()
+        };
+        assert!(!diff_visible(&app));
+
+        // Inspect synchronous scheduling state without polling any task: a
+        // catalog refresh must not reveal the surface hidden by the overlay.
+        drop(app.update_refresh(refresh_ui::Action::Tick));
+        assert!(!diff_visible(&app));
+
+        drop(app.update(Message::WindowResized(1600.0, 900.0)));
+        assert!(!app.context_inspector_is_overlay());
+        assert!(diff_visible(&app));
+    }
+
+    #[test]
     fn restored_editor_startup_focus_follows_the_loaded_surface() {
         let (mut app, pane) = editing_repository_app();
         let update = app.workspace.resize_viewport(1200.0);
@@ -31433,6 +31628,45 @@ mod tests {
                 &Message::Sidebar(action)
             ));
         }
+    }
+
+    #[test]
+    fn queued_revert_does_not_confirm_a_different_selected_file() {
+        let (mut app, card) = editing_repository_app();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "original\n");
+        let original = runtime.selected_revert_action(card).unwrap();
+        let key = ActiveWorktreeKey {
+            canonical_path: runtime.descriptor.worktree.clone(),
+            project_id: runtime.descriptor.project,
+            worktree_id: crate::model::WorktreeId::new(),
+        };
+        app.sidebar_model.source_control = Some(SourceControlModel::loading(key));
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+
+        // A later selection owns the same pane before this callback drains.
+        let (replacement, _) = RepositoryRuntime::open_fixture(card, "other.txt", "other\n");
+        let current = replacement.selected_revert_action(card).unwrap();
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(replacement)));
+        drop(app.update(Message::Repository(original)));
+        assert!(app.sidebar_state.pending_discard().is_none());
+        assert!(app.source_control_mutations.is_empty());
+
+        drop(app.update(Message::Repository(current)));
+        let pending = app
+            .sidebar_state
+            .pending_discard()
+            .expect("a fresh activation uses the existing confirmation");
+        assert_eq!(pending.request.tracked.len(), 1);
+        assert_eq!(
+            pending.request.tracked[0].path.as_path(),
+            Path::new("other.txt")
+        );
+        assert!(!pending.request.confirmed);
+        assert!(app.source_control_mutations.is_empty());
+        drop(app.update(Message::Sidebar(SidebarAction::CancelDiscard)));
+        assert!(app.sidebar_state.pending_discard().is_none());
     }
 
     #[test]
