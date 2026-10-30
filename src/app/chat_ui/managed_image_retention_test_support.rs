@@ -13,8 +13,18 @@ fn runtime(app: &Cagents, card: CardId) -> &Runtime {
 pub(in crate::app) fn insert_image_only(app: &mut Cagents, card: CardId, image: &Attachment) {
     let _admission = attachment_draft::test_admission();
     chat::attachment_assets::validate(image).unwrap();
-    let target = runtime(app, card).target;
-    assert!(runtime(app, card).accepts_draft_attachments());
+    let target = {
+        let runtime = runtime(app, card);
+        let handle = runtime.handle().expect("actual managed wire attachment");
+        assert!(handle.is_connected());
+        let snapshot = handle.snapshot();
+        assert!(snapshot.ready);
+        assert!(snapshot.capabilities.attachments);
+        assert!(runtime.snapshot.ready);
+        assert!(runtime.snapshot.capabilities.attachments);
+        assert!(runtime.accepts_draft_attachments());
+        runtime.target
+    };
     let ticket = app
         .chat_runtime_mut(target)
         .unwrap()

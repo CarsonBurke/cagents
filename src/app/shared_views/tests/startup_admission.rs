@@ -1173,6 +1173,23 @@ fn mixed_scope_verified_retirement_preserves_runtime_only_managed_images() {
                 assert!(app.chat_awaiting_admission(rejected.id));
                 assert!(daemon.requests().is_empty());
 
+                // Mount the measured composer before its real attachment:
+                // a hidden-first handle intentionally evicts its resident body.
+                let viewport = app.update(Message::Viewport {
+                    generation: app.workspace_view_generation,
+                    event: WorkspaceViewportEvent::Resized(1200.0),
+                });
+                settle(&mut app, viewport);
+                assert_eq!(app.workspace.viewport_width(), 1200.0);
+                assert_eq!(
+                    app.workspace.visibility(healthy.id),
+                    Some(VisibilityClass::Visible)
+                );
+                assert!(app.workspace_surfaces_visible());
+                assert!(app.chat_awaiting_admission(healthy.id));
+                assert!(app.chat_awaiting_admission(rejected.id));
+                assert!(daemon.requests().is_empty());
+
                 let mut view = View::empty(channel);
                 view.revision = 7;
                 view.panes = vec![healthy.clone(), rejected.clone()];
