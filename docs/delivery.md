@@ -36,6 +36,12 @@ of ungranted execution, and require a new exact candidate before qualifying an
 extraction. Give current workers explicit steering on their next useful task;
 do not restart them merely to refresh instructions.
 
+When reusing a completed native Codex worker, dispatch the prepared assignment
+through `followup_task`; `send_message` alone queues it without starting a turn.
+Use the documented task/resume operation for another harness. Confirm a
+task-specific response or produced artifact before calling the assignment
+applied. Keep message delivery, activation and completed work separate.
+
 Before feature fanout, obtain accepted ownership and capacity for independent
 review, compilation/tests, affected native interactions and release. A person
 may own several stages. A reservation must identify the existing lane or job,
