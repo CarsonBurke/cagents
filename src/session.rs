@@ -5786,6 +5786,236 @@ mod tests {
         );
     }
 
+    fn quarantine_replacement_workspace()
+    -> (WorkspaceState, crate::chat::Session, crate::chat::Session) {
+        let mut state = workspace();
+        let healthy = state.cards[0].clone();
+        let source = crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec!["--remote".into(), "unix:///private/source.sock".into()],
+                    working_directory: "/private/source".into(),
+                    environment: BTreeMap::new(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some(uuid::Uuid::new_v4().to_string()),
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "quarantine-source-host".into(),
+                boot_id: BootId::new("quarantine-replacement-boot"),
+                host_incarnation: "quarantine-source-incarnation".into(),
+            }),
+            terminal: None,
+        };
+        let mut replacement = source.clone();
+        replacement.launch.provider = crate::agent::Provider::Claude;
+        replacement.launch.recipe.program = "claude".into();
+        replacement.launch.recipe.arguments.clear();
+        replacement.launch.session_id = None;
+        replacement.proof = None;
+        assert!(replacement.is_unstarted());
+        state.cards[0].kind = CardKind::Chat(source.clone());
+        let mut healthy = healthy;
+        healthy.id = CardId::new();
+        state.focused = Some(healthy.id);
+        state.cards.push(healthy);
+        (state, source, replacement)
+    }
+
+    #[test]
+    fn a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("quarantine-rebase.sqlite3");
+            let boot = BootId::new("quarantine-replacement-boot");
+            let store = StateStore::open(&path, boot.clone()).unwrap();
+            let (mut stale, source, replacement) = quarantine_replacement_workspace();
+            let card = stale.cards[0].id;
+            let first = store
+                .save_workspace(
+                    &stale,
+                    SnapshotBase {
+                        workspace: 0,
+                        cards: &BTreeMap::new(),
+                    },
+                )
+                .unwrap();
+            let mut writes = PendingWrites::restored(
+                first.generation,
+                first.card_generations.clone(),
+                HashMap::new(),
+                HashMap::new(),
+            );
+            let peer = StateStore::open(&path, boot).unwrap();
+            peer.replace_chat_identity(card, source.id, &replacement)
+                .unwrap();
+            let mut current = stale.clone();
+            current.cards[0].kind = CardKind::Chat(replacement.clone());
+            current.cards[1].title = "peer sibling".into();
+            peer.save_workspace(
+                &current,
+                SnapshotBase {
+                    workspace: first.generation,
+                    cards: &first.card_generations,
+                },
+            )
+            .unwrap();
+            let committed = store.load_workspace(stale.id, None).unwrap().unwrap();
+            let generations = store.stored_generations(stale.id).unwrap();
+            stale
+                .quarantined_panes
+                .insert(card, CardKind::Chat(source.clone()));
+            stale
+                .chat_drafts
+                .insert(card, "the original rejected draft".into());
+            stale
+                .chat_draft_attachments
+                .insert(card, vec![image.clone()]);
+            stale.cards[1].title = "must not partly land".into();
+            let snapshot = Arc::new(stale);
+            writes.workspace = Some(Arc::clone(&snapshot));
+            let mut remaining = PERSIST_REBASES_PER_BATCH;
+            assert!(flush_rebasing_stale_bases(&mut writes, &store, &mut remaining).is_empty());
+            assert_eq!(remaining, 0, "the real stale generation was rebased");
+            for attempt in 0..3 {
+                if attempt != 0 {
+                    writes.rearm_quarantine();
+                    assert!(Arc::ptr_eq(writes.workspace.as_ref().unwrap(), &snapshot));
+                    assert!(writes.flush(&store).is_empty());
+                }
+                let (held, refused, _) = writes.quarantine.workspace.as_ref().unwrap();
+                assert_eq!(*refused, Some(card));
+                assert!(Arc::ptr_eq(held, &snapshot));
+                assert_eq!(held.cards[0].kind, CardKind::Chat(source.clone()));
+                assert_eq!(
+                    held.quarantined_panes[&card],
+                    CardKind::Chat(source.clone())
+                );
+                assert_eq!(held.chat_drafts[&card], "the original rejected draft");
+                assert_eq!(held.chat_draft_attachments[&card], [image.clone()]);
+                assert!(
+                    writes.quarantine.panes.is_none(),
+                    "an incoherent partial commit must not land"
+                );
+                assert_eq!(store.stored_generations(snapshot.id).unwrap(), generations);
+                assert_eq!(
+                    store.load_workspace(snapshot.id, None).unwrap().unwrap(),
+                    committed
+                );
+                crate::chat::attachment_assets::validate(&image).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("runtime-quarantine-rebase.sqlite3");
+            let boot = BootId::new("quarantine-replacement-boot");
+            let timeout = Duration::from_secs(5);
+            let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+            let health = runtime.health_receiver();
+            let (mut stale, source, replacement) = quarantine_replacement_workspace();
+            let card = stale.cards[0].id;
+            runtime.snapshot(Arc::new(stale.clone()));
+            runtime.flush(timeout).unwrap();
+            let peer = StateStore::open(&path, boot.clone()).unwrap();
+            let generations = peer.stored_generations(stale.id).unwrap();
+            peer.replace_chat_identity(card, source.id, &replacement)
+                .unwrap();
+            let mut current = stale.clone();
+            current.cards[0].kind = CardKind::Chat(replacement.clone());
+            current.cards[0].title = "new provider".into();
+            current.cards[1].title = "peer changes".into();
+            current.chat_drafts.insert(card, "peer draft".into());
+            let peer_image = crate::chat::attachment_assets::test_image("peer runtime draft");
+            current
+                .chat_draft_attachments
+                .insert(card, vec![peer_image]);
+            peer.save_workspace(
+                &current,
+                SnapshotBase {
+                    workspace: generations.workspace,
+                    cards: &generations.cards,
+                },
+            )
+            .unwrap();
+            let committed = peer.load_workspace(stale.id, None).unwrap().unwrap();
+            let committed_generations = peer.stored_generations(stale.id).unwrap();
+            assert!(peer.saved_conversations().unwrap().is_empty());
+            let inspect = || {
+                crate::persistence::read_open_migration_sessions_with_budget(
+                    &path,
+                    &mut crate::persistence::MigrationInspectionBudget::new(
+                        Instant::now() + timeout,
+                    ),
+                )
+                .unwrap()
+            };
+            let inventory = inspect();
+            stale
+                .quarantined_panes
+                .insert(card, CardKind::Chat(source.clone()));
+            stale
+                .chat_drafts
+                .insert(card, "unsent rejected draft".into());
+            stale
+                .chat_draft_attachments
+                .insert(card, vec![image.clone()]);
+            stale.cards[1].title = "a refused window must roll this back too".into();
+            let snapshot = Arc::new(stale);
+            runtime.snapshot(Arc::clone(&snapshot));
+            for attempt in 0..3 {
+                if attempt != 0 {
+                    assert!(runtime.retry_save());
+                }
+                let error = runtime.flush(timeout).unwrap_err();
+                assert!(error.contains("refused part of the window"), "{error}");
+                let refused = latest_health(&health);
+                assert_eq!(
+                    refused
+                        .quarantined
+                        .iter()
+                        .map(|write| &write.subject)
+                        .collect::<Vec<_>>(),
+                    vec![&WriteSubject::Workspace { card: Some(card) }]
+                );
+                assert_eq!(
+                    peer.stored_generations(snapshot.id).unwrap(),
+                    committed_generations
+                );
+                assert_eq!(
+                    peer.load_workspace(snapshot.id, None).unwrap().unwrap(),
+                    committed
+                );
+                assert!(peer.saved_conversations().unwrap().is_empty());
+                assert_eq!(inspect(), inventory);
+                crate::chat::attachment_assets::validate(&image).unwrap();
+            }
+            // A refused final window never earns a clean-shutdown receipt.
+            runtime.shutdown();
+            drop(peer);
+            let reopened = StateStore::open(&path, boot).unwrap();
+            assert!(reopened.recovery_report().dirty_shutdown);
+            assert_eq!(
+                reopened.load_workspace(snapshot.id, None).unwrap().unwrap(),
+                committed
+            );
+            assert_eq!(
+                reopened.load_card(card, None).unwrap().unwrap().kind,
+                CardKind::Chat(replacement)
+            );
+            assert!(reopened.saved_conversations().unwrap().is_empty());
+            assert_eq!(inspect(), inventory);
+        });
+    }
+
     #[test]
     fn ownership_recovery_unblocks_the_actual_update_flush_without_losing_unsaved_work() {
         let directory = tempdir().unwrap();

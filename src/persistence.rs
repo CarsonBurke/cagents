@@ -2900,7 +2900,7 @@ pub(crate) fn read_open_migration_sessions_with_budget(
                 } else {
                     None
                 };
-                if !quarantined_migration_source_matches(rejected, &session, restored_boot) {
+                if !quarantined_source_matches(rejected, &session, restored_boot) {
                     return Err(StoreError::InvalidState(
                         "A quarantined saved pane no longer matches its rejected source".into(),
                     ));
@@ -2934,8 +2934,7 @@ pub(crate) fn read_open_migration_sessions_with_budget(
 /// Restoring a terminal can discard its live continuity claim without changing
 /// the rejected source it preserves. Admit only those deterministic downgrades;
 /// the marker's original proof and every other descriptor field stay exact.
-#[cfg(any(feature = "host", test))]
-fn quarantined_migration_source_matches(
+fn quarantined_source_matches(
     rejected: &CardKind,
     saved: &CardKind,
     restored_boot: Option<&str>,
@@ -4185,6 +4184,8 @@ fn save_workspace_transaction(
     for (ordinal, card) in state.cards.iter().enumerate() {
         let expected = base.cards.get(&card.id).copied().unwrap_or(0);
         let stored = existing.get(&card.id);
+        let earlier_refusals = refused.len();
+        let mut preserved_source = false;
         let generation = if card.existence.is_open() && isolate_refused_cards {
             save_open_card(
                 transaction,
@@ -4217,8 +4218,22 @@ fn save_workspace_transaction(
                 timestamp,
                 refused_closures,
             )
+            .map(|(generation, preserved)| {
+                preserved_source = preserved;
+                generation
+            })
         }
         .map_err(|error| error.in_card(card.id))?;
+        if (preserved_source || refused.len() != earlier_refusals)
+            && let Some(rejected) = state.quarantined_panes.get(&card.id)
+        {
+            // Isolation keeps the stored descriptor, including a closed
+            // card's content fallback. Its rejection evidence must describe
+            // that effective row too; otherwise the metadata would make the
+            // next History or migration read refuse the whole saved window.
+            validate_preserved_quarantined_source(transaction, card.id, rejected)
+                .map_err(|error| error.in_card(card.id))?;
+        }
         card_generations.insert(card.id, generation);
     }
     // A refused card keeps what storage holds for it, which may be its
@@ -4257,6 +4272,92 @@ fn save_workspace_transaction(
         card_generations,
         refused,
     })
+}
+
+/// A refused card can keep its stored content only if the snapshot's durable
+/// rejection evidence still describes that content. Never rewrite either
+/// source to make an incoherent partial save fit: refuse the outer transaction.
+fn validate_preserved_quarantined_source(
+    transaction: &Transaction<'_>,
+    card: CardId,
+    rejected: &CardKind,
+) -> Result<()> {
+    let mismatch = || {
+        StoreError::InvalidState(
+            "A quarantined saved pane cannot keep content from a different rejected source".into(),
+        )
+    };
+    let row = transaction
+        .query_row(
+            "SELECT kind_tag,
+             CASE WHEN length(CAST(content_json AS BLOB)) <= 4194304 THEN content_json ELSE NULL END,
+             existence_json FROM cards WHERE card_id=?1",
+            [card.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((kind, content, existence)) = row else {
+        return Err(mismatch());
+    };
+    let kind = PersistedCardKind::parse(&kind)?;
+    if kind != card_kind(rejected) {
+        return Err(mismatch());
+    }
+    let payload = || content.as_deref().ok_or_else(mismatch);
+    let saved = match kind {
+        PersistedCardKind::Terminal
+            if content.is_some()
+                && !from_json::<Existence>("card existence", &existence)?.is_open() =>
+        {
+            CardKind::Terminal(from_json("archived terminal", payload()?)?)
+        }
+        PersistedCardKind::Terminal | PersistedCardKind::Chat => {
+            read_migration_session_at(transaction, card, kind.as_str(), content.as_deref())?
+        }
+        PersistedCardKind::Browser => CardKind::Browser(load_browser(transaction, card)?),
+        PersistedCardKind::PullRequests => {
+            CardKind::PullRequests(from_json("pull request card", payload()?)?)
+        }
+        PersistedCardKind::Repository => {
+            CardKind::Repository(from_json("repository card", payload()?)?)
+        }
+        PersistedCardKind::Settings => CardKind::Settings,
+        PersistedCardKind::Accounts => CardKind::Accounts,
+        PersistedCardKind::Automations => CardKind::Automations,
+        PersistedCardKind::Work => CardKind::Work,
+    };
+    let restored_boot = if rejected != &saved
+        && matches!(
+            &saved,
+            CardKind::Terminal(TerminalSession {
+                continuity: TerminalContinuity::RelaunchAvailable { .. },
+                ..
+            })
+        ) {
+        // A bounded local restore witness, with exactly the same meaning as
+        // in migration inspection. It grants no actor or resource authority.
+        transaction
+            .query_row(
+                "SELECT CASE WHEN length(CAST(value AS BLOB)) BETWEEN 1 AND 128 THEN value ELSE NULL END
+                 FROM metadata WHERE key='last_boot_id'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+    } else {
+        None
+    };
+    if !quarantined_source_matches(rejected, &saved, restored_boot.as_deref()) {
+        return Err(mismatch());
+    }
+    Ok(())
 }
 
 /// Writes a card the snapshot holds open.
@@ -4425,6 +4526,8 @@ fn save_card(
 /// The window goes on offering the card in every later snapshot. A refusal is
 /// therefore remembered in `refused_closures`, and the same content offered
 /// over the same row is neither written nor reported a second time.
+/// The returned flag identifies outcomes that preserve stored source content
+/// rather than writing the offered descriptor.
 #[allow(clippy::too_many_arguments)]
 fn save_closed_card(
     transaction: &Transaction<'_>,
@@ -4435,7 +4538,7 @@ fn save_closed_card(
     stored: Option<&ExistingCard>,
     timestamp: i64,
     refused_closures: &mut RefusedClosures,
-) -> Result<u64> {
+) -> Result<(u64, bool)> {
     if let Some(stored) = stored
         && stored.kind == PersistedCardKind::Terminal
         && transaction.query_row(
@@ -4454,12 +4557,13 @@ fn save_closed_card(
         // This tombstone's terminal is now owned by another open card. Keep
         // its archived historical descriptor; a stale snapshot must never
         // reclaim that live identity or erase the archive.
-        return tombstone_card(transaction, card.id, stored, &card.existence, timestamp);
+        return tombstone_card(transaction, card.id, stored, &card.existence, timestamp)
+            .map(|generation| (generation, true));
     }
     if let Some(refused) = refused_closures.get(&card.id)
         && refused.repeats(card, stored)
     {
-        return Ok(refused.generation);
+        return Ok((refused.generation, true));
     }
     transaction.execute_batch("SAVEPOINT closed_card")?;
     let written = save_card(
@@ -4496,14 +4600,14 @@ fn save_closed_card(
                     generation,
                 },
             );
-            Ok(generation)
+            Ok((generation, true))
         }
         written => {
             transaction.execute_batch("RELEASE closed_card")?;
             if written.is_ok() {
                 refused_closures.remove(&card.id);
             }
-            written
+            written.map(|generation| (generation, false))
         }
     }
 }
@@ -10590,6 +10694,256 @@ mod tests {
             store.load_card(card, None).unwrap().unwrap().existence,
             Existence::Closed { .. }
         ));
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            for closing in [false, true] {
+                let directory = tempdir().unwrap();
+                let database = directory.path().join("replacement-quarantine.sqlite3");
+                let first = StateStore::open(&database, boot("chat-boot")).unwrap();
+                let (mut stale, mut source) = agent_workspace(crate::agent::Provider::Codex);
+                source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+                source.terminal = None;
+                stale.cards[0].kind = CardKind::Chat(source.clone());
+                let mut healthy = workspace_with_terminal(&boot("chat-boot")).cards.remove(0);
+                healthy.title = "initial sibling".into();
+                let (card, sibling) = (stale.cards[0].id, healthy.id);
+                stale.cards.push(healthy);
+                let mut first_lane = SaveLane::default();
+                first_lane.save(&first, &stale).unwrap();
+
+                // A supported same-card, same-session-ID provider replacement,
+                // followed by that writer's coherent full snapshot.
+                let peer = StateStore::open(&database, boot("chat-boot")).unwrap();
+                let mut replacement = source.clone();
+                replacement.launch.provider = crate::agent::Provider::Claude;
+                replacement.launch.recipe.program = "claude".into();
+                replacement.launch.recipe.arguments.clear();
+                replacement.launch.session_id = None;
+                replacement.proof = None;
+                assert!(replacement.is_unstarted());
+                assert_eq!(replacement.id, source.id);
+                peer.replace_chat_identity(card, source.id, &replacement)
+                    .unwrap();
+                let mut current = stale.clone();
+                current.cards[0].kind = CardKind::Chat(replacement.clone());
+                current.cards[0].title = "replacement".into();
+                current.cards[1].title = "peer sibling".into();
+                current.chat_drafts.insert(card, "peer draft".into());
+                let peer_image = crate::chat::attachment_assets::test_image("peer draft");
+                current
+                    .chat_draft_attachments
+                    .insert(card, vec![peer_image]);
+                current.workspace_model_identity = Some(uuid::Uuid::new_v4());
+                let mut peer_lane = SaveLane {
+                    workspace: first_lane.workspace,
+                    cards: first_lane.cards.clone(),
+                };
+                peer_lane.save(&peer, &current).unwrap();
+                let committed = peer.load_workspace(current.id, None).unwrap().unwrap();
+                assert!(peer.saved_conversations().unwrap().is_empty());
+                let migration = read_open_migration_sessions(&database).unwrap();
+
+                stale
+                    .quarantined_panes
+                    .insert(card, CardKind::Chat(source.clone()));
+                stale
+                    .chat_drafts
+                    .insert(card, "original rejected draft".into());
+                stale
+                    .chat_draft_attachments
+                    .insert(card, vec![image.clone()]);
+                stale.cards[1].title = "must roll back with the metadata".into();
+                stale.workspace_model_identity = Some(uuid::Uuid::new_v4());
+                if closing {
+                    stale.cards[0].existence = closed_by_user();
+                    stale.local_only_cards.insert(card);
+                    stale.focused = Some(sibling);
+                }
+                assert!(matches!(
+                    first_lane.save(&first, &stale),
+                    Err(StoreError::StaleGeneration { .. })
+                ));
+                let rebased = first.stored_generations(stale.id).unwrap();
+                first_lane.workspace = rebased.workspace;
+                first_lane.cards.clone_from(&rebased.cards);
+                for _ in 0..2 {
+                    let error = first_lane.save(&first, &stale).unwrap_err();
+                    assert!(
+                        matches!(
+                            &error,
+                            StoreError::Card { card: refused, error }
+                                if *refused == card && error.refuses_content()
+                                    && error.to_string().contains("different rejected source")
+                        ),
+                        "{error:?}"
+                    );
+                    assert_eq!(first.stored_generations(stale.id).unwrap(), rebased);
+                    assert_eq!(
+                        first.load_workspace(stale.id, None).unwrap().unwrap(),
+                        committed
+                    );
+                    assert!(first.saved_conversations().unwrap().is_empty());
+                    assert_eq!(read_open_migration_sessions(&database).unwrap(), migration);
+                    assert_eq!(stale.cards[0].kind, CardKind::Chat(source.clone()));
+                    assert_eq!(
+                        stale.quarantined_panes[&card],
+                        CardKind::Chat(source.clone())
+                    );
+                    assert_eq!(stale.chat_drafts[&card], "original rejected draft");
+                    assert_eq!(stale.chat_draft_attachments[&card], [image.clone()]);
+                    crate::chat::attachment_assets::validate(&image).unwrap();
+                }
+                drop(first);
+                drop(peer);
+                let reopened = StateStore::open(&database, boot("chat-boot")).unwrap();
+                assert_eq!(
+                    reopened.load_workspace(stale.id, None).unwrap().unwrap(),
+                    committed
+                );
+                assert_eq!(
+                    reopened.load_card(card, None).unwrap().unwrap().kind,
+                    CardKind::Chat(replacement)
+                );
+                assert!(reopened.saved_conversations().unwrap().is_empty());
+                assert_eq!(read_open_migration_sessions(&database).unwrap(), migration);
+            }
+        });
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn coherent_quarantine_still_isolates_refused_content_and_closed_tombstones() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let directory = tempdir().unwrap();
+            let database = directory.path().join("coherent-quarantine.sqlite3");
+            let store = StateStore::open(&database, boot("chat-boot")).unwrap();
+            let (mut state, mut source) = agent_workspace(crate::agent::Provider::Codex);
+            source.proof = source.terminal.as_ref().unwrap().continuity.live_proof();
+            source.terminal = None;
+            let card = state.cards[0].id;
+            state.cards[0].kind = CardKind::Chat(source.clone());
+            state
+                .quarantined_panes
+                .insert(card, CardKind::Chat(source.clone()));
+            state
+                .chat_draft_attachments
+                .insert(card, vec![image.clone()]);
+            let healthy = workspace_with_terminal(&boot("chat-boot")).cards.remove(0);
+            let sibling = healthy.id;
+            state.cards.push(healthy);
+            state.focused = Some(sibling);
+            let mut lane = SaveLane::default();
+            lane.save(&store, &state).unwrap();
+
+            let CardKind::Chat(offered) = &mut state.cards[0].kind else {
+                unreachable!()
+            };
+            offered.id = TerminalId::new();
+            state.cards[1].title = "saved beside a refused quarantine".into();
+            state.chat_drafts.insert(card, "retained draft".into());
+            let commit = lane.save(&store, &state).unwrap();
+            assert!(
+                matches!(commit.refused.as_slice(), [StoreError::Card { card: refused, .. }] if *refused == card)
+            );
+            let saved = store.load_workspace(state.id, None).unwrap().unwrap();
+            assert_eq!(saved.cards[0].kind, CardKind::Chat(source.clone()));
+            assert_eq!(saved.cards[1].title, state.cards[1].title);
+            assert_eq!(saved.chat_drafts, state.chat_drafts);
+            assert_eq!(saved.chat_draft_attachments, state.chat_draft_attachments);
+            let inventory = read_open_migration_sessions(&database).unwrap();
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(inventory[0].0, sibling);
+            assert!(store.saved_conversations().unwrap()[0].quarantined);
+
+            // Final refused content keeps the exact stored source while the
+            // local dismissal's tombstone and healthy edits still commit.
+            state.cards[0].existence = closed_by_user();
+            state.local_only_cards.insert(card);
+            for title in ["closed fallback", "repeated closed fallback"] {
+                state.cards[1].title = title.into();
+                let commit = lane.save(&store, &state).unwrap();
+                assert!(commit.refused.is_empty());
+                let saved = store.load_workspace(state.id, None).unwrap().unwrap();
+                assert!(!saved.cards[0].existence.is_open());
+                assert_eq!(saved.cards[0].kind, CardKind::Chat(source.clone()));
+                assert_eq!(saved.quarantined_panes, state.quarantined_panes);
+                assert_eq!(saved.chat_drafts, state.chat_drafts);
+                assert_eq!(saved.chat_draft_attachments, state.chat_draft_attachments);
+                assert_eq!(saved.cards[1].title, title);
+                assert_eq!(read_open_migration_sessions(&database).unwrap().len(), 1);
+                let history = store.saved_conversations().unwrap();
+                assert!(history[0].quarantined && !history[0].open);
+            }
+            crate::chat::attachment_assets::validate(&image).unwrap();
+        });
+    }
+
+    #[test]
+    fn restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals() {
+        for rebooted in [false, true] {
+            let directory = tempdir().unwrap();
+            let database = directory
+                .path()
+                .join("restored-quarantine-isolation.sqlite3");
+            let original_boot = boot("original-quarantine-boot");
+            let mut state = workspace_with_terminal(&original_boot);
+            let card = state.cards[0].id;
+            let rejected = state.cards[0].kind.clone();
+            state.quarantined_panes.insert(card, rejected.clone());
+            let mut healthy = workspace_with_terminal(&original_boot).cards.remove(0);
+            healthy.title = "healthy".into();
+            let sibling = healthy.id;
+            state.cards.push(healthy);
+            state.focused = Some(sibling);
+            {
+                let store = StateStore::open(&database, original_boot.clone()).unwrap();
+                SaveLane::default().save(&store, &state).unwrap();
+                store.shutdown().unwrap();
+            }
+            let current_boot = if rebooted {
+                boot("next-quarantine-boot")
+            } else {
+                original_boot
+            };
+            let store = StateStore::open(&database, current_boot).unwrap();
+            let mut state = store.load_workspace(state.id, None).unwrap().unwrap();
+            let normalized = state.cards[0].kind.clone();
+            assert_ne!(normalized, rejected);
+            let mut lane = SaveLane {
+                workspace: state.generation,
+                cards: state
+                    .cards
+                    .iter()
+                    .map(|card| (card.id, card.generation))
+                    .collect(),
+            };
+            // Persist the real restore downgrade, then offer a different ID
+            // without a relaunch; only its original stored source may remain.
+            lane.save(&store, &state).unwrap();
+            let CardKind::Terminal(offered) = &mut state.cards[0].kind else {
+                unreachable!()
+            };
+            offered.id = TerminalId::new();
+            state.cards[1].title = "saved around the normalized quarantine".into();
+            let commit = lane.save(&store, &state).unwrap();
+            assert!(
+                matches!(commit.refused.as_slice(), [StoreError::Card { card: refused, .. }] if *refused == card)
+            );
+            state.cards[0].existence = closed_by_user();
+            lane.save(&store, &state).unwrap();
+            let saved = store.load_workspace(state.id, None).unwrap().unwrap();
+            assert_eq!(saved.cards[0].kind, normalized);
+            assert!(!saved.cards[0].existence.is_open());
+            assert_eq!(saved.quarantined_panes[&card], rejected);
+            assert_eq!(saved.cards[1].title, state.cards[1].title);
+            let inventory = read_open_migration_sessions(&database).unwrap();
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(inventory[0].0, sibling);
+        }
     }
 
     /// A new Codex thread asks for a listener of its own with a bare
