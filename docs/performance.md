@@ -1,9 +1,13 @@
 # Performance measurements
 
 - [Redraw scheduling](#redraw-scheduling)
+- [Activity spinner cost](#activity-spinner-cost)
+- [Native chat stage attribution](#native-chat-stage-attribution)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
 - [Terminal search](#terminal-search)
+- [Busy terminals and the update tail](#busy-terminals-and-the-update-tail)
+- [Native chat viewport](#native-chat-viewport)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -48,6 +52,123 @@ in-process terminal scroll workload (no compositor, daemon, or release build).
 It reports what one viewport scroll command costs, and so what applying one
 coalesced move per frame saves over applying every wheel notch.
 
+## Activity spinner cost
+
+Each visible activity spinner asks for a whole-window redraw every
+`SPINNER_FRAME` (100 ms, `src/ui_controls/gauge.rs`) while the main window is
+focused. An unfocused window may still be in view, so its spinners keep turning,
+but slower: they ask for a frame every `SPINNER_BACKGROUND_FRAME` (500 ms) and
+advance one focused step per frame. Measure the UI process with one busy agent
+on screen:
+
+1. Run `scripts/run-development --browserless` without `--debug` in a nested
+   session, using the isolated environment from
+   [chat-composer-fixture.md](chat-composer-fixture.md). The fixture's first
+   turn stays busy, so its channel shows sidebar, tab and footer spinners
+   without a real model.
+2. Open the busy channel, leave the pointer still, and read `utime + stime`
+   from `/proc/<ui-pid>/stat` across a 20 s interval. Also read the main
+   thread's `voluntary_ctxt_switches` from `/proc/<ui-pid>/task/<ui-pid>/status`.
+3. Repeat with another window focused, then with the agent interrupted for the
+   idle floor.
+
+Local reference: Ryzen 7 7840HS, Radeon RX 7600S, `dev-runtime` build, nested
+niri 26.04 inside a headless KWin 6.4 virtual output, 1596x929, scale 1.0.
+Each row reports 20 s samples, as a percentage of one core:
+
+| State | Before (`c07b6f78e`) | After |
+| --- | --- | --- |
+| One busy agent, window focused | 11.1-12.6% (73-86 wakeups/s) | 4.1-4.2% (30-34 wakeups/s) |
+| One busy agent, another window focused | 9.1-9.5% (79 wakeups/s) | 1.15-1.25% (5-6 wakeups/s) |
+| Agent interrupted, window focused | not measured | 1.6% (7 wakeups/s) |
+
+Two changes produced the focused result. At the 100 ms cadence alone, the UI
+still used 11.8% of a core because Iced's event loop kept a deadline that had
+already elapsed. After a redraw scheduled a later deadline, the event loop
+polled with a zero timeout until that deadline arrived (about 630
+`epoll_pwait` calls per second). The vendored `iced-winit` now replaces an
+elapsed deadline with the requested one; see `vendor/iced-winit/README.cagents.md`.
+Each remaining step still repaints the whole window, which is why a busy
+agent still costs about 3% of a core above idle in this build. Slowing
+unfocused spinners instead of stopping them costs little: an earlier revision
+that stopped them entirely measured 1.0-1.6% with another window focused
+(3 wakeups/s).
+
+## Native chat stage attribution
+
+Development UI builds can record bounded, content-free **inclusive wall time**
+for selected chat stages. Set `CAGENTS_CHAT_STAGE_OUTPUT` before startup to a
+fresh absolute filename in an existing directory owned by the effective user
+with mode `0700`. Use a dedicated private fixture and the normal development
+runner; the variable does not grant a build or native testing slot. The runner
+selects the `development` feature explicitly, including in `dev-runtime`;
+`debug_assertions` does not control this recorder. Ordinary builds ignore the
+variable and compile the recording path out. Development builds with the variable
+unset keep an inert hot path with no clock read or allocation.
+
+Startup reads the setting once and retains the private parent directory FD.
+Normal application close writes an exclusive `0600` file relative to that FD,
+without replacing an existing file or following a leaf symlink. A later rename
+of the parent does not redirect output to a replacement directory. Output is
+not written from `Drop`, per frame, or by a timer. A failed or abnormal close
+can leave no report or a partial report; do not interpret it as zero work.
+
+Schema `1`, clock `1` means Linux `CLOCK_MONOTONIC` nanoseconds. The report has
+fixed stage indices, numeric counts and timing fields; it contains no chat text,
+paths, entity IDs or event payloads:
+
+| Index | Stage | Measured caller |
+| --- | --- | --- |
+| 0 | Refresh | `Runtime::refresh`, including its early returns |
+| 1 | Parent preparation | Parent `prepare_items` in refresh |
+| 2 | Child preparation | `prepare_child_cache`, including empty selection |
+| 3 | Parse | Markdown source advance and content append/restart |
+| 4 | Highlight | Fence scan and syntax-block update |
+| 5 | Turn build | Actual `turn_rows` construction, including retained cache misses |
+| 6 | Shape | Cold selectable-prose `ParagraphBuffer::with_spans` |
+| 7 | Retained clone | Cached layout `Node::clone` on a retained layout hit |
+
+These hooks cover named synchronous stages, not every text renderer, widget
+layout, event, GPU operation or application task. A quiet cache hit can have no
+turn construction or shaping calls. Missing stage time is not evidence that the
+remaining work costs nothing.
+
+The recorder retains at most 1024 one-second buckets relative to
+`origin_monotonic_ns`. Elapsed spans are split by overlap across bucket
+boundaries, with a loop bounded by that capacity. Started and ended endpoints
+belong to their own half-open buckets. `crossing_calls` marks a span touching a
+bucket without being wholly contained in it; an endpoint at the right boundary
+belongs to the next bucket. Per-bucket maxima describe overlap in that bucket;
+summary maxima describe whole calls. Summary counts, wall time, clock failures
+and outside-horizon values saturate. Unmatched endpoints or failed clocks must
+remain visible in analysis.
+
+Join complete bucket ranges to the fixture's actual emission timestamps and
+the sampler's actual read timestamps. Do not assign an entire cross-boundary
+span to its finishing bucket. Nested stages overlap: refresh includes parsing
+and highlighting. Their totals are not exclusive
+time and cannot be summed into CPU utilization. Wall time includes scheduler
+delay; these are not on-CPU stacks, input latency or presentation timestamps.
+
+Before claiming a CPU improvement, compare fresh identical-corpus cases using
+the same optimized instrumentable binary with the variable unset and set.
+Keep source, provider rate, selected scope, focus preparation, observer actions
+and process identity receipts fixed. Record sampler overhead and ambient
+pressure; repeat controls separately when needed to measure variance. Source
+tests and headless `frame_cost` workloads do not replace native measurements,
+selection/Copy/accessibility validation, or complete history preservation.
+
+The focused recorder tests require the UI lane; include `development` for
+output-custody tests:
+
+```sh
+cargo test --locked --no-default-features --features development,ui --lib performance::chat_stage::recording::tests
+```
+
+Run builds and tests only through the repository's serialized admission process.
+This command is a test reference, not an automatic workload or a current
+performance qualification.
+
 ## Pane open
 
 ```sh
@@ -78,6 +199,23 @@ worktree, alternating baseline and change:
 These are scheduling timestamps from one process, not presentation times.
 
 ## Terminal pipeline
+
+The daemon delivers live and completed terminals' semantic events on one shared
+`terminal-event-notify` thread. Registering a terminal replays its startup events
+before later metadata and completion events; callbacks never run under the
+publishing worker's locks. This removes the per-terminal `cagentsd-events-*`
+monitor. Holder-control reports also use one `terminal-io` reactor thread.
+Each watcher retains its authenticated original socket and root pidfd; a partial
+frame or idle holder cannot block other watchers. Reads use per-call
+`MSG_DONTWAIT`, preserving the control writer's blocking descriptor flags.
+PTY parsing, PTY readers, and UI socket transport still have separate thread
+costs; these changes alone do not meet a total idle-plus-one-thread-per-terminal
+budget.
+
+For multi-terminal memory comparisons, report daemon and UI RSS separately
+and use PSS for holder processes: their executable mappings are shared, so
+summing holder RSS counts those shared pages repeatedly. Record thread counts
+alongside RSS/PSS and input p99 on the same workload and build profile.
 
 ```sh
 scripts/benchmark-terminal all
@@ -179,6 +317,239 @@ ASCII ingestion with the same benchmark fixtures; its bulk-append benchmark
 helper delegates to the original character-by-character implementation.
 The two additional Unicode-miss guard workloads have optimized samples only
 in this reference; no before/after claim is made for those cases.
+
+## Busy terminals and the update tail
+
+After most messages, `Cagents::update` runs a tail of whole-workspace
+projection: sidebar channels and worktree panes, worktree protections,
+selection, source control, transcript probes and chrome. Terminal wakes that
+change no metadata, and repaint-only ticks (`ChatUi` ticks and, in the
+integrated build, browser progress ticks), now skip it. A wake whose only
+change is a reported terminal title (OSC 0/2) runs only chrome, which includes
+the window title. Reported titles on their own cause at most one save, and
+one publication to shared views, every three seconds. The unit tests in `src/app/terminal_output_tests.rs`
+count the tail passes, chrome syncs and saves each message causes.
+
+The native workload has no script. In the browserless development runner,
+inside a nested niri session with fresh private HOME and XDG directories, open
+20 terminals with Ctrl+Shift+T. Then use `cagents terminal write` to start one
+of these in every terminal:
+
+- Title churn: `bash -c 'i=0; while :; do printf "\033]0;build step %d\007" $((i++)); sleep 0.1; done'`
+  (20 terminals, 10 titles per second each).
+- Streaming: `bash -c 'while :; do yes cagents-N | head -c 200M; done'`.
+
+After five seconds, sample `utime+stime` from `/proc/<ui>/task/<ui>/stat`
+(UI main thread), `/proc/<ui>/stat` (UI process) and the matched `cagentsd`
+over 20-second windows.
+
+Local reference on a Ryzen 7 7840HS, `dev-runtime`, `c07b6f78e` (before)
+against the #1103 branch (after). Each build had one fresh run with two
+windows per workload. The host was shared with other builds, with a load
+average of 35 to 45, so treat the differences as indicative only.
+
+| Workload | Main thread before | Main thread after | Daemon before | Daemon after |
+| --- | --- | --- | --- | --- |
+| Idle, 20 terminals | 0.4% | 0.2% | 0.1% | 0.2% |
+| Title churn | 83.7%, 80.9% | 53.7%, 53.2% | 43.7%, 42.8% | 34.6%, 33.4% |
+| Streaming | 15.5%, 14.8% | 17.4%, 14.8% | 423%, 420% | 443%, 418% |
+
+Streaming output already took the metadata-unchanged fast path before this
+change, so it is unchanged. Its main-thread profile is terminal widget
+resolution, layout, accessibility projection and allocation. After the change,
+the remaining title-churn time is mostly the same view, layout and render work
+that each title causes; `sync_chrome` is about 0.2% of samples.
+
+## Native chat viewport
+
+Run the headless viewport contract with optimized application code, separately
+from native application measurements:
+
+```sh
+CARGO_BUILD_JOBS=2 cargo test --locked --no-default-features --features ui \
+  --profile dev-runtime --config 'profile.dev-runtime.opt-level=2' \
+  --config 'profile.dev-runtime.debug-assertions=false' --lib \
+  chat_ui::view::frame_cost::viewport_cost_with_a_megabyte_answer_and_three_hundred_tools \
+  -- --ignored --nocapture --test-threads=1
+```
+
+The workload compares a 16 KiB answer with ten tool rows against single 1 MiB
+paragraph, many-paragraph and fenced-code answers with 300 tool rows, at a fixed
+viewport. It warms the real pane/composer, then records refresh separately from
+view, native widget layout, pointer update, headless draw and widget/cache
+disposal CPU time. The event total includes those latter stages. Its median must
+be at most 2 ms and at most twice the small workload. These are explicit test
+budgets, not claims of achieved results. The test excludes GPU submission and
+compositor presentation. Run the neighboring long-streaming workloads separately
+for a busy parent and a selected running child whose parent is idle. Streaming
+fixtures apply validated `Presentation` deltas and record append lineage. They
+complete and verify each current rendered publication before sampling its steady
+frame, and separately report synchronous fixture wall time for refresh, the owned
+parser engine, installation and geometry settling. This phase is diagnostic work
+attribution, not native worker scheduling/input latency. An unconsumed new source
+or a Loading placeholder cannot count as the rendered streaming workload. Native
+80-delta/second input and completion timing must be measured separately.
+
+A native comparison must use the same scripted provider, workload text, pane
+geometry and build profile on both revisions. Record the exact commit and dirty
+state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
+raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
+40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
+the 1 MiB answer has a 150 MB RSS growth budget; after switching away, the UI
+must return within 30 MB of its prior baseline. Repeat hide/reveal and close
+cycles, including Hide tab. Use the isolated development runner described in
+[development.md](development.md), preserving existing sessions.
+
+Full-context shaping holds one output permit through UI consumption; queued
+completion messages do not release it. Accepted installation releases the permit
+while the visible paragraph keeps its geometry. Discarded results retain the
+permit through background disposal. Parser and shaper workers wait for earlier
+retirement before allocating another generation. A hide can retire its existing
+active graph as one batch; this bounds generation amplification, not total live
+glyph storage or process RSS. Optional `cagents::memory=trace` includes pending
+retirement item counts for native visit/hide qualification. Actual permit release
+also publishes one coalesced availability event; visible deferred readers retry
+without depending on unrelated input, provider output, or another redraw. Parser
+disposal checks continuation/reference allocations even when the document has no
+rendered items. The selected growing source retains its Markdown parser
+continuation across verified appends. A changed fence rebuilds its syntax
+palettes on the worker; only unchanged matching fences share prepared palettes.
+Worker placement does not establish acceptable streaming CPU or input latency;
+those costs remain part of native qualification.
+
+Nested reader bookmarks retain a byte length and full source digest, alongside
+geometry and the exact logical reader identity. After hiding releases bodies,
+the admitted parser worker verifies that exact prefix in the authoritative new
+code/tool source, including its partial final hash chunk. Only the matching
+context/reader bookmark advances to the verified new digest. Inputs and outputs
+are bounded by the existing 1,024 bookmark entries; unbookmarked sources need no
+extra verification pass. No source bytes or acceptance graph remain hidden.
+Changed tools with exact remembered reader paths use the same admitted worker
+even while collapsed. Reopening preserves pending verification; installation
+uses the current disclosure state. The worker also builds immutable tool text
+and source descriptors, shared through visible collapse/reopen instead of
+rehashing/copying the full body during UI installation. Hiding evicts these
+body owners with the rest of the cache. A rewrite cannot overwrite a valid
+bookmark before verification.
+
+Literal user messages use the same admitted preparation engine without Markdown
+interpretation. The worker prepares their full text, legacy collapsed preview
+and selection checkpoints. Cold views show a bounded preview until the exact
+current source is ready. A queued first message moves its canonical string into
+an immutable local source and retains the same source reservation through its
+final raw destruction, including cancellation before a subscription starts.
+Compact local follow-ups prepare their preview at explicit submission. Provider
+queue previews reuse immutable records across unrelated publications; changed
+records are copied only within the existing 128-message, 16 KiB source-preview
+limits, with the existing truncation marker appended. Comparing those bounded
+sources on a changed snapshot remains UI work.
+Copy resolves the exact current record at explicit intent and preserves raw
+bytes independently of its displayed preview.
+
+Search results, Notice bodies and Image descriptions/paths use the same admitted
+literal preparation boundary. Stable logical readers preserve their displayed
+text for selection and Find without interpreting it as Markdown. Search fields
+share prepared document storage; long Notice previews preserve the existing
+three-line policy. Ready values must match the current canonical item before
+installation, and rejected or evicted payloads use the existing reclaimer.
+
+Find Next/Previous retains its existing matching-turn/item counts and temporary
+disclosure ownership. Raw group discovery, provider-aware disclosure plans,
+rendered-block lookup and lazy visible Flow highlights share one try-admitted
+worker. A fixed aggregate small-input path handles tiny searches synchronously.
+Unicode query folding and its matcher table are shared across phases. Large
+sources are scanned on the worker, with cancellation checked inside both query
+preparation and source matching. Highlights bind the exact painted ready source;
+their existing 4,096-range limit applies to each block. Output reservations stay
+with painted range owners, including retained widget clones.
+Retained Flow widgets read current marks against the exact ready prefix they
+paint, so an asynchronous completion does not require rebuilding the element.
+A late per-block limit notice appears below the text without moving its glyph
+origin. Accepted query contexts carry a separate render revision when their
+exact tool-disclosure bindings change; unrelated publications reuse it.
+
+Link destinations share immutable storage through parser output, native spans,
+hit testing and reader actions. Rendering does not clone a long URL just because
+its displayed label is short. Resolving a clicked destination remains explicit
+UI work and preserves its complete destination.
+
+Every normal raw outcome, including failure, retains the same admission through
+message consumption or background disposal. Query and attempt epochs reject old
+errors before they can change a newer search. Metadata pressure retires displaced
+plans and waits for actual metadata capacity release, independently of worker-slot
+wakes. Pending searches and failed searches have distinct visible states; failure
+does not masquerade as a successful zero-match result. Exact unchanged groups can
+remain available during unrelated streamed publications while changed groups
+await current indexing.
+
+Each selected group is resolved to its first matching rendered logical block and
+UTF-8 byte. Navigation
+then realizes cheap offscreen descriptors, mounted chunks and actual ready glyph
+geometry, including horizontal readers. One initial coarse realization may be
+needed while matching worker geometry is pending; it belongs to the intent's
+maximum sixteen actual coordinate corrections and absolute thirty-second
+deadline. Waiting for that geometry does not consume further corrections,
+including across verified source publications or unrelated completion wakes.
+Parser and shape completions wake pending geometry without a timer subscription.
+Matching metadata without rendered plaintext keeps the coarse group anchor.
+Loading is never an exact glyph match.
+Independent intent and rendered-document epochs guard both async replies and
+the eventual native scroll mutation. Query/context/disclosure/hide changes and
+native wheel, thumb, selection drag, touch, resize and keyboard navigation revoke
+queued corrections. A Find scroll does not masquerade as new user input.
+
+The final owners of parser requests, canonical continuations and logical
+selection catalogs transfer their raw allocations to the same reclaimer. This
+also covers subscriptions and retained widgets that outlive cache eviction.
+Canceled and discarded work releases reservations after its actual owned payloads.
+Independent native widget/read clones still contribute to measured event and
+cache-disposal costs; this is not a guarantee that every UI allocation frees on
+the reclaimer.
+
+The pane inspector's diagnostics disclose known source, prepared-presentation
+and logical-selection payload owners for the selected chat. These counters
+exclude opaque parser/font/renderer/image allocations and allocator retention;
+they are not RSS or a complete heap estimate. Use process measurements to verify
+residency budgets rather than inferring them from logical byte counts.
+
+Transcript row factories share one UI-local immutable AST root per parser
+publication, using index paths for quotes, lists and table cells. Ordinary
+publications clone that graph once on the parser worker; the unchanged
+inline/code text backing is shared. This removes recursive factory clones
+during view rebuilding. Final raw graph disposal runs on the persistent
+reclaimer even when retained widgets outlive the cache. Raw graphs in rejected
+output are dropped inside the existing retirement batch before its admission
+permit and FIFO barrier. Coordination recognition and all rich prompt, brief
+and result parts use the same provider-aware admitted parser worker; the UI
+detects preparation candidates from bounded item metadata. Exact-source
+disclosure changes reuse those parts and their palettes. Canonical coordination
+graphs and recognition
+metadata also retire off the UI thread. Process measurements must include the
+extra publication graph containers. The worker also prepares aggregate subtree
+sizes, code line counts and row estimates. A recursive tree of short quote/list
+children cannot opt into a dense column merely because each immediate list is
+small. Rows share slices of one flat logical outline. Binding that outline to
+an item/root namespace first visits logical metadata on the UI thread; later
+views reuse the binding. Virtual column geometry/index rebuilding still visits
+its aliases on a revision change. These costs are not claimed constant-time or
+small for arbitrary rich documents.
+Actual native rich/hide CPU, RSS/PSS/HWM and input/frame qualification remains
+required.
+
+Parser admission retains at most 128 selected-source entries and 72 MiB of
+queued source bytes; these are source reservations, not RSS estimates.
+Temporary pressure leaves the immutable source in its authoritative snapshot
+and resumes automatically from a metadata cursor after entry or final
+source-lease release. Each resumed pump visits at most 128 positions; initial
+cache enumeration still visits the selected history. The watch sends a
+current-state event when subscribed so an idle UI cannot miss capacity released
+during subscription installation. Newest text gets first admission; historical
+inputs retain deterministic order. Sources that individually cannot fit the
+budget remain explicit errors. No shell/JSON parse runs on the UI during
+pressure; commands of at most 2,048 bytes can be excluded using the
+recognizer's existing program-name predicate. Full rich coordination parts are
+still reparsed on changed publications; off-thread ownership does not make this
+cost incremental.
 
 ## Reference results
 

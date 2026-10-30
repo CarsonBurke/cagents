@@ -4,7 +4,8 @@ use cagents::{
     persistence::StateStore,
     pull_request_review::CheckoutTarget,
     repository::{
-        CreateWorktreeRequest, WorktreeInput, WorktreeOperationReport, WorktreeOperationState,
+        CreateWorktreeRequest, PrCheckoutDisposition, VerifiedPrCheckout, WorktreeInput,
+        WorktreeOperationReport, WorktreeOperationState,
     },
 };
 
@@ -25,7 +26,13 @@ pub(crate) enum Action {
     Destination(String),
     Resolve,
     Resolved(OperationId, Result<CreateWorktreeRequest, String>),
+    Prepared(
+        OperationId,
+        Result<cagents::pull_request_review::checkout::PreparedCheckout, String>,
+    ),
     Create,
+    ReconcileExisting,
+    ExistingFinished(OperationId, Result<VerifiedPrCheckout, String>),
     Finished(OperationId, Result<WorktreeOperationReport, String>),
     Cancel,
     Edit,
@@ -34,6 +41,7 @@ pub(crate) enum Action {
 
 pub(super) struct Dialog {
     target: CheckoutTarget,
+    review_owner: Option<(CardId, u64, pull_request_review::ReviewTarget)>,
     branch: String,
     destination: String,
     id: OperationId,
@@ -41,11 +49,43 @@ pub(super) struct Dialog {
     cancellation: Option<CancellationToken>,
     error: Option<String>,
     completed: Option<PathBuf>,
+    existing_receipt: Option<VerifiedPrCheckout>,
     accepted: bool,
+    prepared: Option<cagents::pull_request_review::checkout::PreparedCheckout>,
 }
 impl Dialog {
     pub(super) fn busy(&self) -> bool {
         self.cancellation.is_some()
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_pending_existing(&mut self) -> OperationId {
+        self.accepted = true;
+        self.cancellation = Some(CancellationToken::new());
+        self.id
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_prepared(
+        &mut self,
+        prepared: cagents::pull_request_review::checkout::PreparedCheckout,
+    ) -> OperationId {
+        self.prepared = Some(prepared);
+        self.id
+    }
+    #[cfg(test)]
+    pub(super) fn completed_for_test(&self) -> Option<&Path> {
+        self.completed.as_deref()
+    }
+    #[cfg(test)]
+    pub(super) fn cancellation_for_test(&self) -> Option<CancellationToken> {
+        self.cancellation.clone()
+    }
+    #[cfg(test)]
+    pub(super) fn retained_receipt_for_test(&self) -> Option<&VerifiedPrCheckout> {
+        self.existing_receipt.as_ref()
+    }
+    #[cfg(test)]
+    pub(super) fn error_for_test(&self) -> Option<&str> {
+        self.error.as_deref()
     }
 }
 
@@ -70,24 +110,132 @@ impl Editor {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn begin_checkout(&mut self, target: CheckoutTarget) {
+        self.begin_checkout_owned(target, None);
+    }
+
+    pub(super) fn begin_review_checkout(&mut self, card: CardId, target: CheckoutTarget) {
+        let Some(tab) = self.tab(card) else {
+            return;
+        };
+        let Some(review) = tab.review.target().cloned() else {
+            return;
+        };
+        let owner = (card, tab.review.selection_generation(), review);
+        self.begin_checkout_owned(target, Some(owner));
+        self.invalidate_stale_checkout();
+    }
+
+    fn begin_checkout_owned(
+        &mut self,
+        target: CheckoutTarget,
+        review_owner: Option<(CardId, u64, pull_request_review::ReviewTarget)>,
+    ) {
         if self.modal_open() {
             return;
         }
         self.checkout_dialog = Some(Dialog {
             branch: target.suggested_branch(),
             target,
+            review_owner,
             destination: String::new(),
             id: OperationId::new(),
             request: None,
             cancellation: None,
             error: None,
             completed: None,
+            existing_receipt: None,
             accepted: false,
+            prepared: None,
         });
     }
 
+    fn checkout_origin_is_current(&self) -> bool {
+        let Some(dialog) = self.checkout_dialog.as_ref() else {
+            return false;
+        };
+        let Some((card, generation, original)) = dialog.review_owner.as_ref() else {
+            return dialog.target.pull_request.is_none();
+        };
+        let Some(tab) = self.tab(*card) else {
+            return false;
+        };
+        let Some(current) = tab.review.target() else {
+            return false;
+        };
+        *generation == tab.review.selection_generation()
+            && original.repository.same_repository(&current.repository)
+            && original.worktree == current.worktree
+            && current.worktree == dialog.target.repository
+            && original.pull_request.id == current.pull_request.id
+            && original.pull_request.number == current.pull_request.number
+            && current.pull_request.number == dialog.target.number
+            && original.pull_request.head_ref_name == current.pull_request.head_ref_name
+            && current.pull_request.head_ref_name == dialog.target.head_ref_name
+            && original.pull_request.head_ref_oid == current.pull_request.head_ref_oid
+            && current.pull_request.head_ref_oid == dialog.target.head.as_str()
+            && tab
+                .review
+                .range()
+                .is_some_and(|range| range.head == dialog.target.head)
+            && original
+                .pull_request
+                .head_repository_key()
+                .zip(current.pull_request.head_repository_key())
+                .is_some_and(|(original, current)| original.same_repository(&current))
+            && dialog.target.pull_request.as_ref().is_some_and(|key| {
+                key.repository.same_repository(&current.repository)
+                    && key.number == current.pull_request.number
+            })
+    }
+
+    fn checkout_plan_is_current(
+        &self,
+        prepared: &cagents::pull_request_review::checkout::PreparedCheckout,
+    ) -> bool {
+        if !self.checkout_origin_is_current() {
+            return false;
+        }
+        let dialog = self.checkout_dialog.as_ref().unwrap();
+        prepared.repository == dialog.target.repository
+            && prepared.reconciliation.as_ref().is_none_or(|plan| {
+                let request = plan.request();
+                request.expected_head == dialog.target.head
+                    && request.repository == dialog.target.repository
+                    && request.head_branch.as_str() == dialog.target.head_ref_name
+                    && dialog
+                        .review_owner
+                        .as_ref()
+                        .is_some_and(|(_, _, original)| {
+                            original
+                                .pull_request
+                                .belongs_to_head(&request.head_repository)
+                        })
+            })
+    }
+
+    pub(super) fn invalidate_stale_checkout(&mut self) {
+        if self.checkout_dialog.is_some() && !self.checkout_origin_is_current() {
+            let dialog = self.checkout_dialog.as_mut().unwrap();
+            if let Some(token) = &dialog.cancellation {
+                token.cancel();
+            }
+            dialog.completed = None;
+            dialog.error = Some("The owning PR branch, source or head changed. Close this dialog and prepare checkout again.".into());
+        }
+    }
+
     pub(super) fn checkout_action(&mut self, action: Action) -> Task<Message> {
+        let origin_current = self.checkout_origin_is_current();
+        if matches!(
+            &action,
+            Action::Resolve | Action::Create | Action::ReconcileExisting | Action::Open(_)
+        ) && !origin_current
+        {
+            self.invalidate_stale_checkout();
+            return Task::none();
+        }
         match action {
             Action::JournalLoaded(result) => match result {
                 Ok((journal, reports)) => {
@@ -136,11 +284,21 @@ impl Editor {
                 }
             }
             Action::Open(path) => {
-                if self
-                    .checkout_dialog
-                    .as_ref()
-                    .is_some_and(|d| d.completed.as_ref() == Some(&path))
-                {
+                if self.checkout_dialog.as_ref().is_some_and(|d| {
+                    d.completed.as_ref() == Some(&path)
+                        && d.prepared
+                            .as_ref()
+                            .and_then(|plan| plan.reconciliation.as_ref())
+                            .is_none_or(|plan| {
+                                d.existing_receipt.as_ref().is_some_and(|receipt| {
+                                    cagents::pull_request_review::checkout::verified_existing_path(
+                                        &d.target, plan, receipt,
+                                    )
+                                    .as_ref()
+                                        == Ok(&path)
+                                })
+                            })
+                }) {
                     self.checkout_dialog = None;
                     self.selection_epoch = self.selection_epoch.wrapping_add(1);
                     return Self::open(path, self.selection_epoch);
@@ -150,7 +308,7 @@ impl Editor {
                 if let Some(dialog) = self
                     .checkout_dialog
                     .as_mut()
-                    .filter(|d| !d.busy() && d.request.is_none())
+                    .filter(|d| !d.busy() && d.request.is_none() && d.target.pull_request.is_none())
                 {
                     dialog.branch = value;
                     dialog.error = None;
@@ -181,19 +339,45 @@ impl Editor {
                 dialog.cancellation = Some(cancellation.clone());
                 dialog.error = None;
                 let id = dialog.id;
+                if dialog.prepared.is_none() {
+                    let target = dialog.target.clone();
+                    return cosmic::task::future(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            cagents::pull_request_review::checkout::prepare(&target, &cancellation)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                        Message::Checkout(Action::Prepared(id, result))
+                    });
+                }
                 let input = WorktreeInput {
                     repository: dialog.target.repository.clone(),
                     input: dialog.branch.clone(),
-                    base: dialog.target.head.as_str().to_owned(),
+                    base: dialog.prepared.as_ref().map_or_else(
+                        || dialog.target.head.as_str().to_owned(),
+                        |plan| plan.base.clone(),
+                    ),
                     managed_directory: self.settings.managed_worktree_directory.clone(),
                     destination: dialog.destination.clone(),
                     operation_id: id,
                 };
+                let consent = dialog
+                    .prepared
+                    .as_ref()
+                    .and_then(|plan| plan.creation_consent.clone());
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        RepositoryService::system("git")
-                            .resolve_worktree_request(&input, &cancellation)
-                            .map_err(|e| e.to_string())
+                        let service = RepositoryService::system("git");
+                        match consent {
+                            Some(consent) => service.resolve_worktree_request_for_pr(
+                                &input,
+                                &consent,
+                                &cancellation,
+                            ),
+                            None => service.resolve_worktree_request(&input, &cancellation),
+                        }
+                        .map_err(|e| e.to_string())
                     })
                     .await
                     .map_err(|e| e.to_string())
@@ -201,20 +385,146 @@ impl Editor {
                     Message::Checkout(Action::Resolved(id, result))
                 });
             }
+            Action::Prepared(id, result) => {
+                let plan_current = result
+                    .as_ref()
+                    .is_ok_and(|plan| self.checkout_plan_is_current(plan));
+                let Some(dialog) = self
+                    .checkout_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.id == id)
+                else {
+                    return Task::none();
+                };
+                let cancelled = dialog
+                    .cancellation
+                    .take()
+                    .is_some_and(|token| token.is_cancelled());
+                if cancelled || !origin_current {
+                    dialog.error =
+                        Some("Cancelled or owning PR changed before preparing checkout.".into());
+                    return Task::none();
+                }
+                match result {
+                    Ok(plan) => {
+                        if !plan_current {
+                            dialog.error = Some("Prepared checkout no longer matches the owning PR. Prepare it again.".into());
+                            return Task::none();
+                        }
+                        if plan.existing_worktree.is_some() && plan.reconciliation.is_none() {
+                            dialog.error=Some("Existing checkout has no verified reconciliation plan; prepare it again.".into());
+                            return Task::none();
+                        }
+                        dialog.branch = plan.branch_input.clone();
+                        let existing = plan.reconciliation.is_some();
+                        dialog.prepared = Some(plan);
+                        if !existing {
+                            return self.checkout_action(Action::Resolve);
+                        }
+                    }
+                    Err(error) => dialog.error = Some(error),
+                }
+            }
             Action::Resolved(id, result) => {
                 if let Some(dialog) = self.checkout_dialog.as_mut().filter(|d| d.id == id) {
                     let cancelled = dialog
                         .cancellation
                         .take()
                         .is_some_and(|token| token.is_cancelled());
-                    if cancelled {
-                        dialog.error = Some("Cancelled before creating a worktree.".into());
+                    if cancelled || !origin_current {
+                        dialog.error = Some(
+                            "Cancelled or owning PR changed before creating a worktree.".into(),
+                        );
                     } else {
                         match result {
                             Ok(request) => dialog.request = Some(request),
                             Err(error) => dialog.error = Some(error),
                         }
                     }
+                }
+            }
+            Action::ReconcileExisting => {
+                if !self
+                    .checkout_dialog
+                    .as_ref()
+                    .and_then(|dialog| dialog.prepared.as_ref())
+                    .is_some_and(|plan| self.checkout_plan_is_current(plan))
+                {
+                    return Task::none();
+                }
+                let Some(dialog) = self
+                    .checkout_dialog
+                    .as_mut()
+                    .filter(|dialog| !dialog.busy() && !dialog.accepted)
+                else {
+                    return Task::none();
+                };
+                let Some(plan) = dialog
+                    .prepared
+                    .as_ref()
+                    .and_then(|prepared| prepared.reconciliation.clone())
+                else {
+                    return Task::none();
+                };
+                if plan.request().expected_head != dialog.target.head {
+                    return Task::none();
+                }
+                dialog.accepted = true;
+                dialog.error = None;
+                let cancellation = CancellationToken::new();
+                dialog.cancellation = Some(cancellation.clone());
+                let id = dialog.id;
+                return cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        RepositoryService::system("git")
+                            .reconcile_existing_pr_checkout(&plan, &cancellation)
+                            .map_err(|error| error.to_string())
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    Message::Checkout(Action::ExistingFinished(id, result))
+                });
+            }
+            Action::ExistingFinished(id, result) => {
+                let Some(dialog) = self
+                    .checkout_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.id == id)
+                else {
+                    return Task::none();
+                };
+                dialog.cancellation = None;
+                if let Ok(receipt) = &result {
+                    dialog.existing_receipt = Some(receipt.clone());
+                }
+                if !origin_current {
+                    dialog.completed = None;
+                    dialog.error = Some("Checkout settled after its owning PR changed. Its result was retained; refresh the review before opening it.".into());
+                    return Task::none();
+                }
+                match result {
+                    Ok(receipt) => {
+                        let path = dialog
+                            .prepared
+                            .as_ref()
+                            .and_then(|prepared| prepared.reconciliation.as_ref())
+                            .ok_or_else(|| {
+                                "The checkout plan was replaced. Prepare checkout again.".to_owned()
+                            })
+                            .and_then(|plan| {
+                                cagents::pull_request_review::checkout::verified_existing_path(
+                                    &dialog.target,
+                                    plan,
+                                    &receipt,
+                                )
+                            });
+                        match path {
+                            Ok(path) => dialog.completed = Some(path),
+                            Err(error) => dialog.error = Some(error),
+                        }
+                    }
+                    Err(error) => dialog.error = Some(error),
                 }
             }
             Action::Create => {
@@ -231,6 +541,16 @@ impl Editor {
                 let Some(request) = dialog.request.clone() else {
                     return Task::none();
                 };
+                let consent = dialog
+                    .prepared
+                    .as_ref()
+                    .and_then(|plan| plan.creation_consent.clone());
+                if dialog.target.pull_request.is_some() && consent.is_none() {
+                    dialog.error = Some(
+                        "The reviewed creation consent is missing; prepare checkout again.".into(),
+                    );
+                    return Task::none();
+                }
                 dialog.accepted = true;
                 let cancellation = CancellationToken::new();
                 dialog.cancellation = Some(cancellation.clone());
@@ -241,6 +561,7 @@ impl Editor {
                         cagents::pull_request_review::checkout::create(
                             &journal.0,
                             &request,
+                            consent.as_ref(),
                             &cancellation,
                         )
                     })
@@ -259,8 +580,17 @@ impl Editor {
                 if let Some(dialog) = self.checkout_dialog.as_mut().filter(|d| d.id == id) {
                     dialog.cancellation = None;
                     match result {
-                        Ok(report) if report.state == WorktreeOperationState::Created => {
+                        Ok(report)
+                            if report.state == WorktreeOperationState::Created
+                                && origin_current =>
+                        {
                             dialog.completed = report.request.map(|r| r.destination);
+                        }
+                        Ok(report) if !origin_current => {
+                            dialog.error = Some(format!(
+                                "Checkout settled after its owning PR changed. {} Reopen the review before opening its result.",
+                                report.detail
+                            ))
                         }
                         Ok(report) => dialog.error = Some(report.detail),
                         Err(error) => {
@@ -357,7 +687,18 @@ impl Editor {
         let dialog = self.checkout_dialog.as_ref()?;
         let action = |a| Message::Checkout(a);
         let mut body = vec![
-            widget::text::title3("Create PR worktree").into(),
+            widget::text::title3(
+                if dialog
+                    .prepared
+                    .as_ref()
+                    .is_some_and(|prepared| prepared.reconciliation.is_some())
+                {
+                    "Open existing PR worktree"
+                } else {
+                    "Create PR worktree"
+                },
+            )
+            .into(),
             design::caption(format!(
                 "PR #{} · {}",
                 dialog.target.number,
@@ -365,12 +706,48 @@ impl Editor {
             ))
             .into(),
         ];
+        if let Some(plan) = &dialog.prepared {
+            body.push(design::caption(&plan.notice).into());
+        }
         if let Some(path) = &dialog.completed {
-            body.push(widget::text::body(format!("Created {}", path.display())).into());
+            body.push(widget::text::body(format!("Worktree ready at {}", path.display())).into());
             body.push(
                 widget::button::suggested("Open worktree")
                     .on_press(action(Action::Open(path.clone())))
                     .into(),
+            );
+        } else if let Some(plan) = dialog
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.reconciliation.as_ref())
+        {
+            body.push(
+                widget::text::body(format!("Existing worktree: {}", plan.path().display())).into(),
+            );
+            if dialog.accepted && !dialog.busy() {
+                body.push(design::caption("Inspect this outcome, then close and prepare checkout again before retrying.").into());
+            }
+            body.push(
+                widget::button::suggested(if dialog.busy() {
+                    "Reconciling checkout…"
+                } else {
+                    match plan.disposition() {
+                        PrCheckoutDisposition::OpenPreservingLocal => "Keep existing local work",
+                        PrCheckoutDisposition::RepairTrackingPreservingLocal => {
+                            "Configure upstream and open local work"
+                        }
+                        PrCheckoutDisposition::AlreadyCurrent => "Verify existing worktree",
+                        PrCheckoutDisposition::FastForward => "Update existing worktree",
+                        PrCheckoutDisposition::RepairTracking => "Set PR upstream",
+                        PrCheckoutDisposition::FastForwardAndRepair => {
+                            "Update worktree and set PR upstream"
+                        }
+                    }
+                })
+                .on_press_maybe(
+                    (!dialog.busy() && !dialog.accepted).then(|| action(Action::ReconcileExisting)),
+                )
+                .into(),
             );
         } else if let Some(request) = &dialog.request {
             body.push(
@@ -402,7 +779,9 @@ impl Editor {
                 &dialog.destination,
             );
             if !dialog.busy() {
-                branch = branch.on_input(|v| Message::Checkout(Action::Branch(v)));
+                if dialog.target.pull_request.is_none() {
+                    branch = branch.on_input(|v| Message::Checkout(Action::Branch(v)));
+                }
                 destination = destination.on_input(|v| Message::Checkout(Action::Destination(v)));
             }
             body.push(branch.into());

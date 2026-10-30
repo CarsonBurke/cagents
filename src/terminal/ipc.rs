@@ -143,9 +143,63 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-/// Version 78 carries terminal provider outcomes and readable exit diagnostics.
-/// Version 79 pages immutable retained provider output by opaque log identity.
-pub const PROTOCOL_VERSION: u16 = 79;
+/// Version 78 verifies automatic channel-name refreshes against their shared-view owner.
+/// Version 80 carries opt-in semantic notification context and preview privacy.
+/// Version 95 combines conversation-title refreshes with notification context.
+/// Version 96 preserves version 95 and appends native terminal title metadata
+/// to TerminalDescriptor carriers (Connect/List/Spawn/Attach/TerminalCreated).
+/// Positional postcard peers require the matched layout; serde(default)
+/// preserves older JSON records, not older binary frames.
+/// Version 97 preserves version 78 and appends only DeviceOperation::AccountDefault
+/// with its Automatic/account-ID selection; all prior tags and layouts remain.
+/// Version 98 combines notification context with account-default selection.
+/// Version 99 preserves version 98 and adds the version 96 terminal-title
+/// descriptor layout, requiring matched positional postcard peers.
+/// Version 100 appends native chat capacity and guarded release controls.
+/// Version 101 requires atomic adoption of recovered native identities into
+/// managed panes and shared admission. The updater must replace older hosts
+/// even though the read-only inventory DTO layout remains unchanged.
+/// Version 102 preserves version 101 and adds immutable native text-copy
+/// sidecars to Snapshot and a requester-specific paged reply. The three
+/// executables require this matched positional postcard layout; JSON defaults
+/// do not preserve binary compatibility.
+/// Version 103 adds retained Claude actor continuity to native descriptors and
+/// snapshots. Private actor protocol 2 has a separate authenticated namespace.
+/// Version 104 preserves version 103 and appends the Work board request and
+/// its response. The Work board subscription - `ClientRequest::WatchWork`,
+/// `work::Response::Watching` and `ServerMessage::WorkBoard` - deliberately
+/// does not move it, for the reasons terminal-inventory observation did not:
+/// each is appended, and none reaches a peer that cannot issue the request.
+/// Worktree removal - `work::Request::{RemovalPlan, Remove, Snapshots}` and
+/// their responses - is appended under the same policy.
+/// Version 105 adds immutable image-reference metadata to Attachment and
+/// ItemContent::Image. These are positional postcard fields, so all three
+/// executables must be replaced together; JSON omission alone is compatible.
+/// Version 110 bounds channel-work projections with independent current/history
+/// cursors and adds exact-target and metadata-only home reads for safe recovery.
+/// Version 115 appends an explicit recoverable input notice. Older clients
+/// cannot decode this unsolicited event, so all three executables must match.
+/// Version 116 combines channel-work requests/responses with recoverable input
+/// notices. Neither predecessor identifies this combined matched executable set.
+/// Version 119 replaces a channel-work caller's incidental whole-view revision
+/// with an explicit durable placement_epoch. Matched executables are required;
+/// old saved actor requests are refused without rebasing their captured intent.
+/// Known private account experiments use 117 and 118 and are not adopted here.
+/// Version 122 appends no-run automation notification target identity and fixed
+/// pause/block kinds while preserving channel-work placement and input notices.
+/// The matched set includes the accepted attention predecessor; schema 19 adds
+/// the current-actionable automation outbox without backfilling past audit rows.
+/// Version 125 raises terminal history to an explicit byte budget (16 MiB by
+/// default, up to 1 GiB). Published protocol-119 hosts reject values above
+/// 1,000,000, so their unchanged positional field encoding is not sufficient
+/// compatibility: replace the matched daemon before sending the new budgets.
+/// Version 127 combines both contracts in the matched set. Version 126 is
+/// reserved for the separate native Goal integration and is not adopted here.
+/// Version 147 preserves main's request tags 0..72 and response tags 0..38,
+/// appends provider-exit output at request 73/response 39, and carries terminal
+/// provider outcome/diagnostic fields in ChatActivity and Snapshot. Draft 146
+/// uses different appended variants and must never be decoded as this contract.
+pub const PROTOCOL_VERSION: u16 = 147;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -154,6 +208,8 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
+/// Maximum scalar values retained in a descriptor's observed terminal title.
+pub const MAX_TERMINAL_TITLE_CHARACTERS: usize = 256;
 /// Production full and browserless builds retain the runtime namespace; a
 /// mismatched daemon is preserved and reported, never automatically replaced.
 pub const SOCKET_FILE_NAME: &str = "cagentsd.sock";
@@ -474,6 +530,29 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Resident native handles; this is independent of provider usage quotas.
+    ChatCapacityInspect,
+    ChatCapacitySet {
+        limit: u32,
+    },
+    ChatReleaseInspect {
+        chat_id: TerminalId,
+    },
+    /// Revalidate the exact inspected actor before releasing its resident handle.
+    ChatRelease {
+        proof: ChatReleaseProof,
+        dry_run: bool,
+    },
+    /// Reads the Work board or pins one of its cards.
+    Work(crate::work::Request),
+    /// Subscribes this connection to the whole Work board and returns it in
+    /// the same response, as [`crate::work::Response::Watching`]. Each later
+    /// change arrives as [`ServerMessage::WorkBoard`].
+    WatchWork,
+    ChannelWork {
+        authority: crate::agent_execution::Authority,
+        request: crate::channel_work_api::Request,
+    },
     /// Read one bounded page from an opaque, immutable provider-exit log.
     ChatProviderExitOutput {
         chat_id: TerminalId,
@@ -495,7 +574,9 @@ pub struct TerminalSpawnOptions {
     pub rows: u16,
     pub cell_width_px: u32,
     pub cell_height_px: u32,
-    pub max_scrollback: usize,
+    /// Ghostty history page budget in bytes. The legacy JSON name also meant bytes.
+    #[serde(alias = "max_scrollback")]
+    pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
 }
@@ -507,7 +588,7 @@ impl Default for TerminalSpawnOptions {
             rows: 24,
             cell_width_px: 9,
             cell_height_px: 18,
-            max_scrollback: 10_000,
+            max_scrollback_bytes: TerminalConfig::DEFAULT_SCROLLBACK_BYTES,
             initially_visible: true,
             theme: TerminalTheme::default(),
         }
@@ -521,7 +602,7 @@ impl From<TerminalConfig> for TerminalSpawnOptions {
             rows: value.rows,
             cell_width_px: value.cell_width_px,
             cell_height_px: value.cell_height_px,
-            max_scrollback: value.max_scrollback,
+            max_scrollback_bytes: value.max_scrollback_bytes,
             initially_visible: value.initially_visible,
             theme: value.theme,
         }
@@ -686,6 +767,14 @@ pub enum ServerMessage {
     NotificationActivated {
         target: crate::notifications::Target,
     },
+    /// The whole Work board after a change, delivered only to a connection
+    /// that subscribed with [`ClientRequest::WatchWork`]. `revision` grows with
+    /// every board the daemon sends, so a receiver keeps the newest of a board
+    /// pushed while its subscription was being answered and the answer.
+    WorkBoard {
+        revision: u64,
+        board: Box<crate::work::Board>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -788,6 +877,23 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
+    ChatCapacity {
+        capacity: ChatCapacity,
+        persistence_warning: Option<String>,
+    },
+    ChatReleaseInspected {
+        inspection: ChatReleaseInspection,
+    },
+    ChatReleased {
+        inspection: ChatReleaseInspection,
+        dry_run: bool,
+    },
+    ChatTextCopy {
+        chat_id: TerminalId,
+        page: crate::chat::TextCopyPage,
+    },
+    Work(crate::work::Response),
+    ChannelWork(crate::channel_work_api::Response),
     /// Raw pages preserve UTF-8 and ANSI sequences across frame boundaries;
     /// the requesting client cleans the complete bounded output once.
     ChatProviderExitOutput {
@@ -798,6 +904,43 @@ pub enum ServerResponse {
         next_offset: Option<u64>,
         omitted: u64,
     },
+}
+
+/// Maximum compact inventory rows in one capacity response.
+pub const MAX_CHAT_CAPACITY_ROWS: usize = 4096;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCapacity {
+    /// Distinct admission slots; recovery can reserve an already resident ID.
+    pub used: u32,
+    pub resident: u32,
+    pub spawning: u32,
+    pub limit: u32,
+    pub residents: Vec<ChatCapacityResident>,
+    pub omitted_residents: u32,
+}
+
+/// Cheap resident inventory; eligibility still requires a per-ID inspection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCapacityResident {
+    pub chat_id: TerminalId,
+    pub provider: crate::agent::Provider,
+    pub status: String,
+    /// None means verification is still required, never permission to release.
+    pub release_blocked: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatReleaseProof {
+    pub session: crate::chat::Session,
+    pub execution_instance: uuid::Uuid,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatReleaseInspection {
+    pub proof: ChatReleaseProof,
+    pub release_blocked: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -899,6 +1042,7 @@ pub enum ProtocolErrorCode {
     PermissionDenied,
     Internal,
     ViewConflict,
+    ChatCapacity,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -922,6 +1066,10 @@ pub struct TerminalDescriptor {
     pub upgrade_sources: Vec<TerminalSession>,
     #[serde(default)]
     pub upgrade_relaunches: Vec<UpgradeRelaunch>,
+    /// Last observed native terminal title; absent before any title event.
+    /// This display metadata never authorizes process/session recovery.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 /// Explicitly accepted resume-picker or fresh agent launches, bound to the
@@ -962,6 +1110,7 @@ impl TerminalDescriptor {
             agent_activity: None,
             upgrade_sources: Vec::new(),
             upgrade_relaunches: Vec::new(),
+            title: None,
         }
     }
 }
@@ -1446,6 +1595,10 @@ pub enum WireTerminalEvent {
         matches: Vec<crate::terminal::SearchMatch>,
         truncated: bool,
     },
+    InputNotice {
+        operation: String,
+        message: String,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
@@ -1483,6 +1636,10 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 Self::AgentActivityChanged { activity }
             }
             TerminalEvent::Bell => Self::Bell,
+            TerminalEvent::InputNotice { operation, message } => Self::InputNotice {
+                operation: operation.to_owned(),
+                message,
+            },
             TerminalEvent::Exited {
                 exit_code,
                 signal,
@@ -1492,7 +1649,11 @@ impl From<TerminalEvent> for WireTerminalEvent {
                 signal,
                 intentional,
             },
-            TerminalEvent::Error { operation, message } => Self::Error {
+            // InputRejected is client-local. If serialized by a future caller,
+            // preserve the conservative existing wire Error semantics; a bare
+            // wire event must never issue trusted nonfatal admission evidence.
+            TerminalEvent::Error { operation, message }
+            | TerminalEvent::InputRejected { operation, message } => Self::Error {
                 operation: operation.to_owned(),
                 message,
             },
@@ -1539,6 +1700,19 @@ impl From<WireTerminalEvent> for TerminalEvent {
                 Self::AgentActivityChanged(activity)
             }
             WireTerminalEvent::Bell => Self::Bell,
+            WireTerminalEvent::InputNotice { operation, message } => Self::InputNotice {
+                operation: match operation.as_str() {
+                    "cancel terminal input" => "cancel terminal input",
+                    "write terminal input" => "write terminal input",
+                    "write encoded key" => "write encoded key",
+                    "write terminal paste" => "write terminal paste",
+                    "write encoded mouse event" => "write encoded mouse event",
+                    "write terminal response" => "write terminal response",
+                    "interrupt terminal" => "interrupt terminal",
+                    _ => "terminal input",
+                },
+                message,
+            },
             WireTerminalEvent::Exited {
                 exit_code,
                 signal,
@@ -1594,6 +1768,36 @@ pub struct FrameCodec {
     payload_length: Option<usize>,
     payload_read: usize,
     maximum: usize,
+    memory_id: u64,
+    small_reads: u8,
+    small_writes: u8,
+}
+
+// A codec moves from handshake into a reader thread. Pointer identity would
+// leave a phantom owner at its former stack address in memory census traces.
+fn next_memory_codec_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+// Normal interactive frames keep a reusable quarter-mebibyte allocation. A
+// one-off transcript/image transfer must not permanently multiply its peak
+// capacity across every attached chat. Eight consecutive frames at least four
+// times smaller retire an outlier; interleaved snapshots/acknowledgements keep
+// hot capacity. Hidden chat transports explicitly release their spare buffers.
+const FRAME_REUSE_FLOOR: usize = 256 * 1024;
+
+fn recycle_frame_buffer(buffer: &mut Vec<u8>, completed_bytes: usize, small_frames: &mut u8) {
+    buffer.clear();
+    if buffer.capacity() > FRAME_REUSE_FLOOR.max(completed_bytes.saturating_mul(4)) {
+        *small_frames = small_frames.saturating_add(1);
+        if *small_frames >= 8 {
+            buffer.shrink_to(FRAME_REUSE_FLOOR);
+            *small_frames = 0;
+        }
+    } else {
+        *small_frames = 0;
+    }
 }
 
 impl FrameCodec {
@@ -1606,7 +1810,30 @@ impl FrameCodec {
             payload_length: None,
             payload_read: 0,
             maximum,
+            memory_id: next_memory_codec_id(),
+            small_reads: 0,
+            small_writes: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn buffer_capacities_for_test(&self) -> (usize, usize) {
+        (self.read_buffer.capacity(), self.write_buffer.capacity())
+    }
+
+    /// Release outlier scratch when a connection becomes hidden or idle.
+    /// A timed-out partial frame remains intact until it is decoded.
+    pub fn release_spare(&mut self) {
+        if self.payload_length.is_none() && self.prefix_read == 0 {
+            self.read_buffer.clear();
+            self.read_buffer.shrink_to(FRAME_REUSE_FLOOR);
+            self.small_reads = 0;
+        }
+        self.write_buffer.clear();
+        self.write_buffer.shrink_to(FRAME_REUSE_FLOOR);
+        self.small_writes = 0;
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
     }
 
     pub fn read<T: DeserializeOwned>(
@@ -1666,6 +1893,8 @@ impl FrameCodec {
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_decode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = length);
         }
+        recycle_frame_buffer(&mut self.read_buffer, length, &mut self.small_reads);
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(Some(value?))
     }
 
@@ -1685,7 +1914,20 @@ impl FrameCodec {
         }
         writer.write_all(&self.write_buffer)?;
         writer.flush()?;
+        recycle_frame_buffer(
+            &mut self.write_buffer,
+            payload_length,
+            &mut self.small_writes,
+        );
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(())
+    }
+}
+
+impl Drop for FrameCodec {
+    fn drop(&mut self) {
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id,
+            released = true, read_capacity = 0usize, write_capacity = 0usize);
     }
 }
 
@@ -1871,6 +2113,116 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wire_147_provider_exit_append_and_activity_have_exact_postcard_bytes() {
+        assert_eq!(PROTOCOL_VERSION, 147);
+        let chat_id = TerminalId::from_uuid(uuid::Uuid::nil());
+        // UUID's binary representation is a length followed by its 16 bytes.
+        let mut id = vec![16];
+        id.extend_from_slice(&[0; 16]);
+        let request = ClientRequest::ChatProviderExitOutput {
+            chat_id,
+            log_id: "l".into(),
+            offset: 7,
+        };
+        let mut golden = vec![73];
+        golden.extend_from_slice(&id);
+        golden.extend_from_slice(&[1, b'l', 7]);
+        assert_eq!(postcard::to_stdvec(&request).unwrap(), golden);
+        assert_eq!(
+            postcard::from_bytes::<ClientRequest>(&golden).unwrap(),
+            request
+        );
+        // The immediately preceding main-only unit request remains tag 71;
+        // ChannelWork remains 72, before the appended request at 73.
+        assert_eq!(
+            postcard::to_stdvec(&ClientRequest::WatchWork).unwrap(),
+            [71]
+        );
+
+        let response = ServerResponse::ChatProviderExitOutput {
+            chat_id,
+            log_id: "l".into(),
+            offset: 7,
+            bytes: vec![0, 255],
+            next_offset: Some(9),
+            omitted: 3,
+        };
+        let mut golden = vec![39];
+        golden.extend_from_slice(&id);
+        golden.extend_from_slice(&[1, b'l', 7, 2, 0, 255, 1, 9, 3]);
+        assert_eq!(postcard::to_stdvec(&response).unwrap(), golden);
+        assert_eq!(
+            postcard::from_bytes::<ServerResponse>(&golden).unwrap(),
+            response
+        );
+
+        let activity = ServerMessage::ChatActivity {
+            chat_id,
+            state: crate::agent::ActivityState::Idle,
+            generation: 7,
+            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "x".into() }),
+        };
+        let mut golden = vec![10];
+        golden.extend_from_slice(&id);
+        golden.extend_from_slice(&[1, 7, 1, 2, 1, b'x']);
+        assert_eq!(postcard::to_stdvec(&activity).unwrap(), golden);
+        assert_eq!(
+            postcard::from_bytes::<ServerMessage>(&golden).unwrap(),
+            activity
+        );
+    }
+
+    #[test]
+    fn wire_147_nested_snapshot_has_exact_outcome_and_provider_exit_field_order() {
+        let snapshot = crate::chat::Snapshot {
+            sampled_at: Some(1),
+            generation: 2,
+            turn_generation: 3,
+            finished_at: Some(4),
+            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "x".into() }),
+            provider_exit: Some(crate::chat::ProviderExitDiagnostic {
+                summary: "s".into(),
+                output: "o".into(),
+                log: Some(crate::chat::ProviderExitLog {
+                    id: "l".into(),
+                    bytes: 7,
+                    omitted: 2,
+                }),
+            }),
+            ..Default::default()
+        };
+        // Frozen positional schema: no serializer-derived expected fields.
+        let mut golden = vec![1, 1, 2, 3, 1, 4, 1, 2, 1, b'x'];
+        golden.extend_from_slice(&[0; 5]); // items, text-copy(3), requests
+        golden.extend_from_slice(&[0; 15]); // capabilities
+        golden.extend_from_slice(&[0; 9]); // models through skills
+        golden.extend_from_slice(&[0; 6]); // usage
+        golden.extend_from_slice(&[0; 6]); // busy, detail, session, continuity, title, error
+        golden.extend_from_slice(&[1, 1, b's', 1, b'o', 1, 1, b'l', 7, 2]);
+        golden.extend_from_slice(&[0; 17]); // read-only reason through forked
+        golden.extend_from_slice(&[0; 10]); // file changes and coverage
+        assert_eq!(postcard::to_stdvec(&snapshot).unwrap(), golden);
+        assert_eq!(
+            postcard::from_bytes::<crate::chat::Snapshot>(&golden).unwrap(),
+            snapshot
+        );
+
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::from_uuid(uuid::Uuid::nil()),
+            snapshot: Some(snapshot),
+        };
+        let mut nested = vec![12, 16];
+        nested.extend_from_slice(&[0; 16]);
+        nested.push(1);
+        nested.extend_from_slice(&golden);
+        assert_eq!(postcard::to_stdvec(&response).unwrap(), nested);
+        assert_eq!(
+            postcard::from_bytes::<ServerResponse>(&nested).unwrap(),
+            response
+        );
+    }
+
+    #[test]
     fn activity_ipc_preserves_failed_outcome_and_reason() {
         let message = ServerMessage::ChatActivity {
             chat_id: TerminalId::new(),
@@ -1890,6 +2242,156 @@ mod tests {
         assert!(
             matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
         );
+    }
+
+    #[test]
+    fn scrollback_options_keep_legacy_json_and_positional_wire_bytes() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct LegacyOptions {
+            columns: u16,
+            rows: u16,
+            cell_width_px: u32,
+            cell_height_px: u32,
+            max_scrollback: usize,
+            initially_visible: bool,
+            theme: TerminalTheme,
+        }
+        for budget in [
+            0,
+            10_000,
+            TerminalConfig::DEFAULT_SCROLLBACK_BYTES,
+            TerminalConfig::MAX_SCROLLBACK_BYTES,
+        ] {
+            let legacy = LegacyOptions {
+                columns: 80,
+                rows: 24,
+                cell_width_px: 9,
+                cell_height_px: 18,
+                max_scrollback: budget,
+                initially_visible: true,
+                theme: TerminalTheme::default(),
+            };
+            let decoded: TerminalSpawnOptions =
+                serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+            assert_eq!(decoded.max_scrollback_bytes, budget);
+            let mut old_frame = Vec::new();
+            write_frame(&mut old_frame, &legacy).unwrap();
+            let mut new_frame = Vec::new();
+            write_frame(&mut new_frame, &decoded).unwrap();
+            assert_eq!(old_frame, new_frame);
+            assert_eq!(
+                read_frame::<TerminalSpawnOptions>(&mut Cursor::new(&old_frame)).unwrap(),
+                Some(decoded)
+            );
+            assert_eq!(
+                read_frame::<LegacyOptions>(&mut Cursor::new(&new_frame)).unwrap(),
+                Some(legacy)
+            );
+        }
+        let options = TerminalSpawnOptions::from(TerminalConfig::default());
+        assert_eq!(options.max_scrollback_bytes, 16 * 1024 * 1024);
+        let mut duplicate = serde_json::to_value(options).unwrap();
+        duplicate["max_scrollback"] = serde_json::json!(10_000);
+        assert!(serde_json::from_value::<TerminalSpawnOptions>(duplicate).is_err());
+    }
+
+    #[test]
+    fn retained_claude_snapshot_continuity_uses_the_matched_public_wire() {
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(crate::chat::Snapshot {
+                native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor {
+                    protocol: 2,
+                },
+                ..Default::default()
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        assert_eq!(
+            read_frame::<ServerResponse>(&mut Cursor::new(bytes)).unwrap(),
+            Some(response)
+        );
+        let mut legacy = serde_json::to_value(crate::chat::Snapshot::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("native_continuity");
+        let legacy: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            legacy.native_continuity,
+            crate::chat::NativeContinuity::ReconnectOnly
+        );
+    }
+
+    #[test]
+    fn frame_codec_sheds_oversized_capacity_after_small_frame_without_losing_reuse() {
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let large = "x".repeat(3 * 1024 * 1024);
+        let mut frames = Vec::new();
+        codec.write(&mut frames, &large).unwrap();
+        assert!(codec.write_buffer.capacity() >= large.len());
+        for _ in 0..8 {
+            codec.write(&mut frames, &"small").unwrap();
+        }
+        assert!(codec.write_buffer.capacity() <= FRAME_REUSE_FLOOR);
+        let reused = codec.write_buffer.capacity();
+        codec.write(&mut Vec::new(), &"small").unwrap();
+        assert_eq!(codec.write_buffer.capacity(), reused);
+        let mut reader = Cursor::new(frames);
+        assert_eq!(codec.read::<String>(&mut reader).unwrap(), Some(large));
+        assert!(codec.read_buffer.capacity() >= 3 * 1024 * 1024);
+        for _ in 0..8 {
+            assert_eq!(
+                codec.read::<String>(&mut reader).unwrap().as_deref(),
+                Some("small")
+            );
+        }
+        assert!(codec.read_buffer.capacity() <= FRAME_REUSE_FLOOR);
+    }
+
+    #[test]
+    fn recoverable_input_notice_does_not_reclassify_error_or_admission_evidence() {
+        let message = "Previously delivered input was preserved; unsent input was canceled.";
+        let notice = TerminalEvent::InputNotice {
+            operation: "cancel terminal input",
+            message: message.into(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &WireTerminalEvent::from(notice.clone())).unwrap();
+        let received = read_frame::<WireTerminalEvent>(&mut Cursor::new(bytes))
+            .unwrap()
+            .unwrap();
+        assert_eq!(TerminalEvent::from(received), notice);
+
+        // An old or genuine failure with identical text is still a failure.
+        // Only the explicit event variant carries recoverable semantics.
+        let error = TerminalEvent::from(WireTerminalEvent::Error {
+            operation: "cancel terminal input".into(),
+            message: message.into(),
+        });
+        assert!(matches!(error, TerminalEvent::Error { .. }));
+        assert!(matches!(
+            WireTerminalEvent::from(TerminalEvent::InputRejected {
+                operation: "write terminal input",
+                message: "local correlated refusal".into(),
+            }),
+            WireTerminalEvent::Error { .. }
+        ));
+        assert!(PROTOCOL_VERSION > 105);
+    }
+
+    #[test]
+    fn alternating_large_frames_and_acknowledgements_keep_hot_capacity_until_hidden() {
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let large = "x".repeat(3 * 1024 * 1024);
+        codec.write(&mut Vec::new(), &large).unwrap();
+        let hot = codec.write_buffer.capacity();
+        for _ in 0..8 {
+            codec.write(&mut Vec::new(), &"ack").unwrap();
+            assert_eq!(codec.write_buffer.capacity(), hot);
+            codec.write(&mut Vec::new(), &large).unwrap();
+            assert_eq!(codec.write_buffer.capacity(), hot);
+        }
+        codec.release_spare();
+        assert!(codec.write_buffer.capacity() <= FRAME_REUSE_FLOOR);
     }
 
     #[test]
@@ -1933,12 +2435,14 @@ mod tests {
             codec.read::<String>(&mut reader),
             Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+        codec.release_spare();
         // A writer on the same connection must not overwrite a partial read.
         codec.write(&mut Vec::new(), &"outbound").unwrap();
         assert!(matches!(
             codec.read::<String>(&mut reader),
             Err(FrameError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
+        codec.release_spare();
         assert_eq!(
             codec.read::<String>(&mut reader).unwrap(),
             Some("a split payload".into())
@@ -1948,6 +2452,70 @@ mod tests {
             Some("next frame".into())
         );
         assert_eq!(codec.read::<String>(&mut reader).unwrap(), None);
+    }
+
+    #[test]
+    fn terminal_title_round_trips_through_every_descriptor_carrier() {
+        for title in [
+            None,
+            Some(String::new()),
+            Some("Native terminal 界".to_owned()),
+        ] {
+            let mut terminal = TerminalDescriptor::relaunchable(
+                TerminalId::new(),
+                LaunchRecipe {
+                    program: "/bin/sh".into(),
+                    arguments: vec![],
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                None,
+            );
+            terminal.title = title.clone();
+            let peer = proof("title-peer", "private-boot", "private-incarnation");
+            for message in [
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: peer.clone(),
+                        resumed: vec![terminal.clone()],
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Listed {
+                        terminals: vec![terminal.clone()],
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Spawned {
+                        terminal: terminal.clone(),
+                    },
+                },
+                ServerMessage::Response {
+                    response: ServerResponse::Attached {
+                        terminal: terminal.clone(),
+                    },
+                },
+                ServerMessage::TerminalCreated {
+                    terminal: terminal.clone(),
+                },
+            ] {
+                let envelope = ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(1),
+                    proof: peer.clone(),
+                    message,
+                };
+                let mut bytes = Vec::new();
+                write_frame(&mut bytes, &envelope).unwrap();
+                let decoded: ServerEnvelope = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+                assert_eq!(decoded, envelope);
+            }
+            let mut old_json = serde_json::to_value(&terminal).unwrap();
+            old_json.as_object_mut().unwrap().remove("title");
+            let decoded: TerminalDescriptor = serde_json::from_value(old_json).unwrap();
+            assert_eq!(decoded.title, None, "only JSON omission has a default");
+        }
     }
 
     #[test]
@@ -2097,6 +2665,99 @@ mod tests {
     }
 
     #[test]
+    fn managed_image_identity_roundtrips_prompt_and_snapshot_with_json_legacy_defaults() {
+        let reference = crate::chat::ImageReference {
+            id: uuid::Uuid::new_v4(),
+            number: 19,
+            device: uuid::Uuid::new_v4(),
+            name: "literal *.png".into(),
+            sha256: "a".repeat(64),
+            extension: "png".into(),
+        };
+        let attachment = crate::chat::Attachment {
+            path: "/private/image.png".into(),
+            reference: Some(reference.clone()),
+        };
+        let request = ClientRequest::ChatCommand {
+            chat_id: TerminalId::new(),
+            command: crate::chat::Command::Prompt {
+                text: format!("Inspect {}", reference.token()),
+                attachments: vec![attachment.clone()],
+                mode: crate::chat::PromptMode::Send,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        assert_eq!(
+            read_frame::<ClientRequest>(&mut Cursor::new(bytes))
+                .unwrap()
+                .unwrap(),
+            request
+        );
+        let image = crate::chat::ItemContent::Image {
+            path: attachment.path.to_str().unwrap().into(),
+            description: reference.label(),
+            reference: Some(reference.clone()),
+        };
+        let response = ServerResponse::ChatSnapshot {
+            chat_id: TerminalId::new(),
+            snapshot: Some(crate::chat::Snapshot {
+                items: vec![Arc::new(crate::chat::Item {
+                    id: "image".into(),
+                    role: crate::chat::Role::User,
+                    content: image.clone(),
+                    started_at: None,
+                    at: None,
+                })],
+                ..Default::default()
+            }),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        assert_eq!(
+            read_frame::<ServerResponse>(&mut Cursor::new(bytes))
+                .unwrap()
+                .unwrap(),
+            response
+        );
+        let legacy = serde_json::json!({"path":"/legacy.png"});
+        assert_eq!(
+            serde_json::from_value::<crate::chat::Attachment>(legacy)
+                .unwrap()
+                .reference,
+            None
+        );
+        let mut legacy_image = serde_json::to_value(image).unwrap();
+        legacy_image["Image"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reference");
+        assert!(matches!(
+            serde_json::from_value::<crate::chat::ItemContent>(legacy_image).unwrap(),
+            crate::chat::ItemContent::Image {
+                reference: None,
+                ..
+            }
+        ));
+        #[derive(serde::Serialize)]
+        struct LegacyAttachment {
+            path: PathBuf,
+        }
+        let legacy = postcard::to_stdvec(&LegacyAttachment {
+            path: "/legacy.png".into(),
+        })
+        .unwrap();
+        assert!(
+            postcard::from_bytes::<crate::chat::Attachment>(&legacy).is_err(),
+            "JSON defaults cannot repair positional postcard layout"
+        );
+        assert!(
+            PROTOCOL_VERSION > 104,
+            "image reference fields require matched positional peers"
+        );
+    }
+
+    #[test]
     fn chat_fast_mode_and_estimate_round_trip_with_legacy_json_defaults() {
         let snapshot = crate::chat::Snapshot {
             fast_mode: Some(crate::chat::FastMode {
@@ -2196,6 +2857,47 @@ mod tests {
         let restored: crate::chat::Snapshot = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.prompt_suggestion, None);
         assert_eq!(restored.turn_generation, 7);
+    }
+
+    #[test]
+    fn chat_text_copy_request_and_reply_preserve_exact_source_and_raw_text() {
+        use crate::chat::{Command, TextCopyPage, TextCopyScope, TextCopySource};
+        let chat_id = TerminalId::new();
+        let source = TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: TextCopyScope::Subagent {
+                id: "same#opaque-id".into(),
+            },
+            token: 17,
+            revision: 29,
+            bytes: 9,
+        };
+        let request = ClientRequest::ChatCommand {
+            chat_id,
+            command: Command::ReadTextCopy {
+                source: source.clone(),
+                offset: 3,
+            },
+        };
+        let encoded = postcard::to_allocvec(&request).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ClientRequest>(&encoded).unwrap(),
+            request
+        );
+        let response = ServerResponse::ChatTextCopy {
+            chat_id,
+            page: TextCopyPage {
+                source,
+                offset: 3,
+                text: "猫\r\n ".into(),
+                done: true,
+            },
+        };
+        let encoded = postcard::to_allocvec(&response).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<ServerResponse>(&encoded).unwrap(),
+            response
+        );
     }
 
     #[test]

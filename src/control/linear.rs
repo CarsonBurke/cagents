@@ -5,6 +5,9 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, io::Read, path::PathBuf};
 
+#[path = "linear_output.rs"]
+mod human;
+
 #[derive(Debug, Args)]
 pub struct LinearCommand {
     /// Credential workspace alias (CAGENTS_LINEAR_API_KEY_<ALIAS>).
@@ -21,6 +24,7 @@ enum Operation {
         #[command(flatten)]
         target: IssueTarget,
         #[arg(long)]
+        #[arg(help = "Include the complete issue, comments, attachments and relations.")]
         full: bool,
     },
     /// Read a page of comments, including Markdown image URLs.
@@ -51,10 +55,12 @@ enum Operation {
         #[command(flatten)]
         page: Page,
         #[arg(long)]
+        #[arg(help = "List incoming relations instead of outgoing ones.")]
         inverse: bool,
     },
     /// Search issues in the selected workspace.
     Search {
+        #[arg(help = "Search text for matching issues.")]
         query: String,
         #[command(flatten)]
         page: Page,
@@ -65,12 +71,16 @@ enum Operation {
         #[command(flatten)]
         page: Page,
         #[arg(long)]
+        #[arg(help = "Team ID, key, or unique team name.")]
         team: Option<String>,
         #[arg(long)]
+        #[arg(help = "Workflow state ID or unique name.")]
         state: Option<String>,
         #[arg(long)]
+        #[arg(help = "Assignee ID, email, or unique name; use none to clear.")]
         assignee: Option<String>,
         #[arg(long, value_parser=clap::value_parser!(u8).range(0..=4))]
+        #[arg(help = "Priority: 0 none, 1 urgent, 2 high, 3 normal, 4 low.")]
         priority: Option<u8>,
     },
     /// Discover teams, workflow states, labels, and members.
@@ -91,7 +101,9 @@ enum Operation {
         #[command(flatten)]
         target: Target,
         #[arg(value_enum)]
+        #[arg(help = "Issue field to change.")]
         field: Field,
+        #[arg(help = "New field value; use none to clear an optional field.")]
         value: String,
     },
     /// Change an issue's workflow state.
@@ -109,8 +121,10 @@ enum Operation {
         #[command(flatten)]
         target: Target,
         #[arg(long)]
+        #[arg(help = "HTTP(S) URL to attach.")]
         url: String,
         #[arg(long)]
+        #[arg(help = "Title of the issue or attached link.")]
         title: String,
     },
     /// Add, remove, or replace issue labels.
@@ -124,7 +138,10 @@ enum Operation {
         command: RelationCommand,
     },
     /// Save a validated issue UUID and credential alias for this checkout.
-    Link { id: String },
+    Link {
+        #[arg(help = "The stable resource ID.")]
+        id: String,
+    },
     /// Remove this worktree's ticket link without contacting Linear.
     Unlink,
 }
@@ -140,8 +157,10 @@ struct Target {
 #[derive(Debug, Args)]
 struct IssueTarget {
     #[arg(required_unless_present = "current", conflicts_with = "current")]
+    #[arg(help = "The stable resource ID.")]
     id: Option<String>,
     #[arg(long)]
+    #[arg(help = "Use the issue linked to this Git worktree.")]
     current: bool,
 }
 impl From<IssueTarget> for Target {
@@ -163,21 +182,28 @@ struct Page {
 }
 #[derive(Debug, Subcommand)]
 enum TeamCommand {
+    /// List teams in the selected workspace.
     List {
         #[command(flatten)]
         page: Page,
     },
+    /// List workflow states for a team.
     States {
+        #[arg(help = "Team ID, key, or unique team name.")]
         team: String,
         #[command(flatten)]
         page: Page,
     },
+    /// List labels for a team.
     Labels {
+        #[arg(help = "Team ID, key, or unique team name.")]
         team: String,
         #[command(flatten)]
         page: Page,
     },
+    /// List members of a team.
     Members {
+        #[arg(help = "Team ID, key, or unique team name.")]
         team: String,
         #[command(flatten)]
         page: Page,
@@ -185,6 +211,7 @@ enum TeamCommand {
 }
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
+    /// List projects in the selected workspace.
     List {
         #[command(flatten)]
         page: Page,
@@ -193,33 +220,46 @@ enum ProjectCommand {
 #[derive(Debug, Args)]
 struct Save {
     #[arg(long, conflicts_with = "current")]
+    #[arg(help = "The stable resource ID.")]
     id: Option<String>,
     #[arg(long)]
+    #[arg(help = "Use the issue linked to this Git worktree.")]
     current: bool,
     #[arg(long)]
+    #[arg(help = "Team ID, key, or unique team name.")]
     team: Option<String>,
     #[arg(long)]
+    #[arg(help = "Title of the issue or attached link.")]
     title: Option<String>,
     /// Markdown file, or - to read stdin (maximum 2 MiB).
     #[arg(long)]
     body_file: Option<PathBuf>,
     #[arg(long, conflicts_with = "parent_current")]
+    #[arg(help = "Parent issue identifier or UUID; use none to clear.")]
     parent: Option<String>,
     #[arg(long)]
+    #[arg(help = "Use this worktree’s linked issue as the parent.")]
     parent_current: bool,
     #[arg(long)]
+    #[arg(help = "Workflow state ID or unique name.")]
     status: Option<String>,
     #[arg(long)]
+    #[arg(help = "Assignee ID, email, or unique name; use none to clear.")]
     assignee: Option<String>,
     #[arg(long)]
+    #[arg(help = "Project ID or unique name; use none to clear.")]
     project: Option<String>,
     #[arg(long, value_delimiter = ',')]
+    #[arg(help = "Label names or IDs; comma-separate option values.")]
     labels: Option<Vec<String>>,
     #[arg(long, value_parser=clap::value_parser!(u8).range(0..=4))]
+    #[arg(help = "Priority: 0 none, 1 urgent, 2 high, 3 normal, 4 low.")]
     priority: Option<u8>,
     #[arg(long, value_parser=clap::value_parser!(u32).range(0..=2147483647))]
+    #[arg(help = "Nonnegative issue estimate.")]
     estimate: Option<u32>,
     #[arg(long)]
+    #[arg(help = "Due date in YYYY-MM-DD format; use none to clear.")]
     due_date: Option<String>,
     /// UUID for reconciling an uncertain create result. No automatic write retries.
     #[arg(long)]
@@ -239,14 +279,17 @@ enum Field {
 }
 #[derive(Debug, Subcommand)]
 enum StatusCommand {
+    /// Set an issue workflow state.
     Set {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Workflow state ID or unique name.")]
         state: String,
     },
 }
 #[derive(Debug, Subcommand)]
 enum CommentCommand {
+    /// Add a Markdown comment to an issue.
     Add {
         #[command(flatten)]
         target: Target,
@@ -255,28 +298,37 @@ enum CommentCommand {
             conflicts_with = "body_file",
             required_unless_present = "body_file"
         )]
+        #[arg(help = "Markdown comment text.")]
         body: Option<String>,
         #[arg(long)]
+        #[arg(help = "Markdown file; use - to read standard input (maximum 2 MiB).")]
         body_file: Option<PathBuf>,
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Option<uuid::Uuid>,
     },
 }
 #[derive(Debug, Subcommand)]
 enum LabelCommand {
+    /// Add labels without removing current labels.
     Add {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
+    /// Remove the named labels from an issue.
     Remove {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
+    /// Replace the complete issue label set.
     Set {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
 }
@@ -289,17 +341,24 @@ enum RelationType {
 }
 #[derive(Debug, Subcommand)]
 enum RelationCommand {
+    /// Create a typed relation between two issues.
     Add {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Related issue identifier, UUID or URL.")]
         related: String,
         #[arg(long, value_enum)]
+        #[arg(help = "Relation type to create.")]
         kind: RelationType,
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Option<uuid::Uuid>,
     },
     /// Remove by the relation UUID shown by issue --full.
-    Remove { id: uuid::Uuid },
+    Remove {
+        /// The stable resource ID.
+        id: uuid::Uuid,
+    },
 }
 
 #[cfg(feature = "ui")]
@@ -326,9 +385,13 @@ impl LinearCommand {
                 ("Updated ticket", ticket(&save.id))
             }
             Operation::Create(save) => ("Created ticket", save.title.clone().unwrap_or_default()),
-            Operation::Set { target, .. } | Operation::Label { command: LabelCommand::Add { target, .. } | LabelCommand::Remove { target, .. } | LabelCommand::Set { target, .. } } => {
-                ("Updated ticket", issue(target))
-            }
+            Operation::Set { target, .. }
+            | Operation::Label {
+                command:
+                    LabelCommand::Add { target, .. }
+                    | LabelCommand::Remove { target, .. }
+                    | LabelCommand::Set { target, .. },
+            } => ("Updated ticket", issue(target)),
             Operation::Status {
                 command: StatusCommand::Set { target, state },
             } => ("Moved ticket", format!("{} to {state}", issue(target))),
@@ -337,7 +400,10 @@ impl LinearCommand {
             } => ("Commented on", issue(target)),
             Operation::Attach { target, .. } => ("Attached a link to", issue(target)),
             Operation::Relation {
-                command: RelationCommand::Add { target, related, .. },
+                command:
+                    RelationCommand::Add {
+                        target, related, ..
+                    },
             } => ("Related", format!("{} to {related}", issue(target))),
             Operation::Relation {
                 command: RelationCommand::Remove { .. },
@@ -360,8 +426,11 @@ fn convert(error: linear::Error) -> AppError {
         details: error.details,
     }
 }
-fn output(command: &'static str, data: Value) -> CommandOutput {
-    let human = serde_json::to_string_pretty(&data).unwrap_or_default();
+fn output(command: &'static str, data: Value, list: Option<human::List>) -> CommandOutput {
+    let human = match list {
+        Some(list) => human::render(list, &data),
+        None => serde_json::to_string_pretty(&data).unwrap_or_default(),
+    };
     CommandOutput {
         command,
         data,
@@ -544,7 +613,7 @@ fn page(client: &Client, field: &str, selection: &str, page: &Page) -> Result<Va
         field,
     )
 }
-/// Resolve names only after all pages have been examined, avoiding first-match writes.
+/// Exact server-side filters keep lookups cheap; ambiguity still prevents writes.
 fn resolve(
     client: &Client,
     field: &str,
@@ -553,18 +622,21 @@ fn resolve(
     team: Option<&str>,
 ) -> Result<String, AppError> {
     let references = [reference.to_owned()];
-    let mut ids = resolve_references(client, field, selection, &references, |node| {
+    let mut ids = resolve_references(client, field, selection, &references, team, |node| {
         team.is_none_or(|t| node["team"]["id"].as_str() == Some(t))
     })?;
     Ok(ids.remove(0))
 }
 
-/// Scan metadata once for all requested names. Explicit UUIDs need no lookup.
+/// Fetch exact metadata matches in one filtered connection for all requested
+/// names. Explicit UUIDs need no lookup. The bounded fallback is only for
+/// connection types for which no name filter is defined.
 fn resolve_references(
     client: &Client,
     field: &str,
     selection: &str,
     references: &[String],
+    team: Option<&str>,
     eligible: impl Fn(&Value) -> bool,
 ) -> Result<Vec<String>, AppError> {
     let explicit = references
@@ -576,16 +648,10 @@ fn resolve_references(
     }
     let mut matches = vec![Vec::new(); references.len()];
     let mut cursor = None;
-    for _ in 0..1000 {
-        let data = page(
-            client,
-            field,
-            selection,
-            &Page {
-                limit: 100,
-                after: cursor.clone(),
-            },
-        )?;
+    for _ in 0..10 {
+        let (query, variables) =
+            metadata_query(field, selection, references, team, cursor.as_deref());
+        let data = result_field(request(client, &query, variables, false)?, field)?;
         let nodes = data["nodes"]
             .as_array()
             .ok_or_else(|| error("Linear response omitted nodes"))?;
@@ -626,6 +692,51 @@ fn resolve_references(
     Err(error(
         "Metadata pagination exceeded the safety limit; use a UUID",
     ))
+}
+
+fn metadata_query(
+    field: &str,
+    selection: &str,
+    references: &[String],
+    team: Option<&str>,
+    after: Option<&str>,
+) -> (String, Value) {
+    let definition = match field {
+        "teams" => Some(("TeamFilter", &["name", "key"][..])),
+        "workflowStates" => Some(("WorkflowStateFilter", &["name"][..])),
+        "users" => Some(("UserFilter", &["name", "email"][..])),
+        "projects" => Some(("ProjectFilter", &["name"][..])),
+        "issueLabels" => Some(("IssueLabelFilter", &["name"][..])),
+        _ => None,
+    };
+    let mut variables = json!({"first":100,"after":after});
+    let (declaration, argument) = if let Some((filter_type, fields)) = definition {
+        let alternatives: Vec<_> = references
+            .iter()
+            .filter(|reference| uuid::Uuid::parse_str(reference).is_err())
+            .flat_map(|reference| {
+                fields
+                    .iter()
+                    .map(move |field| json!({(*field): {"eqIgnoreCase":reference}}))
+            })
+            .collect();
+        let mut filter = json!({"or":alternatives});
+        if field == "workflowStates"
+            && let Some(team) = team
+        {
+            filter["team"] = json!({"id":{"eq":team}});
+        }
+        variables["filter"] = filter;
+        (format!(",$filter:{filter_type}!"), ",filter:$filter")
+    } else {
+        (String::new(), "")
+    };
+    (
+        format!(
+            "query($first:Int!,$after:String{declaration}) {{ {field}(first:$first,after:$after{argument}) {{ nodes {{ {selection} }} {PAGE_INFO} }} }}"
+        ),
+        variables,
+    )
 }
 
 fn label_eligible(node: &Value, teams: &BTreeSet<String>) -> bool {
@@ -692,6 +803,7 @@ fn resolve_labels(
         "issueLabels",
         "id name team { id }",
         references,
+        None,
         |node| label_eligible(node, &teams),
     )
 }
@@ -858,7 +970,27 @@ fn update(client: &Client, id: &str, input: Value) -> Result<Value, AppError> {
     )?)
 }
 
+fn list_kind(command: &Operation) -> Option<human::List> {
+    match command {
+        Operation::List { .. } | Operation::Search { .. } | Operation::Children { .. } => {
+            Some(human::List::Issues)
+        }
+        Operation::Comments { .. } => Some(human::List::Comments),
+        Operation::Attachments { .. } => Some(human::List::Attachments),
+        Operation::Relations { .. } => Some(human::List::Relations),
+        Operation::Team { command } => Some(match command {
+            TeamCommand::List { .. } => human::List::Teams,
+            TeamCommand::States { .. } => human::List::States,
+            TeamCommand::Labels { .. } => human::List::Labels,
+            TeamCommand::Members { .. } => human::List::Members,
+        }),
+        Operation::Project { .. } => Some(human::List::Projects),
+        _ => None,
+    }
+}
+
 pub(super) fn execute(args: LinearCommand) -> Result<CommandOutput, AppError> {
+    let list = list_kind(&args.command);
     let workspace = args.workspace;
     let (name, data) = match args.command {
         Operation::Unlink => {
@@ -1156,7 +1288,7 @@ pub(super) fn execute(args: LinearCommand) -> Result<CommandOutput, AppError> {
             }
         },
     };
-    Ok(output(name, data))
+    Ok(output(name, data, list))
 }
 fn issue_connection(
     t: Target,
@@ -1278,6 +1410,78 @@ fn save_issue(save: Save, mut workspace: Option<String>) -> Result<Value, AppErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_lookups_use_one_exact_filtered_query() {
+        for (field, kind) in [
+            ("teams", "TeamFilter"),
+            ("workflowStates", "WorkflowStateFilter"),
+            ("users", "UserFilter"),
+        ] {
+            let (query, variables) = metadata_query(
+                field,
+                "id name",
+                &["In Progress".into()],
+                Some("team-id"),
+                None,
+            );
+            assert!(query.contains(&format!("$filter:{kind}!")));
+            assert!(query.contains("filter:$filter"));
+            assert_eq!(
+                variables["filter"]["or"][0]["name"]["eqIgnoreCase"],
+                "In Progress"
+            );
+            assert!(variables["after"].is_null());
+            if field == "workflowStates" {
+                assert_eq!(variables["filter"]["team"]["id"]["eq"], "team-id");
+            }
+        }
+    }
+
+    #[test]
+    fn readable_linear_actual_commands_select_columns_and_preserve_json() {
+        use clap::Parser;
+        let data = json!({"nodes":[{"id":"one","identifier":"ENG-7","title":"Issue","name":"A name","key":"ENG","type":"started","state":{"name":"In progress"},"assignee":null}],"opaque":{"Provider":"Claude","raw_ms":123}});
+        for (args, header) in [
+            (vec!["list"], "ISSUE"),
+            (vec!["search", "a query"], "ISSUE"),
+            (vec!["children", "--id", "ENG-1"], "ISSUE"),
+            (vec!["comments", "--id", "ENG-1"], "COMMENT"),
+            (vec!["attachments", "--id", "ENG-1"], "ATTACHMENT"),
+            (vec!["relations", "--id", "ENG-1"], "RELATION"),
+            (vec!["team", "list"], "TEAM"),
+            (vec!["team", "states", "ENG"], "STATE"),
+            (vec!["team", "labels", "ENG"], "LABEL"),
+            (vec!["team", "members", "ENG"], "MEMBER"),
+            (vec!["project", "list"], "PROJECT"),
+        ] {
+            let cli =
+                super::super::Cli::try_parse_from(["cagents", "linear"].into_iter().chain(args))
+                    .unwrap();
+            let super::super::TopCommand::Linear(command) = cli.command else {
+                panic!("expected Linear");
+            };
+            let result = output("linear.test", data.clone(), list_kind(&command.command));
+            assert!(result.human.starts_with(header), "{}", result.human);
+            assert_eq!(result.data, data);
+        }
+        let cli = super::super::Cli::try_parse_from([
+            "cagents",
+            "linear",
+            "set",
+            "--id",
+            "ENG-1",
+            "title",
+            "New title",
+        ])
+        .unwrap();
+        let super::super::TopCommand::Linear(command) = cli.command else {
+            panic!("expected Linear");
+        };
+        let result = output("linear.set", data.clone(), list_kind(&command.command));
+        assert_eq!(result.human, serde_json::to_string_pretty(&data).unwrap());
+        assert_eq!(result.data, data);
+    }
+
     #[test]
     fn dates_validate_calendar() {
         for d in ["2024-02-29", "2026-10-09"] {

@@ -140,6 +140,25 @@ pub(crate) fn open_existing_private_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Inspection must not repair permissions or change the receipt's metadata.
+/// An unsafe or multiply linked file is unavailable, never silently migrated.
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) fn open_existing_private_file_readonly(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    validate_owned_regular_file(path, &metadata)?;
+    if metadata.mode() & 0o077 != 0 || metadata.nlink() != 1 {
+        return Err(storage_error(
+            path,
+            "inspection requires a singly linked private file",
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(feature = "host")]
 pub(crate) fn open_private_append_file(path: &Path) -> io::Result<File> {
     let parent = path
@@ -156,4 +175,53 @@ pub(crate) fn open_private_append_file(path: &Path) -> io::Result<File> {
         .open(path)?;
     validate_and_privatize_open_file(path, &file)?;
     Ok(file)
+}
+
+#[cfg(all(test, any(feature = "ui", feature = "host")))]
+mod readonly_tests {
+    use super::*;
+
+    #[test]
+    fn inspecting_a_private_receipt_does_not_rewrite_permissions_or_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipt");
+        fs::write(&path, b"exact saved receipt").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let file = open_existing_private_file_readonly(&path).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!(before.mode(), after.mode());
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        // SAFETY: scalar fcntl query on the live descriptor.
+        use std::os::fd::AsRawFd;
+        assert_ne!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        drop(file);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_existing_private_file_readonly(&path).is_err());
+        assert_eq!(
+            fs::metadata(&path).unwrap().mode() & 0o777,
+            0o644,
+            "inspection refuses instead of repairing"
+        );
+    }
+
+    #[test]
+    fn receipt_inspection_refuses_symlinks_and_extra_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipt");
+        fs::write(&path, b"receipt").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(open_existing_private_file_readonly(&alias).is_err());
+        fs::remove_file(&alias).unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        assert!(open_existing_private_file_readonly(&path).is_err());
+    }
 }

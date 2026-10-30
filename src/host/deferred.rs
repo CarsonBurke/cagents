@@ -91,7 +91,7 @@ impl Drop for Credit {
     }
 }
 struct Pending {
-    reply: Receiver<Result<(), String>>,
+    reply: crate::chat::runtime::CommandReply,
     deadline: Instant,
     complete: Box<dyn FnOnce(Result<(), String>) + Send>,
     _credit: Credit,
@@ -193,8 +193,7 @@ pub(super) fn try_defer(
             ));
         }
     };
-    super::client::ensure_control_open(host)?;
-    super::agent_execution::terminals::admit(host, client_id, &request)?;
+    super::client::admit_shared_request(host, client_id, &request)?;
     // This preserves the exact interactive ownership/agent gate used by the
     // synchronous ChatCommand path; only waiting for its reply is deferred.
     let reply = super::chat::enqueue_deferred(host, client_id, request)?;
@@ -258,7 +257,7 @@ fn run(incoming: Receiver<Pending>, cancelled: Receiver<ClientKey>) {
             let cancel_index = cancellations.then(|| select.recv(&cancelled));
             let mut indices = Vec::with_capacity(pending.len());
             for job in &pending {
-                indices.push(select.recv(&job.reply));
+                indices.push(job.reply.select(&mut select));
             }
             let selection = if let Some(deadline) = pending.iter().map(|job| job.deadline).min() {
                 select
@@ -279,7 +278,7 @@ fn run(incoming: Receiver<Pending>, cancelled: Receiver<ClientKey>) {
                         .iter()
                         .position(|index| *index == operation.index())
                         .unwrap();
-                    Ready::Reply(index, operation.recv(&pending[index].reply))
+                    Ready::Reply(index, pending[index].reply.receive(operation))
                 }
                 None => Ready::Deadline,
             }
@@ -372,7 +371,7 @@ mod tests {
         let (ignored, reply) = crossbeam_channel::bounded(1);
         let event = events.clone();
         send.send(Pending {
-            reply,
+            reply: reply.into(),
             deadline: Instant::now() + Duration::from_secs(10),
             complete: Box::new(move |reply| {
                 event.send(("ordinary", reply)).unwrap();
@@ -382,7 +381,7 @@ mod tests {
         .unwrap_or_else(|_| panic!("broker fixture stopped"));
         let (interrupt, reply) = crossbeam_channel::bounded(1);
         send.send(Pending {
-            reply,
+            reply: reply.into(),
             deadline: Instant::now() + Duration::from_secs(1),
             complete: Box::new(move |reply| {
                 events.send(("interrupt", reply)).unwrap();
@@ -405,6 +404,39 @@ mod tests {
         assert_eq!(budget.lock().unwrap().total, 0);
     }
     #[test]
+    fn retained_receipt_refusal_keeps_its_uncertainty_through_the_completion_broker() {
+        let (send, receive) = crossbeam_channel::bounded(1);
+        let (cancel, cancelled) = crossbeam_channel::bounded(1);
+        let worker = std::thread::spawn(move || run(receive, cancelled));
+        let budget = Arc::new(Mutex::new(Budget::default()));
+        let (provider, reply) = crossbeam_channel::bounded(1);
+        let (event, observed) = crossbeam_channel::bounded(1);
+        send.send(Pending {
+            reply: crate::chat::runtime::CommandReply::Retained(reply),
+            deadline: Instant::now() + Duration::from_secs(2),
+            complete: Box::new(move |reply| {
+                let _ = event.send(reply);
+            }),
+            _credit: Credit::acquire(&budget, key(1), TerminalId::new(), false).unwrap(),
+        })
+        .unwrap_or_else(|_| panic!("broker fixture stopped"));
+        provider
+            .send(Err(crate::chat::runtime::Rejection::Unacknowledged(
+                "original sequence 7 remains unknown; never regenerate".into(),
+            )))
+            .unwrap();
+        let error = observed
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("original sequence 7 remains unknown; never regenerate"));
+        drop(send);
+        drop(cancel);
+        worker.join().unwrap();
+        assert_eq!(budget.lock().unwrap().total, 0);
+    }
+
+    #[test]
     fn deadlines_and_disconnections_release_bounded_reply_ownership() {
         for disconnected in [false, true] {
             let (send, receive) = crossbeam_channel::bounded(4);
@@ -415,7 +447,7 @@ mod tests {
             let (provider, reply) = crossbeam_channel::bounded(1);
             let (event, observed) = crossbeam_channel::bounded(1);
             send.send(Pending {
-                reply,
+                reply: reply.into(),
                 deadline: if disconnected {
                     Instant::now() + Duration::from_secs(10)
                 } else {

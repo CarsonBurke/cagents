@@ -1,0 +1,36 @@
+[package]
+name = "smithay-clipboard"
+version = "0.8.0"
+authors = [
+    "Kirill Chibisov <contact@kchibisov.com>",
+    "Victor Berger <victor.berger@m4x.org>",
+]
+edition = "2021"
+description = "Provides access to the wayland clipboard for client applications."
+repository = "https://github.com/smithay/smithay-clipboard"
+documentation = "https://smithay.github.io/smithay-clipboard"
+license = "MIT"
+keywords = ["clipboard", "wayland"]
+rust-version = "1.65.0"
+
+# Standalone, so its regression tests run in place; cagents uses it as a patch.
+[workspace]
+
+[dependencies]
+libc = "0.2.149"
+sctk = { package = "smithay-client-toolkit", version = "0.20", default-features = false, features = [
+    "calloop",
+] }
+wayland-backend = { version = "0.3.3", default_features = false, features = [
+    "client_system",
+] }
+raw-window-handle = { version = "0.6", optional = true }
+
+[dev-dependencies]
+wayland-server = "0.31"
+
+[features]
+default = ["dlopen", "dnd", "rwh-6"]
+rwh-6 = ["raw-window-handle"]
+dnd = []
+dlopen = ["wayland-backend/dlopen"]

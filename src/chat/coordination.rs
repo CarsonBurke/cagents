@@ -220,12 +220,50 @@ pub struct Run {
     pub result: String,
 }
 
+/// A bounded candidate check for callers which schedule recognition off-thread.
+/// Short ordinary commands can be excluded without parsing shell syntax. Long
+/// commands are always candidates; arbitrary quoting/JSON is read by the worker.
+pub fn may_recognize(item: &Item, provider: Provider) -> bool {
+    match &item.content {
+        ItemContent::Command { command, .. } => command.len() > 2048 || names_program(command),
+        ItemContent::Tool { name, .. } => match provider {
+            Provider::Claude => matches!(
+                name.as_str(),
+                "Agent"
+                    | "Task"
+                    | "SendMessage"
+                    | "SubagentHandback"
+                    | "TaskStop"
+                    | "KillShell"
+                    | "TaskOutput"
+            ),
+            Provider::Codex => matches!(
+                name.as_str(),
+                "spawnAgent"
+                    | "spawn_agent"
+                    | "sendInput"
+                    | "send_input"
+                    | "wait"
+                    | "closeAgent"
+                    | "close_agent"
+                    | "resumeAgent"
+                    | "resume_agent"
+            ),
+            Provider::Omp => name == "task",
+        },
+        _ => false,
+    }
+}
+
 /// What `item` did to coordinate, when it did anything of the kind.
 ///
 /// `provider` is the conversation's, which is what gives a tool's name its
 /// meaning: a tool called `task` is OMP's subagent launcher and nobody
 /// else's.
 pub fn recognize(item: &Item, provider: Provider) -> Option<Coordination> {
+    if !may_recognize(item, provider) {
+        return None;
+    }
     match &item.content {
         ItemContent::Command {
             command, output, ..

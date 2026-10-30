@@ -179,20 +179,39 @@ impl Cagents {
     }
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
-        let regained_focus = match action {
-            Action::Focused(window, focused) => {
-                if self.core.main_window_id() != Some(window) {
-                    return Task::none();
-                }
-                let regained = focused && !self.refresh_ui.focused;
-                self.refresh_ui.focused = focused;
-                if !regained {
-                    return Task::none();
-                }
-                true
+        match action {
+            Action::Tick => self.refresh(false),
+            Action::Focused(window, focused) if self.core.main_window_id() == Some(window) => {
+                self.main_window_focus_changed(focused)
             }
-            Action::Tick => false,
-        };
+            Action::Focused(..) => Task::none(),
+        }
+    }
+
+    /// Everything that follows the main window's focus. Regaining it catches
+    /// up on whatever only polls, or polls quickly, while it is focused.
+    fn main_window_focus_changed(&mut self, focused: bool) -> Task<Message> {
+        let regained = focused && !self.refresh_ui.focused;
+        if !focused {
+            self.tab_history.finish(self.workspace.focused());
+            // Losing the window is not a choice of workspace, and the
+            // release that would have made one never arrives.
+            self.cancel_workspace_preview();
+        }
+        self.refresh_ui.focused = focused;
+        crate::ui_controls::animate_activity(focused);
+        if !regained {
+            return self.accounts_focus_changed(focused, false);
+        }
+        Task::batch([
+            self.refresh(true),
+            self.accounts_focus_changed(focused, true),
+            self.installation_focus_regained(),
+            self.review_requests_focus_regained(),
+        ])
+    }
+
+    fn refresh(&mut self, regained_focus: bool) -> Task<Message> {
         // Device windows refresh their navigation catalog through the daemon.
         // Git, editor and filesystem refreshes below remain local-only.
         if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
@@ -388,6 +407,27 @@ mod tests {
 
     fn active<const N: usize>(projects: [ProjectId; N]) -> [(ProjectId, Duration); N] {
         projects.map(|project| (project, ACTIVE_PROJECT_INTERVAL))
+    }
+
+    /// Spinners take their cadence from the main window's focus and nothing
+    /// else: another window's focus changes must neither slow nor restore it.
+    #[test]
+    fn activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let main = window::Id::RESERVED;
+        app.core.set_main_window_id(Some(main));
+        let other = window::Id::unique();
+        assert!(!crate::ui_controls::activity_animates());
+
+        drop(app.update(Message::RefreshUi(Action::Focused(main, true))));
+        assert!(crate::ui_controls::activity_animates());
+        drop(app.update(Message::RefreshUi(Action::Focused(other, false))));
+        assert!(crate::ui_controls::activity_animates());
+
+        drop(app.update(Message::RefreshUi(Action::Focused(main, false))));
+        assert!(!crate::ui_controls::activity_animates());
+        drop(app.update(Message::RefreshUi(Action::Focused(other, true))));
+        assert!(!crate::ui_controls::activity_animates());
     }
 
     #[test]
@@ -605,7 +645,7 @@ mod tests {
         }
         crate::device::save(crate::device::Device {
             name: "focus-test".into(),
-            host: "fw16".into(),
+            host: "build-host".into(),
             executable: "cagents".into(),
         })
         .unwrap();

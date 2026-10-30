@@ -1,6 +1,6 @@
 //! OS thread exit can follow is_finished (notably TLS destructors). Keep
 //! actual joins off callers with deadlines and retain the exact actor owner.
-use super::Handle;
+use super::LocalHandle as Handle;
 use std::sync::{OnceLock, atomic::Ordering};
 
 struct Task {

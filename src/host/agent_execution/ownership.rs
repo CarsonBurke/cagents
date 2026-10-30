@@ -7,6 +7,8 @@ use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
 pub(in crate::host) enum Reconciliation {
     Closed,
     Idle,
+    /// The exact owned provider is busy or changed before idle close; retain its slot.
+    Busy,
     UserOwned,
 }
 
@@ -180,8 +182,11 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
             let snapshot = handle
                 .snapshot(None)
                 .ok_or("Provider state is unavailable")?;
-            if !snapshot.ready || snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty()
+            if snapshot.ready && snapshot.busy && !snapshot.waiting && snapshot.requests.is_empty()
             {
+                return Ok(Reconciliation::Busy);
+            }
+            if !snapshot.ready || snapshot.waiting || !snapshot.requests.is_empty() {
                 return Err("The provider is not idle; automatic cleanup did not stop it".into());
             }
             Some(snapshot.generation)
@@ -194,7 +199,9 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
             return Ok(Reconciliation::Idle);
         }
         if let Some(generation) = idle_generation {
-            handle.close_if_idle(generation)?;
+            if !handle.try_close_if_idle(generation)? {
+                return Ok(Reconciliation::Busy);
+            }
         }
         super::super::chat::process(
             host,

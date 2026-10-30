@@ -9,6 +9,8 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
 mod names;
+pub(crate) mod native_chat_capacity;
+pub mod search_match;
 
 pub mod account;
 pub mod agent;
@@ -22,12 +24,18 @@ pub mod automations;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
+pub mod channel_work;
+pub mod channel_work_api;
+#[cfg(feature = "ui")]
+pub mod channel_work_ui;
 pub mod chat;
 pub mod companion;
 pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]
 pub(crate) mod daemon_health;
+#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+pub(crate) mod descriptor_frame;
 #[cfg(feature = "ui")]
 pub mod design;
 pub mod device;
@@ -44,6 +52,8 @@ pub mod editor;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_history;
 #[cfg(feature = "ui")]
+pub mod editor_search;
+#[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
 pub mod file_drop;
@@ -51,8 +61,11 @@ pub mod file_drop;
 pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) mod file_url;
+mod filesystem_recovery_context;
 pub mod fs_safety;
-#[cfg(feature = "ui")]
+#[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
@@ -69,6 +82,7 @@ pub mod instance;
 pub mod interaction;
 #[cfg(feature = "latency-harness")]
 pub mod latency_fixture;
+pub mod layout_metrics;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
 pub mod linear;
@@ -77,14 +91,17 @@ pub mod location;
 pub mod lsp;
 pub mod model;
 pub mod notifications;
+#[cfg(feature = "ui")]
+pub mod operation_recovery;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
-#[cfg(any(feature = "ui", feature = "host"))]
+#[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
 pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
+pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod reorder;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -97,7 +114,6 @@ mod selected_file_path;
 mod separator;
 #[cfg(feature = "ui")]
 pub mod session;
-#[cfg(feature = "ui")]
 pub mod settings;
 #[cfg(feature = "ui")]
 pub mod settings_widgets;
@@ -118,9 +134,18 @@ pub mod transcript_location;
 pub mod tray;
 #[cfg(feature = "ui")]
 pub mod ui_controls;
+#[cfg(feature = "ui")]
+pub mod ui_memory;
 pub mod update;
 pub mod upgrade;
+pub mod work;
+#[cfg(feature = "ui")]
+pub mod work_ui;
+pub mod worktree_branch;
 pub mod worktree_cleanup;
+pub mod worktree_content;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod worktree_setup;
 pub use terminal::ipc as terminal_ipc;
 #[cfg(feature = "ui")]
 pub mod workspace;

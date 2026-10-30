@@ -62,7 +62,7 @@ impl Tracker {
             State::Cancelled
         } else if status.is_some_and(|status| status.success()) {
             State::Interrupted
-        } else if status.is_some() || diagnostic.is_some() {
+        } else if status.is_some() {
             State::Failed
         } else {
             State::Interrupted
@@ -176,7 +176,12 @@ impl Tracker {
             Kind::Succeeded => State::Succeeded,
             Kind::Failed => State::Failed,
             Kind::Cancelled => State::Cancelled,
-            Kind::Waiting | Kind::Interrupted | Kind::ReviewRequested | Kind::MessageReceived => {
+            Kind::Waiting
+            | Kind::Interrupted
+            | Kind::ReviewRequested
+            | Kind::MessageReceived
+            | Kind::AutomationPaused
+            | Kind::AutomationBlocked => {
                 return Err("Attention is not a confirmed provider outcome".into());
             }
         };
@@ -309,6 +314,25 @@ mod tests {
     }
 
     #[test]
+    fn missing_exact_exit_status_keeps_diagnostics_without_inventing_failure() {
+        let mut tracker = Tracker::default();
+        let run = RunId::new();
+        tracker.start(run, "request".into()).unwrap();
+        let updates = tracker.ended(false, None, Some("writer disappeared"), Usage::default());
+        let Update::Finished { state, result } = &updates[0].1 else {
+            panic!("missing interrupted outcome")
+        };
+        assert_eq!(*state, State::Interrupted);
+        assert!(
+            result
+                .diagnostic
+                .as_ref()
+                .unwrap()
+                .contains("writer disappeared")
+        );
+    }
+
+    #[test]
     fn deferred_outcome_retains_the_old_result_and_usage_after_a_new_prompt() {
         let mut tracker = Tracker::default();
         let first = RunId::new();
@@ -359,7 +383,13 @@ mod tests {
         tracker.observe(run, &text("message", "Completed answer"));
         tracker.settle(run, Usage::default()).unwrap();
 
-        assert!(tracker.finish(run, Kind::MessageReceived).is_err());
+        for attention in [
+            Kind::MessageReceived,
+            Kind::AutomationPaused,
+            Kind::AutomationBlocked,
+        ] {
+            assert!(tracker.finish(run, attention).is_err());
+        }
         let Update::Finished { state, result } = tracker.finish(run, Kind::Succeeded).unwrap()
         else {
             panic!("expected result")

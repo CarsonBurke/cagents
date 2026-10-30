@@ -1,6 +1,6 @@
 //! A fixed, bounded owner for retained-provider cleanup. Caller deadlines do
 //! not abandon holders or allocate another thread for each close attempt.
-use super::Handle;
+use super::LocalHandle as Handle;
 use std::sync::{OnceLock, atomic::Ordering};
 
 const CAPACITY: usize = 64;

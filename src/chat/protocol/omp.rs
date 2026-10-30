@@ -429,17 +429,50 @@ impl Omp {
                 at: None,
             }];
         }
-        message["content"]
+        let blocks = message["content"]
             .as_array()
-            .into_iter()
-            .flatten()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mapping = if role == Role::User
+            && blocks
+                .first()
+                .is_some_and(|block| text(block, "type") == "text")
+            && blocks.len() > 1
+            && blocks[1..]
+                .iter()
+                .all(|block| text(block, "type") == "image")
+        {
+            let sources = blocks[1..]
+                .iter()
+                .map(|block| {
+                    format!(
+                        "data:{};base64,{}",
+                        text(block, "mimeType"),
+                        text(block, "data")
+                    )
+                })
+                .collect::<Vec<_>>();
+            super::image_references::restore_list(text(&blocks[0], "text"), &sources)
+        } else {
+            None
+        };
+        blocks
+            .iter()
             .enumerate()
             .filter_map(|(index, block)| {
                 let (id, content) = match text(block, "type") {
                     "text" => (
                         format!("{key}:{index}"),
                         ItemContent::Text {
-                            text: text(block, "text").into(),
+                            text: if index == 0 {
+                                mapping
+                                    .as_ref()
+                                    .map(|(plain, _)| *plain)
+                                    .unwrap_or_else(|| text(block, "text"))
+                                    .into()
+                            } else {
+                                text(block, "text").into()
+                            },
                             thinking: false,
                             phase: phase(block),
                         },
@@ -465,12 +498,28 @@ impl Omp {
                     "image" => (
                         format!("{key}:{index}"),
                         ItemContent::Image {
+                            reference: mapping.as_ref().and_then(|(_, refs)| {
+                                index
+                                    .checked_sub(1)
+                                    .and_then(|index| refs.get(index))
+                                    .cloned()
+                                    .flatten()
+                            }),
                             path: format!(
                                 "data:{};base64,{}",
                                 text(block, "mimeType"),
                                 text(block, "data")
                             ),
-                            description: "Image attachment".into(),
+                            description: mapping
+                                .as_ref()
+                                .and_then(|(_, refs)| {
+                                    index
+                                        .checked_sub(1)
+                                        .and_then(|index| refs.get(index))
+                                        .and_then(Option::as_ref)
+                                })
+                                .map(|reference| reference.label())
+                                .unwrap_or_else(|| "Image attachment".into()),
                         },
                     ),
                     _ => return None,
@@ -755,21 +804,54 @@ impl Adapter for Omp {
                 }
                 let kind=match mode {PromptMode::Send=>"prompt",PromptMode::Steer=>"steer",PromptMode::Queue=>"follow_up"};
                 let mut request=self.request(kind);
+                let ordered = super::image_references::ordered(&message, &attachments)?;
+                let mapped = ordered.iter().filter(|a| a.reference.is_some()).count();
+                // Every managed receipt is an image. Refuse this known lower
+                // bound before even resolving a legacy sentinel path or blob.
+                super::image_references::check_image_count(mapped)?;
+                let mut prepared = Vec::with_capacity(ordered.len());
+                for attachment in ordered {
+                    // ordered() already checked the managed extension schema.
+                    // Counting does not resolve/read a managed receipt or blob.
+                    let (path, ext) = if let Some(reference) = &attachment.reference {
+                        (None, reference.extension.clone())
+                    } else {
+                        let path=attachment.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",attachment.path.display()))?;
+                        let ext=path.extension().and_then(|s|s.to_str()).unwrap_or_default().to_ascii_lowercase();
+                        (Some(path), ext)
+                    };
+                    let mime=match ext.as_str(){"png"=>Some("image/png"),"jpg"|"jpeg"=>Some("image/jpeg"),"gif"=>Some("image/gif"),"webp"=>Some("image/webp"),_=>None};
+                    prepared.push((attachment, path, mime));
+                }
+                // Legacy paths may resolve through symlinks to images, so use
+                // their actual resolved types. Nonimage files consume no image
+                // slots, and prompts without managed mapping keep old rules.
+                if mapped > 0 {
+                    super::image_references::check_image_count(prepared.iter().filter(|(_, _, mime)| mime.is_some()).count())?;
+                }
                 let mut message=message;
                 let mut images=Vec::new();
-                for attachment in attachments {
-                    let path=attachment.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",attachment.path.display()))?;
-                    let ext=path.extension().and_then(|s|s.to_str()).unwrap_or_default().to_ascii_lowercase();
-                    let mime=match ext.as_str(){"png"=>Some("image/png"),"jpg"|"jpeg"=>Some("image/jpeg"),"gif"=>Some("image/gif"),"webp"=>Some("image/webp"),_=>None};
+                let mut references=Vec::new();
+                for (attachment, path, mime) in prepared {
+                    let path = match path {
+                        Some(path) => path,
+                        None => {
+                            let owned = crate::chat::attachment_assets::resolve(attachment)?;
+                            owned.path.canonicalize().map_err(|e|format!("Cannot attach {}: {e}",owned.path.display()))?
+                        }
+                    };
                     if let Some(mime)=mime {
                         let mut bytes=Vec::new(); File::open(&path).map_err(|e|e.to_string())?.take(MAX_IMAGE+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
                         if bytes.len() as u64>MAX_IMAGE {return Err("Image exceeds the 16 MiB attachment limit.".into());}
+                        references.push(attachment.reference.clone());
                         images.push(json!({"type":"image","mimeType":mime,"data":STANDARD.encode(bytes)}));
                     } else {
                         message.push_str("\nAttached file (read this exact path): "); message.push_str(&serde_json::to_string(&path.to_string_lossy()).map_err(|e|e.to_string())?);
                     }
                 }
+                if references.iter().any(Option::is_some) { message.push_str(&super::image_references::image_list(&references)?); }
                 request["message"]=message.into(); if !images.is_empty(){request["images"]=images.into();}
+                for attachment in &attachments { crate::chat::attachment_assets::retain(attachment)?; }
                 step.writes.push(request);
             }
             Command::Interrupt => step.writes.push(self.request("abort")),
@@ -810,6 +892,8 @@ impl Adapter for Omp {
             Command::Compact => step.writes.push(self.request("compact")),
             Command::ResumeAfterLogin { .. } => return Err("Live login verification is available for Codex chats".into()),
             Command::Refresh => return Ok(self.refresh()),
+            Command::ReadTextCopy { .. } =>
+                return Err("Text copies are served by the transcript cache".into()),
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } =>
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
@@ -1866,6 +1950,201 @@ mod tests {
     }
 
     #[test]
+    fn managed_mapping_limit_refuses_before_any_sentinel_path_lookup_or_payload_read() {
+        let device = uuid::Uuid::new_v4();
+        let mut attachments = vec![chat::Attachment::file(
+            "/must-not-read-before-image-mapping-limit.txt",
+        )];
+        attachments.extend((1..=129).map(|number| chat::Attachment {
+            path: format!("/must-not-read-before-image-mapping-limit-{number}.png").into(),
+            reference: Some(chat::ImageReference {
+                id: uuid::Uuid::new_v4(),
+                number,
+                device,
+                name: "image.png".into(),
+                sha256: "a".repeat(64),
+                extension: "png".into(),
+            }),
+        }));
+        let mut adapter = Omp {
+            ready: true,
+            ..Default::default()
+        };
+        let error = adapter
+            .command(Command::Prompt {
+                text: String::new(),
+                attachments,
+                mode: PromptMode::Send,
+            })
+            .err()
+            .expect("129 managed images must fail");
+        assert!(
+            error.contains("Too many image mappings"),
+            "mapping cap must precede the sentinel path/receipt error: {error}"
+        );
+    }
+
+    #[test]
+    fn mixed_mapping_overflow_precedes_even_the_first_managed_blob_read() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let directory = tempfile::tempdir().unwrap();
+            let legacy = directory.path().join("legacy.png");
+            std::fs::write(&legacy, std::fs::read(&first.path).unwrap()).unwrap();
+            let mut attachments = vec![first.clone()];
+            attachments.extend(
+                (1..128).map(|i| {
+                    crate::chat::attachment_assets::test_image(&format!("managed-{i}.png"))
+                }),
+            );
+            attachments.push(chat::Attachment::file(legacy));
+            // All128 UUID receipts are real. A missing first blob is an IO
+            // sentinel: exact129-image overflow must win before resolving it.
+            std::fs::remove_file(&first.path).unwrap();
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let error = adapter
+                .command(Command::Prompt {
+                    text: String::new(),
+                    attachments,
+                    mode: PromptMode::Send,
+                })
+                .err()
+                .expect("mixed129-image mapping must fail");
+            assert!(
+                error.contains("Too many image mappings"),
+                "count refusal must precede the missing managed blob read: {error}"
+            );
+            assert!(
+                crate::chat::attachment_assets::list()
+                    .unwrap()
+                    .images
+                    .iter()
+                    .all(|image| !image.retained),
+                "failed preflight must not retain any image"
+            );
+        });
+    }
+
+    #[test]
+    fn nonimage_legacy_files_do_not_consume_managed_image_mapping_slots() {
+        crate::chat::attachment_assets::with_test_image(|image| {
+            let directory = tempfile::tempdir().unwrap();
+            let document = directory.path().join("notes.txt");
+            std::fs::write(&document, b"ordinary document").unwrap();
+            let mut attachments = vec![image.clone()];
+            attachments.extend((0..129).map(|_| chat::Attachment::file(document.clone())));
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let sent = adapter
+                .command(Command::Prompt {
+                    text: image.reference.as_ref().unwrap().token(),
+                    attachments,
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            assert_eq!(sent.writes[0]["images"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                sent.writes[0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .matches("Attached file (read this exact path)")
+                    .count(),
+                129
+            );
+        });
+    }
+
+    #[test]
+    fn referenced_image_array_mapping_restores_only_verified_retained_history() {
+        crate::chat::attachment_assets::with_test_image(|first| {
+            let second = crate::chat::attachment_assets::test_image("second.png");
+            let display = tempfile::tempdir().unwrap();
+            let mut hinted = first.clone();
+            hinted.path = display.path().join(first.path.file_name().unwrap());
+            std::fs::copy(&second.path, &hinted.path).unwrap();
+            let first_ref = first.reference.as_ref().unwrap();
+            let second_ref = second.reference.as_ref().unwrap();
+            let text = format!(
+                "Earlier [Image 77777] was dark; compare new {} between {} after",
+                second_ref.token(),
+                first_ref.token()
+            );
+            let mut adapter = Omp {
+                ready: true,
+                ..Default::default()
+            };
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text: text.clone(),
+                    attachments: vec![hinted, second.clone()],
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            let request = &submitted.writes[0];
+            let images = request["images"].as_array().unwrap();
+            assert_eq!(images.len(), 2);
+            assert_ne!(
+                std::fs::read(&first.path).unwrap(),
+                std::fs::read(&second.path).unwrap(),
+                "image order fixture must contain different pixels"
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(images[1]["data"].as_str().unwrap())
+                    .unwrap(),
+                std::fs::read(&first.path).unwrap()
+            );
+            assert_eq!(
+                STANDARD
+                    .decode(images[0]["data"].as_str().unwrap())
+                    .unwrap(),
+                std::fs::read(&second.path).unwrap()
+            );
+            let mut content = vec![json!({"type":"text","text":request["message"]})];
+            content.extend(images.iter().cloned());
+            let mut history = json!({"role":"user","id":"omp-images","content":content});
+            let restored = adapter.message_items(&history);
+            assert!(
+                matches!(&restored[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+            );
+            let identities = restored
+                .iter()
+                .filter_map(|item| match &item.content {
+                    ItemContent::Image {
+                        reference: Some(reference),
+                        ..
+                    } => Some(reference.id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(identities, [second_ref.id, first_ref.id]);
+            history["content"][1]["data"] = json!(STANDARD.encode(b"different image"));
+            let untrusted = adapter.message_items(&history);
+            assert!(
+                matches!(&untrusted[0].content, ItemContent::Text { text: visible, .. } if visible.contains("cagents-image-inputs"))
+            );
+            assert!(untrusted.iter().all(|item| !matches!(
+                &item.content,
+                ItemContent::Image {
+                    reference: Some(_),
+                    ..
+                }
+            )));
+            history["content"] = json!(request["message"]);
+            let unavailable = adapter.message_items(&history);
+            assert_eq!(
+                unavailable.len(),
+                1,
+                "text-only provider history never manufactures image items"
+            );
+        });
+    }
+
+    #[test]
     fn branching_restores_the_selected_prompt_after_the_confirmed_session_reset() {
         let mut adapter = Omp {
             ready: true,
@@ -2647,6 +2926,64 @@ mod tests {
         let request = adapter.request("get_state");
         assert!(adapter.receive(json!({"type":"response","id":request["id"],"command":"get_state","success":true,"data":{"sessionId":"other"}})).is_err());
         assert!(!adapter.ready);
+    }
+
+    #[test]
+    fn notification_questions_preserve_omp_messages_without_prefill_values() {
+        for method in ["select", "input", "editor", "confirm"] {
+            let question = |message: &str, prefill: &str| {
+                json!({
+                    "type":"extension_ui_request", "id":"migration", "method":method,
+                    "title":"Migration strategy", "message":message,
+                    "placeholder":"Choose a strategy", "prefill":prefill,
+                    "options":["Keep", "Replace"]
+                })
+            };
+            let receipts = crate::chat::runtime::notification_frames_for_test(
+                Box::new(Omp {
+                    ready: true,
+                    ..Default::default()
+                }),
+                vec![
+                    question(
+                        "Which migration strategy should be used?",
+                        "PRIVATE_PREFILL",
+                    ),
+                    question("Updated question: keep config_file.rs?", "PRIVATE_PREFILL"),
+                    question(
+                        "Updated question: keep config_file.rs?",
+                        "EDITED_PRIVATE_PREFILL",
+                    ),
+                ],
+                false,
+            );
+            assert_eq!(
+                receipts.len(),
+                2,
+                "prefill changes must not notify: {method}"
+            );
+            for (index, expected) in [
+                "Which migration strategy should be used?",
+                "Updated question: keep config_file.rs?",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (evidence, content) = &receipts[index];
+                assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+                assert_eq!(
+                    content.request,
+                    Some(crate::notifications::RequestType::Question)
+                );
+                assert!(
+                    content.preview.starts_with(expected),
+                    "{method}: {}",
+                    content.preview
+                );
+                assert!(!content.preview.contains("PRIVATE_PREFILL"));
+            }
+            assert_ne!(receipts[0].0.key, receipts[1].0.key);
+        }
     }
 
     #[test]

@@ -1,5 +1,9 @@
-//! Use the preferred reading width unless the footer needs more room.
+//! One reading column, determined by available space rather than its contents.
 use super::*;
+
+/// The conversation's readable width, including its symmetric inset.
+pub(in crate::app) const READING_COLUMN: f32 = design::READABLE_MEASURE + 2.0 * step::GAP_M;
+
 use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, mouse, overlay, renderer,
     widget::{Operation, Tree},
@@ -9,17 +13,14 @@ use iced::{Event, Point, Rectangle, Size, Vector};
 pub(super) fn pane<'a>(
     body: Element<'a, Message>,
     footer: Element<'a, Message>,
-    preferred: f32,
 ) -> Element<'a, Message> {
     Element::new(Pane {
         children: [body, footer],
-        preferred,
     })
 }
 
 struct Pane<'a> {
     children: [Element<'a, Message>; 2],
-    preferred: f32,
 }
 
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Pane<'_> {
@@ -39,38 +40,36 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Pane<'_> {
         renderer: &cosmic::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        // Measure only the footer, not the transcript. Its widgets know their
-        // actual font and control extents; character-count estimates do not.
-        let natural = self.children[1].as_widget_mut().layout(
-            &mut tree.children[1],
-            renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(f32::INFINITY, limits.max().height)),
-        );
-        let width = self
-            .preferred
-            // Flex layout rounds child positions to pixels. Reserve a pixel
-            // beyond the measured extent so fractional text widths still fit.
-            .max(natural.size().width.ceil() + 1.0)
-            .min(limits.max().width);
+        // The footer is laid out at the reading column's exact width. A
+        // permission request, resumed conversation or wider status label must
+        // never move the column. The footer's flex row wraps within that room.
+        //
+        // The body spans the pane so the transcript's scroll viewport, and its
+        // scrollbar, reach the pane edge. The body's own children keep
+        // everything else, including the transcript's rows, centered in the
+        // same reading column.
+        let pane = limits.max().width.max(0.0);
+        let width = pane.min(READING_COLUMN);
         let mut footer = self.children[1].as_widget_mut().layout(
             &mut tree.children[1],
             renderer,
             &layout::Limits::new(Size::ZERO, Size::new(width, limits.max().height)),
         );
         let body_height = (limits.max().height - footer.size().height - step::GAP_S).max(0.0);
-        let mut body = self.children[0].as_widget_mut().layout(
+        let body = self.children[0].as_widget_mut().layout(
             &mut tree.children[0],
             renderer,
-            &layout::Limits::new(Size::new(width, body_height), Size::new(width, body_height)),
+            &layout::Limits::new(Size::new(pane, body_height), Size::new(pane, body_height)),
         );
         let size = limits.resolve(
             Length::Fill,
             Length::Fill,
-            Size::new(width, body_height + step::GAP_S + footer.size().height),
+            Size::new(pane, body_height + step::GAP_S + footer.size().height),
         );
-        let x = (size.width - width) / 2.0;
-        body.move_to_mut(Point::new(x, 0.0));
-        footer.move_to_mut(Point::new(x, body_height + step::GAP_S));
+        footer.move_to_mut(Point::new(
+            (size.width - width) / 2.0,
+            body_height + step::GAP_S,
+        ));
         layout::Node::with_children(size, vec![body, footer])
     }
 
@@ -248,63 +247,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn footer_expands_the_reading_width_before_wrapping() {
+    fn contents_do_not_change_the_reading_column_and_the_body_spans_the_pane() {
         let renderer = crate::app::tests::headless_renderer();
-        for (preferred, available, expected_width, wrapped) in [
-            (400.0, 800.0, 400.0, false),
-            (100.0, 800.0, 311.0, false),
-            (100.0, 200.0, 200.0, true),
-        ] {
-            let footer = widget::flex_row(vec![
-                widget::Space::new().width(150).height(20).into(),
-                widget::Space::new().width(150).height(20).into(),
-            ])
-            .spacing(10)
-            .into();
-            let mut element = pane(
-                widget::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into(),
-                footer,
-                preferred,
-            );
-            let mut tree = Tree::new(&element);
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(available, 600.0)),
-            );
-            assert_eq!(node.children()[0].size().width, expected_width);
-            assert_eq!(node.children()[1].size().height > 20.0, wrapped);
-            assert_eq!(
-                node.children()[1].bounds().y + node.children()[1].size().height,
-                600.0
-            );
-            assert_eq!(
-                node.children()[0].bounds().x,
-                (available - expected_width) / 2.0
-            );
+        for available in [280.0_f32, 600.0, 956.0, 1440.0] {
+            let expected = available.min(READING_COLUMN);
+            for footer_width in [0.0, 150.25, 900.0, 3000.0] {
+                let footer = widget::flex_row(vec![
+                    widget::Space::new().width(footer_width).height(20).into(),
+                    widget::Space::new().width(150).height(20).into(),
+                ])
+                .spacing(10)
+                .into();
+                let mut element = pane(
+                    widget::Space::new()
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into(),
+                    footer,
+                );
+                let mut tree = Tree::new(&element);
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(available, 600.0)),
+                );
+                let body = &node.children()[0];
+                let footer = &node.children()[1];
+                assert_eq!(body.size().width, available);
+                assert_eq!(body.bounds().x, 0.0);
+                assert_eq!(footer.bounds().x, (available - expected) / 2.0);
+                assert!(footer.size().width <= expected);
+                assert_eq!(footer.bounds().y + footer.size().height, 600.0);
+            }
         }
-    }
-
-    #[test]
-    fn fractional_footer_extents_do_not_force_a_second_row() {
-        let renderer = crate::app::tests::headless_renderer();
-        let footer = widget::flex_row(vec![
-            widget::Space::new().width(150.25).height(20).into(),
-            widget::Space::new().width(150.25).height(20).into(),
-        ])
-        .spacing(10)
-        .into();
-        let mut element = pane(widget::Space::new().into(), footer, 100.0);
-        let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(800.0, 600.0)),
-        );
-        assert!(node.children()[0].size().width >= 310.5);
-        assert_eq!(node.children()[1].size().height, 20.0);
     }
 }

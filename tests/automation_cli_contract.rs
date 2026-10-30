@@ -1,9 +1,15 @@
 #![cfg(feature = "host")]
 
+#[path = "support/hosted_agent_cleanup.rs"]
+mod hosted_agent_cleanup;
+
+#[path = "support/private_cli_capture.rs"]
+mod private_cli_capture;
+
 use serde_json::{Value, json};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::Path,
     process::{Child, Command, Output, Stdio},
     thread,
@@ -13,6 +19,7 @@ use std::{
 struct Fixture {
     root: tempfile::TempDir,
     daemon: Child,
+    agents: hosted_agent_cleanup::Agents,
 }
 
 impl Fixture {
@@ -36,19 +43,46 @@ impl Fixture {
     }
 
     fn start(root: &Path) -> Child {
+        Self::start_with_soft_limit(root, None)
+    }
+
+    fn start_with_soft_limit(root: &Path, soft_limit: Option<libc::rlim_t>) -> Child {
         let log = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(root.join("daemon.log"))
             .unwrap();
-        Self::command(root, env!("CARGO_BIN_EXE_cagentsd"))
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap()
+        let mut command = Self::command(root, env!("CARGO_BIN_EXE_cagentsd"));
+        command.stdout(log.try_clone().unwrap()).stderr(log);
+        if let Some(soft_limit) = soft_limit {
+            // Set only the fixture daemon's incoming limit. The test process
+            // and the other contracts running beside it retain their limits.
+            unsafe {
+                command.pre_exec(move || {
+                    let mut limit = std::mem::zeroed();
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = soft_limit;
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        command.spawn().unwrap()
     }
 
     fn new() -> Self {
+        Self::with_soft_limit(None)
+    }
+
+    fn with_soft_limit(soft_limit: Option<libc::rlim_t>) -> Self {
+        Self::with_soft_limit_and_branch(soft_limit, "main")
+    }
+
+    fn with_soft_limit_and_branch(soft_limit: Option<libc::rlim_t>, branch: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         for name in [
             "home", "run", "data", "config", "cache", "tmp", "project", "bin",
@@ -56,8 +90,23 @@ impl Fixture {
             fs::create_dir(root.path().join(name)).unwrap();
         }
         fs::set_permissions(root.path().join("run"), fs::Permissions::from_mode(0o700)).unwrap();
-        let daemon = Self::start(root.path());
-        let mut fixture = Self { root, daemon };
+        // Own the repository identity even when TMPDIR has enclosing Git
+        // metadata. Plain-folder discovery must not select another checkout.
+        let initialized = Self::command(root.path(), "/usr/bin/git")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["init", "--quiet", "--template="])
+            .arg(format!("--initial-branch={branch}"))
+            .arg(root.path().join("project"))
+            .output()
+            .unwrap();
+        assert!(initialized.status.success(), "{initialized:?}");
+        let daemon = Self::start_with_soft_limit(root.path(), soft_limit);
+        let mut fixture = Self {
+            root,
+            daemon,
+            agents: Default::default(),
+        };
         fixture.ready();
         fixture
     }
@@ -105,24 +154,12 @@ impl Fixture {
     }
 
     fn output_until(&self, arguments: &[&str], deadline: Instant) -> Output {
-        let mut child = Self::command(self.root.path(), env!("CARGO_BIN_EXE_cagents"))
-            .arg("--json")
-            .args(arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        while child.try_wait().unwrap().is_none() {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                panic!(
-                    "CLI timed out: {arguments:?}: {:?}",
-                    child.wait_with_output()
-                );
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        child.wait_with_output().unwrap()
+        let spec =
+            private_cli_capture::private_cli(self.root.path()).args(arguments.iter().copied());
+        let output = private_cli_capture::capture(spec, deadline)
+            .unwrap_or_else(|failure| panic!("CLI failed: {arguments:?}: {failure:?}"));
+        self.agents.observe(&output);
+        output
     }
 
     fn cli(&self, arguments: &[&str]) -> Value {
@@ -344,9 +381,143 @@ fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.daemon.kill();
+        let panicking = thread::panicking();
+        if panicking {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+        }
+        // Fresh firings retire their execution through the scheduler. Cancel
+        // any still-active private firing only after contract assertions; the
+        // intentional stop/restart boundaries in the tests remain unchanged.
+        let result = self
+            .agents
+            .close(self.root.path())
+            .and_then(|()| hosted_agent_cleanup::stop(self.root.path()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.daemon.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let daemon_stopped = self.daemon.try_wait().ok().flatten().is_some();
+        if !daemon_stopped {
+            let _ = self.daemon.kill();
+        }
         let _ = self.daemon.wait();
+        if let Err(error) = result.and_then(|()| {
+            if daemon_stopped {
+                Ok(())
+            } else {
+                Err("Private daemon did not exit after public cleanup".into())
+            }
+        }) {
+            self.root.disable_cleanup(true);
+            hosted_agent_cleanup::diagnostics(self.root.path());
+            eprintln!(
+                "Private cleanup evidence retained at {}: {error}",
+                self.root.path().display()
+            );
+            if !panicking {
+                panic!("private fixture cleanup failed: {error}");
+            }
+        }
     }
+}
+
+#[test]
+fn precheck_shell_keeps_incoming_limits_while_daemon_retains_raised_limit() {
+    let mut incoming: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut incoming) },
+        0
+    );
+    assert!(
+        incoming.rlim_max > 64,
+        "fixture needs room below the hard limit"
+    );
+    let soft_limit = incoming.rlim_cur.min(1024).min(incoming.rlim_max - 1);
+    let fixture = Fixture::with_soft_limit(Some(soft_limit));
+    let project = fixture.root.path().join("project");
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let definition = json!({
+        "name": "Descriptor limit fixture", "prompt": "must never launch a provider",
+        "agent": { "provider": "Omp", "account": null,
+            "target": {"repository": project, "directory": project, "channel": null},
+            "surface": "Chat", "model": null, "permission_mode": null },
+        "schedule": {"pattern": {"daily": {"hour": 3, "minute": 0}}, "timezone": "UTC"},
+        "session_mode": "fresh",
+        "precheck": {"command": "ulimit -Sn > soft-limit; ulimit -Hn > hard-limit; exit 1", "timeout_seconds": 2}
+    });
+    let path = fixture.root.path().join("definition.json");
+    fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&[
+        "automation",
+        "create",
+        "--definition",
+        path.to_str().unwrap(),
+    ]);
+    let id = created["automation"]["id"].as_str().unwrap();
+    let revision = created["automation"]["execution_revision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let accepted = fixture.cli(&[
+        "automation",
+        "run-now",
+        id,
+        "--execution-revision",
+        &revision,
+        "--request-id",
+        &uuid::Uuid::new_v4().to_string(),
+        "--confirm",
+    ]);
+    let firing = accepted["firing"]["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let detail = fixture.cli(&["automation", "run", firing]);
+        if detail["run"]["firing"]["state"] == "skipped" {
+            assert!(detail["run"]["run"].is_null());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "precheck did not settle: {detail}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let limit_text = |limit: libc::rlim_t| {
+        if limit == libc::RLIM_INFINITY {
+            "unlimited".to_owned()
+        } else {
+            limit.to_string()
+        }
+    };
+    assert_eq!(
+        fs::read_to_string(project.join("soft-limit"))
+            .unwrap()
+            .trim(),
+        limit_text(soft_limit)
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("hard-limit"))
+            .unwrap()
+            .trim(),
+        limit_text(incoming.rlim_max)
+    );
+    let daemon_limits =
+        fs::read_to_string(format!("/proc/{}/limits", fixture.daemon.id())).unwrap();
+    let mut fields = daemon_limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .unwrap()
+        .split_whitespace();
+    assert_eq!(fields.next().unwrap(), limit_text(incoming.rlim_max));
+    assert_eq!(fields.next().unwrap(), limit_text(incoming.rlim_max));
+    let mut unchanged: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut unchanged) },
+        0
+    );
+    assert_eq!(unchanged.rlim_cur, incoming.rlim_cur);
+    assert_eq!(unchanged.rlim_max, incoming.rlim_max);
 }
 
 #[test]
@@ -458,4 +629,99 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
         !fixture.output(&changed).status.success(),
         "retry identity cannot authorize another revision"
     );
+}
+
+#[test]
+fn automation_cli_lifecycle_audit_pages_durable_receipts_without_running_a_provider() {
+    let mut fixture = Fixture::with_soft_limit_and_branch(None, "lifecycle-fixture");
+    let project = fixture.root.path().join("project");
+    // This case owns lifecycle receipts, not discovery of a plain folder.
+    // Bind its project explicitly even when TMPDIR is inside another checkout.
+    let initialized = Fixture::command(fixture.root.path(), "git")
+        .args([
+            "init",
+            "--quiet",
+            "--template=",
+            "--initial-branch=lifecycle-fixture",
+        ])
+        .arg(&project)
+        .output()
+        .unwrap();
+    assert!(initialized.status.success(), "{initialized:?}");
+    let discovered = Fixture::command(fixture.root.path(), "git")
+        .arg("-C")
+        .arg(&project)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .unwrap();
+    assert!(discovered.status.success(), "{discovered:?}");
+    let discovered = String::from_utf8(discovered.stdout).unwrap();
+    assert_eq!(
+        Path::new(discovered.trim_end()).canonicalize().unwrap(),
+        project.canonicalize().unwrap(),
+        "the audit fixture must not discover an enclosing repository"
+    );
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let provider = fixture.root.path().join("bin/omp");
+    fs::write(
+        &provider,
+        "#!/bin/sh\nprintf 'unexpected provider\\n' >> \"$HOME/../unexpected-provider\"\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let definition = json!({
+        "name": "Lifecycle only", "prompt": "PRIVATE_LIFECYCLE_PROMPT",
+        "agent": {"provider": "Omp", "account": null,
+            "target": {"repository": project, "directory": project, "channel": null},
+            "surface": "Chat", "model": null, "permission_mode": null},
+        "schedule": {"pattern": {"daily": {"hour": 3, "minute": 0}}, "timezone": "UTC"},
+        "session_mode": "fresh", "precheck": null
+    });
+    let path = fixture.root.path().join("audit-definition.json");
+    fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&[
+        "automation",
+        "create",
+        "--definition",
+        path.to_str().unwrap(),
+    ]);
+    let id = created["automation"]["id"].as_str().unwrap().to_owned();
+    fixture.cli(&["automation", "disable", &id, "--revision", "1"]);
+    assert!(
+        !fixture
+            .output(&["automation", "disable", &id, "--revision", "1"])
+            .status
+            .success()
+    );
+    let first = fixture.cli(&["automation", "audit", &id, "--limit", "1"]);
+    assert_eq!(first["audit"]["events"][0]["cause"], "disabled");
+    assert_eq!(first["audit"]["events"][0]["actor"], "user_management");
+    assert_eq!(first["audit"]["events"][0]["revision"], 2);
+    let cursor = first["audit"]["next"].as_u64().unwrap().to_string();
+    let second = fixture.cli(&[
+        "automation",
+        "audit",
+        &id,
+        "--limit",
+        "1",
+        "--before",
+        &cursor,
+    ]);
+    assert_eq!(second["audit"]["events"][0]["cause"], "created");
+    assert!(second["audit"]["next"].is_null());
+    assert_eq!(second["audit"]["earlier_events_unavailable"], false);
+    let audit = fixture.cli(&["automation", "audit", &id]);
+    assert!(!audit.to_string().contains("PRIVATE_LIFECYCLE_PROMPT"));
+    fixture.restart();
+    assert_eq!(fixture.cli(&["automation", "audit", &id]), audit);
+    fixture.cli(&["automation", "remove", &id, "--revision", "2"]);
+    let removed = fixture.cli(&["automation", "audit", &id]);
+    assert_eq!(removed["audit"]["events"].as_array().unwrap().len(), 3);
+    assert_eq!(removed["audit"]["events"][0]["cause"], "removed");
+    assert_eq!(removed["audit"]["events"][0]["revision"], 3);
+    assert_eq!(
+        fixture.cli(&["automation", "history", &id])["history"]["firings"],
+        json!([])
+    );
+    assert!(!fixture.root.path().join("unexpected-provider").exists());
 }

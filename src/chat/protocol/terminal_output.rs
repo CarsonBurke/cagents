@@ -8,7 +8,7 @@
 //! taken out where the output enters it.
 //!
 //! All three adapters use this: [`display`] for output a provider reports
-//! whole, and [`Stream`] for output it reports in deltas, where a sequence may
+//! whole, and `Stream` for output it reports in deltas, where a sequence may
 //! be cut anywhere.
 
 /// Output reported whole, without its escape sequences and with each line as
@@ -47,57 +47,178 @@ pub(crate) fn display(raw: String) -> String {
 ///
 /// What a delta contributes is only ever appended, because that is all a
 /// delta may do to the output already sent to the surfaces. An escape
-/// sequence cut by the end of a delta is held until the rest of it arrives.
+/// sequence cut by the end of a delta leaves only its grammar state; its
+/// already-discarded payload is never buffered or scanned again.
 /// A line redrawn with a carriage return cannot be taken back, so each
 /// redraw is given a line of its own while the command runs - the newest is
 /// the last line, which is what a reader following it sees - and the output
 /// the provider reports whole at the end goes through [`display`], which
 /// keeps only the last.
 #[derive(Debug)]
+#[cfg(any(feature = "host", test))]
 pub(super) struct Stream {
-    held: String,
+    escape: Escape,
     returned: bool,
     /// Whether nothing has been written to the current line.
     fresh: bool,
+    #[cfg(test)]
+    steps: usize,
 }
 
+/// No sequence payload is needed to identify its terminator. In particular,
+/// an arbitrarily long unterminated OSC/DCS/APC string costs one enum value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg(any(feature = "host", test))]
+enum Escape {
+    #[default]
+    Ground,
+    Introducer,
+    CsiParameters,
+    CsiIntermediates,
+    Intermediates,
+    String,
+    StringEscape,
+}
+
+#[cfg(any(feature = "host", test))]
 impl Default for Stream {
     fn default() -> Self {
         Self {
-            held: String::new(),
+            escape: Escape::Ground,
             returned: false,
             fresh: true,
+            #[cfg(test)]
+            steps: 0,
         }
     }
 }
 
+#[cfg(any(feature = "host", test))]
 impl Stream {
+    /// Continue decoding after an authoritative whole-output snapshot. The
+    /// snapshot owns its partial escape/CR grammar, not a superseded stream.
+    /// No visible output or control payload is allocated by this pass.
+    pub(super) fn from_snapshot(raw: &str) -> Self {
+        let mut stream = Self::default();
+        for character in raw.chars() {
+            stream.consume(character, |_| {});
+        }
+        stream
+    }
+
     /// What `delta` adds to the output shown so far.
     pub(super) fn push(&mut self, delta: &str) -> String {
-        let mut raw = std::mem::take(&mut self.held);
-        raw.push_str(delta);
-        let mut text = String::with_capacity(raw.len());
-        let consumed = strip(&raw, &mut text);
-        self.held = raw[consumed..].to_owned();
-        let mut shown = String::with_capacity(text.len());
-        for character in text.chars() {
-            match character {
-                '\r' => self.returned = true,
-                '\n' => {
-                    shown.push('\n');
-                    self.returned = false;
-                    self.fresh = true;
+        let mut shown = String::new();
+        for character in delta.chars() {
+            self.consume(character, |character| shown.push(character));
+        }
+        shown
+    }
+
+    fn consume(&mut self, character: char, mut emit: impl FnMut(char)) {
+        if !self.visible(character) {
+            return;
+        }
+        match character {
+            '\r' => self.returned = true,
+            '\n' => {
+                emit('\n');
+                self.returned = false;
+                self.fresh = true;
+            }
+            character => {
+                if std::mem::take(&mut self.returned) && !self.fresh {
+                    emit('\n');
                 }
-                character => {
-                    if std::mem::take(&mut self.returned) && !self.fresh {
-                        shown.push('\n');
+                emit(character);
+                self.fresh = false;
+            }
+        }
+    }
+
+    fn visible(&mut self, character: char) -> bool {
+        // A malformed sequence ends before the character that broke it. Retry
+        // only that character in its new state, never the preceding payload.
+        // At most StringEscape -> Introducer -> Ground examines it again.
+        loop {
+            #[cfg(test)]
+            {
+                self.steps += 1;
+            }
+            match self.escape {
+                Escape::Ground => {
+                    if character == '\x1b' {
+                        self.escape = Escape::Introducer;
+                        return false;
                     }
-                    shown.push(character);
-                    self.fresh = false;
+                    return !character.is_ascii()
+                        || !interpreted(character as u8)
+                        || character == '\r';
+                }
+                Escape::Introducer => {
+                    self.escape = match character {
+                        '[' => Escape::CsiParameters,
+                        ']' | 'P' | 'X' | '^' | '_' => Escape::String,
+                        '\x20'..='\x2f' => Escape::Intermediates,
+                        '\x30'..='\x7e' => Escape::Ground,
+                        _ => {
+                            self.escape = Escape::Ground;
+                            continue;
+                        }
+                    };
+                    return false;
+                }
+                Escape::CsiParameters => match character {
+                    '\x30'..='\x3f' => return false,
+                    '\x20'..='\x2f' => {
+                        self.escape = Escape::CsiIntermediates;
+                        return false;
+                    }
+                    '\x40'..='\x7e' => {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
+                    _ => self.escape = Escape::Ground,
+                },
+                Escape::CsiIntermediates => match character {
+                    '\x20'..='\x2f' => return false,
+                    '\x40'..='\x7e' => {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
+                    _ => self.escape = Escape::Ground,
+                },
+                Escape::Intermediates => match character {
+                    '\x20'..='\x2f' => return false,
+                    '\x30'..='\x7e' => {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
+                    _ => self.escape = Escape::Ground,
+                },
+                Escape::String => match character {
+                    '\x07' => {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
+                    '\n' => self.escape = Escape::Ground,
+                    '\x1b' => {
+                        self.escape = Escape::StringEscape;
+                        return false;
+                    }
+                    _ => return false,
+                },
+                Escape::StringEscape => {
+                    if character == '\\' {
+                        self.escape = Escape::Ground;
+                        return false;
+                    }
+                    // A different ESC sequence terminates the string before
+                    // its introducer. That ESC now parses this character.
+                    self.escape = Escape::Introducer;
                 }
             }
         }
-        shown
     }
 }
 
@@ -306,5 +427,120 @@ mod tests {
             shown,
             "Downloading 10%\nDownloading 55%\nDownloading 100%\ndone\n"
         );
+    }
+
+    #[test]
+    fn fragmented_unclosed_sequences_keep_constant_storage_and_linear_work() {
+        let string_payload = "private escape payload λ".repeat(512);
+        let parameters = "123456789;".repeat(1024);
+        let intermediates = " ".repeat(8192);
+        let cases = [
+            (
+                "\x1b]",
+                string_payload.as_str(),
+                Escape::String,
+                "\x1b\\visible",
+            ),
+            (
+                "\x1bP",
+                string_payload.as_str(),
+                Escape::String,
+                "\x07visible",
+            ),
+            (
+                "\x1bX",
+                string_payload.as_str(),
+                Escape::String,
+                "\nvisible",
+            ),
+            (
+                "\x1b^",
+                string_payload.as_str(),
+                Escape::String,
+                "\x1b\\visible",
+            ),
+            (
+                "\x1b_",
+                string_payload.as_str(),
+                Escape::String,
+                "\x07visible",
+            ),
+            (
+                "\x1b[",
+                parameters.as_str(),
+                Escape::CsiParameters,
+                "mvisible",
+            ),
+            (
+                "\x1b[ ",
+                intermediates.as_str(),
+                Escape::CsiIntermediates,
+                "mvisible",
+            ),
+            (
+                "\x1b(",
+                intermediates.as_str(),
+                Escape::Intermediates,
+                "Bvisible",
+            ),
+        ];
+        for (prefix, payload, pending, terminator) in cases {
+            let mut stream = Stream::default();
+            assert_eq!(stream.push("before "), "before ");
+            assert!(stream.push(prefix).is_empty());
+            let mut characters = "before ".chars().count() + prefix.chars().count();
+            for _ in 0..256 {
+                assert!(stream.push(payload).is_empty());
+                characters += payload.chars().count();
+                assert_eq!(stream.escape, pending);
+                // The test-only step counter is included in this bound. The
+                // production state contains only the enum and two booleans.
+                assert!(std::mem::size_of_val(&stream) <= 16);
+            }
+            // Exercise every cut of the terminator, including ESC | backslash.
+            let mut shown = String::new();
+            let mut encoded = [0; 4];
+            for character in terminator.chars() {
+                shown.push_str(&stream.push(character.encode_utf8(&mut encoded)));
+                characters += 1;
+            }
+            assert_eq!(
+                shown,
+                if terminator.starts_with('\n') {
+                    "\nvisible"
+                } else {
+                    "visible"
+                }
+            );
+            assert_eq!(stream.escape, Escape::Ground);
+            assert!(
+                stream.steps <= 3 * characters,
+                "discarded payload must never be scanned again at a later delta"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_grammar_recovers_like_whole_output_for_every_ascii_byte() {
+        for prefix in [
+            "\x1b",
+            "\x1b[12",
+            "\x1b[ ",
+            "\x1b(",
+            "\x1b]hidden",
+            "\x1b]hidden\x1b",
+        ] {
+            for byte in 0..=127u8 {
+                let tail = format!("{}tail\n", char::from(byte));
+                let expected = display(format!("{prefix}{tail}"));
+                let mut stream = Stream::default();
+                assert!(stream.push(prefix).is_empty());
+                assert_eq!(
+                    stream.push(&tail),
+                    expected,
+                    "prefix {prefix:?}, byte {byte}"
+                );
+            }
+        }
     }
 }

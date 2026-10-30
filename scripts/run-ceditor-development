@@ -6,24 +6,24 @@ cd "$root"
 alerts=0
 case "${1:-}" in
     --help)
-        printf '%s\n' 'Usage: scripts/run-ceditor-development [--review-alerts] [--] [FILE_OR_DIRECTORY...]' '' 'Builds only ceditor with dev-runtime and an isolated development identity.' 'Use --review-alerts to build matched CLI/daemon companions in separate lanes.' 'Without that flag, ordinary editing requires no terminal host, Zig, or Servo.' 'Pass -- --help for ceditor CLI help; -- --settings-path prints its settings path.'
+        printf '%s\n' 'Usage: scripts/run-ceditor-development [--review-alerts] [--] [FILE_OR_DIRECTORY...]' '' 'Builds only ceditor with dev-runtime and an isolated development identity.' 'Requires Python 3 to read Cargo executable artifacts.' 'Use --review-alerts to build matched CLI/daemon companions in separate lanes.' 'Without that flag, ordinary editing requires no terminal host, Zig, or Servo.' 'Pass -- --help for ceditor CLI help; -- --settings-path prints its settings path.'
         exit 0
         ;;
     --review-alerts) alerts=1; shift; [ "${1:-}" != -- ] || shift ;;
     --) shift ;;
 esac
+command -v python3 >/dev/null 2>&1 || {
+    printf '%s\n' 'required command not found: python3 (reads Cargo executable artifacts)' >&2
+    exit 1
+}
 if [ "$alerts" = 1 ]; then
-    cargo build --locked --profile dev-runtime --no-default-features --features development --bin cagents
-    cargo build --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd
+    python3 "$root/scripts/build-ceditor-product" cagents --locked --profile dev-runtime --no-default-features --features development --bin cagents >/dev/null
+    python3 "$root/scripts/build-ceditor-product" cagentsd --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd >/dev/null
 fi
-cargo build --locked --profile dev-runtime --package ceditor --features development
-# Cargo metadata honors target-dir from Cargo config as well as the environment.
+editor=$(python3 "$root/scripts/build-ceditor-product" ceditor --locked --profile dev-runtime --package ceditor --features development)
+# Cargo's artifact path honors configured targets and directories, including
+# build.target without CARGO_BUILD_TARGET. Never guess a path to an older build.
 # Companions are started lazily only when a review alert is observed.
-target=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
-[ -n "$target" ] || { printf '%s\n' 'Cargo did not report its target directory' >&2; exit 1; }
-if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
-    target=$target/$CARGO_BUILD_TARGET
-fi
 # Wayland task switchers resolve icons through the application ID's desktop entry.
 # Keep development separate without maintaining a second copy of the artwork.
 data_home=${XDG_DATA_HOME:-"${HOME:?HOME must be set}/.local/share"}
@@ -31,7 +31,7 @@ desktop_id=io.github.cagents.ceditor.Development
 install -d "$data_home/applications"
 install -Dm644 "$root/packaging/io.github.cagents.ceditor.svg" \
     "$data_home/icons/hicolor/scalable/apps/$desktop_id.svg"
-desktop_exec=$(printf '%s' "$target/dev-runtime/ceditor" | sed \
+desktop_exec=$(printf '%s' "$editor" | sed \
     -e 's/\\/\\\\/g' \
     -e 's/"/\\"/g' \
     -e 's/`/\\`/g' \
@@ -57,4 +57,4 @@ if command -v update-desktop-database >/dev/null 2>&1; then
     update-desktop-database "$data_home/applications" >/dev/null 2>&1 || :
 fi
 cd "$caller_cwd"
-exec "$target/dev-runtime/ceditor" "$@"
+exec "$editor" "$@"
