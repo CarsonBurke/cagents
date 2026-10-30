@@ -117,6 +117,21 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Fixed local helper used inside the provider's default sandbox.
+    #[command(hide = true)]
+    InternalWorkspaceProbe {
+        /// Workspace directory selected for this capability probe.
+        workspace: PathBuf,
+        /// Expected filesystem device ID of the workspace directory.
+        #[arg(long)]
+        device_id: u64,
+        /// Expected inode of the workspace directory.
+        #[arg(long)]
+        inode: u64,
+        /// Unique challenge binding the result and scratch path to this request.
+        #[arg(long)]
+        nonce: uuid::Uuid,
+    },
     /// Generate a shell completion script without contacting services.
     Completions {
         /// Shell whose completion script should be generated.
@@ -2317,6 +2332,38 @@ where
         };
     }
 
+    // This fixed filesystem helper is already inside the selected provider's
+    // sandbox. It never selects a device, follows a staged owner, opens a
+    // daemon socket, changes authority, or starts a service.
+    if let TopCommand::InternalWorkspaceProbe {
+        workspace,
+        device_id,
+        inode,
+        nonce,
+    } = &cli.command
+    {
+        if cli.device.is_some() {
+            emit_error(
+                cli.json,
+                &AppError::new(
+                    "workspace_probe",
+                    "The internal workspace probe is local only",
+                ),
+            );
+            return ExitCode::FAILURE;
+        }
+        let receipt = crate::account::workspace_probe::probe(workspace, *device_id, *inode, *nonce);
+        match serde_json::to_string(&receipt) {
+            Ok(json) => println!("{json}"),
+            Err(_) => return ExitCode::FAILURE,
+        }
+        return if receipt.is_verified() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
     // These operations govern the whole daemon, not a hosted session's own
     // actors. Refuse before staged-owner routing, SSH preparation, autostart or
     // local installer effects. Presence is enough: malformed/non-Unicode
@@ -2375,6 +2422,15 @@ where
                 "This operation manages the local installation; omit --device or select local",
             ),
         );
+        return ExitCode::FAILURE;
+    }
+
+    // Staged import is an explicit user action. Refuse hosted authority before
+    // selecting a device, recovering a staged owner, or preparing SSH transport.
+    if let TopCommand::Account { command } = &cli.command
+        && let Err(error) = accounts::preflight(command)
+    {
+        emit_error(cli.json, &error);
         return ExitCode::FAILURE;
     }
 
@@ -2627,6 +2683,10 @@ fn execute_with_model_context(
     service_context: Option<ServiceRequestContext>,
 ) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::InternalWorkspaceProbe { .. } => Err(AppError::new(
+            "workspace_probe",
+            "The internal probe must run before device selection",
+        )),
         TopCommand::Completions { shell } => Ok(completions::execute(shell)),
         TopCommand::Diagnostics => {
             let report = crate::diagnostics::inspect().map_err(|_| {

@@ -29,6 +29,22 @@ pub enum Operation {
 }
 
 #[cfg(feature = "host")]
+fn require_sign_in_origin(
+    registry: &super::registry::Registry,
+    provider: Provider,
+    key: uuid::Uuid,
+) -> Result<(), String> {
+    if registry
+        .pending()
+        .iter()
+        .any(|pending| pending.key == key && pending.provider == provider && pending.is_import())
+    {
+        return Err("This pending account belongs to an import; use its original import status and explicit verification".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "host")]
 pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Account>, String> {
     use super::{Account, home::Homes, registry::Store};
     let homes = Homes::installation().ok_or("Remote account storage is unavailable")?;
@@ -38,6 +54,7 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
         .map_err(|error| error.to_string())?;
     match operation {
         Operation::Register { provider, key } | Operation::Abandon { provider, key } => {
+            require_sign_in_origin(&registry, *provider, *key)?;
             let pending = registry
                 .pending()
                 .iter()
@@ -63,15 +80,8 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
             key,
             path,
         } => {
-            let chosen = if let Some(relative) = path.trim().strip_prefix("~/") {
-                std::path::PathBuf::from(std::env::var_os("HOME").ok_or("HOME unavailable")?)
-                    .join(relative)
-            } else {
-                std::path::PathBuf::from(path.trim())
-            };
-            if !chosen.is_absolute() {
-                return Err("Enter an absolute account home path".into());
-            }
+            let chosen =
+                super::expand_linked_home(path.trim(), std::env::var_os("HOME").as_deref())?;
             // Keep the user's ORIGINAL operand. Home capture resolves and pins
             // it while retaining this spelling for every later revalidation.
             Ok(Some(Account::linked(*provider, *key, chosen)))
@@ -197,7 +207,7 @@ fn execute_at(
                 })
             })?;
             let account = Account::managed(provider, key, home.clone());
-            let recipe = match login_recipe(&account, program) {
+            let recipe = match login_recipe_with_path(&account, program, search.as_deref()) {
                 Ok(recipe) => recipe,
                 Err(error) => {
                     return Err(format!(
@@ -216,17 +226,8 @@ fn execute_at(
             if !Account::PROVIDERS.contains(&provider) {
                 return Err("Omp manages its own logins".into());
             }
-            let chosen = if let Some(relative) = path.trim().strip_prefix("~/") {
-                std::path::PathBuf::from(
-                    std::env::var_os("HOME").ok_or("Remote HOME is unavailable")?,
-                )
-                .join(relative)
-            } else {
-                std::path::PathBuf::from(path.trim())
-            };
-            if !chosen.is_absolute() {
-                return Err("Enter an absolute device path or one starting with ~/".into());
-            }
+            let chosen =
+                super::expand_linked_home(path.trim(), std::env::var_os("HOME").as_deref())?;
             let path = reservation.link_home(provider, key, &chosen)?;
             crate::secure_file::validate_owned_directory(&path)
                 .map_err(|error| error.to_string())?;
@@ -242,6 +243,7 @@ fn execute_at(
         }
         Operation::Register { provider, key } => {
             let registry = store.try_load().map_err(|error| error.to_string())?;
+            require_sign_in_origin(&registry, provider, key)?;
             // A transport interruption can lose a successful reply. Retrying
             // the same pending key must not delete or replace that login.
             if registry.find(key).is_some_and(|registered| {
@@ -335,6 +337,7 @@ fn execute_at(
         }
         Operation::Abandon { provider, key } => {
             let registry = store.try_load().map_err(|error| error.to_string())?;
+            require_sign_in_origin(&registry, provider, key)?;
             if !registry
                 .pending()
                 .iter()
@@ -375,9 +378,23 @@ fn execute_at(
 }
 
 #[cfg(feature = "host")]
+#[cfg(test)]
 fn login_recipe(
     account: &super::Account,
     program: std::path::PathBuf,
+) -> Result<crate::model::LaunchRecipe, String> {
+    login_recipe_with_path(
+        account,
+        program,
+        super::probe::current_search_path().as_deref(),
+    )
+}
+
+#[cfg(feature = "host")]
+fn login_recipe_with_path(
+    account: &super::Account,
+    program: std::path::PathBuf,
+    search_path: Option<&std::ffi::OsStr>,
 ) -> Result<crate::model::LaunchRecipe, String> {
     let mut environment = std::collections::BTreeMap::new();
     if let (Some(variable), Some(home)) = (
@@ -386,7 +403,7 @@ fn login_recipe(
     ) {
         environment.insert(variable.into(), home.display().to_string());
     }
-    if let Some(path) = super::probe::shell_search_path().and_then(|path| path.to_str()) {
+    if let Some(path) = search_path.and_then(|path| path.to_str()) {
         environment.insert("PATH".into(), path.into());
     }
     Ok(crate::model::LaunchRecipe {
@@ -420,6 +437,63 @@ mod tests {
         agent::Provider,
     };
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn import_pending_refuses_generic_registration_and_abandon_before_any_provider_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let (key, home) = store
+            .create_pending(&homes, Provider::Codex, 1, || {
+                homes.create(Provider::Codex, None)
+            })
+            .unwrap();
+        store
+            .update(|registry| {
+                let mut encoded = serde_json::to_value(&*registry).unwrap();
+                let row = encoded["pending"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|row| row["key"] == key.to_string())
+                    .unwrap();
+                row["origin"] = serde_json::json!({"kind":"cache_import","operation":key});
+                *registry = serde_json::from_value(encoded).unwrap();
+            })
+            .unwrap();
+        std::fs::write(home.join("retain-import-fixture"), b"retained").unwrap();
+        let host = crate::host::AccountReservation::test_host();
+        let reservation = crate::host::AccountReservation::test_install(
+            &host,
+            &[Account::managed(Provider::Codex, key, home.clone())],
+            store.clone(),
+            &homes,
+        )
+        .unwrap();
+        let before = store.load().unwrap();
+        for operation in [
+            Operation::Register {
+                provider: Provider::Codex,
+                key,
+            },
+            Operation::Abandon {
+                provider: Provider::Codex,
+                key,
+            },
+        ] {
+            let error =
+                execute_at(operation, &reservation, homes.clone(), store.clone()).unwrap_err();
+            assert_eq!(
+                error,
+                "This pending account belongs to an import; use its original import status and explicit verification"
+            );
+            assert_eq!(store.load().unwrap(), before);
+            assert_eq!(
+                std::fs::read(home.join("retain-import-fixture")).unwrap(),
+                b"retained"
+            );
+        }
+    }
 
     #[test]
     fn host_lifecycle_never_deletes_managed_or_linked_files_without_a_permit() {
@@ -582,5 +656,29 @@ mod tests {
             std::fs::read(linked.join("history")).unwrap(),
             b"keep linked history"
         );
+    }
+
+    #[test]
+    fn a_prepared_remote_login_uses_its_selected_path_snapshot() {
+        let selected = std::ffi::OsString::from("/old/node/bin:/old/cli/bin");
+        let recipe = login_recipe_with_path(
+            &Account::system(Provider::Codex),
+            "/old/cli/bin/codex".into(),
+            Some(&selected),
+        )
+        .unwrap();
+        assert_eq!(recipe.program, "/old/cli/bin/codex");
+        assert_eq!(
+            recipe.environment.get("PATH").map(String::as_str),
+            selected.to_str()
+        );
+        assert_eq!(recipe.arguments, ["login", "--device-auth"]);
+        let no_path = login_recipe_with_path(
+            &Account::system(Provider::Codex),
+            "/old/cli/bin/codex".into(),
+            None,
+        )
+        .unwrap();
+        assert!(!no_path.environment.contains_key("PATH"));
     }
 }

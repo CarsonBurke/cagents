@@ -33,7 +33,7 @@ use crate::model::ProjectId;
 
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
@@ -97,6 +97,33 @@ pub struct Pending {
     /// Unix milliseconds.
     #[serde(default)]
     pub started_at: u64,
+    #[serde(default, skip_serializing_if = "PendingOrigin::is_sign_in")]
+    pub origin: PendingOrigin,
+}
+
+/// Import-owned pending homes require the dedicated expected-identity path.
+/// Legacy entries remain ordinary sign-ins; writing an import requires format6
+/// so old managed-home launch authorization refuses the newer registry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PendingOrigin {
+    #[default]
+    SignIn,
+    CacheImport {
+        operation: Uuid,
+    },
+}
+
+impl PendingOrigin {
+    pub fn is_sign_in(&self) -> bool {
+        matches!(self, Self::SignIn)
+    }
+}
+
+impl Pending {
+    pub fn is_import(&self) -> bool {
+        !self.origin.is_sign_in()
+    }
 }
 
 /// The whole registry.
@@ -529,7 +556,9 @@ impl Registry {
     /// Records an existing provider home without taking ownership of it.
     /// Its canonical path, not its reported email, determines whether it is
     /// already registered: separate homes can hold the same login but have
-    /// different histories. Linking an archived home restores its row.
+    /// different histories. Repeating an unambiguous active linked home returns
+    /// its original key without changing metadata. Linking an archived home
+    /// restores its row.
     pub fn link(
         &mut self,
         provider: Provider,
@@ -545,14 +574,33 @@ impl Registry {
         if system_home
             .and_then(|home| fs::canonicalize(home).ok())
             .is_some_and(|home| home == path)
-            || self.accounts(homes).iter().any(|account| {
+        {
+            return Err("That account home is already listed".into());
+        }
+        let matching = self
+            .all_accounts(homes)
+            .into_iter()
+            .filter(|account| {
                 account.provider == provider
                     && account
                         .resolved_home()
                         .and_then(|home| fs::canonicalize(home).ok())
                         .is_some_and(|home| home == path)
             })
-        {
+            .collect::<Vec<_>>();
+        if matching.iter().any(|account| {
+            !account
+                .registry_key()
+                .is_some_and(|key| self.is_archived(key))
+        }) {
+            // A reply may have been lost after the registration committed.
+            // Recover only one exact linked home, never a System/managed home
+            // or an ambiguous active/archived registration sharing its path.
+            if let [account] = matching.as_slice()
+                && let AccountHome::Linked { key, .. } = &account.home
+            {
+                return Ok(*key);
+            }
             return Err("That account home is already listed".into());
         }
         if let Some(existing) = self.accounts.iter().find(|account| {
@@ -590,8 +638,48 @@ impl Registry {
                 key,
                 provider,
                 started_at,
+                origin: PendingOrigin::SignIn,
             });
         }
+    }
+
+    /// True only for the exact import operation and its original managed key.
+    pub(crate) fn is_import_pending(&self, operation: Uuid) -> bool {
+        !operation.is_nil()
+            && self.find(operation).is_none()
+            && !self.is_archived(operation)
+            && self
+                .pending
+                .iter()
+                .filter(|pending| pending.key == operation)
+                .count()
+                == 1
+            && self.pending.iter().any(|pending| {
+                pending.key == operation
+                    && pending.provider == Provider::Codex
+                    && pending.origin == PendingOrigin::CacheImport { operation }
+            })
+    }
+
+    fn import_key_referenced(&self, key: Uuid) -> bool {
+        self.defaults
+            .values()
+            .chain(self.project_defaults.values().flat_map(|v| v.values()))
+            .any(|value| Uuid::parse_str(value).ok() == Some(key))
+    }
+
+    fn require_fresh_import_key(&self, key: Uuid) -> io::Result<()> {
+        if key.is_nil()
+            || self.find(key).is_some()
+            || self.pending.iter().any(|pending| pending.key == key)
+            || self.is_archived(key)
+            || self.import_key_referenced(key)
+        {
+            return Err(io::Error::other(
+                "The import destination key is already used or referenced",
+            ));
+        }
+        Ok(())
     }
 
     /// Sign-ins that have not finished, oldest first.
@@ -848,6 +936,16 @@ impl Store {
             )));
         }
         for (provider, key) in selected {
+            if registry
+                .pending
+                .iter()
+                .any(|pending| pending.key == key && pending.is_import())
+            {
+                return Err(LaunchAccountError::Unreadable(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "The imported cache requires explicit identity verification before this account can launch",
+                )));
+            }
             if !registry.contains_managed_home(homes, provider, key) {
                 return Err(LaunchAccountError::Removed { provider, key });
             }
@@ -950,9 +1048,10 @@ impl Store {
         Ok((key, home))
     }
 
-    /// Forget and park under the same lifecycle lock as spawning. A failed
-    /// deletion cannot make an unregistered home launchable again; the sweep
-    /// finishes parked trees later. Linked aliases still protect their home.
+    // Legacy destructive fixture support only. Product lifecycle operations
+    // require daemon admission and preserve managed/abandoned home files.
+    // Registry absence or an old parked name grants no deletion authority.
+    #[cfg(test)]
     pub fn remove_home(
         &self,
         homes: &Homes,
@@ -1033,6 +1132,16 @@ impl Store {
         self.update_checked_with_mode(
             |registry| {
                 validate(registry)?;
+                if registry
+                    .pending
+                    .iter()
+                    .any(|pending| pending.key == account.key && pending.is_import())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Use the imported cache's explicit expected-identity verification",
+                    ));
+                }
                 if registry.find(account.key).is_some_and(|existing| {
                     existing.provider == account.provider && existing.linked_home.is_none()
                 }) {
@@ -1495,10 +1604,201 @@ mod tests {
                 Some(&homes),
                 2
             ),
-            Err("That account home is already listed".into())
+            Ok(key)
         );
         registry.unregister(key).unwrap();
         assert!(history.is_file());
+    }
+
+    #[test]
+    fn repeating_a_link_recovers_its_key_without_rewriting_registry_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("selected");
+        let other = directory.path().join("other");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&other).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let other = fs::canonicalize(other).unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("managed"));
+        let key = Uuid::new_v4();
+        let account = Account::linked(Provider::Codex, key, home.clone());
+        let (before, ()) = store
+            .update(|registry| {
+                assert_eq!(
+                    registry.link(Provider::Codex, key, home.clone(), None, Some(&homes), 7),
+                    Ok(key)
+                );
+                registry.set_label(&account, Some("Selected home".into()));
+                registry.observe_identity(
+                    key,
+                    &Identity {
+                        email: Some("selected@example.test".into()),
+                        organization: Some("Fixture organization".into()),
+                        plan: None,
+                    },
+                );
+                registry.set_default(&account);
+                registry.set_project_default(directory.path(), &account);
+                registry.begin(Provider::Claude, Uuid::new_v4(), 8);
+            })
+            .unwrap();
+        let bytes = fs::read(store.path()).unwrap();
+        // The first response was lost: repeat explicitly with a fresh request
+        // key, as the real Link callers do. No transport/provider is exercised.
+        let requested = Uuid::new_v4();
+        let (after, result) = store
+            .update(|registry| {
+                registry.link(
+                    Provider::Codex,
+                    requested,
+                    home.clone(),
+                    None,
+                    Some(&homes),
+                    99,
+                )
+            })
+            .unwrap();
+        assert_eq!(result, Ok(key));
+        assert_eq!(after, before);
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.registered().len(), 1);
+        assert!(after.find(requested).is_none());
+        assert_eq!(after.find(key).unwrap().added_at, 7);
+        assert_eq!(after.label(&account), Some("Selected home"));
+        assert_eq!(
+            after.default_account(Provider::Codex, Some(&homes)),
+            account
+        );
+        assert_eq!(
+            after.project_default_account(directory.path(), Provider::Codex, Some(&homes)),
+            account
+        );
+
+        // Identity alone cannot merge a different home. It remains a separate
+        // registration with the independently requested key.
+        let other_key = Uuid::new_v4();
+        let (after, result) = store
+            .update(|registry| {
+                let result = registry.link(
+                    Provider::Codex,
+                    other_key,
+                    other.clone(),
+                    None,
+                    Some(&homes),
+                    100,
+                );
+                registry.observe_identity(other_key, &before.find(key).unwrap().identity());
+                result
+            })
+            .unwrap();
+        assert_eq!(result, Ok(other_key));
+        assert_eq!(after.registered().len(), 2);
+        assert_eq!(after.find(key), before.find(key));
+        assert_eq!(
+            after.default_account(Provider::Codex, Some(&homes)),
+            account
+        );
+    }
+
+    #[test]
+    fn link_recovery_refuses_conflicting_home_kinds_and_ambiguous_registrations() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("selected");
+        fs::create_dir(&home).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let key = Uuid::new_v4();
+        let mut registry = Registry::default();
+        registry
+            .link(Provider::Codex, key, home.clone(), None, None, 1)
+            .unwrap();
+        let original = registry.clone();
+        let listed: Result<Uuid, String> = Err("That account home is already listed".into());
+        assert_eq!(
+            registry.link(
+                Provider::Codex,
+                Uuid::new_v4(),
+                home.clone(),
+                Some(&home),
+                None,
+                2
+            ),
+            listed
+        );
+        assert_eq!(
+            registry, original,
+            "System conflict wins over linked recovery"
+        );
+
+        // A stored linked path can alias a managed home. Retain the managed
+        // registration's existing refusal even when the linked row is first.
+        let homes = Homes::at(directory.path().join("managed"));
+        let managed_key = Uuid::new_v4();
+        let managed_home = homes.path(Provider::Codex, managed_key);
+        fs::create_dir_all(&managed_home).unwrap();
+        registry.accounts[0].linked_home = Some(managed_home.clone());
+        registry.accounts.push(Registered {
+            key: managed_key,
+            provider: Provider::Codex,
+            linked_home: None,
+            label: None,
+            email: None,
+            organization: None,
+            added_at: 2,
+        });
+        let before = registry.clone();
+        assert_eq!(
+            registry.link(
+                Provider::Codex,
+                Uuid::new_v4(),
+                managed_home,
+                None,
+                Some(&homes),
+                3
+            ),
+            listed
+        );
+        assert_eq!(registry, before);
+
+        // Multiple linked registrations (including an archived collision)
+        // must not choose the first row as the recovered identity.
+        for archived in [false, true] {
+            registry = original.clone();
+            let duplicate_key = Uuid::new_v4();
+            let mut duplicate = registry.accounts[0].clone();
+            duplicate.key = duplicate_key;
+            registry.accounts.push(duplicate);
+            if archived {
+                registry.archived.push(duplicate_key);
+            }
+            let before = registry.clone();
+            assert_eq!(
+                registry.link(Provider::Codex, Uuid::new_v4(), home.clone(), None, None, 4),
+                listed
+            );
+            assert_eq!(registry, before);
+        }
+
+        registry = original.clone();
+        registry.archived.push(key);
+        let before = registry.clone();
+        assert_eq!(
+            registry.link(Provider::Codex, Uuid::new_v4(), home.clone(), None, None, 5),
+            Ok(key)
+        );
+        let mut restored = before;
+        restored.archived.clear();
+        assert_eq!(
+            registry, restored,
+            "archive restoration keeps all row metadata"
+        );
+        let other_provider_key = Uuid::new_v4();
+        assert_eq!(
+            registry.link(Provider::Claude, other_provider_key, home, None, None, 6),
+            Ok(other_provider_key),
+            "path uniqueness remains scoped to the chosen provider"
+        );
     }
 
     #[test]
@@ -1909,5 +2209,1769 @@ mod tests {
         fs::write(&target, "").unwrap();
         std::os::unix::fs::symlink(&target, directory.path().join(FILE_NAME)).unwrap();
         assert!(Store::at(directory.path()).load().is_err());
+    }
+}
+
+#[cfg(feature = "host")]
+pub(crate) use cache_import::ImportLaunchLease;
+
+#[cfg(feature = "host")]
+mod cache_import {
+    use super::*;
+    use crate::{account::import::PhysicalIdentity, fs_safety::Root};
+    use std::{ffi::OsStr, os::unix::fs::MetadataExt};
+
+    /// Held only across the actual identity-probe spawn, never across its I/O.
+    /// Both locks come from the real Store; metadata DTOs cannot mint this lease.
+    pub(crate) struct ImportLaunchLease {
+        _lifecycle: crate::instance::OwnedLock,
+        _registry: crate::instance::OwnedLock,
+    }
+
+    fn refuse(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::PermissionDenied, message)
+    }
+
+    fn current_home(
+        homes: &Homes,
+        operation: Uuid,
+        expected: PhysicalIdentity,
+    ) -> io::Result<Root> {
+        let path = homes.path(Provider::Codex, operation);
+        crate::secure_file::reject_symlink_components(&path)
+            .map_err(|_| refuse("The imported account home changed"))?;
+        let root =
+            Root::open(&path).map_err(|_| refuse("The imported account home is unavailable"))?;
+        let metadata = root
+            .metadata()
+            .map_err(|_| refuse("The imported account home is unavailable"))?;
+        if metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() == 0
+        {
+            return Err(refuse("The imported account home changed"));
+        }
+        Ok(root)
+    }
+
+    /// Resolve missing suffixes without treating a dangling link as absence.
+    /// Existing roots come from the bounded Registry/System metadata census.
+    fn potential_home(path: &Path) -> io::Result<PathBuf> {
+        if !path.is_absolute()
+            || path.as_os_str().as_bytes().len() > 16 * 1024
+            || path.components().count() > 128
+            || path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(refuse("Account home independence could not be confirmed"));
+        }
+        let mut ancestor = path;
+        let mut suffix = Vec::new();
+        loop {
+            match ancestor.canonicalize() {
+                Ok(mut base) => {
+                    for part in suffix.iter().rev() {
+                        base.push(part);
+                    }
+                    return Ok(base);
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match fs::symlink_metadata(ancestor) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        _ => {
+                            return Err(refuse("Account home independence could not be confirmed"));
+                        }
+                    }
+                    let name = ancestor.file_name().ok_or_else(|| {
+                        refuse("Account home independence could not be confirmed")
+                    })?;
+                    suffix.push(name.to_os_string());
+                    ancestor = ancestor.parent().ok_or_else(|| {
+                        refuse("Account home independence could not be confirmed")
+                    })?;
+                }
+                Err(_) => return Err(refuse("Account home independence could not be confirmed")),
+            }
+        }
+    }
+
+    fn independent_home(registry: &Registry, homes: &Homes, operation: Uuid) -> io::Result<()> {
+        if registry.accounts.len() + registry.pending.len() > 128 {
+            return Err(refuse(
+                "Too many account homes to confirm import independence",
+            ));
+        }
+        let destination = potential_home(&homes.path(Provider::Codex, operation))?;
+        let known = registry
+            .accounts
+            .iter()
+            .filter(|row| row.key != operation)
+            .map(|row| {
+                row.linked_home
+                    .clone()
+                    .unwrap_or_else(|| homes.path(row.provider, row.key))
+            })
+            .chain(
+                registry
+                    .pending
+                    .iter()
+                    .filter(|row| row.key != operation)
+                    .map(|row| homes.path(row.provider, row.key)),
+            )
+            .chain(
+                Account::system_accounts()
+                    .into_iter()
+                    .filter_map(|account| account.resolved_home()),
+            );
+        for operand in known {
+            let other = potential_home(&operand)?;
+            if destination.starts_with(&other) || other.starts_with(&destination) {
+                return Err(refuse("Another account refers to the import destination"));
+            }
+        }
+        Ok(())
+    }
+
+    fn require_pending(registry: &Registry, operation: Uuid) -> io::Result<()> {
+        if registry.is_newer() || !registry.is_import_pending(operation) {
+            return Err(refuse("The original import-owned pending account changed"));
+        }
+        if registry.import_key_referenced(operation) {
+            return Err(refuse(
+                "The import destination was selected as a default before registration",
+            ));
+        }
+        Ok(())
+    }
+
+    fn require_verifiable(
+        registry: &Registry,
+        operation: Uuid,
+        expected_email: &str,
+    ) -> io::Result<()> {
+        if registry.is_newer()
+            || operation.is_nil()
+            || !super::super::import::expected_email_is_valid(expected_email)
+        {
+            return Err(refuse(
+                "The original import verification identity is invalid",
+            ));
+        }
+        if registry.accounts.iter().any(|row| row.key == operation) {
+            let matches: Vec<_> = registry
+                .accounts
+                .iter()
+                .filter(|row| row.key == operation)
+                .collect();
+            if matches.len() != 1
+                || registry.pending.iter().any(|row| row.key == operation)
+                || registry.is_archived(operation)
+                || matches[0].provider != Provider::Codex
+                || matches[0].linked_home.is_some()
+                || !matches[0]
+                    .email
+                    .as_deref()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(expected_email))
+            {
+                return Err(refuse("The original imported registration changed"));
+            }
+            return Ok(());
+        }
+        require_pending(registry, operation)
+    }
+
+    fn registry_directory(store: &Store) -> io::Result<Root> {
+        let root = Root::open(&store.directory)
+            .map_err(|_| refuse("The import registry directory is unavailable"))?;
+        let metadata = root
+            .metadata()
+            .map_err(|_| refuse("The import registry directory is unavailable"))?;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() == 0
+        {
+            return Err(refuse("The import registry directory is not private"));
+        }
+        Ok(root)
+    }
+
+    fn sync_registry(store: &Store, root: &Root) -> io::Result<()> {
+        let uncertain = || {
+            refuse(
+                "The import registry acknowledgement is uncertain; inspect the original operation",
+            )
+        };
+        let original = root.metadata().map_err(|_| uncertain())?;
+        let same = || -> io::Result<bool> {
+            let named = registry_directory(store)?.metadata()?;
+            Ok((named.dev(), named.ino()) == (original.dev(), original.ino()))
+        };
+        if !same().map_err(|_| uncertain())? {
+            return Err(uncertain());
+        }
+        crate::fs_safety::sync_directory(root).map_err(|_| uncertain())?;
+        if !same().map_err(|_| uncertain())? {
+            return Err(uncertain());
+        }
+        Ok(())
+    }
+
+    fn check_command(
+        command: &std::process::Command,
+        homes: &Homes,
+        operation: Uuid,
+    ) -> io::Result<()> {
+        if !Path::new(command.get_program()).is_absolute()
+            || command.get_args().collect::<Vec<_>>() != [OsStr::new("app-server")]
+        {
+            return Err(refuse(
+                "Only the selected official identity-probe command is admitted",
+            ));
+        }
+        let expected = homes.path(Provider::Codex, operation);
+        let env: Vec<_> = command.get_envs().collect();
+        let selected = env
+            .iter()
+            .find(|(name, _)| *name == OsStr::new("CODEX_HOME"))
+            .and_then(|(_, value)| *value);
+        if selected.map(Path::new) != Some(expected.as_path()) {
+            return Err(refuse(
+                "The identity probe must use the original imported account home",
+            ));
+        }
+        for name in super::super::credential_overrides(Provider::Codex) {
+            if !env
+                .iter()
+                .any(|(key, value)| *key == OsStr::new(name) && value.is_none())
+            {
+                return Err(refuse(
+                    "The identity probe must remove inherited provider credentials",
+                ));
+            }
+        }
+        if env
+            .iter()
+            .any(|(name, value)| *name == OsStr::new("CLAUDE_CONFIG_DIR") && value.is_some())
+        {
+            return Err(refuse(
+                "The identity probe cannot select another provider home",
+            ));
+        }
+        Ok(())
+    }
+
+    impl Store {
+        /// Read-only atomic-rename snapshot for Status, never an admission permit.
+        /// Missing metadata is empty; unsafe metadata is refused, not repaired.
+        pub(crate) fn read_import_metadata(&self) -> io::Result<Registry> {
+            let mut file =
+                match crate::secure_file::open_existing_private_file_readonly(&self.path()) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return Ok(Registry::default());
+                    }
+                    Err(_) => return Err(refuse("The import registry metadata is unavailable")),
+                };
+            let mut bytes = Vec::new();
+            Read::by_ref(&mut file)
+                .take(MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| refuse("The import registry metadata is unavailable"))?;
+            if bytes.len() as u64 > MAX_BYTES {
+                return Err(refuse("The import registry metadata is too large"));
+            }
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| refuse("The import registry metadata is invalid"))?;
+            toml::from_str(text).map_err(|_| refuse("The import registry metadata is invalid"))
+        }
+
+        /// The create callback must use the reservation's actual fresh-home
+        /// initializer. It may persist the journal's prepared inode receipt,
+        /// but must never reenter Store. No credential link precedes this ACK.
+        pub(crate) fn try_create_import_pending_reserved(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            operation: Uuid,
+            started_at: u64,
+            create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+        ) -> io::Result<(Uuid, PathBuf)> {
+            self.create_import_pending(homes, operation, started_at, create, |registry| {
+                reservation
+                    .verify_registry(registry)
+                    .map_err(io::Error::other)
+            })
+        }
+
+        fn create_import_pending(
+            &self,
+            homes: &Homes,
+            operation: Uuid,
+            started_at: u64,
+            create: impl FnOnce() -> io::Result<(Uuid, PathBuf)>,
+            validate: impl FnOnce(&Registry) -> io::Result<()>,
+        ) -> io::Result<(Uuid, PathBuf)> {
+            let _lifecycle = homes.try_lifecycle_lock()?;
+            let _lock = self.try_lock()?;
+            let registry_root = registry_directory(self)?;
+            let mut registry = read(&self.path())?;
+            if registry.is_newer() {
+                return Err(refuse("The account registry requires a newer cagents"));
+            }
+            validate(&registry)?;
+            registry.require_fresh_import_key(operation)?;
+            independent_home(&registry, homes, operation)?;
+            let revision = registry
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| refuse("Account registry revision exhausted"))?;
+            let (key, home) = create()?;
+            if key != operation || home != homes.path(Provider::Codex, operation) {
+                return Err(refuse(
+                    "The created home does not match the original import operation",
+                ));
+            }
+            // Recheck metadata aliases after mkdir; no named credential exists yet.
+            independent_home(&registry, homes, operation)?;
+            registry.pending.push(Pending {
+                key: operation,
+                provider: Provider::Codex,
+                started_at,
+                origin: PendingOrigin::CacheImport { operation },
+            });
+            registry.version = VERSION;
+            registry.revision = revision;
+            write(&self.directory, &self.path(), &registry)?;
+            sync_registry(self, &registry_root)?;
+            Ok((key, home))
+        }
+
+        /// Exact pending/physical admission at a short file publication boundary.
+        /// The effect may link/fsync one already-prepared auth inode, never Store.
+        pub(crate) fn try_with_import_pending_reserved<T>(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            effect: impl FnOnce() -> io::Result<T>,
+        ) -> io::Result<T> {
+            let _lifecycle = homes.try_lifecycle_lock()?;
+            let _lock = self.try_lock()?;
+            let registry = read(&self.path())?;
+            reservation
+                .verify_import_home(operation, expected_home)
+                .map_err(io::Error::other)?;
+            require_pending(&registry, operation)?;
+            independent_home(&registry, homes, operation)?;
+            let _home = current_home(homes, operation, expected_home)?;
+            effect()
+        }
+
+        /// Dedicated verification spawn only. The caller's SpawnOwner retains
+        /// process/cleanup custody; dropping an async waiter is not admission.
+        pub(crate) fn authorize_import_command_reserved(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            expected_email: &str,
+            command: &std::process::Command,
+        ) -> io::Result<ImportLaunchLease> {
+            self.import_launch(
+                homes,
+                operation,
+                expected_home,
+                expected_email,
+                command,
+                |_registry| {
+                    reservation
+                        .verify_import_home(operation, expected_home)
+                        .map_err(io::Error::other)?;
+                    Ok(())
+                },
+            )
+        }
+
+        fn import_launch(
+            &self,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            expected_email: &str,
+            command: &std::process::Command,
+            validate: impl FnOnce(&Registry) -> io::Result<()>,
+        ) -> io::Result<ImportLaunchLease> {
+            let lifecycle = homes.try_lifecycle_lock()?;
+            let lock = self.try_lock()?;
+            let registry = read(&self.path())?;
+            validate(&registry)?;
+            require_verifiable(&registry, operation, expected_email)?;
+            independent_home(&registry, homes, operation)?;
+            let _home = current_home(homes, operation, expected_home)?;
+            check_command(command, homes, operation)?;
+            Ok(ImportLaunchLease {
+                _lifecycle: lifecycle,
+                _registry: lock,
+            })
+        }
+
+        /// A matching fresh provider result is required by the host before this
+        /// call. Repeat the expected-email/key/home checks under actual leases;
+        /// this method never probes System or selects a duplicate/default.
+        pub(crate) fn try_register_import_pending_reserved(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            expected_email: &str,
+            account: Registered,
+            known_system: &[(Provider, Identity)],
+        ) -> io::Result<(Registry, Result<(), AccountId>)> {
+            self.register_import_pending(
+                homes,
+                operation,
+                expected_home,
+                expected_email,
+                account,
+                known_system,
+                |registry| {
+                    reservation
+                        .verify_import_home(operation, expected_home)
+                        .map_err(io::Error::other)?;
+                    if registry.find(operation).is_none() {
+                        require_pending(registry, operation)?;
+                    }
+                    Ok(())
+                },
+            )
+        }
+
+        fn register_import_pending(
+            &self,
+            homes: &Homes,
+            operation: Uuid,
+            expected_home: PhysicalIdentity,
+            expected_email: &str,
+            account: Registered,
+            known_system: &[(Provider, Identity)],
+            validate: impl FnOnce(&Registry) -> io::Result<()>,
+        ) -> io::Result<(Registry, Result<(), AccountId>)> {
+            if operation.is_nil()
+                || account.key != operation
+                || account.provider != Provider::Codex
+                || account.linked_home.is_some()
+                || !super::super::import::expected_email_is_valid(expected_email)
+                || !account
+                    .email
+                    .as_deref()
+                    .is_some_and(|email| email.eq_ignore_ascii_case(expected_email))
+            {
+                return Err(refuse(
+                    "The verified ChatGPT identity does not match the original import",
+                ));
+            }
+            let _lifecycle = homes.try_lifecycle_lock()?;
+            let registry_root = registry_directory(self)?;
+            let result = self.update_checked_with_mode(
+                |registry| {
+                    validate(registry)?;
+                    let _home = current_home(homes, operation, expected_home)?;
+                    independent_home(registry, homes, operation)?;
+                    if let Some(existing) = registry.find(operation) {
+                        if registry
+                            .accounts
+                            .iter()
+                            .filter(|row| row.key == operation)
+                            .count()
+                            != 1
+                            || registry
+                                .pending
+                                .iter()
+                                .any(|pending| pending.key == operation)
+                            || existing.provider != Provider::Codex
+                            || existing.linked_home.is_some()
+                            || !existing
+                                .email
+                                .as_deref()
+                                .is_some_and(|email| email.eq_ignore_ascii_case(expected_email))
+                        {
+                            return Err(refuse("The original imported registration changed"));
+                        }
+                        return Ok(Ok(()));
+                    }
+                    require_pending(registry, operation)?;
+                    Ok(registry.register(account, known_system))
+                },
+                true,
+            )?;
+            sync_registry(self, &registry_root)?;
+            Ok(result)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn fixture() -> (tempfile::TempDir, Homes, Store) {
+            let root = tempfile::tempdir().unwrap();
+            let homes = Homes::at(root.path().join("homes"));
+            let store = Store::at(root.path().join("registry"));
+            (root, homes, store)
+        }
+
+        fn prepare(store: &Store, homes: &Homes, key: Uuid) -> PathBuf {
+            store
+                .create_import_pending(
+                    homes,
+                    key,
+                    1,
+                    || {
+                        homes.create_planned_with_config_initialized(
+                            Provider::Codex,
+                            key,
+                            None,
+                            super::super::super::home::CodexConfig::Shared,
+                            |_| Ok(()),
+                        )
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap()
+                .1
+        }
+
+        fn stamp(home: &Path) -> PhysicalIdentity {
+            let metadata = fs::metadata(home).unwrap();
+            PhysicalIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+
+        fn account(key: Uuid, email: &str) -> Registered {
+            Registered {
+                key,
+                provider: Provider::Codex,
+                linked_home: None,
+                label: None,
+                email: Some(email.into()),
+                organization: None,
+                added_at: 1,
+            }
+        }
+
+        fn command(home: &Path) -> std::process::Command {
+            let mut command = std::process::Command::new("/never-executed");
+            command.arg("app-server");
+            command.env("CODEX_HOME", home);
+            for name in super::super::super::credential_overrides(Provider::Codex) {
+                command.env_remove(name);
+            }
+            command
+        }
+
+        #[test]
+        fn status_metadata_does_not_create_storage_or_repair_existing_permissions() {
+            let (root, _homes, store) = fixture();
+            assert_eq!(store.read_import_metadata().unwrap(), Registry::default());
+            assert!(!store.directory.exists());
+            fs::create_dir(&store.directory).unwrap();
+            fs::write(store.path(), "version = 6\n").unwrap();
+            fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(store.read_import_metadata().is_err());
+            assert_eq!(fs::metadata(store.path()).unwrap().mode() & 0o777, 0o644);
+            assert!(!store.directory.join(LOCK_NAME).exists());
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+
+        #[test]
+        fn old_pending_defaults_to_sign_in_but_import_publishes_format_six_without_seeding() {
+            let old: Registry = toml::from_str("version = 5\n[[pending]]\nkey = '00000000-0000-4000-8000-000000000001'\nprovider = 'codex'\nstarted_at = 1\n").unwrap();
+            assert!(!old.pending[0].is_import());
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(2);
+            let home = prepare(&store, &homes, key);
+            let registry = store.load().unwrap();
+            assert!(registry.is_import_pending(key));
+            assert_eq!(registry.version, 6);
+            assert!(
+                registry.version > 5,
+                "the old managed-home reader must refuse its future version"
+            );
+            assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+            assert_eq!(
+                fs::metadata(&home).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(store.load().unwrap(), registry);
+        }
+
+        #[test]
+        fn default_references_and_existing_keys_refuse_before_home_creation_without_changing_bytes()
+        {
+            for mode in 0..6 {
+                let (_root, homes, store) = fixture();
+                let key = Uuid::parse_str("00000000-0000-4000-8000-000000abcdef").unwrap();
+                store
+                    .update(|registry| match mode {
+                        0 => {
+                            registry
+                                .defaults
+                                .insert("codex".into(), key.to_string().to_uppercase());
+                        }
+                        1 => {
+                            registry.project_defaults.insert(
+                                "project".into(),
+                                BTreeMap::from([("codex".into(), key.to_string())]),
+                            );
+                        }
+                        2 => registry.accounts.push(account(key, "fixture@example.test")),
+                        3 => registry.begin(Provider::Codex, key, 1),
+                        4 => registry.archived.push(key),
+                        _ => {}
+                    })
+                    .unwrap();
+                let before = fs::read(store.path()).unwrap_or_default();
+                let mut called = false;
+                let chosen = if mode == 5 { Uuid::nil() } else { key };
+                assert!(
+                    store
+                        .create_import_pending(
+                            &homes,
+                            chosen,
+                            2,
+                            || {
+                                called = true;
+                                unreachable!()
+                            },
+                            |_| Ok(())
+                        )
+                        .is_err()
+                );
+                assert!(!called);
+                assert_eq!(fs::read(store.path()).unwrap_or_default(), before);
+                assert!(!homes.path(Provider::Codex, key).exists());
+            }
+        }
+
+        #[test]
+        fn generic_launch_and_registration_refuse_import_but_the_exact_probe_lease_is_scoped() {
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(4);
+            let home = prepare(&store, &homes, key);
+            let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
+            recipe
+                .environment
+                .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+            assert!(
+                store
+                    .authorize_launch(&homes, &recipe, Some(Provider::Codex))
+                    .is_err()
+            );
+            let before = fs::read(store.path()).unwrap();
+            assert!(
+                store
+                    .try_register_pending(&homes, account(key, "fixture@example.test"), &[])
+                    .is_err()
+            );
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+            let mut probe = command(&home);
+            probe.env("OPENAI_API_KEY", "synthetic-not-a-credential");
+            assert!(
+                store
+                    .import_launch(
+                        &homes,
+                        key,
+                        stamp(&home),
+                        "fixture@example.test",
+                        &probe,
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            probe.env_remove("OPENAI_API_KEY");
+            probe.env("CODEX_HOME", home.parent().unwrap());
+            assert!(
+                store
+                    .import_launch(
+                        &homes,
+                        key,
+                        stamp(&home),
+                        "fixture@example.test",
+                        &probe,
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            probe.env("CODEX_HOME", &home);
+            let lease = store
+                .import_launch(
+                    &homes,
+                    key,
+                    stamp(&home),
+                    "fixture@example.test",
+                    &probe,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert!(
+                store.try_lock().is_err(),
+                "actual Store lease outlives validation through spawn"
+            );
+            assert!(homes.try_lifecycle_lock().is_err());
+            drop(lease);
+            assert!(store.try_lock().is_ok());
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+        }
+
+        #[test]
+        fn wrong_identity_and_duplicate_never_register_or_select_and_same_reply_is_idempotent() {
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(5);
+            let home = prepare(&store, &homes, key);
+            let physical = stamp(&home);
+            let before = fs::read(store.path()).unwrap();
+            assert!(
+                store
+                    .register_import_pending(
+                        &homes,
+                        key,
+                        physical,
+                        "fixture@example.test",
+                        account(key, "wrong@example.test"),
+                        &[],
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+            let (registered, result) = store
+                .register_import_pending(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    account(key, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            assert!(!registered.is_import_pending(key));
+            store
+                .update(|registry| {
+                    registry.set_label(
+                        &Account::managed(Provider::Codex, key, home.clone()),
+                        Some("My label".into()),
+                    );
+                    registry.set_default(&Account::system(Provider::Claude));
+                })
+                .unwrap();
+            let current = store.load().unwrap();
+            let bytes = fs::read(store.path()).unwrap();
+            let (again, result) = store
+                .register_import_pending(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    account(key, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            assert_eq!(again, current);
+            assert_eq!(fs::read(store.path()).unwrap(), bytes);
+            let other = Uuid::from_u128(6);
+            let other_home = prepare(&store, &homes, other);
+            let before_duplicate = fs::read(store.path()).unwrap();
+            let (_, result) = store
+                .register_import_pending(
+                    &homes,
+                    other,
+                    stamp(&other_home),
+                    "fixture@example.test",
+                    account(other, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert!(result.is_err());
+            assert!(store.load().unwrap().is_import_pending(other));
+            assert_eq!(fs::read(store.path()).unwrap(), before_duplicate);
+        }
+
+        #[test]
+        fn explicit_verification_can_reconcile_registered_store_with_a_lost_journal_ack() {
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(31);
+            let home = prepare(&store, &homes, key);
+            let physical = stamp(&home);
+            let probe = command(&home);
+            let (_, result) = store
+                .register_import_pending(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    account(key, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            // Simulate only the Store side of an acknowledged registration. The
+            // host must still hold the original Published journal record and run
+            // a fresh identity probe before marking that journal Registered.
+            let registered = store.load().unwrap();
+            let bytes = fs::read(store.path()).unwrap();
+            let lease = store
+                .import_launch(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    &probe,
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert!(store.try_lock().is_err());
+            drop(lease);
+            assert_eq!(fs::read(store.path()).unwrap(), bytes);
+            let mut wrong_email = registered.clone();
+            wrong_email.accounts[0].email = Some("other@example.test".into());
+            let mut linked = registered.clone();
+            linked.accounts[0].linked_home = Some(home.clone());
+            let mut archived = registered.clone();
+            archived.archived.push(key);
+            let mut pending = registered.clone();
+            pending.pending.push(Pending {
+                key,
+                provider: Provider::Codex,
+                started_at: 1,
+                origin: PendingOrigin::CacheImport { operation: key },
+            });
+            let mut wrong_key = registered.clone();
+            wrong_key.accounts[0].key = Uuid::from_u128(32);
+            let mut ambiguous = registered.clone();
+            ambiguous.accounts.push(ambiguous.accounts[0].clone());
+            for invalid in [wrong_email, linked, archived, pending, wrong_key, ambiguous] {
+                write(&store.directory, &store.path(), &invalid).unwrap();
+                let before = fs::read(store.path()).unwrap();
+                assert!(
+                    store
+                        .import_launch(
+                            &homes,
+                            key,
+                            physical,
+                            "fixture@example.test",
+                            &probe,
+                            |_| Ok(())
+                        )
+                        .is_err()
+                );
+                assert_eq!(fs::read(store.path()).unwrap(), before);
+            }
+            write(&store.directory, &store.path(), &registered).unwrap();
+            assert!(
+                store
+                    .import_launch(&homes, key, physical, "wrong@example.test", &probe, |_| Ok(
+                        ()
+                    ))
+                    .is_err()
+            );
+            let mut wrong_home = physical;
+            wrong_home.inode += 1;
+            assert!(
+                store
+                    .import_launch(
+                        &homes,
+                        key,
+                        wrong_home,
+                        "fixture@example.test",
+                        &probe,
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            let (_, result) = store
+                .register_import_pending(
+                    &homes,
+                    key,
+                    physical,
+                    "fixture@example.test",
+                    account(key, "fixture@example.test"),
+                    &[],
+                    |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            assert_eq!(fs::read(store.path()).unwrap(), bytes);
+        }
+
+        #[test]
+        fn pending_store_failure_retains_empty_home_without_a_durable_acknowledgement() {
+            let (root, homes, store) = fixture();
+            store
+                .update(|registry| registry.set_default(&Account::system(Provider::Claude)))
+                .unwrap();
+            let before = fs::read(store.path()).unwrap();
+            let moved = root.path().join("retained-registry");
+            let key = Uuid::from_u128(10);
+            let result = store.create_import_pending(
+                &homes,
+                key,
+                1,
+                || {
+                    let created = homes.create_planned_with_config_initialized(
+                        Provider::Codex,
+                        key,
+                        None,
+                        super::super::super::home::CodexConfig::Shared,
+                        |_| Ok(()),
+                    )?;
+                    fs::rename(&store.directory, &moved)?;
+                    Ok(created)
+                },
+                |_| Ok(()),
+            );
+            assert!(result.is_err());
+            assert_eq!(fs::read(moved.join(FILE_NAME)).unwrap(), before);
+            assert!(!store.path().exists());
+            let home = homes.path(Provider::Codex, key);
+            assert!(home.is_dir());
+            assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
+            assert!(!home.join("auth.json").exists());
+        }
+
+        #[test]
+        fn dangling_link_to_the_new_home_is_not_activated() {
+            use std::os::unix::fs::symlink;
+            let (_root, homes, store) = fixture();
+            let key = Uuid::from_u128(7);
+            let target = homes.path(Provider::Codex, key);
+            let alias = homes.path(Provider::Claude, Uuid::from_u128(8));
+            fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            symlink(&target, &alias).unwrap();
+            store
+                .update(|registry| {
+                    let mut row = account(Uuid::from_u128(9), "other@example.test");
+                    row.linked_home = Some(alias);
+                    registry.accounts.push(row);
+                })
+                .unwrap();
+            let before = fs::read(store.path()).unwrap();
+            let mut created = false;
+            assert!(
+                store
+                    .create_import_pending(
+                        &homes,
+                        key,
+                        1,
+                        || {
+                            created = true;
+                            unreachable!()
+                        },
+                        |_| Ok(())
+                    )
+                    .is_err()
+            );
+            assert!(!created);
+            assert!(!target.exists());
+            assert_eq!(fs::read(store.path()).unwrap(), before);
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+pub(crate) use coding_config_init::CodingConfigRefusal;
+
+/// Only the selected daemon initializes an account file. UI/CLI callers use
+/// typed lifecycle RPCs; no shared reservation trait or lease is exported.
+#[cfg(feature = "host")]
+mod coding_config_init {
+    use super::*;
+    use crate::{
+        account::{
+            coding_config::{self, aliases},
+            readiness::PhysicalIdentity,
+        },
+        fs_safety::{self, Root},
+    };
+    use std::os::unix::fs::MetadataExt;
+
+    const MAX_HOMES: usize = 128;
+    const MAX_OBSERVATIONS: usize = 256;
+    const MAX_HOME_COMPONENTS: usize = 128;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CodingConfigRefusal {
+        RegistryUnavailable,
+        RegistryBusy,
+        RegistryNewer,
+        InvalidAccount,
+        ContextChanged,
+        SharedHome,
+        SharedConfig,
+        CensusUnavailable,
+        CensusLimit,
+    }
+    type Refusal = CodingConfigRefusal;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Stamp {
+        device: u64,
+        inode: u64,
+        uid: u32,
+        mode: u32,
+    }
+    impl Stamp {
+        fn directory(root: &Root) -> Result<Self, Refusal> {
+            let metadata = root.metadata().map_err(|_| Refusal::CensusUnavailable)?;
+            Self::metadata(&metadata)
+        }
+        fn metadata(metadata: &fs::Metadata) -> Result<Self, Refusal> {
+            if !metadata.is_dir() || metadata.nlink() == 0 {
+                return Err(Refusal::CensusUnavailable);
+            }
+            Ok(Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                uid: metadata.uid(),
+                mode: metadata.mode(),
+            })
+        }
+        fn is_selected(&self, selected: PhysicalIdentity) -> bool {
+            (self.device, self.inode) == (selected.device, selected.inode)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct HomeKey {
+        operand: PathBuf,
+        stamp: Stamp,
+        /// Empty for an existing home; otherwise the first proved-absent
+        /// component and remaining suffix under the retained nearest parent.
+        missing: PathBuf,
+    }
+    struct HomeObservation {
+        key: HomeKey,
+        root: Root,
+        anchor: PathBuf,
+    }
+    impl HomeObservation {
+        fn capture(path: PathBuf) -> Result<Self, Refusal> {
+            use std::path::Component;
+            if !path.is_absolute()
+                || path.as_os_str().as_bytes().len() > 16 * 1024
+                || path.components().count() > MAX_HOME_COMPONENTS
+                || path
+                    .components()
+                    .any(|part| matches!(part, Component::ParentDir))
+            {
+                return Err(Refusal::CensusUnavailable);
+            }
+            let mut ancestor = path.as_path();
+            let mut missing = Vec::new();
+            loop {
+                match ancestor.canonicalize() {
+                    Ok(canonical) => {
+                        let root =
+                            Root::open(&canonical).map_err(|_| Refusal::CensusUnavailable)?;
+                        let stamp = Stamp::directory(&root)?;
+                        let named =
+                            fs::metadata(ancestor).map_err(|_| Refusal::CensusUnavailable)?;
+                        if Stamp::metadata(&named)? != stamp {
+                            return Err(Refusal::ContextChanged);
+                        }
+                        let suffix: PathBuf = missing.into_iter().rev().collect();
+                        if let Some(first) = suffix.components().next() {
+                            // canonicalize(NotFound) alone is insufficient:
+                            // an existing dangling symlink is not absence.
+                            match fs_safety::metadata_beneath(&root, Path::new(first.as_os_str())) {
+                                Err(error) if error.is_not_found() => {}
+                                _ => return Err(Refusal::CensusUnavailable),
+                            }
+                        }
+                        return Ok(Self {
+                            key: HomeKey {
+                                operand: path.clone(),
+                                stamp,
+                                missing: suffix,
+                            },
+                            root,
+                            anchor: ancestor.to_path_buf(),
+                        });
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                        missing.push(
+                            ancestor
+                                .file_name()
+                                .ok_or(Refusal::CensusUnavailable)?
+                                .to_owned(),
+                        );
+                        ancestor = ancestor.parent().ok_or(Refusal::CensusUnavailable)?;
+                    }
+                    Err(_) => return Err(Refusal::CensusUnavailable),
+                }
+            }
+        }
+        fn revalidate(&self) -> bool {
+            if Stamp::directory(&self.root).ok().as_ref() != Some(&self.key.stamp)
+                || fs::metadata(&self.anchor)
+                    .ok()
+                    .and_then(|metadata| Stamp::metadata(&metadata).ok())
+                    .as_ref()
+                    != Some(&self.key.stamp)
+            {
+                return false;
+            }
+            self.key.missing.components().next().is_none_or(|first| {
+                matches!(fs_safety::metadata_beneath(&self.root, Path::new(first.as_os_str())), Err(error) if error.is_not_found())
+            })
+        }
+    }
+
+    struct Census {
+        homes: Vec<HomeObservation>,
+        witnesses: Vec<aliases::Witness>,
+        observations: usize,
+    }
+    impl Census {
+        fn revalidate(&self) -> bool {
+            self.homes.iter().all(HomeObservation::revalidate)
+                && self.witnesses.iter().all(aliases::Witness::revalidate)
+        }
+        fn same_homes(&self, fresh: &Self) -> bool {
+            self.homes
+                .iter()
+                .map(|home| &home.key)
+                .eq(fresh.homes.iter().map(|home| &home.key))
+        }
+    }
+
+    fn census(
+        registry: &Registry,
+        homes: &Homes,
+        selected: &AccountId,
+        root: &Root,
+        expected: PhysicalIdentity,
+        system: &[Account],
+        observation_budget: usize,
+    ) -> Result<Census, Refusal> {
+        if registry
+            .registered()
+            .len()
+            .checked_add(registry.pending().len())
+            .and_then(|count| count.checked_add(system.len()))
+            .is_none_or(|count| count > MAX_HOMES)
+        {
+            return Err(Refusal::CensusLimit);
+        }
+        let mut accounts: Vec<_> = registry
+            .registered()
+            .iter()
+            .map(|row| {
+                row.linked_home.as_ref().map_or_else(
+                    || Account::managed(row.provider, row.key, homes.path(row.provider, row.key)),
+                    |path| Account::linked(row.provider, row.key, path.clone()),
+                )
+            })
+            .collect();
+        accounts.extend(
+            registry.pending().iter().map(|row| {
+                Account::managed(row.provider, row.key, homes.path(row.provider, row.key))
+            }),
+        );
+        accounts.extend_from_slice(system);
+        let mut result = Census {
+            homes: Vec::new(),
+            witnesses: Vec::new(),
+            observations: 0,
+        };
+        for account in accounts {
+            if account.id() == *selected {
+                continue;
+            }
+            let path = account.resolved_home().ok_or(Refusal::CensusUnavailable)?;
+            let home = HomeObservation::capture(path)?;
+            if home.key.missing.as_os_str().is_empty() {
+                if home.key.stamp.is_selected(expected) {
+                    return Err(Refusal::SharedHome);
+                }
+                if account.provider == Provider::Codex {
+                    let observed = aliases::observe(&home.root, root);
+                    match observed.verdict {
+                        aliases::Verdict::Reference => return Err(Refusal::SharedConfig),
+                        aliases::Verdict::Unknown => return Err(Refusal::CensusUnavailable),
+                        aliases::Verdict::Independent => {}
+                    }
+                    let witness = observed.witness.ok_or(Refusal::CensusUnavailable)?;
+                    result.observations = result
+                        .observations
+                        .checked_add(witness.observation_count())
+                        .ok_or(Refusal::CensusLimit)?;
+                    if result.observations > observation_budget {
+                        return Err(Refusal::CensusLimit);
+                    }
+                    result.witnesses.push(witness);
+                }
+            }
+            result.homes.push(home);
+        }
+        if !result.revalidate() {
+            return Err(Refusal::ContextChanged);
+        }
+        Ok(result)
+    }
+
+    impl Store {
+        /// Publish only the selected fixed config, under one private registry
+        /// lease and the caller's existing account lifecycle reservation.
+        /// An earlier inspection is context, not permission: selection, home
+        /// identity and every relevant config target are checked afresh here.
+        /// No account/default/revision mutation or provider invocation occurs.
+        pub(crate) fn try_initialize_codex_config_reserved(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            id: &AccountId,
+            expected: PhysicalIdentity,
+            network_access: bool,
+        ) -> Result<coding_config::Outcome, CodingConfigRefusal> {
+            self.initialize_codex_config_with_system(
+                reservation,
+                homes,
+                id,
+                expected,
+                network_access,
+                &Account::system_accounts(),
+                |_| {},
+            )
+        }
+
+        fn initialize_codex_config_with_system(
+            &self,
+            reservation: &crate::host::AccountReservation,
+            homes: &Homes,
+            id: &AccountId,
+            expected: PhysicalIdentity,
+            network_access: bool,
+            system: &[Account],
+            mut before_validation: impl FnMut(bool),
+        ) -> Result<coding_config::Outcome, Refusal> {
+            // The exact existing private lock serializes every cooperating
+            // registry writer. No Registry mutation, save or revision occurs.
+            let _lease = self.try_lock().map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    Refusal::RegistryBusy
+                } else {
+                    Refusal::RegistryUnavailable
+                }
+            })?;
+            let latest = read(&self.path()).map_err(|_| Refusal::RegistryUnavailable)?;
+            if latest.is_newer() {
+                return Err(Refusal::RegistryNewer);
+            }
+            let key = latest
+                .registered()
+                .iter()
+                .find(|row| {
+                    let account = row.linked_home.as_ref().map_or_else(
+                        || {
+                            Account::managed(
+                                row.provider,
+                                row.key,
+                                homes.path(row.provider, row.key),
+                            )
+                        },
+                        |path| Account::linked(row.provider, row.key, path.clone()),
+                    );
+                    account.id() == *id
+                })
+                .ok_or(Refusal::InvalidAccount)?;
+            if key.provider != Provider::Codex
+                || latest.is_archived(key.key)
+                || latest.pending().iter().any(|row| row.key == key.key)
+                // Deserialization accepts duplicate rows. A second home with
+                // this UUID must not disappear through the census's selected
+                // account exclusion, even if its provider differs.
+                || latest.registered().iter().filter(|row| row.key == key.key).count() != 1
+            {
+                return Err(Refusal::InvalidAccount);
+            }
+            let root = reservation
+                .coding_config_root(&latest, id, expected)
+                .map_err(|_| Refusal::ContextChanged)?;
+            let baseline = census(
+                &latest,
+                homes,
+                id,
+                &root,
+                expected,
+                system,
+                MAX_OBSERVATIONS,
+            )?;
+            let prepared = match coding_config::prepare(&root, network_access) {
+                Ok(prepared) => prepared,
+                Err(reason) => return Ok(coding_config::Outcome::NotCreated(reason)),
+            };
+            let mut post = false;
+            let mut refused = None;
+            let outcome = prepared.publish(|| {
+                before_validation(post);
+                post = true;
+                let validation = (|| {
+                    reservation
+                        .coding_config_root(&latest, id, expected)
+                        .map_err(|_| Refusal::ContextChanged)?;
+                    if !baseline.revalidate() {
+                        return Err(Refusal::ContextChanged);
+                    }
+                    // The earlier witnesses stay live during this pass. Bound
+                    // both sets together rather than allowing each a full
+                    // independent descriptor budget. The leaf walk also has
+                    // its own fixed bound for its in-progress observation.
+                    let fresh = census(
+                        &latest,
+                        homes,
+                        id,
+                        &root,
+                        expected,
+                        system,
+                        MAX_OBSERVATIONS - baseline.observations,
+                    )?;
+                    if !baseline.same_homes(&fresh) || !baseline.revalidate() || !fresh.revalidate()
+                    {
+                        return Err(Refusal::ContextChanged);
+                    }
+                    Ok(())
+                })();
+                if let Err(reason) = validation {
+                    refused = Some(reason);
+                    false
+                } else {
+                    true
+                }
+            });
+            if matches!(
+                outcome,
+                coding_config::Outcome::NotCreated(coding_config::Refusal::ContextChanged)
+            ) {
+                return Err(refused.unwrap_or(Refusal::ContextChanged));
+            }
+            Ok(outcome)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{account::AccountHome, host::AccountReservation};
+        use std::os::unix::fs::symlink;
+
+        struct Fixture {
+            directory: tempfile::TempDir,
+            store: Store,
+            homes: Homes,
+            host: crate::host::TestSharedHost,
+            account: Account,
+            expected: PhysicalIdentity,
+            system: Vec<Account>,
+        }
+        impl Fixture {
+            fn new() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                let selected = directory.path().join("selected");
+                fs::create_dir(&selected).unwrap();
+                let account = Account::linked(Provider::Codex, Uuid::new_v4(), selected.clone());
+                let metadata = fs::metadata(&selected).unwrap();
+                let store = Store::at(directory.path().join("registry"));
+                let homes = Homes::at(directory.path().join("managed"));
+                store
+                    .update(|registry| {
+                        registry.accounts.push(registered(&account));
+                        registry.set_default(&account);
+                        registry.set_project_default(Path::new("/fixture-project"), &account);
+                    })
+                    .unwrap();
+                let system = [Provider::Codex, Provider::Claude]
+                    .into_iter()
+                    .map(|provider| {
+                        let path = directory
+                            .path()
+                            .join(format!("system-{}", provider.executable()));
+                        fs::create_dir(&path).unwrap();
+                        Account {
+                            provider,
+                            home: AccountHome::SystemAt { path },
+                        }
+                    })
+                    .collect();
+                Self {
+                    directory,
+                    store,
+                    homes,
+                    host: AccountReservation::test_host(),
+                    account,
+                    expected: PhysicalIdentity {
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                    },
+                    system,
+                }
+            }
+            fn path(&self) -> PathBuf {
+                self.account.resolved_home().unwrap().join("config.toml")
+            }
+            fn reserve(&self) -> AccountReservation {
+                AccountReservation::test_install(
+                    &self.host,
+                    std::slice::from_ref(&self.account),
+                    self.store.clone(),
+                    &self.homes,
+                )
+                .unwrap()
+            }
+            fn other(&self, name: &str) -> Account {
+                let path = self.directory.path().join(name);
+                fs::create_dir(&path).unwrap();
+                let account = Account::linked(Provider::Codex, Uuid::new_v4(), path);
+                self.store
+                    .update(|registry| registry.accounts.push(registered(&account)))
+                    .unwrap();
+                account
+            }
+            fn initialize(
+                &self,
+                reservation: &AccountReservation,
+                hook: impl FnMut(bool),
+            ) -> Result<coding_config::Outcome, Refusal> {
+                self.store.initialize_codex_config_with_system(
+                    reservation,
+                    &self.homes,
+                    &self.account.id(),
+                    self.expected,
+                    false,
+                    &self.system,
+                    hook,
+                )
+            }
+        }
+        fn registered(account: &Account) -> Registered {
+            Registered {
+                provider: account.provider,
+                key: account.registry_key().unwrap(),
+                linked_home: account.resolved_home(),
+                label: Some("fixture".into()),
+                email: Some("fixture@example.test".into()),
+                organization: None,
+                added_at: 1,
+            }
+        }
+
+        #[test]
+        fn publication_holds_the_real_store_lease_and_preserves_registry_defaults_and_revision() {
+            let fixture = Fixture::new();
+            let reservation = fixture.reserve();
+            let before = fs::read(fixture.store.path()).unwrap();
+            let saved = fixture.store.load().unwrap();
+            let mut passes = 0;
+            let outcome = fixture.initialize(&reservation, |_| {
+                passes += 1;
+                assert!(matches!(fixture.store.try_lock(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+            }).unwrap();
+            assert_eq!(outcome, coding_config::Outcome::Created);
+            assert_eq!(passes, 2);
+            assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+            assert_eq!(fixture.store.load().unwrap(), saved);
+            assert_eq!(fixture.store.load().unwrap().revision(), saved.revision());
+            let profile: toml::Value =
+                toml::from_str(&fs::read_to_string(fixture.path()).unwrap()).unwrap();
+            assert_eq!(
+                profile["sandbox_workspace_write"]["network_access"].as_bool(),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn reverse_config_links_from_registered_archived_system_and_pending_homes_refuse() {
+            for variant in [
+                "absolute",
+                "relative",
+                "parent-alias",
+                "chain",
+                "archived",
+                "system",
+                "pending",
+            ] {
+                let mut fixture = Fixture::new();
+                let selected = fixture.account.resolved_home().unwrap();
+                let other = if variant == "system" {
+                    fixture.system[0].clone()
+                } else if variant == "pending" {
+                    let key = Uuid::new_v4();
+                    let path = fixture.homes.path(Provider::Codex, key);
+                    fs::create_dir_all(&path).unwrap();
+                    fixture
+                        .store
+                        .update(|registry| registry.begin(Provider::Codex, key, 1))
+                        .unwrap();
+                    Account::managed(Provider::Codex, key, path)
+                } else {
+                    fixture.other("other")
+                };
+                if variant == "archived" {
+                    fixture
+                        .store
+                        .update(|registry| registry.archived.push(other.registry_key().unwrap()))
+                        .unwrap();
+                }
+                let parent = other.resolved_home().unwrap();
+                let target = match variant {
+                    "relative" => PathBuf::from("../selected/config.toml"),
+                    "parent-alias" => {
+                        let alias = fixture.directory.path().join("selected-alias");
+                        symlink(&selected, &alias).unwrap();
+                        alias.join("config.toml")
+                    }
+                    "chain" => {
+                        symlink(fixture.path(), parent.join("next-link")).unwrap();
+                        PathBuf::from("next-link")
+                    }
+                    _ => fixture.path(),
+                };
+                let config = parent.join("config.toml");
+                symlink(&target, &config).unwrap();
+                let inode = fs::symlink_metadata(&config).unwrap().ino();
+                let before = fs::read(fixture.store.path()).unwrap();
+                let reservation = fixture.reserve();
+                assert_eq!(
+                    fixture.initialize(&reservation, |_| {}),
+                    Err(Refusal::SharedConfig),
+                    "{variant}"
+                );
+                assert!(!fixture.path().exists());
+                assert_eq!(fs::read_link(&config).unwrap(), target);
+                assert_eq!(fs::symlink_metadata(&config).unwrap().ino(), inode);
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+            }
+        }
+
+        #[test]
+        fn a_physically_distinct_dangling_config_and_absent_home_remain_untouched() {
+            let mut fixture = Fixture::new();
+            let other = fixture.other("other").resolved_home().unwrap();
+            let target = PathBuf::from("independent.toml");
+            symlink(&target, other.join("config.toml")).unwrap();
+            let inode = fs::symlink_metadata(other.join("config.toml"))
+                .unwrap()
+                .ino();
+            fixture.system[1].home = AccountHome::SystemAt {
+                path: fixture.directory.path().join("absent-system-home"),
+            };
+            let reservation = fixture.reserve();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}).unwrap(),
+                coding_config::Outcome::Created
+            );
+            assert_eq!(fs::read_link(other.join("config.toml")).unwrap(), target);
+            assert_eq!(
+                fs::symlink_metadata(other.join("config.toml"))
+                    .unwrap()
+                    .ino(),
+                inode
+            );
+        }
+
+        #[test]
+        fn a_home_alias_introduced_after_reservation_is_caught_by_the_latest_census() {
+            let fixture = Fixture::new();
+            let other = fixture.other("other").resolved_home().unwrap();
+            let reservation = fixture.reserve();
+            fs::rename(&other, fixture.directory.path().join("old-other")).unwrap();
+            symlink(fixture.account.resolved_home().unwrap(), &other).unwrap();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Err(Refusal::SharedHome)
+            );
+            assert!(!fixture.path().exists());
+        }
+
+        #[test]
+        fn a_new_registered_reverse_alias_after_reservation_is_not_hidden_by_selected_validation() {
+            let fixture = Fixture::new();
+            let reservation = fixture.reserve();
+            let other = fixture.other("new-other").resolved_home().unwrap();
+            symlink(fixture.path(), other.join("config.toml")).unwrap();
+            let latest = fixture.store.load().unwrap();
+            assert!(reservation.verify_registry(&latest).is_ok());
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Err(Refusal::SharedConfig)
+            );
+            assert!(!fixture.path().exists());
+        }
+
+        #[test]
+        fn accepted_duplicate_uuid_rows_refuse_without_rewriting_or_touching_either_config() {
+            for provider in [Provider::Codex, Provider::Claude] {
+                let fixture = Fixture::new();
+                let reservation = fixture.reserve();
+                let other = fixture.directory.path().join("duplicate-home");
+                fs::create_dir(&other).unwrap();
+                let config = other.join("config.toml");
+                symlink(fixture.path(), &config).unwrap();
+                let link_before = fs::symlink_metadata(&config).unwrap();
+                let original = fixture.store.load().unwrap();
+                let mut duplicate = original.clone();
+                let mut row = duplicate.accounts[0].clone();
+                row.provider = provider;
+                row.linked_home = Some(other);
+                duplicate.accounts.push(row);
+
+                // Exercise the actual accepted on-disk preimage rather than
+                // relying on a normal writer to construct malformed metadata.
+                let bytes = toml::to_string_pretty(&duplicate).unwrap().into_bytes();
+                fs::write(fixture.store.path(), &bytes).unwrap();
+                let accepted = fixture.store.load().unwrap();
+                assert_eq!(accepted, duplicate);
+                assert_eq!(accepted.defaults, original.defaults);
+                assert_eq!(accepted.project_defaults, original.project_defaults);
+                assert_eq!(accepted.revision(), original.revision());
+                // Selected-only validation sees the first row unchanged;
+                // the new lease-time uniqueness guard must close this gap.
+                assert!(reservation.verify_registry(&accepted).is_ok());
+                assert_eq!(
+                    fixture.initialize(&reservation, |_| panic!("publication must not start")),
+                    Err(Refusal::InvalidAccount)
+                );
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), bytes);
+                assert_eq!(fixture.store.load().unwrap(), accepted);
+                assert!(matches!(
+                    fs::symlink_metadata(fixture.path()),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound
+                ));
+                let link_after = fs::symlink_metadata(&config).unwrap();
+                assert_eq!(
+                    (link_after.dev(), link_after.ino()),
+                    (link_before.dev(), link_before.ino())
+                );
+                assert_eq!(fs::read_link(&config).unwrap(), fixture.path());
+            }
+        }
+
+        #[test]
+        fn an_observed_target_changed_before_or_after_link_is_refused_or_uncertain() {
+            for after_link in [false, true] {
+                let fixture = Fixture::new();
+                let other = fixture.other("other").resolved_home().unwrap();
+                let config = other.join("config.toml");
+                symlink("independent.toml", &config).unwrap();
+                let reservation = fixture.reserve();
+                let before = fs::read(fixture.store.path()).unwrap();
+                let result = fixture.initialize(&reservation, |post| {
+                    if post == after_link {
+                        fs::remove_file(&config).unwrap();
+                        symlink(fixture.path(), &config).unwrap();
+                    }
+                });
+                if after_link {
+                    assert_eq!(
+                        result,
+                        Ok(coding_config::Outcome::CreationUncertain(
+                            coding_config::Uncertainty::ContextChanged
+                        ))
+                    );
+                    assert!(fixture.path().is_file());
+                } else {
+                    assert_eq!(result, Err(Refusal::ContextChanged));
+                    assert!(!fixture.path().exists());
+                }
+                assert_eq!(fs::read_link(config).unwrap(), fixture.path());
+                assert_eq!(fs::read(fixture.store.path()).unwrap(), before);
+            }
+        }
+
+        #[test]
+        fn stale_home_identity_busy_registry_and_occupied_configuration_never_publish() {
+            let fixture = Fixture::new();
+            let reservation = fixture.reserve();
+            let lease = fixture.store.try_lock().unwrap();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Err(Refusal::RegistryBusy)
+            );
+            drop(lease);
+            let wrong = PhysicalIdentity {
+                inode: fixture.expected.inode.wrapping_add(1),
+                ..fixture.expected
+            };
+            assert_eq!(
+                fixture.store.initialize_codex_config_with_system(
+                    &reservation,
+                    &fixture.homes,
+                    &fixture.account.id(),
+                    wrong,
+                    true,
+                    &fixture.system,
+                    |_| {}
+                ),
+                Err(Refusal::ContextChanged)
+            );
+            assert!(!fixture.path().exists());
+            fs::write(fixture.path(), b"existing user configuration").unwrap();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Ok(coding_config::Outcome::NotCreated(
+                    coding_config::Refusal::ExistingConfiguration
+                ))
+            );
+            assert_eq!(
+                fs::read(fixture.path()).unwrap(),
+                b"existing user configuration"
+            );
+        }
+
+        #[test]
+        fn alias_walks_have_an_aggregate_budget_without_publishing_a_partial_result() {
+            let fixture = Fixture::new();
+            for index in 0..100 {
+                fixture.other(&format!("other-{index}"));
+            }
+            let reservation = fixture.reserve();
+            assert_eq!(
+                fixture.initialize(&reservation, |_| {}),
+                Err(Refusal::CensusLimit)
+            );
+            assert!(!fixture.path().exists());
+        }
+
+        #[test]
+        fn fresh_census_shares_the_budget_with_the_still_retained_baseline() {
+            let fixture = Fixture::new();
+            for index in 0..55 {
+                fixture.other(&format!("other-{index}"));
+            }
+            let reservation = fixture.reserve();
+            let mut validations = 0;
+            assert_eq!(
+                fixture.initialize(&reservation, |_| validations += 1),
+                Err(Refusal::CensusLimit)
+            );
+            // Staging was reached, so the baseline alone fit. The first
+            // pre-publication pass must still account for its retained roots.
+            assert_eq!(validations, 1);
+            assert!(!fixture.path().exists());
+        }
     }
 }

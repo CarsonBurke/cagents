@@ -132,6 +132,7 @@ impl Reservation {
             }
         };
         super::client::ensure_control_open(host)?;
+        super::account_readiness::ensure_unused_directory(host, &scope.path, &scope._pin)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if entries.values().any(|other| other.overlaps(&scope)) {
             return Err(refusal(
@@ -159,6 +160,8 @@ impl Reservation {
     /// automation work targets it, or an account operation is changing a
     /// credential directory inside it. Call outside HostState.
     pub(super) fn ensure_unoccupied(&self, host: &SharedHost) -> Result<(), String> {
+        super::account_readiness::ensure_unused_directory(host, &self.scope.path, &self.scope._pin)
+            .map_err(|error| error.message)?;
         let hosted = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let mut hosted: Vec<(&'static str, PathBuf)> = Vec::new();
