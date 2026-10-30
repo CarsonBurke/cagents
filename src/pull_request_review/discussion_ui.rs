@@ -33,6 +33,17 @@ pub enum Action {
     Preview,
     Cancel,
     Save,
+    SaveNow,
+    Reanchor,
+    Reanchored {
+        generation: u64,
+        composer_revision: u64,
+        context: ReviewContext,
+        result: Result<Anchor, String>,
+    },
+    PrepareDiscard,
+    ConfirmDiscard,
+    CancelDiscard,
     Summary(text_editor::Action),
     Event(ReviewEvent),
     /// Shows or hides the review submission popover.
@@ -49,8 +60,8 @@ pub enum Action {
     OpenLink(String),
 }
 
-#[derive(Debug, Clone)]
-enum Destination {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Destination {
     Line(Anchor),
     File(String),
     Reply(String),
@@ -59,6 +70,7 @@ enum Destination {
 
 struct Composer {
     authority: Authority,
+    range: Option<PullRequestRange>,
     destination: Destination,
     content: text_editor::Content<cosmic::Renderer>,
     preview: bool,
@@ -85,6 +97,7 @@ pub(super) struct DiscussionState {
     /// The submission surface is disclosed on demand rather than parked
     /// under every diff.
     review_open: bool,
+    discard_confirmation: Option<(Authority, String)>,
     /// Why GitHub refused the last submission, shown inside the popover.
     submit_error: Option<String>,
     summary: text_editor::Content<cosmic::Renderer>,
@@ -99,6 +112,10 @@ pub(super) struct DiscussionState {
     saving_composer: bool,
     unknown: Option<String>,
     loading: bool,
+    drafts_saved: bool,
+    /// Fences asynchronous anchor mapping to the draft and destination it read.
+    composer_revision: u64,
+    cache_version: Option<String>,
 }
 
 impl Default for DiscussionState {
@@ -111,6 +128,7 @@ impl Default for DiscussionState {
             expanded: BTreeSet::new(),
             composer: None,
             review_open: false,
+            discard_confirmation: None,
             submit_error: None,
             summary: text_editor::Content::new(),
             event: ReviewEvent::Comment,
@@ -120,6 +138,9 @@ impl Default for DiscussionState {
             saving_composer: false,
             unknown: None,
             loading: false,
+            drafts_saved: true,
+            composer_revision: 0,
+            cache_version: None,
         }
     }
 }
@@ -132,8 +153,14 @@ impl DiscussionState {
             summary: std::mem::take(&mut self.summary),
             event: self.event,
             review_open: self.review_open,
+            drafts_saved: self.drafts_saved,
+            cache_version: self.cache_version,
             ..Self::default()
         }
+    }
+
+    pub(super) fn has_conversation(&self) -> bool {
+        self.conversation.is_some()
     }
 
     pub(super) fn has_local_work(&self) -> bool {
@@ -142,6 +169,71 @@ impl DiscussionState {
 }
 
 impl State {
+    pub(super) fn discussion_is_busy(&self) -> bool {
+        self.discussion.busy
+    }
+    pub(super) fn drafts_need_save(&self) -> bool {
+        !self.discussion.drafts_saved
+    }
+
+    pub(super) fn draft_cache_basis(&self) -> Option<String> {
+        self.discussion.cache_version.clone()
+    }
+    pub(super) fn drafts_cache_saved(&mut self, version: Option<String>) {
+        self.discussion.drafts_saved = true;
+        if version.is_some() {
+            self.discussion.cache_version = version;
+        }
+    }
+
+    pub(super) fn local_drafts(&self) -> Option<cache::Drafts> {
+        (self.discussion.has_local_work() || self.discussion.unknown.is_some()).then(|| {
+            cache::Drafts {
+                composer: self
+                    .discussion
+                    .composer
+                    .as_ref()
+                    .map(|composer| cache::Draft {
+                        context: composer.authority.context.clone(),
+                        range: composer.range.clone(),
+                        destination: composer.destination.clone(),
+                        body: composer.content.text(),
+                    }),
+                summary: self.discussion.summary.text(),
+                event: self.discussion.event,
+                unknown: self.discussion.unknown.clone(),
+            }
+        })
+    }
+    pub(super) fn restore_drafts(
+        &mut self,
+        drafts: Option<cache::Drafts>,
+        version: Option<String>,
+    ) {
+        if self.discussion.has_local_work() {
+            return;
+        }
+        self.discussion.cache_version = version;
+        let (Some(drafts), Some(target)) = (drafts, self.target.clone()) else {
+            return;
+        };
+        self.discussion.summary = text_editor::Content::with_text(&drafts.summary);
+        self.discussion.event = drafts.event;
+        self.discussion.unknown = drafts.unknown;
+        self.discussion.composer = drafts.composer.map(|draft| Composer {
+            authority: Authority {
+                target,
+                context: draft.context,
+                merge_base: draft.range.as_ref().map(|range| range.merge_base.clone()),
+            },
+            range: draft.range,
+            destination: draft.destination,
+            content: text_editor::Content::with_text(&draft.body),
+            preview: false,
+            markdown: markdown::parse(&draft.body).collect(),
+        });
+    }
+
     /// Local review input and write receipts must survive until explicitly resolved.
     pub fn restart_blocker(&self) -> Option<&'static str> {
         if self.existing_checkout.busy() {
@@ -154,14 +246,14 @@ impl State {
             Some(
                 "Check the unresolved review write on GitHub and acknowledge its outcome before closing the window.",
             )
-        } else if self.discussion.has_local_work()
-            || self
-                .parked_discussions
-                .iter()
-                .any(|(_, discussion)| discussion.has_local_work())
+        } else if (self.discussion.has_local_work() && self.cache.is_none())
+            || (!self.discussion.drafts_saved && self.cache.is_some())
+            || self.parked_discussions.iter().any(|(_, discussion)| {
+                discussion.has_local_work() && (!discussion.drafts_saved || self.cache.is_none())
+            })
         {
             Some(
-                "The window contains local PR review drafts. Save or clear the comment and review summary before closing; reopen reviews with drafts if needed.",
+                "Local review drafts are not saved yet. Wait for the cache write or keep this window open until its save error is resolved.",
             )
         } else {
             None
@@ -173,7 +265,9 @@ impl State {
             self.notice = Some("Wait for checkout reconciliation to settle before leaving this review. You can request cancellation below.".into());
             return true;
         }
-        let message = if self.discussion.busy {
+        let message = if self.cache.is_some() && !self.discussion.drafts_saved {
+            Some("Wait for the local review draft to finish saving before leaving this review.")
+        } else if self.discussion.busy {
             Some("Wait for the GitHub write to finish before leaving this review.")
         } else if self.discussion.unknown.is_some() {
             Some(
@@ -224,15 +318,12 @@ impl State {
         Some(Authority {
             target: self.target.clone()?,
             context: self.context.clone()?,
+            merge_base: self.range.as_ref().map(|range| range.merge_base.clone()),
         })
     }
 
     fn can_mutate_discussion(&self) -> bool {
-        self.load == LoadState::Ready
-            && !self.refreshing
-            && !self.discussion.loading
-            && !self.discussion.busy
-            && self.discussion.unknown.is_none()
+        self.load == LoadState::Ready && !self.discussion.busy && self.discussion.unknown.is_none()
     }
 
     fn can_discard_draft(&self) -> bool {
@@ -243,6 +334,7 @@ impl State {
         if !self.can_mutate_discussion() {
             return ActionTask::none();
         }
+        self.force_conversation = true;
         self.discussion.busy = true;
         self.discussion.submitting = matches!(mutation, Mutation::Submit { .. });
         self.discussion.saving_composer = matches!(
@@ -254,6 +346,9 @@ impl State {
         );
         // A load started before this write must not install an older pending count.
         self.load_generation = self.load_generation.wrapping_add(1);
+        self.refreshing = false;
+        self.discussion.loading = false;
+        self.pages.loading = false;
         let generation = self.generation;
         let api = Arc::clone(&self.api);
         let git = self.git.clone();
@@ -276,6 +371,34 @@ impl State {
 
     pub(super) fn update_discussion(&mut self, action: Action) -> ActionTask {
         self.discussion.revision = self.discussion.revision.wrapping_add(1);
+        if matches!(
+            &action,
+            Action::Cancel
+                | Action::Begin(_)
+                | Action::BeginFile(_)
+                | Action::Reply(_)
+                | Action::Edit(_)
+                | Action::Reanchor
+                | Action::AcknowledgeUnknown
+        ) {
+            self.discussion.composer_revision = self.discussion.composer_revision.wrapping_add(1);
+        }
+        if matches!(
+            &action,
+            Action::Composer(_)
+                | Action::Summary(_)
+                | Action::Cancel
+                | Action::Finished { .. }
+                | Action::AcknowledgeUnknown
+                | Action::Event(_)
+                | Action::Begin(_)
+                | Action::BeginFile(_)
+                | Action::Reply(_)
+                | Action::Edit(_)
+        ) {
+            self.cache_dirty = true;
+            self.discussion.drafts_saved = false;
+        }
         match action {
             Action::Fenced {
                 generation,
@@ -327,6 +450,9 @@ impl State {
                             })
                             .collect();
                         self.discussion.conversation = Some(conversation);
+                        if let Some(target) = &self.target {
+                            crate::github::polling::succeeded(&target.repository.host);
+                        }
                     }
                     Err(error) => {
                         self.notice = Some(format!("Could not load review discussion. {error}"))
@@ -369,8 +495,13 @@ impl State {
                         self.discussion.unknown = Some(message);
                     }
                 }
-                self.refreshing = true;
-                return self.start_load();
+                if self.target.as_ref().is_some_and(|target| {
+                    crate::github::polling::ready(&target.repository.host, false)
+                }) {
+                    self.refreshing = true;
+                    return self.start_load();
+                }
+                self.refreshing = false;
             }
             Action::AcknowledgeUnknown if !self.discussion.busy => {
                 self.discussion.unknown = None;
@@ -428,6 +559,38 @@ impl State {
                     self.effects.push(Effect::OpenUrl(url));
                 }
             }
+            Action::Reanchored {
+                generation,
+                composer_revision,
+                context,
+                result,
+            } => {
+                if generation != self.generation
+                    || composer_revision != self.discussion.composer_revision
+                    || self
+                        .context
+                        .as_ref()
+                        .is_none_or(|current| !same_diff_authority(current, &context))
+                {
+                    return ActionTask::none();
+                }
+                match result {
+                    Ok(anchor) => {
+                        if let Some(composer) = &mut self.discussion.composer {
+                            composer.destination = Destination::Line(anchor);
+                            composer.authority.context = context;
+                            composer.authority.merge_base =
+                                self.range.as_ref().map(|range| range.merge_base.clone());
+                            composer.range = self.range.clone();
+                            self.cache_dirty = true;
+                            self.discussion.drafts_saved = false;
+                            self.notice = Some("Draft re-anchored to the current head. Check its line before posting.".into());
+                        }
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
+            Action::CancelDiscard => self.discussion.discard_confirmation = None,
             _ if !self.can_mutate_discussion() => return ActionTask::none(),
             Action::Begin(anchor) => {
                 if self
@@ -440,9 +603,16 @@ impl State {
                 let authority = self.authority().expect("loaded review authority");
                 if let Some(composer) = &mut self.discussion.composer {
                     if matches!(composer.destination, Destination::Line(_))
-                        && composer.authority == authority
+                        && discussion::same_identity(
+                            &composer.authority.context,
+                            &authority.context,
+                        )
+                        .is_ok()
                     {
                         composer.destination = Destination::Line(anchor);
+                        composer.authority = authority;
+                        composer.range = self.range.clone();
+                        self.cache_dirty = true;
                     } else {
                         self.notice = Some("Save or cancel the open comment first.".into());
                     }
@@ -450,6 +620,7 @@ impl State {
                 }
                 self.discussion.composer = Some(Composer {
                     authority,
+                    range: self.range.clone(),
                     destination: Destination::Line(anchor),
                     content: text_editor::Content::new(),
                     preview: false,
@@ -470,6 +641,7 @@ impl State {
                 }
                 self.discussion.composer = Some(Composer {
                     authority: self.authority().expect("loaded review authority"),
+                    range: self.range.clone(),
                     destination: Destination::File(path),
                     content: text_editor::Content::new(),
                     preview: false,
@@ -486,6 +658,7 @@ impl State {
                 self.discussion.expanded.insert(id.clone());
                 self.discussion.composer = Some(Composer {
                     authority: self.authority().expect("loaded review authority"),
+                    range: self.range.clone(),
                     destination: Destination::Reply(id),
                     content: text_editor::Content::new(),
                     preview: false,
@@ -506,6 +679,7 @@ impl State {
                 };
                 self.discussion.composer = Some(Composer {
                     authority: self.authority().expect("loaded review authority"),
+                    range: self.range.clone(),
                     destination: Destination::Edit(id),
                     content: text_editor::Content::with_text(&comment.body),
                     preview: false,
@@ -518,10 +692,27 @@ impl State {
                 self.discussion.confirmation = None;
                 self.discussion.submit_error = None;
             }
-            Action::Save => {
+            Action::Save | Action::SaveNow => {
+                let single = matches!(action, Action::SaveNow);
                 let Some(composer) = &self.discussion.composer else {
                     return ActionTask::none();
                 };
+                if matches!(
+                    &composer.destination,
+                    Destination::Line(_) | Destination::File(_)
+                ) && (self
+                    .context
+                    .as_ref()
+                    .is_none_or(|current| current.head_oid != composer.authority.context.head_oid)
+                    || composer
+                        .range
+                        .as_ref()
+                        .zip(self.range.as_ref())
+                        .is_none_or(|(old, new)| old.merge_base != new.merge_base))
+                {
+                    self.notice = Some("The draft's diff changed. Re-anchor it to the current head, or select its new line in the gutter.".into());
+                    return ActionTask::none();
+                }
                 let authority = composer.authority.clone();
                 let body = composer.content.text();
                 if body.trim().is_empty() {
@@ -531,14 +722,17 @@ impl State {
                     Destination::Line(anchor) => Mutation::Comment {
                         anchor: anchor.clone(),
                         body,
+                        single,
                     },
                     Destination::File(path) => Mutation::FileComment {
                         path: path.clone(),
                         body,
+                        single,
                     },
                     Destination::Reply(thread) => Mutation::Reply {
                         thread: thread.clone(),
                         body,
+                        add_to_review: !single,
                     },
                     Destination::Edit(comment) => Mutation::Edit {
                         comment: comment.clone(),
@@ -546,6 +740,80 @@ impl State {
                     },
                 };
                 return self.send_discussion(authority, mutation);
+            }
+            Action::PrepareDiscard => {
+                if let Some(authority) = self.authority()
+                    && let Some(pending) = &authority.context.pending
+                {
+                    self.discussion.discard_confirmation =
+                        Some((authority.clone(), pending.id.clone()));
+                }
+            }
+            Action::ConfirmDiscard => {
+                if let Some((authority, review_id)) = self.discussion.discard_confirmation.take() {
+                    return self.send_discussion(authority, Mutation::Discard { review_id });
+                }
+            }
+            Action::Reanchor => {
+                let Some(composer) = &self.discussion.composer else {
+                    return ActionTask::none();
+                };
+                if !discussion::same_identity(
+                    &composer.authority.context,
+                    &self.context.clone().expect("loaded context"),
+                )
+                .is_ok()
+                {
+                    self.notice = Some("The account or pull request changed. Restore that account before using this draft.".into());
+                    return ActionTask::none();
+                }
+                let Some(authority) = self.authority() else {
+                    return ActionTask::none();
+                };
+                if matches!(composer.destination, Destination::File(_)) {
+                    let composer = self.discussion.composer.as_mut().unwrap();
+                    composer.authority = authority;
+                    composer.range = self.range.clone();
+                    self.cache_dirty = true;
+                    self.discussion.drafts_saved = false;
+                    return ActionTask::none();
+                }
+                let Destination::Line(anchor) = &composer.destination else {
+                    return ActionTask::none();
+                };
+                let (Some(old), Some(new)) = (composer.range.clone(), self.range.clone()) else {
+                    return ActionTask::none();
+                };
+                let anchor = anchor.clone();
+                let git = self.git.clone();
+                let cancellation = self.cancellation.clone();
+                let worktree = authority.target.worktree.clone();
+                let composer_revision = self.discussion.composer_revision;
+                let generation = self.generation;
+                let context = authority.context;
+                return ActionTask::perform(
+                    async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            discussion::reanchor(
+                                &git,
+                                &worktree,
+                                &old,
+                                &new,
+                                &anchor,
+                                &cancellation,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        super::Action::Discussion(Action::Reanchored {
+                            generation,
+                            composer_revision,
+                            context,
+                            result,
+                        })
+                    },
+                    |action| action,
+                );
             }
             Action::Delete(comment) => {
                 if let Some(authority) = self.authority() {
@@ -563,6 +831,13 @@ impl State {
                     self.notice = Some(
                         "Save or cancel the open comment before submitting your review.".into(),
                     );
+                    return ActionTask::none();
+                }
+                if self.discussion.event == ReviewEvent::Comment
+                    && self.discussion.summary.text().trim().is_empty()
+                    && self.pending_count() == 0
+                {
+                    self.discussion.submit_error = Some("Write a summary or add a pending comment before submitting a Comment review.".into());
                     return ActionTask::none();
                 }
                 if let Some(authority) = self.authority() {
@@ -665,7 +940,16 @@ impl State {
         let enabled = self.can_mutate_discussion();
         let pending = self.pending_count();
         let mut rows: Vec<Element<'_, Action>> = Vec::new();
-        if let Some((authority, request, _)) = &self.discussion.confirmation {
+        if let Some((authority, _)) = &self.discussion.discard_confirmation {
+            rows.push(design::heading("Discard pending review?").into());
+            rows.push(design::body(format!("This deletes the pending review and all {} draft comments from GitHub. Your local composer is kept.", authority.context.pending.as_ref().map_or(0, |pending| pending.comment_count))).into());
+            rows.push(popup_actions(
+                crate::ui_controls::button::secondary("Keep review")
+                    .on_press(Action::CancelDiscard),
+                crate::ui_controls::button::primary("Discard review")
+                    .on_press_maybe(enabled.then_some(Action::ConfirmDiscard)),
+            ));
+        } else if let Some((authority, request, _)) = &self.discussion.confirmation {
             let comments = match authority
                 .context
                 .pending
@@ -722,6 +1006,22 @@ impl State {
             ));
         } else {
             rows.push(design::heading("Finish your review").into());
+            if let Some(pending) = self
+                .context
+                .as_ref()
+                .and_then(|context| context.pending.as_ref())
+            {
+                let commit = pending.commit_oid.as_deref().unwrap_or("unknown");
+                let stale = self.context.as_ref().is_some_and(|context| {
+                    Some(context.head_oid.as_str()) != pending.commit_oid.as_deref()
+                });
+                rows.push(design::body(format!("You have a pending review with {} comments on {}.{}", pending.comment_count, commit.get(..7).unwrap_or(commit), if stale { " This review belongs to an old head. Discard it to start a review on the current head." } else { "" })).into());
+                rows.push(
+                    crate::ui_controls::button::secondary("Discard pending review…")
+                        .on_press_maybe(enabled.then_some(Action::PrepareDiscard))
+                        .into(),
+                );
+            }
             rows.push(
                 design::caption(match pending {
                     0 => "No pending comments. Comment on a line from the diff gutter, or on a whole file from its toolbar.".to_owned(),
@@ -783,6 +1083,18 @@ impl State {
             );
             let drafting = self.discussion.composer.is_some();
             if drafting {
+                if let Some(composer) = &self.discussion.composer {
+                    let mut editor = text_editor::TextEditor::new(&composer.content).height(100);
+                    if !self.discussion.busy {
+                        editor = editor.on_action(Action::Composer);
+                    }
+                    rows.push(editor.into());
+                    rows.push(
+                        crate::ui_controls::button::quiet("Discard local comment")
+                            .on_press_maybe(self.can_discard_draft().then_some(Action::Cancel))
+                            .into(),
+                    );
+                }
                 rows.push(
                     design::caption("Save or cancel the comment you’re writing before submitting.")
                         .class(cosmic::theme::Text::Custom(design::warning_text))
@@ -790,14 +1102,34 @@ impl State {
                         .into(),
                 );
             }
+            let empty_comment = self.discussion.event == ReviewEvent::Comment
+                && self.discussion.summary.text().trim().is_empty()
+                && pending == 0;
+            if empty_comment {
+                rows.push(
+                    design::caption(
+                        "Write a summary or add a pending comment to submit a Comment review.",
+                    )
+                    .into(),
+                );
+            }
             rows.push(popup_actions(
                 crate::ui_controls::button::secondary("Cancel").on_press(Action::CloseReview),
-                crate::ui_controls::button::primary(if self.discussion.busy {
-                    "Saving…"
-                } else {
-                    "Submit review"
-                })
-                .on_press_maybe((enabled && !drafting).then_some(Action::PrepareSubmit)),
+                crate::interaction::tooltip(
+                    crate::ui_controls::button::primary(if self.discussion.busy {
+                        "Saving…"
+                    } else {
+                        "Submit review"
+                    })
+                    .on_press_maybe(
+                        (enabled && !drafting && !empty_comment).then_some(Action::PrepareSubmit),
+                    ),
+                    if empty_comment {
+                        "Write a summary or add a pending comment to submit a Comment review."
+                    } else {
+                        "Confirm and submit this review"
+                    },
+                ),
             ));
         }
         if let Some(error) = &self.discussion.submit_error {
@@ -1036,6 +1368,17 @@ impl State {
         self.composer_at(path, old, new, leading, None)
     }
 
+    fn composer_stale(&self, composer: &Composer) -> bool {
+        self.context.as_ref().is_some_and(|context| {
+            context.head_oid != composer.authority.context.head_oid
+                || composer
+                    .range
+                    .as_ref()
+                    .zip(self.range.as_ref())
+                    .is_none_or(|(a, b)| a.merge_base != b.merge_base)
+        })
+    }
+
     fn composer_at(
         &self,
         path: &str,
@@ -1049,6 +1392,9 @@ impl State {
         };
         match &composer.destination {
             Destination::Line(anchor) => {
+                if self.composer_stale(composer) {
+                    return leading;
+                }
                 !leading
                     && anchor.path == path
                     && match anchor.side {
@@ -1060,7 +1406,7 @@ impl State {
                         }
                     }
             }
-            Destination::File(file) => leading && file == path,
+            Destination::File(file) => leading && (file == path || self.composer_stale(composer)),
             Destination::Reply(id) => self
                 .threads_at(path, old, new, leading, bounds)
                 .any(|t| &t.id == id),
@@ -1311,6 +1657,10 @@ impl State {
                 rows.push(design::caption("More comments are available on GitHub.").into());
             }
         }
+        let has_pending_review = self
+            .context
+            .as_ref()
+            .is_some_and(|context| context.pending.is_some());
         if self.composer_at(path, old, new, leading, bounds)
             && let Some(composer) = &self.discussion.composer
         {
@@ -1320,10 +1670,29 @@ impl State {
                 }
                 Destination::Line(anchor) => format!("New comment · line {}", anchor.line),
                 Destination::File(_) => "New comment · whole file".into(),
-                Destination::Reply(_) => "Reply in pending review".into(),
+                Destination::Reply(_) => "Reply".into(),
                 Destination::Edit(_) => "Edit pending comment".into(),
             };
             rows.push(design::heading(label).into());
+            let stale = matches!(
+                composer.destination,
+                Destination::Line(_) | Destination::File(_)
+            ) && self.context.as_ref().is_some_and(|context| {
+                context.head_oid != composer.authority.context.head_oid
+                    || composer
+                        .range
+                        .as_ref()
+                        .zip(self.range.as_ref())
+                        .is_none_or(|(a, b)| a.merge_base != b.merge_base)
+            });
+            if stale {
+                rows.push(design::caption("The draft is kept, but its diff changed. Re-anchor it automatically, or pick a new line in the gutter.").into());
+                rows.push(
+                    crate::ui_controls::button::secondary("Re-anchor to current head")
+                        .on_press_maybe(enabled.then_some(Action::Reanchor))
+                        .into(),
+                );
+            }
             if composer.preview {
                 rows.push(
                     markdown::view(
@@ -1346,12 +1715,45 @@ impl State {
             }
             rows.push(
                 widget::row::with_children(vec![
-                    crate::ui_controls::button::primary("Save pending comment")
-                        .on_press_maybe(
-                            (enabled && !composer.content.text().trim().is_empty())
-                                .then_some(Action::Save),
-                        )
-                        .into(),
+                    crate::ui_controls::button::primary(
+                        if matches!(composer.destination, Destination::Edit(_)) {
+                            "Save comment"
+                        } else if has_pending_review {
+                            "Add to review"
+                        } else {
+                            "Comment"
+                        },
+                    )
+                    .on_press_maybe(
+                        (enabled && !stale && !composer.content.text().trim().is_empty())
+                            .then_some(
+                                if matches!(composer.destination, Destination::Edit(_))
+                                    || has_pending_review
+                                {
+                                    Action::Save
+                                } else {
+                                    Action::SaveNow
+                                },
+                            ),
+                    )
+                    .into(),
+                    crate::ui_controls::button::secondary(if has_pending_review {
+                        "Comment now"
+                    } else {
+                        "Add to review"
+                    })
+                    .on_press_maybe(
+                        (enabled
+                            && !stale
+                            && !matches!(composer.destination, Destination::Edit(_))
+                            && !composer.content.text().trim().is_empty())
+                        .then_some(if has_pending_review {
+                            Action::SaveNow
+                        } else {
+                            Action::Save
+                        }),
+                    )
+                    .into(),
                     // Local to the draft, so live through a background
                     // refresh, as typing is; only a write in flight holds them.
                     crate::ui_controls::button::quiet(if composer.preview {
@@ -1404,6 +1806,546 @@ mod tests {
             start_line: 4,
             line: 7,
         }
+    }
+
+    mod reanchor_receipt_tests {
+        use super::*;
+        use crate::pull_request_review::Action as ReviewAction;
+        use cosmic::iced::futures::StreamExt;
+
+        const BODY: &str = "Keep this saved line draft";
+
+        async fn outputs(task: ActionTask) -> Vec<ReviewAction> {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return Vec::new();
+            };
+            tokio::time::timeout(Duration::from_secs(10), async move {
+                let mut outputs = Vec::new();
+                while let Some(effect) = stream.next().await {
+                    if let iced::runtime::Action::Output(action) = effect {
+                        outputs.push(action);
+                    }
+                }
+                outputs
+            })
+            .await
+            .expect("the owned Git/cache fixture must finish")
+        }
+
+        async fn finish_cache(state: &mut State, task: ActionTask) {
+            let receipts = outputs(task).await;
+            assert_eq!(receipts.len(), 1, "one real cache write must finish");
+            for receipt in receipts {
+                let ReviewAction::CacheSaved { result, .. } = &receipt else {
+                    panic!("expected the cache's actual receipt, got {receipt:?}");
+                };
+                assert!(result.is_ok(), "{result:?}");
+                drop(state.update(receipt));
+            }
+            assert!(!state.drafts_need_save());
+            assert!(state.restart_blocker().is_none());
+        }
+
+        fn git(root: &Path, arguments: &[&str]) -> String {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Review fixture",
+                    "-c",
+                    "user.email=review-fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .arg("-C")
+                .arg(root)
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "fixture git {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        }
+
+        async fn saved_draft() -> (tempfile::TempDir, State, Loaded, Loaded) {
+            let directory = tempfile::tempdir().unwrap();
+            git(directory.path(), &["init", "--quiet"]);
+            let commit = |text: &str| {
+                std::fs::write(directory.path().join("file.rs"), text).unwrap();
+                git(directory.path(), &["add", "--", "file.rs"]);
+                git(directory.path(), &["commit", "--quiet", "-m", "fixture"]);
+                Oid::parse(git(directory.path(), &["rev-parse", "HEAD"])).unwrap()
+            };
+            let base = commit("base\n");
+            let old_head = commit("a\nb\nc\nd\ne\nf\ng\nh\n");
+            let new_head = commit("inserted\na\nb\nc\nd\ne\nf\ng\nh\n");
+            let load = |head: Oid| {
+                let mut load = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+                load.context.head_oid = head.as_str().to_owned();
+                load.context.base_oid = base.as_str().to_owned();
+                load.pull_request.head_ref_oid = head.as_str().to_owned();
+                load.pull_request.base_ref_oid = Some(base.as_str().to_owned());
+                load.range.head = head;
+                load.range.base_tip = base.clone();
+                load.range.merge_base = base.clone();
+                load
+            };
+            let old = load(old_head);
+            let current = load(new_head);
+            let mut state = ready();
+            state.cache = Some(Arc::new(cache::JsonStore::new(
+                directory.path().join("review-cache.json"),
+            )));
+            state.target = Some(ReviewTarget {
+                worktree: directory.path().to_path_buf(),
+                pull_request: Arc::new(old.pull_request.clone()),
+                ..target(1)
+            });
+            state.adopt(&old);
+            let save = state.update(ReviewAction::Discussion(Action::Begin(anchor())));
+            finish_cache(&mut state, save).await;
+            let save = state.update(ReviewAction::Discussion(Action::Composer(
+                text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(BODY.into()))),
+            )));
+            finish_cache(&mut state, save).await;
+            state.adopt(&current);
+            // Finish the refresh's real cache write before starting the mapping.
+            let save = state.update(ReviewAction::Discussion(Action::Preview));
+            finish_cache(&mut state, save).await;
+            (directory, state, old, current)
+        }
+
+        async fn mapped_receipt(task: ActionTask) -> ReviewAction {
+            let mut receipts = outputs(task).await;
+            assert_eq!(receipts.len(), 1, "one real mapping receipt expected");
+            let receipt = receipts.pop().unwrap();
+            assert!(matches!(
+                receipt,
+                ReviewAction::Discussion(Action::Reanchored { .. })
+            ));
+            receipt
+        }
+
+        #[tokio::test]
+        async fn reanchor_receipts_after_close_do_not_dirty_an_empty_review_or_block_reopening() {
+            for success_queued_before_close in [true, false] {
+                let (_directory, mut state, old, _) = saved_draft().await;
+                let original = state.target.clone().unwrap();
+                let mapping = state.update(ReviewAction::Discussion(Action::Reanchor));
+                let (queued, pending) = if success_queued_before_close {
+                    (Some(mapped_receipt(mapping).await), None)
+                } else {
+                    (None, Some(mapping))
+                };
+                assert!(!state.discussion_is_busy());
+                assert!(!state.drafts_need_save());
+                let order = state.cache_order;
+                let closed = state.update(ReviewAction::Close);
+                assert!(outputs(closed).await.is_empty());
+                assert!(state.target.is_none() && state.range.is_none());
+                assert!(state.discussion.composer.is_none());
+
+                let receipt = match queued {
+                    Some(receipt) => receipt,
+                    None => mapped_receipt(pending.unwrap()).await,
+                };
+                let ReviewAction::Discussion(Action::Reanchored { result, .. }) = &receipt else {
+                    unreachable!()
+                };
+                assert_eq!(result.is_ok(), success_queued_before_close, "{result:?}");
+                let ignored = state.update(receipt);
+                assert!(outputs(ignored).await.is_empty(), "no orphan cache save");
+                assert!(state.target.is_none() && state.range.is_none());
+                assert!(state.discussion.composer.is_none());
+                assert!(!state.drafts_need_save());
+                assert!(state.restart_blocker().is_none());
+                assert_eq!(state.cache_order, order);
+
+                let mut another = target(2);
+                another.worktree = original.worktree.clone();
+                drop(state.update(ReviewAction::Open(another)));
+                assert_eq!(state.target.as_ref().unwrap().pull_request.number, 2);
+                drop(state.update(ReviewAction::Close));
+                drop(state.update(ReviewAction::Open(original)));
+                let composer = state.discussion.composer.as_ref().unwrap();
+                assert_eq!(composer.content.text(), BODY);
+                assert_eq!(composer.destination, Destination::Line(anchor()));
+                assert_eq!(composer.authority.context, old.context);
+                assert_eq!(composer.range.as_ref(), Some(&old.range));
+                assert!(state.restart_blocker().is_none());
+            }
+        }
+
+        #[tokio::test]
+        async fn current_reanchor_success_saves_its_change_but_failure_keeps_the_saved_draft() {
+            let (_directory, mut state, old, current) = saved_draft().await;
+            let mapping = state.update(ReviewAction::Discussion(Action::Reanchor));
+            let receipt = mapped_receipt(mapping).await;
+            let mut failed = receipt.clone();
+            let ReviewAction::Discussion(Action::Reanchored { result, .. }) = &mut failed else {
+                unreachable!()
+            };
+            *result = Err("The anchor is ambiguous; choose its new line.".into());
+            let unchanged = state.update(failed);
+            assert!(outputs(unchanged).await.is_empty());
+            assert!(!state.drafts_need_save());
+            assert!(state.restart_blocker().is_none());
+            assert_eq!(
+                state
+                    .discussion
+                    .composer
+                    .as_ref()
+                    .unwrap()
+                    .authority
+                    .context,
+                old.context
+            );
+            assert!(state.notice.as_ref().unwrap().contains("ambiguous"));
+
+            let save = state.update(receipt);
+            assert!(state.drafts_need_save());
+            assert!(
+                state.restart_blocker().is_some(),
+                "the changed draft must save"
+            );
+            let mut mapped = anchor();
+            mapped.start_line += 1;
+            mapped.line += 1;
+            let composer = state.discussion.composer.as_ref().unwrap();
+            assert_eq!(composer.destination, Destination::Line(mapped.clone()));
+            assert_eq!(composer.authority.context, current.context);
+            assert_eq!(composer.range.as_ref(), Some(&current.range));
+            assert_eq!(composer.content.text(), BODY);
+            finish_cache(&mut state, save).await;
+
+            let target = state.target.clone().unwrap();
+            let cache = state.cache.clone().unwrap();
+            let mut reopened = State::new(
+                Arc::new(ScriptedApi::new()),
+                RepositoryService::system("git"),
+            )
+            .with_cache(Some(cache));
+            let open = reopened.update(ReviewAction::Open(target));
+            let mut receipts = outputs(open).await;
+            assert_eq!(receipts.len(), 1);
+            let receipt = receipts.pop().unwrap();
+            assert!(matches!(
+                &receipt,
+                ReviewAction::Cached {
+                    result: Ok(Some(_)),
+                    ..
+                }
+            ));
+            // The subsequent live GitHub refresh is outside this local-cache contract.
+            drop(reopened.update(receipt));
+            let composer = reopened.discussion.composer.as_ref().unwrap();
+            assert_eq!(composer.content.text(), BODY);
+            assert_eq!(composer.destination, Destination::Line(mapped));
+            assert_eq!(composer.authority.context, current.context);
+            assert_eq!(composer.range.as_ref(), Some(&current.range));
+            assert!(reopened.restart_blocker().is_none());
+        }
+    }
+
+    #[test]
+    fn a_fenced_reanchor_receipt_can_finish_while_an_unrelated_modal_is_open() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        let mut mapped = anchor();
+        mapped.line = 12;
+        mapped.start_line = 12;
+        let callback = crate::pull_request_review::Action::Discussion(Action::Reanchored {
+            generation: state.generation,
+            composer_revision: state.discussion.composer_revision,
+            context: state.context.clone().unwrap(),
+            result: Ok(mapped.clone()),
+        });
+        assert!(
+            callback.allowed_while_modal(),
+            "the shell must deliver this worker receipt beneath a modal"
+        );
+        drop(state.update(callback));
+        assert_eq!(
+            state.discussion.composer.as_ref().unwrap().destination,
+            Destination::Line(mapped)
+        );
+    }
+
+    #[test]
+    fn late_reanchor_cannot_retarget_a_replacement_reply() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        let composer_revision = state.discussion.composer_revision;
+        let context = state.context.clone().unwrap();
+        drop(state.update_discussion(Action::Cancel));
+        drop(state.update_discussion(Action::Reply("other-thread".into())));
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Reply body stays a reply");
+        drop(state.update_discussion(Action::Reanchored {
+            generation: state.generation,
+            composer_revision,
+            context,
+            result: Ok(anchor()),
+        }));
+        let composer = state.discussion.composer.as_ref().unwrap();
+        assert_eq!(
+            composer.destination,
+            Destination::Reply("other-thread".into())
+        );
+        assert_eq!(composer.content.text(), "Reply body stays a reply");
+    }
+
+    #[test]
+    fn selecting_another_gutter_anchor_invalidates_an_inflight_mapping() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        let composer_revision = state.discussion.composer_revision;
+        let context = state.context.clone().unwrap();
+        let mut selected = anchor();
+        selected.line = 12;
+        selected.start_line = 12;
+        drop(state.update_discussion(Action::Begin(selected.clone())));
+        drop(state.update_discussion(Action::Reanchored {
+            generation: state.generation,
+            composer_revision,
+            context,
+            result: Ok(anchor()),
+        }));
+        assert_eq!(
+            state.discussion.composer.as_ref().unwrap().destination,
+            Destination::Line(selected)
+        );
+    }
+
+    #[test]
+    fn same_draft_mapping_preserves_text_typed_while_git_runs() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        let composer_revision = state.discussion.composer_revision;
+        let context = state.context.clone().unwrap();
+        drop(
+            state.update_discussion(Action::Composer(text_editor::Action::Edit(
+                text_editor::Edit::Insert('x'),
+            ))),
+        );
+        let mut mapped = anchor();
+        mapped.line = 9;
+        mapped.start_line = 9;
+        drop(state.update_discussion(Action::Reanchored {
+            generation: state.generation,
+            composer_revision,
+            context,
+            result: Ok(mapped.clone()),
+        }));
+        let composer = state.discussion.composer.as_ref().unwrap();
+        assert_eq!(composer.destination, Destination::Line(mapped));
+        assert_eq!(composer.content.text().trim(), "x");
+    }
+
+    #[test]
+    fn successful_latest_cache_write_allows_saved_drafts_to_survive_restart() {
+        let mut state = ready();
+        // A store is present; this test drives its receipt without background I/O.
+        let directory = tempfile::tempdir().unwrap();
+        state.cache = Some(Arc::new(cache::JsonStore::new(
+            directory.path().join("cache"),
+        )));
+        drop(state.update_discussion(Action::Begin(anchor())));
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Saved draft");
+        assert!(state.restart_blocker().is_some());
+        state.cache_order = 4;
+        drop(state.update_inner(super::super::Action::CacheSaved {
+            generation: state.generation,
+            order: 4,
+            draft_version: None,
+            result: Ok(()),
+        }));
+        assert!(state.restart_blocker().is_none());
+    }
+
+    #[test]
+    fn failed_or_conflicted_cache_write_keeps_the_local_draft_and_restart_fence() {
+        let mut state = ready();
+        let directory = tempfile::tempdir().unwrap();
+        state.cache = Some(Arc::new(cache::JsonStore::new(
+            directory.path().join("cache"),
+        )));
+        drop(state.update_discussion(Action::Begin(anchor())));
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Unsaved text");
+        state.cache_order = 4;
+        drop(state.update_inner(super::super::Action::CacheSaved {
+            generation: state.generation,
+            order: 4,
+            draft_version: Some("new-version".into()),
+            result: Err("Draft changed in another window".into()),
+        }));
+        assert_eq!(
+            state.discussion.composer.as_ref().unwrap().content.text(),
+            "Unsaved text"
+        );
+        assert!(state.restart_blocker().is_some());
+        assert!(state.cache_save_error);
+        drop(state.update_inner(super::super::Action::RetryCacheSave));
+        assert!(state.cache_dirty);
+        assert!(!state.cache_save_error);
+        assert!(!state.discussion.drafts_saved);
+    }
+
+    #[test]
+    fn local_draft_roundtrip_keeps_text_anchor_and_original_head() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Keep across restart");
+        state.discussion.summary = text_editor::Content::with_text("Summary survives");
+        let drafts =
+            serde_json::from_str(&serde_json::to_string(&state.local_drafts()).unwrap()).unwrap();
+        let mut restored = ready();
+        restored.restore_drafts(drafts, None);
+        let composer = restored.discussion.composer.as_ref().unwrap();
+        assert_eq!(composer.content.text(), "Keep across restart");
+        assert_eq!(composer.destination, Destination::Line(anchor()));
+        assert_eq!(restored.discussion.summary.text(), "Summary survives");
+        let mut next = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+        next.context.head_oid = "c".repeat(40);
+        restored.adopt(&next);
+        assert_eq!(
+            restored
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .authority
+                .context
+                .head_oid,
+            "a".repeat(40)
+        );
+        assert_eq!(
+            restored
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .content
+                .text(),
+            "Keep across restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn reanchored_file_draft_restores_its_new_authority_after_restart() {
+        use cosmic::iced::futures::StreamExt;
+
+        async fn save(state: &mut State) {
+            let mut stream = iced::runtime::task::into_stream(state.persist_cache()).unwrap();
+            let mut saved = false;
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action) = action {
+                    if let super::super::Action::CacheSaved { result, .. } = &action {
+                        assert!(result.is_ok(), "{result:?}");
+                        saved = true;
+                    }
+                    drop(state.update_inner(action));
+                }
+            }
+            assert!(saved, "the cache write must finish before restarting");
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let cache_path = directory.path().join("cache");
+        let mut state = ready();
+        state.cache = Some(Arc::new(cache::JsonStore::new(cache_path.clone())));
+        drop(state.update_discussion(Action::BeginFile("file.rs".into())));
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("Keep this file comment");
+        save(&mut state).await;
+
+        let mut current = loaded(vec![entry("file.rs", ChangeKind::Modified)], vec![]);
+        current.context.head_oid = "d".repeat(40);
+        current.pull_request.head_ref_oid = current.context.head_oid.clone();
+        current.range.head = Oid::parse(current.context.head_oid.as_str()).unwrap();
+        current.range.merge_base = Oid::parse("e".repeat(40)).unwrap();
+        state.adopt(&current);
+        drop(state.update_discussion(Action::Reanchor));
+        // Re-anchoring must persist without another keystroke marking the draft dirty.
+        save(&mut state).await;
+        let target = state.target.clone().unwrap();
+        let key =
+            PullRequestKey::new(target.repository.clone(), target.pull_request.number).unwrap();
+        drop(state);
+
+        let reopened = cache::JsonStore::new(cache_path);
+        let snapshot = cache::Store::load(&reopened, &key).unwrap().unwrap();
+        let mut restored = State::new(
+            Arc::new(ScriptedApi::new()),
+            RepositoryService::system("git"),
+        );
+        restored.target = Some(target);
+        restored.adopt_cache(snapshot);
+        restored.adopt(&current);
+        let composer = restored.discussion.composer.as_ref().unwrap();
+        assert_eq!(composer.content.text(), "Keep this file comment");
+        assert_eq!(composer.destination, Destination::File("file.rs".into()));
+        assert_eq!(composer.authority.context, current.context);
+        assert_eq!(composer.range.as_ref(), Some(&current.range));
+        assert_eq!(
+            composer.authority.merge_base.as_ref(),
+            Some(&current.range.merge_base)
+        );
+        assert!(!restored.composer_stale(composer));
+    }
+
+    #[test]
+    fn unresolved_write_receipt_survives_recovery_and_still_fences_mutations() {
+        let mut state = ready();
+        state.discussion.unknown = Some("The write may have reached GitHub".into());
+        let drafts =
+            serde_json::from_str(&serde_json::to_string(&state.local_drafts()).unwrap()).unwrap();
+        let mut restored = ready();
+        restored.restore_drafts(drafts, None);
+        assert_eq!(restored.discussion.unknown, state.discussion.unknown);
+        assert!(!restored.can_mutate_discussion());
+        assert!(restored.restart_blocker().is_some());
+    }
+
+    #[test]
+    fn empty_comment_submission_explains_refusal_but_empty_approval_is_valid() {
+        let mut state = ready();
+        drop(state.update_discussion(Action::PrepareSubmit));
+        assert!(state.discussion.confirmation.is_none());
+        assert!(
+            state
+                .discussion
+                .submit_error
+                .as_deref()
+                .unwrap()
+                .contains("Write a summary")
+        );
+        drop(state.update_discussion(Action::Event(ReviewEvent::Approve)));
+        drop(state.update_discussion(Action::PrepareSubmit));
+        assert!(state.discussion.confirmation.is_some());
+    }
+    #[test]
+    fn resolve_and_reply_controls_remain_usable_during_background_refresh() {
+        let mut state = ready();
+        state.refreshing = true;
+        state.discussion.loading = true;
+        assert!(state.can_mutate_discussion());
+        drop(state.update_discussion(Action::Resolve {
+            thread: "thread".into(),
+            resolved: true,
+        }));
+        assert!(
+            state.discussion.busy,
+            "the action is sent, never dropped by refresh"
+        );
+        assert!(!state.refreshing);
     }
 
     #[test]
@@ -1501,7 +2443,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_comment_range_preserves_text_and_cannot_retarget_a_refreshed_head() {
+    fn choosing_a_new_line_reanchors_the_kept_draft_to_the_current_head() {
         let mut state = ready();
         drop(state.update_discussion(Action::Begin(anchor())));
         let composer = state.discussion.composer.as_mut().unwrap();
@@ -1526,8 +2468,8 @@ mod tests {
         drop(state.update_discussion(Action::Begin(extended)));
         let composer = state.discussion.composer.as_ref().unwrap();
         assert_eq!(composer.content.text(), "Keep this draft");
-        assert_eq!(composer.authority.context.head_oid, "a".repeat(40));
-        assert!(matches!(&composer.destination, Destination::Line(a) if a.line == 9));
+        assert_eq!(composer.authority.context.head_oid, "c".repeat(40));
+        assert!(matches!(&composer.destination, Destination::Line(a) if a.line == 10));
     }
 
     #[test]
@@ -1615,6 +2557,7 @@ mod tests {
     #[test]
     fn review_popover_is_disclosed_on_demand_and_closing_it_drops_a_confirmation() {
         let mut state = ready();
+        state.discussion.summary = text_editor::Content::with_text("Review summary");
         assert!(!state.discussion.review_open, "submission starts hidden");
         drop(state.update_discussion(Action::ToggleReview));
         assert!(state.discussion.review_open);
@@ -1683,6 +2626,7 @@ mod tests {
     #[test]
     fn confirming_keeps_the_confirmation_on_screen_while_submitting() {
         let mut state = ready();
+        state.discussion.summary = text_editor::Content::with_text("Review summary");
         drop(state.update_discussion(Action::ToggleReview));
         drop(state.update_discussion(Action::PrepareSubmit));
         drop(state.update_discussion(Action::CancelSubmit));
@@ -1709,7 +2653,7 @@ mod tests {
         let mut state = ready();
         drop(state.update_discussion(Action::BeginFile("file.rs".into())));
         state.refreshing = true;
-        assert!(!state.can_mutate_discussion());
+        assert!(state.can_mutate_discussion());
         let typed = text_editor::Action::Edit(text_editor::Edit::Insert('x'));
         drop(state.update_discussion(Action::Composer(typed.clone())));
         drop(state.update_discussion(Action::Summary(typed.clone())));

@@ -323,7 +323,9 @@ impl Monitor {
         let Some(repository) = state
             .entries
             .iter()
-            .filter(|(_, entry)| entry.due <= now)
+            .filter(|(repository, entry)| {
+                entry.due <= now && crate::github::polling::ready(&repository.host, false)
+            })
             .min_by_key(|(_, entry)| entry.due)
             .map(|(key, _)| key.clone())
         else {

@@ -151,7 +151,7 @@ fn read(
         _ => {
             let from = target.root.as_deref().unwrap_or(&target.repository);
             let repository = gh
-                .resolve_repository(from, cancellation)
+                .resolve_repository(from, &remotes, cancellation)
                 .map_err(|error| error.to_string())?;
             memory.repository = Some((repository.clone(), Instant::now()));
             repository
