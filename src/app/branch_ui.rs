@@ -391,6 +391,7 @@ mod tests {
 
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
+            history_destination: None,
             operation: None,
             stashes: Vec::new(),
             last_fetch_unix_ms: None,

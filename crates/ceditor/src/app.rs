@@ -7703,6 +7703,10 @@ mod tests {
     ) -> cagents::repository::RepositorySnapshot {
         use cagents::repository::{RepositorySnapshot, StatusSnapshot, WorkingFiles};
         RepositorySnapshot {
+            history_destination: None,
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: StatusSnapshot {
                 entries,
                 ..StatusSnapshot::default()
