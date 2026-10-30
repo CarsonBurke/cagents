@@ -222,7 +222,10 @@ impl Cagents {
         // identities: recovery can replace a terminal ID mid-start, so the card
         // does not hold the identity the daemon already published. Deciding now
         // would race it, so the observation waits for a quiet moment instead.
-        if self.terminal_starts_in_flight() > 0 {
+        // A native return reserves this unknown-ID window too. Once its exact
+        // returned ID is claimed, that claim protects it while unrelated
+        // terminals can be adopted without waiting for the shared pane ACK.
+        if self.terminal_starts_in_flight() > 0 || self.native_terminal_return_pending() {
             self.pending_adoptions.extend(terminals);
             return Task::none();
         }
@@ -286,17 +289,23 @@ impl Cagents {
         if remaining > 0 {
             return Task::none();
         }
-        let adopted = if self.pending_adoptions.is_empty() {
-            Task::none()
-        } else {
-            let pending = std::mem::take(&mut self.pending_adoptions);
-            self.observe_hosted_terminals(pending)
-        };
+        let adopted = self.drain_pending_terminal_adoptions();
         Task::batch([
             adopted,
             self.attach_next_restored_agent(),
             self.start_next_saved_terminal(),
         ])
+    }
+
+    pub(super) fn drain_pending_terminal_adoptions(&mut self) -> Task<Message> {
+        if self.pending_adoptions.is_empty()
+            || self.terminal_starts_in_flight() > 0
+            || self.native_terminal_return_pending()
+        {
+            return Task::none();
+        }
+        let pending = std::mem::take(&mut self.pending_adoptions);
+        self.observe_hosted_terminals(pending)
     }
 
     pub(super) fn terminal_starts_in_flight(&self) -> usize {

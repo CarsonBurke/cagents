@@ -551,6 +551,16 @@ struct LocalReturn {
     resumes: bool,
 }
 
+/// A returned PTY is not a replacement pane until the original shared view
+/// accepts it. Keep the readable runtime in its card throughout that wait.
+struct SharedTerminalReturn {
+    source: chat::Session,
+    origin: super::shared_views::TerminalReturnOrigin,
+    terminal: Option<TerminalSession>,
+    operation: Option<uuid::Uuid>,
+    close_requested: bool,
+}
+
 /// One operation owns an existing card at a time. A card absent from this map
 /// is ready for input; its runtime and durable descriptor describe its content.
 /// Detached actors have their own target-keyed retirement ledger, since an old
@@ -585,6 +595,15 @@ pub(super) struct State {
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     phases: HashMap<CardId, Phase>,
+    terminal_returns: HashMap<Target, SharedTerminalReturn>,
+    terminal_return_owners: HashMap<
+        TerminalId,
+        (
+            Target,
+            super::shared_views::TerminalReturnOrigin,
+            TerminalSession,
+        ),
+    >,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -633,6 +652,8 @@ impl Default for State {
             receiver,
             generation: 0,
             phases: HashMap::new(),
+            terminal_returns: HashMap::new(),
+            terminal_return_owners: HashMap::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -4883,6 +4904,66 @@ fn retire_conversation(
     )
 }
 
+/// A completed native return already issued this exact PTY. Closing the old
+/// native owner is neither necessary nor authority to close a replacement
+/// daemon's terminal with the same saved ID.
+fn close_returned_terminal(terminal: &TerminalSession) -> Result<(), String> {
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client = crate::control::ControlClient::connect(&socket)
+        .map_err(|error| format!("Cannot confirm the returned terminal stopped: {error}"))?;
+    close_returned_terminal_on(&mut client, terminal)
+}
+
+fn close_returned_terminal_on(
+    client: &mut crate::control::ControlClient,
+    terminal: &TerminalSession,
+) -> Result<(), String> {
+    use crate::terminal::ipc::TerminalCloseResult;
+    let proof = terminal
+        .continuity
+        .live_proof()
+        .filter(HostSessionProof::is_complete)
+        .ok_or(
+            "The terminal's service could not be verified. Your conversation and draft are kept",
+        )?;
+    if client.proof() != &proof {
+        return Err(
+            "The returned terminal belongs to a different service; nothing was closed".into(),
+        );
+    }
+    let terminals = client.list().map_err(|error| error.to_string())?;
+    let Some(current) = terminals
+        .iter()
+        .find(|current| current.session.id == terminal.id)
+    else {
+        return Err("The service no longer lists the returned terminal, so its cleanup could not be confirmed. Your conversation and draft are kept".into());
+    };
+    let outcome = if crate::agent_execution::same_terminal_process(terminal, &current.session) {
+        client.close_terminal_checked(terminal.id, true)
+    } else if current.session.launch == terminal.launch
+        && matches!(
+            current.session.continuity,
+            TerminalContinuity::Exited { .. }
+                | TerminalContinuity::RelaunchAvailable {
+                    last_exit: Some(_),
+                    ..
+                }
+        )
+    {
+        client.release_completed_terminal(current.session.clone(), true)
+    } else {
+        return Err("The returned terminal changed; nothing was closed".into());
+    }
+    .map_err(|error| error.to_string())?;
+    match outcome {
+        TerminalCloseResult::Closed => Ok(()),
+        TerminalCloseResult::Active => Err("The returned terminal is still active".into()),
+        TerminalCloseResult::Unknown(error) => Err(format!(
+            "The returned terminal could not be confirmed stopped: {error}"
+        )),
+    }
+}
+
 /// The CLI the daemon still runs for a Codex thread, if any.
 ///
 /// A Codex chat and its CLI are two views of one thread, and the daemon ends
@@ -6611,6 +6692,311 @@ impl Cagents {
         }
         Subscription::batch(subscriptions)
     }
+    pub(super) fn native_terminal_return_pending(&self) -> bool {
+        self.chat_ui.phases.values().any(|phase| {
+            matches!(phase, Phase::Returning { target, local: None, .. }
+                    if !self.chat_ui.terminal_returns.get(target).is_some_and(|pending|
+                        pending.terminal.as_ref().is_some_and(|terminal|
+                            self.pending_terminal_handoffs.get(&terminal.id) == Some(terminal))))
+        })
+    }
+
+    pub(super) fn terminal_return_can_commit(&self, terminal: &TerminalSession) -> bool {
+        self.chat_ui
+            .terminal_return_owners
+            .get(&terminal.id)
+            .is_none_or(|(target, origin, expected)| {
+                crate::agent_execution::same_terminal_process(expected, terminal)
+                    && self.card_state(target.card).is_some_and(|card|
+                        matches!(&card.kind, CardKind::Terminal(current) if current == terminal))
+                    && self.shared_terminal_return_admitted(origin, terminal)
+            })
+    }
+
+    pub(super) fn terminal_return_canonically_accepted(&self, terminal: &TerminalSession) -> bool {
+        self.chat_ui
+            .terminal_return_owners
+            .contains_key(&terminal.id)
+            && self.terminal_return_can_commit(terminal)
+    }
+
+    pub(super) fn terminal_return_receipt_committed(&mut self, terminal: &TerminalSession) {
+        if self
+            .chat_ui
+            .terminal_return_owners
+            .get(&terminal.id)
+            .is_some_and(|(_, _, expected)| {
+                crate::agent_execution::same_terminal_process(expected, terminal)
+            })
+        {
+            self.chat_ui.terminal_return_owners.remove(&terminal.id);
+        }
+    }
+
+    fn forget_shared_terminal_return(&mut self, card: CardId) {
+        let targets = self
+            .chat_ui
+            .terminal_returns
+            .keys()
+            .filter(|target| target.card == card)
+            .copied()
+            .collect::<Vec<_>>();
+        for target in targets {
+            self.forget_shared_terminal_return_target(target);
+        }
+    }
+
+    fn forget_shared_terminal_return_target(&mut self, target: Target) {
+        if let Some(pending) = self.chat_ui.terminal_returns.remove(&target)
+            && let Some(terminal) = pending.terminal
+        {
+            if self.pending_terminal_handoffs.get(&terminal.id) == Some(&terminal) {
+                self.pending_terminal_handoffs.remove(&terminal.id);
+            }
+            self.terminal_return_receipt_committed(&terminal);
+        }
+    }
+
+    fn shared_terminal_return_source_current(&self, target: Target) -> bool {
+        self.chat_ui
+            .terminal_returns
+            .get(&target)
+            .is_some_and(|pending| {
+                self.card_state(target.card).is_some_and(|card| {
+                    card.existence.is_open()
+                        && matches!(&card.kind, CardKind::Chat(session)
+                        if closed_draft_source_matches(&pending.source, session))
+                }) && matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
+                if runtime.target == target
+                    && closed_draft_source_matches(&pending.source, &runtime.session))
+            })
+    }
+
+    fn publish_shared_terminal_return(&mut self, target: Target) -> Task<Message> {
+        if !self.shared_terminal_return_source_current(target) {
+            self.forget_shared_terminal_return_target(target);
+            self.chat_ui.finish(target, |phase| {
+                matches!(phase, Phase::Returning { local: None, .. })
+            });
+            return self.drain_pending_terminal_adoptions();
+        }
+        let Some(pending) = self.chat_ui.terminal_returns.get(&target) else {
+            return Task::none();
+        };
+        let Some(terminal) = pending.terminal.clone() else {
+            return Task::none();
+        };
+        let origin = pending.origin.clone();
+        match self.publish_shared_terminal_return_change(&origin, &terminal) {
+            Ok(operation) => {
+                self.chat_ui
+                    .terminal_returns
+                    .get_mut(&target)
+                    .unwrap()
+                    .operation = Some(operation);
+            }
+            Err(error) => return self.refuse_shared_terminal_return(target, error),
+        }
+        Task::none()
+    }
+
+    #[cfg(test)]
+    fn shared_terminal_return_change_pending(&self, operation: uuid::Uuid) -> bool {
+        self.chat_ui
+            .terminal_returns
+            .values()
+            .any(|pending| pending.operation == Some(operation))
+    }
+
+    fn refuse_shared_terminal_return(&mut self, target: Target, error: String) -> Task<Message> {
+        if let Some(pending) = self.chat_ui.terminal_returns.get_mut(&target) {
+            pending.operation = None;
+        }
+        let close = matches!(
+            self.chat_ui.finish(target, |phase| {
+                matches!(phase, Phase::Returning { local: None, .. })
+            }),
+            Some(Phase::Returning {
+                close_requested: true,
+                ..
+            })
+        );
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.error = Some(format!("Could not return to terminal: {error}"));
+        }
+        self.status = Some(TransientNotice::error(error));
+        self.reread_chat_activity(target);
+        let adopted = self.drain_pending_terminal_adoptions();
+        if close {
+            Task::batch([adopted, self.begin_chat_close(target.card)])
+        } else {
+            adopted
+        }
+    }
+
+    pub(super) fn refuse_native_terminal_return_operation(
+        &mut self,
+        operation: uuid::Uuid,
+        error: String,
+    ) -> Task<Message> {
+        let target = self
+            .chat_ui
+            .terminal_returns
+            .iter()
+            .find_map(|(target, pending)| {
+                (pending.operation == Some(operation)).then_some(*target)
+            });
+        let Some(target) = target else {
+            return Task::none();
+        };
+        if !self.shared_terminal_return_source_current(target) {
+            return Task::none();
+        }
+        self.refuse_shared_terminal_return(target, error)
+    }
+
+    /// Only raw canonical descriptors admit the returned terminal. A pending
+    /// optimistic change, its enqueue, or a local writer flush cannot do so.
+    pub(super) fn settle_shared_terminal_returns(&mut self) -> Task<Message> {
+        let candidates = self
+            .chat_ui
+            .terminal_returns
+            .iter()
+            .map(|(target, pending)| {
+                (
+                    *target,
+                    pending.origin.clone(),
+                    pending.terminal.clone(),
+                    pending.operation,
+                    pending.close_requested,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for (target, origin, terminal, operation, close_requested) in candidates {
+            if !self.shared_terminal_return_source_current(target) {
+                self.forget_shared_terminal_return_target(target);
+                self.chat_ui.finish(target, |phase| {
+                    matches!(phase, Phase::Returning { local: None, .. })
+                });
+                continue;
+            }
+            let Some(terminal) = terminal else {
+                continue;
+            };
+            if self.shared_terminal_return_admitted(&origin, &terminal) {
+                if close_requested {
+                    continue;
+                }
+                // An error reply can return control to the composer before
+                // its transaction's canonical acceptance arrives. Preserve
+                // new in-flight paste/attachment work until it can be saved.
+                if self
+                    .chat_runtime_mut(target)
+                    .is_some_and(|runtime| runtime.handoff_blocker().is_some())
+                {
+                    continue;
+                }
+                let close_requested = match self.chat_ui.phases.get(&target.card) {
+                    Some(Phase::Returning {
+                        target: current,
+                        local: None,
+                        ..
+                    }) if *current == target => {
+                        matches!(
+                            self.chat_ui.finish(target, |phase| {
+                                matches!(phase, Phase::Returning { local: None, .. })
+                            }),
+                            Some(Phase::Returning {
+                                close_requested: true,
+                                ..
+                            })
+                        )
+                    }
+                    // A refused reply can precede proof that the original
+                    // transaction actually committed. That exact accepted
+                    // descriptor settles the original idle target; a newer
+                    // close/start/return keeps its own ownership.
+                    None => false,
+                    Some(_) => continue,
+                };
+                self.chat_ui.terminal_returns.remove(&target);
+                tasks.push(self.complete_chat_terminal_return(
+                    target,
+                    terminal,
+                    close_requested,
+                    true,
+                ));
+            } else if !self.shared_terminal_return_source_admitted(&origin) && operation.is_some() {
+                tasks.push(self.refuse_shared_terminal_return(target,
+                    "The original shared conversation or its destination changed. No other pane was replaced.".into()));
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    pub(super) fn hold_shared_terminal_return_projection(&self, card: CardId) -> bool {
+        self.chat_ui
+            .terminal_returns
+            .iter()
+            .any(|(target, pending)| {
+                target.card == card
+                    && self.shared_terminal_return_source_current(*target)
+                    && pending.terminal.as_ref().is_some_and(|terminal| {
+                        self.shared_terminal_return_admitted(&pending.origin, terminal)
+                    })
+            })
+    }
+
+    fn complete_chat_terminal_return(
+        &mut self,
+        target: Target,
+        terminal: TerminalSession,
+        close: bool,
+        canonical: bool,
+    ) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        if let Some(reason) = runtime.handoff_blocker()
+            && !close
+        {
+            runtime.error = Some(format!("Could not return to terminal: {reason}"));
+            self.status = Some(TransientNotice::error(reason));
+            return Task::none();
+        }
+        let Some(snapshot) = runtime.handle().map(|handle| handle.snapshot()) else {
+            return Task::none();
+        };
+        runtime.session.launch.session_id = snapshot.session_id.clone();
+        let preserve = runtime.session.launch.provider == Provider::Codex && !snapshot.exited;
+        if preserve {
+            runtime.session.terminal = Some(terminal.clone());
+        }
+        let session = runtime.session.clone();
+        if !canonical {
+            self.commit_chat_session(target.card, session);
+        }
+        if preserve && let Some(CardRuntime::Chat(mut runtime)) = self.cards.remove(&target.card) {
+            runtime.show(false);
+            self.chat_ui.parked.insert(target.card, runtime);
+        }
+        // Save the source draft while its runtime still owns it, before the
+        // terminal's loading surface replaces that runtime.
+        self.chat_forget(target.card);
+        let task = self.finish_chat_terminal_handoff(target.card, terminal);
+        if close {
+            let close = if self.chat_has_parked_runtime(target.card) {
+                self.begin_chat_close(target.card)
+            } else {
+                self.begin_card_close(target.card)
+            };
+            Task::batch([task, close])
+        } else {
+            task
+        }
+    }
+
     pub(super) fn shared_chat_has_local_work(&self, card: CardId) -> bool {
         let runtime = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
@@ -6654,6 +7040,7 @@ impl Cagents {
     pub(super) fn shared_chat_detach(&mut self, card: CardId) {
         // Dropping a phase also fences a late attachment result. Unlike
         // abandoned creator starts, it grants no authority to close an actor.
+        self.forget_shared_terminal_return(card);
         self.chat_ui.phases.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.observe_agent_activity_for_card(card, None);
@@ -6676,6 +7063,7 @@ impl Cagents {
     }
 
     pub(super) fn chat_forget(&mut self, card: CardId) {
+        self.forget_shared_terminal_return(card);
         self.chat_ui.explicit_starts.remove(&card);
         self.chat_ui.capacity_offers.remove(&card);
         // The runtime is about to be dropped, so its unsent text is captured
@@ -6912,6 +7300,15 @@ impl Cagents {
                 }
                 session.learn_native_continuity_from(&observed);
             }
+            // A failed shared publication must not make an explicitly closed
+            // card forget the PTY the successful daemon return already issued.
+            // This is teardown evidence only, not a new launch or attachment.
+            if let Some(pending) = self.chat_ui.terminal_returns.get(&runtime.target)
+                && closed_draft_source_matches(&pending.source, &session)
+                && let Some(terminal) = &pending.terminal
+            {
+                session.terminal = Some(terminal.clone());
+            }
             return Some(session);
         }
         match self.card_state(card).map(|state| &state.kind) {
@@ -7019,6 +7416,42 @@ impl Cagents {
         let Some(session) = self.chat_return_session(card) else {
             return Task::none();
         };
+        let returned = self.cards.get(&card).and_then(|runtime| {
+            let CardRuntime::Chat(runtime) = runtime else {
+                return None;
+            };
+            self.chat_ui
+                .terminal_returns
+                .get(&runtime.target)
+                .filter(|pending| {
+                    runtime.snapshot.exited
+                        && closed_draft_source_matches(&pending.source, &runtime.session)
+                })
+                .and_then(|pending| pending.terminal.clone())
+        });
+        if let Some(terminal) = returned {
+            if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+                && let Some(pending) = self.chat_ui.terminal_returns.get_mut(&runtime.target)
+            {
+                pending.close_requested = true;
+            }
+            let target = self.chat_ui.next_target(card);
+            self.chat_ui.phases.insert(
+                card,
+                Phase::Closing {
+                    target,
+                    restart: None,
+                },
+            );
+            return cosmic::task::future(async move {
+                let result =
+                    tokio::task::spawn_blocking(move || close_returned_terminal(&terminal))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                Message::ChatUi(Action::RetainedCloseFinished(target, session, result))
+            });
+        }
         // Capture the retirement capability before the synchronous removal
         // drops the surface. In-flight operations move to the detached ledger
         // only after commit succeeds, and retire when their own answer lands.
@@ -8161,6 +8594,8 @@ impl Cagents {
             _ => None,
         };
         let task = self.handle_chat_ui_inner(action);
+        let returned = self.settle_shared_terminal_returns();
+        let task = Task::batch([task, returned, self.drain_pending_terminal_adoptions()]);
         self.reconcile_chat_failure_presentations();
         if let Some(card) = closed_refresh {
             self.sync_closed_chat_draft(card);
@@ -8431,6 +8866,44 @@ impl Cagents {
             }
             Action::CancelQueued(target) => return self.cancel_queued(target),
             Action::Switch(card) => {
+                // A refused view edit retries only the already-returned PTY.
+                // It never asks the provider to return or start a second time.
+                let retry = self
+                    .chat_ui
+                    .terminal_returns
+                    .iter()
+                    .find_map(|(target, pending)| {
+                        (target.card == card
+                            && pending.terminal.is_some()
+                            && pending.operation.is_none())
+                        .then_some(*target)
+                    });
+                if let Some(target) = retry {
+                    if self.pane_transfer_pending(card) {
+                        self.status = Some(TransientNotice::warning(
+                            "This pane is moving to a channel. Wait for the move to finish before retrying Return to terminal.".into()));
+                        return Task::none();
+                    }
+                    if self.chat_ui.phases.contains_key(&card) {
+                        return Task::none();
+                    }
+                    // A new explicit Return choice supersedes a failed Close
+                    // of this same cached terminal; it still never restarts it.
+                    self.chat_ui
+                        .terminal_returns
+                        .get_mut(&target)
+                        .unwrap()
+                        .close_requested = false;
+                    self.chat_ui.phases.insert(
+                        card,
+                        Phase::Returning {
+                            target,
+                            local: None,
+                            close_requested: false,
+                        },
+                    );
+                    return self.publish_shared_terminal_return(target);
+                }
                 if let Some(reason) = self.chat_switch_blocker(card) {
                     self.status = Some(
                         if self.chat_start_pending(card) || self.pending_terminal_spawn(card) {
@@ -8577,6 +9050,26 @@ impl Cagents {
                         };
                         let target = runtime.target;
                         let _ = terminal;
+                        let source = runtime.session.clone();
+                        let origin = match self.capture_terminal_return_origin(card, &source) {
+                            Ok(origin) => origin,
+                            Err(error) => {
+                                self.status = Some(TransientNotice::error(error));
+                                return Task::none();
+                            }
+                        };
+                        if let Some(origin) = origin {
+                            self.chat_ui.terminal_returns.insert(
+                                target,
+                                SharedTerminalReturn {
+                                    source,
+                                    origin,
+                                    terminal: None,
+                                    operation: None,
+                                    close_requested: false,
+                                },
+                            );
+                        }
                         self.chat_ui.phases.insert(
                             target.card,
                             Phase::Returning {
@@ -11383,7 +11876,47 @@ impl Cagents {
             }
             Action::HandoffFinished(target, result) => {
                 if self.chat_runtime_mut(target).is_none() {
+                    self.forget_shared_terminal_return_target(target);
+                    self.chat_ui.finish(target, |phase| {
+                        matches!(phase, Phase::Returning { local: None, .. })
+                    });
                     return Task::none();
+                }
+                if self.chat_ui.terminal_returns.contains_key(&target)
+                    && matches!(self.chat_ui.phases.get(&target.card),
+                        Some(Phase::Returning { target: current, local: None, .. }) if *current == target)
+                {
+                    match result {
+                        Ok(terminal) => {
+                            let source = &self.chat_ui.terminal_returns[&target].source;
+                            let proof = terminal.continuity.live_proof();
+                            if proof.as_ref().is_none_or(|proof| !proof.is_complete())
+                                || source.proof != proof
+                            {
+                                self.chat_ui.terminal_returns.remove(&target);
+                                return self.refuse_shared_terminal_return(
+                                    target,
+                                    "The returned terminal does not belong to the original host."
+                                        .into(),
+                                );
+                            }
+                            let origin = self.chat_ui.terminal_returns[&target].origin.clone();
+                            self.chat_ui
+                                .terminal_returns
+                                .get_mut(&target)
+                                .unwrap()
+                                .terminal = Some(terminal.clone());
+                            self.chat_ui
+                                .terminal_return_owners
+                                .insert(terminal.id, (target, origin, terminal.clone()));
+                            self.pending_terminal_handoffs.insert(terminal.id, terminal);
+                            return self.publish_shared_terminal_return(target);
+                        }
+                        Err(error) => {
+                            self.chat_ui.terminal_returns.remove(&target);
+                            return self.refuse_shared_terminal_return(target, error);
+                        }
+                    }
                 }
                 let Some(Phase::Returning {
                     local: None,
@@ -11401,6 +11934,9 @@ impl Cagents {
                 let terminal = match result {
                     Ok(terminal) => terminal,
                     Err(error) => {
+                        if let Some(runtime) = self.chat_runtime_mut(target) {
+                            runtime.error = Some(format!("Could not return to terminal: {error}"));
+                        }
                         self.status = Some(TransientNotice::error(error));
                         self.reread_chat_activity(target);
                         return if close {
@@ -11410,50 +11946,7 @@ impl Cagents {
                         };
                     }
                 };
-                let Some(runtime) = self.chat_runtime_mut(target) else {
-                    return Task::none();
-                };
-                if let Some(reason) = runtime.handoff_blocker()
-                    && !close
-                {
-                    self.status = Some(TransientNotice::error(reason));
-                    return Task::none();
-                }
-                let Some(snapshot) = runtime.handle().map(|handle| handle.snapshot()) else {
-                    return Task::none();
-                };
-                runtime.session.launch.session_id = snapshot.session_id.clone();
-                let preserve =
-                    runtime.session.launch.provider == Provider::Codex && !snapshot.exited;
-                if preserve {
-                    runtime.session.terminal = Some(terminal.clone());
-                }
-                let session = runtime.session.clone();
-                self.commit_chat_session(target.card, session);
-                if preserve
-                    && let Some(CardRuntime::Chat(mut runtime)) = self.cards.remove(&target.card)
-                {
-                    runtime.show(false);
-                    self.chat_ui.parked.insert(target.card, runtime);
-                }
-                // Enqueue the returned live proof checkpoint. The host retains
-                // the transition receipt independently of this UI attachment.
-                let task = self.finish_chat_terminal_handoff(target.card, terminal);
-                self.chat_forget(target.card);
-                return if close {
-                    // Called rather than sent: a message could be dropped by a
-                    // modal opened meanwhile, losing the close the user asked for.
-                    // A chat parked behind its CLI closes first, exactly as a
-                    // close of that card does, and the CLI's close follows it.
-                    let close = if self.chat_has_parked_runtime(target.card) {
-                        self.begin_chat_close(target.card)
-                    } else {
-                        self.begin_card_close(target.card)
-                    };
-                    Task::batch([task, close])
-                } else {
-                    task
-                };
+                return self.complete_chat_terminal_return(target, terminal, close, false);
             }
             Action::RetainedCloseFinished(target, session, result) => {
                 if self
@@ -11469,6 +11962,12 @@ impl Cagents {
                     return Task::none();
                 }
                 if let Err(error) = result {
+                    if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card)
+                        && self.chat_ui.terminal_returns.contains_key(&runtime.target)
+                    {
+                        runtime.error =
+                            Some(format!("Could not close the returned terminal: {error}"));
+                    }
                     self.status = Some(TransientNotice::error(error));
                     return Task::none();
                 }
@@ -22315,6 +22814,1044 @@ mod tests {
         assert!(app.terminal_close.is_none());
         assert!(!app.chat_has_parked_runtime(card));
         assert!(!app.chat_ui.transition_pending());
+    }
+
+    struct SharedReturnFixture {
+        app: Cagents,
+        card: CardId,
+        target: Target,
+        model: crate::workspace_model::WorkspaceModel,
+        edits: async_channel::Receiver<crate::workspace_model::ModelEdit>,
+        terminal: TerminalSession,
+        items: Vec<Arc<chat::Item>>,
+        allocation: usize,
+    }
+
+    fn shared_return_fixture() -> SharedReturnFixture {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId, ProjectKind};
+        use crate::workspace_model::{
+            ModelChannel, ModelProject, WorkspaceModel,
+            views::{Pane, Scope, View},
+        };
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let items = [chat::Role::User, chat::Role::Assistant]
+            .into_iter()
+            .enumerate()
+            .map(|(index, role)| {
+                Arc::new(chat::Item {
+                    id: format!("handoff-{index}"),
+                    role,
+                    content: text(if index == 0 {
+                        "Original user task"
+                    } else {
+                        "Retained answer"
+                    }),
+                    started_at: None,
+                    at: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.items = items.clone();
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let mut source = chat_runtime(&app, card).session.clone();
+        source.launch.session_id = Some(KNOWN_THREAD.into());
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(source.has_valid_native_continuity());
+        app.install_chat_session(card, source.clone());
+        app.chat_runtime_mut(target).unwrap().session = source.clone();
+        let channel = ChannelId::new();
+        let project = ProjectId::new();
+        let repository = PathBuf::from(FIXTURE_DIRECTORY);
+        app.sidebar_model.projects.push(
+            crate::sidebar::SidebarProject::new(
+                project,
+                crate::repository::RepositoryId::new(),
+                "Return fixture".into(),
+                repository.clone(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        app.active_workspace = Some(repository.clone());
+        {
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.channels.push(ProjectChannel {
+                id: channel,
+                project_id: project,
+                title: "Keep this channel name".into(),
+                title_source: ChannelTitleSource::Manual,
+                ordinal: 1,
+                shared: true,
+                cards: vec![card],
+                focused: Some(card),
+            });
+            durable.active_channel = Some(channel);
+            durable.card_scopes.insert(card, repository.clone());
+        }
+        app.shared_views = super::super::shared_views::State::for_workspace(&app.durable);
+        let mut view = View::empty(Scope::Channel(channel));
+        view.revision = 1;
+        view.panes.push(
+            Pane::from_card(app.card_state(card).unwrap(), Some(repository.clone())).unwrap(),
+        );
+        let model = WorkspaceModel {
+            identity: uuid::Uuid::new_v4(),
+            sequence: 1,
+            projects: vec![ModelProject {
+                repository: repository.clone(),
+                name: "Return fixture".into(),
+                kind: ProjectKind::Folder,
+                ordinal: 1,
+            }],
+            channels: vec![ModelChannel {
+                id: channel,
+                repository,
+                title: "Keep this channel name".into(),
+                title_source: ChannelTitleSource::Manual,
+                ordinal: 1,
+            }],
+            views: vec![view],
+            ..Default::default()
+        };
+        let (sender, edits) = async_channel::unbounded();
+        app.workspace_model_tx = sender;
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::ViewApplied {
+                scope: Scope::Channel(channel),
+                operation: None,
+                model: model.clone(),
+            },
+        )));
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        app.chat_runtime_mut(target).unwrap().refresh();
+        write(&mut app, card, "Unsent draft stays here");
+        assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
+        while edits.try_recv().is_ok() {}
+        let allocation = chat_runtime(&app, card) as *const Runtime as usize;
+        let mut terminal = return_terminal(&source).unwrap();
+        terminal.id = TerminalId::new();
+        let proof = source.proof.unwrap();
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id,
+            boot_id: proof.boot_id,
+            host_incarnation: proof.host_incarnation,
+        };
+        SharedReturnFixture {
+            app,
+            card,
+            target,
+            model,
+            edits,
+            terminal,
+            items,
+            allocation,
+        }
+    }
+
+    fn assert_shared_return_readable(f: &SharedReturnFixture) {
+        let runtime = chat_runtime(&f.app, f.card);
+        assert_eq!(runtime as *const Runtime as usize, f.allocation);
+        assert_eq!(runtime.unsent_text(), "Unsent draft stays here");
+        assert_eq!(runtime.snapshot.items.len(), 2);
+        for (actual, original) in runtime.snapshot.items.iter().zip(&f.items) {
+            assert!(Arc::ptr_eq(actual, original));
+            assert_eq!(
+                copy_text(CopyPart::Text, &actual.content),
+                copy_text(CopyPart::Text, &original.content)
+            );
+        }
+        assert!(runtime.pending.is_none());
+        assert!(runtime.queued.is_none());
+        assert!(runtime.followups.is_empty());
+    }
+
+    fn handoff_descriptor(session: TerminalSession) -> crate::terminal::ipc::TerminalDescriptor {
+        crate::terminal::ipc::TerminalDescriptor {
+            session,
+            generation: 1,
+            event_sequence: 0,
+            oldest_event_sequence: 0,
+            attached: false,
+            transcript: None,
+            activity: None,
+            agent_activity: None,
+            upgrade_sources: Vec::new(),
+            upgrade_relaunches: Vec::new(),
+            screen_lost_after_crash: false,
+            title: None,
+        }
+    }
+
+    fn begin_shared_return(f: &mut SharedReturnFixture) {
+        drop(f.app.update(Message::ChatUi(Action::Switch(f.card))));
+        assert!(matches!(f.app.chat_ui.phases.get(&f.card),
+            Some(Phase::Returning { target, local: None, .. }) if *target == f.target));
+        let handle = chat_runtime(&f.app, f.card).handle().unwrap().clone();
+        let mut final_snapshot = (*handle.snapshot()).clone();
+        final_snapshot.exited = true;
+        final_snapshot.generation += 1;
+        handle.publish_snapshot_for_test(final_snapshot);
+        f.app.chat_runtime_mut(f.target).unwrap().refresh();
+    }
+
+    fn stage_shared_return(
+        f: &mut SharedReturnFixture,
+    ) -> (
+        crate::workspace_model::views::Scope,
+        uuid::Uuid,
+        crate::workspace_model::views::Change,
+    ) {
+        use crate::workspace_model::{ModelEdit, views::Change};
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            Ok(f.terminal.clone()),
+        ))));
+        while let Ok(edit) = f.edits.try_recv() {
+            if let ModelEdit::ChangeView {
+                scope,
+                operation,
+                change: change @ Change::Update { .. },
+                ..
+            } = edit
+                && matches!(&change, Change::Update { pane, .. } if pane.id == f.card && matches!(&pane.kind, CardKind::Terminal(terminal) if terminal == &f.terminal))
+            {
+                return (scope, operation, change);
+            }
+        }
+        panic!("the real return completion must publish the same-card terminal replacement");
+    }
+
+    fn acknowledge_shared_return(
+        f: &mut SharedReturnFixture,
+        edit: (
+            crate::workspace_model::views::Scope,
+            uuid::Uuid,
+            crate::workspace_model::views::Change,
+        ),
+    ) {
+        let (scope, operation, change) = edit;
+        let view = f
+            .model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == scope)
+            .unwrap();
+        assert!(view.apply(&change).unwrap());
+        view.revision += 1;
+        f.model.sequence += 1;
+        drop(f.app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::ViewApplied {
+                scope,
+                operation: Some(operation),
+                model: f.model.clone(),
+            },
+        )));
+    }
+
+    #[test]
+    fn shared_terminal_return_waits_for_exact_channel_ack_through_both_inventory_orders() {
+        for inventory_first in [true, false] {
+            let mut f = shared_return_fixture();
+            begin_shared_return(&mut f);
+            let mut unrelated = f.terminal.clone();
+            unrelated.id = TerminalId::new();
+            unrelated.launch.program = "/bin/sh".into();
+            unrelated.launch.arguments.clear();
+            unrelated.resume_hint = None;
+            let inventory = vec![
+                handoff_descriptor(f.terminal.clone()),
+                handoff_descriptor(unrelated.clone()),
+            ];
+            if inventory_first {
+                drop(
+                    f.app
+                        .update(Message::HostedTerminalsObserved(inventory.clone())),
+                );
+                assert_eq!(f.app.pending_adoptions.len(), 2);
+            }
+            let edit = stage_shared_return(&mut f);
+            if !inventory_first {
+                drop(f.app.update(Message::HostedTerminalsObserved(inventory)));
+            }
+            assert_shared_return_readable(&f);
+            // The pre-RPC reservation defers only the unknown-ID interval.
+            // Exact returned-ID custody lets unrelated census entries appear
+            // while this real shared operation is still awaiting its ACK.
+            assert!(!f.app.native_terminal_return_pending());
+            assert!(f.app.pending_adoptions.is_empty());
+            assert_eq!(f.app.durable.cards.iter().filter(|card|
+                matches!(&card.kind, CardKind::Terminal(terminal) if terminal.id == unrelated.id)).count(), 1);
+            assert!(!f.app.durable.cards.iter().any(|card|
+                matches!(&card.kind, CardKind::Terminal(terminal) if terminal.id == f.terminal.id)));
+            assert!(!f.app.terminal_return_can_commit(&f.terminal));
+            drop(f.app.update(Message::TerminalHandoffsCommitted {
+                result: Ok(vec![(f.terminal.clone(), Ok(()))]),
+            }));
+            assert_eq!(
+                f.app.pending_terminal_handoffs.get(&f.terminal.id),
+                Some(&f.terminal)
+            );
+            // This real old canonical read arrives before TerminalStarted.
+            // Optimism is not admission and must not replace the readable chat.
+            f.model.sequence += 1;
+            drop(f.app.update(Message::WorkspaceModelObserved(
+                super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+            )));
+            assert_shared_return_readable(&f);
+            assert!(matches!(
+                f.app.card_state(f.card).unwrap().kind,
+                CardKind::Chat(_)
+            ));
+            let old = f.model.clone();
+            acknowledge_shared_return(&mut f, edit);
+            assert_eq!(f.app.durable.channels[0].cards, vec![f.card]);
+            assert_eq!(f.app.durable.channels[0].title, "Keep this channel name");
+            assert_eq!(f.app.workspace.focused(), Some(f.card));
+            assert!(matches!(&f.app.card_state(f.card).unwrap().kind,
+                CardKind::Terminal(current) if current == &f.terminal));
+            assert!(matches!(
+                f.app.cards.get(&f.card),
+                Some(CardRuntime::Loading)
+            ));
+            assert_eq!(
+                f.app.chat_ui.drafts.get(&f.card).map(String::as_str),
+                Some("Unsent draft stays here")
+            );
+            assert!(f.app.terminal_return_can_commit(&f.terminal));
+            assert!(matches!(
+                terminal_start_mode(&f.terminal),
+                Ok(TerminalStartMode::Attach(_))
+            ));
+            drop(f.app.update(Message::WorkspaceModelObserved(
+                super::super::workspace_model_sync::ModelUpdate::Read(old),
+            )));
+            drop(f.app.update(Message::TerminalStarted {
+                card: f.card,
+                terminal: f.terminal.id,
+                result: Err("fixture: terminal surface unavailable".into()),
+            }));
+            assert!(f.app.pending_adoptions.is_empty());
+            assert_eq!(f.app.durable.cards.iter().filter(|card|
+                matches!(&card.kind, CardKind::Terminal(terminal) if terminal.id == f.terminal.id)).count(), 1);
+            assert_eq!(f.app.durable.channels[0].cards, vec![f.card]);
+        }
+    }
+
+    #[test]
+    fn refused_terminal_return_keeps_readable_source_and_retries_only_the_same_publication() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        use crate::workspace_model::views::Scope;
+        for conflict in [false, true] {
+            let mut f = shared_return_fixture();
+            begin_shared_return(&mut f);
+            let (scope, operation, change) = stage_shared_return(&mut f);
+            let refusal = if conflict {
+                ModelUpdate::ViewConflicted {
+                    scope,
+                    operation,
+                    change,
+                    model: f.model.clone(),
+                    error: "fixture exact shared refusal".into(),
+                }
+            } else {
+                ModelUpdate::ViewRefused {
+                    scope,
+                    operation,
+                    error: "fixture exact shared refusal".into(),
+                }
+            };
+            drop(f.app.update(Message::WorkspaceModelObserved(refusal)));
+            assert_shared_return_readable(&f);
+            assert!(!f.app.chat_start_pending(f.card));
+            assert!(
+                chat_runtime(&f.app, f.card)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("fixture exact shared refusal")
+            );
+            assert!(!f.app.terminal_return_can_commit(&f.terminal));
+            while f.edits.try_recv().is_ok() {}
+            // The retry is an ordinary reducer action with no RPC future:
+            // only the exact already-created terminal's view edit is queued.
+            let retry = f.app.handle_chat_action(Action::Switch(f.card));
+            assert!(cosmic::iced::runtime::task::into_stream(retry).is_none());
+            assert_shared_return_readable(&f);
+            let edit = f
+                .edits
+                .try_recv()
+                .expect("explicit retry queues a view edit");
+            let crate::workspace_model::ModelEdit::ChangeView {
+                scope,
+                operation: retry,
+                change,
+                ..
+            } = edit
+            else {
+                panic!("only view publication is retried");
+            };
+            assert_ne!(operation, retry);
+            assert!(matches!(scope, Scope::Channel(_)));
+            acknowledge_shared_return(&mut f, (scope, retry, change));
+            assert!(matches!(&f.app.card_state(f.card).unwrap().kind,
+                CardKind::Terminal(current) if current == &f.terminal));
+            assert_eq!(f.app.durable.channels[0].cards, vec![f.card]);
+        }
+    }
+
+    #[test]
+    fn late_canonical_return_acceptance_settles_only_the_original_idle_target() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for close_started in [false, true] {
+            let mut f = shared_return_fixture();
+            begin_shared_return(&mut f);
+            let (scope, operation, change) = stage_shared_return(&mut f);
+            drop(
+                f.app
+                    .update(Message::WorkspaceModelObserved(ModelUpdate::ViewRefused {
+                        scope: scope.clone(),
+                        operation,
+                        error: "fixture: reply lost after publication".into(),
+                    })),
+            );
+            assert_shared_return_readable(&f);
+            assert!(!f.app.chat_ui.phases.contains_key(&f.card));
+            let mut closing = None;
+            if close_started {
+                drop(f.app.begin_chat_close(f.card));
+                closing = f.app.chat_ui.phases.get(&f.card).map(Phase::target);
+                assert!(matches!(
+                    f.app.chat_ui.phases.get(&f.card),
+                    Some(Phase::Closing { restart: None, .. })
+                ));
+                assert_ne!(closing, Some(f.target));
+            }
+            // A canonical response is the authority even when the ordinary
+            // error reply arrived first. No RPC or provider action is replayed.
+            acknowledge_shared_return(&mut f, (scope, operation, change));
+            if close_started {
+                assert_shared_return_readable(&f);
+                assert_eq!(
+                    f.app.chat_ui.phases.get(&f.card).map(Phase::target),
+                    closing
+                );
+                assert!(!f.app.terminal_return_can_commit(&f.terminal));
+                assert_eq!(
+                    f.app.pending_terminal_handoffs.get(&f.terminal.id),
+                    Some(&f.terminal)
+                );
+            } else {
+                assert!(matches!(&f.app.card_state(f.card).unwrap().kind,
+                    CardKind::Terminal(terminal) if terminal == &f.terminal));
+                assert_eq!(f.app.durable.channels[0].cards, vec![f.card]);
+                assert_eq!(
+                    f.app.chat_ui.drafts.get(&f.card).map(String::as_str),
+                    Some("Unsent draft stays here")
+                );
+                assert!(f.app.terminal_return_can_commit(&f.terminal));
+                assert_eq!(f.app.durable.cards.iter().filter(|card|
+                    matches!(&card.kind, CardKind::Terminal(terminal) if terminal.id == f.terminal.id)).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn late_terminal_ack_preserves_a_real_pending_paste_until_its_reply_settles() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let mut f = shared_return_fixture();
+        begin_shared_return(&mut f);
+        let (scope, operation, change) = stage_shared_return(&mut f);
+        drop(
+            f.app
+                .update(Message::WorkspaceModelObserved(ModelUpdate::ViewRefused {
+                    scope: scope.clone(),
+                    operation,
+                    error: "fixture: reply lost after publication".into(),
+                })),
+        );
+        // The actual enabled composer Paste producer creates the admission
+        // ticket before its clipboard task can return; no clipboard is read.
+        drop(f.app.handle_chat_ui(Action::Paste(f.target)));
+        let ticket = {
+            let runtime = chat_runtime(&f.app, f.card);
+            assert_eq!(runtime.pastes_pending, 1);
+            let id = runtime.attachment_order[0];
+            runtime.attachment_ticket(id).unwrap()
+        };
+        acknowledge_shared_return(&mut f, (scope, operation, change));
+        assert_shared_return_readable(&f);
+        assert_eq!(chat_runtime(&f.app, f.card).pastes_pending, 1);
+        assert!(f.app.chat_ui.terminal_returns.contains_key(&f.target));
+        assert!(!f.app.terminal_return_can_commit(&f.terminal));
+        drop(
+            f.app
+                .handle_chat_ui(Action::PastedText(f.target, ticket, None)),
+        );
+        assert!(matches!(&f.app.card_state(f.card).unwrap().kind,
+            CardKind::Terminal(terminal) if terminal == &f.terminal));
+        assert_eq!(
+            f.app.chat_ui.drafts.get(&f.card).map(String::as_str),
+            Some("Unsent draft stays here")
+        );
+        assert!(f.app.chat_ui.terminal_returns.is_empty());
+        assert!(f.app.terminal_return_can_commit(&f.terminal));
+    }
+
+    #[test]
+    fn an_unqueued_return_publication_retains_its_source_and_retries_only_the_known_pty() {
+        let mut f = shared_return_fixture();
+        begin_shared_return(&mut f);
+        f.edits.close();
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            Ok(f.terminal.clone()),
+        ))));
+        assert_shared_return_readable(&f);
+        assert!(!f.app.chat_start_pending(f.card));
+        assert!(
+            chat_runtime(&f.app, f.card)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("pane could not be updated")
+        );
+        assert_eq!(
+            f.app.pending_terminal_handoffs.get(&f.terminal.id),
+            Some(&f.terminal)
+        );
+        assert!(!f.app.terminal_return_can_commit(&f.terminal));
+        let (sender, receiver) = async_channel::unbounded();
+        f.app.workspace_model_tx = sender;
+        let task = f.app.handle_chat_action(Action::Switch(f.card));
+        assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+        let edit = receiver
+            .try_recv()
+            .expect("retry publishes the existing terminal");
+        assert!(
+            matches!(edit, crate::workspace_model::ModelEdit::ChangeView {
+            change: crate::workspace_model::views::Change::Update { pane, .. }, ..
+        } if pane.id == f.card && matches!(pane.kind, CardKind::Terminal(terminal) if terminal == f.terminal))
+        );
+        assert!(f.app.shared_views.pending.is_empty());
+    }
+
+    #[test]
+    fn close_after_return_refusal_retains_custody_until_its_exact_cleanup_completes() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for close_during_rpc in [false, true] {
+            let mut f = shared_return_fixture();
+            begin_shared_return(&mut f);
+            if close_during_rpc {
+                drop(f.app.begin_chat_close(f.card));
+                assert!(matches!(
+                    f.app.chat_ui.phases.get(&f.card),
+                    Some(Phase::Returning {
+                        close_requested: true,
+                        ..
+                    })
+                ));
+            }
+            let (scope, operation, change) = stage_shared_return(&mut f);
+            drop(
+                f.app
+                    .update(Message::WorkspaceModelObserved(ModelUpdate::ViewRefused {
+                        scope: scope.clone(),
+                        operation,
+                        error: "fixture view refused".into(),
+                    })),
+            );
+            if !close_during_rpc {
+                drop(f.app.begin_chat_close(f.card));
+            }
+            let first = f.app.chat_ui.phases[&f.card].target();
+            assert!(matches!(
+                f.app.chat_ui.phases.get(&f.card),
+                Some(Phase::Closing { restart: None, .. })
+            ));
+            let saved = f.app.chat_return_session(f.card).unwrap();
+            assert_eq!(saved.terminal.as_ref(), Some(&f.terminal));
+            drop(f.app.update(Message::ChatUi(Action::RetainedCloseFinished(
+                first,
+                saved.clone(),
+                Err("fixture close not confirmed".into()),
+            ))));
+            assert_shared_return_readable(&f);
+            assert!(
+                chat_runtime(&f.app, f.card)
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("close not confirmed")
+            );
+            assert!(!f.app.chat_ui.phases.contains_key(&f.card));
+            assert!(f.app.chat_ui.terminal_returns[&f.target].close_requested);
+            acknowledge_shared_return(&mut f, (scope, operation, change));
+            assert_shared_return_readable(&f);
+            assert!(!f.app.terminal_return_can_commit(&f.terminal));
+            drop(f.app.begin_chat_close(f.card));
+            let retry = f.app.chat_ui.phases[&f.card].target();
+            assert_ne!(first, retry);
+            drop(f.app.update(Message::ChatUi(Action::RetainedCloseFinished(
+                first,
+                saved.clone(),
+                Ok(()),
+            ))));
+            assert_eq!(f.app.chat_ui.phases[&f.card].target(), retry);
+            assert_shared_return_readable(&f);
+            drop(f.app.update(Message::ChatUi(Action::RetainedCloseFinished(
+                retry,
+                saved,
+                Ok(()),
+            ))));
+            assert!(!f.app.card_state(f.card).unwrap().existence.is_open());
+            assert!(!matches!(
+                f.app.cards.get(&f.card),
+                Some(CardRuntime::Chat(_))
+            ));
+            assert!(!f.app.chat_ui.terminal_returns.contains_key(&f.target));
+            assert!(!f.app.pending_terminal_handoffs.contains_key(&f.terminal.id));
+        }
+    }
+
+    fn returned_terminal_close_fixture(
+        terminal: TerminalSession,
+        scenario: &'static str,
+    ) -> Result<(), String> {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, TerminalCloseResult, read_frame, write_frame,
+        };
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let expected = terminal.clone();
+        let server = std::thread::spawn(move || {
+            let mut proof = expected.continuity.live_proof().unwrap();
+            if scenario == "wrong host" {
+                proof.host_incarnation = "replacement-host".into();
+            }
+            let send = |peer: &mut std::os::unix::net::UnixStream, request_id, message| {
+                write_frame(
+                    peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+            send(
+                &mut peer,
+                Some(hello.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            if scenario != "wrong host" {
+                let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(list.request, ClientRequest::List);
+                let mut current = expected.clone();
+                if scenario == "changed launch" {
+                    current.launch.arguments.push("different-process".into());
+                }
+                if scenario == "ended" {
+                    current.continuity = TerminalContinuity::Exited {
+                        last_exit: crate::model::TerminalExit {
+                            code: Some(0),
+                            signal: None,
+                            occurred_at_unix_ms: 1,
+                        },
+                    };
+                }
+                let descriptor = handoff_descriptor(current);
+                send(
+                    &mut peer,
+                    Some(list.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::Listed {
+                            terminals: if scenario == "gone" {
+                                Vec::new()
+                            } else {
+                                vec![descriptor.clone()]
+                            },
+                        },
+                    },
+                );
+                if !matches!(scenario, "changed launch" | "gone") {
+                    if scenario != "ended" {
+                        let attach: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                        assert!(
+                            matches!(attach.request, ClientRequest::Attach { terminal_id, .. } if terminal_id == expected.id)
+                        );
+                        send(
+                            &mut peer,
+                            Some(attach.request_id),
+                            ServerMessage::Response {
+                                response: ServerResponse::Attached {
+                                    terminal: descriptor.clone(),
+                                },
+                            },
+                        );
+                        send(
+                            &mut peer,
+                            None,
+                            ServerMessage::Synchronized {
+                                terminal_id: expected.id,
+                                generation: 1,
+                                event_sequence: 0,
+                            },
+                        );
+                    }
+                    let close: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                    if scenario == "ended" {
+                        assert!(
+                            matches!(close.request, ClientRequest::ReleaseCompletedTerminal { session, allow_active: true } if session == descriptor.session)
+                        );
+                    } else {
+                        assert!(
+                            matches!(close.request, ClientRequest::CloseTerminalChecked { terminal_id, allow_active: true } if terminal_id == expected.id)
+                        );
+                    }
+                    let outcome = match scenario {
+                        "active" => TerminalCloseResult::Active,
+                        "unknown" => TerminalCloseResult::Unknown("fixture cleanup pending".into()),
+                        _ => TerminalCloseResult::Closed,
+                    };
+                    send(
+                        &mut peer,
+                        Some(close.request_id),
+                        ServerMessage::Response {
+                            response: ServerResponse::TerminalCloseChecked {
+                                terminal_id: expected.id,
+                                outcome,
+                            },
+                        },
+                    );
+                    if scenario != "ended" {
+                        let detach: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                        assert_eq!(
+                            detach.request,
+                            ClientRequest::Detach {
+                                terminal_id: expected.id
+                            }
+                        );
+                        send(
+                            &mut peer,
+                            Some(detach.request_id),
+                            ServerMessage::Response {
+                                response: ServerResponse::Detached,
+                            },
+                        );
+                    }
+                }
+            }
+            let extra: Option<ClientEnvelope> = read_frame(&mut peer).unwrap();
+            assert!(
+                extra.is_none(),
+                "no chat close, provider start, receipt commit or extra terminal request"
+            );
+        });
+        let mut client = crate::control::ControlClient::from_stream(stream).unwrap();
+        let result = close_returned_terminal_on(&mut client, &terminal);
+        drop(client);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn returned_terminal_cleanup_uses_its_actual_host_and_process_before_confirmed_close() {
+        let f = shared_return_fixture();
+        for scenario in [
+            "closed",
+            "active",
+            "unknown",
+            "wrong host",
+            "changed launch",
+            "gone",
+            "ended",
+        ] {
+            let result = returned_terminal_close_fixture(f.terminal.clone(), scenario);
+            assert_eq!(
+                result.is_ok(),
+                matches!(scenario, "closed" | "ended"),
+                "{scenario}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_terminal_return_retains_copyable_transcript_draft_and_inline_cause() {
+        let mut f = shared_return_fixture();
+        begin_shared_return(&mut f);
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            Err("fixture terminal spawn refused".into()),
+        ))));
+        assert_shared_return_readable(&f);
+        f.app.status = None;
+        f.app.notices.entries.clear();
+        f.app.reconcile_chat_failure_presentations();
+        let runtime = chat_runtime(&f.app, f.card);
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some("Could not return to terminal: fixture terminal spawn refused")
+        );
+        assert_eq!(
+            runtime.failure_ui.local_error.as_deref(),
+            runtime.error.as_deref()
+        );
+        assert!(!runtime.failure_ui.incidents.is_empty());
+        assert!(!f.app.chat_start_pending(f.card));
+        assert!(f.app.pending_terminal_handoffs.is_empty());
+        assert!(f.app.chat_ui.terminal_returns.is_empty());
+        while let Ok(edit) = f.edits.try_recv() {
+            assert!(!matches!(edit,
+                crate::workspace_model::ModelEdit::ChangeView { change: crate::workspace_model::views::Change::Update { pane, .. }, .. }
+                    if matches!(pane.kind, CardKind::Terminal(_))));
+        }
+    }
+
+    #[test]
+    fn late_terminal_return_cannot_replace_a_closed_or_replaced_shared_source() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for closed in [false, true] {
+            let mut f = shared_return_fixture();
+            begin_shared_return(&mut f);
+            let mut newer = f.model.clone();
+            newer.sequence += 1;
+            newer.views[0].revision += 1;
+            if closed {
+                newer.views[0].panes.clear();
+                newer.views[0].retired.push(f.card);
+            } else {
+                let CardKind::Chat(session) = &mut newer.views[0].panes[0].kind else {
+                    unreachable!();
+                };
+                session.id = TerminalId::new();
+                session.launch.session_id = Some("different-native-conversation".into());
+            }
+            drop(
+                f.app
+                    .update(Message::WorkspaceModelObserved(ModelUpdate::Read(newer))),
+            );
+            let before = f.app.card_state(f.card).unwrap().kind.clone();
+            let newer_phase = f.app.chat_ui.phases.get(&f.card).map(Phase::target);
+            drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+                f.target,
+                Ok(f.terminal.clone()),
+            ))));
+            assert_eq!(f.app.card_state(f.card).unwrap().kind, before);
+            assert!(!matches!(&before, CardKind::Terminal(terminal) if terminal == &f.terminal));
+            assert!(
+                !f.app.chat_ui.terminal_returns.contains_key(&f.target)
+                    || f.app.chat_ui.terminal_returns[&f.target]
+                        .operation
+                        .is_none()
+            );
+            if newer_phase.is_some_and(|target| target != f.target) {
+                assert_eq!(
+                    f.app.chat_ui.phases.get(&f.card).map(Phase::target),
+                    newer_phase
+                );
+            }
+            assert!(!f.app.workspace_model.views.iter().flat_map(|view| &view.panes)
+                .any(|pane| pane.id == f.card && matches!(&pane.kind, CardKind::Terminal(terminal) if terminal == &f.terminal)));
+        }
+    }
+
+    #[test]
+    fn a_closed_then_reopened_project_cannot_admit_its_old_pending_terminal_return() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        use crate::workspace_model::ModelEdit;
+
+        let mut f = shared_return_fixture();
+        begin_shared_return(&mut f);
+        let (scope, operation, change) = stage_shared_return(&mut f);
+        assert!(f.app.shared_terminal_return_change_pending(operation));
+        assert!(matches!(f.app.chat_ui.phases.get(&f.card),
+            Some(Phase::Returning { target, local: None, .. }) if *target == f.target));
+        let repository = f.model.projects[0].repository.clone();
+        let closing = ModelEdit::CloseProject {
+            repository: repository.clone(),
+        };
+        let reopening = ModelEdit::ReopenProject {
+            repository: repository.clone(),
+            name: "Reopened project".into(),
+            kind: crate::model::ProjectKind::Folder,
+        };
+        let mut closed_then_reopened = f.model.clone();
+        closed_then_reopened.fold(2, &closing);
+        // The real CloseProject transaction removes these scope rows through
+        // its project/channel foreign-key cascades. A client metadata fold
+        // alone deliberately lacks that complete pane inventory evidence.
+        closed_then_reopened.views.clear();
+        closed_then_reopened.fold(3, &reopening);
+        assert!(closed_then_reopened.closed_projects.is_empty());
+        assert!(closed_then_reopened.channels.is_empty());
+        drop(
+            f.app
+                .update(Message::WorkspaceModelObserved(ModelUpdate::Read(
+                    closed_then_reopened,
+                ))),
+        );
+        // The complete read overtakes both old edges. The original runtime
+        // survives as a readable local draft, but its old publication does not.
+        drop(
+            f.app
+                .update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                    sequence: 2,
+                    edit: closing,
+                })),
+        );
+        drop(
+            f.app
+                .update(Message::WorkspaceModelObserved(ModelUpdate::Edited {
+                    sequence: 3,
+                    edit: reopening,
+                })),
+        );
+        assert_shared_return_readable(&f);
+        assert!(!f.app.chat_start_pending(f.card));
+        assert!(!f.app.terminal_return_can_commit(&f.terminal));
+        assert_eq!(
+            f.app.pending_terminal_handoffs.get(&f.terminal.id),
+            Some(&f.terminal)
+        );
+        // Cleanup can still address the exact already-issued PTY. The live
+        // chat and its durable source are not rewritten into a new launch.
+        assert_eq!(
+            f.app.chat_return_session(f.card).unwrap().terminal,
+            Some(f.terminal.clone())
+        );
+        assert!(chat_runtime(&f.app, f.card).session.terminal.is_none());
+        assert!(matches!(&f.app.card_state(f.card).unwrap().kind,
+            CardKind::Chat(session) if session.terminal.is_none()));
+
+        let mut stale_acceptance = f.model.clone();
+        assert!(stale_acceptance.views[0].apply(&change).unwrap());
+        stale_acceptance.views[0].revision += 1;
+        stale_acceptance.sequence = 2;
+        drop(
+            f.app
+                .update(Message::WorkspaceModelObserved(ModelUpdate::ViewApplied {
+                    scope,
+                    operation: Some(operation),
+                    model: stale_acceptance,
+                })),
+        );
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            Ok(f.terminal.clone()),
+        ))));
+        assert_shared_return_readable(&f);
+        assert!(!f.app.terminal_return_can_commit(&f.terminal));
+        assert!(!f.app.workspace_model.views.iter().flat_map(|view| &view.panes)
+            .any(|pane| matches!(&pane.kind, CardKind::Terminal(terminal) if terminal == &f.terminal)));
+        assert!(!f.app.durable.cards.iter().any(|card|
+            matches!(&card.kind, CardKind::Terminal(terminal) if terminal.id == f.terminal.id)));
+    }
+
+    #[test]
+    fn retired_return_replays_unrelated_inventory_on_failure_detach_and_forget() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for retirement in ["failure", "shared detach", "forget"] {
+            let mut f = shared_return_fixture();
+            begin_shared_return(&mut f);
+            let mut unrelated = f.terminal.clone();
+            unrelated.id = TerminalId::new();
+            unrelated.launch.program = "/bin/sh".into();
+            unrelated.launch.arguments.clear();
+            unrelated.resume_hint = None;
+            drop(
+                f.app
+                    .update(Message::HostedTerminalsObserved(vec![handoff_descriptor(
+                        unrelated.clone(),
+                    )])),
+            );
+            assert_eq!(f.app.pending_adoptions.len(), 1);
+            match retirement {
+                "failure" => drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+                    f.target,
+                    Err("fixture return failed".into()),
+                )))),
+                "shared detach" => {
+                    f.app
+                        .chat_runtime_mut(f.target)
+                        .unwrap()
+                        .replace_draft(text_editor::Content::new());
+                    let mut closed = f.model.clone();
+                    closed.sequence += 1;
+                    closed.views[0].revision += 1;
+                    closed.views[0].panes.clear();
+                    closed.views[0].retired.push(f.card);
+                    drop(
+                        f.app
+                            .update(Message::WorkspaceModelObserved(ModelUpdate::Read(closed))),
+                    );
+                }
+                "forget" => {
+                    f.app.chat_forget(f.card);
+                    // This is the same existing refresh/save wake used by the
+                    // product, not a manual drain of the queue under test.
+                    drop(f.app.commit_terminal_handoffs());
+                }
+                _ => unreachable!(),
+            }
+            assert!(!f.app.native_terminal_return_pending());
+            assert!(f.app.pending_adoptions.is_empty());
+            assert_eq!(f.app.durable.cards.iter().filter(|card|
+                matches!(&card.kind, CardKind::Terminal(terminal) if terminal.id == unrelated.id)).count(), 1);
+            assert!(matches!(
+                &f.app.card_state(f.card).unwrap().kind,
+                CardKind::Chat(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_return_refuses_a_foreign_terminal_proof_without_replacing_source() {
+        let mut f = shared_return_fixture();
+        begin_shared_return(&mut f);
+        let mut foreign = f.terminal.clone();
+        let TerminalContinuity::Live {
+            host_incarnation, ..
+        } = &mut foreign.continuity
+        else {
+            unreachable!();
+        };
+        *host_incarnation = "another-daemon".into();
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            Ok(foreign.clone()),
+        ))));
+        assert_shared_return_readable(&f);
+        assert!(!f.app.chat_start_pending(f.card));
+        assert!(!f.app.pending_terminal_handoffs.contains_key(&foreign.id));
+        assert!(f.app.chat_ui.terminal_return_owners.is_empty());
+        assert!(
+            chat_runtime(&f.app, f.card)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("original host")
+        );
     }
 
     /// A chat that switches to a shell leaves its channel only for the shell
