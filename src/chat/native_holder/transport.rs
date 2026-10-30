@@ -12,7 +12,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     io::{self, Read, Write},
     os::{
         fd::{AsFd, AsRawFd, FromRawFd, RawFd},
@@ -32,6 +32,8 @@ const PROTOCOL: u32 = 3;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
+const STDERR_LIMIT: usize = 64 << 10;
+const DIAGNOSTIC_TIMEOUT: Duration = Duration::from_millis(250);
 // This status is emitted only after the helper's owned descendants have all
 // been reaped. Signals, panics and ordinary setup exits are not cleanup proof.
 const CLEANUP_PROVED: i32 = 73;
@@ -98,7 +100,7 @@ impl Spawn {
             .envs(&self.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .process_group(0);
         crate::host::descriptor_limit::inherit(&mut command);
         // The helper's signalfd owns SIGCHLD; its provider must receive the
@@ -132,6 +134,7 @@ impl Spawn {
 
 #[derive(Serialize, Deserialize)]
 enum Request {
+    Diagnostic,
     Spawn {
         protocol: u32,
         spawn: Spawn,
@@ -161,6 +164,7 @@ enum Request {
 
 #[derive(Serialize, Deserialize)]
 enum Report {
+    Diagnostic(ExitDiagnostic),
     Started {
         protocol: u32,
         record: Record,
@@ -182,6 +186,128 @@ enum Report {
     Failed(String),
 }
 
+/// A bounded snapshot of the original launcher's stderr. Bytes are retained
+/// exactly; presentation is deliberately separate and never logs this payload.
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ExitDiagnostic {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+    pub provider_exited: bool,
+    pub stderr: Vec<u8>,
+    pub observed_bytes: u64,
+    pub complete: bool,
+    pub read_failed: bool,
+}
+
+impl ExitDiagnostic {
+    /// UI text only. Raw bytes stay in the bounded private control snapshot;
+    /// terminal escapes/control bytes and common credential-bearing lines do
+    /// not become an error label. This is not a complete-log export.
+    pub(crate) fn failure_summary(&self) -> Option<String> {
+        if !self.provider_exited {
+            return None;
+        }
+        // A bounded byte tail may start inside a credential-bearing line,
+        // after the label used to identify it has already been discarded.
+        // Keep the raw snapshot intact, but do not display a leading fragment
+        // whose original context is unknown.
+        let display = if self.observed_bytes > self.stderr.len() as u64 {
+            self.stderr
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[][..], |end| &self.stderr[end + 1..])
+        } else {
+            &self.stderr
+        };
+        let loss = String::from_utf8_lossy(display);
+        let mut plain = String::new();
+        let mut escape = 0;
+        for ch in loss.chars() {
+            match escape {
+                0 if ch == '\u{1b}' => escape = 1,
+                0 if ch == '\n' || ch == '\t' || !ch.is_control() => plain.push(ch),
+                0 => {}
+                1 => {
+                    escape = match ch {
+                        '[' => 2,
+                        ']' => 3,
+                        _ => 0,
+                    }
+                }
+                2 if ('@'..='~').contains(&ch) => escape = 0,
+                3 if ch == '\u{7}' => escape = 0,
+                3 if ch == '\u{1b}' => escape = 4,
+                4 => escape = if ch == '\\' { 0 } else { 3 },
+                _ => {}
+            }
+        }
+        let mut lines = plain
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .rev()
+            .take(8)
+            .map(|line| {
+                let lower = line.to_ascii_lowercase();
+                if [
+                    "authorization",
+                    "bearer ",
+                    "api_key",
+                    "api-key",
+                    "access_token",
+                    "refresh_token",
+                    "password",
+                    "secret",
+                ]
+                .iter()
+                .any(|key| lower.contains(key))
+                {
+                    "[redacted credential-bearing stderr line]".to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>();
+        lines.reverse();
+        let mut text = lines.join("\n");
+        if text.len() > 1024 {
+            let start = text
+                .char_indices()
+                .find(|(index, _)| *index >= text.len() - 1024)
+                .unwrap()
+                .0;
+            text.drain(..start);
+        }
+        let status = match (self.code, self.signal) {
+            (Some(code), _) => format!("Native provider exited with status {code}"),
+            (_, Some(signal)) => format!("Native provider exited from signal {signal}"),
+            _ => "Native provider exited; its exit status is unavailable".into(),
+        };
+        let mut notes = Vec::new();
+        if self.observed_bytes > self.stderr.len() as u64 {
+            notes.push("earlier bytes omitted");
+        }
+        if !self.complete {
+            notes.push("stderr capture incomplete");
+        }
+        if self.read_failed {
+            notes.push("stderr read failed");
+        }
+        if matches!(loss, std::borrow::Cow::Owned(_)) {
+            notes.push("invalid UTF-8 replaced for display");
+        }
+        let notes = if notes.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", notes.join("; "))
+        };
+        Some(if text.is_empty() {
+            format!("{status}{notes}")
+        } else {
+            format!("{status}\nProvider stderr tail{notes}:\n{text}")
+        })
+    }
+}
+
 /// Dropping an intentionally closed actor releases its server. An unexpected
 /// daemon exit instead closes the socket without sending Release.
 pub(crate) struct Holder {
@@ -195,6 +321,64 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    /// Failure-only best effort. One short absolute deadline bounds the whole
+    /// exchange; a partial reply poisons this channel, never its original owner.
+    pub(crate) fn exit_diagnostic(&mut self) -> Result<ExitDiagnostic, String> {
+        if self.control_poisoned {
+            return Err("Native holder control framing is uncertain".into());
+        }
+        if !self.identity.record.build.as_ref().is_some_and(|build| {
+            build
+                .capabilities
+                .iter()
+                .any(|value| value == "provider-exit-diagnostics")
+        }) {
+            return Err("This native holder does not expose exit diagnostics".into());
+        }
+        if !self.identity.record.holder.is_current() {
+            return Err("Original native holder is no longer live".into());
+        }
+        let control = self.control.as_ref().ok_or("Native holder is detached")?;
+        let credentials = peer(control)?;
+        if credentials.uid != crate::daemon::current_uid()
+            || credentials.pid != self.control_peer.pid
+            || !self.control_peer.is_current()
+        {
+            return Err("Native diagnostic endpoint belongs to another process".into());
+        }
+        let deadline = Instant::now() + DIAGNOSTIC_TIMEOUT;
+        let exchange = (|| {
+            crate::descriptor_frame::send_json_with_fds_until(
+                control,
+                &Request::Diagnostic,
+                &[],
+                deadline,
+                MAX_FRAME,
+                0,
+                crate::descriptor_frame::FrameByteOrder::BigEndian,
+            )?;
+            crate::descriptor_frame::receive_json_with_fds_until::<Report>(
+                control,
+                deadline,
+                MAX_FRAME,
+                0,
+                crate::descriptor_frame::FrameByteOrder::BigEndian,
+            )
+        })();
+        match exchange {
+            Ok((Report::Diagnostic(value), descriptors))
+                if descriptors.is_empty() && value.stderr.len() <= STDERR_LIMIT =>
+            {
+                Ok(value)
+            }
+            Ok((Report::Failed(error), descriptors)) if descriptors.is_empty() => Err(error),
+            _ => {
+                self.control_poisoned = true;
+                Err("Native diagnostic response is incomplete or invalid".into())
+            }
+        }
+    }
+
     pub(crate) fn pinned_launch_directory(
         &mut self,
     ) -> Result<
@@ -768,6 +952,7 @@ struct Residence {
     recovery: Recovery,
     child: Server,
     child_events: ChildEvents,
+    stderr: StderrCapture,
     released: bool,
     _working_directory: Option<std::fs::File>,
     provider_pidfd: std::fs::File,
@@ -804,12 +989,19 @@ impl Residence {
             .map_err(|error| error.to_string())?;
         let socket = registry::socket(&directory, spawn.recovery.source.id);
         let listener = Listener::bind(socket)?;
-        let child = match spawn.command().spawn() {
-            Ok(child) => Server(crate::daemon::owned_children::OwnedChildren::new(child)),
+        let (child, stderr) = match spawn.command().spawn() {
+            Ok(mut child) => {
+                let stderr = child.stderr.take();
+                (
+                    Server(crate::daemon::owned_children::OwnedChildren::new(child)),
+                    stderr,
+                )
+            }
             Err(error) => {
                 return Err(error.to_string());
             }
         };
+        let stderr = StderrCapture::new(stderr).map_err(|error| error.to_string())?;
         let record = Record {
             version: 4,
             build: Some(registry::BuildIdentity::current(Kind::Native)),
@@ -830,6 +1022,7 @@ impl Residence {
             recovery: spawn.recovery,
             child,
             child_events,
+            stderr,
             released: false,
             _working_directory: working_directory,
         };
@@ -903,7 +1096,14 @@ impl Residence {
     }
     fn attend(&mut self, control: UnixStream) -> bool {
         loop {
-            if wait_for_control(control.as_raw_fd(), &self.child, &self.child_events).is_err() {
+            if wait_for_control_with_stderr(
+                control.as_raw_fd(),
+                &self.child,
+                &self.child_events,
+                &mut self.stderr,
+            )
+            .is_err()
+            {
                 return self.recovery.is_durable();
             }
             let request = match receive(&control, TIMEOUT) {
@@ -937,6 +1137,10 @@ impl Residence {
                 continue;
             }
             let response = match request {
+                Request::Diagnostic => match self.diagnostic() {
+                    Ok(value) => Report::Diagnostic(value),
+                    Err(error) => Report::Failed(error),
+                },
                 Request::Release => match self.release() {
                     Ok(()) => {
                         let _ = send(&control, &Report::Released, TIMEOUT);
@@ -982,6 +1186,59 @@ impl Residence {
         }
     }
 
+    fn diagnostic(&mut self) -> Result<ExitDiagnostic, String> {
+        self.stderr.drain_turn();
+        // WNOWAIT keeps the original group leader reserved for final cleanup.
+        // A wrapper's status is not substituted for its confirmed server status.
+        let original_is_server = self
+            .recovery
+            .server_process
+            .as_ref()
+            .is_none_or(|server| server == &self.record.root);
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let (mut code, mut signal) = (None, None);
+        if original_is_server {
+            if unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    self.child.id() as u32,
+                    &mut status,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            } == -1
+            {
+                return Err("Original provider exit status is unavailable".into());
+            }
+            if unsafe { status.si_pid() } != 0 {
+                match status.si_code {
+                    libc::CLD_EXITED => code = Some(unsafe { status.si_status() }),
+                    libc::CLD_KILLED | libc::CLD_DUMPED => {
+                        signal = Some(unsafe { status.si_status() })
+                    }
+                    _ => return Err("Unexpected original provider wait status".into()),
+                }
+            }
+        }
+        let mut event = libc::pollfd {
+            fd: self.provider_pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut event, 1, 0) };
+        if result < 0 || event.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err("Original provider exit observation is unavailable".into());
+        }
+        Ok(ExitDiagnostic {
+            code,
+            signal,
+            provider_exited: event.revents & libc::POLLIN != 0,
+            stderr: self.stderr.tail.iter().copied().collect(),
+            observed_bytes: self.stderr.observed_bytes,
+            complete: self.stderr.eof,
+            read_failed: self.stderr.read_failed,
+        })
+    }
+
     fn verify_server(&self, server: &Process) -> Result<(), String> {
         if self
             .recovery
@@ -1024,10 +1281,11 @@ impl Residence {
 
     fn orphan(&mut self) -> bool {
         loop {
-            if wait_for_control(
+            if wait_for_control_with_stderr(
                 self.listener.socket.as_raw_fd(),
                 &self.child,
                 &self.child_events,
+                &mut self.stderr,
             )
             .is_err()
             {
@@ -1100,6 +1358,64 @@ impl Residence {
     }
 }
 
+/// The dedicated owner drains at most 64 KiB per event turn. This is a
+/// bounded raw tail, not a complete log or an unbounded disk writer.
+struct StderrCapture {
+    pipe: Option<std::process::ChildStderr>,
+    tail: VecDeque<u8>,
+    observed_bytes: u64,
+    eof: bool,
+    read_failed: bool,
+}
+
+impl StderrCapture {
+    fn new(pipe: Option<std::process::ChildStderr>) -> io::Result<Self> {
+        if let Some(pipe) = &pipe {
+            let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                    == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self {
+            pipe,
+            tail: VecDeque::with_capacity(STDERR_LIMIT),
+            observed_bytes: 0,
+            eof: false,
+            read_failed: false,
+        })
+    }
+
+    fn drain_turn(&mut self) {
+        let mut bytes = [0_u8; 8192];
+        for _ in 0..8 {
+            let Some(pipe) = &mut self.pipe else { break };
+            match pipe.read(&mut bytes) {
+                Ok(0) => {
+                    self.eof = true;
+                    self.pipe = None;
+                    break;
+                }
+                Ok(count) => {
+                    self.observed_bytes = self.observed_bytes.saturating_add(count as u64);
+                    let discard = (self.tail.len() + count).saturating_sub(STDERR_LIMIT);
+                    self.tail.drain(..discard);
+                    self.tail.extend(&bytes[..count]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.read_failed = true;
+                    self.pipe = None;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// SIGCHLD is blocked only in the dedicated holder. The provider's pre-exec
 /// hook restores the ordinary mask so its own child management is unaffected.
 struct ChildEvents {
@@ -1156,19 +1472,23 @@ impl Drop for ChildEvents {
     }
 }
 
-/// A child exit or control message is the only source of idle wakeups. Reap
+/// Child exit, available stderr, or control messages wake the holder. Reap
 /// once before blocking as well, including orphans already pending at startup.
-fn wait_for_control(
+fn wait_for_control_with_stderr(
     fd: RawFd,
     children: &crate::daemon::owned_children::OwnedChildren,
     child_events: &ChildEvents,
+    stderr: &mut StderrCapture,
 ) -> io::Result<()> {
-    wait_for_control_with_reaper(fd, child_events, || children.reap_exited_descendants())
+    wait_for_control_with_reaper(fd, child_events, stderr, || {
+        children.reap_exited_descendants()
+    })
 }
 
 fn wait_for_control_with_reaper(
     fd: RawFd,
     child_events: &ChildEvents,
+    stderr: &mut StderrCapture,
     mut reap: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let mut reported = false;
@@ -1185,6 +1505,7 @@ fn wait_for_control_with_reaper(
         }
     };
     loop {
+        stderr.drain_turn();
         inspect_children();
         let mut poll = [
             libc::pollfd {
@@ -1197,8 +1518,13 @@ fn wait_for_control_with_reaper(
                 events: libc::POLLIN,
                 revents: 0,
             },
+            libc::pollfd {
+                fd: stderr.pipe.as_ref().map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
-        // SAFETY: the array and both owned descriptors remain live throughout
+        // SAFETY: the array and owned descriptors remain live throughout
         // poll. No timer is armed: an idle holder sleeps indefinitely.
         match unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) } {
             result if result > 0 => {
@@ -1219,6 +1545,15 @@ fn wait_for_control_with_reaper(
             }
         }
     }
+}
+
+#[cfg(test)]
+fn wait_for_control(
+    fd: RawFd,
+    children: &crate::daemon::owned_children::OwnedChildren,
+    child_events: &ChildEvents,
+) -> io::Result<()> {
+    wait_for_control_with_stderr(fd, children, child_events, &mut StderrCapture::new(None)?)
 }
 
 /// Removes even an unregistered startup endpoint, but never a replacement
@@ -1482,6 +1817,299 @@ extern "C" fn serve_if_requested() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stderr_summary_refuses_credential_fragments_after_byte_tail_truncation() {
+        const CANARY: &str = "CAPACITY_CREDENTIAL_CANARY_7A2D";
+        let mut raw = b"Authorization: Bearer ".to_vec();
+        raw.extend(std::iter::repeat_n(b'q', STDERR_LIMIT));
+        raw.extend_from_slice(CANARY.as_bytes());
+        raw.extend_from_slice(b"\nmodel capacity exhausted\n");
+        let tail = raw[raw.len() - STDERR_LIMIT..].to_vec();
+        let mut diagnostic = ExitDiagnostic {
+            code: Some(7),
+            signal: None,
+            provider_exited: true,
+            stderr: tail.clone(),
+            observed_bytes: raw.len() as u64,
+            complete: true,
+            read_failed: false,
+        };
+        let summary = diagnostic.failure_summary().unwrap();
+        assert!(!summary.contains(CANARY));
+        assert!(summary.contains("model capacity exhausted"));
+        assert!(summary.contains("earlier bytes omitted"));
+        assert_eq!(diagnostic.stderr, tail, "raw private tail must stay intact");
+
+        diagnostic.stderr = CANARY.as_bytes().to_vec();
+        diagnostic.observed_bytes = diagnostic.stderr.len() as u64 + 1;
+        let summary = diagnostic.failure_summary().unwrap();
+        assert!(
+            !summary.contains(CANARY),
+            "an unterminated fragment is unsafe"
+        );
+        assert!(summary.contains("status 7"));
+        assert!(summary.contains("earlier bytes omitted"));
+
+        diagnostic.stderr =
+            format!("Authorization: Bearer {CANARY}\nmodel capacity exhausted\n").into_bytes();
+        diagnostic.observed_bytes = diagnostic.stderr.len() as u64;
+        let summary = diagnostic.failure_summary().unwrap();
+        assert!(!summary.contains(CANARY));
+        assert!(summary.contains("redacted credential-bearing stderr line"));
+        assert!(summary.contains("model capacity exhausted"));
+        assert!(!summary.contains("earlier bytes omitted"));
+
+        // A normal-length credential can lose its label too: raw carriage
+        // returns fill the byte tail, then disappear during display filtering.
+        let ending = b"\nmodel capacity exhausted\n";
+        let mut raw = b"Authorization: Bearer ".to_vec();
+        raw.extend_from_slice(CANARY.as_bytes());
+        raw.extend(std::iter::repeat_n(
+            b'\r',
+            STDERR_LIMIT - CANARY.len() - ending.len(),
+        ));
+        raw.extend_from_slice(ending);
+        let tail = raw[raw.len() - STDERR_LIMIT..].to_vec();
+        assert!(tail.starts_with(CANARY.as_bytes()));
+        diagnostic.stderr = tail.clone();
+        diagnostic.observed_bytes = raw.len() as u64;
+        let summary = diagnostic.failure_summary().unwrap();
+        assert!(!summary.contains(CANARY));
+        assert!(summary.contains("model capacity exhausted"));
+        assert!(summary.contains("earlier bytes omitted"));
+        assert_eq!(diagnostic.stderr, tail, "raw private tail must stay intact");
+
+        diagnostic.stderr = b"\nmodel capacity exhausted\n".to_vec();
+        diagnostic.observed_bytes = diagnostic.stderr.len() as u64 + 1;
+        assert!(
+            diagnostic
+                .failure_summary()
+                .unwrap()
+                .contains("model capacity exhausted")
+        );
+    }
+    #[test]
+    fn original_provider_stderr_survives_flood_and_adoption_without_blocking_close() {
+        let name = std::thread::current().name().unwrap().to_owned();
+        if crate::repository::test_fixture::isolated_fixture_case(&name) {
+            return;
+        }
+        for flood in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let fifo = directory.path().join("finish");
+            use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+            let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let mut source = super::super::tests::recovery().source;
+            let boot = crate::daemon::read_boot_id().unwrap();
+            source.proof.as_mut().unwrap().boot_id = boot.clone();
+            source
+                .owned_codex_listener
+                .as_mut()
+                .unwrap()
+                .allocator
+                .boot_id = boot;
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                transport: TransportSpec::OwnedUnixWebSocket {
+                    socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+                },
+                program: "/usr/bin/python3".into(),
+                arguments: vec![
+                    "-c".into(),
+                    r#"import os, pathlib, sys
+if sys.argv[1] == 'flood':
+    for _ in range(256):
+        data = b'x' * 8192
+        while data:
+            data = data[os.write(2, data):]
+os.write(2, b'\nfragment-\xe2')
+os.write(2, b'\x82\xac\n')
+pathlib.Path('ready').write_bytes(b'ready')
+with open('finish', 'rb', buffering=0) as gate:
+    assert gate.read(1) == b'!'
+os.write(2, b'Authorization: Bearer fixture-secret\n')
+os.write(2, b'\x1b[31mlocal provider failed\x1b[0m\ninvalid-\xff\n')
+os._exit(7)
+"#
+                    .into(),
+                    if flood { "flood" } else { "small" }.into(),
+                ],
+                working_directory: directory.path().into(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            };
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let _lease =
+                crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+            let mut holder = spawn(spec, source).unwrap();
+            let root = holder.identity.record.root.clone();
+            let original = pin_provider_process(&root).unwrap();
+            holder
+                .confirm(
+                    uuid::Uuid::new_v4().to_string(),
+                    super::super::tests::server_identity(),
+                    root.clone(),
+                )
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !directory.path().join("ready").exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "stderr flood stalled the original provider"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let live = holder.exit_diagnostic().unwrap();
+            assert!(!live.provider_exited);
+            assert_eq!((live.code, live.signal), (None, None));
+            assert!(
+                live.failure_summary().is_none(),
+                "live transport failures are not provider exits"
+            );
+            assert!(live.stderr.ends_with("fragment-€\n".as_bytes()));
+            assert!(live.stderr.len() <= STDERR_LIMIT);
+            assert_eq!(
+                live.observed_bytes,
+                (if flood { 256 * 8192 } else { 0 }) + "\nfragment-€\n".len() as u64
+            );
+            assert_eq!(live.stderr.len() == STDERR_LIMIT, flood);
+            assert!(!live.complete);
+            assert!(!live.read_failed);
+            ensure_provider_live(&original).unwrap();
+            // A legacy capability refusal must send no frame and must not
+            // corrupt the next supported query or lifecycle acknowledgement.
+            let build = holder.identity.record.build.as_mut().unwrap();
+            let current_capabilities = build.capabilities.clone();
+            build
+                .capabilities
+                .retain(|value| value != "provider-exit-diagnostics");
+            assert!(holder.exit_diagnostic().is_err());
+            assert!(!holder.control_poisoned);
+            holder.identity.record.build.as_mut().unwrap().capabilities = current_capabilities;
+            assert!(!holder.exit_diagnostic().unwrap().provider_exited);
+            let detached = holder.preserve();
+            let (mut holder, _) =
+                adopt(&detached.record, &detached.source, &detached.proof).unwrap();
+            assert_eq!(holder.identity.record.root, root);
+            assert_eq!(holder.exit_diagnostic().unwrap().stderr, live.stderr);
+            let mut writer = loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                    .open(&fifo)
+                {
+                    Ok(writer) => break writer,
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            writer.write_all(b"!").unwrap();
+            drop(writer);
+            let final_diagnostic = loop {
+                let value = holder.exit_diagnostic().unwrap();
+                if value.provider_exited && value.complete {
+                    break value;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(
+                (final_diagnostic.code, final_diagnostic.signal),
+                (Some(7), None)
+            );
+            assert!(
+                final_diagnostic
+                    .stderr
+                    .ends_with(b"local provider failed\x1b[0m\ninvalid-\xff\n")
+            );
+            assert!(final_diagnostic.stderr.len() <= STDERR_LIMIT);
+            assert!(!final_diagnostic.read_failed);
+            let summary = final_diagnostic.failure_summary().unwrap();
+            assert!(summary.contains("status 7"));
+            assert!(summary.contains("local provider failed"));
+            assert!(summary.contains("invalid UTF-8 replaced"));
+            assert!(!summary.contains("fixture-secret"));
+            assert!(!summary.contains('\u{1b}'));
+            assert!(summary.len() < 1600);
+            assert!(
+                root.is_current(),
+                "diagnostic consumed original leader wait custody"
+            );
+            holder.close().unwrap();
+            assert!(!root.is_current(), "Close must reap the same original");
+            assert!(ensure_provider_live(&original).is_err());
+        }
+    }
+
+    #[test]
+    fn continuously_writing_provider_keeps_control_close_and_exact_reap_reachable() {
+        let name = std::thread::current().name().unwrap().to_owned();
+        if crate::repository::test_fixture::isolated_fixture_case(&name) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: "/usr/bin/python3".into(),
+            arguments: vec![
+                "-c".into(),
+                "import os
+while True:
+ os.write(2, b'x' * 8192)"
+                    .into(),
+            ],
+            working_directory: directory.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease =
+            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        let mut holder = spawn(spec, source).unwrap();
+        let root = holder.identity.record.root.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snapshot = loop {
+            let snapshot = holder.exit_diagnostic().unwrap();
+            if snapshot.observed_bytes > (STDERR_LIMIT * 2) as u64 {
+                break snapshot;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(snapshot.stderr.len(), STDERR_LIMIT);
+        assert!(snapshot.stderr.iter().all(|byte| *byte == b'x'));
+        assert!(!snapshot.provider_exited);
+        assert!(!snapshot.complete);
+        let started = Instant::now();
+        holder.close().unwrap();
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "stderr flood postponed control cleanup"
+        );
+        assert!(
+            !root.is_current(),
+            "Close must reap the exact original flood writer"
+        );
+    }
+
     #[test]
     fn legacy_adopt_json_keeps_exact_source_and_proof_without_claiming_a_new_role() {
         let source = super::super::tests::recovery().source;
@@ -1898,6 +2526,7 @@ exec /bin/sleep 60
                         /bin/sleep 60 </dev/null 3<&- & echo $! > "$1/live"
                         /bin/sh -c "echo ready > \"\$1/tool-ready\"; read -r token" fixture "$1" <&3 3<&- & echo $! > "$1/tool"
                     ' fixture "$1"
+                    printf 'native census diagnostic\n' >&2
                     echo ready > "$1/ready"
                     exec /bin/sleep 60"#
                         .into(),
@@ -1911,6 +2540,7 @@ exec /bin/sleep 60
             };
             let mut child = spawn.command().stdin(Stdio::piped()).spawn().unwrap();
             let gate = child.stdin.take().unwrap();
+            let mut stderr = StderrCapture::new(child.stderr.take()).unwrap();
             let mut server = Server(crate::daemon::owned_children::OwnedChildren::new(child));
             let provider = Process::read(server.id()).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -1967,7 +2597,7 @@ exec /bin/sleep 60
             let mut release_error = None;
             let mut observation_error = None;
             let mut gate = Some(gate);
-            let waited = wait_for_control_with_reaper(fd, &child_events, || {
+            let waited = wait_for_control_with_reaper(fd, &child_events, &mut stderr, || {
                 calls += 1;
                 if calls == 1 {
                     server.reap_exited_descendants()?;
@@ -2020,6 +2650,13 @@ exec /bin/sleep 60
                 "gated tool exit was not observed: {observation_error:?}"
             );
             assert_eq!(calls, 2, "fault must occur after the real SIGCHLD wake");
+            assert!(
+                stderr
+                    .tail
+                    .iter()
+                    .copied()
+                    .eq(b"native census diagnostic\n".iter().copied())
+            );
             let control = if let Some(listener) = listener {
                 listener.accept().unwrap().0
             } else {

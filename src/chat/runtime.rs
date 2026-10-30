@@ -174,6 +174,59 @@ pub(crate) enum Update {
 #[derive(Clone)]
 struct LocalHandle(Arc<Inner>);
 
+#[cfg(test)]
+type NativeFailureDiagnosticHook = Box<dyn FnOnce(NativeFailureDiagnosticProbe) + Send>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_NATIVE_FAILURE_DIAGNOSTIC: std::cell::RefCell<Option<NativeFailureDiagnosticHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Observes the actual local failure accessor while its one diagnostic query
+/// has not begun. This is installed on the creating thread before actor start.
+#[cfg(test)]
+pub(crate) struct NativeFailureDiagnosticProbe(LocalHandle);
+
+#[cfg(test)]
+impl NativeFailureDiagnosticProbe {
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.0.failure()
+    }
+
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        self.0.snapshot(None).unwrap()
+    }
+
+    pub(crate) fn is_completed(&self) -> bool {
+        self.0.is_completed()
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct NativeFailureDiagnosticHookGuard;
+
+#[cfg(test)]
+impl Drop for NativeFailureDiagnosticHookGuard {
+    fn drop(&mut self) {
+        BEFORE_NATIVE_FAILURE_DIAGNOSTIC.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn before_native_failure_diagnostic_for_test(
+    action: impl FnOnce(NativeFailureDiagnosticProbe) + Send + 'static,
+) -> NativeFailureDiagnosticHookGuard {
+    BEFORE_NATIVE_FAILURE_DIAGNOSTIC.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "native diagnostic hook already owned"
+        );
+        *slot.borrow_mut() = Some(Box::new(action));
+    });
+    NativeFailureDiagnosticHookGuard
+}
+
 struct OwnedSocket(std::path::PathBuf);
 impl Drop for OwnedSocket {
     fn drop(&mut self) {
@@ -465,6 +518,11 @@ impl LocalHandle {
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
         });
         let launch_context = spec.execution.clone();
+        #[cfg(test)]
+        let mut before_native_failure_diagnostic =
+            BEFORE_NATIVE_FAILURE_DIAGNOSTIC.with(|slot| slot.borrow_mut().take());
+        #[cfg(test)]
+        let diagnostic_inner = Arc::downgrade(&inner);
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
         let (started, startup) = crossbeam_channel::bounded(1);
         let worker = thread::Builder::new()
@@ -582,7 +640,24 @@ impl LocalHandle {
                             kind: crate::notifications::Kind::Interrupted,
                         }
                     });
-                    *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
+                    #[cfg(test)]
+                    if actor.native_holder.is_some()
+                        && let Some(before) = before_native_failure_diagnostic.take()
+                        && let Some(inner) = diagnostic_inner.upgrade()
+                    {
+                        before(NativeFailureDiagnosticProbe(Self(inner)));
+                    }
+                    let native_diagnostic = actor
+                        .native_holder
+                        .as_mut()
+                        .and_then(|holder| holder.exit_diagnostic().ok())
+                        .and_then(|diagnostic| diagnostic.failure_summary());
+                    let failure_message = native_diagnostic.as_ref().map_or_else(
+                        || error.clone(),
+                        // Restore's bounded cache must retain the diagnosis
+                        // even when the provider's RPC error is much longer.
+                        |diagnostic| format!("{diagnostic}\n{error}"),
+                    );
                     let stderr =
                         String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
                     let message = if stderr.is_empty() {
@@ -590,6 +665,14 @@ impl LocalHandle {
                     } else {
                         format!("{error}\nProvider stderr (last 16 KiB): {stderr}")
                     };
+                    let message = native_diagnostic.map_or_else(
+                        || message.clone(),
+                        |diagnostic| format!("{message}\n{diagnostic}"),
+                    );
+                    // Restore polls this lightweight handoff before installing
+                    // a snapshot. Publish only the complete native diagnosis;
+                    // direct-stdio failures retain their existing raw error.
+                    *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(failure_message);
                     actor.apply(Event::Error {
                         message,
                         fatal: true,
@@ -2783,6 +2866,16 @@ impl Actor {
                     self.touch();
                 }
                 for event in events {
+                    // The failure accessor also reads snapshot.error. A native
+                    // fatal RPC must not publish its raw error there before
+                    // the worker's single bounded diagnostic handoff finishes.
+                    // Store still sees the fatal event and retires its pending
+                    // history state; direct stdio keeps its existing behavior.
+                    if self.native_holder.is_some()
+                        && matches!(&event, Event::Error { fatal: true, .. })
+                    {
+                        continue;
+                    }
                     // Preserve history and independently identified children
                     // and requests. Old parent-turn scalar metadata cannot
                     // replace the current turn's state or notification input.
