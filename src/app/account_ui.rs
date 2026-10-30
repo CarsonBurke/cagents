@@ -174,6 +174,22 @@ impl State {
         self.account(id).map(|state| state.owner)
     }
 
+    #[cfg(test)]
+    pub(super) fn begin_probe_for_test(
+        &mut self,
+        id: &AccountId,
+        trigger: Trigger,
+        now: Millis,
+    ) -> (u64, ProbeTicket) {
+        let state = self.account_mut(id).expect("fixture account");
+        (state.owner, state.start_probe(trigger, now))
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_probe_for_test(&self, id: &AccountId) -> Option<ProbeTicket> {
+        self.account(id)?.pending_probe.clone()
+    }
+
     fn shown_in_switcher(&self, account: &AccountState) -> bool {
         account.present || account.account.registry_key().is_some()
     }
@@ -690,6 +706,22 @@ impl LoginConflict {
     }
 }
 
+/// One admitted probe, separate from the home/login row's owner. Its private
+/// allocation stays alive in every delayed or duplicate callback, so a later
+/// admission cannot reissue its identity. This never crosses a wire or cache.
+#[derive(Debug, Clone)]
+pub struct ProbeTicket(std::sync::Arc<()>);
+
+impl ProbeTicket {
+    fn new() -> Self {
+        Self(std::sync::Arc::new(()))
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 struct AccountState {
     /// Replacements get a new owner even when a home changes back to its old path.
     owner: u64,
@@ -702,6 +734,7 @@ struct AccountState {
     identity: Option<Identity>,
     snapshot: Option<UsageSnapshot>,
     schedule: Schedule,
+    pending_probe: Option<ProbeTicket>,
     /// Why the latest probe produced nothing, while the figures on screen
     /// are older than that attempt.
     failure: Option<String>,
@@ -721,6 +754,7 @@ impl AccountState {
         // A result from before this login cannot confirm the new login intent.
         // Abandon that scheduling slot so a fresh verification can start.
         self.owner = NEXT_ACCOUNT_OWNER.fetch_add(1, Ordering::Relaxed);
+        self.pending_probe = None;
         self.schedule.abandon();
         self.schedule.await_login(now);
         self.signing_in_from = self.identity.clone();
@@ -735,11 +769,32 @@ impl AccountState {
             identity: None,
             snapshot: None,
             schedule: Schedule::default(),
+            pending_probe: None,
             failure: None,
             queued: None,
             signing_in_from: None,
             sign_in_terminal: None,
         }
+    }
+
+    fn start_probe(&mut self, trigger: Trigger, now: Millis) -> ProbeTicket {
+        let ticket = ProbeTicket::new();
+        self.pending_probe = Some(ticket.clone());
+        self.schedule.start(trigger, now);
+        ticket
+    }
+
+    fn consume_probe(&mut self, owner: u64, ticket: &ProbeTicket) -> bool {
+        if self.owner != owner
+            || !self
+                .pending_probe
+                .as_ref()
+                .is_some_and(|pending| pending.same(ticket))
+        {
+            return false;
+        }
+        self.pending_probe = None;
+        true
     }
 
     fn name(&self) -> &'static str {
@@ -872,6 +927,7 @@ pub enum Action {
     Probed {
         owner: u64,
         id: AccountId,
+        ticket: ProbeTicket,
         outcome: Outcome,
     },
     /// Omp's usage record was read.
@@ -1965,7 +2021,7 @@ impl Cagents {
         // The cache is only as fresh as the last probe, which is exactly
         // what a reader asking again, or signing in, is trying to get past.
         let force = trigger == Trigger::Manual || state.schedule.awaiting_login(now);
-        state.schedule.start(trigger, now);
+        let ticket = state.start_probe(trigger, now);
         let account = state.account.clone();
         let id = state.id.clone();
         let owner = state.owner;
@@ -1988,7 +2044,12 @@ impl Cagents {
             } else {
                 probe::run(account, cache, force).await
             };
-            Message::AccountUi(Action::Probed { owner, id, outcome })
+            Message::AccountUi(Action::Probed {
+                owner,
+                id,
+                ticket,
+                outcome,
+            })
         });
         // The refresh control comes back the moment its debounce lifts,
         // rather than on whichever tick next reads the clock.
@@ -2327,7 +2388,12 @@ impl Cagents {
                 self.account_ui.restore(restored);
                 Task::none()
             }
-            Action::Probed { owner, id, outcome } => self.account_probed(id, owner, outcome),
+            Action::Probed {
+                owner,
+                id,
+                ticket,
+                outcome,
+            } => self.account_probed(id, owner, ticket, outcome),
             Action::OmpRead(history) => {
                 let now = now_ms();
                 self.account_ui.now_ms = now;
@@ -2838,11 +2904,17 @@ impl Cagents {
         }
     }
 
-    fn account_probed(&mut self, id: AccountId, owner: u64, mut outcome: Outcome) -> Task<Message> {
+    fn account_probed(
+        &mut self,
+        id: AccountId,
+        owner: u64,
+        ticket: ProbeTicket,
+        mut outcome: Outcome,
+    ) -> Task<Message> {
         if !self
             .account_ui
-            .account(&id)
-            .is_some_and(|state| state.owner == owner)
+            .account_mut(&id)
+            .is_some_and(|state| state.consume_probe(owner, &ticket))
         {
             return Task::none();
         }
@@ -5761,7 +5833,8 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let _ = app.open_login(&id, Provider::Codex, true, Ok("/tools/codex".into()));
         let state = app.account_ui.account_mut(&id).unwrap();
         state
@@ -5769,7 +5842,8 @@ mod app_tests {
             .await_login(now_ms() - 2 * account::schedule::LOGIN_WATCH);
         assert!(!state.schedule.awaiting_login(now_ms()));
         assert!(state.sign_in_terminal.is_some());
-        let _ = app.update(signed_in_as(&app, &id, "new@example.com"));
+        let reply = signed_in_as(&mut app, &id, "new@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
@@ -5784,7 +5858,8 @@ mod app_tests {
         assert!(!state.schedule.awaiting_login(now_ms()));
         // Even if the auth terminal remains open, its completed intent cannot
         // authorize a later replacement of this home's credentials.
-        let _ = app.update(signed_in_as(&app, &id, "unexpected@example.com"));
+        let reply = signed_in_as(&mut app, &id, "unexpected@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("new@example.com")
@@ -6315,9 +6390,11 @@ mod app_tests {
         accounts
     }
 
-    fn signed_in_as(app: &Cagents, id: &AccountId, email: &str) -> Message {
+    fn signed_in_as(app: &mut Cagents, id: &AccountId, email: &str) -> Message {
+        let (owner, ticket) = app.account_ui.begin_probe_for_test(id, Trigger::Focus, NOW);
         Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6346,7 +6423,7 @@ mod app_tests {
             .pop()
             .unwrap();
         let original = app.account_ui.account(&id).unwrap().account.clone();
-        let stale_probe = signed_in_as(&app, &id, "wrong@example.com");
+        let stale_probe = signed_in_as(&mut app, &id, "wrong@example.com");
         let old_owner = app.account_ui.account(&id).unwrap().owner;
         app.account_ui.preparing_logins.insert(old_owner);
         app.account_ui.preparing_browser_login = Some(old_owner);
@@ -6400,9 +6477,10 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let old_owner = app.account_ui.probe_owner(&id).unwrap();
-        let old_reply = signed_in_as(&app, &id, "other@example.com");
+        let old_reply = signed_in_as(&mut app, &id, "other@example.com");
         app.account_ui
             .account_mut(&id)
             .unwrap()
@@ -6424,7 +6502,8 @@ mod app_tests {
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
         );
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
@@ -6472,7 +6551,8 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["expected@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "actual@example.com"));
+        let reply = signed_in_as(&mut app, &id, "actual@example.com");
+        let _ = app.update(reply);
         let account = app.account_ui.account(&id).unwrap().account.clone();
         assert!(app.account_login_change(&account).is_some());
         let captured = app
@@ -6493,7 +6573,8 @@ mod app_tests {
             .account_ui
             .reported_login_action(app.account_ui.account(&id).unwrap())
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "latest@example.com"));
+        let reply = signed_in_as(&mut app, &id, "latest@example.com");
+        let _ = app.update(reply);
         let _ = app.update(Message::AccountUi(captured));
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
@@ -6546,7 +6627,8 @@ mod app_tests {
         let unavailable = app.account_ui.account(&id).unwrap();
         assert!(!unavailable.present);
         assert!(app.account_ui.shown_in_switcher(unavailable));
-        let _ = app.update(signed_in_as(&app, &id, "actual@example.com"));
+        let reply = signed_in_as(&mut app, &id, "actual@example.com");
+        let _ = app.update(reply);
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.account_origin(state), "Linked account");
         assert!(app.account_ui.shown_in_switcher(state));
@@ -6578,12 +6660,14 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
 
         // Something replaced the credentials in its home.
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         let recorded = |app: &Cagents| {
             app.account_ui
                 .registry
@@ -6609,7 +6693,8 @@ mod app_tests {
         );
         assert_eq!(login_changes_noticed(&app), 1, "reported, not absorbed");
         // Once per change, not on every probe.
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 1);
         assert_eq!(recorded(&app), "work@example.com");
 
@@ -6622,7 +6707,8 @@ mod app_tests {
             state.signing_in_from = state.identity.clone();
         };
         sign_in_again(&mut app);
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(recorded(&app), "work@example.com");
         assert!(
             app.account_ui
@@ -6633,14 +6719,16 @@ mod app_tests {
             "the sign-in is still watched for"
         );
         // Signed back in to the login it was added with: nothing to adopt.
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         assert_eq!(recorded(&app), "work@example.com");
         let state = app.account_ui.account(&id).unwrap();
         assert_eq!(app.account_ui.login_conflict(state), None);
         assert!(!state.schedule.awaiting_login(now_ms()));
         // A different login after sign-in still requires explicit acceptance.
         sign_in_again(&mut app);
-        let _ = app.update(signed_in_as(&app, &id, "new@example.com"));
+        let reply = signed_in_as(&mut app, &id, "new@example.com");
+        let _ = app.update(reply);
         assert_eq!(recorded(&app), "work@example.com");
         accept_reported_login(&mut app, &id);
         assert_eq!(recorded(&app), "new@example.com");
@@ -6655,10 +6743,15 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         // Its token expired: signed out, still the account it was.
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6678,23 +6771,27 @@ mod app_tests {
         state.signing_in_from = state.identity.clone();
 
         // Signed back in to the same login: the sign-in is over.
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let state = app.account_ui.account(&id).unwrap();
         assert!(!state.schedule.awaiting_login(now_ms()));
         assert_eq!(state.signing_in_from, None);
         assert_eq!(app.account_ui.login_conflict(state), None);
 
         // A login that replaces it afterwards is reported, not adopted.
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             app.account_ui.registry.find(key).unwrap().email.as_deref(),
             Some("work@example.com")
         );
         assert_eq!(login_changes_noticed(&app), 1);
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 1, "once per login");
         // Replaced again, by yet another login: that is a change of its own.
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 2);
     }
 
@@ -6719,7 +6816,8 @@ mod app_tests {
         let (key, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
         let changed = Identity {
             email: Some("personal@example.com".into()),
             ..Identity::default()
@@ -6727,7 +6825,8 @@ mod app_tests {
 
         // Another window signed it in to the login it now reports: the
         // registry it saved says so, and there is nothing to report.
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(
             login_changes_noticed(&app),
             0,
@@ -6743,13 +6842,16 @@ mod app_tests {
         // Replaced behind every window's back: the registry still records
         // the login it was last signed in to, so the change is reported -
         // once, however many probes answer while the registry is read.
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
         assert_eq!(app.account_ui.login_changes_unconfirmed.len(), 1);
         let on_disk = app.account_ui.registry.clone();
         let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Ok(on_disk))));
         assert_eq!(login_changes_noticed(&app), 1);
-        let _ = app.update(signed_in_as(&app, &id, "other@example.com"));
+        let reply = signed_in_as(&mut app, &id, "other@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 1);
     }
 
@@ -6761,8 +6863,10 @@ mod app_tests {
         let (_, id) = linked_logins(&mut app, directory.path(), &["work@example.com"])
             .pop()
             .unwrap();
-        let _ = app.update(signed_in_as(&app, &id, "work@example.com"));
-        let _ = app.update(signed_in_as(&app, &id, "personal@example.com"));
+        let reply = signed_in_as(&mut app, &id, "work@example.com");
+        let _ = app.update(reply);
+        let reply = signed_in_as(&mut app, &id, "personal@example.com");
+        let _ = app.update(reply);
         assert_eq!(login_changes_noticed(&app), 0);
         let _ = app.update(Message::AccountUi(Action::RegistryLoaded(Err(
             "unreadable".into(),
@@ -6781,7 +6885,8 @@ mod app_tests {
             &["one@example.com", "two@example.com"],
         );
         for (_, id) in &accounts {
-            let _ = app.update(signed_in_as(&app, id, "one@example.com"));
+            let reply = signed_in_as(&mut app, id, "one@example.com");
+            let _ = app.update(reply);
         }
         let state = |index: usize| app.account_ui.account(&accounts[index].1).unwrap();
         // The second home was added as another login: that is the louder
@@ -6812,7 +6917,8 @@ mod app_tests {
             &["same@example.com", "same@example.com"],
         );
         for (_, id) in &accounts {
-            let _ = app.update(signed_in_as(&app, id, "same@example.com"));
+            let reply = signed_in_as(&mut app, id, "same@example.com");
+            let _ = app.update(reply);
         }
         let (_, duplicate) = &accounts[1];
         let home = app
@@ -6865,8 +6971,12 @@ mod app_tests {
             span_secs: None,
             binding: false,
         }];
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6877,8 +6987,12 @@ mod app_tests {
         let state = app.account_ui.account(&id).unwrap();
         assert!(state.present);
         assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Failed("timed out".into()),
         }));
@@ -6890,8 +7004,12 @@ mod app_tests {
         // nothing - not the figures, and not who the account belongs to.
         let mut older = UsageSnapshot::state(UsageStatus::NeedsLogin, "signed out", NOW - 1);
         older.source = UsageSource::Cache;
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -6942,13 +7060,13 @@ mod app_tests {
                 }),
                 t1 - 1_000,
             );
-            let owner = {
+            let (owner, ticket) = {
                 let state = app.account_ui.account_mut(&id).unwrap();
                 state.identity = Some(identity.clone());
                 state.snapshot = Some(previous.clone());
                 state.schedule.succeed(previous.observed_at);
-                state.schedule.start(Trigger::Focus, t1);
-                state.owner
+                let ticket = state.start_probe(Trigger::Focus, t1);
+                (state.owner, ticket)
             };
             assert_eq!(app.automatic_account(&current).unwrap().id(), id);
             let mut delayed = previous;
@@ -6958,6 +7076,7 @@ mod app_tests {
             old_identity.plan = Some("older plan".into());
             let held = Message::AccountUi(Action::Probed {
                 owner,
+                ticket,
                 id: id.clone(),
                 outcome: Outcome::Answered {
                     catalog: None,
@@ -7022,7 +7141,7 @@ mod app_tests {
                 let state = app.account_ui.account_mut(&id).unwrap();
                 state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "", live_at - 1));
                 state.schedule.succeed(live_at - 1);
-                state.schedule.start(Trigger::Focus, now);
+                state.start_probe(Trigger::Focus, now);
             }
             let rejection = LiveReport::Claude(
                 account::claude::parse_rate_limit_event(&serde_json::json!({"status": "rejected"}))
@@ -7033,6 +7152,7 @@ mod app_tests {
             assert_eq!(state.snapshot.as_ref().unwrap().source, UsageSource::Live);
             assert_eq!(state.snapshot.as_ref().unwrap().observed_at, live_at);
             let owner = state.owner;
+            let ticket = state.pending_probe.clone().unwrap();
             let key = state.account.registry_key().unwrap();
             let mut identity = app.account_ui.registry.find(key).unwrap().identity();
             identity.plan = Some("fresh probe plan".into());
@@ -7049,6 +7169,7 @@ mod app_tests {
 
             drop(app.update(Message::AccountUi(Action::Probed {
                 owner,
+                ticket,
                 id: id.clone(),
                 outcome: Outcome::Answered {
                     catalog: None,
@@ -7157,13 +7278,13 @@ mod app_tests {
             Provider::Codex => account::codex::parse_rate_limits(&quota, quota_at - 1_000),
             _ => unreachable!(),
         };
-        let owner = {
+        let (owner, ticket) = {
             let state = app.account_ui.account_mut(&id).unwrap();
             state.identity = Some(identity.clone());
             state.snapshot = Some(previous.clone());
             state.schedule.succeed(previous.observed_at);
-            state.schedule.start(Trigger::Focus, quota_at);
-            state.owner
+            let ticket = state.start_probe(Trigger::Focus, quota_at);
+            (state.owner, ticket)
         };
         assert_eq!(
             app.automatic_account(&current).unwrap().id(),
@@ -7352,6 +7473,7 @@ mod app_tests {
         // it. Returned UI/provider/cache Tasks remain unpolled.
         drop(app.update(Message::AccountUi(Action::Probed {
             owner,
+            ticket,
             id: id.clone(),
             outcome,
         })));
@@ -7440,6 +7562,406 @@ mod app_tests {
         }
     }
 
+    async fn collected_ticket_answer(
+        app: &Cagents,
+        id: &AccountId,
+        quota_at: Millis,
+        catalog_at: Millis,
+    ) -> Outcome {
+        use probe::collector_fixture::{Frames, held_outcome};
+        use std::{cell::RefCell, collections::VecDeque};
+        use tokio::sync::oneshot;
+
+        let account = app.account_ui.account(id).unwrap().account.clone();
+        let email = app
+            .account_ui
+            .registry
+            .find(account.registry_key().unwrap())
+            .unwrap()
+            .identity()
+            .email
+            .unwrap();
+        let (frames, observations) = match account.provider {
+            Provider::Claude => (
+                Frames::Claude {
+                    initialize: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage-initialize",
+                    "response":{"models":[{"value":"opus"}]}}}),
+                    quota: serde_json::json!({"type":"control_response","response":{
+                    "subtype":"success","request_id":"cagents-usage","response":{
+                        "rate_limits":{"limits":[{"kind":"session","percent":20.0}]}}}}),
+                    auth: serde_json::json!({"loggedIn":true,"email":email.clone()}),
+                },
+                vec![catalog_at, quota_at, quota_at + 1],
+            ),
+            Provider::Codex => (
+                Frames::Codex {
+                    quota: serde_json::json!({"id":3,"result":{"ordinaryUsageAllowed":true,
+                    "rateLimits":{"limitId":"codex","primary":{
+                        "usedPercent":20.0,"windowDurationMins":300}}}}),
+                    account: serde_json::json!({"id":2,"result":{"account":{
+                    "type":"chatgpt","email":email.clone()},"requiresOpenaiAuth":true}}),
+                    models: Some(serde_json::json!({"id":4,"result":{
+                    "data":[{"model":"gpt-5"}]}})),
+                },
+                vec![quota_at, quota_at + 1, catalog_at],
+            ),
+            _ => unreachable!("the two scheduled CLI collectors"),
+        };
+        let clock = RefCell::new(VecDeque::from(observations));
+        let (seen, mut observed) = oneshot::channel();
+        let (ready, wait) = oneshot::channel();
+        let (closed, close) = oneshot::channel();
+        ready.send(()).unwrap();
+        closed.send(()).unwrap();
+        let outcome = held_outcome(
+            account,
+            frames,
+            || {
+                clock
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("only matched observations read this clock")
+            },
+            seen,
+            wait,
+            close,
+        )
+        .await
+        .unwrap();
+        assert!(observed.try_recv().is_ok());
+        assert!(clock.borrow().is_empty());
+        let Outcome::Answered {
+            identity,
+            snapshot,
+            catalog,
+        } = &outcome
+        else {
+            panic!("the real collector and finisher must build the answer");
+        };
+        assert_eq!(
+            identity.as_ref().unwrap().email.as_deref(),
+            Some(email.as_str())
+        );
+        assert_eq!(snapshot.source, UsageSource::Probe);
+        assert_eq!(snapshot.status, UsageStatus::Ok);
+        assert_eq!(snapshot.observed_at, quota_at);
+        assert!(!snapshot.windows.is_empty());
+        assert_eq!(catalog.as_ref().unwrap().observed_at, catalog_at);
+        outcome
+    }
+
+    async fn seed_ticket_account(app: &mut Cagents, id: &AccountId, now: Millis) {
+        let Outcome::Answered {
+            identity,
+            snapshot,
+            catalog,
+        } = collected_ticket_answer(app, id, now, now - 1).await
+        else {
+            unreachable!()
+        };
+        let state = app.account_ui.account_mut(id).unwrap();
+        state.present = true;
+        state.identity = identity;
+        state.schedule.succeed(snapshot.observed_at);
+        state.snapshot = Some(snapshot);
+        let provider = state.account.provider;
+        app.account_ui.take_catalog(provider, catalog.unwrap());
+    }
+
+    fn admit_actual_ticket(app: &mut Cagents, id: &AccountId, now: Millis) -> (u64, ProbeTicket) {
+        // This runs the actual gates and scheduling admission, but never polls
+        // a provider, remote request, cache or process task.
+        drop(
+            app.probe_account(id, Trigger::Manual, now)
+                .expect("actual probe admission"),
+        );
+        (
+            app.account_ui.probe_owner(id).unwrap(),
+            app.account_ui.pending_probe_for_test(id).unwrap(),
+        )
+    }
+
+    type ProbeRowEffects = (
+        AccountId,
+        u64,
+        Account,
+        bool,
+        Option<Identity>,
+        Option<UsageSnapshot>,
+        Schedule,
+        Option<String>,
+        Option<Trigger>,
+        (Option<Identity>, Option<TerminalId>),
+    );
+    type ProbeReplyEffects = (
+        Millis,
+        Registry,
+        BTreeMap<Provider, Catalog>,
+        Option<AccountId>,
+        Vec<ProbeRowEffects>,
+        (
+            BTreeMap<AccountId, Identity>,
+            BTreeSet<AccountId>,
+            BTreeSet<AccountId>,
+            BTreeSet<Provider>,
+            bool,
+        ),
+    );
+
+    fn probe_reply_effects(app: &Cagents) -> ProbeReplyEffects {
+        let ui = &app.account_ui;
+        (
+            ui.now_ms,
+            ui.registry.clone(),
+            ui.catalogs.clone(),
+            ui.popover.clone(),
+            ui.accounts
+                .iter()
+                .map(|state| {
+                    (
+                        state.id.clone(),
+                        state.owner,
+                        state.account.clone(),
+                        state.present,
+                        state.identity.clone(),
+                        state.snapshot.clone(),
+                        state.schedule.clone(),
+                        state.failure.clone(),
+                        state.queued,
+                        (state.signing_in_from.clone(), state.sign_in_terminal),
+                    )
+                })
+                .collect(),
+            (
+                ui.login_changes_reported.clone(),
+                ui.login_changes_unconfirmed.clone(),
+                ui.live_unsaved.clone(),
+                ui.catalogs_unsaved.clone(),
+                ui.saving_live,
+            ),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_probe_replies_cannot_consume_a_successor_slot() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            for completion in ["answered", "failed", "busy"] {
+                let mut app = context_inspector_test_app(false);
+                app.refresh_ui.focused = true;
+                assert!(app.account_ui.cache.is_none() && app.account_ui.store.is_none());
+                let id = app.account_ui.add_managed_fixture(provider, 1938001);
+                let queued = app.account_ui.add_managed_fixture(provider, 1938002);
+                let recipe = recipe_on(&app, &id);
+                let now = now_ms();
+                let first = now - schedule::IN_FLIGHT_LIMIT - 1;
+                seed_ticket_account(&mut app, &id, first - 1_000).await;
+                let current = Account::system(provider);
+                app.account_ui.account_mut(&current.id()).unwrap().snapshot =
+                    Some(UsageSnapshot::state(UsageStatus::Limited, "", now));
+                let (owner, a) = admit_actual_ticket(&mut app, &id, first);
+                // Rejected in-flight/busy admissions cannot replace a ticket.
+                assert!(app.probe_account(&id, Trigger::Manual, first + 1).is_none());
+                assert!(app.account_ui.pending_probe_for_test(&id).unwrap().same(&a));
+                assert!(
+                    app.probe_account(&queued, Trigger::Manual, first + 1)
+                        .is_none()
+                );
+                assert!(app.account_ui.pending_probe_for_test(&queued).is_none());
+                let outcome = match completion {
+                    "answered" => collected_ticket_answer(&app, &id, first + 1, now + 10).await,
+                    "failed" => Outcome::Failed("original A failed".into()),
+                    "busy" => Outcome::Busy,
+                    _ => unreachable!(),
+                };
+                let old = Action::Probed {
+                    owner,
+                    id: id.clone(),
+                    ticket: a,
+                    outcome,
+                };
+                let rejection = match provider {
+                    Provider::Claude => LiveReport::Claude(
+                        account::claude::parse_rate_limit_event(
+                            &serde_json::json!({"status":"rejected","unifiedWindows":{
+                            "five_hour":{"utilization":1.0}}}),
+                        )
+                        .unwrap(),
+                    ),
+                    Provider::Codex => LiveReport::CodexLimits(
+                        account::codex::parse_update(
+                            &serde_json::json!({"rateLimits":{"limitId":"codex",
+                            "rateLimitReachedType":"fixture-exhausted","primary":{
+                                "usedPercent":100.0,"windowDurationMins":300}}}),
+                        )
+                        .unwrap(),
+                    ),
+                    _ => unreachable!(),
+                };
+                drop(app.account_reported(provider, &recipe, vec![(rejection, now - 1)]));
+                assert!(app.automatic_account(&current).is_none());
+                let (same_owner, b) = admit_actual_ticket(&mut app, &id, now);
+                assert_eq!(same_owner, owner);
+                let state = app.account_ui.account_mut(&id).unwrap();
+                // A stale completion must not even refresh this login watch.
+                state.schedule.await_login(now);
+                state.signing_in_from = state.identity.clone();
+                state.sign_in_terminal = Some(TerminalId::new());
+                state.failure = Some("previous failure retained while B runs".into());
+                app.account_ui.account_mut(&queued).unwrap().queued = Some(Trigger::Focus);
+                let before = probe_reply_effects(&app);
+                drop(app.update(Message::AccountUi(old.clone())));
+                assert_eq!(
+                    probe_reply_effects(&app),
+                    before,
+                    "{provider:?} {completion}"
+                );
+                assert!(app.account_ui.pending_probe_for_test(&id).unwrap().same(&b));
+                assert!(app.account_ui.pending_probe_for_test(&queued).is_none());
+                assert!(app.automatic_account(&current).is_none());
+
+                let outcome = collected_ticket_answer(&app, &id, now, now + 20).await;
+                let expected = outcome.clone();
+                let current_reply = Action::Probed {
+                    owner,
+                    id: id.clone(),
+                    ticket: b,
+                    outcome,
+                };
+                drop(app.update(Message::AccountUi(current_reply.clone())));
+                let Outcome::Answered {
+                    identity,
+                    snapshot,
+                    catalog,
+                } = expected
+                else {
+                    unreachable!()
+                };
+                let state = app.account_ui.account(&id).unwrap();
+                assert_eq!(state.snapshot.as_ref(), Some(&snapshot));
+                assert_eq!(state.identity, identity);
+                assert!(state.failure.is_none());
+                assert!(!state.schedule.in_flight(now));
+                assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+                assert_eq!(app.account_ui.catalog(provider), catalog.as_ref());
+                assert_eq!(app.automatic_account(&current).unwrap().id(), id);
+                let queued_ticket = app.account_ui.pending_probe_for_test(&queued).unwrap();
+                let settled = probe_reply_effects(&app);
+                for duplicate in [old, current_reply] {
+                    drop(app.update(Message::AccountUi(duplicate)));
+                    assert_eq!(probe_reply_effects(&app), settled);
+                    assert!(
+                        app.account_ui
+                            .pending_probe_for_test(&queued)
+                            .unwrap()
+                            .same(&queued_ticket)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_completion_tickets_are_single_use_across_successor_and_owner_changes() {
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let id = app.account_ui.add_managed_fixture(Provider::Codex, 1938003);
+        let other = app
+            .account_ui
+            .add_managed_fixture(Provider::Claude, 1938004);
+        let now = now_ms();
+        let first = now - schedule::IN_FLIGHT_LIMIT - 1;
+        seed_ticket_account(&mut app, &id, first - 1_000).await;
+        seed_ticket_account(&mut app, &other, first - 1_000).await;
+        let (owner, a) = admit_actual_ticket(&mut app, &id, first);
+        let old = Action::Probed {
+            owner,
+            id: id.clone(),
+            ticket: a,
+            outcome: collected_ticket_answer(&app, &id, first + 1, first + 2).await,
+        };
+        drop(app.update(Message::AccountUi(old.clone())));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        let settled = probe_reply_effects(&app);
+        drop(app.update(Message::AccountUi(old.clone())));
+        assert_eq!(probe_reply_effects(&app), settled);
+
+        let (same_owner, b) = admit_actual_ticket(&mut app, &id, now);
+        assert_eq!(same_owner, owner);
+        let outcome = collected_ticket_answer(&app, &id, now, now + 1).await;
+        let (other_owner, c) = admit_actual_ticket(&mut app, &other, now);
+        let current = probe_reply_effects(&app);
+        for rejected in [
+            old,
+            Action::Probed {
+                owner: other_owner,
+                id: other.clone(),
+                ticket: b.clone(),
+                outcome: outcome.clone(),
+            },
+            Action::Probed {
+                owner: other_owner,
+                id: id.clone(),
+                ticket: b.clone(),
+                outcome: outcome.clone(),
+            },
+        ] {
+            drop(app.update(Message::AccountUi(rejected)));
+            assert_eq!(probe_reply_effects(&app), current);
+            assert!(app.account_ui.pending_probe_for_test(&id).unwrap().same(&b));
+            assert!(
+                app.account_ui
+                    .pending_probe_for_test(&other)
+                    .unwrap()
+                    .same(&c)
+            );
+        }
+        // Use the actual login lifecycle invalidation. A fresh admission on
+        // the same home has a new owner and a new request identity.
+        app.account_ui.account_mut(&id).unwrap().begin_sign_in(now);
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        let (new_owner, d) = admit_actual_ticket(&mut app, &id, now);
+        assert_ne!(new_owner, owner);
+        let current = probe_reply_effects(&app);
+        for (reply_owner, ticket) in [(owner, b.clone()), (new_owner, b), (owner, d.clone())] {
+            drop(app.update(Message::AccountUi(Action::Probed {
+                owner: reply_owner,
+                id: id.clone(),
+                ticket,
+                outcome: outcome.clone(),
+            })));
+            assert_eq!(probe_reply_effects(&app), current);
+            assert!(app.account_ui.pending_probe_for_test(&id).unwrap().same(&d));
+        }
+        let accepted = Action::Probed {
+            owner: new_owner,
+            id: id.clone(),
+            ticket: d,
+            outcome,
+        };
+        drop(app.update(Message::AccountUi(accepted.clone())));
+        assert!(app.account_ui.pending_probe_for_test(&id).is_none());
+        assert_eq!(
+            app.account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .observed_at,
+            now
+        );
+        let settled = probe_reply_effects(&app);
+        drop(app.update(Message::AccountUi(accepted)));
+        assert_eq!(probe_reply_effects(&app), settled);
+        assert!(
+            app.account_ui
+                .pending_probe_for_test(&other)
+                .unwrap()
+                .same(&c)
+        );
+    }
+
     fn claude_report(used: f64) -> LiveReport {
         LiveReport::Claude(
             account::claude::parse_rate_limit_event(&serde_json::json!({
@@ -7506,8 +8028,12 @@ mod app_tests {
         // the probe cached it.
         let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "ok", now - 5_000);
         snapshot.source = UsageSource::Probe;
+        let (owner, ticket) =
+            app.account_ui
+                .begin_probe_for_test(&managed, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&managed).unwrap().owner,
+            owner,
+            ticket,
             id: managed.clone(),
             outcome: Outcome::Answered {
                 identity: None,
@@ -7602,8 +8128,12 @@ mod app_tests {
             UsageSnapshot::state(UsageStatus::Ok, "", now - 2 * schedule::REFRESH_INTERVAL);
         probed.detail = None;
         probed.plan = Some("max".into());
+        let (owner, ticket) =
+            app.account_ui
+                .begin_probe_for_test(&managed, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&managed).unwrap().owner,
+            owner,
+            ticket,
             id: managed.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -7725,8 +8255,12 @@ mod app_tests {
 
         let mut probed = cached(0.8).snapshot;
         probed.observed_at = now + 1;
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&codex, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&codex).unwrap().owner,
+            owner,
+            ticket,
             id: codex.clone(),
             outcome: Outcome::Answered {
                 catalog: None,
@@ -7787,8 +8321,12 @@ mod app_tests {
         app.refresh_ui.focused = true;
         let id = Account::system(Provider::Codex).id();
         let now = now_ms();
+        let (owner, ticket) = app
+            .account_ui
+            .begin_probe_for_test(&id, Trigger::Focus, now_ms());
         let _ = app.update(Message::AccountUi(Action::Probed {
-            owner: app.account_ui.account(&id).unwrap().owner,
+            owner,
+            ticket,
             id: id.clone(),
             outcome: Outcome::Answered {
                 catalog: None,

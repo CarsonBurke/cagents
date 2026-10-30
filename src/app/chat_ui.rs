@@ -15225,8 +15225,14 @@ mod tests {
             ),
             (alternate.clone(), account::UsageStatus::Ok),
         ] {
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(
+                &id,
+                crate::account::schedule::Trigger::Focus,
+                now,
+            );
             let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
-                owner: app.account_ui.probe_owner(&id).unwrap(),
+                owner,
+                ticket,
                 id,
                 outcome: account::probe::Outcome::Answered {
                     identity: None,
@@ -20508,8 +20514,14 @@ mod tests {
         };
         let now = crate::chat::now_ms().unwrap();
         // Live figures refine a reading the account already has.
+        let (owner, ticket) = app.account_ui.begin_probe_for_test(
+            &account,
+            crate::account::schedule::Trigger::Focus,
+            now,
+        );
         let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
-            owner: app.account_ui.probe_owner(&account).unwrap(),
+            owner,
+            ticket,
             id: account.clone(),
             outcome: crate::account::probe::Outcome::Answered {
                 catalog: None,
@@ -25398,8 +25410,14 @@ mod tests {
                 false,
             ),
         ] {
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(
+                &id,
+                crate::account::schedule::Trigger::Focus,
+                now,
+            );
             drop(app.update(Message::AccountUi(account_ui::Action::Probed {
-                owner: app.account_ui.probe_owner(&id).unwrap(),
+                owner,
+                ticket,
                 id: id.clone(),
                 outcome: account::probe::Outcome::Answered {
                     identity: Some(account::Identity {

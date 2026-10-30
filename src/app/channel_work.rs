@@ -3434,6 +3434,7 @@ mod tests {
             // Start a real adapter probe but never poll its returned task.
             drop(app.update(Message::AccountUi(AccountAction::Refresh(id.clone()))));
             let probe_owner = app.account_ui.probe_owner(&id).unwrap();
+            let probe_ticket = app.account_ui.pending_probe_for_test(&id).unwrap();
             drop(app.open_channel_work(home.channel));
             if modal {
                 drop(app.update(Message::DaemonHealth(
@@ -3474,6 +3475,7 @@ mod tests {
             // Accepted completion remains AccountUi, not pane-origin input.
             drop(app.update(Message::AccountUi(AccountAction::Probed {
                 owner: probe_owner,
+                ticket: probe_ticket,
                 id: id.clone(),
                 outcome: crate::account::probe::Outcome::Answered {
                     identity: None,
