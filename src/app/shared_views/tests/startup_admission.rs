@@ -1432,7 +1432,9 @@ fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cance
         assert_eq!(writer.last_error(), None);
         drop(writer);
         // Read the real saved database again without a second snapshot/save.
-        let reopened = StateStore::open(&database, crate::model::BootId::new("boot")).unwrap();
+        let reopened =
+            crate::persistence::StateStore::open(&database, crate::model::BootId::new("boot"))
+                .unwrap();
         let saved = reopened
             .load_workspace(app.durable.id, None)
             .unwrap()
