@@ -64,7 +64,9 @@ pub(super) fn close_retained(
     if terminal_handoff::is_cleanup_descriptor(source) {
         return terminal_handoff::close_retained(host, client, source);
     }
-    close_retained_native(host, source).map_err(unavailable)?;
+    close_retained_native(host, source).map_err(|message| {
+        ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+    })?;
     Ok(ServerResponse::Accepted)
 }
 

@@ -289,13 +289,14 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
     let mut wrong_epoch = cleanup.clone();
     wrong_epoch.proof.as_mut().unwrap().host_incarnation =
         crate::model::HostIncarnation::new("different-host-incarnation");
-    for changed in [
+    let malformed = [
         wrong_source,
         wrong_terminal,
         wrong_terminal_recipe,
         missing_proof,
         wrong_epoch,
-    ] {
+    ];
+    for changed in &malformed {
         assert!(
             process(
                 &host,
@@ -306,7 +307,7 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
             )
             .is_err()
         );
-        assert!(retained_close(1, changed).is_err());
+        assert!(retained_close(1, changed.clone()).is_err());
         assert!(
             !host.lock().unwrap().chat_handoffs[&chat_id]
                 .subscribers
@@ -357,17 +358,27 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
     // Missing private evidence must never fall through to an ordinary resident
     // A or history cleanup. Preserve the real issued receipt across negatives.
     let receipt = host.lock().unwrap().chat_handoffs.remove(&chat_id).unwrap();
-    assert!(
-        process(
-            &host,
-            6,
-            ClientRequest::ChatAttach {
-                session: cleanup.clone()
-            }
-        )
-        .is_err()
+    let missing_attach = process(
+        &host,
+        6,
+        ClientRequest::ChatAttach {
+            session: cleanup.clone(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        missing_attach.message,
+        "The issued terminal handoff is no longer available"
     );
-    assert!(retained_close(6, cleanup.clone()).is_err());
+    let missing = retained_close(6, cleanup.clone()).unwrap_err();
+    assert_eq!(
+        missing.message,
+        "The exact issued handoff is unavailable; native cleanup was not attempted"
+    );
+    {
+        let state = host.lock().unwrap();
+        assert!(state.native_closing.is_empty() && state.native_actor_startups.is_empty());
+    }
     host.lock().unwrap().chats.insert(
         chat_id,
         Record {
@@ -383,21 +394,22 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
             returning_terminal: false,
         },
     );
-    assert!(retained_close(6, cleanup.clone()).is_err());
-    assert!(
-        process(
-            &host,
-            6,
-            ClientRequest::ChatAttach {
-                session: cleanup.clone()
-            }
-        )
-        .is_err()
-    );
+    let resident = retained_close(6, cleanup.clone()).unwrap_err();
+    assert_eq!(resident.message, missing.message);
+    let resident_attach = process(
+        &host,
+        6,
+        ClientRequest::ChatAttach {
+            session: cleanup.clone(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(resident_attach.message, missing_attach.message);
     {
         let mut state = host.lock().unwrap();
         assert!(state.chats.remove(&chat_id).is_some());
         assert!(state.terminals.contains_key(&terminal.id));
+        assert!(state.native_closing.is_empty() && state.native_actor_startups.is_empty());
         assert!(state.chat_handoffs.insert(chat_id, receipt).is_none());
     }
     // ACK may arrive from another window's ordinary hydration/save before
@@ -432,6 +444,22 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
             .unwrap()
     );
     host.lock().unwrap().retire_terminal(terminal.id);
+    // The genuine terminal owner is gone now. None of these refusals can be
+    // masked by the later live-T guard, and none may settle the valid receipt.
+    let generation = host.lock().unwrap().chat_handoffs[&chat_id].generation;
+    for changed in &malformed {
+        assert!(retained_close(1, changed.clone()).is_err());
+        let state = host.lock().unwrap();
+        let receipt = &state.chat_handoffs[&chat_id];
+        assert_eq!(receipt.generation, generation);
+        assert!(!receipt.terminal_retired);
+    }
+    let unattached = retained_close(7, cleanup.clone()).unwrap_err();
+    assert_eq!(unattached.code, ProtocolErrorCode::PermissionDenied);
+    assert_eq!(
+        host.lock().unwrap().chat_handoffs[&chat_id].generation,
+        generation
+    );
     for _ in 0..2 {
         assert!(matches!(retained_close(6, cleanup.clone()).unwrap().0,
             ServerResponse::ChatClosed { chat_id: closed, snapshot }
@@ -456,4 +484,20 @@ fn returned_terminal_ack_keeps_real_retirement_proof_and_close_retry() {
     let receipt = &state.chat_handoffs[&chat_id];
     assert!(receipt.terminal_retired && !receipt.pending());
     assert!(state.chats.is_empty() && state.terminals.is_empty());
+    drop(state);
+    // Ordinary retained cleanup keeps its pre-existing error classification,
+    // for both omitted pairing and a same-ID terminal descriptor. These fresh
+    // private IDs have no holder and must never acquire cleanup authority.
+    let mut legacy = cleanup;
+    legacy.id = TerminalId::new();
+    let mut same_id = terminal;
+    same_id.id = legacy.id;
+    for pairing in [None, Some(same_id)] {
+        legacy.terminal = pairing;
+        let failure = retained_close(6, legacy.clone()).unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(failure.retryable);
+        let state = host.lock().unwrap();
+        assert!(state.native_closing.is_empty() && state.native_actor_startups.is_empty());
+    }
 }
