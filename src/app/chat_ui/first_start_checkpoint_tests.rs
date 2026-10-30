@@ -1512,7 +1512,7 @@ fn draft_source_is_fixed_while_its_first_save_is_in_flight() {
 /// independent UI producers: a real, successful completion can remain queued
 /// while the UI reduces EOF's Disconnected wake first. Both parents drain the
 /// real wake FIFO; no command completion or wake is fabricated.
-fn accepted_first_prompt_transport_disconnect_case(completion_first: bool) {
+fn accepted_first_prompt_transport_disconnect_case(completion_first: bool, publish_user: bool) {
     let budget = Duration::from_secs(20);
     let deadline = std::time::Instant::now() + budget;
     let (finished, result) = std::sync::mpsc::channel();
@@ -1520,7 +1520,11 @@ fn accepted_first_prompt_transport_disconnect_case(completion_first: bool) {
     // worker owns only temporary SQLite state and the private socket peer.
     std::thread::spawn(move || {
         let outcome = std::panic::catch_unwind(|| {
-            accepted_first_prompt_transport_disconnect_before(completion_first, deadline);
+            accepted_first_prompt_transport_disconnect_before(
+                completion_first,
+                publish_user,
+                deadline,
+            );
         });
         let _ = finished.send(outcome);
     });
@@ -1533,6 +1537,7 @@ fn accepted_first_prompt_transport_disconnect_case(completion_first: bool) {
 
 fn accepted_first_prompt_transport_disconnect_before(
     completion_first: bool,
+    publish_user: bool,
     deadline: std::time::Instant,
 ) {
     use crate::terminal_ipc::{
@@ -1760,39 +1765,41 @@ fn accepted_first_prompt_transport_disconnect_before(
                 other => panic!("expected the reader's real ChatRead, got {other:?}"),
             }
         };
-        let accepted = Snapshot {
-            generation: 2,
-            busy: true,
-            items: vec![Arc::new(chat::Item {
-                id: "accepted-disconnect-user-item".into(),
-                role: chat::Role::User,
-                content: chat::ItemContent::Text {
-                    text: peer_text,
-                    thinking: false,
-                    phase: Default::default(),
+        if publish_user {
+            let accepted = Snapshot {
+                generation: 2,
+                busy: true,
+                items: vec![Arc::new(chat::Item {
+                    id: "accepted-disconnect-user-item".into(),
+                    role: chat::Role::User,
+                    content: chat::ItemContent::Text {
+                        text: peer_text,
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    started_at: None,
+                    at: None,
+                })],
+                ..initial
+            };
+            reply(
+                &mut codec,
+                &mut server,
+                Some(read),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id: actor,
+                        snapshot: Some(accepted),
+                    },
                 },
-                started_at: None,
-                at: None,
-            })],
-            ..initial
-        };
-        reply(
-            &mut codec,
-            &mut server,
-            Some(read),
-            ServerMessage::Response {
-                response: ServerResponse::ChatSnapshot {
-                    chat_id: actor,
-                    snapshot: Some(accepted),
-                },
-            },
-        );
+            );
+        }
         disconnect_now
             .recv_timeout(remaining(deadline).min(Duration::from_secs(5)))
             .unwrap();
-        // Prompt Accepted and ChatSnapshot were already written in socket
-        // order. EOF now runs the actual client's Disconnected producer; the
-        // UI driver still holds the real successful command completion.
+        // Prompt Accepted was written before EOF. The User publication is
+        // optional: the receipt alone must protect an accepted execution while
+        // the UI driver holds the real successful command completion.
     });
     // Use the same State sender/receiver as the real wake subscription.
     let wake_sender = app.chat_ui.sender.clone();
@@ -1863,25 +1870,27 @@ fn accepted_first_prompt_transport_disconnect_before(
             panic!("command Task exceeded {MAX_TASK_MESSAGES} messages without CommandFinished");
         })
     });
-    // set_interest/show can enqueue Changed before the reader publishes the
-    // accepted snapshot. Reduce the actual FIFO until the acceptance latch,
-    // rather than assuming the first wake came from ChatSnapshot.
-    loop {
-        let (wake_target, wake) = receive_wake();
-        assert_eq!(wake_target, target);
-        assert!(
-            matches!(&wake, Wake::Changed),
-            "unexpected pre-acceptance wake: {wake:?}"
-        );
-        drop(app.handle_chat_ui(Action::Wake(wake_target, wake)));
-        if handle.has_observed_user_item() {
-            break;
+    if publish_user {
+        // set_interest/show can enqueue Changed before the reader publishes the
+        // accepted snapshot. Reduce the actual FIFO until the acceptance latch,
+        // rather than assuming the first wake came from ChatSnapshot.
+        loop {
+            let (wake_target, wake) = receive_wake();
+            assert_eq!(wake_target, target);
+            assert!(
+                matches!(&wake, Wake::Changed),
+                "unexpected pre-acceptance wake: {wake:?}"
+            );
+            drop(app.handle_chat_ui(Action::Wake(wake_target, wake)));
+            if handle.has_observed_user_item() {
+                break;
+            }
         }
+        assert!(
+            handle.has_observed_user_item(),
+            "production reader latched accepted User item"
+        );
     }
-    assert!(
-        handle.has_observed_user_item(),
-        "production reader latched accepted User item"
-    );
     // Collect and hold the actual successful callback before allowing EOF.
     // Delaying UI delivery does not delay a host reply or invent a frame order.
     let completed = completion.join().unwrap();
@@ -1889,6 +1898,23 @@ fn accepted_first_prompt_transport_disconnect_before(
         matches!(&completed, Message::ChatUi(Action::CommandFinished(t, id, Ok(())))
         if *t == target && *id == command_id)
     );
+    assert!(
+        handle.has_accepted_user_input(),
+        "authenticated acceptance is latched before UI completion delivery"
+    );
+    if !publish_user {
+        assert!(
+            !handle.has_observed_user_item(),
+            "no User frame was sent by this peer"
+        );
+        assert!(
+            handle
+                .snapshot()
+                .items
+                .iter()
+                .all(|item| item.role != chat::Role::User)
+        );
+    }
     disconnect.send(()).unwrap();
     let disconnected = loop {
         let (wake_target, wake) = receive_wake();
@@ -1908,9 +1934,9 @@ fn accepted_first_prompt_transport_disconnect_before(
     assert!(runtime(&app, card).queued.is_some());
     assert_eq!(runtime(&app, card).pending.as_ref().unwrap().id, command_id);
 
-    // Only application delivery order changes. Prompt Accepted precedes the
-    // accepted publication on the wire; all real Changed wakes are reduced
-    // before EOF's wake, while CommandFinished(Ok) is held by the driver.
+    // Only application delivery order changes. Prompt Accepted precedes EOF;
+    // all real Changed wakes are reduced before EOF's wake, while the driver
+    // holds CommandFinished(Ok). A User publication need not have arrived.
     let retained_before_late_completion = if completion_first {
         drop(app.update(completed));
         drop(app.handle_chat_ui(Action::Wake(target, disconnected)));
@@ -1975,12 +2001,22 @@ fn accepted_first_prompt_transport_disconnect_before(
 
 #[test]
 fn accepted_first_prompt_transport_completion_before_disconnect_is_a_control() {
-    accepted_first_prompt_transport_disconnect_case(true);
+    accepted_first_prompt_transport_disconnect_case(true, true);
 }
 
 #[test]
 fn accepted_first_prompt_transport_disconnect_before_completion_keeps_execution() {
-    accepted_first_prompt_transport_disconnect_case(false);
+    accepted_first_prompt_transport_disconnect_case(false, true);
+}
+
+#[test]
+fn accepted_reply_without_user_publication_before_disconnect_keeps_execution() {
+    accepted_first_prompt_transport_disconnect_case(false, false);
+}
+
+#[test]
+fn accepted_reply_without_user_publication_completion_first_is_a_control() {
+    accepted_first_prompt_transport_disconnect_case(true, false);
 }
 
 #[path = "first_start_checkpoint_tests/passive_peer_tests.rs"]

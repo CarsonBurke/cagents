@@ -8201,7 +8201,7 @@ impl Cagents {
                 // it can only be this one.
                 let arrived = runtime
                     .handle()
-                    .is_some_and(|handle| handle.has_observed_user_item());
+                    .is_some_and(|handle| handle.has_accepted_user_input());
                 if !arrived {
                     return self.revert_chat_draft(target, Some(error));
                 }
@@ -9757,7 +9757,7 @@ impl Cagents {
                         // The reader can accept the first message before its
                         // command callback reaches the UI. Preserve that
                         // execution across EOF, as the command-error path does.
-                        if runtime.queued.is_some() && !handle.has_observed_user_item() {
+                        if runtime.queued.is_some() && !handle.has_accepted_user_input() {
                             return self.revert_chat_draft(target, Some(error));
                         }
                         runtime.disconnected = true;
