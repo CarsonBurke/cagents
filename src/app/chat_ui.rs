@@ -3275,6 +3275,13 @@ impl Runtime {
     fn is_draft(&self) -> bool {
         matches!(self.connection, Connection::Draft)
     }
+    /// A choosing draft has no provider handle; its metadata snapshot owns
+    /// option-validation errors. Local start/attachment failures stay separate.
+    fn set_draft_choice_error(&mut self, error: Option<String>) {
+        Arc::make_mut(&mut self.snapshot).error = error;
+        self.refresh_failure_ui();
+    }
+
     /// Whether this draft's provider, model and account can still change: it
     /// has not started, and its first message is not on its way.
     fn choosing(&self) -> bool {
@@ -5020,6 +5027,9 @@ fn draft_snapshot(
 
 // A saved absent pair is the provider default, never this window's last choice.
 fn project_draft_model_choice(snapshot: &mut Snapshot, launch: &chat::Launch) {
+    // These metadata snapshots belong to unstarted drafts, not provider
+    // publications. Reprojection retires only their choice-validation error.
+    snapshot.error = None;
     snapshot.selected_model = None;
     snapshot.reasoning = None;
     match chat::draft_model_choice(launch.provider, &launch.recipe) {
@@ -5547,7 +5557,7 @@ impl Cagents {
             match chat::draft_model_choice(original.launch.provider, &original.launch.recipe) {
                 Ok(choice) => choice,
                 Err(error) => {
-                    runtime.error = Some(error);
+                    runtime.set_draft_choice_error(Some(error));
                     return Task::none();
                 }
             };
@@ -5555,7 +5565,7 @@ impl Cagents {
             .as_ref()
             .is_some_and(|id| !models.iter().any(|model| &model.id == id))
         {
-            runtime.error = Some("That model is no longer listed. Choose an available model or the provider default.".into());
+            runtime.set_draft_choice_error(Some("That model is no longer listed. Choose an available model or the provider default.".into()));
             return Task::none();
         }
         let moved = original.launch.provider != provider;
@@ -5575,7 +5585,9 @@ impl Cagents {
             match fresh_chat_session(provider, original.id, directory, &account, automatic) {
                 Ok(session) => session,
                 Err(error) => {
-                    self.chat_runtime_mut(target).unwrap().error = Some(error);
+                    self.chat_runtime_mut(target)
+                        .unwrap()
+                        .set_draft_choice_error(Some(error));
                     return Task::none();
                 }
             }
@@ -5585,7 +5597,9 @@ impl Cagents {
         if let Err(error) =
             chat::set_draft_model_choice(provider, &mut session.launch.recipe, &choice)
         {
-            self.chat_runtime_mut(target).unwrap().error = Some(error);
+            self.chat_runtime_mut(target)
+                .unwrap()
+                .set_draft_choice_error(Some(error));
             return Task::none();
         }
         let runtime = self.chat_runtime_mut(target).unwrap();
@@ -5601,6 +5615,7 @@ impl Cagents {
         if moved {
             runtime.error = None;
         }
+        runtime.set_draft_choice_error(None);
         self.remember_chat_model(provider, model, reasoning);
         let skills = if session != original {
             // Same-provider choices must publish the same full source CAS as
@@ -5686,7 +5701,7 @@ impl Cagents {
             match chat::draft_model_choice(account.provider, &runtime.session.launch.recipe) {
                 Ok(choice) => choice,
                 Err(error) => {
-                    runtime.error = Some(error);
+                    runtime.set_draft_choice_error(Some(error));
                     return Task::none();
                 }
             };
@@ -5699,14 +5714,14 @@ impl Cagents {
         ) {
             Ok(session) => session,
             Err(error) => {
-                runtime.error = Some(error);
+                runtime.set_draft_choice_error(Some(error));
                 return Task::none();
             }
         };
         if let Err(error) =
             chat::set_draft_model_choice(account.provider, &mut session.launch.recipe, &choice)
         {
-            runtime.error = Some(error);
+            runtime.set_draft_choice_error(Some(error));
             return Task::none();
         }
         // A picker choice is a pin, even if it chooses the same home as the
@@ -5716,6 +5731,7 @@ impl Cagents {
             .recipe
             .environment
             .remove(account::routing::AUTOMATIC_MARKER);
+        runtime.set_draft_choice_error(None);
         if session == runtime.session {
             return Task::none();
         }
@@ -6056,10 +6072,6 @@ impl Cagents {
         }
         if !moved {
             let snapshot = Arc::make_mut(&mut runtime.snapshot);
-            if chat::draft_model_choice(previous.launch.provider, &previous.launch.recipe).is_err()
-            {
-                snapshot.error = None;
-            }
             project_draft_model_choice(snapshot, &session.launch);
         }
         Arc::make_mut(&mut runtime.snapshot).permission_mode =
@@ -6069,6 +6081,7 @@ impl Cagents {
             runtime.error = None;
             runtime.completion.restart(true);
         }
+        runtime.refresh_failure_ui();
         let target = runtime.target;
         self.load_draft_skills(target)
     }
@@ -6716,6 +6729,9 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
+        if runtime.snapshot.error.is_some() {
+            runtime.refresh_failure_ui();
+        }
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
@@ -11386,11 +11402,12 @@ impl Cagents {
                     if let Err(error) =
                         chat::set_draft_model_choice(provider, &mut session.launch.recipe, &choice)
                     {
-                        runtime.error = Some(error);
+                        runtime.set_draft_choice_error(Some(error));
                         return Task::none();
                     }
                     Arc::make_mut(&mut runtime.snapshot).reasoning = Some(reasoning.clone());
                     runtime.session = session.clone();
+                    runtime.set_draft_choice_error(None);
                     self.remember_chat_model(provider, Some(model), Some(reasoning));
                     self.replace_chat_conversation(target.card, session);
                     return self.load_draft_skills(target);
@@ -22900,6 +22917,226 @@ mod tests {
                 effort
             );
             assert!(!app.chat_start_pending(card) && !other.chat_start_pending(card));
+        }
+    }
+
+    #[test]
+    fn successful_draft_choices_retire_only_their_own_refusals() {
+        let _admission = attachment_draft::test_admission();
+        for unrelated in ["none", "attachment", "failed_start"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.observe_listed_models(
+                Provider::Codex,
+                vec![
+                    fixture_model("valid", &["low", "high"]),
+                    fixture_model("other", &["low", "high"]),
+                ],
+            ));
+            let card = if unrelated == "failed_start" {
+                let (card, target) = starting_chat(&mut app);
+                answer_start(
+                    &mut app,
+                    target,
+                    Err(chat::StartFailure::retry("fixture provider start failed")),
+                );
+                let retirement = retired(&mut app, card);
+                drop(app.update(Message::ChatUi(Action::Retired(retirement, Ok(())))));
+                card
+            } else {
+                draft_chat(&mut app)
+            };
+            let target = chat_runtime(&app, card).target;
+            // Pin the ordinary account first; repeating this valid exact choice
+            // later must also retire a refusal when the Session needs no edit.
+            let account = Account::system(Provider::Codex).id();
+            drop(app.update(Message::ChatUi(Action::ChooseAccount(
+                target,
+                account.clone(),
+            ))));
+            if unrelated == "attachment" {
+                drop(app.update(Message::ChatUi(Action::Paste(target))));
+                let runtime = chat_runtime(&app, card);
+                let ticket = runtime
+                    .attachment_ticket(runtime.attachment_order[0])
+                    .unwrap();
+                drop(app.update(Message::ChatUi(Action::PasteRefused(
+                    target,
+                    ticket,
+                    "fixture attachment failed",
+                ))));
+            }
+            let expected_local = chat_runtime(&app, card).error.clone();
+            assert_eq!(
+                expected_local.as_deref(),
+                match unrelated {
+                    "none" => None,
+                    "attachment" => Some("fixture attachment failed"),
+                    _ => Some("fixture provider start failed"),
+                }
+            );
+            for recovery in ["model", "default", "effort", "adoption", "same_account"] {
+                drop(app.update(Message::ChatUi(Action::DraftModel(
+                    target,
+                    Provider::Codex,
+                    Some("valid".into()),
+                ))));
+                let runtime = chat_runtime(&app, card);
+                let before = runtime.session.clone();
+                let pointer = runtime as *const Runtime;
+                let draft = runtime.composer.text();
+                let cursor = runtime.composer.cursor();
+                drop(app.update(Message::ChatUi(Action::DraftModel(
+                    target,
+                    Provider::Codex,
+                    Some("no-longer-listed".into()),
+                ))));
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(
+                    runtime.session, before,
+                    "refusal preserves the complete source"
+                );
+                assert_eq!(
+                    app.card_state(card).unwrap().kind,
+                    CardKind::Chat(before.clone())
+                );
+                assert_eq!(
+                    runtime.error, expected_local,
+                    "choice never claims an unrelated local error"
+                );
+                let refusal = runtime
+                    .snapshot
+                    .error
+                    .as_deref()
+                    .expect("choice refusal is visible")
+                    .to_owned();
+                assert!(refusal.contains("no longer listed"));
+                assert!(runtime.failure_ui.incidents.iter().any(|incident| {
+                    runtime
+                        .failure_details(&incident.key)
+                        .is_some_and(|details| details.contains(&refusal))
+                }));
+                match recovery {
+                    "model" => drop(app.update(Message::ChatUi(Action::DraftModel(
+                        target,
+                        Provider::Codex,
+                        Some("other".into()),
+                    )))),
+                    "default" => drop(app.update(Message::ChatUi(Action::DraftModel(
+                        target,
+                        Provider::Codex,
+                        None,
+                    )))),
+                    "effort" => drop(app.update(Message::ChatUi(Action::Reasoning(
+                        target,
+                        "valid".into(),
+                        "high".into(),
+                    )))),
+                    "adoption" => {
+                        let mut canonical = before.clone();
+                        let effort = if runtime.snapshot.reasoning.as_deref() == Some("high") {
+                            "low"
+                        } else {
+                            "high"
+                        };
+                        chat::set_draft_model_choice(
+                            Provider::Codex,
+                            &mut canonical.launch.recipe,
+                            &chat::DraftModelChoice {
+                                model: Some("valid".into()),
+                                reasoning: Some(effort.into()),
+                            },
+                        )
+                        .unwrap();
+                        app.card_state_mut(card).unwrap().kind = CardKind::Chat(canonical.clone());
+                        drop(app.adopt_shared_draft_session(card, &canonical));
+                    }
+                    _ => drop(app.update(Message::ChatUi(Action::ChooseAccount(
+                        target,
+                        account.clone(),
+                    )))),
+                }
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.snapshot.error, None, "{unrelated}/{recovery}");
+                assert_eq!(runtime.error, expected_local);
+                let choice =
+                    chat::draft_model_choice(Provider::Codex, &runtime.session.launch.recipe)
+                        .unwrap();
+                match recovery {
+                    "model" => assert_eq!(choice.model.as_deref(), Some("other")),
+                    "default" => assert_eq!(choice, chat::DraftModelChoice::default()),
+                    "effort" => assert_eq!(choice.reasoning.as_deref(), Some("high")),
+                    "same_account" => assert_eq!(
+                        runtime.session, before,
+                        "repeating an unchanged valid choice still recovers"
+                    ),
+                    _ => assert_ne!(
+                        runtime.session, before,
+                        "an admitted canonical change recovers"
+                    ),
+                }
+                assert_eq!(runtime.target, target);
+                assert_eq!(runtime as *const _, pointer);
+                assert_eq!(runtime.composer.text(), draft);
+                assert_eq!(runtime.composer.cursor(), cursor);
+                let collected = failure::State::collect(runtime);
+                assert_eq!(
+                    collected.incidents.len(),
+                    usize::from(expected_local.is_some())
+                );
+                assert_eq!(
+                    runtime.failure_ui.incidents.len(),
+                    collected.incidents.len(),
+                    "mounted presentation is refreshed too"
+                );
+                for incident in &runtime.failure_ui.incidents {
+                    let details = runtime.failure_details(&incident.key).unwrap();
+                    assert!(!details.contains(&refusal));
+                    assert!(details.contains(expected_local.as_deref().unwrap()));
+                }
+                assert!(!app.chat_start_pending(card));
+            }
+
+            // A malformed canonical recipe uses the same owned projection
+            // channel. Its parser refusal must not poison a later valid source.
+            let valid = chat_runtime(&app, card).session.clone();
+            let mut opaque = valid.clone();
+            opaque
+                .launch
+                .recipe
+                .arguments
+                .extend(["--config".into(), "model=opaque".into()]);
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(opaque.clone());
+            drop(app.adopt_shared_draft_session(card, &opaque));
+            let runtime = chat_runtime(&app, card);
+            let refusal = runtime.snapshot.error.clone().unwrap();
+            assert_eq!(runtime.error, expected_local);
+            assert!(!runtime.failure_ui.incidents.is_empty());
+            drop(app.update(Message::ChatUi(Action::DraftModel(
+                target,
+                Provider::Codex,
+                None,
+            ))));
+            assert_eq!(chat_runtime(&app, card).session, opaque);
+            assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(opaque));
+            assert_eq!(
+                chat_runtime(&app, card).snapshot.error.as_deref(),
+                Some(refusal.as_str())
+            );
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(valid.clone());
+            drop(app.adopt_shared_draft_session(card, &valid));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.session, valid);
+            assert_eq!(runtime.error, expected_local);
+            assert_eq!(runtime.snapshot.error, None);
+            assert_eq!(
+                runtime.failure_ui.incidents.len(),
+                usize::from(expected_local.is_some())
+            );
+            assert!(!runtime.failure_ui.incidents.iter().any(|incident| {
+                runtime
+                    .failure_details(&incident.key)
+                    .is_some_and(|details| details.contains(&refusal))
+            }));
         }
     }
 
