@@ -5596,13 +5596,35 @@ impl RowGrid {
         content: RowContent<'a>,
         selected: bool,
     ) -> button::Button<'a, SidebarAction> {
+        self.control_with_action(content, selected, false)
+    }
+
+    /// Give an eligible expanded row one stable action target, inside the
+    /// primary button's full-width surface. The target includes the ordinary
+    /// right gutter; neither its reveal nor keyboard focus remeasures the title.
+    /// Ordinary/primary worktrees spend no space on an unavailable action.
+    fn control_with_action<'a>(
+        self,
+        content: RowContent<'a>,
+        selected: bool,
+        quick_action: bool,
+    ) -> button::Button<'a, SidebarAction> {
         button::custom(content)
             .class(match self.kind {
                 RowKind::Project => row_button_style::<true, false>(selected),
                 RowKind::Child => row_button_style::<true, true>(selected),
             })
             .selected(selected)
-            .padding([0.0, self.gutter()])
+            .padding(Padding {
+                top: 0.0,
+                right: if quick_action && !self.compact {
+                    ICON_CONTROL_SIZE
+                } else {
+                    self.gutter()
+                },
+                bottom: 0.0,
+                left: self.gutter(),
+            })
             .width(if self.compact {
                 Length::Fixed(COMPACT_ROW_WIDTH)
             } else {
@@ -6883,7 +6905,7 @@ fn channel_view(
     // delete twice.
     let inert = modal_open || deleting;
     let action = grid
-        .control(content, channel.selected)
+        .control_with_action(content, channel.selected, true)
         .id(channel.open_id.clone())
         .name(with_deletion_name(
             Cow::Owned(format!(
@@ -6932,9 +6954,10 @@ fn channel_view(
     )
 }
 
-/// Keep the row's primary button and its destructive quick action separate.
-/// The compact rail reuses its indicator slot while hovered; an expanded row
-/// reserves the button width so the label continues to ellipsize correctly.
+/// A separate expanded-row command, painted over its own stable inset in the
+/// primary surface. Keep live status visible beside it; never replace it with
+/// a tiny destructive target in the compact rail. Compact rows retain their
+/// ordinary contextual commands and focused-row Delete/Backspace handling.
 fn row_quick_delete<'a>(
     content: Element<'static, SidebarAction>,
     label: &str,
@@ -6942,25 +6965,18 @@ fn row_quick_delete<'a>(
     id: Id,
     compact: bool,
 ) -> Element<'static, SidebarAction> {
-    let width = if compact {
-        ROW_STATUS_WIDTH
-    } else {
-        ICON_CONTROL_SIZE
-    };
-    let control = centered_icon_button(Icon::Delete, width, WORKTREE_ROW_HEIGHT)
-        .class(sidebar_button_style(false))
+    if compact {
+        return content;
+    }
+    let control = centered_icon_button(Icon::Delete, ICON_CONTROL_SIZE, WORKTREE_ROW_HEIGHT)
+        .class(row_quick_action_style())
         .id(id)
         .name(label.to_owned())
         .on_press_maybe(action);
-    let controls = widget::container(
-        widget::container(crate::interaction::tooltip(control, label.to_owned()))
-            .class(theme::Container::Primary)
-            .width(width)
-            .height(WORKTREE_ROW_HEIGHT),
-    )
-    .align_right(Length::Fill)
-    .into();
-    RowInteraction::actions(content, controls, if compact { 0.0 } else { width })
+    let controls = widget::container(crate::interaction::tooltip(control, label.to_owned()))
+        .align_right(Length::Fill)
+        .into();
+    RowInteraction::actions(content, controls, 0.0)
 }
 
 /// The commands a channel row offers on right-click.
@@ -7170,6 +7186,10 @@ fn worktree_view<'a>(
         ..
     } = row_state;
     let chrome = &worktree.chrome;
+    let quick_delete = !primary
+        && worktree
+            .pull_request()
+            .is_some_and(|pr| pr.state == Some(WorktreePullRequestState::Merged));
     let grid = RowGrid::child(compact);
     let deletion = worktree.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
@@ -7293,7 +7313,7 @@ fn worktree_view<'a>(
     // sessions in a directory Git is about to remove.
     let inert = modal_open || deleting;
     let action = grid
-        .control(content, selected)
+        .control_with_action(content, selected, quick_delete)
         .id(chrome.open_id.clone())
         .name(with_deletion_name(
             worktree_accessible_name(worktree, row_state),
@@ -7311,11 +7331,7 @@ fn worktree_view<'a>(
         crate::interaction::hover(action)
     };
     let action = crate::interaction::tooltip(action, chrome.tooltip.to_string());
-    let action = if !primary
-        && worktree
-            .pull_request()
-            .is_some_and(|pr| pr.state == Some(WorktreePullRequestState::Merged))
-    {
+    let action = if quick_delete {
         row_quick_delete(
             action,
             &chrome.delete_name,
@@ -10499,6 +10515,49 @@ fn row_button_style<const FLAT: bool, const HOVER: bool>(selected: bool) -> them
     }
 }
 
+/// The quick action borrows its row's surface. Only an intentional pointer
+/// press or a keyboard focus border distinguishes the action target; no opaque
+/// rounded patch cuts a selected row into two unrelated controls.
+fn row_quick_action_style() -> theme::Button {
+    fn appearance(
+        theme: &cosmic::Theme,
+        focused: bool,
+        hovered: bool,
+        pressed: bool,
+        disabled: bool,
+    ) -> button::Style {
+        let mut style = button::Style::new();
+        let foreground: cosmic::iced::Color = theme.current_container().on.into();
+        let mut icon = if focused || hovered {
+            foreground
+        } else {
+            design::muted_icon_color(theme)
+        };
+        if disabled {
+            icon.a *= 0.5;
+        }
+        style.icon_color = Some(icon);
+        style.text_color = Some(icon);
+        style.border_radius = 0.0.into();
+        if focused && !disabled {
+            style.border_width = 1.0;
+            style.border_color = theme.cosmic().accent.base.into();
+        }
+        if pressed && !disabled {
+            style.background = Some(cosmic::iced::Background::Color(
+                foreground.scale_alpha(0.08),
+            ));
+        }
+        style
+    }
+    theme::Button::Custom {
+        active: Box::new(|focused, theme| appearance(theme, focused, false, false, false)),
+        disabled: Box::new(|theme| appearance(theme, false, false, false, true)),
+        hovered: Box::new(|focused, theme| appearance(theme, focused, true, false, false)),
+        pressed: Box::new(|focused, theme| appearance(theme, focused, true, true, false)),
+    }
+}
+
 /// Compact source-control commands share the row height and hover geometry.
 fn panel_icon_action<'a>(
     icon_name: Icon,
@@ -11518,6 +11577,7 @@ mod row_interaction {
     struct State {
         modifiers: keyboard::Modifiers,
         selection_bounds: Option<Rectangle>,
+        selection_exclusion: Option<Rectangle>,
         origin: Option<(super::SelectionRow, Point)>,
         dragging: bool,
         drop: Option<(Option<super::SelectionRow>, f32)>,
@@ -11548,7 +11608,7 @@ mod row_interaction {
     }
 
     #[derive(Default)]
-    struct FocusWithin(bool, Option<Id>, Option<Rectangle>);
+    struct FocusWithin(bool, Option<Id>, Option<Rectangle>, Option<Rectangle>);
 
     impl Operation for FocusWithin {
         fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
@@ -11564,6 +11624,25 @@ mod row_interaction {
             if self.1.as_ref().is_none_or(|target| Some(target) == id) {
                 self.0 |= state.is_focused();
                 self.2 = Some(bounds);
+            } else if let Some(primary) = self.2
+                && let Some(overlap) = primary.intersection(&bounds)
+            {
+                // Overlay commands keep their own press ownership even though
+                // the primary button now paints the complete row behind them.
+                self.3 = Some(match self.3 {
+                    None => overlap,
+                    Some(previous) => {
+                        let x = previous.x.min(overlap.x);
+                        let y = previous.y.min(overlap.y);
+                        Rectangle {
+                            x,
+                            y,
+                            width: (previous.x + previous.width).max(overlap.x + overlap.width) - x,
+                            height: (previous.y + previous.height).max(overlap.y + overlap.height)
+                                - y,
+                        }
+                    }
+                });
             }
         }
     }
@@ -11697,6 +11776,7 @@ mod row_interaction {
             let state = tree.state.downcast_mut::<State>();
             state.focused = focus.0;
             state.selection_bounds = focus.2;
+            state.selection_exclusion = focus.3;
         }
 
         fn header_at(&self, layout: Layout<'_>, point: Point) -> Option<super::SelectionRow> {
@@ -12031,7 +12111,10 @@ mod row_interaction {
                         if hovered
                             && state
                                 .selection_bounds
-                                .is_some_and(|bounds| cursor.is_over(bounds)) =>
+                                .is_some_and(|bounds| cursor.is_over(bounds))
+                            && state
+                                .selection_exclusion
+                                .is_none_or(|bounds| !cursor.is_over(bounds)) =>
                     {
                         // A plain click is navigation: the row's own button
                         // opens it, and the selection only learns the anchor.
@@ -13768,7 +13851,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn channel_hover_delete_targets_its_row_without_opening_it_in_both_densities() {
+    fn channel_trailing_click_uses_the_available_control_without_retargeting() {
         use cosmic::iced::{
             Event, Point, Rectangle,
             advanced::{Shell, clipboard},
@@ -13830,6 +13913,10 @@ pub(crate) mod tests {
                 messages,
                 if modal {
                     Vec::new()
+                } else if compact {
+                    vec![SidebarAction::OpenChannel {
+                        channel_id: channel.id,
+                    }]
                 } else {
                     vec![SidebarAction::DeleteChannel {
                         channel_id: channel.id,
@@ -13937,25 +14024,21 @@ pub(crate) mod tests {
             1,
         );
         let label = "Delete channel WhatsApp conversation export";
-        for compact in [false, true] {
-            let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
+        // The compact rail keeps its status and uses the row menu/keyboard
+        // command instead of replacing that status with a tiny delete target.
+        for width in [148.0, 240.0, 380.0] {
             let hover = cosmic::iced::Point::new(width - 8.0, WORKTREE_ROW_HEIGHT / 2.0);
             let (control, glyphs) = icon_glyphs_in_control(
-                channel_view(&channel, Listing::Live, false, compact, Some(1), ""),
+                channel_view(&channel, Listing::Live, false, false, Some(1), ""),
                 Size::new(width, WORKTREE_ROW_HEIGHT),
                 hover,
                 label,
             );
             assert_eq!(
-                control.width,
-                if compact {
-                    ROW_STATUS_WIDTH
-                } else {
-                    ICON_CONTROL_SIZE
-                },
-                "compact={compact}: the hit area keeps its reserved slot"
+                control.width, ICON_CONTROL_SIZE,
+                "width={width}: the hit area keeps its usable target"
             );
-            assert_glyph_centered(&format!("{label}, compact={compact}"), control, &glyphs);
+            assert_glyph_centered(&format!("{label}, width={width}"), control, &glyphs);
         }
 
         let mut worktree = worktree(3, "feature", false);
@@ -13983,6 +14066,235 @@ pub(crate) mod tests {
             "Delete merged worktree feature",
         );
         assert_glyph_centered("Delete merged worktree feature", control, &glyphs);
+    }
+
+    #[test]
+    fn expanded_row_action_keeps_title_status_and_primary_geometry_stable() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{
+                Shell, clipboard,
+                widget::{Operation, operation},
+            },
+            mouse,
+        };
+
+        struct Controls<'a> {
+            primary: &'a Id,
+            action: &'a Id,
+            bounds: [Option<Rectangle>; 2],
+        }
+        impl Operation for Controls<'_> {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                for (index, target) in [self.primary, self.action].into_iter().enumerate() {
+                    if id == Some(target) {
+                        self.bounds[index] = Some(bounds);
+                    }
+                }
+            }
+        }
+        let renderer = headless_renderer();
+        for width in [148.0, 240.0, 380.0] {
+            for selected in [false, true] {
+                for merged_worktree in [false, true] {
+                    let channel = SidebarChannel::new(
+                        ChannelId::new(),
+                        "WhatsApp conversation export with an intentionally long title".into(),
+                        selected,
+                        Some(crate::agent::ActivityState::Waiting),
+                        true,
+                        1,
+                        true,
+                        1,
+                    );
+                    let mut worktree =
+                        worktree(3, "feature-with-a-long-title-and-visible-status", false);
+                    let mut pr = project().pull_requests.remove(0);
+                    pr.state = Some(WorktreePullRequestState::Merged);
+                    worktree.set_pull_request(pr);
+                    let (primary, action) = if merged_worktree {
+                        (&worktree.chrome.open_id, &worktree.chrome.delete_id)
+                    } else {
+                        (&channel.open_id, &channel.delete_id)
+                    };
+                    let mut element = if merged_worktree {
+                        worktree_view(
+                            project_id(1),
+                            &worktree,
+                            false,
+                            false,
+                            selected.then_some(SidebarSelection::Worktree {
+                                project_id: project_id(1),
+                                worktree_id: worktree.id,
+                            }),
+                            false,
+                            true,
+                            &[],
+                            WorktreeRowState {
+                                activity: Some(crate::agent::ActivityState::Waiting),
+                                ..Default::default()
+                            },
+                            false,
+                            Some(1),
+                            "",
+                            true,
+                        )
+                    } else {
+                        channel_view(&channel, Listing::Live, false, false, Some(1), "")
+                    };
+                    let mut tree = Tree::new(&element);
+                    let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
+                    let limits = layout::Limits::new(Size::ZERO, viewport.size());
+                    let measure = |element: &mut Element<'_, SidebarAction>, tree: &mut Tree| {
+                        let node = element.as_widget_mut().layout(tree, &renderer, &limits);
+                        let mut rows = Vec::new();
+                        navigation_rows(Layout::new(&node), &mut rows);
+                        assert_eq!(rows.len(), 1);
+                        let mut controls = Controls {
+                            primary,
+                            action,
+                            bounds: [None, None],
+                        };
+                        element.as_widget_mut().operate(
+                            tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut controls,
+                        );
+                        (
+                            controls.bounds[0].expect("primary control"),
+                            rows.remove(0).1,
+                            controls.bounds[1].expect("expanded quick action"),
+                        )
+                    };
+                    let resting = measure(&mut element, &mut tree);
+                    assert_eq!(
+                        resting.0.width, width,
+                        "the primary state surface spans the complete row"
+                    );
+                    assert_eq!(resting.2.width, ICON_CONTROL_SIZE);
+                    assert_eq!(resting.2.height, WORKTREE_ROW_HEIGHT);
+                    assert!(
+                        resting.1[1].width > 0.0,
+                        "the title keeps a usable measured slot"
+                    );
+                    assert_eq!(resting.1[2].width, ROW_STATUS_WIDTH);
+                    let last = resting.1.last().unwrap();
+                    assert!(
+                        last.x + last.width <= resting.2.x + 0.1,
+                        "status and badges do not sit under the action"
+                    );
+                    let node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                    let at = Point::new(width - 8.0, WORKTREE_ROW_HEIGHT / 2.0);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                        Layout::new(&node),
+                        mouse::Cursor::Available(at),
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut Vec::new()),
+                        &viewport,
+                    );
+                    assert_eq!(
+                        measure(&mut element, &mut tree),
+                        resting,
+                        "hover must not change title truncation or status/action positions"
+                    );
+                    let node = element
+                        .as_widget_mut()
+                        .layout(&mut tree, &renderer, &limits);
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(action.clone()),
+                    );
+                    assert_eq!(
+                        measure(&mut element, &mut tree),
+                        resting,
+                        "keyboard focus must not reflow the row"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_quick_delete_does_not_turn_modifier_click_into_row_selection() {
+        use cosmic::iced::{
+            Event, Point, Rectangle,
+            advanced::{Shell, clipboard},
+            keyboard, mouse,
+        };
+        let renderer = headless_renderer();
+        let channel = SidebarChannel::new(
+            ChannelId::new(),
+            "Inactive channel".into(),
+            false,
+            None,
+            false,
+            1,
+            true,
+            1,
+        );
+        let row = SelectionRow::Channel(channel.id);
+        let state = SidebarState::default();
+        for modifiers in [
+            keyboard::Modifiers::empty(),
+            keyboard::Modifiers::CTRL,
+            keyboard::Modifiers::SHIFT,
+        ] {
+            let mut element = RowInteraction::selectable(
+                channel_view(&channel, Listing::Live, false, false, Some(1), ""),
+                row,
+                &state,
+                true,
+            );
+            let mut tree = Tree::new(&element);
+            let viewport = Rectangle::with_size(Size::new(240.0, WORKTREE_ROW_HEIGHT));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let at = Point::new(232.0, WORKTREE_ROW_HEIGHT / 2.0);
+            let mut messages = Vec::new();
+            for event in [
+                Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(at),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert_eq!(
+                messages,
+                vec![SidebarAction::DeleteChannel {
+                    channel_id: channel.id
+                }],
+                "the overlay action owns its press, including {modifiers:?}"
+            );
+        }
     }
 
     #[test]
@@ -15536,13 +15848,36 @@ pub(crate) mod tests {
         renderer: &mut cosmic::Renderer,
     ) -> cosmic::iced::runtime::UserInterface<'a, SidebarAction, cosmic::Theme, cosmic::Renderer>
     {
+        interface_in_mode(
+            model,
+            state,
+            navigation,
+            bounds,
+            SidebarMode::Expanded,
+            false,
+            cache,
+            renderer,
+        )
+    }
+
+    fn interface_in_mode<'a>(
+        model: &'a SidebarModel,
+        state: &'a SidebarState,
+        navigation: &'a NavigationCache,
+        bounds: Size,
+        mode: SidebarMode,
+        modal_open: bool,
+        cache: cosmic::iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> cosmic::iced::runtime::UserInterface<'a, SidebarAction, cosmic::Theme, cosmic::Renderer>
+    {
         cosmic::iced::runtime::UserInterface::build(
             view_cached(
                 model,
                 state,
-                SidebarMode::Expanded,
+                mode,
                 design::NAVIGATION_DEFAULT_WIDTH,
-                false,
+                modal_open,
                 navigation,
                 &crate::settings::KeyboardShortcuts::default(),
             ),
@@ -15563,6 +15898,7 @@ pub(crate) mod tests {
         renderer: cosmic::Renderer,
         cache: cosmic::iced::runtime::user_interface::Cache,
         bounds: Size,
+        modal_open: bool,
     }
 
     impl Sidebar {
@@ -15597,6 +15933,38 @@ pub(crate) mod tests {
             sidebar
         }
 
+        fn compact_row(channel: ChannelId, merged_worktree: bool) -> Self {
+            let mut sidebar = Self::with_channel(channel);
+            sidebar.model.mode = SidebarMode::Compact;
+            // The menu belongs to the complete window, not the narrow rail.
+            sidebar.bounds.width = 760.0;
+            if merged_worktree {
+                let entry = &mut sidebar.model.projects[0];
+                entry.worktrees[0].path = entry.repository.clone();
+                let mut pr = entry.pull_requests[0].clone();
+                pr.state = Some(WorktreePullRequestState::Merged);
+                entry.worktrees[1].set_pull_request(pr);
+                let target = &entry.worktrees[1];
+                sidebar.state.active_worktree = Some(ActiveWorktreeKey {
+                    project_id: entry.id,
+                    worktree_id: target.id,
+                    canonical_path: target.path.clone(),
+                });
+            } else {
+                sidebar.model.projects[0].channels[0] = SidebarChannel::new(
+                    channel,
+                    "Investigate login".into(),
+                    false,
+                    Some(crate::agent::ActivityState::Waiting),
+                    false,
+                    1,
+                    true,
+                    1,
+                );
+            }
+            sidebar
+        }
+
         fn sized(height: f32) -> Self {
             let mut entry = project();
             entry.worktrees = (2..30)
@@ -15618,6 +15986,7 @@ pub(crate) mod tests {
                 renderer: headless_renderer(),
                 cache: Default::default(),
                 bounds: Size::new(design::NAVIGATION_DEFAULT_WIDTH, height),
+                modal_open: false,
             }
         }
 
@@ -15629,11 +15998,13 @@ pub(crate) mod tests {
                     renderer::{Headless, Style},
                 },
             };
-            let mut ui = interface(
+            let mut ui = interface_in_mode(
                 &self.model,
                 &self.state,
                 &self.navigation,
                 self.bounds,
+                self.model.mode,
+                self.modal_open,
                 std::mem::take(&mut self.cache),
                 &mut self.renderer,
             );
@@ -15684,11 +16055,13 @@ pub(crate) mod tests {
         ) -> Vec<SidebarAction> {
             use cosmic::iced::advanced::{clipboard, mouse};
             let mut messages = Vec::new();
-            let mut interface = interface(
+            let mut interface = interface_in_mode(
                 &self.model,
                 &self.state,
                 &self.navigation,
                 self.bounds,
+                self.model.mode,
+                self.modal_open,
                 std::mem::take(&mut self.cache),
                 &mut self.renderer,
             );
@@ -15765,11 +16138,13 @@ pub(crate) mod tests {
                 sidebar.move_to(anchor);
                 // The frame that draws has to be the frame that updated: the
                 // runtime keeps an overlay's layout from its own update pass.
-                let mut interface = interface(
+                let mut interface = interface_in_mode(
                     &sidebar.model,
                     &sidebar.state,
                     &sidebar.navigation,
                     sidebar.bounds,
+                    sidebar.model.mode,
+                    sidebar.modal_open,
                     std::mem::take(&mut sidebar.cache),
                     &mut sidebar.renderer,
                 );
@@ -15935,6 +16310,138 @@ pub(crate) mod tests {
             Some(&vec![SidebarAction::DeleteChannel { channel_id }]),
             "Delete must target the channel without opening a row underneath: {attempted:?}",
         );
+    }
+
+    #[test]
+    fn compact_rows_keep_activity_and_delete_the_captured_target_by_menu_or_keyboard() {
+        use cosmic::iced::{
+            Event, Point,
+            advanced::{clipboard, mouse, widget::operation},
+            keyboard,
+        };
+        let channel = ChannelId::from_uuid(Uuid::from_u128(20));
+        for merged_worktree in [false, true] {
+            let mut sidebar = Sidebar::compact_row(channel, merged_worktree);
+            let (label, focus_id, selection, expected) = if merged_worktree {
+                let entry = &sidebar.model.projects[0];
+                let target = &entry.worktrees[1];
+                (
+                    worktree_accessible_name(target, WorktreeRowState::default()).into_owned(),
+                    target.chrome.open_id.clone(),
+                    SelectionRow::Worktree(entry.id, target.id),
+                    SidebarAction::ProjectCommand {
+                        project_id: entry.id,
+                        worktree_id: Some(target.id),
+                        command: ProjectCommand::Delete,
+                    },
+                )
+            } else {
+                let target = &sidebar.model.projects[0].channels[0];
+                (
+                    target.accessible_name.to_string(),
+                    target.open_id.clone(),
+                    SelectionRow::Channel(channel),
+                    SidebarAction::DeleteChannel {
+                        channel_id: channel,
+                    },
+                )
+            };
+            let (controls, _) = sidebar.attention_frame();
+            let (_, bounds) = controls
+                .iter()
+                .find(|(name, _)| name == &label)
+                .unwrap_or_else(|| {
+                    panic!("compact target is actually mounted: {label}: {controls:?}")
+                });
+            assert!((bounds[2] - bounds[0] - f64::from(COMPACT_ROW_WIDTH)).abs() < 0.1);
+            let row = Point::new(
+                ((bounds[0] + bounds[2]) / 2.0) as f32,
+                ((bounds[1] + bounds[3]) / 2.0) as f32,
+            );
+            sidebar.move_to(row);
+            let (hovered_controls, _) = sidebar.attention_frame();
+            assert!(
+                !hovered_controls
+                    .iter()
+                    .any(|(name, _)| name.starts_with("Delete channel ")
+                        || name.starts_with("Delete merged worktree ")),
+                "hover cannot replace the compact row's status with a destructive overlay"
+            );
+
+            // Exercise the real menu widget, including its layout/redraw and
+            // actual pointer dispatch. Merely listing a Delete command would
+            // not establish that a person can reach it from the compact row.
+            let painted =
+                Sidebar::menu_rows_for(|| Sidebar::compact_row(channel, merged_worktree), row, 0.0);
+            let (top, bottom) = painted
+                .iter()
+                .find(|(top, bottom)| *top <= row.y as usize && *bottom > row.y as usize)
+                .expect("the compact row's menu paints at its anchor");
+            let selected = (*top..=*bottom).step_by(4).find_map(|y| {
+                let mut candidate = Sidebar::compact_row(channel, merged_worktree);
+                candidate.click(mouse::Button::Right, row);
+                candidate.feed(
+                    &[Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                        std::time::Instant::now(),
+                    ))],
+                    row,
+                );
+                let at = Point::new(row.x + 30.0, y as f32);
+                candidate.move_to(at);
+                let actions = candidate.click(mouse::Button::Left, at);
+                actions.contains(&expected).then_some(actions)
+            });
+            assert_eq!(
+                selected,
+                Some(vec![expected]),
+                "the menu must not open or delete another row"
+            );
+
+            for modal_open in [false, true] {
+                let mut sidebar = Sidebar::compact_row(channel, merged_worktree);
+                sidebar.modal_open = modal_open;
+                let mut frame = interface_in_mode(
+                    &sidebar.model,
+                    &sidebar.state,
+                    &sidebar.navigation,
+                    sidebar.bounds,
+                    SidebarMode::Compact,
+                    modal_open,
+                    std::mem::take(&mut sidebar.cache),
+                    &mut sidebar.renderer,
+                );
+                frame.operate(
+                    &sidebar.renderer,
+                    &mut operation::focusable::focus::<()>(focus_id.clone()),
+                );
+                let delete = Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Delete),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Delete),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Delete),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                });
+                let mut actions = Vec::new();
+                frame.update(
+                    &[delete],
+                    mouse::Cursor::Unavailable,
+                    &mut sidebar.renderer,
+                    &mut clipboard::Null,
+                    &mut actions,
+                );
+                assert_eq!(
+                    actions,
+                    if modal_open {
+                        Vec::new()
+                    } else {
+                        vec![SidebarAction::DeleteRow(selection)]
+                    },
+                    "keyboard deletion is captured to its focused row and refuses behind a modal"
+                );
+            }
+        }
     }
 
     #[test]
