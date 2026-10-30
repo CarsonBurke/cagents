@@ -7,6 +7,66 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const MAX_RECEIPT_BYTES: usize = 256 * 1024;
+const HISTORY_CENSUS_ROWS: usize = 16_384;
+const HISTORY_CENSUS_BYTES: usize = 64 * 1024 * 1024;
+const HISTORY_CENSUS_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Historical candidate data, not permission to read a file or run a provider.
+/// Only the consistent Registry lookup below can construct this value. Current
+/// connection, role, account, route, owner and file admission remain separate.
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::host) struct RetiredHistoryCandidate {
+    ownership: NativeActorOwnership,
+    retirement: NativeActorRetirement,
+}
+
+impl std::fmt::Debug for RetiredHistoryCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RetiredHistoryCandidate")
+    }
+}
+
+impl RetiredHistoryCandidate {
+    pub(in crate::host) fn source(&self) -> &chat::Session {
+        &self.retirement.source
+    }
+
+    pub(in crate::host) fn actor(&self) -> Uuid {
+        self.retirement.actor
+    }
+
+    pub(in crate::host) fn owner(&self) -> &Record {
+        &self.retirement.owner
+    }
+
+    pub(in crate::host) fn scope(&self) -> &LaunchAccountScope {
+        // Construction requires the actual known, matching historical tuples.
+        self.retirement.scope.as_ref().expect("candidate has scope")
+    }
+
+    pub(in crate::host) fn confirmed_session(&self) -> &str {
+        self.retirement
+            .confirmed_session
+            .as_deref()
+            .expect("candidate has provider confirmation")
+    }
+}
+
+struct HistoryCensusBudget {
+    deadline: std::time::Instant,
+    rows: usize,
+    bytes: usize,
+}
+
+impl HistoryCensusBudget {
+    fn check(&self) -> Result<(), String> {
+        if std::time::Instant::now() >= self.deadline {
+            Err("Retired history census exceeded its admission deadline".into())
+        } else {
+            Ok(())
+        }
+    }
+}
 
 /// Pending is cleanup evidence only; installation requires the helper ACK and
 /// committed Registry projection. Missing phase is explicitly legacy Installed.
@@ -293,6 +353,183 @@ pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
 }
 
 impl Registry {
+    /// Read a complete, consistent bounded historical census. Call this on a
+    /// blocking worker without HostState/UI locks. No current filesystem,
+    /// account selection, alias construction or ownership mutation occurs.
+    /// A successful candidate is not a current History read witness.
+    pub(in crate::host) fn retired_history_candidate(
+        &self,
+        requested: &chat::Session,
+    ) -> Result<Option<RetiredHistoryCandidate>, String> {
+        self.retired_history_candidate_with_budget(
+            requested,
+            HistoryCensusBudget {
+                deadline: std::time::Instant::now() + HISTORY_CENSUS_TIME,
+                rows: HISTORY_CENSUS_ROWS,
+                bytes: HISTORY_CENSUS_BYTES,
+            },
+        )
+    }
+
+    fn retired_history_candidate_with_budget(
+        &self,
+        requested: &chat::Session,
+        budget: HistoryCensusBudget,
+    ) -> Result<Option<RetiredHistoryCandidate>, String> {
+        budget.check()?;
+        if requested.launch.provider != crate::agent::Provider::Claude
+            || !requested.has_valid_native_continuity()
+            || !matches!(
+                requested.native_continuity,
+                chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )
+            || requested
+                .launch
+                .session_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .is_none_or(|id| id.is_nil())
+        {
+            return Ok(None);
+        }
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|_| "Retired history census could not begin".to_owned())?;
+        let candidate = {
+            // Include orphan retirements as errors rather than silently
+            // treating a partial join as a complete uniqueness census.
+            let mut statement = tx
+                .prepare(
+                    "SELECT o.actor,o.ownership,r.actor,r.receipt
+                     FROM native_actor_ownerships o
+                     LEFT JOIN native_actor_retirements r ON r.actor=o.actor
+                     UNION ALL
+                     SELECT NULL,NULL,r.actor,r.receipt
+                     FROM native_actor_retirements r
+                     LEFT JOIN native_actor_ownerships o ON o.actor=r.actor
+                     WHERE o.actor IS NULL",
+                )
+                .map_err(|_| "Retired history census could not be prepared".to_owned())?;
+            let mut rows = statement
+                .query([])
+                .map_err(|_| "Retired history census could not be read".to_owned())?;
+            let (mut count, mut bytes) = (0usize, 0usize);
+            let mut found = None;
+            while let Some(row) = rows
+                .next()
+                .map_err(|_| "Retired history census could not be read".to_owned())?
+            {
+                budget.check()?;
+                count += 1;
+                if count > budget.rows {
+                    return Err("Retired history census exceeded its row bound".into());
+                }
+                // Inspect borrowed SQLite bytes before allocating or decoding
+                // any payload. The total includes keys as well as JSON.
+                let mut fields = [None; 4];
+                for (index, field) in fields.iter_mut().enumerate() {
+                    match row
+                        .get_ref(index)
+                        .map_err(|_| "Retired history census has invalid columns".to_owned())?
+                    {
+                        rusqlite::types::ValueRef::Null => {}
+                        rusqlite::types::ValueRef::Text(value) => {
+                            if value.len() > MAX_RECEIPT_BYTES {
+                                return Err("Retired history census has oversized metadata".into());
+                            }
+                            bytes = bytes.checked_add(value.len()).ok_or_else(|| {
+                                "Retired history census exceeded its byte bound".to_owned()
+                            })?;
+                            if bytes > budget.bytes {
+                                return Err("Retired history census exceeded its byte bound".into());
+                            }
+                            *field = Some(value);
+                        }
+                        _ => return Err("Retired history census has invalid metadata".into()),
+                    }
+                }
+                let key = fields[0].ok_or("Retired history census has an orphan retirement")?;
+                let encoded =
+                    fields[1].ok_or("Retired history census has missing ownership metadata")?;
+                let ownership: NativeActorOwnership = serde_json::from_slice(encoded)
+                    .map_err(|_| "Retired history census has unreadable ownership".to_owned())?;
+                if ownership.actor.is_nil()
+                    || key != ownership.actor.to_string().as_bytes()
+                    || ownership.owner.kind != crate::daemon::holder_registry::Kind::Native
+                    || !crate::daemon::holder_registry::record_application_matches(&ownership.owner)
+                    || ownership.owner.terminal != ownership.source.id
+                    || ownership.source.launch.provider != crate::agent::Provider::Claude
+                    || !ownership.source.proof.as_ref().is_some_and(|proof| {
+                        proof.is_complete() && proof.boot_id == ownership.owner.boot
+                    })
+                    || !valid_continuity(&ownership.source, ownership.phase)
+                    || !ownership.source.has_valid_native_continuity()
+                    || ownership.source.owned_codex_listener.is_some()
+                    || ownership.scope.as_ref().is_ok_and(|scope| {
+                        scope.provider != crate::agent::Provider::Claude
+                            || !scope.canonical_home.is_absolute()
+                    })
+                {
+                    return Err("Retired history census has invalid ownership identity".into());
+                }
+                let (Some(retired_key), Some(encoded)) = (fields[2], fields[3]) else {
+                    if fields[2].is_some() || fields[3].is_some() {
+                        return Err(
+                            "Retired history census has incomplete retirement metadata".into()
+                        );
+                    }
+                    continue;
+                };
+                let retirement: NativeActorRetirement = serde_json::from_slice(encoded)
+                    .map_err(|_| "Retired history census has unreadable retirement".to_owned())?;
+                retirement.validate().map_err(|_| {
+                    "Retired history census has invalid retirement identity".to_owned()
+                })?;
+                if retired_key != key
+                    || retirement.actor != ownership.actor
+                    || retirement.owner != ownership.owner
+                    || !compatible_source(&ownership.source, &retirement.source)
+                    || !same_scope(&ownership.scope, &retirement.scope)
+                {
+                    return Err(
+                        "Retired history census changed its immutable owner or scope".into(),
+                    );
+                }
+                if &retirement.source != requested {
+                    continue;
+                }
+                if ownership.is_pending() || retirement.is_pending() {
+                    return Err("Pending cleanup never grants retired history eligibility".into());
+                }
+                let Some(confirmed) = retirement.confirmed_session.as_deref() else {
+                    return Err("Retired history has no recorded provider confirmation".into());
+                };
+                if Some(confirmed) != retirement.source.launch.session_id.as_deref()
+                    || Uuid::parse_str(confirmed).ok().is_none_or(|id| id.is_nil())
+                {
+                    return Err("Retired history provider identity is unconfirmed".into());
+                }
+                if ownership.scope.is_err() || retirement.scope.is_err() {
+                    return Err("Retired history has no captured physical account scope".into());
+                }
+                if found.is_some() {
+                    return Err("Retired history has ambiguous original ownership".into());
+                }
+                found = Some(RetiredHistoryCandidate {
+                    ownership,
+                    retirement,
+                });
+            }
+            budget.check()?;
+            found
+        };
+        tx.commit()
+            .map_err(|_| "Retired history census could not finish".to_owned())?;
+        budget.check()?;
+        Ok(candidate)
+    }
+
     /// Publish after authenticating installation/adoption and before exposing
     /// a handle that accepts input. This is a known-owner census, not launch
     /// authority; only that exact helper's authenticated route may refresh it.
@@ -611,6 +848,228 @@ impl Registry {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// Synthetic Registry metadata only, not an authenticated provider/read
+    /// witness. The existing real normal-shutdown producer must separately
+    /// qualify the final integrated reader on an old issued descriptor.
+    fn history_candidate_fixture() -> (
+        tempfile::TempDir,
+        Registry,
+        Uuid,
+        Record,
+        chat::Session,
+        LaunchAccountScope,
+    ) {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut registry = Registry::at(&root.path().join("history-registry")).unwrap();
+        let (actor, owner, issued, scope) = fixture(root.path());
+        registry
+            .register_native_actor_ownership(actor, &owner, &issued, Ok(&scope))
+            .unwrap();
+        let mut retired = issued;
+        retired.launch.session_id = Some("11111111-1111-4111-8111-111111111111".into());
+        // Ordinary authenticated publication can change epoch/pair projection;
+        // the Registry producer deliberately compares the immutable core.
+        retired.proof.as_mut().unwrap().host_incarnation = "later-attachment".into();
+        registry
+            .commit_native_actor_retirement(
+                actor,
+                &owner,
+                &retired,
+                Ok(&scope),
+                retired.launch.session_id.as_deref(),
+            )
+            .unwrap();
+        (root, registry, actor, owner, retired, scope)
+    }
+
+    #[test]
+    fn history_candidate_uses_exact_retirement_after_issued_projection_and_reopen() {
+        let (root, registry, actor, owner, source, scope) = history_candidate_fixture();
+        let ownership = registry.native_actor_ownership(actor).unwrap().unwrap();
+        assert_ne!(ownership.source(), &source);
+        drop(registry);
+        let registry = Registry::at(&root.path().join("history-registry")).unwrap();
+        let before: u64 = registry
+            .db
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        let candidate = registry
+            .retired_history_candidate(&source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate.source(), &source);
+        assert_eq!(candidate.actor(), actor);
+        assert_eq!(candidate.owner(), &owner);
+        assert_eq!(candidate.scope(), &scope);
+        assert_eq!(
+            Some(candidate.confirmed_session()),
+            source.launch.session_id.as_deref()
+        );
+        let after: u64 = registry
+            .db
+            .query_row("SELECT total_changes()", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "candidate lookup cannot mutate the ledger");
+        assert_eq!(format!("{candidate:?}"), "RetiredHistoryCandidate");
+    }
+
+    #[test]
+    fn history_candidate_does_not_normalize_requested_proof_account_cwd_or_unset() {
+        let (_root, registry, _actor, _owner, source, _scope) = history_candidate_fixture();
+        for variant in 0..4 {
+            let mut requested = source.clone();
+            match variant {
+                0 => requested.proof.as_mut().unwrap().host_incarnation = "other".into(),
+                1 => {
+                    requested
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other".into());
+                }
+                2 => requested.launch.recipe.working_directory.push("other"),
+                _ => {
+                    requested
+                        .launch
+                        .recipe
+                        .unset_environment
+                        .insert("HOME".into());
+                }
+            }
+            assert!(
+                registry
+                    .retired_history_candidate(&requested)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            registry
+                .retired_history_candidate(&source)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn history_candidate_refuses_ambiguous_complete_matching_rows() {
+        let (_root, mut registry, _actor, owner, source, scope) = history_candidate_fixture();
+        let second = Uuid::new_v4();
+        registry
+            .register_native_actor_ownership(second, &owner, &source, Ok(&scope))
+            .unwrap();
+        registry
+            .commit_native_actor_retirement(
+                second,
+                &owner,
+                &source,
+                Ok(&scope),
+                source.launch.session_id.as_deref(),
+            )
+            .unwrap();
+        assert!(
+            registry
+                .retired_history_candidate(&source)
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+    }
+
+    #[test]
+    fn history_candidate_refuses_missing_confirmation_unknown_scope_and_pending() {
+        for variant in 0..3 {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut registry = Registry::at(&root.path().join("registry")).unwrap();
+            let (actor, owner, mut source, scope) = fixture(root.path());
+            source.launch.session_id = Some("11111111-1111-4111-8111-111111111111".into());
+            let captured = if variant == 1 {
+                Err("historical scope unknown")
+            } else {
+                Ok(&scope)
+            };
+            if variant == 2 {
+                registry
+                    .register_pending_native_actor_ownership(actor, &owner, &source, captured)
+                    .unwrap();
+            } else {
+                registry
+                    .register_native_actor_ownership(actor, &owner, &source, captured)
+                    .unwrap();
+            }
+            let confirmed = (variant != 0).then_some(source.launch.session_id.as_deref().unwrap());
+            registry
+                .commit_native_actor_retirement(actor, &owner, &source, captured, confirmed)
+                .unwrap();
+            assert!(registry.retired_history_candidate(&source).is_err());
+        }
+    }
+
+    #[test]
+    fn history_candidate_census_limits_are_unavailable_not_partial_uniqueness() {
+        let (_root, registry, _actor, _owner, source, _scope) = history_candidate_fixture();
+        for variant in 0..3 {
+            let budget = HistoryCensusBudget {
+                rows: if variant == 0 { 0 } else { HISTORY_CENSUS_ROWS },
+                bytes: if variant == 1 {
+                    1
+                } else {
+                    HISTORY_CENSUS_BYTES
+                },
+                deadline: if variant == 2 {
+                    std::time::Instant::now()
+                } else {
+                    std::time::Instant::now() + HISTORY_CENSUS_TIME
+                },
+            };
+            assert!(
+                registry
+                    .retired_history_candidate_with_budget(&source, budget)
+                    .is_err()
+            );
+        }
+        assert!(
+            registry
+                .retired_history_candidate(&source)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn history_candidate_census_rejects_corrupt_unrelated_metadata() {
+        let (root, mut registry, _actor, _owner, source, _scope) = history_candidate_fixture();
+        let (other, owner, unrelated, scope) = fixture(root.path());
+        registry
+            .register_native_actor_ownership(other, &owner, &unrelated, Ok(&scope))
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "UPDATE native_actor_ownerships SET ownership='invalid-json' WHERE actor=?1",
+                [other.to_string()],
+            )
+            .unwrap();
+        assert!(registry.retired_history_candidate(&source).is_err());
+    }
+
+    #[test]
+    fn history_candidate_census_rejects_a_changed_captured_tuple() {
+        let (_root, registry, actor, _owner, source, _scope) = history_candidate_fixture();
+        let mut retirement = registry.native_actor_retirement(actor).unwrap().unwrap();
+        retirement.scope.as_mut().unwrap().inode += 1;
+        registry
+            .db
+            .execute(
+                "UPDATE native_actor_retirements SET receipt=?1 WHERE actor=?2",
+                params![
+                    serde_json::to_string(&retirement).unwrap(),
+                    actor.to_string()
+                ],
+            )
+            .unwrap();
+        assert!(registry.retired_history_candidate(&source).is_err());
+    }
 
     // Exact a96 ownership/retirement field layout: serde accepted unknown fields.
     // Do not reuse the new deny_unknown_fields payload as an old-reader oracle.

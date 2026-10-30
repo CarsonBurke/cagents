@@ -4,6 +4,7 @@ mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
 pub(super) mod capacity;
+pub(super) mod lost_holder_history;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;

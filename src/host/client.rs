@@ -468,6 +468,7 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     }
     // Outside the control gate: unwatching waits for a board being assembled,
     // which must not hold up a writer queued at the gate.
+    super::chat::lost_holder_history::settle_revoked_readers(host);
     let work = host.lock().unwrap_or_else(|p| p.into_inner()).work.clone();
     if let Some(work) = work {
         work.unwatch(client_id);

@@ -41,7 +41,9 @@ mod mailbox;
 mod native_actor;
 mod native_actor_retirement;
 pub(super) use native_actor::NativeActorEvent;
-pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
+pub(super) use native_actor_retirement::{
+    NativeActorOwnership, NativeActorRetirement, RetiredHistoryCandidate,
+};
 mod navigation;
 mod schema;
 mod terminal_owners;

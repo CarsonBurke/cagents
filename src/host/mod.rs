@@ -558,6 +558,12 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         drop(work_board);
         finish_shutdown_owners(&host, &mut runtime_error, true);
     }
+    // The committed-successor path above does not use the ordinary retry
+    // predicate. Its listener/lease must likewise outlive original readers.
+    while !chat::lost_holder_history::finish_shutdown_readers(&host) {
+        tracing::warn!("daemon shutdown retains an unsettled original history reader");
+        thread::park_timeout(std::time::Duration::from_millis(100));
+    }
     for client in clients {
         let _ = client.join();
     }
@@ -619,6 +625,11 @@ fn finish_shutdown_owners(
     runtime_error: &mut Option<io::Error>,
     close_deliveries: bool,
 ) -> bool {
+    // Reader handles/cache owners settle off HostState before releasing their
+    // separate credit. A timeout retains the original shutdown barrier.
+    if !chat::lost_holder_history::finish_shutdown_readers(host) {
+        return false;
+    }
     let (handles, deliveries) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !close_deliveries && state.ordinary_exit_cleanup_blocked() {

@@ -1792,13 +1792,13 @@ fn reload_history(session: &Session) -> Result<chat::runtime::Store, String> {
     chat::runtime::preflight(&spec, &mut initial)
 }
 
-type LoadedHistory = (
+pub(super) type LoadedHistory = (
     chat::protocol::ProcessSpec,
     Box<dyn chat::protocol::Adapter>,
     chat::protocol::Step,
 );
 
-fn load_history(session: &Session) -> Result<LoadedHistory, String> {
+pub(super) fn load_history(session: &Session) -> Result<LoadedHistory, String> {
     if has_native_owner(session).map_err(|error| error.message)? {
         return Err("An authenticated native provider owner remains".into());
     }

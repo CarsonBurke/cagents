@@ -345,6 +345,9 @@ pub(crate) struct HostState {
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
+    /// Data-only history reader slots, including revoked and unsettled owners.
+    /// This is independent of native chat ownership and capacity.
+    pub(super) history_readers: super::chat::lost_holder_history::ReaderSlots,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
     /// retained conversations a restore could not reattach.
     pub(super) upgrade_evidence: Option<Arc<crate::upgrade::handoff::Store>>,
@@ -467,6 +470,7 @@ impl HostState {
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
             chat_resolutions: BTreeMap::new(),
+            history_readers: Default::default(),
             upgrade_evidence: None,
         }
     }
@@ -512,6 +516,7 @@ impl HostState {
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+        self.history_readers.revoke_client(client_id);
         self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
@@ -889,6 +894,7 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        self.history_readers.revoke_client(client_id);
         self.chat_resolutions.remove(&client_id);
         if self.notification_watchers.remove(&client_id).is_some()
             && let Some(notifications) = &self.notifications
