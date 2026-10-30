@@ -85,12 +85,27 @@ fn command_bytes(command:Option<&RawCommandCall>)->Result<Vec<u8>,String> {
     command.map(serde_json::to_vec).transpose().map_err(err).map(|value|value.unwrap_or_default())
 }
 fn source_error(error:impl ToString)->SourceError {SourceError::Transport(error.to_string())}
+fn input_representation(value: i64) -> Result<RawRepresentation, String> {
+    match value {
+        0 => Ok(RawRepresentation::StreamJson),
+        1 => Ok(RawRepresentation::CanonicalJson),
+        _ => Err("Original tool source has an unsupported representation".into()),
+    }
+}
 
 pub(super) fn revoked(db:&Connection,source:&SourceKey)->Result<bool,String> {
     db.query_row("SELECT EXISTS(SELECT 1 FROM raw_tool_revoked WHERE agent=?1 AND id=?2)",params![agent(source),source.source_id],|row|row.get(0)).map_err(err)
 }
 impl Store {
     pub(super) fn raw_guard(&self)->Result<(),String> {guard(&self.db,self.raw_sources.nonce)}
+    fn raw_read_guard(&self) -> Result<(), String> {
+        // A failed cleanup can leave both the old rows and their nonce intact.
+        // The reset's in-memory revocation must still fence every raw reader.
+        if self.raw_read_generation != self.canonical_generation {
+            return Err("Original tool source was revoked by a conversation reset".into());
+        }
+        self.raw_guard()
+    }
     fn raw_refused(&mut self,message:String)->Result<Option<String>,String> {
         let first=self.raw_sources.blocked.is_none();
         self.raw_sources.blocked=Some(message.clone());self.raw_sources.open.clear();self.raw_sources.open_bytes=0;self.dirty=true;
@@ -290,28 +305,32 @@ impl Store {
     }
     pub(super) fn raw_parts(&self,id:&str)->Result<Vec<RawSourcePart>,String>{
         let _read=self.db.unchecked_transaction().map_err(err)?;
-        self.raw_guard()?;if self.raw_sources.blocked.is_some(){return Ok(Vec::new());}
+        self.raw_read_guard()?;if self.raw_sources.blocked.is_some(){return Ok(Vec::new());}
         let row:Option<(String,i64,usize,usize,u64)>=self.db.query_row("SELECT name,representation,input_len,command_len,epoch FROM raw_tool_sources WHERE agent='' AND id=?1 AND state=1 AND NOT EXISTS(SELECT 1 FROM raw_tool_revoked r WHERE r.agent='' AND r.id=raw_tool_sources.id)",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(err)?;
         let Some((name,rep,input,command,revision))=row else{return Ok(Vec::new());};
+        let representation = input_representation(rep)?;
         let epoch=SourceEpoch{incarnation:self.source_incarnation,revision};
-        let mut parts=vec![RawSourcePart{item_id:id.into(),source:key("",id),field:RawSourceField::ToolInput,epoch,source_len:input,metadata:RawSourceMetadata{tool_name:name.clone(),representation:if rep==0{RawRepresentation::StreamJson}else{RawRepresentation::CanonicalJson},complete_call:true}}];
+        let mut parts=vec![RawSourcePart{item_id:id.into(),source:key("",id),field:RawSourceField::ToolInput,epoch,source_len:input,metadata:RawSourceMetadata{tool_name:name.clone(),representation,complete_call:true}}];
         if command>0{parts.push(RawSourcePart{item_id:id.into(),source:key("",id),field:RawSourceField::CommandCall,epoch,source_len:command,metadata:RawSourceMetadata{tool_name:name,representation:RawRepresentation::CommandMetadataJson,complete_call:true}});}
         Ok(parts)
     }
     /// Called only while the parent canonical reader holds its read snapshot.
     pub(super) fn raw_command(&self,source:&SourceKey)->Result<Option<RawCommandCall>,String>{
-        self.raw_guard()?;if let Some(reason)=&self.raw_sources.blocked{return Err(reason.clone());}
+        self.raw_read_guard()?;if let Some(reason)=&self.raw_sources.blocked{return Err(reason.clone());}
         if self.raw_revoked(source)?{return Err("Original command was removed".into());}
-        let len:Option<usize>=self.db.query_row("SELECT command_len FROM raw_tool_sources WHERE agent=?1 AND id=?2 AND state=1",params![agent(source),source.source_id],|r|r.get(0)).optional().map_err(err)?;
-        let Some(len)=len.filter(|len|*len>0) else{return Ok(None);};if len>RAW_SOURCE_BYTES{return Err("Original command exceeds read limit".into());}
+        let row:Option<(i64,usize)>=self.db.query_row("SELECT representation,command_len FROM raw_tool_sources WHERE agent=?1 AND id=?2 AND state=1",params![agent(source),source.source_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
+        let Some((representation,len))=row else{return Ok(None);};
+        input_representation(representation)?;
+        if len==0{return Ok(None);}if len>RAW_SOURCE_BYTES{return Err("Original command exceeds read limit".into());}
         serde_json::from_slice(&self.raw_owned_range(source,1,0,len)?).map(Some).map_err(err)
     }
     pub(super) fn raw_original(&mut self,source:&SourceKey)->Result<Option<(String,String)>,String>{
         let _read=self.db.unchecked_transaction().map_err(err)?;
-        self.raw_guard()?;if let Some(reason)=&self.raw_sources.blocked{return Err(reason.clone());}
+        self.raw_read_guard()?;if let Some(reason)=&self.raw_sources.blocked{return Err(reason.clone());}
         if self.raw_revoked(source)?{return Err("Original call was removed".into());}
-        let row:Option<(String,usize,i64)>=self.db.query_row("SELECT name,input_len,state FROM raw_tool_sources WHERE agent=?1 AND id=?2",params![agent(source),source.source_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(err)?;
-        let Some((name,len,state))=row else{return Ok(None);};if state!=SEALED{return Err("Original call is incomplete".into());}if len>RAW_SOURCE_BYTES{return Err("Original call exceeds bounded read limit".into());}
+        let row:Option<(String,i64,usize,i64)>=self.db.query_row("SELECT name,representation,input_len,state FROM raw_tool_sources WHERE agent=?1 AND id=?2",params![agent(source),source.source_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(err)?;
+        let Some((name,representation,len,state))=row else{return Ok(None);};if state!=SEALED{return Err("Original call is incomplete".into());}if len>RAW_SOURCE_BYTES{return Err("Original call exceeds bounded read limit".into());}
+        input_representation(representation)?;
         let bytes=self.raw_owned_range(source,0,0,len)?;Ok(Some((name,String::from_utf8(bytes).map_err(err)?)))
     }
 
@@ -328,12 +347,13 @@ impl Store {
     pub(crate) fn raw_source_page(&mut self,query:RawSourceQuery)->Result<RawSourcePage,SourceError> {
         if !valid_key(&query.source)||!(4..=PAGE_BYTES).contains(&query.limit)||(query.offset>0&&(query.until.is_none()||query.expected_epoch.is_none()))||query.until.is_some()&&query.expected_epoch.is_none() {return Err(SourceError::InvalidRange);}
         let _read=self.db.unchecked_transaction().map_err(source_error)?;
-        self.raw_guard().map_err(source_error)?;
+        self.raw_read_guard().map_err(source_error)?;
         if let Some(reason)=&self.raw_sources.blocked {return Err(source_error(reason));}
         if self.raw_revoked(&query.source).map_err(source_error)? {return Err(SourceError::NotFound);}
         let record:Option<(String,i64,usize,usize,i64,u64)>=self.db.query_row("SELECT name,representation,input_len,command_len,state,epoch FROM raw_tool_sources WHERE agent=?1 AND id=?2",params![agent(&query.source),query.source.source_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional().map_err(source_error)?;
         let (name,representation,input_len,command_len,state,revision)=record.ok_or(SourceError::NotFound)?;
         if state!=SEALED {return Err(source_error("Original tool input is still streaming or unavailable"));}
+        let representation = input_representation(representation).map_err(source_error)?;
         let field=match query.field {RawSourceField::ToolInput=>0,RawSourceField::CommandCall=>1};
         let length=if field==0 {input_len}else{command_len};if field==1&&length==0 {return Err(SourceError::Unsupported);}
         let epoch=SourceEpoch{incarnation:self.source_incarnation,revision};
@@ -348,7 +368,7 @@ impl Store {
         let text=String::from_utf8(bytes[..keep].to_vec()).map_err(|_|source_error("Original tool source is not valid UTF-8"))?;
         if keep==0&&query.offset<until {return Err(SourceError::InvalidRange);}
         let next_offset=query.offset+keep;
-        Ok(RawSourcePage{source:query.source,field:query.field,epoch,source_len:until,offset:query.offset,next_offset,text,complete:next_offset==until,metadata:RawSourceMetadata{tool_name:name,representation:if field==1 {RawRepresentation::CommandMetadataJson}else if representation==0 {RawRepresentation::StreamJson}else{RawRepresentation::CanonicalJson},complete_call:until==length}})
+        Ok(RawSourcePage{source:query.source,field:query.field,epoch,source_len:until,offset:query.offset,next_offset,text,complete:next_offset==until,metadata:RawSourceMetadata{tool_name:name,representation:if field==1 {RawRepresentation::CommandMetadataJson}else{representation},complete_call:until==length}})
     }
 }
 
@@ -397,8 +417,235 @@ mod tests {
         store.apply(Event::ItemsRemoved{ids:vec!["private".into()]}).unwrap();full(&mut store,"private","null");
         assert_eq!(store.raw_source_page(query("private")),Err(SourceError::NotFound));assert_eq!(store.db.query_row("SELECT count(*) FROM raw_tool_sources",[],|r|r.get::<_,usize>(0)).unwrap(),0);
         store.db.execute_batch("CREATE TRIGGER refuse_raw_reset BEFORE DELETE ON raw_tool_revoked BEGIN SELECT RAISE(FAIL,'retained privacy proof');END;").unwrap();assert!(store.apply(Event::Reset{reason:"test".into()}).is_err());
-        assert_eq!(store.raw_source_page(query("private")),Err(SourceError::NotFound));
+        assert!(store.raw_source_page(query("private")).is_err());
         store.db.execute_batch("DROP TRIGGER refuse_raw_reset").unwrap();store.apply(Event::Reset{reason:"test".into()}).unwrap();full(&mut store,"private","null");assert_ne!(store.raw_source_page(query("private")).unwrap().epoch,old);
+    }
+    #[test]
+    fn failed_reset_revokes_retained_original_reads_without_changing_stored_identity_or_bytes() {
+        fn snapshot(store: &Store) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+            [
+                "SELECT * FROM raw_source_schema ORDER BY singleton",
+                "SELECT * FROM raw_tool_sources ORDER BY agent,id",
+                "SELECT * FROM raw_tool_chunks ORDER BY agent,id,field,position",
+                "SELECT * FROM raw_tool_revoked ORDER BY agent,id",
+            ]
+            .map(|sql| {
+                let mut statement = store.db.prepare(sql).unwrap();
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..row.as_ref().column_count())
+                            .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap();
+                rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            })
+            .into()
+        }
+
+        let mut store = Store::new().unwrap();
+        let source = key("", "retained");
+        let input = r#"{"path":"retained","contents":"λ"}"#;
+        let command = RawCommandCall {
+            label: "retained command".into(),
+            command: "printf 'retained original'".into(),
+            working_directory: "/fixture".into(),
+            action: CommandAction::Run,
+        };
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: source.clone(),
+                name: "Write".into(),
+                input: input.into(),
+                command: Some(command.clone()),
+            }))
+            .unwrap();
+        let original = store.raw_source_page(query("retained")).unwrap();
+        assert_eq!(original.text, input);
+        assert_eq!(store.raw_command(&source).unwrap(), Some(command.clone()));
+        assert_eq!(store.raw_parts("retained").unwrap().len(), 2);
+        let before = snapshot(&store);
+        let generation = store.canonical_generation;
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER refuse_retained_reset BEFORE DELETE ON raw_tool_sources \
+                 BEGIN SELECT RAISE(ABORT,'retained original reset failure');END;",
+            )
+            .unwrap();
+
+        let error = store
+            .apply(Event::Reset {
+                reason: "test".into(),
+            })
+            .unwrap_err();
+        assert!(error.contains("retained original reset failure"), "{error}");
+        assert_ne!(store.canonical_generation, generation);
+        assert_eq!(
+            snapshot(&store),
+            before,
+            "rollback retains the original row, nonce and every byte"
+        );
+        guard(&store.db, store.raw_sources.nonce).unwrap();
+        for field in [RawSourceField::ToolInput, RawSourceField::CommandCall] {
+            for expected_epoch in [None, Some(original.epoch)] {
+                let mut request = query("retained");
+                request.field = field;
+                request.expected_epoch = expected_epoch;
+                assert!(
+                    matches!(store.raw_source_page(request), Err(SourceError::Transport(reason)) if reason.contains("revoked by a conversation reset"))
+                );
+            }
+        }
+        assert!(store.raw_parts("retained").is_err());
+        assert!(store.raw_original(&source).is_err());
+        assert!(store.raw_command(&source).is_err());
+        assert_eq!(
+            snapshot(&store),
+            before,
+            "refused reads do not mutate the retained source"
+        );
+
+        store
+            .db
+            .execute_batch("DROP TRIGGER refuse_retained_reset")
+            .unwrap();
+        assert!(
+            store.raw_source_page(query("retained")).is_err(),
+            "removing the fault does not restore authority"
+        );
+        store
+            .apply(Event::Reset {
+                reason: "recovered".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.raw_source_page(query("retained")),
+            Err(SourceError::NotFound)
+        );
+        full(&mut store, "retained", r#"{"new_generation":true}"#);
+        let current = store.raw_source_page(query("retained")).unwrap();
+        assert_eq!(current.text, r#"{"new_generation":true}"#);
+        assert_ne!(current.epoch, original.epoch);
+        assert_eq!(store.raw_parts("retained").unwrap()[0].epoch, current.epoch);
+        let mut old = query("retained");
+        old.expected_epoch = Some(original.epoch);
+        assert_eq!(store.raw_source_page(old), Err(SourceError::Changed));
+    }
+    #[test]
+    fn raw_read_authority_returns_only_after_the_entire_reset_succeeds() {
+        let mut store = Store::new().unwrap();
+        full(&mut store, "call", "{}");
+        store
+            .apply(Event::Item(Item {
+                id: "call".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Tool {
+                    name: "Write".into(),
+                    input: "{}".into(),
+                    output: String::new(),
+                    status: ToolStatus::Succeeded,
+                },
+            }))
+            .unwrap();
+        store.db.execute_batch("CREATE TRIGGER refuse_item_reset BEFORE DELETE ON items BEGIN SELECT RAISE(ABORT,'later reset failure');END;").unwrap();
+        let error = store
+            .apply(Event::Reset {
+                reason: "test".into(),
+            })
+            .unwrap_err();
+        assert!(error.contains("later reset failure"), "{error}");
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT count(*) FROM raw_tool_sources", [], |row| row
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        full(&mut store, "late", "null");
+        assert!(
+            store.raw_source_page(query("late")).is_err(),
+            "a later capture cannot undo the failed Reset fence"
+        );
+        store
+            .db
+            .execute_batch("DROP TRIGGER refuse_item_reset")
+            .unwrap();
+        store
+            .apply(Event::Reset {
+                reason: "recovered".into(),
+            })
+            .unwrap();
+        full(&mut store, "late", "null");
+        assert_eq!(store.raw_source_page(query("late")).unwrap().text, "null");
+    }
+    #[test]
+    fn unknown_stored_representation_never_claims_a_canonical_original() {
+        let mut store = Store::new().unwrap();
+        let source = key("", "call");
+        let command = RawCommandCall {
+            label: "original command".into(),
+            command: "printf original".into(),
+            working_directory: "/fixture".into(),
+            action: CommandAction::Run,
+        };
+        store
+            .apply(Event::RawToolCapture(RawToolCapture::Full {
+                source: source.clone(),
+                name: "Write".into(),
+                input: "{}".into(),
+                command: Some(command.clone()),
+            }))
+            .unwrap();
+        let before = store.raw_source_page(query("call")).unwrap();
+        assert_eq!(
+            before.metadata.representation,
+            RawRepresentation::CanonicalJson
+        );
+        store
+            .db
+            .execute(
+                "UPDATE raw_tool_sources SET representation=9 WHERE id='call'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .raw_parts("call")
+                .unwrap_err()
+                .contains("unsupported representation")
+        );
+        assert!(
+            store
+                .raw_original(&source)
+                .unwrap_err()
+                .contains("unsupported representation")
+        );
+        assert!(
+            store
+                .raw_command(&source)
+                .unwrap_err()
+                .contains("unsupported representation")
+        );
+        for field in [RawSourceField::ToolInput, RawSourceField::CommandCall] {
+            let mut request = query("call");
+            request.field = field;
+            assert!(
+                matches!(store.raw_source_page(request), Err(SourceError::Transport(reason)) if reason.contains("unsupported representation"))
+            );
+        }
+        store
+            .db
+            .execute(
+                "UPDATE raw_tool_sources SET representation=1 WHERE id='call'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.raw_source_page(query("call")).unwrap(), before);
+        assert_eq!(store.raw_command(&source).unwrap(), Some(command));
     }
     #[test]
     fn corrupt_raw_chunks_never_promote_a_partial_original(){

@@ -60,6 +60,8 @@ pub(crate) struct Store {
     db: Connection,
     /// A reset revokes every previously issued canonical source reader.
     canonical_generation: uuid::Uuid,
+    /// Raw reads resume only after every step of that reset succeeds.
+    raw_read_generation: uuid::Uuid,
     raw_sources: raw::State,
     file_revision: u64,
     child_file_ordinal: i64,
@@ -166,9 +168,11 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             db.execute_batch(child_tools::SCHEMA).map_err(|e| e.to_string())?;
             let raw_sources=raw::initialize(&mut db)?;
+            let canonical_generation = uuid::Uuid::new_v4();
             Ok(Self {
                 raw_sources,
-                canonical_generation: uuid::Uuid::new_v4(),
+                canonical_generation,
+                raw_read_generation: canonical_generation,
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -888,6 +892,7 @@ impl Store {
                 self.pending_earlier = None;
                 self.latest_boundary = None;
                 self.dirty = true;
+                self.raw_read_generation = self.canonical_generation;
                 out.push(Event::Reset { reason });
                 return Ok(out);
             }
