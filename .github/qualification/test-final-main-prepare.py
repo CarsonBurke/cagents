@@ -303,10 +303,27 @@ class PreparationAlgorithms(unittest.TestCase):
     def test_source_wiring_keeps_global_preparation_before_the_first_desktop_and_no_current_override(self):
         nodes = ast.parse(SOURCE).body
         main = next(node for node in nodes if isinstance(node,ast.FunctionDef) and node.name == 'main')
-        body = ast.get_source_segment(SOURCE,main)
-        self.assertLess(body.index('admit_references('),body.index('.resolve('))
-        self.assertLess(body.index('admit_references('),body.index('subprocess.'))
-        self.assertLess(body.index('admit_references('),body.index('out.mkdir('))
+        calls = [node for node in ast.walk(main) if isinstance(node,ast.Call)]
+        named = lambda call,name:isinstance(call.func,ast.Name) and call.func.id == name
+        attr = lambda node,owner,name:(isinstance(node,ast.Attribute) and isinstance(node.value,ast.Name)
+                                      and node.value.id == owner and node.attr == name)
+        admission = [call for call in calls if named(call,'admit_references')]
+        self.assertEqual(len(admission),1)
+        # Source coordinates belong to executable AST nodes, never comments
+        # containing e.g. "subprocess.". Require every expected boundary to exist.
+        boundaries = {
+            'path resolve':[call for call in calls if isinstance(call.func,ast.Attribute) and call.func.attr == 'resolve'],
+            'directory creation':[call for call in calls if isinstance(call.func,ast.Attribute) and call.func.attr == 'mkdir'],
+            'original child owner':[call for call in calls if named(call,'PreparationChildren')],
+            'owned metadata child':[call for call in calls if attr(call.func,'owner','capture')],
+            'owned build child adapter':[call for call in calls if named(call,'command')],
+            'temporary root factory':[call for call in calls if attr(call.func,'tempfile','mkdtemp')],
+            'Popen factory reference':[node for node in ast.walk(main) if attr(node,'subprocess','Popen')],
+        }
+        for name, values in boundaries.items():
+            self.assertTrue(values,name + ' boundary must exist')
+            for boundary in values:
+                self.assertLess(admission[0].lineno,boundary.lineno,name + ' must follow source-pinned admission')
         self.assertNotIn('allow-current',SOURCE)
         workflow = Path(__file__).parent.parent.joinpath('workflows/qualify-final-main-integration.yml').read_text()
         self.assertLess(workflow.index('id: native_admission'),workflow.index('uses: ./control/.github/actions/setup-linux'))
