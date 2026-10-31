@@ -5,7 +5,7 @@ use std::{
     fs, io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt, net::UnixStream, process::CommandExt},
+        unix::{ffi::OsStrExt, net::UnixStream, process::CommandExt},
     },
     path::Path,
     process::{Command, Stdio},
@@ -15,6 +15,7 @@ use std::{
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
+const INVISIBLE_MANAGER: &str = "user manager peer is not visible and owned";
 
 fn cgroup(pid: u32) -> io::Result<String> {
     let contents = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
@@ -40,13 +41,14 @@ pub(crate) fn manager_available() -> bool {
 /// Numeric PIDs in StartTransientUnit belong to the manager's PID namespace.
 /// A visible peer PID alone does not suffice: a descendant namespace's manager
 /// is visible too, but would interpret the same number differently. The peer
-/// pidfd binds its lifetime without reopening a reusable numeric PID; the
-/// namespace ioctl also avoids interpreting a foreign /proc mount's PID view.
-/// Missing kernel support or denied proof deliberately leaves launch unchanged.
+/// pidfd binds its lifetime without reopening a reusable numeric PID, and its
+/// procfs fdinfo names the namespaces it occupies. The fdinfo needs no ptrace
+/// access, unlike PIDFD_GET_PID_NAMESPACE or /proc/PID/ns, which the OS user
+/// manager denies us because it holds CAP_WAKE_ALARM. Missing kernel support or
+/// denied proof deliberately leaves launch unchanged.
 struct ManagerNamespace {
     _connection: UnixStream,
     peer: OwnedFd,
-    _namespace: fs::File,
 }
 
 impl ManagerNamespace {
@@ -78,9 +80,7 @@ impl ManagerNamespace {
         // SAFETY: getsockopt initialized the complete ucred above.
         let credentials = unsafe { credentials.assume_init() };
         if credentials.pid <= 0 || credentials.uid != uid {
-            return Err(io::Error::other(
-                "user manager peer is not visible and owned",
-            ));
+            return Err(io::Error::other(INVISIBLE_MANAGER));
         }
         let mut descriptor = -1;
         let mut size = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -105,37 +105,55 @@ impl ManagerNamespace {
         if size as usize != std::mem::size_of::<i32>() || !peer_alive(&peer) {
             return Err(io::Error::other("manager peer is no longer live"));
         }
-        // SAFETY: this ioctl returns a new fd for the exact pidfd's active PID
-        // namespace, or fails. Its third argument must be explicitly zero;
-        // pidfs rejects nonzero arguments. No numeric /proc/PID lookup occurs.
-        let namespace = unsafe {
-            libc::ioctl(
-                peer.as_raw_fd(),
-                libc::PIDFD_GET_PID_NAMESPACE,
-                0 as libc::c_ulong,
-            )
-        };
-        if namespace < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful namespace ioctl transferred a new owned fd.
-        let namespace = unsafe { fs::File::from_raw_fd(namespace) };
-        let current = fs::File::open("/proc/self/ns/pid")?;
-        if !same_namespace(&namespace, &current)? || !peer_alive(&peer) {
+        let own = read_procfs("/proc/self/status")?;
+        let peer_info = read_procfs(&format!("/proc/self/fdinfo/{}", peer.as_raw_fd()))?;
+        if !same_namespace(&own, std::process::id(), &peer_info, credentials.pid)
+            || !peer_alive(&peer)
+        {
             return Err(io::Error::other("user manager uses another PID namespace"));
         }
         Ok(Self {
             _connection: connection,
             peer,
-            _namespace: namespace,
         })
     }
 }
 
-fn same_namespace(left: &fs::File, right: &fs::File) -> io::Result<bool> {
-    let left = left.metadata()?;
-    let right = right.metadata()?;
-    Ok((left.dev(), left.ino()) == (right.dev(), right.ino()))
+/// Only the kernel's procfs reports namespaces; another filesystem mounted on
+/// /proc could claim any.
+fn read_procfs(path: &str) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the open file and correctly sized output remain live.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), statfs.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs initialized the complete statfs above.
+    if unsafe { statfs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+        return Err(io::Error::other("/proc is not procfs"));
+    }
+    let mut contents = String::new();
+    io::Read::read_to_string(&mut file, &mut contents)?;
+    Ok(contents)
+}
+
+/// procfs lists NSpid from its own PID namespace down to the process's. One
+/// entry for ourselves proves /proc views our namespace rather than an
+/// ancestor's, and then one entry for the peer, matching the PID the kernel
+/// translated into our namespace, proves the peer shares it.
+fn same_namespace(own: &str, own_pid: u32, peer: &str, peer_pid: i32) -> bool {
+    let nspid = |status: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("NSpid:"))
+            .map(|pids| {
+                pids.split_whitespace()
+                    .map(str::parse::<i64>)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+    };
+    matches!(nspid(own), Some(Ok(pids)) if pids == [i64::from(own_pid)])
+        && matches!(nspid(peer), Some(Ok(pids)) if pids == [i64::from(peer_pid)])
 }
 
 fn peer_alive(peer: &OwnedFd) -> bool {
@@ -388,13 +406,7 @@ pub(crate) mod tests {
     use super::*;
     #[test]
     fn unproved_manager_never_attempts_numeric_pid_enrollment() {
-        for error in [
-            libc::ENOPROTOOPT,
-            libc::ENOTTY,
-            libc::EPERM,
-            libc::EACCES,
-            libc::ENOENT,
-        ] {
+        for error in [libc::ENOPROTOOPT, libc::EPERM, libc::EACCES, libc::ENOENT] {
             with_verified_manager(Err(io::Error::from_raw_os_error(error)), || {
                 panic!("unproved manager must not receive a scope request")
             })
@@ -403,12 +415,67 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn kernel_namespace_identity_is_not_an_unrelated_namespace_inode() {
-        let current = fs::File::open("/proc/self/ns/pid").unwrap();
-        let same = fs::File::open("/proc/self/ns/pid").unwrap();
-        let other = fs::File::open("/proc/self/ns/mnt").unwrap();
-        assert!(same_namespace(&current, &same).unwrap());
-        assert!(!same_namespace(&current, &other).unwrap());
+    fn namespace_proof_requires_one_shared_namespace_view() {
+        let own = "Name:\tcagentsd\nNSpid:\t40\n";
+        let peer = "pos:\t0\nPid:\t7\nNSpid:\t7\n";
+        let cases = [
+            (own, 40, peer, 7, true),
+            // /proc belongs to an ancestor namespace.
+            ("NSpid:\t900\t40\n", 40, peer, 7, false),
+            // The peer lives in a descendant namespace.
+            (own, 40, "NSpid:\t7\t1\n", 7, false),
+            (own, 40, "NSpid:\t8\n", 7, false),
+            // An exited peer, or a kernel without NSpid in pidfd fdinfo.
+            (own, 40, "Pid:\t-1\nNSpid:\t-1\n", 7, false),
+            (own, 40, "pos:\t0\nPid:\t7\n", 7, false),
+            (own, 41, peer, 7, false),
+            ("Name:\tcagentsd\n", 40, peer, 7, false),
+        ];
+        for (own, own_pid, peer, peer_pid, proved) in cases {
+            assert_eq!(
+                same_namespace(own, own_pid, peer, peer_pid),
+                proved,
+                "{own:?} {peer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_reports_are_read_only_from_procfs() {
+        let directory = tempfile::tempdir().unwrap();
+        let forged = directory.path().join("status");
+        fs::write(&forged, "NSpid:\t1\n").unwrap();
+        assert_eq!(
+            read_procfs(forged.to_str().unwrap())
+                .unwrap_err()
+                .to_string(),
+            "/proc is not procfs"
+        );
+        assert!(read_procfs("/proc/self/status").unwrap().contains("NSpid:"));
+    }
+
+    #[test]
+    fn the_os_user_manager_is_proved_without_ptrace_access() {
+        if !manager_available() {
+            eprintln!("no OS user manager; scope isolation unqualified here");
+            return;
+        }
+        let own = read_procfs("/proc/self/status").unwrap();
+        if !own.lines().any(|line| {
+            line.strip_prefix("NSpid:")
+                .is_some_and(|pids| pids.split_whitespace().count() == 1)
+        }) {
+            eprintln!("/proc views an ancestor PID namespace; scope isolation unqualified here");
+            return;
+        }
+        match ManagerNamespace::connect() {
+            Ok(_) => {}
+            // A container sharing /run/user cannot see the host's manager.
+            Err(error) if error.to_string() == INVISIBLE_MANAGER => {
+                eprintln!("OS user manager is outside our PID namespace; unqualified here");
+            }
+            Err(error) => panic!("OS user manager proof failed: {error}"),
+        }
     }
 
     #[test]
@@ -426,14 +493,11 @@ pub(crate) mod tests {
         let proof = ManagerNamespace::from_connection(connection, super::super::current_uid());
         match proof {
             Ok(proof) => {
-                let current = fs::File::open("/proc/self/ns/pid").unwrap();
-                assert!(same_namespace(&proof._namespace, &current).unwrap());
                 let peer = proof.peer.as_raw_fd();
-                let namespace = proof._namespace.as_raw_fd();
                 let connection = proof._connection.as_raw_fd();
                 let mut requested = false;
                 let error = with_verified_manager(Ok(proof), || {
-                    for descriptor in [peer, namespace, connection] {
+                    for descriptor in [peer, connection] {
                         // SAFETY: the proof must retain all owned descriptors
                         // until the request returns; F_GETFD has no side effect.
                         let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
@@ -451,10 +515,7 @@ pub(crate) mod tests {
             Err(error) => {
                 // Older kernels and confinement can deny these optional APIs.
                 // Verify real refusal, not a fictional positive manager proof.
-                assert!(matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOPROTOOPT | libc::ENOTTY | libc::EPERM | libc::EACCES)
-                ));
+                assert!(matches!(error.raw_os_error(), Some(libc::ENOPROTOOPT)));
                 eprintln!("kernel manager proof unavailable; no scope request: {error}");
                 with_verified_manager(Err(error), || panic!("unproved peer request")).unwrap();
             }
