@@ -504,6 +504,39 @@ answer; a worktree's pin is forgotten with the worktree.
 
 ### Removing a worktree
 
+In a non-primary worktree card's actions menu, choose **Remove worktree…**.
+The inline review shows the original path, what removal keeps, and what it
+deletes. The branch stays by default; **Also delete the landed branch** is an
+optional choice available only for landed work. **Remove worktree** is the
+final confirmation.
+
+For unsaved work, **Save snapshot first** is preferred when a snapshot can
+preserve it. **Discard unsaved work** always requires an explicit choice.
+Ignored entries are deleted even with a snapshot; the review shows their count
+and a bounded preview. Filtered files and nested repositories may also contain
+work a snapshot cannot preserve. Review these losses before confirming.
+
+Use **Inspect again** and review the new plan when content changes. Closing the
+Work pane does not cancel a pending removal. If its result is not confirmed,
+inspect the original worktree and saved snapshots before any retry; the app
+does not automatically resend removal. A failed reinspection leaves the result
+unresolved. **Keep unresolved; review other work** keeps the full original
+request and its uncertainty for the current application lifetime, so unrelated
+worktrees can still be reviewed. This is memory-only, not recovery across app
+restarts. The same original card or absolute path stays blocked, even if its
+branch, contents or host change. **Review original** returns to a read-only
+view: **Inspect again** uses the original host, and neither a missing path nor
+a successful inspection proves that removal succeeded or enables removal.
+**Back to unresolved removals** closes only that view. Up to 16 unresolved
+operations can be kept; at capacity new removals stop, while browsing and
+original inspection remain available. Records are never evicted or expired
+automatically, and removals are never resent automatically.
+
+A saved snapshot's receipt shows its actual ref and a restore
+command: use that ref in another worktree of the same project on the same
+device. If branch deletion fails, the worktree may already be removed; read the
+receipt before taking further action.
+
 `cagents work rm` removes a card's worktree and keeps its branch. It first
 judges what removal would lose:
 
