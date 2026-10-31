@@ -1,0 +1,343 @@
+{
+  "schema": "startup-aeb-Agent-safe47-focused-packet-author-freeze-v1",
+  "utc": "2026-10-31T12:21:31.275391+00:00",
+  "role": "Bounded current packet source author for Root; not the independent reviewer of this candidate",
+  "status": "FROZEN_SOURCE_PREPARATION_NOT_QUEUED_NOT_ADMITTED_NO_GRANT",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source",
+  "branch": "qualification/fw16-startup-whole-focused-source",
+  "head": "579f9a58eee6561f6f7317284091b99f72172281",
+  "tree": "4f1ddf27876c3ca9e77ebfb1b24070e83fd85f3f",
+  "sole_parent": "9e5e9c605b491365bdb75b83412d0a32872cd81a",
+  "product": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "parents": [
+      "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "1892a6f458828d7b1f38f6e03457bf1a072efb73"
+    ],
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery",
+    "source_pin_count": 30,
+    "all_source_pins_current_frozenGit_live_and_snapshot_equal": true
+  },
+  "primary_pins": {
+    "run-packet.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/run-packet.py",
+      "sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+      "bytes": 81451,
+      "git_blob_oid": "dec747fab9a915110ac32f17df1df58b180602a0"
+    },
+    "plan.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/plan.json",
+      "sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
+      "bytes": 63927,
+      "git_blob_oid": "0151bbadc7ebb57c13c4ada78e4408cc350035e5"
+    },
+    "manifest.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/manifest.json",
+      "sha256": "88b3efed78a640f0c071cb1dd50a9e1352550c65c5568ab9b320eb9cd258b122",
+      "bytes": 25456,
+      "git_blob_oid": "f120b210550c57428f7f271a2fa80dec8372fc3d"
+    },
+    "source-binding.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/source-binding.json",
+      "sha256": "92b313f6588178d976332f00fb6dbec93c776d14cc2e77347e492332c2a5c929",
+      "bytes": 11871,
+      "git_blob_oid": "1551b46d4f33fbf9be8e1b9ecc0fbd39bfab3c38"
+    },
+    "command-data.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/command-data.json",
+      "sha256": "18fd276bdb8496587cb21de0f03a52f1c1afc54fb54918e391f4cfe00b439355",
+      "bytes": 63269,
+      "git_blob_oid": "ce0aad0f36585d481e14a1e0ceb7db94bada73d6"
+    },
+    "current-source-map.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/current-source-map.json",
+      "sha256": "19389aa866bdb12cbf87110ef72a5f4591ae86dedac9e5fc6c03179625f24281",
+      "bytes": 8909,
+      "git_blob_oid": "898086b26a7d0a9e2bd2cc9b70cd06740542668b"
+    },
+    "required-source-contract.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/required-source-contract.json",
+      "sha256": "c48bd1259b424db7eaf2afbdd41c98478233ca42edb508e4eaded0f1727776b2",
+      "bytes": 39199,
+      "git_blob_oid": "a9d7d9612463e7c62acf073037e039e2b631304b"
+    },
+    "execution-template.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/execution-template.json",
+      "sha256": "a08d481eca67e4601ec47f23e4ef69380d6c5fea31fdca467b4e5f3635744869",
+      "bytes": 1747,
+      "git_blob_oid": "67767817b540da5a777b65569bead8869b2867f9"
+    },
+    "source-conservation.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/source-conservation.json",
+      "sha256": "628208d0ad1c5b5278d209cf764bb33f5fd46018b2f12b65b5443b51e8510625",
+      "bytes": 9804,
+      "git_blob_oid": "c6ee308edb35b242f0f984827e449230c2eacee2"
+    },
+    "from-9e5e9c60.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/from-9e5e9c60.diff.json",
+      "sha256": "ee77838bd5eaca5640337688164497d98582872701f39a364b367bc66b0bcaaf",
+      "bytes": 15472,
+      "git_blob_oid": "1b7e0863811979ff803a074c4350d4959ef3557b"
+    },
+    "to-9e5e9c60.inverse.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/to-9e5e9c60.inverse.diff.json",
+      "sha256": "4c5ce216df53fb6c38aabcf29359f91b80ab6f94a5c1e71887c16ae60c2506ab",
+      "bytes": 15484,
+      "git_blob_oid": "bb717e8d953af2f7c18e275bef3f44ed0bf1d17d"
+    },
+    "adoption-port.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/adoption-port.json",
+      "sha256": "2d5f4c80f8d5a8ac95285c87fb8466f96b79a22cbaf7b7057c83493047d83666",
+      "bytes": 1621,
+      "git_blob_oid": "0dcb2ac5c6397fddef91906a1d2d7d1884966b93"
+    },
+    "README.md": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/README.md",
+      "sha256": "b6953d7ece684ad832048b82ad09386b1c6db7929e416476fcf808513ec657e2",
+      "bytes": 3224,
+      "git_blob_oid": "d9cceab6893d709af278b599a410b1745b29ed53"
+    }
+  },
+  "selected_scope": {
+    "name": "Explicit Agent-safe47 focused partial qualification",
+    "source_selected_distinct": 47,
+    "graph_counts": {
+      "cli-lib": 1,
+      "host-lib": 6,
+      "ui-lib": 40
+    },
+    "selected_full_names": [
+      "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+      "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+      "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+      "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+      "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+      "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+      "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+      "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+      "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+      "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+      "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+      "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+      "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+      "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+      "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+      "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+      "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+      "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+      "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+      "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+      "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+      "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+      "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+      "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+      "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+      "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+      "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+      "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+      "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+      "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+      "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+      "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+      "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+      "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+      "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+      "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+      "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+      "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+      "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+      "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+      "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+      "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+      "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+      "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+      "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+      "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
+    ],
+    "actual_execution": null,
+    "actual_selected_passes": null,
+    "actual_inventory": null,
+    "source_inventory_membership_predictions": [
+      1,
+      7,
+      46
+    ],
+    "predictions_are_not_passes": true
+  },
+  "unresolved_required_scope": {
+    "full52_source_contract": 52,
+    "deferred_User_only_count": 5,
+    "deferred_full_names": [
+      "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+      "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel"
+    ],
+    "deferred_body_invocations": null,
+    "deferred_pass_ignored_or_skipped_credit": "NONE",
+    "User5_FULL52_native_UX_WHOLE_readiness": "HOLD_UNQUALIFIED",
+    "one_live_plan_only": true
+  },
+  "authority_and_scope": {
+    "actual_caller_authority": "UNKNOWN_UNREAD",
+    "opaque_authority_HOME_context": "Preserved; no values inspected, logged, scrubbed or changed",
+    "User_absence_gate_in_live47": false,
+    "existing_User_test_guard": "Unmodified actual product source; isolated() rejects inherited authority before existing env_clear",
+    "no_User_proxy_wrapper_or_new_context": true,
+    "absence_does_not_prove_identity_or_capability": true
+  },
+  "source_conservation": {
+    "outside_packet_mode_type_blob_entries_exact": 2222,
+    "changed_paths_count": 79,
+    "new_paths_count": 62,
+    "modified_preexisting_paths_count": 17,
+    "all_original_history_dependencies_and_inverses_exact": true,
+    "all_other31_top_functions_exact_to9e5": true,
+    "all5_nested_main_functions_exact": true,
+    "parser_before_source_task_assertions_exact": {
+      "exact": true,
+      "sha256": "4edf23c221619a64c3a20e5f74bbedcf761e15a2e9fc6951b9227ce0cddb4310"
+    },
+    "23_generic_functions_exact_to_original_donor": 23,
+    "canonical_unsignaled_settler_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "protected_lifecycle_tail": {
+      "bytes": 3790,
+      "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+      "byte_exact": true
+    },
+    "summary_original_error_ledgers_hashmanifest_compact_output_returns_suffix_exact": true,
+    "direct_original_Popen_wait_held_pidfd_cleanup_exact": true,
+    "source_context_run_helper_protocol_controller_review_ABI_HOLD_exact": true,
+    "only_changed_existing_top_function": "main",
+    "only_other_changes": "Task docstring and current WT/PLAN/PLAN_SHA literals, genuine source data/snapshots/archives, manifest and source conservation."
+  },
+  "phases_and_bounds": {
+    "serial_phases": [
+      "compile-cli-lib",
+      "inventory-cli-lib",
+      "parent-cli-lib-exact",
+      "compile-host-lib",
+      "inventory-host-lib",
+      "parent-host-lib-exact",
+      "compile-ui-lib",
+      "inventory-ui-lib",
+      "parent-ui-lib-exact"
+    ],
+    "phase_count": 9,
+    "workload_cap_seconds": 2400,
+    "phase_caps_sum_seconds": 2310,
+    "jobs": 2,
+    "isolated_features": [
+      [],
+      [
+        "host"
+      ],
+      [
+        "ui"
+      ]
+    ],
+    "existing_C_target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "new_target": false,
+    "helper": null,
+    "actual_fit": "UNRUN_UNKNOWN"
+  },
+  "archive_integrity": {
+    "manifest_members": 144,
+    "every_member_length_hash_verified": true,
+    "runtime_archive_inputs": 87,
+    "all_runtime_archive_hashes_verified": true,
+    "historical347_preserved": true,
+    "historical9e5_metadata_and_old22_source_snapshots_preserved": true,
+    "original_Bnegative": "history/B347-negative contains exact Root acceptance/executor/soleRAW/hashjoin. OriginalEXIT1, onlyCLI1/HOST1 qualified and UI27P1F nonqualifying; no re-audit or qualification transfer.",
+    "unrelated_Root16_negative_not_archived": true
+  },
+  "genuine_source_review_join": {
+    "final_delivery_freeze": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/final-delivery-freeze.json",
+      "sha256": "e1c34ab4dbf29aa4eb5e133f925834365558dd0ed038e5cda1ea3d18193d2975",
+      "bytes": 1259,
+      "scope": "Root author source freeze; not independent approval"
+    },
+    "final_delivery_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/final-delivery-review.json",
+      "sha256": "2f35a3ef191930da3457a172b2e852428364bb28da2f7990c466609ca843e4d8",
+      "bytes": 12064,
+      "scope": "Independent ancestry/full tree conservation only, genuine aeb source tuple"
+    },
+    "main15_protected_production_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/main15-protected-production-review.json",
+      "sha256": "72ffb69533dbcebb4fe59f1b02d64ec81ed6438af7b43e7056d41ef1e8163b6e",
+      "bytes": 19834,
+      "scope": "Genuine original62 production preservation; no retargeted head or final52 runtime approval"
+    },
+    "main15_final_protected_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/main15-final-protected-review.json",
+      "sha256": "eeeeb413c2b06650abe514fb4c37df723af583aa70d52b6152da8679bf32a139",
+      "bytes": 19436,
+      "scope": "Genuine finalaeb protected/source-test oracles; all final Rust/native UNRUN"
+    },
+    "final_owning_parent_selection": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/final-owning-parent-selection.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef",
+      "bytes": 25829,
+      "scope": "Genuine current52 ownership source map, not52 executions"
+    },
+    "main15_lead_source_parent_join": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/main15-lead-source-parent-join.json",
+      "sha256": "804a167bcf87414a154372e6001506bd6e27702a3c1a7dae6df3d1764e330417",
+      "bytes": 8004,
+      "scope": "Genuine current protected/52 source handoff only; no execution grant"
+    },
+    "caller_classification": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/caller-classification.json",
+      "sha256": "315693dcdebbb93dee644e5fb05c192acfe6e6ad44a225d3ea128ad2b8f6a258",
+      "bytes": 24100,
+      "scope": "Genuine current source-path47/5 partition only; no actual caller/fixture/resource admission"
+    },
+    "unsignaled_port_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/port-review.json",
+      "sha256": "ae273482c63f0b9ece1af53f7614c667165edea5cd51c70b10ac8d54a9bf1e6c",
+      "bytes": 7003,
+      "scope": "Original9e5 exact port/caller/conservation review only"
+    }
+  },
+  "pending_admission": {
+    "exact_current_nonauthor_controller_review": null,
+    "required_existing_ABI": {
+      "verdict": "CONTROLLER_SOURCE_CLEAR",
+      "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+      "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+      "runner_sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+      "plan_sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
+      "scope": "This is the required shape for a genuine later nonauthor review, not an authored review or approval."
+    },
+    "actual_Root_grant": null,
+    "actual_queue_position": null,
+    "actual_context_resource_guards": null,
+    "runtime_and_RAW": null,
+    "safe_release": null,
+    "publication": null,
+    "scope": "A genuine later exact current reviewer must produce the required existing verdict/head/tree/runner/plan record; this author template is not that record. Root retains all scheduling/admission decisions."
+  },
+  "source_checks": {
+    "AST_syntax_and_function_topology": "PASS as source analysis only",
+    "all_JSON_source_binding_and_manifest_consistency": "PASS as data/hash analysis only",
+    "current_product30_Git_live_snapshot_pins": "PASS",
+    "unstaged_diff_check": "original0 tool9ed6ae",
+    "staged_diff_check": "original0 tool27b680",
+    "local_source_commit": "original0 tool62133d",
+    "post_commit_worktree": "clean",
+    "all_candidate_import_call_compile_tests_Cargo_build_native_probes": "NONE"
+  },
+  "pre_freeze_authoring_error": {
+    "receipt": "/tmp/startup47-authoring-source-correction-4nmbr4nk/authoring-error.json",
+    "scope": "Unfrozen text-replacement mistake caught before candidate execution; runner rebuilt from immutable9e5 and all function/binding conservation assertions now satisfied. No historical runtime/source reinterpretation.",
+    "sha256": "97cc81a7fd9503b8921be96158c0ecea0af585610f6d66dcea3b69e306ce6cec",
+    "bytes": 509
+  },
+  "limits": "No current Rust/test/native/provider/installation/body execution result or readiness inferred. OldA2 adopted-empty/4680 positives and original347Bnegative retain their exact original scopes. Source classifier does not establish caller, fixture, resource or native safety. User5/full52 remain required and held; selected47 is explicit partial work, not a waiver.",
+  "actions": "Only claimed packet source/artifact writes, read-only source/Git/AST/JSON/hash checks and a local source freeze commit. No candidate or extracted function imported/invoked, build/test/Cargo/native/provider/process/env/target/resource/account/DB probe, C acquisition, public write, new worker, role change or authority manipulation."
+}

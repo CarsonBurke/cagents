@@ -1208,6 +1208,11 @@ def main():
         'product_head': plan['product_head'], 'product_tree': plan['product_tree'],
         'product_worktree': str(WT), 'embedded_version_qualification': 'NOT_ESTABLISHED'}
 
+    parent_accounting = lambda *args, original=globals()['parent_accounting'], declared=len(selected): (
+        lambda result: ({**result[0], 'declared_requested_unique_parent_count': declared},
+                        result[1], result[2])
+    )(original(*args))
+
     try:
         require_workload_allowed()
         lock_fd = os.open(LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)

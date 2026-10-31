@@ -1,0 +1,8 @@
+{
+  "encoding": "UTF-8 exact unified diff inside JSON string",
+  "base_head": "579f9a58eee6561f6f7317284091b99f72172281",
+  "before_sha256": "93d01c01be059b8d64266afd293f176981285ac3a6255cb6b79cbe347f8bb54f",
+  "after_sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+  "unified_diff_sha256": "bb1e0fafe74ee59e182f5ea01b2e24fcdc882e39d33b8bf86441ccba9feeaa60",
+  "unified_diff": "--- to-579f9a58.inverse.diff.json:before\n+++ to-579f9a58.inverse.diff.json:after\n@@ -1208,11 +1208,6 @@\n         'product_head': plan['product_head'], 'product_tree': plan['product_tree'],\n         'product_worktree': str(WT), 'embedded_version_qualification': 'NOT_ESTABLISHED'}\n \n-    parent_accounting = lambda *args, original=globals()['parent_accounting'], declared=len(selected): (\n-        lambda result: ({**result[0], 'declared_requested_unique_parent_count': declared},\n-                        result[1], result[2])\n-    )(original(*args))\n-\n     try:\n         require_workload_allowed()\n         lock_fd = os.open(LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)\n"
+}

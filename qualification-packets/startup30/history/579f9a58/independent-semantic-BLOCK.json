@@ -1,0 +1,194 @@
+{
+  "author_freeze": {
+    "path": "/tmp/startup-aeb-Agent-safe47-author-bbcfi412/freeze.json",
+    "sha256": "8bff346f25a027c6d952a5a945b1bba65eb5e3d333d60ca8f89b1813267d9a11"
+  },
+  "blocking_findings": [
+    {
+      "bounded_correction": "Make only the task declared-request count reflect the validated47 selection. If original31 function bodies and3790 tail must stay byte-exact, use a narrowly reviewed task-main adapter before acquisition around the existing accounting result, retaining original exceptions and changing only this declared field. Do not overwrite discovered/qualified/unknown counts or credit User5. Alternatively explicitly expand the owning accounting change scope. Freeze and independently refresh the resulting source before clearance.",
+      "consequence": "A clean successful47 execution can report declared30, discovered47 and qualified47. Early failures would also misstate the declared scope. This is an inherited30-specific constant newly incompatible with this task expansion; no actual run or oversized incident is asserted.",
+      "evidence": "parent_accounting returns the literal declared_requested_unique_parent_count:30. New main validates47 selected parents. The protected finalizer spreads unchanged accounting into the full summary and terminal projection copies that field. No task-local override exists.",
+      "id": "AGENT47-DECLARED-COUNT-1",
+      "priority": "P2",
+      "related_anchors": [
+        "run-packet.py:941",
+        "run-packet.py:1233",
+        "run-packet.py:1274",
+        "run-packet.py:1299"
+      ],
+      "source": "qualification-packets/startup30/run-packet.py:776",
+      "tests_or_native": "UNRUN; finding follows directly from source literals and unchanged output construction",
+      "title": "Expanded47 task still declares30 parents in final evidence"
+    }
+  ],
+  "conservation": {
+    "HOLD_and_original_close_predicates_not_changed": true,
+    "all5_nested_main_functions_byte_exact": true,
+    "canonical_unsignaled_settle_children_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "fullsummary_originalerror_ledger_hashmanifest_compact_output_return_suffix_exact": true,
+    "important_limit": "Exact conservation preserves the stale declared30 accounting literal; byte conservation alone does not establish task correctness.",
+    "only_changed_top_function_to9e5": "main",
+    "other_top_functions_byte_exact": 31,
+    "parser_grouped_result_execute_direct_Popen_wait_and_held_pidfd_cleanup_exact": true,
+    "protected_acquire_finalize_Cclose_tail_bytes": 3790,
+    "protected_tail_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4"
+  },
+  "controller_head": "579f9a58eee6561f6f7317284091b99f72172281",
+  "controller_parent": "9e5e9c605b491365bdb75b83412d0a32872cd81a",
+  "controller_tree": "4f1ddf27876c3ca9e77ebfb1b24070e83fd85f3f",
+  "controller_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source",
+  "deferred_required_scope": {
+    "FULL52_required_count": 52,
+    "User5_FULL52_native_UX_WHOLE_readiness": "HOLD_UNQUALIFIED",
+    "User5_count": 5,
+    "invoked_pass_ignored_skipped_or_child_credit": "NONE",
+    "names": [
+      "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+      "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel"
+    ]
+  },
+  "existing_controller_review_ABI": {
+    "identity_fields_in_this_record_are_current": true,
+    "old347_2fc_record": "Shape reference only; not retargeted or reused as this independent review",
+    "required_identity_fields": [
+      "head",
+      "tree",
+      "runner_sha256",
+      "plan_sha256"
+    ],
+    "required_verdict": "CONTROLLER_SOURCE_CLEAR",
+    "source_anchor": "run-packet.py:364-369",
+    "this_record_intentionally_fails_verdict_gate_because_of_blocker": true
+  },
+  "future_invocation": {
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source",
+    "frozen12argv_template": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/run-packet.py",
+      "--grant",
+      null,
+      "--runner-sha256",
+      "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+      "--controller-review",
+      null,
+      "--controller-review-sha256",
+      null
+    ],
+    "grant_NULL_index": 5,
+    "only_Root_can_supply_fresh_grant_after_a_clear_successor_review": true,
+    "prospective_external_binding": {
+      "review_path": "/tmp/startup-aeb-Agent-safe47-semantic-admission-review-579f9a58-1335-v1.json",
+      "review_sha256": "Compute externally after sealing; no recursive self-hash. This blocked review cannot authorize admission."
+    },
+    "review_hash_slot": 11,
+    "review_path_slot": 9,
+    "status": "BLOCKED_NOT_SUBMITTABLE"
+  },
+  "genuine_archived_source_scopes": [
+    {
+      "path": "dependencies/final-delivery/caller-classification.json",
+      "scope": "Current source-path47/5 classification only; actual caller authority unread, no fixture or resource admission",
+      "sha256": "315693dcdebbb93dee644e5fb05c192acfe6e6ad44a225d3ea128ad2b8f6a258"
+    },
+    {
+      "path": "dependencies/final-delivery/main15-final-protected-review.json",
+      "scope": "Current protected source/test oracles; final Rust/native UNRUN",
+      "sha256": "eeeeb413c2b06650abe514fb4c37df723af583aa70d52b6152da8679bf32a139"
+    },
+    {
+      "path": "dependencies/final-delivery/final-owning-parent-selection.json",
+      "scope": "Current52 ownership/source names, not52 executions",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef"
+    },
+    {
+      "path": "dependencies/final-delivery/final-delivery-review.json",
+      "scope": "Actual finalaeb ancestry/tree conservation source scope only",
+      "sha256": "2f35a3ef191930da3457a172b2e852428364bb28da2f7990c466609ca843e4d8"
+    }
+  ],
+  "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+  "kind": "INDEPENDENT_CURRENT_TASK_SEMANTIC_AND_ADMISSION_ABI_SOURCE_REVIEW_NOT_RUNTIME_ADMISSION",
+  "operations_and_limits": {
+    "C_status": "Parent reports UNALLOCATED after accepted9995; not inspected or allocated by this review",
+    "candidate_import_call_run_compile_tests_Cargo_build_native": "UNRUN_NOT_PERFORMED",
+    "grant_queue_release_merge_runtime_readiness": "ROOT_ONLY_NONE_CREATED",
+    "live_environment_authority_values_process_target_lock_resource_tools_account_DB_probes": "NOT_PERFORMED",
+    "new_workers_or_sessions": "NONE",
+    "no_User5_wholePR_native_global_claim": true,
+    "old_B347_negative_and_other_accepted_or_held_results": "Original scopes preserved; no re-audit/pass/qualification transfer",
+    "own_review_only_write": "/tmp/startup-aeb-Agent-safe47-semantic-admission-review-579f9a58-1335-v1.json",
+    "source_Git_public_writes": "NONE"
+  },
+  "plan_sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
+  "reviewer": "/root/1335_full_output_copy_lease",
+  "runner_sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+  "schema": "startup-aeb-Agent-safe47-independent-semantic-admission-ABI-review-v1",
+  "scope": "Genuine fresh independent semantic/admission/source-join review of the one exact Agent-compatible47 packet. Existing generic execution machinery checked for conservation, not requalified as a whole engine. User5/FULL52/native/global scopes remain held.",
+  "source_binding_and_main_checks": {
+    "actual_warmth_fit_or_availability": "UNKNOWN_NOT_PROBED",
+    "all13_primary_file_pins_current_local_and_immutable_Git_match": true,
+    "all144_manifest_payload_members_complete_hash_size_local_Git_match": true,
+    "all30_product_source_Git_live_and_snapshot_pins_match": true,
+    "all87_runtime_archive_paths_hashes_current": true,
+    "all_live_selected_records_and_three_group_names_equal_classified47": true,
+    "all_source_binding_path_hash_length_references_current": true,
+    "current_WT_PLAN_PLAN_SHA_runner_path_source_review_paths_match": true,
+    "deferred_User5_named_required_but_not_selected_or_in_predicted_absence_lists": true,
+    "existing_target_reused_source_setting": true,
+    "fresh_inventory_and_original_output_remain_runtime_requirements": true,
+    "frozen_head_tree_parent_and_product_merge_head_tree_parents_match": true,
+    "grouped_execution_uses_only_selected_exact_names_and_default_scheduler": true,
+    "inherited_authority_HOME_and_existing_context_route_preserved_no_scrub_or_substitution": true,
+    "jobs": 2,
+    "main_final_freeze_ancestry_conservation_review_tuple_joins_match": true,
+    "nine_serial_phase_caps_seconds": [
+      600,
+      30,
+      60,
+      600,
+      30,
+      60,
+      600,
+      30,
+      300
+    ],
+    "no_User_authority_absence_gate_added_to_live47": true,
+    "no_helper_added": true,
+    "packet_files_including_manifest": 145,
+    "predictions_are_not_full_inventory_N_or_pass_counts": true,
+    "product_existing_isolated_User_guard_precedes_child_marker_and_env_clear": "product-source/src/app/shared_views/tests/startup_admission.rs:20-44",
+    "required52_equals_genuine_Root35_and_Main15_remaining17_source_selection": true,
+    "required52_equals_original30_rootAdditional5_and_deduplicated_current_assignment": true,
+    "safe47_User5_disjoint_complete52_partition_matches_current_classifier": true,
+    "selected_graph_counts": [
+      1,
+      6,
+      40
+    ],
+    "selected_source_membership_predictions": [
+      1,
+      7,
+      46
+    ],
+    "source_runtime_actual_fields_all_NULL_no_grant": true,
+    "sum_seconds": 2310,
+    "test_body_guard_refusal_or_early_return_is_not_causal_body_coverage": true,
+    "three_separate_compile_feature_graphs": [
+      [],
+      [
+        "host"
+      ],
+      [
+        "ui"
+      ]
+    ],
+    "workload_cap_seconds": 2400
+  },
+  "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+  "verdict": "CONTROLLER_SOURCE_BLOCKED"
+}

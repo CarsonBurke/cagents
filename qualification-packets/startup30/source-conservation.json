@@ -1,8 +1,8 @@
 {
   "kind": "AUTHOR_FINAL_FOCUSED_PARTIAL_SOURCE_CONSERVATION_NOT_REVIEW",
-  "base_controller": "9e5e9c605b491365bdb75b83412d0a32872cd81a",
-  "base_runner_sha256": "9b5d0ce0eb9e753ff1616674fd8853457a6dc82d1fc4a4e16e022dd981202e68",
-  "runner_sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+  "base_controller": "579f9a58eee6561f6f7317284091b99f72172281",
+  "base_runner_sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+  "runner_sha256": "93d01c01be059b8d64266afd293f176981285ac3a6255cb6b79cbe347f8bb54f",
   "plan_sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
   "product": {
     "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
@@ -87,12 +87,7 @@
     "exact": true,
     "sha256": "4edf23c221619a64c3a20e5f74bbedcf761e15a2e9fc6951b9227ce0cddb4310"
   },
-  "declared_top_level_changes": [
-    "task docstring",
-    "WT absolute product path",
-    "PLAN absolute current packet path",
-    "PLAN_SHA exact current plan hash"
-  ],
+  "declared_top_level_changes": [],
   "all_other_bytes_outside_main_and_declared_bindings_exact": true,
   "protected_lifecycle_tail": {
     "bytes": 3790,
@@ -102,7 +97,7 @@
   "full_summary_original_error_ledgers_hashmanifest_compact_output_and_returns_suffix_byte_exact": true,
   "direct_original_Popen_wait_timeout_held_pidfd_cleanup_exact": true,
   "source_context_run_helper_protocol_generic_review_ABI_and_HOLD_exact": true,
-  "task_main_changes": "Actual final two-parent source/review proof chain, current52-source/47-selected/5-deferred classifier agreement, source cfg inventory membership and current isolated group counts only. No47 User gate or authority manipulation.",
+  "task_main_changes": "Only a main-local call-result adapter before the protected tail. It captures the validated selected47 count and original global accounting function once; returns a copied accounting dict with only declared_requested_unique_parent_count corrected. Raw/errors objects, discovered/qualified counts, exceptions and all failure/return/close predicates are unchanged.",
   "selection": {
     "selected_distinct": 47,
     "selected_graph_counts": {
@@ -131,13 +126,13 @@
   },
   "genuine_evidence_scope": "Current final protected/52 source selection and47/5 caller classifier bind exactaeb. They are source-only, not controller ABI approval or runtime/body proof. Original receipts archived verbatim with original scopes.",
   "diffs": {
-    "from-9e5e9c60.diff.json": {
-      "sha256": "ee77838bd5eaca5640337688164497d98582872701f39a364b367bc66b0bcaaf",
-      "unified_diff_sha256": "18a26efcfd42132a355317eb00147d4fec243d20f1d67a303da0328e5550e539"
+    "from-579f9a58.diff.json": {
+      "sha256": "730855be531afb6b971f2ebbe7a7d5ef7b8c435f17f374761882c8c8a0b2b34e",
+      "unified_diff_sha256": "bb43482c886c94969b2a57aca407794c4ff7e03676e6651f7a839d78b0e62d27"
     },
-    "to-9e5e9c60.inverse.diff.json": {
-      "sha256": "4c5ce216df53fb6c38aabcf29359f91b80ab6f94a5c1e71887c16ae60c2506ab",
-      "unified_diff_sha256": "ba9ab053f7af1c4d900e066caf7116328bc68b9946177b805aa850dfca2a672a"
+    "to-579f9a58.inverse.diff.json": {
+      "sha256": "d6450885415825d0d5ae77c60c685b4db0690bb3fa89ac98730f66c1cee961fc",
+      "unified_diff_sha256": "bb1e0fafe74ee59e182f5ea01b2e24fcdc882e39d33b8bf86441ccba9feeaa60"
     }
   },
   "old_histories_and_negatives": "All preexisting dependencies/history and earlier inverse files unchanged. Exact9e5 current metadata and old22 product snapshots retained in history/9e5e9c60. OriginalBnegative four receipts retained verbatim under history/B347-negative.",
@@ -150,5 +145,30 @@
   "exact_current_controller_review": "PENDING; required genuine later verdict CONTROLLER_SOURCE_CLEAR with exact product/head/tree/runner/plan fields. No positive record manufactured.",
   "all_candidate_import_call_compile_test_build_native_probes": "NONE",
   "actual_grant": null,
-  "queueable": false
+  "queueable": false,
+  "declared_count_correction": {
+    "finding": "AGENT47-DECLARED-COUNT-1",
+    "historical_controller": "579f9a58eee6561f6f7317284091b99f72172281",
+    "historical_generic_declaration": 30,
+    "current_task_declared_count": 47,
+    "source": "len(selected) from already validated current selected task data, captured before protected tail",
+    "generic_parent_accounting_body": "BYTE_EXACT_UNCHANGED",
+    "raw_and_errors": "Same original result objects result[1]/result[2]",
+    "original_call_count": "Exactly once per existing protected-tail call; no catch",
+    "all_qualification_and_partial_or_unknown_fields": "UNCHANGED",
+    "adapter_sha256": "863aa6507b639b1880792631d61598d9351cf1ab12b854464171aa949efa2f84",
+    "old_block_review": {
+      "path": "history/579f9a58/independent-semantic-BLOCK.json",
+      "sha256": "27e9a935d6a732aedfd1c5904582573b8a4cb19e86c607a65d78d54bb7561b8f"
+    },
+    "proposal_coordination": {
+      "reviewer": "/root/1335_full_output_copy_lease",
+      "assessment": "Source-level agreement with exact proposed adapter before freeze; not successor clearance or execution authority."
+    }
+  },
+  "historical_579_conservation": {
+    "path": "history/579f9a58/source-conservation.json",
+    "sha256": "628208d0ad1c5b5278d209cf764bb33f5fd46018b2f12b65b5443b51e8510625",
+    "scope": "Original579 author record retained immutable with its original source/error history; do not retarget review."
+  }
 }

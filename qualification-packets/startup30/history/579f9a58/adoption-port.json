@@ -1,0 +1,19 @@
+{
+  "kind": "AUTHOR_CURRENT_POLICY_CONTINUITY_NOT_RUNTIME_ADMISSION",
+  "base_controller": "9e5e9c605b491365bdb75b83412d0a32872cd81a",
+  "runner_sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+  "canonical_definition_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+  "canonical_source": "dependencies/adopted-child-settlement/canonical-settle_children.py",
+  "genuine_prior_port_review": {
+    "path": "dependencies/final-delivery/port-review.json",
+    "sha256": "ae273482c63f0b9ece1af53f7614c667165edea5cd51c70b10ac8d54a9bf1e6c",
+    "scope": "Original9e5 exact port/caller/conservation only; no automatic current packet review transfer."
+  },
+  "current_policy": "Exact canonical3s natural settle prefix, survivors unsignaled with clean:false/forced:false/observed+remaining; original directPopen timeout/heldpidfd cleanup and sticky caller C/HOLD unchanged.",
+  "current_bindings": "Finalaeb product and current whole-focused packet paths/hashes are now refreshed in plan/source-binding/template; exact current nonauthor controller review/actual Root grant remain absent.",
+  "scope": "One explicit Agent-safe47 partial liveplan. Full52 source contract/deferredUser5 remain HOLD data, with no User-absence gate in47, authority scrub, source/test guard changes or second liveplan.",
+  "historical": "Original347/9e5 sources, inverses and originalBnegative preserved unchanged. No past signal incident, pass donation, native readiness or resource return inferred.",
+  "actual_grant": null,
+  "execution": null,
+  "independent_current_controller_review": null
+}
