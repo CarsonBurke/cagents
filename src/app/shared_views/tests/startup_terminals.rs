@@ -504,8 +504,18 @@ fn a_detached_offscreen_attach_is_reported_rather_than_awaited() {
 /// Restore an actual observed-agent row so initialize_runtimes, rather than
 /// a fixture queue insertion, owns the pre-admission attach intent.
 fn reopened_observed_window(with_projected: bool) -> Window {
-    let (mut app, active, hidden, _) = fixture();
+    let (mut app, active, hidden, pane) = fixture();
     let identity = app.workspace_model.identity;
+    let active_pane = CardState {
+        id: pane.id,
+        generation: 0,
+        title: pane.title,
+        width_fraction: pane.width_fraction,
+        existence: Existence::Open,
+        exposure: Exposure::Visible,
+        residency: Residency::Hot,
+        kind: pane.kind,
+    };
     let mut cached = offscreen(&live_terminal());
     let CardKind::Terminal(source) = &mut cached.kind else {
         unreachable!()
@@ -515,18 +525,32 @@ fn reopened_observed_window(with_projected: bool) -> Window {
     let durable = Arc::make_mut(&mut app.durable);
     durable.workspace_model_identity = Some(identity);
     durable.active_channel = Some(active);
+    durable.focused = Some(active_pane.id);
+    let active_channel = durable
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == active)
+        .unwrap();
+    active_channel.cards = vec![active_pane.id];
+    active_channel.focused = Some(active_pane.id);
     durable
         .channels
         .iter_mut()
         .find(|channel| channel.id == hidden)
         .unwrap()
         .cards = vec![cached.id];
-    durable.cards = vec![cached.clone()];
-    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    durable.cards = vec![active_pane.clone(), cached.clone()];
+    // The visible strip belongs to the active channel; the cached terminal
+    // remains durable offscreen content, not the focus/order baseline.
+    let mut visible = (*app.durable).clone();
+    visible.cards.retain(|card| card.id == active_pane.id);
+    app.workspace = Cagents::rebuild_workspace(&visible);
     app.shared_views = State::for_workspace(&app.durable);
     app.workspace_model = crate::workspace_model::WorkspaceModel::default();
     app.startup_gate = crate::app::startup_gate::State::fixture_opened();
     drop(app.initialize_runtimes());
+    assert_eq!(app.workspace.focused(), Some(active_pane.id));
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), [active_pane.id]);
     assert_eq!(app.restored_agent_attaches, [cached.id]);
     assert_eq!(app.terminal_starts_in_flight(), 0);
     Window {
@@ -563,14 +587,115 @@ fn observed_window_model(window: &Window) -> crate::workspace_model::WorkspaceMo
     }
 }
 
-fn emitted_seed_scopes(requests: &async_channel::Receiver<ModelEdit>) -> HashSet<Scope> {
-    let mut scopes = HashSet::new();
+fn emitted_seeds(requests: &async_channel::Receiver<ModelEdit>) -> HashMap<Scope, ModelEdit> {
+    let mut seeds = HashMap::new();
     while let Ok(edit) = requests.try_recv() {
-        if let ModelEdit::SeedView { scope, .. } = edit {
-            scopes.insert(scope);
+        let ModelEdit::SeedView { scope, .. } = &edit else {
+            panic!("unexpected model edit before the fixture SeedView ACK: {edit:?}");
+        };
+        assert!(seeds.insert(scope.clone(), edit).is_none());
+    }
+    seeds
+}
+
+/// The isolated UI lane cannot use the Host's SQL registry. For these ordinary
+/// unmanaged panes, use its public View reducer in the same closed-before-insert
+/// order as host::model::views::apply, then return that model in the real UI ACK.
+fn apply_emitted_seed(
+    model: &mut crate::workspace_model::WorkspaceModel,
+    seeds: &mut HashMap<Scope, ModelEdit>,
+    scope: Scope,
+) -> crate::workspace_model::WorkspaceModel {
+    assert!(
+        model.agents.is_empty(),
+        "this fixture has no managed issuers"
+    );
+    let ModelEdit::SeedView {
+        scope: issued_scope,
+        panes,
+        closed,
+    } = seeds
+        .remove(&scope)
+        .expect("ACK requires an emitted SeedView")
+    else {
+        unreachable!()
+    };
+    assert_eq!(issued_scope, scope);
+    let index = model
+        .views
+        .iter()
+        .position(|view| view.scope == scope)
+        .unwrap();
+    assert_eq!(
+        model
+            .views
+            .iter()
+            .filter(|view| view.scope == scope)
+            .count(),
+        1
+    );
+    // A revision-zero view is the fixture's not-yet-registered migration view.
+    let mut changed = model.views[index].revision == 0;
+    for id in closed {
+        changed |= model.views[index].apply(&Change::Remove { id }).unwrap();
+    }
+    for pane in panes {
+        let another_owner = model.views.iter().any(|view| {
+            view.panes.iter().any(|current| {
+                (current.id == pane.id && view.scope != scope)
+                    || (current.id != pane.id
+                        && crate::workspace_model::views::same_resource(&current.kind, &pane.kind))
+            })
+        });
+        if !another_owner {
+            changed |= model.views[index]
+                .apply(&Change::Insert { pane, before: None })
+                .unwrap();
         }
     }
-    scopes
+    if changed {
+        model.views[index].revision = model.views[index].revision.checked_add(1).unwrap();
+        model.sequence = model.sequence.checked_add(1).unwrap();
+    }
+    model.clone()
+}
+
+#[test]
+fn emitted_seed_replies_are_additive_and_apply_closed_before_panes() {
+    let scope = Scope::Channel(ChannelId::new());
+    let existing = Pane::from_card(&offscreen(&live_terminal()), None).unwrap();
+    let closed = Pane::from_card(&offscreen(&live_terminal()), None).unwrap();
+    let added = Pane::from_card(&offscreen(&live_terminal()), None).unwrap();
+    let mut stale = existing.clone();
+    stale.title = "A seed must not overwrite the canonical pane".into();
+    let mut view = View::empty(scope.clone());
+    view.revision = 1;
+    view.panes = vec![existing.clone(), closed.clone()];
+    let mut model = crate::workspace_model::WorkspaceModel {
+        sequence: 1,
+        views: vec![view],
+        ..Default::default()
+    };
+    let edit = ModelEdit::SeedView {
+        scope: scope.clone(),
+        panes: vec![stale, closed.clone(), added.clone()],
+        closed: vec![closed.id],
+    };
+    let (publisher, requests) = async_channel::unbounded();
+    publisher.try_send(edit.clone()).unwrap();
+    let mut seeds = emitted_seeds(&requests);
+    let reply = apply_emitted_seed(&mut model, &mut seeds, scope.clone());
+    assert!(seeds.is_empty());
+    assert_eq!(reply, model);
+    assert_eq!(model.views[0].panes, [existing, added]);
+    assert_eq!(model.views[0].retired, [closed.id]);
+    assert_eq!(model.views[0].revision, 2);
+    assert_eq!(model.sequence, 2);
+
+    publisher.try_send(edit).unwrap();
+    let mut duplicate = emitted_seeds(&requests);
+    assert_eq!(apply_emitted_seed(&mut model, &mut duplicate, scope), reply);
+    assert!(duplicate.is_empty());
 }
 
 #[test]
@@ -579,7 +704,7 @@ fn restored_observed_row_waits_for_its_own_seed_ack_after_connected() {
     let mut window = reopened_observed_window(false);
     let (publisher, requests) = async_channel::unbounded();
     window.app.workspace_model_tx = publisher;
-    let model = observed_window_model(&window);
+    let mut model = observed_window_model(&window);
     let focused = window.app.workspace.focused();
     let order = window.app.workspace.order().collect::<Vec<_>>();
     drop(
@@ -587,9 +712,13 @@ fn restored_observed_row_waits_for_its_own_seed_ack_after_connected() {
             .app
             .apply_workspace_model_update(ModelUpdate::Connected(model.clone())),
     );
-    let seeds = emitted_seed_scopes(&requests);
-    assert!(seeds.contains(&Scope::Channel(window.active)));
-    assert!(seeds.contains(&Scope::Channel(window.hidden)));
+    let mut seeds = emitted_seeds(&requests);
+    assert!(seeds.contains_key(&Scope::Channel(window.active)));
+    assert!(seeds.contains_key(&Scope::Channel(window.hidden)));
+    assert!(
+        matches!(&seeds[&Scope::Channel(window.active)], ModelEdit::SeedView { panes, .. }
+        if panes.iter().map(|pane| pane.id).collect::<Vec<_>>() == order)
+    );
     assert_eq!(window.app.terminal_starts_in_flight(), 0);
     assert_eq!(window.app.restored_agent_attaches, [window.cached.id]);
     drop(
@@ -598,7 +727,7 @@ fn restored_observed_row_waits_for_its_own_seed_ack_after_connected() {
             .apply_workspace_model_update(ModelUpdate::ViewApplied {
                 scope: Scope::Channel(window.active),
                 operation: None,
-                model: model.clone(),
+                model: apply_emitted_seed(&mut model, &mut seeds, Scope::Channel(window.active)),
             }),
     );
     assert_eq!(
@@ -607,16 +736,19 @@ fn restored_observed_row_waits_for_its_own_seed_ack_after_connected() {
         "another scope's ACK cannot admit this row"
     );
     assert_eq!(window.app.restored_agent_attaches, [window.cached.id]);
+    assert_eq!(window.app.workspace.focused(), focused);
+    assert_eq!(window.app.workspace.order().collect::<Vec<_>>(), order);
     drop(
         window
             .app
             .apply_workspace_model_update(ModelUpdate::ViewApplied {
                 scope: Scope::Channel(window.hidden),
                 operation: None,
-                model,
+                model: apply_emitted_seed(&mut model, &mut seeds, Scope::Channel(window.hidden)),
             }),
     );
     assert!(window.app.terminal_start_in_flight(window.cached.id));
+    assert!(seeds.is_empty());
     let saved = session(&window.cached);
     drop(window.app.update(Message::RestoredAgentAttached {
         card: window.cached.id,
@@ -647,16 +779,16 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
                 .app
                 .apply_workspace_model_update(ModelUpdate::Connected(model.clone())),
         );
-        let seeds = emitted_seed_scopes(&requests);
+        let mut seeds = emitted_seeds(&requests);
         for channel in [window.active, window.hidden] {
-            assert!(seeds.contains(&Scope::Channel(channel)));
+            assert!(seeds.contains_key(&Scope::Channel(channel)));
             drop(
                 window
                     .app
                     .apply_workspace_model_update(ModelUpdate::ViewApplied {
                         scope: Scope::Channel(channel),
                         operation: None,
-                        model: model.clone(),
+                        model: apply_emitted_seed(&mut model, &mut seeds, Scope::Channel(channel)),
                     }),
             );
         }
@@ -716,14 +848,20 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
                 .app
                 .apply_workspace_model_update(ModelUpdate::Read(model.clone())),
         );
-        assert!(emitted_seed_scopes(&requests).contains(&Scope::Channel(destination)));
+        let mut destination_seeds = emitted_seeds(&requests);
+        assert!(destination_seeds.contains_key(&Scope::Channel(destination)));
         assert!(!window.app.shared_views_ready_for_startup());
         assert_eq!(window.app.restored_agent_attaches, [target, other.id]);
+        let target_model = apply_emitted_seed(
+            &mut model,
+            &mut destination_seeds,
+            Scope::Channel(destination),
+        );
         let target_ack = |app: &mut Cagents| {
             drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
                 scope: Scope::Channel(destination),
                 operation: None,
-                model: model.clone(),
+                model: target_model.clone(),
             }));
         };
         if ack_before_release {
