@@ -1,0 +1,127 @@
+{
+  "schema": "startup30-stable-successor-author-source-freeze-v1",
+  "utc": "2026-10-31T10:26:03.787850+00:00",
+  "role": "/root/1945_cache_io_oracles; source author only, not independent reviewer, executor or admission authority",
+  "disposition": "FROZEN_LOCAL_PRIVATE_SOURCE_REQUIRES_TWO_INDEPENDENT_REVIEWS_NOT_SUBMITTABLE",
+  "controller": {
+    "head": "7e057dc05cf1333a22f60a12d6b97b9393edeac5",
+    "tree": "779715c3e510dfb766f80041d8164a23a21360f7",
+    "sole_parent": "982feefc3688bf73c874800cf1f83da67ba343cc",
+    "branch": "localfix/fw16-startup30-stable-source",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source",
+    "clean": true,
+    "published": false
+  },
+  "product": {
+    "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+    "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+    "sole_parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard",
+    "BASE": "b914->eb7 original receipts kept unchanged; actual one-file stable-guard delta supplied by current genuine review/publication"
+  },
+  "key_pins": {
+    "run-packet.py": "e86273f69b504f1b613c9539b55636c38a34b1795b13909f60b09468eae2a1cc",
+    "plan.json": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+    "command-data.json": "473b30389d70303af3b903245eb7e6d822e74f0272f9b456ffee5cab2dd3d6a6",
+    "current-source-map.json": "b46d22934cd7a21878e6331c7ac59cc83b3766171a34f297256b4bec978a107b",
+    "source-binding.json": "660afcf28d44317d2e2ce5340f59d7b0293f42b76562c6a0edb98fc84a3125a4",
+    "source-conservation.json": "081029d2877992fb33409afc2334ed248d713a11cd81e35f80b8f6c823132b6d",
+    "manifest.json": "6d590f342d989f2eba8f174163acc05d94288813efe8538bf6b9da7740b7fcf9",
+    "execution-template.json": "a27fd66541360dbe2e749f50c2bc75b7e00b3299e3659d7ce25884e4a8e1f87d"
+  },
+  "all_pins": {
+    "path": "/tmp/startup30-stable-source-author-srgc1e_n/all-source-pins.json",
+    "sha256": "8e8474eff040978979cb7cdc0ee44716c2ee5cb9695bb8f93dee1bc9ca65a657",
+    "count": 63
+  },
+  "changed_paths": [
+    "qualification-packets/startup30/README.md",
+    "qualification-packets/startup30/command-data.json",
+    "qualification-packets/startup30/current-source-map.json",
+    "qualification-packets/startup30/dependencies/base_eb7_startup_gate.rs",
+    "qualification-packets/startup30/dependencies/historical_982_accounting_correction_review.json",
+    "qualification-packets/startup30/dependencies/historical_982_admission_selection_execution_review.json",
+    "qualification-packets/startup30/dependencies/historical_982_conservation_review.json",
+    "qualification-packets/startup30/dependencies/historical_982_manifest.json",
+    "qualification-packets/startup30/dependencies/historical_982_plan.json",
+    "qualification-packets/startup30/dependencies/historical_982_publication.json",
+    "qualification-packets/startup30/dependencies/historical_982_run-packet.py",
+    "qualification-packets/startup30/dependencies/historical_982_source-binding.json",
+    "qualification-packets/startup30/dependencies/historical_982_source-conservation.json",
+    "qualification-packets/startup30/dependencies/stable_guard_publication.json",
+    "qualification-packets/startup30/dependencies/stable_guard_review.json",
+    "qualification-packets/startup30/dependencies/stable_guard_source_receipt.json",
+    "qualification-packets/startup30/execution-template.json",
+    "qualification-packets/startup30/from-982feefc.diff.json",
+    "qualification-packets/startup30/from-d412.diff.json",
+    "qualification-packets/startup30/manifest.json",
+    "qualification-packets/startup30/plan.json",
+    "qualification-packets/startup30/product-source/src/app/startup_gate.rs",
+    "qualification-packets/startup30/run-packet.py",
+    "qualification-packets/startup30/source-binding.json",
+    "qualification-packets/startup30/source-conservation.json",
+    "qualification-packets/startup30/to-982feefc.inverse.diff.json",
+    "qualification-packets/startup30/to-d412.inverse.diff.json"
+  ],
+  "outside_packet_mode_type_blob_entries_exact": 2222,
+  "author_static_checks": {
+    "candidate_invocations_imports_compilation_tests_native": "NONE",
+    "checks": "Inert source/Git/AST/JSON/hash/text conservation only",
+    "git_diff_check_original_exit": 0,
+    "git_cached_diff_check_original_exit": 0,
+    "local_commit_original_exit": 0,
+    "commit_hooks_and_signing": "Disabled per command to keep this local source-only freeze from invoking unrelated hooks/signing processes. No repository configuration changed.",
+    "top_functions": 32,
+    "only_changed_top_function": "main",
+    "other31_bodies_byte_exact": true,
+    "generic24_byte_exact": true,
+    "original_nested4_byte_exact": true,
+    "grouped_result_parser_byte_exact": true,
+    "corrected_parent_accounting982_body_byte_exact": true,
+    "protected_lifecycle_tail_bytes": 3790,
+    "protected_lifecycle_tail_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "full_summary_construction_save_and_hash_ledger_byte_exact": true,
+    "selector_rows30_exact": true,
+    "three_features_nine_phases_budgets_exact": true,
+    "no_helper": true,
+    "execution_template_outer_prefix": [
+      "/usr/bin/python3",
+      "-I",
+      "-B"
+    ]
+  },
+  "intended_source_changes": [
+    "Bind only current product/source pins to6ceb and actual product WT; base b914/eb7 proof stays immutable and checked as base.",
+    "Add current genuine guard source review/publication/author receipt and require the one-file hash/parent chain; no old receipt retargeted.",
+    "Unconditional nonassert __debug__ refusal before imports/effects; main checks isolated/no-bytecode invocation, keeps all assertions.",
+    "After the protected tail, preserve full summary.json/ledgers/errors/SHA256SUMS and output only scalar terminal phase/count/receipt metadata with explicit full artifact locations.",
+    "Preserve original exceptions/required saves/accounting and return/HOLD/release predicates exactly."
+  ],
+  "historical_reviews": "Old source/accounting/conservation reviews and source publication, old runner/plan/manifest/binding/conservation, BASE startup_gate bytes and original ACCOUNTING-DISCOVERY-1 negative are archived fullbytes; no successor clearance transferred.",
+  "required_independent_reviews": [
+    "Actual source/chain reader joins, early optimized-Python refusal and compact terminal/failure behavior.",
+    "Exact tree/function/nested/parser/3790B tail, selector/phase/budget/data/inverse/hash/archive conservation."
+  ],
+  "remaining_execution_gates": [
+    "Both actual independent successor reviews pending Root.",
+    "Corrected current-product Packet A positive return, accepted donor qualification/return within actual scope and current compatibility assessment remain separate prerequisites.",
+    "Fresh actual scoped Root B grant/current source/context/tool/resource guards; template grant and review inputs remain null."
+  ],
+  "actual": {
+    "B_grant": null,
+    "execution": "UNRUN",
+    "builds_tests": "UNRUN",
+    "native": "UNRUN",
+    "queue_or_resource_allocation": null,
+    "publication": null,
+    "merge": null
+  },
+  "limits": [
+    "Source author verification is not an independent review or runtime qualification.",
+    "No candidate/helper/parser import, invocation, extracted case, build/Cargo/test/native/tool/env/process/target/resource probe, grant, public write, new worker or role/session action.",
+    "Only the new ignored worktree/branch and own /tmp artifacts were written. Old Packet B, B9 product/A2, Root16 fixture controller and all other worktrees remain unmodified.",
+    "The actual current product object was read from B9's private source Git. No fetch/object import into the main private common was performed.",
+    "Precommit author note key accounting983_corrected_body_exact was a label typo referring to982; this final freeze records the exact982 source relationship."
+  ],
+  "signature": "Source author /root/1945_cache_io_oracles; no self-review approval or execution authority."
+}

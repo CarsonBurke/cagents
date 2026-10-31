@@ -1,0 +1,284 @@
+{
+  "schema": "independent-startup30-current-product-source-binding-review-v1",
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+  "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+  "runner_sha256": "e86273f69b504f1b613c9539b55636c38a34b1795b13909f60b09468eae2a1cc",
+  "plan_sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+  "controller_commit": "7e057dc05cf1333a22f60a12d6b97b9393edeac5",
+  "controller_tree": "779715c3e510dfb766f80041d8164a23a21360f7",
+  "controller_parent": "982feefc3688bf73c874800cf1f83da67ba343cc",
+  "manifest_sha256": "6d590f342d989f2eba8f174163acc05d94288813efe8538bf6b9da7740b7fcf9",
+  "reviewed_at_utc": "2026-10-31T10:30:19.189888+00:00",
+  "scope": "Independent source code/binding refresh: genuine corrected current product and review schema joins; exact owning selection, isolated command graph, budgets, default scheduler, selection/execution/accounting. Stdout compaction and generic/core conservation remain reviewer1335 scope; no duplicated full-core clearance.",
+  "author_freeze": {
+    "path": "/tmp/startup30-stable-source-author-srgc1e_n/freeze.json",
+    "sha256": "ffa495ffbf5458f5bcc7d346963fce03fcfce7f81db4553b5c5bc1e76739f25b"
+  },
+  "blocking_findings": [],
+  "current_source_binding": {
+    "product_head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+    "product_tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+    "actual_parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+    "product_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard",
+    "controller_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source",
+    "current_HEAD_tree_and_source_clean_before_after": true,
+    "product_pins_live_git_and_embedded_exact": 22,
+    "manifest_members_live_git_hash_bytes_exact": 62,
+    "archive_bindings_sha_exact": 53,
+    "stable_guard_changed_path": [
+      "src/app/startup_gate.rs"
+    ],
+    "stable_guard_other_entries": 2221,
+    "genuine_original_current_review_and_publication": [
+      {
+        "kind": "stable_guard_review",
+        "original_path": "/tmp/coord-b9-startup-stable-match-guard-6ceb2e98-independent-current-head-review.json",
+        "sha256": "a81bc8b8f89c38deec1028a9b33b2648a434cf80ec69ca6736dfd163c721ee8f",
+        "archived_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/dependencies/stable_guard_review.json"
+      },
+      {
+        "kind": "stable_guard_publication",
+        "original_path": "/tmp/coord-b9-startup-stable-guard-reviewed-source-publication.json",
+        "sha256": "ee9ab001aa3144c657de2db1fd379c1b9a6fc60263e14d5e45be6f4c28b528ef",
+        "archived_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/dependencies/stable_guard_publication.json"
+      },
+      {
+        "kind": "stable_guard_source_receipt",
+        "original_path": "/tmp/coord-b9-startup-stable-guard-evidence/source-receipt.json",
+        "sha256": "07f2f51ab299616525ee75b369068d5068a3b88b5c5b1fbfb9a894c050063243",
+        "archived_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/dependencies/stable_guard_source_receipt.json"
+      }
+    ],
+    "consumer_anchors": "run-packet.py:891-955",
+    "schema_values_checked": "Current review verdict/head/tree/parents/findings and source-file before/after SHA; publication and author receipt exact current head/tree/sole_parent; publication->current review SHA and publication/review->author receipt SHA; actual parent eb7, BASE eb7 parent b914; original freeze/publication/shared-test/conservation reader fields exist and agree."
+  },
+  "historical_provenance": {
+    "chain": "b914f9d9b55527aa1bb22d591968c58958d717ee -> eb7ff16beb8864349573231521c5d4eab5270cc6 -> 6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+    "BASE": "Original b914/eb7 receipts are immutable historical BASE; no retargeting. New guard review/publication/author receipt separately cover6ceb. Archived base_eb7_startup_gate.rs equals actual eb7 object.",
+    "historical_982_review": "Old CONTROLLER_SOURCE_CLEAR applies to old runner4fbf/producteb7 and is archived as historical; not passed to current validator.",
+    "negative": "ACCOUNTING-DISCOVERY-1 original SOURCE_HOLD_ONE_PARTIAL_DISCOVERY_ACCOUNTING_GAP retained as a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465. Separate982 source correction review ceed7e7c18e372eb740c24d18c78e96f3812dcd89704ca56b73c4cc6b57759d8 and corrected parent_accounting body preserved. Original producteb7 A3 UI E0658 negative remains historical; no new-product pass inferred."
+  },
+  "selection": {
+    "owning_parent_count": 30,
+    "groups": {
+      "cli-lib": 1,
+      "host-lib": 1,
+      "ui-lib": 28
+    },
+    "ui_breakdown": "13 startup_gate/tests +5 attachment_tests +10 shared startup_terminals",
+    "all_selected_source_rows": "Names are unique actual #[test] definitions at recorded file/line in6ceb; all source-file SHA and ignored=false/attributes=test declarations agree. No test bodies or direct helper blobs changed by the one-file guard delta.",
+    "row_table_sha256": "399631c5a9cf78d7785e511b93d824028ca4f0fb1cc34ae77ccab7498548f205",
+    "source_map_and_command_groups_equal_plan": true,
+    "feature_predictions": "CLI compiles CLI control row; HOST also contains CLI row but executes only HOST row; UI also contains CLI row but executes only28UI rows. Absent cross-feature selectors are required absent from actual inventory. No overlap double credit.",
+    "anchors": "run-packet.py:956-985,294-310,500-515,609-644"
+  },
+  "commands_and_budgets": {
+    "features": [
+      [],
+      [
+        "host"
+      ],
+      [
+        "ui"
+      ]
+    ],
+    "helper_build": null,
+    "phases": [
+      "compile-cli-lib",
+      "inventory-cli-lib",
+      "parent-cli-lib-exact",
+      "compile-host-lib",
+      "inventory-host-lib",
+      "parent-host-lib-exact",
+      "compile-ui-lib",
+      "inventory-ui-lib",
+      "parent-ui-lib-exact"
+    ],
+    "phase_count": 9,
+    "compile": "Per graph cargo test --locked --no-default-features [--features host|ui] --lib --no-run --message-format=json; no feature union or broad suite.",
+    "inventory": "Cargo root cagents lib test-profile artifact selected by exact manifest/target/features and one successful build-finished; actual direct ELF --list --color=never before execution; artifact file descriptor observation before/after use.",
+    "execution": "One direct libtest invocation per graph using exact full-name filters plus --exact --format=pretty --color=never. No --nocapture or --test-threads override. RUST_TEST_THREADS, RUST_TEST_NOCAPTURE and preexisting fixture/helper selector names refuse admission. Natural HOME/opaque authority stay inherited; only declared compiler/target/jobs overrides.",
+    "compile_seconds_each": 600,
+    "inventory_seconds_each": 30,
+    "group_seconds": [
+      60,
+      60,
+      300
+    ],
+    "phase_caps_sum_seconds": 2310,
+    "packet_deadline_seconds": 2400,
+    "deadline_limit": "Existing absolute packet/phase deadline behavior preserved; it is not a promise each invocation receives a full nominal budget after metadata overhead. No timeout waiver or expanded budget introduced.",
+    "lane_jobs": 2,
+    "lane": "Existing C lock/target only, new_cache=false",
+    "toolchain": "Physical Rust1.93 cargo/rustc/rustdoc bytes frozen in plan; tool provenance remains donor source only until future preflight; no installed tool observation here.",
+    "anchors": "run-packet.py:21-31,272-310,609-644,969-988,1018-1022,1090-1174"
+  },
+  "accounting": {
+    "body_identical_to_archived_reviewed982": true,
+    "anchors": "run-packet.py:712-804",
+    "causal_checks": "Missing group-contracts evidence is not an error before any actual parent attempt; attempted parents require original contract evidence. Partial discovered groups must be exact CLI/HOST/UI prefix and are retained. Final credit re-reads original stdout, binds it to phase hash/original wait0/evidence and earlier parsed result. Three fully qualified original invocations required; declared30 is separate from discovered subset; nested/self-child results are nonadditive. Semantic failure remains FAIL_STOP with no invented parent receipts, while read/decode/control errors remain supervision failures.",
+    "unchanged_relevant_bodies": [
+      "validate_controller_review",
+      "cargo_test_artifact",
+      "inventory_names",
+      "grouped_contracts",
+      "grouped_result",
+      "execute_contracts",
+      "parent_accounting"
+    ]
+  },
+  "review_validator": {
+    "anchor": "run-packet.py:387-392,989-994",
+    "receipt_fields_exact": {
+      "verdict": "CONTROLLER_SOURCE_CLEAR",
+      "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+      "runner_sha256": "e86273f69b504f1b613c9539b55636c38a34b1795b13909f60b09468eae2a1cc",
+      "plan_sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31"
+    },
+    "meaning": "head/tree are CURRENT PRODUCT pins, while controller commit/tree are separate receipt fields. This receipt is source review only. It does not supply a grant, Packet A result, accepted donor return or permission to execute."
+  },
+  "early_invocation_guard": {
+    "anchors": "run-packet.py:1-4,868",
+    "fact": "Unconditional if not __debug__: raise RuntimeError precedes imports/effects, preventing optimized Python from bypassing assertions. main requires isolated/no-bytecode invocation; template correctly begins /usr/bin/python3 -I -B."
+  },
+  "admission": {
+    "execution_authorized": false,
+    "readiness": false,
+    "all_actual_values_null": true,
+    "template_grant_and_review_values_null": true,
+    "runtime": "UNRUN",
+    "builds_tests": "UNRUN",
+    "native_UX": "UNRUN",
+    "queue": null,
+    "grant": null,
+    "publication": null,
+    "merge": null,
+    "remaining": [
+      "Independent stdout/core conservation review by1335.",
+      "New current-product Packet A2 original positive result/RAW and accepted donor qualification/return within actual scope.",
+      "Root compatibility assessment plus current source/context/tool/resource preflight and a fresh specific B grant."
+    ],
+    "source_only_not_ready": true
+  },
+  "product_source_pins": [
+    {
+      "path": ".cargo/config.toml",
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "git_blob": "0e2d20b442d9256e22ecbe4852d77e2a07c45409"
+    },
+    {
+      "path": "Cargo.lock",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "git_blob": "9ff31301cf43f2219a56415069c4d3026765f9bb"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "git_blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5"
+    },
+    {
+      "path": "build.rs",
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "git_blob": "cc0447aee8720c7e850030ca36b5385665e6a275"
+    },
+    {
+      "path": "src/app.rs",
+      "sha256": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
+      "git_blob": "7c655b98eae0184af72a2e8cafb2fd3ea82359e3"
+    },
+    {
+      "path": "src/app/chat_ui.rs",
+      "sha256": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+      "git_blob": "7185ed02bd905cf52d1f0019742abb54fbc9ea75"
+    },
+    {
+      "path": "src/app/saved_terminal.rs",
+      "sha256": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+      "git_blob": "9f0f0421c08111f2e9b15ad8ac33e6f053983076"
+    },
+    {
+      "path": "src/app/shared_views.rs",
+      "sha256": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
+      "git_blob": "24b8e50a46abca271a46a35fdd3305293676f68b"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "git_blob": "2dab732885bb68e5b6d06fd433f4e0b3b5ef4812"
+    },
+    {
+      "path": "src/app/startup_gate.rs",
+      "sha256": "6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339",
+      "git_blob": "01bb3356994e9d6f76cd7be4623aa17cfb5982a7"
+    },
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "git_blob": "b6b7e18be052072b4ec2d2df0a89f4e00d6470a0"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "git_blob": "07c71dddb701dae4e02b1cd42b5a62ba1d21f24c"
+    },
+    {
+      "path": "src/control.rs",
+      "sha256": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "git_blob": "73f466464da429be939ba96786e72b31e3ee6918"
+    },
+    {
+      "path": "src/host/agent_execution/terminals.rs",
+      "sha256": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+      "git_blob": "33760aec3b600344721d1e8ce0f39854da229b5d"
+    },
+    {
+      "path": "src/host/client.rs",
+      "sha256": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+      "git_blob": "3228e99c86c94947733ae2fdc3805aa648276436"
+    },
+    {
+      "path": "src/host/mod.rs",
+      "sha256": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+      "git_blob": "1fcf101724e3a9984bb038d208998a19a4a1d3e6"
+    },
+    {
+      "path": "src/host/state.rs",
+      "sha256": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "git_blob": "e3fd4f7ad86fc4d4804de1bef55643e0799b5a45"
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "git_blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e"
+    },
+    {
+      "path": "src/modules.rs",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "git_blob": "9e04bd958166835de80fc06502dd6cbe547111d6"
+    },
+    {
+      "path": "src/terminal/hosted.rs",
+      "sha256": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+      "git_blob": "d57bc9411845d2da3209c4ac8279b73deb6ba0b4"
+    },
+    {
+      "path": "src/terminal/ipc.rs",
+      "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+      "git_blob": "1c610082dd9e4565ce4a3beb309351a346f0d158"
+    },
+    {
+      "path": "src/terminal/surface.rs",
+      "sha256": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21",
+      "git_blob": "5e10df3f82349a0463cfa3a2aea245b7c2e23515"
+    }
+  ],
+  "operations": "Read immutable Git/JSON/source, AST parsing and hashing, private worktree source head/tree/clean metadata only. No imports/calls of candidate or helper, extracted candidate case, builds/tests/native, installed tool/env/process probes, lane locks/grants/queue, public writes, source edits or workers.",
+  "scope_limits": [
+    "No product behavior re-review; genuine current stable guard source review is consumed within its delta-only scope.",
+    "No current-head compiler/test/native or integration equivalence claim, including no equivalence to Root PR2030 9a2 ancestry.",
+    "No actual test ELF, inventory, parallel degree or overlap exists yet; these are future runtime observations.",
+    "No generic authority API invented: actual grant and mandatory external prerequisites remain Root-controlled; the source parser only binds the supplied receipt/hash/grant string."
+  ]
+}

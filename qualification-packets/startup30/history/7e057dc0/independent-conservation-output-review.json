@@ -1,0 +1,151 @@
+{
+  "conservation": {
+    "accounting_negative_archive_unchanged_sha256": "a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465",
+    "all_other_top_function_bytes_exact": 31,
+    "changed_paths_all_inside_packet": 27,
+    "execute_contracts_and_required_evidence_wrappers_unchanged": true,
+    "grouped_result_parser_unchanged": true,
+    "helper_functions_and_dormant_binder_unchanged": true,
+    "historical_runner_plan_manifest_binding_conservation_archives_exact_to_old_commit": true,
+    "lease_acquire_finalize_close_tail": {
+      "bytes": 3790,
+      "current_lines": "1232-1291",
+      "old_new_byte_exact": true,
+      "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4"
+    },
+    "only_changed_top_function": "main",
+    "original_error_capture_final_append_return_HOLD_logic_unchanged": true,
+    "outside_packet_mode_type_blob_entries_exact": 2222,
+    "parent_accounting_982_correction_unchanged": true,
+    "protected_24_and_4_declared_hashes_all_match": true,
+    "protected_generic_functions_exact": 24,
+    "protected_original_main_nested_functions_exact": [
+      "read_bound",
+      "source",
+      "context",
+      "run"
+    ],
+    "summary_and_save_hash_archive_block": {
+      "bytes": 2511,
+      "current_lines": "1292-1311",
+      "old_new_byte_exact": true,
+      "sha256": "ddb619e94f0c86c9a613c75a78f9523a10541ba66df8dfad89844a081f84b484"
+    },
+    "top_function_count_each": 32
+  },
+  "contracts": {
+    "all_53_current_archive_bindings_hash_valid": true,
+    "artifact_groups_and_all_names_feature_assignments_exact": true,
+    "artifact_groups_canonical_sha256": "1a83c7f8b76be5cffc7f05b71bbcd9879911398278e48e34c9ad8a50d1038c44",
+    "compile_caps_each_seconds": 600,
+    "execution_caps_seconds": [
+      60,
+      60,
+      300
+    ],
+    "groups": [
+      "CLI1",
+      "HOST1",
+      "UI28"
+    ],
+    "helper_build": null,
+    "inventory_caps_each_seconds": 30,
+    "original_archive_binding_names_retained": true,
+    "packet_deadline_seconds": 2400,
+    "phase_caps_sum_seconds": 2310,
+    "phase_count": 9,
+    "phase_order_exact": [
+      "compile-cli-lib",
+      "inventory-cli-lib",
+      "parent-cli-lib-exact",
+      "compile-host-lib",
+      "inventory-host-lib",
+      "parent-host-lib-exact",
+      "compile-ui-lib",
+      "inventory-ui-lib",
+      "parent-ui-lib-exact"
+    ],
+    "selected_parent_records_canonical_sha256": "399631c5a9cf78d7785e511b93d824028ca4f0fb1cc34ae77ccab7498548f205",
+    "selected_parent_records_exact": 30,
+    "testfiles_exact_and_source_hashes_match": {
+      "src/app/shared_views/tests/startup_terminals.rs": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "src/app/startup_gate/tests.rs": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090"
+    },
+    "unique_parent_names": 30
+  },
+  "correction_requires_new_frozen_source_pin_and_review": true,
+  "execution_and_authority": {
+    "actual_compiler_and_prior_A3_negative": "UNCHANGED; source conservation/correction is not a pass",
+    "build_tests_native": "UNRUN",
+    "candidate_import_call_execution": "UNRUN",
+    "children_or_new_sessions": "NONE",
+    "environment_process_provider_DB_account_probes": "NOT_PERFORMED",
+    "grant_queue_resource_merge_runtime_readiness": "NOT_GRANTED_OR_REVIEWED",
+    "original_output_tail_safety": "NOT_REQUALIFIED_BY_THIS_SOURCE_REVIEW",
+    "source_edits": "NONE"
+  },
+  "findings": [
+    {
+      "anchor": "qualification-packets/startup30/run-packet.py:1316",
+      "bounded_correction": "Task-output only: terminal error = None if summary error is None else summary error[:1024]; add explicit error_truncated boolean and optionally full error character count. Preserve original summary.json error, ledgers, artifacts, protected tail and return/HOLD semantics byte-for-byte.",
+      "classification": "task_output_contract_gap",
+      "id": "COMPACT-ERROR-BOUND-1",
+      "observation": "Compact terminal copies the entire error string. Main records exception strings at 1248 and appends final/raw errors at 1253/1257 with no length cap. Most ordinary refusal messages are fixed; unclean final-custody detail leads to HOLD before this print. No actual oversized output is established.",
+      "oversized_runtime_occurrence": "UNPROVEN_SOURCE_ONLY",
+      "source_supported_possible_payload": "cargo_test_artifact at 286 resolves a Cargo-derived manifest_path outside sticky required_save/library_observation wrappers; path-bearing OSError text is not explicitly bounded by this runner, and clean waits/custody can still permit error summary output."
+    }
+  ],
+  "optimized_python_refusal": {
+    "execution_template_prefix": [
+      "/usr/bin/python3",
+      "-I",
+      "-B"
+    ],
+    "interpreter_execution_not_verified": true,
+    "lines": "2-3",
+    "main_first_statement_asserts_isolated_and_no_bytecode": "868",
+    "no_candidate_effect_precedes_guard": true,
+    "ordinary_if_not_debug_raise_before_first_import": true,
+    "template_grant_and_independent_review_null_execution_UNRUN": true
+  },
+  "output_assessment": {
+    "all_new_terminal_summary_keys_present_in_literal_summary_or_unchanged_accounting_return": true,
+    "full_summary_json_ledger_fields_raw_phase_evidence_and_SHA256SUMS_retained": true,
+    "no_new_exception_suppression_or_success_return": true,
+    "no_new_hidden_save_failure_or_false_closure_found": true,
+    "physical_close_before_summary_save_is_inherited_not_newly_qualified": true,
+    "release_status_and_qualification_predicates_unchanged": true,
+    "save_hash_or_print_failure_propagates_and_prevents_normal_return": true,
+    "terminal_constructed_only_after_full_summary_save_and_SHA256SUMS_write": true
+  },
+  "pins": {
+    "all_source_pins": {
+      "all_committed_blob_mode_type_size_hash_and_local_bytes_match": true,
+      "count": 63,
+      "path": "/tmp/startup30-stable-source-author-srgc1e_n/all-source-pins.json",
+      "sha256": "8e8474eff040978979cb7cdc0ee44716c2ee5cb9695bb8f93dee1bc9ca65a657"
+    },
+    "author_freeze": {
+      "path": "/tmp/startup30-stable-source-author-srgc1e_n/freeze.json",
+      "sha256": "ffa495ffbf5458f5bcc7d346963fce03fcfce7f81db4553b5c5bc1e76739f25b"
+    },
+    "controller_head": "7e057dc05cf1333a22f60a12d6b97b9393edeac5",
+    "key_files_sha256": {
+      "command-data.json": "473b30389d70303af3b903245eb7e6d822e74f0272f9b456ffee5cab2dd3d6a6",
+      "execution-template.json": "a27fd66541360dbe2e749f50c2bc75b7e00b3299e3659d7ce25884e4a8e1f87d",
+      "plan.json": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+      "run-packet.py": "e86273f69b504f1b613c9539b55636c38a34b1795b13909f60b09468eae2a1cc",
+      "source-conservation.json": "081029d2877992fb33409afc2334ed248d713a11cd81e35f80b8f6c823132b6d"
+    },
+    "sole_parent": "982feefc3688bf73c874800cf1f83da67ba343cc",
+    "tree": "779715c3e510dfb766f80041d8164a23a21360f7",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source"
+  },
+  "reviewer": "/root/1335_full_output_copy_lease",
+  "schema": "startup30-stable-source-independent-conservation-output-review-v1",
+  "scope": "Independent source/AST/Git/hash conservation and task output only; product proof-chain/runtime binding review belongs to other reviewer",
+  "verdict": "SOURCE_CONSERVATION_CLEAR_COMPACT_ERROR_PREVIEW_BOUND_REQUIRED_EXECUTION_UNRUN"
+}
