@@ -312,3 +312,196 @@ fn oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery
         "only the transport summary is bounded; original recovery detail remains"
     );
 }
+
+/// Add the same accepted handle to an opened gate that still waits for another
+/// pane. Inspection replies below are typed component inputs, not daemon RPCs.
+fn waiting_beside(surface: TerminalSurface, session: &TerminalSession) -> (Cagents, CardId) {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let mut connected = crate::app::tests::terminal_card_state();
+    connected.kind = CardKind::Terminal(session.clone());
+    let pending = crate::app::tests::terminal_card_state();
+    app.cards
+        .insert(connected.id, CardRuntime::Terminal(surface));
+    app.cards.insert(pending.id, CardRuntime::Loading);
+    Arc::make_mut(&mut app.durable).cards = vec![connected.clone(), pending];
+    app.startup_gate = State::fixture_opened();
+    app.startup_gate.pending = app.startup_pending().unwrap();
+    (app, connected.id)
+}
+
+fn reserved_answer(app: &mut Cagents, state: StartupState, proof: HostSessionProof) -> Inspection {
+    app.startup_gate.inspected = None; // A fixture dispatch without sleeping through its rate limit.
+    app.startup_gate.pending = app.startup_pending().unwrap();
+    let context = app
+        .reserve_startup_inspection()
+        .expect("one eligible component dispatch");
+    Inspection {
+        context,
+        outcome: Ok(Observation {
+            socket: app.startup_gate.fixture_endpoint.clone().unwrap(),
+            proof,
+            state,
+        }),
+    }
+}
+
+#[test]
+fn hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags() {
+    let directory = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(directory.path().join("daemon.sock")).unwrap();
+    let session = session();
+    let handle = HostedTerminalHandle::connect_at(
+        directory.path().join("daemon.sock"),
+        session.id,
+        Some(proof()),
+        |_| {},
+    )
+    .unwrap();
+    let surface = TerminalSurface::from(handle.clone());
+    surface.hibernate().unwrap();
+    let mut stream = accept(&listener);
+    connect(&mut stream, Vec::new());
+    let request = attach(&mut stream, &session);
+    acknowledge(&mut stream, &request, &session);
+    wait_ready(&surface, &session);
+    let (mut app, card) = waiting_beside(TerminalSurface::from(handle), &session);
+    assert!(surface.snapshot().detached);
+    assert_eq!(app.startup_connected_owners(), vec![(card, proof())]);
+    let pending = app.startup_pending().unwrap().unwrap();
+    let current = reserved_answer(&mut app, StartupState::Ready, proof());
+    let context = current.context.clone();
+    drop(app.startup_state_inspected(current));
+    assert!(
+        app.startup_gate.daemon.is_some(),
+        "current matching observation is useful"
+    );
+
+    let old = HostSessionProof {
+        host_session_id: HostSessionId::new("previous-host"),
+        boot_id: BootId::new("previous-boot"),
+        host_incarnation: HostIncarnation::new("previous-incarnation"),
+    };
+    let CardKind::Terminal(stored) = &mut app.card_state_mut(card).unwrap().kind else {
+        unreachable!();
+    };
+    stored.continuity = TerminalContinuity::Live {
+        host_session_id: old.host_session_id.clone(),
+        boot_id: old.boot_id.clone(),
+        host_incarnation: old.host_incarnation.clone(),
+    };
+    assert_eq!(
+        app.startup_connected_owners(),
+        vec![(card, proof())],
+        "actual accepted owner stays observable while saved metadata lags"
+    );
+    for state in [
+        StartupState::Ready,
+        StartupState::Retained {
+            detail: "old owner retained".into(),
+        },
+    ] {
+        let stale = Observed {
+            context: context.clone(),
+            daemon: Observation {
+                socket: app.startup_gate.fixture_endpoint.clone().unwrap(),
+                proof: old.clone(),
+                state,
+            },
+        };
+        assert!(!app.startup_observation_current(&stale, &pending));
+    }
+    let CardKind::Terminal(stored) = &app.card_state(card).unwrap().kind else {
+        unreachable!();
+    };
+    assert_eq!(stored.continuity.live_proof(), Some(old));
+    assert!(
+        terminal_surface_ready(stored, &surface).is_err(),
+        "owner evidence does not waive the separate readiness mismatch"
+    );
+    surface.stop_for_test();
+}
+
+#[test]
+fn actual_reconnect_retires_cached_inspection_until_fresh_acceptance() {
+    let directory = tempfile::tempdir().unwrap();
+    let listener = UnixListener::bind(directory.path().join("daemon.sock")).unwrap();
+    let session = session();
+    let handle = HostedTerminalHandle::connect_at(
+        directory.path().join("daemon.sock"),
+        session.id,
+        Some(proof()),
+        |_| {},
+    )
+    .unwrap();
+    let surface = TerminalSurface::from(handle.clone());
+    surface.hibernate().unwrap();
+    let mut first = accept(&listener);
+    connect(&mut first, Vec::new());
+    let request = attach(&mut first, &session);
+    acknowledge(&mut first, &request, &session);
+    wait_ready(&surface, &session);
+    let (mut app, card) = waiting_beside(TerminalSurface::from(handle), &session);
+    let ready = reserved_answer(&mut app, StartupState::Ready, proof());
+    drop(app.startup_state_inspected(ready));
+    assert!(app.startup_gate.daemon.is_some());
+    let delayed = reserved_answer(
+        &mut app,
+        StartupState::Retained {
+            detail: "late old-connection retained answer".into(),
+        },
+        proof(),
+    );
+    assert_eq!(delayed.context.owners, vec![(card, proof())]);
+
+    drop(first);
+    let mut second = accept(&listener); // Original client really left the first connection.
+    assert_eq!(surface.host_proof(), Some(proof()));
+    assert_eq!(surface.attachment_failure(), None);
+    assert!(app.startup_connected_owners().is_empty());
+    assert!(
+        app.startup_pending()
+            .unwrap()
+            .unwrap()
+            .panes
+            .contains(&card)
+    );
+    // Suppress a new unexecuted producer while delivering this component answer.
+    app.startup_gate.inspected = Some(Instant::now() + Duration::from_secs(60));
+    drop(app.verify_startup_gate()); // Tasks are component outputs and are not executed here.
+    assert!(app.startup_gate.daemon.is_none());
+    assert!(!app.startup_gate.reported);
+    drop(app.startup_state_inspected(delayed));
+    assert!(app.startup_gate.daemon.is_none());
+    assert!(
+        !app.startup_gate.reported,
+        "late retained answer cannot fail a new waiting phase"
+    );
+
+    connect(&mut second, Vec::new());
+    let request = attach(&mut second, &session);
+    assert!(
+        app.startup_connected_owners().is_empty(),
+        "Connected alone is insufficient"
+    );
+    acknowledge(&mut second, &request, &session);
+    wait_ready(&surface, &session);
+    assert_eq!(app.startup_connected_owners(), vec![(card, proof())]);
+    let fresh = reserved_answer(&mut app, StartupState::Ready, proof());
+    drop(app.startup_state_inspected(fresh));
+    let observed = app.startup_gate.daemon.as_ref().unwrap().clone();
+    let pending = app.startup_pending().unwrap().unwrap();
+    assert!(app.startup_observation_current(&observed, &pending));
+
+    surface.stop_for_test();
+    assert!(app.startup_connected_owners().is_empty());
+    assert_eq!(
+        app.startup_pending().unwrap(),
+        Some(pending.clone()),
+        "the other pending pane masks the stopped terminal's failure in the aggregate"
+    );
+    assert!(
+        !app.startup_observation_current(&observed, &pending),
+        "loss of current ownership invalidates Ready even with identical Pending IDs"
+    );
+    assert!(terminal_surface_ready(&session, &surface).is_err());
+}

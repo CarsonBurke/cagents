@@ -4409,6 +4409,7 @@ pub enum Message {
     StartupWindowOpened(window::Id),
     StartupReported(Result<(), String>),
     VerifyStartupPanes,
+    StartupStateInspected(startup_gate::Inspection),
     StartupPanesSaved(Result<SettingsSaved, String>, Result<(), String>),
     UiUpdate(instance::UiUpdateRequest),
     UiUpdateWatchdog(u64),
@@ -16189,6 +16190,7 @@ impl Application for Cagents {
                 report
             }
             Message::VerifyStartupPanes => self.verify_startup_gate(),
+            Message::StartupStateInspected(state) => self.startup_state_inspected(state),
             Message::StartupPanesSaved(settings, saved) => {
                 self.startup_panes_saved(settings, saved)
             }
