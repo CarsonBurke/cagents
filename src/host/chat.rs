@@ -710,6 +710,7 @@ fn resolve_source(
     }).ok_or_else(|| unavailable(match provider {
         Provider::Codex => "This terminal is not associated with a managed thread. Open New thread to use native and CLI views of one conversation.",
         Provider::Claude => "Claude has not published an exact live conversation yet. Retry once its live session is available; the terminal has not been stopped.",
+        Provider::Antigravity => "Antigravity does not publish which conversation this terminal is running, so it cannot move to native chat. Start a new chat, or resume a saved conversation from the resume list.",
         Provider::Omp => "OMP has not published an exact live conversation or fresh-session boundary for this terminal. The terminal has not been stopped; no recent history will be selected.",
     }))?;
     let mut recipe = bind_session(&process.recovery, &id).ok_or_else(|| error(
@@ -5674,6 +5675,7 @@ for line in sys.stdin:
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -5759,6 +5761,7 @@ done
         process_recipe.program = "/bin/cat".into();
         let spec = ProcessSpec::from(&process_recipe);
         let mut initial = Step {
+            interrupt_process: false,
             suppress_current_notification: false,
             notification_preview: None,
             writes: vec![json!({"ready": true})],
@@ -5895,6 +5898,7 @@ done
             }
             fn command(&mut self, _: Command) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({"id":"saved-conversation"})],
@@ -5903,6 +5907,7 @@ done
             }
             fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -5963,6 +5968,7 @@ done
         }
         fn command(&mut self, command: Command) -> Result<Step, String> {
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: Vec::new(),
@@ -6070,6 +6076,7 @@ done
         };
         let spec = ProcessSpec::from(&recipe);
         let mut initial = Step {
+            interrupt_process: false,
             suppress_current_notification: false,
             notification_preview: None,
             writes: Vec::new(),
@@ -6257,6 +6264,7 @@ done
         }
         fn command(&mut self, _: Command) -> Result<Step, String> {
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"tick": true})],
@@ -6266,6 +6274,7 @@ done
         fn receive(&mut self, _: Value) -> Result<Step, String> {
             self.0 = !self.0;
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: Vec::new(),
@@ -6307,6 +6316,7 @@ done
             fn command(&mut self, command: Command) -> Result<Step, String> {
                 assert_eq!(command, Command::Interrupt);
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
@@ -6315,6 +6325,7 @@ done
             }
             fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),

@@ -235,6 +235,7 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
         let flag = match spec.provider {
             Provider::Claude => "--permission-mode",
             Provider::Omp => "--approval-mode",
+            Provider::Antigravity => "--mode",
             Provider::Codex => "--ask-for-approval",
         };
         arguments.extend([flag.into(), mode.clone()]);
@@ -250,6 +251,7 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
                     crate::chat::protocol::codex::REASONING_EFFORT_KEY
                 ),
             ],
+            Provider::Antigravity => ["--effort".into(), effort.clone()],
         });
     }
     arguments

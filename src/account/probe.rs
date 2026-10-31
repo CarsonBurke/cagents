@@ -282,6 +282,7 @@ pub fn cli_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude Code",
         Provider::Codex => "Codex",
+        Provider::Antigravity => "Antigravity CLI",
         Provider::Omp => "Omp",
     }
 }
@@ -294,6 +295,7 @@ async fn probe_cli(account: &Account, program: &Path) -> Result<Probed, String> 
     match account.provider {
         Provider::Claude => probe_claude(account, program).await,
         Provider::Codex => probe_codex(account, program).await,
+        Provider::Antigravity => probe_antigravity(account, program).await,
         Provider::Omp => Err("Omp does not report account usage".into()),
     }
 }
@@ -697,7 +699,7 @@ pub async fn logout(account: Account) -> Result<(), String> {
     let arguments: &[&str] = match account.provider {
         Provider::Claude => &["auth", "logout"],
         Provider::Codex => &["logout"],
-        Provider::Omp => return Ok(()),
+        Provider::Antigravity | Provider::Omp => return Ok(()),
     };
     let executable = account.provider.executable();
     let search_path = search_path().await;
@@ -892,6 +894,44 @@ pub fn match_control_response(frame: &Value, request_id: &str) -> Option<Result<
 
 /// Codex: `codex app-server` over stdio, asked for the account and its
 /// limits and then closed.
+/// Lists the CLI's models, which proves its sign-in without opening a
+/// conversation, calling a model or starting a browser sign-in. It reports no
+/// usage, and the signed-in address only inside its own interface.
+async fn probe_antigravity(account: &Account, program: &Path) -> Result<Probed, String> {
+    let mut command = command(account, program);
+    command
+        .arg("models")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = command
+        .output()
+        .await
+        .map_err(|error| format!("Antigravity CLI could not start: {error}"))?;
+    let observed_at = now_ms();
+    let text = String::from_utf8_lossy(&output.stdout);
+    let refusal = String::from_utf8_lossy(&output.stderr);
+    if text.contains("sign in") || refusal.contains("sign in") {
+        return Ok(Probed::state(
+            UsageStatus::NeedsLogin,
+            "Run agy in a terminal to sign in",
+            observed_at,
+            Vec::new(),
+        ));
+    }
+    if !output.status.success() {
+        return Err(format!("agy models: {}", refusal.trim()));
+    }
+    Ok(Probed {
+        identity: Some(Identity::default()),
+        snapshot: UsageSnapshot::state(
+            UsageStatus::Unavailable,
+            "Antigravity CLI does not report usage",
+            observed_at,
+        ),
+        models: text.lines().filter_map(Model::from_antigravity).collect(),
+    })
+}
+
 async fn probe_codex(account: &Account, program: &Path) -> Result<Probed, String> {
     let mut command = command(account, program);
     command.arg("app-server");

@@ -32,6 +32,7 @@ fn install_url(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "https://code.claude.com/docs/en/setup",
         Provider::Codex => "https://developers.openai.com/codex/cli/",
+        Provider::Antigravity => "https://antigravity.google/docs/install",
         Provider::Omp => "https://github.com/can1357/oh-my-pi",
     }
 }
@@ -1416,7 +1417,7 @@ fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'stati
         (Provider::Claude, _) => &["auth", "login", "--claudeai"],
         (Provider::Codex, false) => &["login"],
         (Provider::Codex, true) => &["login", "--device-auth"],
-        (Provider::Omp, _) => return None,
+        (Provider::Antigravity | Provider::Omp, _) => return None,
     })
 }
 

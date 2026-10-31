@@ -100,6 +100,8 @@ pub fn candidates(seeds: &[chat::Session], cancel: &AtomicBool) -> Vec<Candidate
         let (root, depth) = match provider {
             Provider::Claude => (root.join("projects"), 2),
             Provider::Codex => (root.join("sessions"), 4),
+            // `brain/<conversation>/.system_generated/logs/transcript.jsonl`.
+            Provider::Antigravity => (root.join("brain"), 4),
             Provider::Omp => (root.join("sessions"), 3),
         };
         let root = root.canonicalize().unwrap_or(root);
@@ -348,7 +350,7 @@ fn header_with_cancel(
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        if wants_identity && let Some(declared) = declaration(provider, &value) {
+        if wants_identity && let Some(declared) = declaration(provider, &value, path) {
             // The first record to declare a conversation decides what the
             // file holds; a subagent's is not resumed on its own.
             identity = Some(declared?);
@@ -473,6 +475,7 @@ fn identity_hint(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "\"sessionId\"",
         Provider::Codex => "\"session_meta\"",
+        Provider::Antigravity => "\"step_index\"",
         Provider::Omp => "\"type\":\"session\"",
     }
 }
@@ -482,6 +485,7 @@ fn prompt_hint(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "\"type\":\"user\"",
         Provider::Codex => "\"user_message\"",
+        Provider::Antigravity => "<USER_REQUEST>",
         Provider::Omp => "\"role\":\"user\"",
     }
 }
@@ -489,7 +493,14 @@ fn prompt_hint(provider: Provider) -> &'static str {
 /// Whether a record declares a conversation, and if it does, the ID and
 /// working directory it resumes with, or `None` for one that is not
 /// resumable: a subagent's, or one without a valid identity.
-fn declaration(provider: Provider, value: &Value) -> Option<Option<(String, PathBuf)>> {
+fn declaration(
+    provider: Provider,
+    value: &Value,
+    path: &Path,
+) -> Option<Option<(String, PathBuf)>> {
+    if provider == Provider::Antigravity {
+        return antigravity_declaration(value, path);
+    }
     let header = match (provider, value["type"].as_str()) {
         (Provider::Codex, Some("session_meta")) => &value["payload"],
         (Provider::Omp, Some("session")) => value,
@@ -506,6 +517,33 @@ fn declaration(provider: Provider, value: &Value) -> Option<Option<(String, Path
     };
     let subagent = provider == Provider::Codex && header["source"].is_object();
     Some((!subagent).then(|| identity(provider, header)).flatten())
+}
+
+/// A transcript names neither its conversation nor its directory: the first
+/// comes from the path, the second from the CLI's own index of conversations.
+fn antigravity_declaration(value: &Value, path: &Path) -> Option<Option<(String, PathBuf)>> {
+    if !value["step_index"].is_u64() || path.file_name()? != "transcript.jsonl" {
+        return None;
+    }
+    let brain = path.ancestors().nth(3)?;
+    let id = brain.file_name()?.to_str()?;
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Some(None);
+    }
+    let index = brain.parent()?.parent()?.join("conversation_summaries.db");
+    let database =
+        rusqlite::Connection::open_with_flags(index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let uris: String = database
+        .query_row(
+            "SELECT workspace_uris FROM conversation_summaries WHERE conversation_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let uris: Vec<String> = serde_json::from_str(&uris).ok()?;
+    let directory = PathBuf::from(uris.first()?.strip_prefix("file://")?);
+    Some(directory.is_absolute().then(|| (id.to_owned(), directory)))
 }
 
 fn identity(provider: Provider, header: &Value) -> Option<(String, PathBuf)> {
@@ -531,6 +569,12 @@ fn prompt_of(provider: Provider, value: &Value) -> Option<String> {
                 && value["isSidechain"] != true =>
         {
             &value["message"]
+        }
+        Provider::Antigravity if value["type"] == "USER_INPUT" => {
+            let content = value["content"].as_str()?;
+            let (_, rest) = content.split_once("<USER_REQUEST>")?;
+            let (request, _) = rest.split_once("</USER_REQUEST>")?;
+            return crate::workspace_model::channel_title_from_prompt(request.trim());
         }
         Provider::Omp if value["type"] == "message" && value["message"]["role"] == "user" => {
             &value["message"]
@@ -669,11 +713,17 @@ mod tests {
                     account_home.to_string_lossy().into_owned(),
                 );
             }
+            if provider == Provider::Antigravity {
+                seed.launch
+                    .recipe
+                    .environment
+                    .insert("HOME".into(), account_home.to_string_lossy().into_owned());
+            }
             let base = provider.session_root(&seed.launch.recipe).unwrap();
-            let directory = base.join(if provider == Provider::Claude {
-                "projects/project"
-            } else {
-                "sessions/native"
+            let directory = base.join(match provider {
+                Provider::Claude => "projects/project",
+                Provider::Antigravity => "brain",
+                _ => "sessions/native",
             });
             std::fs::create_dir_all(&directory).unwrap();
             let record = match provider {
@@ -683,9 +733,36 @@ mod tests {
                 Provider::Codex => {
                     json!({"type":"session_meta","payload":{"id":id,"cwd":root.path(),"source":"cli"}})
                 }
+                Provider::Antigravity => {
+                    let index =
+                        rusqlite::Connection::open(base.join("conversation_summaries.db")).unwrap();
+                    index
+                        .execute_batch(
+                            "CREATE TABLE conversation_summaries \
+                             (conversation_id TEXT, workspace_uris TEXT)",
+                        )
+                        .unwrap();
+                    index
+                        .execute(
+                            "INSERT INTO conversation_summaries VALUES (?1, ?2)",
+                            [
+                                id.to_owned(),
+                                json!([format!("file://{}", root.path().display())]).to_string(),
+                            ],
+                        )
+                        .unwrap();
+                    json!({"step_index":0,"type":"USER_INPUT"})
+                }
                 Provider::Omp => json!({"type":"session","id":id,"cwd":root.path()}),
             };
-            std::fs::write(directory.join(format!("{id}.jsonl")), format!("{record}\n")).unwrap();
+            let transcript = if provider == Provider::Antigravity {
+                let logs = directory.join(id).join(".system_generated/logs");
+                std::fs::create_dir_all(&logs).unwrap();
+                logs.join("transcript.jsonl")
+            } else {
+                directory.join(format!("{id}.jsonl"))
+            };
+            std::fs::write(transcript, format!("{record}\n")).unwrap();
             let entries = discover(&[seed.clone()]);
             assert_eq!(entries.len(), 1, "{provider:?}");
             let (found, session) = &entries[0];

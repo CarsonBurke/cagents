@@ -36,7 +36,9 @@ mod review_cache;
 // decode safely. Admission must reject them before partial workspace loading
 // can omit a card and a later snapshot can tombstone it. This supplements the
 // normal local IPC startup gate; it also fences permitted old-set/remote opens.
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+// Format 14 can retain Antigravity descriptors, a provider older readers cannot
+// decode, under the same admission reasoning as format 12.
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const PRIVATE_FILE_MODE: u32 = 0o600;

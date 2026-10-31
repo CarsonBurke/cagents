@@ -1832,6 +1832,7 @@ fn account_login(account: crate::account::Account) -> Result<Reply, String> {
     let arguments = match account.provider {
         Provider::Claude => vec!["auth".into(), "login".into(), "--claudeai".into()],
         Provider::Codex => vec!["login".into(), "--device-auth".into()],
+        Provider::Antigravity => return Err("open a terminal on this device and run agy".into()),
         Provider::Omp => return Err("open an Omp terminal on this device and use /login".into()),
     };
     let runtime = tokio::runtime::Builder::new_current_thread()

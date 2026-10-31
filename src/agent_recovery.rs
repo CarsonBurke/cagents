@@ -159,6 +159,8 @@ fn interactive_recipe(launch: &LaunchRecipe, selector: Selector) -> Option<Launc
     match selector {
         Selector::Fresh => {}
         Selector::Exact => provider.append_resume(&mut arguments, id?),
+        // Its only picker is inside the running CLI.
+        Selector::Picker if provider == Provider::Antigravity => return None,
         Selector::Picker => provider.append_resume_picker(&mut arguments),
     }
     Some(LaunchRecipe {
@@ -520,6 +522,7 @@ fn observation_environment_key(name: &str) -> bool {
         "HOME"
             | "PATH"
             | "CODEX_HOME"
+            | "AGY_ADC_AUTH"
             | "CLAUDE_CONFIG_DIR"
             | "PI_CODING_AGENT_DIR"
             | "OMP_PROFILE"
@@ -648,6 +651,7 @@ fn provider_setting_environment_key(provider: Provider, name: &str) -> bool {
             "AZURE",
         ],
         Provider::Codex => &["CODEX", "OPENAI"],
+        Provider::Antigravity => &["AGY_", "GEMINI", "GOOGLE_", "GCLOUD"],
     };
     if prefixes.iter().any(|prefix| starts_with(prefix)) {
         return true;
@@ -814,6 +818,7 @@ fn return_environment_key(provider: Provider, name: &str) -> bool {
             "AZURE",
         ],
         Provider::Codex => &["CODEX", "OPENAI"],
+        Provider::Antigravity => &["AGY_", "GEMINI", "GOOGLE_", "GCLOUD"],
         Provider::Omp => {
             return (provider_setting_environment_key(provider, name)
                 && !native_runtime_environment_key(name))

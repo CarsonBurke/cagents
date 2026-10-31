@@ -50,7 +50,7 @@ pub(super) fn retry_draft(denial: &chat::PermissionDenial) -> Option<String> {
 fn mode_description(mode: &str) -> &str {
     match mode {
         "manual" | "default" => "Review tool requests before allowing them",
-        "acceptEdits" => "Allow file edits; review other tool requests",
+        "acceptEdits" | "accept-edits" => "Allow file edits; review other tool requests",
         "auto" => "Claude reviews actions; explicit intent can clear soft blocks",
         "plan" => "Explore and plan before making changes",
         "dontAsk" => "Block actions that are not already allowed",

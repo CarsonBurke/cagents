@@ -2671,6 +2671,13 @@ impl Actor {
         {
             context.verify_directory(&self.working_directory)?;
         }
+        if step.interrupt_process
+            && let Some(child) = &self.child
+        {
+            // SAFETY: the actor reaps this child, so its numeric group is still
+            // reserved. An already-exited child has no turn left to stop.
+            unsafe { libc::kill(-(child.child.id() as i32), libc::SIGINT) };
+        }
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)
@@ -4308,6 +4315,7 @@ mod tests {
             ) -> Result<Step, String> {
                 self.run = Some(run);
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![serde_json::json!({"final":true})],
@@ -4326,6 +4334,7 @@ mod tests {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6059,6 +6068,7 @@ mod tests {
     impl Adapter for Echo {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"text": "hello"})],
@@ -6070,6 +6080,7 @@ mod tests {
                 return Err("fixture only supports refresh".into());
             }
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"text": " world"})],
@@ -6078,6 +6089,7 @@ mod tests {
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             Ok(Step {
+                interrupt_process: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: Vec::new(),
@@ -6704,6 +6716,7 @@ mod tests {
         impl Adapter for Reporter {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({})],
@@ -6715,6 +6728,7 @@ mod tests {
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6780,6 +6794,7 @@ mod tests {
         impl Adapter for WholeTurn {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({})],
@@ -6792,6 +6807,7 @@ mod tests {
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 let execution = |event| Event::Execution { run: self.0, event };
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6953,6 +6969,7 @@ mod tests {
         fn command(&mut self, command: Command) -> Result<Step, String> {
             if command == Command::Interrupt {
                 Ok(Step {
+                    interrupt_process: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({"interrupt": true})],

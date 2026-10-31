@@ -3,6 +3,7 @@ use super::{Command, Event, Launch};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
+pub mod antigravity;
 pub mod claude;
 mod claude_edits;
 mod claude_permissions;
@@ -319,6 +320,9 @@ pub struct Step {
     pub notification_preview: Option<super::notification::Preview>,
     /// Written in order before the next incoming frame is processed.
     pub writes: Vec<Value>,
+    /// Stop the turn with SIGINT, for a provider with no cancel message. The
+    /// process ends with it, reporting how the turn finished before it does.
+    pub interrupt_process: bool,
     pub events: Vec<Event>,
 }
 /// Account identity verified during initialize on the actual server connection.
@@ -382,8 +386,8 @@ pub(crate) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Ad
 /// conversation. This rewrites the provider's resume arguments to the
 /// confirmed identity. Only call with an identity the live provider
 /// reported, never user input: strict `create()` forgery checks stay intact
-/// everywhere else. OMP needs nothing: it derives `--resume` from the
-/// session ID when creating the process spec.
+/// everywhere else. OMP and Antigravity need nothing: they select the conversation
+/// from the session ID when creating the process spec.
 pub fn align_resume_identity(launch: &mut Launch) -> Result<(), String> {
     let Some(id) = launch.session_id.clone() else {
         return Ok(());
@@ -395,7 +399,7 @@ pub fn align_resume_identity(launch: &mut Launch) -> Result<(), String> {
         crate::agent::Provider::Codex => {
             codex::align_resume_identity(&mut launch.recipe.arguments, &id)
         }
-        crate::agent::Provider::Omp => Ok(()),
+        crate::agent::Provider::Omp | crate::agent::Provider::Antigravity => Ok(()),
     }
 }
 

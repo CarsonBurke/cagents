@@ -1078,7 +1078,12 @@ fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
 
 /// The providers a draft offers, in the order its picker lists them after
 /// its own.
-const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
+const MODEL_FAMILIES: [Provider; 4] = [
+    Provider::Codex,
+    Provider::Claude,
+    Provider::Antigravity,
+    Provider::Omp,
+];
 
 /// One provider's models, as a draft's picker offers them.
 struct Offer<'a> {
@@ -1093,6 +1098,7 @@ fn family_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Codex => "ChatGPT",
         Provider::Claude => "Claude",
+        Provider::Antigravity => "Antigravity",
         Provider::Omp => "Other models",
     }
 }
@@ -1147,6 +1153,7 @@ impl Runtime {
         let provider = match self.session.launch.provider {
             Provider::Codex => "Codex",
             Provider::Claude => "Claude",
+            Provider::Antigravity => "Antigravity",
             Provider::Omp => "OMP",
         };
         let model = agent
@@ -1688,6 +1695,7 @@ impl Runtime {
             let provider = match self.session.launch.provider {
                 Provider::Codex => "Codex",
                 Provider::Claude => "Claude",
+                Provider::Antigravity => "Antigravity",
                 Provider::Omp => "OMP",
             };
             let model = agent
@@ -5018,7 +5026,7 @@ pub(super) fn permission_mode_label(mode: &str) -> &str {
         "default" | "manual" => "Ask before edits",
         "readOnly" => "Read only",
         "workspaceWrite" => "Workspace write",
-        "acceptEdits" => "Auto-accept edits",
+        "acceptEdits" | "accept-edits" => "Auto-accept edits",
         "auto" => "Auto",
         "plan" => "Plan",
         "dontAsk" => "Don't ask",
@@ -5504,6 +5512,7 @@ fn names_provider(provider: Provider, needle: &str) -> bool {
     let names: &[&str] = match provider {
         Provider::Codex => &["chatgpt", "codex", "openai"],
         Provider::Claude => &["claude", "anthropic"],
+        Provider::Antigravity => &["antigravity", "agy", "gemini", "google"],
         Provider::Omp => &["other models", "omp"],
     };
     names.iter().any(|name| {

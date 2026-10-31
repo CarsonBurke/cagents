@@ -45,7 +45,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   opened while it was selected, and its row shows how many when there is more
   than one.
 - Editor tabs use the ceditor mark; recognized agent terminals and native chats
-  use their OMP, Claude, or Codex provider mark.
+  use their OMP, Claude, Codex, or Antigravity provider mark.
 - Drag a tab title to reorder panes. The
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
@@ -862,7 +862,7 @@ conversation title, provider, project path, or account. Use the arrow keys and
 Enter, or click a conversation to open it.
 
 The picker includes saved native chats that were closed in an earlier run and
-conversation history from the configured Claude, Codex, and OMP accounts. It
+conversation history from the configured Claude, Codex, Antigravity, and OMP accounts. It
 keeps the exact conversation, original account, and working directory; an
 already-open conversation takes you to its existing pane. Claude's terminal
 resume picker excludes SDK sessions, so use this picker for native Claude chats.
@@ -1034,6 +1034,25 @@ remain user-controlled. This policy does not rewrite those settings or an
 already-running conversation. If a terminal later exports an excluded variable,
 switching it to native chat refuses before stopping the CLI. Recovery retains
 the recorded account selection; choose **System default** to inherit credentials.
+
+### Antigravity CLI
+
+Antigravity CLI (`agy`) runs in a terminal tab like any other agent, on its one
+sign-in on this computer: the CLI cannot keep separate logins per directory, so
+it has no managed accounts here. Run `agy` in a terminal to sign in.
+
+Native Antigravity chat needs a Gemini API key, a Google Cloud sign-in or
+Application Default Credentials. Google [does not support](https://antigravity.google/docs/faq)
+wrapping `agy` in other applications on consumer plans, so a personal Google
+sign-in stays in the terminal. A native chat differs from Claude and Codex chats:
+
+- It cannot ask for approval. A tool that needs one is refused and the chat says
+  so. Choose the permission mode before the first message; it cannot change after.
+- **Stop** ends the CLI process; the conversation can be resumed afterward.
+- It accepts text only. The model is chosen once, when the chat starts.
+- Earlier messages come from the CLI's own undocumented transcript. If that cannot
+  be read, what is already shown stays, and new messages continue.
+- Antigravity reports no usage allowance to show.
 
 ### Switching between terminal and chat
 

@@ -4732,6 +4732,7 @@ pub(super) fn chat_card_title(provider: Provider) -> &'static str {
         Provider::Omp => "OMP chat",
         Provider::Claude => "Claude chat",
         Provider::Codex => "Codex chat",
+        Provider::Antigravity => "Antigravity chat",
     }
 }
 
@@ -4765,12 +4766,16 @@ fn bypasses_approvals(recipe: &LaunchRecipe) -> bool {
             argument.as_str(),
             "--dangerously-bypass-approvals-and-sandbox"
                 | "--yolo"
+                | "-y"
+                | "--approval-mode=yolo"
                 | "--dangerously-skip-permissions"
                 | "--permission-mode=bypassPermissions"
         ) || (argument == "--permission-mode"
             && arguments
                 .get(index + 1)
                 .is_some_and(|mode| mode == "bypassPermissions"))
+            || (argument == "--approval-mode"
+                && arguments.get(index + 1).is_some_and(|mode| mode == "yolo"))
     }) || recipe
         .environment
         .get("CLAUDE_CODE_PERMISSION_MODE")
@@ -5002,12 +5007,19 @@ fn draft_snapshot(
                     "bypassPermissions".into(),
                 ],
                 Provider::Codex => vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()],
+                Provider::Antigravity => vec![
+                    "default".into(),
+                    "accept-edits".into(),
+                    "auto".into(),
+                    "plan".into(),
+                    "yolo".into(),
+                ],
                 Provider::Omp => Vec::new(),
             },
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
                 Provider::Claude => chat::SkillReach::Leading,
-                Provider::Omp => chat::SkillReach::First,
+                Provider::Antigravity | Provider::Omp => chat::SkillReach::First,
             },
             ..chat::Capabilities::default()
         },
@@ -5057,8 +5069,30 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .or_else(|| Some("manual".into()))
         }
         Provider::Codex => codex_draft_permission_mode(recipe),
+        Provider::Antigravity => Some(antigravity_draft_permission_mode(arguments)),
         Provider::Omp => None,
     }
+}
+
+fn antigravity_draft_permission_mode(arguments: &[String]) -> String {
+    if arguments
+        .iter()
+        .any(|argument| argument == "--dangerously-skip-permissions")
+    {
+        return "yolo".into();
+    }
+    arguments
+        .iter()
+        .enumerate()
+        .find_map(|(index, argument)| {
+            argument.strip_prefix("--mode=").or_else(|| {
+                (argument == "--mode")
+                    .then(|| arguments.get(index + 1).map(String::as_str))
+                    .flatten()
+            })
+        })
+        .unwrap_or("default")
+        .to_owned()
 }
 
 /// Preview the launch policy without changing the CLI's configuration. Once
@@ -5194,6 +5228,29 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
 }
 
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
+    if provider == Provider::Antigravity {
+        let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
+        let mut original = recipe.arguments.iter();
+        while let Some(argument) = original.next() {
+            match argument.as_str() {
+                "--mode" => {
+                    original.next();
+                }
+                "--dangerously-skip-permissions" => {}
+                other if other.starts_with("--mode=") => {}
+                _ => arguments.push(argument.clone()),
+            }
+        }
+        match mode {
+            "yolo" => arguments.push("--dangerously-skip-permissions".into()),
+            "accept-edits" | "auto" | "plan" => {
+                arguments.extend(["--mode".into(), mode.to_owned()]);
+            }
+            _ => {}
+        }
+        recipe.arguments = arguments;
+        return;
+    }
     if provider == Provider::Claude {
         chat::apply_claude_permission_mode(recipe, mode);
         return;

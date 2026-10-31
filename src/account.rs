@@ -183,7 +183,7 @@ pub fn home_variable(provider: Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("CLAUDE_CONFIG_DIR"),
         Provider::Codex => Some("CODEX_HOME"),
-        Provider::Omp => None,
+        Provider::Antigravity | Provider::Omp => None,
     }
 }
 
@@ -216,7 +216,7 @@ pub(crate) fn credential_overrides(provider: Provider) -> &'static [&'static str
             "OPENAI_IDENTITY_TOKEN_FILE",
             "OPENAI_WORKLOAD_IDENTITY_CONTEXT",
         ],
-        Provider::Omp => &[],
+        Provider::Antigravity | Provider::Omp => &[],
     }
 }
 
@@ -399,7 +399,12 @@ impl Account {
     pub const PROVIDERS: [Provider; 2] = [Provider::Claude, Provider::Codex];
 
     /// The providers whose usage is reported, in the order they are listed.
-    pub const REPORTED: [Provider; 3] = [Provider::Claude, Provider::Codex, Provider::Omp];
+    pub const REPORTED: [Provider; 4] = [
+        Provider::Claude,
+        Provider::Codex,
+        Provider::Antigravity,
+        Provider::Omp,
+    ];
 
     pub fn id(&self) -> AccountId {
         let provider = self.provider.executable();
@@ -492,6 +497,7 @@ impl Account {
                 let directory = match self.provider {
                     Provider::Claude => ".claude",
                     Provider::Codex => ".codex",
+                    Provider::Antigravity => ".gemini/antigravity-cli",
                     Provider::Omp => return None,
                 };
                 Some(Path::new(&home).join(directory))
