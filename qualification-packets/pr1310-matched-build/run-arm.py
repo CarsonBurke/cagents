@@ -121,7 +121,9 @@ def cargo_artifact(raw, checkout, graph):
             if row.get('manifest_path') != str(checkout / 'Cargo.toml'):
                 continue
             target = row.get('target', {})
-            if target.get('name') != graph['name']:
+            # The root lib and CLI bin legitimately share the name cagents.
+            # Only actual bin-kind artifacts participate in this bin selector.
+            if target.get('kind') != ['bin'] or target.get('name') != graph['name']:
                 continue
             require(target.get('kind') == ['bin'] and target.get('crate_types') == ['bin']
                     and target.get('src_path') == str(checkout / graph['source']), 'Wrong actual bin/source kind')

@@ -7,7 +7,7 @@
   },
   "producer": {
     "path": "qualification-packets/pr1310-matched-build/run-arm.py",
-    "sha256": "935fb054ac718f73cf5ed27e0c8d467b86df434846419d28dea02d10e1775c76",
+    "sha256": "129fe858ad9b418c865a789ac557d55a0e3a8ad500b79326f4a5b72db2c04130",
     "API": "produce_arm(arm, checkout, evidence_root, inputs, retained, invoke, fence, failure)",
     "standalone": "ordinary Hold; no CLI/controller/supervisor/resource owner",
     "original_command_source_binding": null,
@@ -34,52 +34,52 @@
       },
       "cargo_artifact": {
         "line": 93,
-        "end_line": 150,
-        "body_sha256": "48e4571c7d4d63cc9d2712856a5f14ccc0fcc36cb86c68bb00abff48adc6af64"
+        "end_line": 152,
+        "body_sha256": "fb3fd8a4a7cfa00b3b964cb98b9fdd97bc18cb6fae769ba02c9912ce4c0dcfa1"
       },
       "identity": {
-        "line": 153,
-        "end_line": 156,
+        "line": 155,
+        "end_line": 158,
         "body_sha256": "5ccc189f3cb22efea7bb33db65a8f71823f5c1fb4ceedaaaa8535ee44512f396"
       },
       "copy_elf": {
-        "line": 159,
-        "end_line": 244,
+        "line": 161,
+        "end_line": 246,
         "body_sha256": "bd16fb0dbbdeb0b077bf564f02c278bbead235eb29ec5fe4845e568532634c25"
       },
       "observe_context": {
-        "line": 247,
-        "end_line": 279,
+        "line": 249,
+        "end_line": 281,
         "body_sha256": "2fb92bab2c2ecc7f6602d0b67fe41f3d12fd0451ca99760e9632edc3ebd24e36"
       },
       "executable_observation": {
-        "line": 283,
-        "end_line": 299,
+        "line": 285,
+        "end_line": 301,
         "body_sha256": "3083edeb2ce44a703427c902b42f4f76a453880204903a3a524330f2733680be"
       },
       "source_observation": {
-        "line": 302,
-        "end_line": 310,
+        "line": 304,
+        "end_line": 312,
         "body_sha256": "4cbf221becfc328810c0509ed803f4a9c1828ca89802d123007995a14966c8ce"
       },
       "write_copy_receipt": {
-        "line": 313,
-        "end_line": 342,
+        "line": 315,
+        "end_line": 344,
         "body_sha256": "b0e3e5d0f96b40489aa9a413f18a4b00cd636dca01ad9256622cade77c25a7e2"
       },
       "require_original_owner": {
-        "line": 344,
-        "end_line": 360,
+        "line": 346,
+        "end_line": 362,
         "body_sha256": "ac893604b49a0d581643da29cea453ed81560d24b3ab081432da8a7dc45705a6"
       },
       "original_output": {
-        "line": 363,
-        "end_line": 375,
+        "line": 365,
+        "end_line": 377,
         "body_sha256": "4dabcf82959142f169b2866c0b037348766036306d39e5dedde560efbc564648"
       },
       "produce_arm": {
-        "line": 378,
-        "end_line": 464,
+        "line": 380,
+        "end_line": 466,
         "body_sha256": "e9fd85dd3e4c7d0f85cccd43a2bcaa3331a3c428d2bd8d3b3b209536843dc42e"
       }
     }
@@ -300,8 +300,8 @@
   },
   "source_oracles": {
     "path": "qualification-packets/pr1310-matched-build/test_build_source.py",
-    "sha256": "17659f6638414b8b3ec995c6c0a1464c3f38867b163fbc457dc43613f985a27b",
-    "parents": 5,
+    "sha256": "fccca12007791b5f11d282deb364f9896c64f30aeb56be2c0df7db075b000d50",
+    "parents": 6,
     "status": "AUTHORED_UNRUN_AST_PARSE_ONLY",
     "scope": "Synthetic actual-parser/command/NULL-refusal/status selection; no copied desired selector or producer import/effect",
     "subcases_nonadditive": true
@@ -318,5 +318,24 @@
     "resource_return": "EXTERNAL_ORIGINAL_OWNER_HOLD"
   },
   "conservation": "ONLY four new task leaves; every original72fd entry/library/driver/fixture/product and protected generic source entry byte exact. Original native five-oracle UNRUN/historical pure3 scope unchanged.",
-  "review": "PENDING_FRESH_NONAUTHOR_SOURCE_REVIEW_NO_PUBLICATION_OR_GRANT"
+  "review": "PENDING_FRESH_NONAUTHOR_SOURCE_REVIEW_NO_PUBLICATION_OR_GRANT",
+  "bin_sibling_correction": {
+    "schema": "pr1310-matched-build-root-bin-sibling-correction-v1",
+    "parent": "fb5a131ff7fdec7823ae528fb02a43dcc12d24be",
+    "parent_tree": "63a925392bd7fead96a8b926b2b1a73eec88bb8b",
+    "scope": "Only cargo_artifact actual bin-kind eligibility filter; ordinary root lib cagents cannot veto requested bin. Existing selected-bin/duplicate/error/completion guards unchanged.",
+    "immutable_negative": "Preserved independently confirmed fb5 SOURCE blocker; original review receipt is bound by external successor author receipt when sealed. No original runtime result exists.",
+    "new_owning_parent": "MatchedBuildSourceOracles.test_cli_root_library_sibling_does_not_veto_actual_bin",
+    "all_oracle_parents": 6,
+    "new_and_old_oracles_status": "AUTHORED_UNRUN; all5 old parent bodies and UI assertions byte exact",
+    "other_helpers": "All13 other top-level function bodies byte exact fb5; no callback binding/chain/authority/resource positivity added",
+    "original_command_binding": null,
+    "review": "PENDING_SAME_NONAUTHOR_FOCUSED_DELTA_SOURCE_REVIEW",
+    "original_negative_review": {
+      "path": "/tmp/coord-b9-pr1310-fb5a131f-independent-matched-build-producer-review.json",
+      "sha256": "3a76c9f96317b1f0b1a8ec3193e61662237a43152d84d513ce19d1a736bac099",
+      "scope": "Immutable fb5 SOURCE negative: one P2 root-library/bin collision; not runtime failure"
+    },
+    "new_parent_subcases": "Same combined stream root lib before AND after actual CLI bin; library-only and duplicate bin refusal, all nonadditive"
+  }
 }

@@ -98,9 +98,23 @@ target-specific runner semantics and the full effective Cargo configuration are
 still UNKNOWN. Physical binary hashes and a version banner cannot fill that gap.
 No full import/native/renderer/UX or later application inference is produced.
 
-The five `MatchedBuildSourceOracles` parents are AUTHORED UNRUN. They select only
+The six `MatchedBuildSourceOracles` parents are AUTHORED UNRUN. They select only
 actual pure source AST; no full producer import or effect/orchestration body is
 executed during preparation. Source/JSON/AST/hash/inverse checks are preparation
 only. Existing native scale five-oracle UNRUN and historical pure3 scope are
 unchanged. Independent source review and an actual one-use original C grant are
 required before any discovery/build; all future runtime fields remain NULL.
+
+## Root library/bin sibling correction (source only)
+
+The immutable fb5 source negative is retained: the ordinary root library and CLI
+binary both have target.name `cagents`, so name-first validation wrongly rejected
+the lib row before reaching the actual bin. The selector now filters actual bin
+kind before applying every existing exact requested-bin guard. It still refuses
+lib-only streams, duplicate bins, wrong selected sources/features/profile/paths,
+errors and ambiguous completion. One new CLI parent uses actual `commands()[0]`
+with both rows in the SAME original combined stream; its lib-only and duplicate
+cases are nonadditive. All original five parent bodies/UI assertions are exact.
+All six remain AUTHORED UNRUN; no executable import/function/case was run. NULL
+safe-owner binding, first-effect refusal and all chain/import/resource holds are
+unchanged. A fresh focused nonauthor source review is required.

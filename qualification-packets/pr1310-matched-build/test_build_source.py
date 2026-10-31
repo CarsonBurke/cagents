@@ -12,7 +12,7 @@ import re
 from types import SimpleNamespace
 import unittest
 
-EXPECTED_SOURCE_SHA256 = '935fb054ac718f73cf5ed27e0c8d467b86df434846419d28dea02d10e1775c76'
+EXPECTED_SOURCE_SHA256 = '129fe858ad9b418c865a789ac557d55a0e3a8ad500b79326f4a5b72db2c04130'
 
 
 def selected_source():
@@ -81,6 +81,34 @@ class MatchedBuildSourceOracles(unittest.TestCase):
         with self.assertRaises(self.hold):
             self.actual['cargo_artifact'](self.stream(self.artifact(), self.artifact(),
                 {'reason': 'build-finished', 'success': True}), self.checkout, self.graph)
+
+    def test_cli_root_library_sibling_does_not_veto_actual_bin(self):
+        cli = self.actual['commands']()[0]
+        binary = self.artifact()
+        executable = str(self.actual['TARGET'] / 'dev-runtime' / 'cagents')
+        binary.update(features=['development'], executable=executable, filenames=[executable],
+                      target={'kind': ['bin'], 'crate_types': ['bin'], 'name': 'cagents',
+                              'src_path': '/tmp/pure-synthetic-source/src/main.rs'})
+        library = {**binary, 'target': {'kind': ['lib'], 'crate_types': ['lib'], 'name': 'cagents',
+                                       'src_path': '/tmp/pure-synthetic-source/src/lib.rs'},
+                   'executable': None, 'filenames': [str(self.actual['TARGET'] / 'dev-runtime' / 'libcagents.rlib')]}
+        finish = {'reason': 'build-finished', 'success': True}
+        for label, rows, bin_line in [('lib-before-bin', (library, binary), 3),
+                                      ('lib-after-bin', (binary, library), 2)]:
+            with self.subTest(order=label):
+                raw = self.stream('   Compiling cagents v0.1.3', *rows, finish)
+                selected = self.actual['cargo_artifact'](raw, self.checkout, cli)
+                self.assertEqual(selected['target']['kind'], ['bin'])
+                self.assertEqual(selected['target']['name'], 'cagents')
+                self.assertEqual(selected['features'], ['development'])
+                self.assertEqual(selected['executable'], executable)
+                self.assertEqual(selected['line'], bin_line)
+                self.assertEqual(selected['raw_sha256'], hashlib.sha256(raw).hexdigest())
+                self.assertEqual(selected['stream'], 'ORIGINAL_COMBINED_STDOUT_STDERR')
+        with self.assertRaises(self.hold):
+            self.actual['cargo_artifact'](self.stream(library, finish), self.checkout, cli)
+        with self.assertRaises(self.hold):
+            self.actual['cargo_artifact'](self.stream(library, binary, binary, finish), self.checkout, cli)
 
     def test_wrong_source_profile_feature_and_completion_refuse(self):
         for key, wrong in [('manifest_path', '/tmp/other/Cargo.toml'),
