@@ -4,6 +4,7 @@ No current producer roles are admitted. Changing the pins below requires a new
 exact source review and execution grant; data supplied at runtime cannot do it.
 Normal run-development remains mandatory and may perform real Cargo rechecks.
 """
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -90,6 +91,9 @@ def validate_inventories(plan, refs, inventories, debug_target):
              and (cache['version'] is None or isinstance(cache['version'],str) and cache['version'])
              and cache['service_archive_sha256'] is None, 'producer-cache')
         reference(cache['publication'])
+        # Declared graph coverage is NOT proof of restored dev-runtime output.
+        # A genuine producer artifact manifest and compatible native restore
+        # gate remain separate future G04 requirements; current roles are NULL.
         need(value['profiles'] == {'profile':'dev-runtime','graphs':FEATURES}, 'producer-profiles')
         need(set(value['tools']) == {'cargo','rustc','zig','clang','libclang'}, 'producer-tools')
         for ref in value['tools'].values(): reference(ref)
@@ -200,9 +204,44 @@ def file_binding(path):
     return dict(path=str(path),sha256=digest(path.read_bytes()),bytes=info.st_size)
 
 
+def decode_inventory(raw, ref):
+    reference(ref)
+    need(isinstance(raw,bytes) and len(raw) == ref['bytes'] and digest(raw) == ref['sha256'], 'producer-inventory-bytes')
+    return json.loads(raw)
+
+
+def read_inventory_bytes(ref):
+    reference(ref)
+    raw = Path(ref['path']).read_bytes()
+    need(file_binding(ref['path']) == ref,'producer-inventory-bytes')
+    decode_inventory(raw,ref)
+    return raw
+
+
 def read_inventory(ref):
-    reference(ref); actual = file_binding(ref['path']); need(actual == ref,'producer-bytes')
-    return json.loads(Path(ref['path']).read_bytes())
+    return decode_inventory(read_inventory_bytes(ref),ref)
+
+
+def verify_inventory_bytes(record, raw_by_role, pinned=PINNED_ROLES):
+    admit_references(record['roles'],pinned)
+    need(set(raw_by_role) == set(record['inventory_members']) == {'before','after'},'prepared-raw-inventory-roles')
+    values = {}
+    for label in ('before','after'):
+        ref = record['roles'][label]
+        need(record['inventory_members'][label] == dict(path='preparation/' + label + '-inventory.json',
+             sha256=ref['sha256'],bytes=ref['bytes']),'prepared-raw-inventory-member')
+        values[label] = decode_inventory(raw_by_role[label],ref)
+        need(values[label] == record['arms'][label]['inventory'],'prepared-nested-inventory')
+    return values
+
+
+def live_inventories(record, read_raw, pinned=PINNED_ROLES):
+    # Authenticate the ORIGINAL source-pinned bytes on every live reuse before
+    # trusting the nested arm data, even when that nested dictionary is valid.
+    admit_references(record['roles'],pinned)
+    raw = {label:read_raw(record['roles'][label]) for label in ('before','after')}
+    return verify_inventory_bytes(record,raw,pinned)
+
 
 
 def inspect_roles(values, debug_target):
@@ -239,21 +278,242 @@ def require_user():
     need(os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted' and 'CAGENTS_AGENT_AUTHORITY' not in os.environ,'Genuine hosted User required; no authority removal')
 
 
-def command(argv, cwd, env, stdout, stderr, timeout):
-    with stdout.open('xb') as output, stderr.open('xb') as errors:
-        process = subprocess.Popen(argv,cwd=cwd,env=env,stdout=output,stderr=errors,start_new_session=True)
+class PreparationCancelled(RuntimeError):
+    pass
+
+
+class PreparationCancellation:
+    """One-shot Python control; child OS signal state is never masked/ignored."""
+    def __init__(self):
+        self.depth = 0
+        self.signum = None
+        self.delivered = False
+        self.finalizing = False
+        self.interruptible = False
+        self.failure = None
+        self.cancel_error = None
+
+    def latch(self, error):
+        if not isinstance(error,PreparationCancelled) and self.failure is None:
+            self.failure = error
+
+    def request(self, signum, frame):
+        if self.signum is None:
+            self.signum = signum
+            self.cancel_error = PreparationCancelled('Preparation cancelled by signal ' + str(signum))
+        # A currently handled exception need not be a terminal failure. Only
+        # the work owner explicitly retains that diagnostic while unwinding.
+        if sys.exc_info()[1] is None and self.interruptible:
+            self.checkpoint()
+
+    def checkpoint(self):
+        if self.signum is not None and not self.delivered and not self.depth and not self.finalizing:
+            self.delivered = True
+            raise self.cancel_error
+
+    @contextmanager
+    def defer(self):
+        self.depth += 1
+        failed = False
         try:
-            code = process.wait(timeout=timeout)
-        except BaseException:
-            # Only the still-unreaped original root may authorize this group.
-            if process.poll() is None:
-                os.killpg(process.pid,signal.SIGTERM)
-            try: process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                if process.poll() is None: os.killpg(process.pid,signal.SIGKILL)
-                process.wait(timeout=10)
+            yield
+        except BaseException as error:
+            failed = True
+            self.latch(error)
             raise
-    need(code == 0,'preparation-command-failed')
+        finally:
+            self.depth -= 1
+            if not failed and sys.exc_info()[1] is None:
+                self.checkpoint()
+
+    @contextmanager
+    def work(self):
+        if self.failure is not None:
+            raise self.failure
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        need(not self.finalizing,'preparation-work-after-finalization')
+        self.checkpoint()
+        previous = self.interruptible
+        self.interruptible = True
+        try:
+            yield
+        except BaseException as error:
+            self.latch(error)
+            raise
+        finally:
+            self.interruptible = previous
+
+    def install(self):
+        for signum in (signal.SIGINT,signal.SIGTERM):
+            signal.signal(signum,self.request)
+
+    def finish(self, errors):
+        if self.failure is not None:
+            raise self.failure
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        need(not errors,'Preparation child/stream settlement unresolved: ' + repr(errors))
+
+
+def original_identity(process):
+    # Read only the originally retained child. This is not a new process-name,
+    # PID-marker or UID inventory from which authority may be borrowed.
+    fields = (Path('/proc') / str(process.pid) / 'stat').read_text().rsplit(')',1)[1].split()
+    need(int(fields[2]) == process.pid,'preparation-original-group')
+    return dict(pid=process.pid,group=int(fields[2]),stamp=fields[19])
+
+
+class PreparationChildren:
+    """Own original roots/parent streams, not a full descendant writer ledger."""
+    def __init__(self, cancellation, popen, identity, signal_group):
+        self.cancellation,self.popen,self.identity,self.signal_group = cancellation,popen,identity,signal_group
+        self.children,self.records,self.streams = [],{},[]
+
+    def open_output(self, path):
+        with self.cancellation.defer():
+            stream = path.open('xb')
+            self.streams.append(stream)
+            return stream
+
+    def publish(self, record):
+        record['published'] = True
+
+    def start(self, argv, cwd, env, stdout, stderr):
+        record = dict(argv=list(argv),cwd=None if cwd is None else str(cwd),identity=None,published=False,error='Original child registration incomplete',
+                      waited=False,exit_code=None)
+        with self.cancellation.defer():
+            process = self.popen(argv,cwd=cwd,env=env,stdin=subprocess.DEVNULL,
+                                 stdout=stdout,stderr=stderr,start_new_session=True)
+            self.children.append(process)  # FIRST action after original Popen returns.
+            self.records[process] = record
+            try:
+                for stream in (process.stdin,process.stdout,process.stderr):
+                    if stream is not None and stream not in self.streams:
+                        self.streams.append(stream)
+                record['identity'] = self.identity(process)
+                self.publish(record)
+                record['error'] = None
+            except BaseException as error:
+                record['error'] = repr(error)
+                self.cancellation.latch(error)
+                raise
+            return process
+
+    def run(self, argv, cwd, env, timeout, stdout=None, stderr=None):
+        with self.cancellation.work():
+            process = self.start(argv,cwd,env,subprocess.PIPE if stdout is None else stdout,
+                                 subprocess.PIPE if stderr is None else stderr)
+            if stdout is None:
+                output,errors = process.communicate(timeout=timeout)
+                code = process.returncode
+            else:
+                code = process.wait(timeout=timeout)
+                output = b''
+            record = self.records[process]
+            record.update(waited=True,exit_code=code)
+            need(code == 0,'preparation-command-failed')
+            with self.cancellation.defer():
+                for stream in (stdout,stderr):
+                    if stream is not None:
+                        stream.close()
+            return output
+
+    def capture(self, argv, cwd=None):
+        return self.run(argv,cwd,None,60)
+
+    def signal_original(self, process, record, signum):
+        # The unreaped original root/stamp authorizes this group. A missing or
+        # replaced identity never turns a fresh PID lookup into kill authority.
+        need(record['identity'] is not None and self.identity(process) == record['identity'],
+             'preparation-original-identity-unresolved')
+        try:
+            self.signal_group(record['identity']['group'],signum)
+        except ProcessLookupError:
+            pass  # Original root may have exited between the owned check and signal.
+
+    def settle(self, process, record):
+        errors = []
+        if process.poll() is None:
+            if record['identity'] is not None:
+                try:
+                    self.signal_original(process,record,signal.SIGTERM)
+                except BaseException as error:
+                    errors.append(error)
+            try:
+                code = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                if process.poll() is None:
+                    try:
+                        self.signal_original(process,record,signal.SIGKILL)
+                    except BaseException as error:
+                        errors.append(error)
+                code = process.wait(timeout=10)
+        else:
+            code = process.wait(timeout=10)  # Actual original wait, even if already exited/reaped.
+        record.update(waited=True,exit_code=code)
+        if errors:
+            raise errors[0]  # Identity uncertainty stays negative even after a successful wait.
+
+    def cleanup(self):
+        self.cancellation.finalizing = True  # Repeated signals only latch; cannot abort settlement.
+        errors = []
+        for process in reversed(self.children):
+            record = self.records.get(process)
+            if record is None:
+                record = dict(argv=[],cwd=None,identity=None,published=False,error='Original registry publication missing',waited=False,exit_code=None)
+                self.records[process] = record
+            try:
+                self.settle(process,record)
+            except BaseException as error:
+                self.cancellation.latch(error)
+                errors.append('Original child wait/identity: ' + repr(error))
+            if record['error'] is not None or not record['published']:
+                errors.append('Original child publication: ' + str(record['error']))
+        streams_closed = True
+        for stream in self.streams:
+            try:
+                stream.close()
+                need(stream.closed,'preparation-stream-not-closed')
+            except BaseException as error:
+                self.cancellation.latch(error)
+                streams_closed = False
+                errors.append('Original parent stream: ' + repr(error))
+        return dict(errors=errors,children=[self.records[process] for process in self.children],
+                    streams_closed=streams_closed,
+                    scope='Original Popen waits and parent stream closure only; full descendant/writer ledger remains separate.')
+
+
+def settle_preparation(owner):
+    owner.cancellation.finalizing = True
+    try:
+        return owner.cleanup()
+    except BaseException as error:
+        # Never replace an original work error with a secondary drain error or
+        # erase retained handles. This report is explicitly unresolved.
+        owner.cancellation.latch(error)
+        return dict(errors=['Original preparation cleanup failed: ' + repr(error)],
+                    children=[],streams_closed=False,scope='UNKNOWN; original child handles remain retained.')
+
+
+def command(owner, argv, cwd, env, stdout, stderr, timeout):
+    output,errors = owner.open_output(stdout),owner.open_output(stderr)
+    owner.run(argv,cwd,env,timeout,output,errors)
+
+
+def verify_original_children(record):
+    summary = record['original_children']
+    need(summary['errors'] == [] and summary['streams_closed'] is True and summary['children'], 'prepared-original-children')
+    children = summary['children']
+    need(all(child['identity'] is not None and child['published'] is True and child['error'] is None
+             and child['waited'] is True and child['exit_code'] == 0 for child in children),'prepared-original-children')
+    for command in record['commands']:
+        checkout = record['arms'][command['arm']]['inventory']['checkout']
+        need(sum(child['argv'] == command['argv'] and child['cwd'] == checkout for child in children) == 1,'prepared-original-command-child')
+    ref = record['original_children_member']
+    raw = encoded(summary) + b'\n'
+    need(ref == dict(path='preparation/original-children.json',sha256=digest(raw),bytes=len(raw)),'prepared-original-children-member')
+
 
 
 def verify_data(record, plan, control, module_sha, fixture_sha, pinned=PINNED_ROLES):
@@ -265,6 +525,7 @@ def verify_data(record, plan, control, module_sha, fixture_sha, pinned=PINNED_RO
     expected = [(label,graph) for label in ('before','after') for graph in ('cli','host','ui','fixture')]
     need([(row['arm'],row['graph']) for row in record['commands']] == expected
          and all(row['exit_code'] == 0 for row in record['commands']),'prepared-command-order')
+    verify_original_children(record)
 
 
 def verify_artifacts(record, compiled, fixture_source):
@@ -299,8 +560,11 @@ def load_prepared(control, plan, checkouts, parent, control_identity):
     record_path = Path(parent['QUALIFICATION_EVIDENCE']) / 'preparation/prepared.json'
     raw = record_path.read_bytes(); record = json.loads(raw)
     verify_data(record,plan,control_identity,digest(Path(__file__).read_bytes()),digest((control / '.github/qualification/final-main-fixture.rs').read_bytes()))
-    validate_inventories(plan,record['roles'],{label:record['arms'][label]['inventory'] for label in ('before','after')},parent['CARGO_TARGET_DIR'])
-    inspect_roles({label:record['arms'][label]['inventory'] for label in ('before','after')},parent['CARGO_TARGET_DIR'])
+    values = live_inventories(record,read_inventory_bytes)
+    retained = {label:(record_path.parent / (label + '-inventory.json')).read_bytes() for label in ('before','after')}
+    verify_inventory_bytes(record,retained)
+    validate_inventories(plan,record['roles'],values,parent['CARGO_TARGET_DIR'])
+    inspect_roles(values,parent['CARGO_TARGET_DIR'])
     compiled = {}
     for row in record['commands']:
         need(file_binding(row['stdout']['path']) == row['stdout'] and file_binding(row['stderr']['path']) == row['stderr'],'prepared-command-bytes')
@@ -331,51 +595,88 @@ def main():
     need(mode in ('--prepare','--verify') and len(sys.argv) == 5,'preparation-mode')
     control = control.resolve(strict=True)
     checkouts = dict(zip(('before','after'),[Path(value).resolve(strict=True) for value in sys.argv[3:]],strict=True))
-    identity = {key:subprocess.check_output(['git','-C',str(control),'rev-parse',ref],text=True).strip()
-                for key,ref in [('sha','HEAD'),('tree','HEAD^{tree}')]}
-    if mode == '--verify': load_prepared(control,plan,checkouts,dict(os.environ),identity); return
-    values = admitted(plan,PINNED_ROLES,read_inventory,inspect_roles,os.environ['CARGO_TARGET_DIR'])
-    for label in ('before','after'):
-        need(values[label]['checkout'] == str(checkouts[label]),'producer-checkout')
-        for key,ref in [('sha','HEAD'),('tree','HEAD^{tree}')]:
-            need(subprocess.check_output(['git','-C',str(checkouts[label]),'rev-parse',ref],text=True).strip() == plan['before' if label == 'before' else 'product'][key],'clean-source')
-        need(not subprocess.check_output(['git','-C',str(checkouts[label]),'status','--porcelain=v1']),'clean-source')
-    out = Path(os.environ['QUALIFICATION_EVIDENCE']) / 'preparation'; out.mkdir(parents=True,exist_ok=True)
-    base = Path(tempfile.mkdtemp(prefix='h2018.',dir='/tmp')).resolve(strict=True); base.chmod(0o700)
-    need(len(str(base)) < 30,'short-private-root')
-    envs = {label:environment(dict(os.environ),str(base),label,values[label]) for label in ('before','after')}
-    for label in ('before','after'):
-        root = base / label; root.mkdir(mode=0o700)
-        for suffix in PRIVATE.values(): (root / suffix).mkdir(mode=0o700)
-        if envs[label].get('CAGENTS_ZIG'):
-            need(str(Path(envs[label]['CAGENTS_ZIG']).resolve(strict=True)) == values[label]['tools']['zig']['path'],'prepared-zig-override')
-        need(re.search(r'zig\s*=\s*"0\.15\.2"',(checkouts[label] / 'mise.toml').read_text()),'prepared-zig-pin')
-        for name in ('cargo','rustc','zig'):
-            need(str(Path(shutil.which(name,path=envs[label]['PATH'])).resolve(strict=True)) == values[label]['tools'][name]['path'],'prepared-tool-selection')
-        need(envs[label].get('RUSTUP_TOOLCHAIN') == '1.93.0' and envs[label].get('CARGO_BUILD_JOBS') == '2','prepared-toolchain')
-    configurations = {label:configuration(values[label]['checkout'],envs[label]) for label in ('before','after')}
-    records = []
-    def run(label, graph, argv, cwd, env, timeout):
-        stdout,stderr = out / (label + '-' + graph + '.jsonl'),out / (label + '-' + graph + '.stderr.log')
-        command(argv,cwd,env,stdout,stderr,timeout)
-        records.append(dict(arm=label,graph=graph,argv=argv,exit_code=0,stdout=file_binding(stdout),stderr=file_binding(stderr)))
-        return [json.loads(line) for line in stdout.read_text().splitlines() if line.startswith('{')]
-    arms = compile_matrix(values,envs,str(control / '.github/qualification/final-main-fixture.rs'),str(base),run)
-    for label,arm in arms.items():
-        paths = {name:artifact['executable'] for name,artifact in arm['triplet'].items()}
-        paths.update({'library-' + name:path for name,path in arm['libraries'].items()}); paths['fixture'] = arm['helper']
-        arm['files'] = {name:file_binding(path) for name,path in paths.items()}
-        need(configuration(arm['inventory']['checkout'],envs[label]) == configurations[label],'prepared-configuration-changed')
-        arm['configuration'] = configurations[label]
-        for key,ref in [('sha','HEAD'),('tree','HEAD^{tree}')]:
-            need(subprocess.check_output(['git','-C',str(checkouts[label]),'rev-parse',ref],text=True).strip() == plan['before' if label == 'before' else 'product'][key],'prepared-source-changed')
-        need(not subprocess.check_output(['git','-C',str(checkouts[label]),'status','--porcelain=v1']),'prepared-source-changed')
-    record = dict(kind='both-heads-prepared-v1',product=plan['product'],before=plan['before'],control=identity,
-        module_sha256=digest(Path(__file__).read_bytes()),fixture_sha256=digest((control / '.github/qualification/final-main-fixture.rs').read_bytes()),
-        roles=plan['native_preparation']['roles'],base=str(base),arms=arms,commands=records,
-        limits='Preparation is not zero-rebuild evidence, native validation, complete writer settlement or external entry closure.')
-    (out / 'prepared.json').write_bytes(json.dumps(record,indent=2).encode() + b'\n')
-    load_prepared(control,plan,checkouts,dict(os.environ),identity)
+    cancellation = PreparationCancellation()
+    cancellation.install()  # Before FIRST Git/Cargo/rustc Popen, after the NULL gate.
+    owner = PreparationChildren(cancellation,subprocess.Popen,original_identity,os.killpg)
+    out = Path(os.environ['QUALIFICATION_EVIDENCE']) / 'preparation'
+    record = None
+    try:
+        with cancellation.work():
+            raw_inventories = {}
+            def read_pinned(ref):
+                label = next(label for label in ('before','after') if plan['native_preparation']['roles'][label] == ref)
+                raw_inventories[label] = read_inventory_bytes(ref)
+                return decode_inventory(raw_inventories[label],ref)
+            values = admitted(plan,PINNED_ROLES,read_pinned,inspect_roles,os.environ['CARGO_TARGET_DIR'])
+            identity = {key:owner.capture(['git','-C',str(control),'rev-parse',ref]).decode().strip()
+                        for key,ref in [('sha','HEAD'),('tree','HEAD^{tree}')]}
+            if mode == '--verify':
+                load_prepared(control,plan,checkouts,dict(os.environ),identity)
+            else:
+                for label in ('before','after'):
+                    need(values[label]['checkout'] == str(checkouts[label]),'producer-checkout')
+                    for key,ref in [('sha','HEAD'),('tree','HEAD^{tree}')]:
+                        need(owner.capture(['git','-C',str(checkouts[label]),'rev-parse',ref]).decode().strip() == plan['before' if label == 'before' else 'product'][key],'clean-source')
+                    need(not owner.capture(['git','-C',str(checkouts[label]),'status','--porcelain=v1']),'clean-source')
+                out.mkdir(parents=True,exist_ok=True)
+                inventory_members = {}
+                for label,raw in raw_inventories.items():
+                    path = out / (label + '-inventory.json'); path.write_bytes(raw)
+                    ref = plan['native_preparation']['roles'][label]
+                    inventory_members[label] = dict(path='preparation/' + path.name,sha256=ref['sha256'],bytes=ref['bytes'])
+                base = Path(tempfile.mkdtemp(prefix='h2018.',dir='/tmp')).resolve(strict=True); base.chmod(0o700)
+                need(len(str(base)) < 30,'short-private-root')
+                envs = {label:environment(dict(os.environ),str(base),label,values[label]) for label in ('before','after')}
+                for label in ('before','after'):
+                    root = base / label; root.mkdir(mode=0o700)
+                    for suffix in PRIVATE.values(): (root / suffix).mkdir(mode=0o700)
+                    if envs[label].get('CAGENTS_ZIG'):
+                        need(str(Path(envs[label]['CAGENTS_ZIG']).resolve(strict=True)) == values[label]['tools']['zig']['path'],'prepared-zig-override')
+                    need(re.search(r'zig\s*=\s*"0\.15\.2"',(checkouts[label] / 'mise.toml').read_text()),'prepared-zig-pin')
+                    for name in ('cargo','rustc','zig'):
+                        need(str(Path(shutil.which(name,path=envs[label]['PATH'])).resolve(strict=True)) == values[label]['tools'][name]['path'],'prepared-tool-selection')
+                    need(envs[label].get('RUSTUP_TOOLCHAIN') == '1.93.0' and envs[label].get('CARGO_BUILD_JOBS') == '2','prepared-toolchain')
+                configurations = {label:configuration(values[label]['checkout'],envs[label]) for label in ('before','after')}
+                records = []
+                def run(label, graph, argv, cwd, env, timeout):
+                    stdout,stderr = out / (label + '-' + graph + '.jsonl'),out / (label + '-' + graph + '.stderr.log')
+                    command(owner,argv,cwd,env,stdout,stderr,timeout)
+                    records.append(dict(arm=label,graph=graph,argv=argv,exit_code=0,stdout=file_binding(stdout),stderr=file_binding(stderr)))
+                    return [json.loads(line) for line in stdout.read_text().splitlines() if line.startswith('{')]
+                arms = compile_matrix(values,envs,str(control / '.github/qualification/final-main-fixture.rs'),str(base),run)
+                for label,arm in arms.items():
+                    paths = {name:artifact['executable'] for name,artifact in arm['triplet'].items()}
+                    paths.update({'library-' + name:path for name,path in arm['libraries'].items()}); paths['fixture'] = arm['helper']
+                    arm['files'] = {name:file_binding(path) for name,path in paths.items()}
+                    need(configuration(arm['inventory']['checkout'],envs[label]) == configurations[label],'prepared-configuration-changed')
+                    arm['configuration'] = configurations[label]
+                    for key,ref in [('sha','HEAD'),('tree','HEAD^{tree}')]:
+                        need(owner.capture(['git','-C',str(checkouts[label]),'rev-parse',ref]).decode().strip() == plan['before' if label == 'before' else 'product'][key],'prepared-source-changed')
+                    need(not owner.capture(['git','-C',str(checkouts[label]),'status','--porcelain=v1']),'prepared-source-changed')
+                record = dict(kind='both-heads-prepared-v1',product=plan['product'],before=plan['before'],control=identity,
+                    module_sha256=digest(Path(__file__).read_bytes()),fixture_sha256=digest((control / '.github/qualification/final-main-fixture.rs').read_bytes()),
+                    roles=plan['native_preparation']['roles'],inventory_members=inventory_members,base=str(base),arms=arms,commands=records,
+                    limits='Preparation is not zero-rebuild evidence, native validation, complete writer settlement or external entry closure.')
+    except BaseException as error:
+        cancellation.latch(error)
+    finally:
+        summary = settle_preparation(owner)
+        try:
+            if out.is_dir():
+                name = 'original-children.json' if mode == '--prepare' else 'verification-original-children.json'
+                (out / name).write_bytes(encoded(summary) + b'\n')
+        except BaseException as error:
+            cancellation.latch(error)
+    cancellation.finish(summary['errors'])
+    if record is not None:
+        # A failed/cancelled command or unresolved original wait/stream can
+        # never leave a positive receipt consumable by the native stage.
+        record['original_children'] = summary
+        raw_summary = encoded(summary) + b'\n'
+        record['original_children_member'] = dict(path='preparation/original-children.json',sha256=digest(raw_summary),bytes=len(raw_summary))
+        (out / 'prepared.json').write_bytes(json.dumps(record,indent=2).encode() + b'\n')
+        load_prepared(control,plan,checkouts,dict(os.environ),identity)
+        cancellation.finish(summary['errors'])
 
 
 if __name__ == '__main__':

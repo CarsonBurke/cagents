@@ -291,7 +291,9 @@ def check_preparation(root, control, plan, source, native_source):
          and native_source['preparation_module_sha256'] == digest(path.read_bytes()),'preparation-native-binding')
     preparation.verify_data(record,plan,dict(sha=source['control_sha'],tree=source['control_tree']),
                             digest(path.read_bytes()),digest((control / '.github/qualification/final-main-fixture.rs').read_bytes()))
-    inventories = {label:record['arms'][label]['inventory'] for label in ('before','after')}
+    retained_raw = {label:member(root,record['inventory_members'][label]) for label in ('before','after')}
+    inventories = preparation.verify_inventory_bytes(record,retained_raw)
+    need(json.loads(member(root,record['original_children_member'])) == record['original_children'],'prepared-original-child-log')
     preparation.validate_inventories(plan,record['roles'],inventories,source['cargo_target_directory'])
     need(inventories['after']['checkout'] == source['product_directory']
          and inventories['before']['checkout'] == str(Path(source['product_directory']).parent / 'before'),'prepared-checkout-roles')

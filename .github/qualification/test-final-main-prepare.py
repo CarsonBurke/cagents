@@ -8,10 +8,13 @@ Run only after independent source/isolation review and the lead's authorization.
 """
 import ast
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
+import sys
 from types import SimpleNamespace
 import unittest
 
@@ -20,7 +23,8 @@ SOURCE = Path(__file__).with_name('final-main-prepare.py').read_text()
 FUNCTIONS = {'need','digest','encoded','path_text','reference','admit_references',
     'validate_inventories','admitted','environment','environment_binding','cargo_argv',
     'select_binary','select_libraries','fixture_argv','compile_matrix','verify_data',
-    'verify_artifacts','verify_environment','check_arm_files'}
+    'verify_artifacts','verify_environment','check_arm_files','verify_original_children',
+    'decode_inventory','verify_inventory_bytes','live_inventories'}
 CONSTANTS = {'PINNED_ROLES','FEATURES','SOURCES','PRIVATE','RENDERER','LATE','ENV_KEYS','ENV_PREFIXES'}
 
 
@@ -61,6 +65,7 @@ class Harness:
         self.refs = {label:dict(path='/algorithm-only/inventory-' + label + '.json',
             sha256=self.api['digest'](self.api['encoded'](value)),bytes=len(self.api['encoded'](value)))
             for label,value in self.inventories.items()}
+        self.raw_inventories = {label:self.api['encoded'](value) for label,value in self.inventories.items()}
         self.plan['native_preparation'] = dict(roles=copy.deepcopy(self.refs))
         self.parent = dict(HOME='/algorithm-only/parent-home',PATH='/algorithm-only/bin',
             CARGO_HOME='/algorithm-only/cargo-home',RUSTUP_HOME='/algorithm-only/rustup-home',
@@ -119,10 +124,20 @@ class Harness:
         self.record = dict(kind='both-heads-prepared-v1',product=self.plan['product'],before=self.plan['before'],
             control=dict(sha='4'*40,tree='5'*40),module_sha256='6'*64,fixture_sha256='7'*64,
             roles=copy.deepcopy(self.refs),base=self.base,arms=arms,commands=copy.deepcopy(self.records))
+        self.record['inventory_members'] = {label:dict(path='preparation/' + label + '-inventory.json',
+            sha256=ref['sha256'],bytes=ref['bytes']) for label,ref in self.refs.items()}
+        summary = dict(errors=[],streams_closed=True,children=[dict(argv=row['argv'],
+            cwd=self.inventories[row['arm']]['checkout'],identity=dict(pid=10+i,group=10+i,stamp='algorithm-only'),
+            published=True,error=None,waited=True,exit_code=0) for i,row in enumerate(self.records)],
+            scope='Algorithm-only original-root fixture, not closure evidence.')
+        self.record['original_children'] = summary
+        raw = self.api['encoded'](summary) + b'\n'
+        self.record['original_children_member'] = dict(path='preparation/original-children.json',sha256=self.api['digest'](raw),bytes=len(raw))
         return self.record
 
     def verify(self):
         self.api['verify_data'](self.record,self.plan,dict(sha='4'*40,tree='5'*40),'6'*64,'7'*64,self.refs)
+        self.api['verify_inventory_bytes'](self.record,self.raw_inventories,self.refs)
         self.api['verify_artifacts'](self.record,self.compiled,'/algorithm-only/control/fixture.rs')
 
 
@@ -286,6 +301,232 @@ class PreparationAlgorithms(unittest.TestCase):
         self.assertNotIn("['rustc'",driver)
         self.assertIn("['scripts/run-development', '--browserless', '--debug'",driver)
         self.assertLess(driver.index('preparation.load_prepared('),driver.index("spawn([str(launcher)"))
+
+
+class Stream:
+    def __init__(self, harness):
+        self.harness,self.closed = harness,False
+        self.on_close = lambda:None
+
+    def close(self):
+        self.harness.events.append(('close',id(self)))
+        self.on_close()
+        self.closed = True
+
+
+class OwnedHandle:
+    def __init__(self, harness, pid, options):
+        self.harness,self.pid,self.returncode = harness,pid,None
+        self.stdin = None
+        self.stdout = Stream(harness) if options['stdout'] == -1 else None
+        self.stderr = Stream(harness) if options['stderr'] == -1 else None
+        self.stamp = 'original-' + str(pid)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout):
+        self.harness.events.append(('wait',self.pid,timeout))
+        self.harness.on_wait(self)
+        if self.returncode is None: self.returncode = 0
+        return self.returncode
+
+    def communicate(self, timeout):
+        self.harness.events.append(('communicate',self.pid,timeout))
+        self.harness.on_wait(self)
+        if self.returncode is None: self.returncode = 0
+        return b'algorithm-only metadata',b''
+
+
+class OwnershipHarness:
+    def __init__(self):
+        self.events,self.handles,self.handlers = [],[],{}
+        self.on_create = lambda process:None
+        self.on_identity = lambda process:None
+        self.on_wait = lambda process:None
+        api = pure_namespace()
+        def create(argv, **options):
+            assert options['start_new_session'] is True and 'preexec_fn' not in options
+            process = OwnedHandle(self,100+len(self.handles),options)
+            self.handles.append(process)
+            self.events.append(('created',process.pid,list(argv)))
+            self.on_create(process)
+            return process
+        def identity(process):
+            self.events.append(('identity',process.pid))
+            self.on_identity(process)
+            return dict(pid=process.pid,group=process.pid,stamp=process.stamp)
+        def signal_group(group, signum):
+            self.events.append(('signal',group,signum))
+            process = next(process for process in self.handles if process.pid == group)
+            process.returncode = -signum
+        api.update(contextmanager=contextmanager,sys=sys,
+            signal=SimpleNamespace(SIGINT=2,SIGTERM=15,SIGKILL=9,
+                signal=lambda signum,handler:self.handlers.__setitem__(signum,handler)),
+            subprocess=SimpleNamespace(PIPE=-1,DEVNULL=-3,TimeoutExpired=subprocess.TimeoutExpired))
+        definitions = {'PreparationCancelled','PreparationCancellation','PreparationChildren','settle_preparation'}
+        selected = [copy.deepcopy(node) for node in ast.parse(SOURCE).body
+                    if isinstance(node,(ast.ClassDef,ast.FunctionDef)) and node.name in definitions]
+        assert {node.name for node in selected} == definitions
+        exec(compile(ast.Module(body=selected,type_ignores=[]),'<actual-mocked-preparation-ownership>','exec'),api)
+        self.api = api
+        self.cancel = api['PreparationCancellation']()
+        self.cancel.install()  # Injected registry only; no real signal operation.
+        self.owner = api['PreparationChildren'](self.cancel,create,identity,signal_group)
+
+    def cleanup(self):
+        return self.api['settle_preparation'](self.owner)
+
+
+class PreparationReviewRegressions(unittest.TestCase):
+    def test_exact_pinned_raw_inventory_binds_live_and_offline_nested_receipts(self):
+        for case in ('valid','producer-job','target','tool','publication','missing-raw','wrong-raw','wrong-member'):
+            with self.subTest(case=case):
+                h = Harness(); record = h.build(); h.verify()
+                reads = []
+                def read(ref):
+                    label = next(label for label in ('before','after') if h.refs[label] == ref)
+                    reads.append(copy.deepcopy(ref))
+                    return h.raw_inventories[label]
+                self.assertEqual(h.api['live_inventories'](record,read,h.refs),h.inventories)
+                self.assertEqual(reads,[h.refs['before'],h.refs['after']])
+                raw = copy.deepcopy(h.raw_inventories)
+                nested = record['arms']['after']['inventory']
+                if case == 'producer-job': nested['producer']['job'] += 1
+                if case == 'target': nested['target'] += '-changed'
+                if case == 'tool': nested['tools']['zig']['sha256'] = '4'*64
+                if case == 'publication': nested['cache']['publication']['path'] += '-changed'
+                if case == 'missing-raw': del raw['after']
+                if case == 'wrong-raw': raw['after'] += b' '
+                if case == 'wrong-member': record['inventory_members']['after']['path'] = 'preparation/before-inventory.json'
+                if case == 'valid':
+                    self.assertEqual(h.api['verify_inventory_bytes'](record,raw,h.refs),h.inventories)
+                else:
+                    with self.assertRaises(ValueError): h.api['verify_inventory_bytes'](record,raw,h.refs)
+                    if case in ('producer-job','target','tool','publication'):
+                        # No artifact/semantic guard can mask this exact raw/nested equality oracle.
+                        with self.assertRaisesRegex(ValueError,'prepared-nested-inventory'):
+                            h.api['live_inventories'](record,read,h.refs)
+        h = Harness(); record = h.build()
+        changed = json.loads(h.raw_inventories['after']); changed['producer']['job'] += 1
+        def changed_live(ref):
+            return h.api['encoded'](changed) if ref == h.refs['after'] else h.raw_inventories['before']
+        with self.assertRaisesRegex(ValueError,'producer-inventory-bytes'):
+            h.api['live_inventories'](record,changed_live,h.refs)
+
+    def test_cancel_after_popen_return_before_registry_or_role_publication_retains_original(self):
+        for stage in ('after-popen','identity','publication'):
+            with self.subTest(stage=stage):
+                h = OwnershipHarness()
+                if stage == 'after-popen':
+                    class Retained(list):
+                        def append(self, process):
+                            h.cancel.request(15,None)  # Popen has returned; actual append/publication has not happened.
+                            self_before = len(self)
+                            super().append(process)
+                            h.events.append(('retained-after-cancel',process.pid,self_before))
+                    h.owner.children = Retained()
+                if stage == 'identity': h.on_identity = lambda process:h.cancel.request(15,None)
+                if stage == 'publication':
+                    original = h.owner.publish
+                    def publish(record):
+                        h.cancel.request(15,None)
+                        original(record)
+                    h.owner.publish = publish
+                with self.assertRaises(h.api['PreparationCancelled']):
+                    h.owner.capture(['git','algorithm-only-metadata'])
+                self.assertEqual(h.owner.children,h.handles)
+                self.assertEqual(len(h.handles),1)
+                record = h.owner.records[h.handles[0]]
+                self.assertTrue(record['published']); self.assertIsNotNone(record['identity'])
+                summary = h.cleanup()
+                self.assertEqual(summary['errors'],[])
+                self.assertTrue(summary['streams_closed'])
+                self.assertIn(('signal',100,15),h.events)
+                self.assertIn(('wait',100,10),h.events)
+                self.assertFalse(any(event[0] == 'communicate' for event in h.events))
+                with self.assertRaises(h.api['PreparationCancelled']): h.cancel.finish(summary['errors'])
+                self.assertTrue(all(callable(handler) for handler in h.handlers.values()))
+
+    def test_first_and_repeated_control_during_wait_or_cleanup_never_runs_later_commands(self):
+        for cleanup_first in (False,True):
+            with self.subTest(cleanup_first=cleanup_first):
+                h = OwnershipHarness()
+                h.on_wait = lambda process:(h.cancel.request(15,None),h.cancel.request(2,None))
+                if cleanup_first:
+                    process = h.owner.start(['cargo','algorithm-only-build'],None,None,-1,-1)
+                    summary = h.cleanup()  # FIRST control is inside the protected original wait.
+                else:
+                    with self.assertRaises(h.api['PreparationCancelled']):
+                        h.owner.capture(['git','algorithm-only-metadata'])
+                    summary = h.cleanup()
+                self.assertEqual(h.cancel.signum,15)
+                self.assertEqual(len(h.handles),1)
+                self.assertTrue(summary['children'][0]['waited'])
+                self.assertTrue(summary['streams_closed'])
+                with self.assertRaises(h.api['PreparationCancelled']): h.cancel.finish(summary['errors'])
+                # A caught first control still cannot authorize another child.
+                with self.assertRaises(h.api['PreparationCancelled']):
+                    h.owner.capture(['rustc','must-not-run-after-control'])
+                self.assertEqual(len(h.handles),1)
+
+    def test_metadata_cargo_and_rustc_share_the_actual_owned_path_and_stream_contract(self):
+        h = OwnershipHarness()
+        self.assertEqual(h.owner.capture(['git','algorithm-only-metadata']),b'algorithm-only metadata')
+        for executable in ('cargo','rustc'):
+            streams = [Stream(h),Stream(h)]
+            for stream in streams: h.owner.streams.append(stream)
+            self.assertEqual(h.owner.run([executable,'algorithm-only'],None,{},30,*streams),b'')
+            self.assertTrue(all(stream.closed for stream in streams))
+        summary = h.cleanup(); h.cancel.finish(summary['errors'])
+        self.assertEqual(len(h.owner.children),3)
+        self.assertTrue(all(child['waited'] and child['exit_code'] == 0 for child in summary['children']))
+        self.assertFalse(any(event[0] == 'signal' for event in h.events))
+        self.assertEqual([event[1] for event in h.events if event[0] == 'wait'],[101,102,102,101,100])
+        self.assertTrue(summary['streams_closed'])
+
+    def test_registration_generation_wait_stream_or_drain_failure_preserves_first_error_and_unknown(self):
+        cases = ('identity','publication','changed-generation','wait','stream','drain')
+        for case in cases:
+            with self.subTest(case=case):
+                h = OwnershipHarness(); original = RuntimeError('Original terminal work diagnostic')
+                if case == 'identity':
+                    def identity_error(process): raise original
+                    h.on_identity = identity_error
+                    with self.assertRaisesRegex(RuntimeError,'Original terminal work diagnostic'):
+                        h.owner.capture(['git','algorithm-only-metadata'])
+                elif case == 'publication':
+                    def publication_error(record): raise original
+                    h.owner.publish = publication_error
+                    with self.assertRaisesRegex(RuntimeError,'Original terminal work diagnostic'):
+                        h.owner.capture(['git','algorithm-only-metadata'])
+                else:
+                    process = h.owner.start(['cargo','algorithm-only'],None,None,-1,-1)
+                    # Explicit work-owner unwind, rather than sys.exc_info inference.
+                    try:
+                        with h.cancel.work(): raise original
+                    except RuntimeError: pass
+                    if case == 'changed-generation': process.stamp = 'replacement'
+                    if case == 'wait':
+                        def wait_error(process): raise RuntimeError('Secondary wait failure')
+                        h.on_wait = wait_error
+                    if case == 'stream':
+                        def close_error(): raise RuntimeError('Secondary stream failure')
+                        process.stdout.on_close = close_error
+                    if case == 'drain':
+                        def drain_error(): raise RuntimeError('Secondary drain failure')
+                        h.owner.cleanup = drain_error
+                h.cancel.request(15,None); h.cancel.request(2,None)
+                summary = h.cleanup()
+                self.assertIs(h.cancel.failure,original)
+                self.assertTrue(summary['errors'])
+                self.assertEqual(len(h.owner.children),1)  # Never clear ownership on failure.
+                with self.assertRaisesRegex(RuntimeError,'Original terminal work diagnostic'):
+                    h.cancel.finish(summary['errors'])
+                if case in ('identity','changed-generation'):
+                    self.assertFalse(any(event[0] == 'signal' for event in h.events))
+                    self.assertIn(('wait',100,10),h.events)
+
 
 
 if __name__ == '__main__':
