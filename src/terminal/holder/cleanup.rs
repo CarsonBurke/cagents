@@ -110,27 +110,57 @@ pub(crate) fn confirmed(
 
 /// Lost close replies can be reconciled without a live daemon worker, but only
 /// an exact private teardown receipt is positive evidence. No process is killed.
-pub(crate) fn confirmed_source(source: &TerminalSession, proof: &HostSessionProof) -> Result<bool, String> {
+pub(crate) fn confirmed_source(
+    source: &TerminalSession,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
     authorize(proof)?;
     let directory = super::directory()?;
     let digest = digest(source)?;
     let prefix = format!("{}-", source.id);
     let mut candidates = 0;
-    for (index, entry) in fs::read_dir(&directory).map_err(|e| e.to_string())?.enumerate() {
-        if index >= 8192 { return Err("Terminal cleanup directory exceeds discovery limit".into()); }
+    for (index, entry) in fs::read_dir(&directory)
+        .map_err(|e| e.to_string())?
+        .enumerate()
+    {
+        if index >= 8192 {
+            return Err("Terminal cleanup directory exceeds discovery limit".into());
+        }
         let entry = entry.map_err(|e| e.to_string())?;
         let name = entry.file_name();
-        let Some(name) = name.to_str().filter(|name| name.starts_with(&prefix) && name.ends_with(".closed")) else { continue; };
+        let Some(name) = name
+            .to_str()
+            .filter(|name| name.starts_with(&prefix) && name.ends_with(".closed"))
+        else {
+            continue;
+        };
         candidates += 1;
-        if candidates > 128 { return Err("Too many terminal close receipts for this identity".into()); }
-        let file = crate::secure_file::open_existing_private_file(&entry.path()).map_err(|e| e.to_string())?;
+        if candidates > 128 {
+            return Err("Too many terminal close receipts for this identity".into());
+        }
+        let file = crate::secure_file::open_existing_private_file(&entry.path())
+            .map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
-        file.take(256 * 1024 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if bytes.len() > 256 * 1024 { return Err("Terminal close receipt is oversized".into()); }
+        file.take(256 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 256 * 1024 {
+            return Err("Terminal close receipt is oversized".into());
+        }
         let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if name != format!("{}-{}-{}.closed", source.id, receipt.record.holder.pid, receipt.record.holder.start)
-            || receipt.record.terminal != source.id || !receipt.sources.contains(&digest) { continue; }
-        if confirmed_receipt(&receipt.record, proof, Some(digest))? { return Ok(true); }
+        if name
+            != format!(
+                "{}-{}-{}.closed",
+                source.id, receipt.record.holder.pid, receipt.record.holder.start
+            )
+            || receipt.record.terminal != source.id
+            || !receipt.sources.contains(&digest)
+        {
+            continue;
+        }
+        if confirmed_receipt(&receipt.record, proof, Some(digest))? {
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -171,7 +201,10 @@ fn confirmed_receipt(
     Ok(receipt.record == *expected
         && receipt.record.kind == Kind::Terminal
         && receipt.record.version == 4
-        && crate::daemon::holder_registry::application_matches(Kind::Terminal, &receipt.record.application)
+        && crate::daemon::holder_registry::application_matches(
+            Kind::Terminal,
+            &receipt.record.application,
+        )
         && receipt.record.boot == proof.boot_id
         && holder_exited(&receipt.record.holder)?
         && !receipt.record.root.is_current()

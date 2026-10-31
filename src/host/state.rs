@@ -732,9 +732,16 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
-        if self.terminals.get(&terminal_id).is_some_and(|record| record.authority_rebind_pending) {
-            return Err(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
-                "Terminal ownership survived but its durable association is pending; use authenticated Retry", true));
+        if self
+            .terminals
+            .get(&terminal_id)
+            .is_some_and(|record| record.authority_rebind_pending)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Terminal ownership survived but its durable association is pending; use authenticated Retry",
+                true,
+            ));
         }
         let record = self
             .terminals
@@ -1205,10 +1212,16 @@ impl HostState {
                 false,
             ));
         }
-        let record = self.terminals.get(&terminal_id).ok_or_else(|| not_found(terminal_id))?;
+        let record = self
+            .terminals
+            .get(&terminal_id)
+            .ok_or_else(|| not_found(terminal_id))?;
         if record.authority_rebind_pending {
-            return Err(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
-                "Terminal ownership survived but its durable association is pending; use authenticated Retry", true));
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Terminal ownership survived but its durable association is pending; use authenticated Retry",
+                true,
+            ));
         }
         Ok(record)
     }
@@ -1252,8 +1265,14 @@ impl HostState {
     /// Only typed native recovery may inspect this private projection before
     /// the console's durable actor binding is committed. Public descriptors
     /// keep masking a provisional record as Failed.
-    pub(super) fn native_terminal_projection(&self, id: TerminalId) -> Result<TerminalSession, String> {
-        let terminal = self.terminals.get(&id).ok_or("The native console worker is unavailable")?;
+    pub(super) fn native_terminal_projection(
+        &self,
+        id: TerminalId,
+    ) -> Result<TerminalSession, String> {
+        let terminal = self
+            .terminals
+            .get(&id)
+            .ok_or("The native console worker is unavailable")?;
         if terminal.handle.is_completed() {
             return Err("The native console worker completed".into());
         }
@@ -1261,32 +1280,60 @@ impl HostState {
     }
 
     fn native_terminal_owner_projection(&self, id: TerminalId) -> Result<TerminalSession, String> {
-        let terminal = self.terminals.get(&id).ok_or("The native console worker is unavailable")?;
-        if !self.proof().is_complete() { return Err("The native console ownership is unavailable".into()); }
+        let terminal = self
+            .terminals
+            .get(&id)
+            .ok_or("The native console worker is unavailable")?;
+        if !self.proof().is_complete() {
+            return Err("The native console ownership is unavailable".into());
+        }
         let proof = self.proof();
         let mut current = terminal.session.clone();
-        current.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(),
-            boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        current.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
         Ok(current)
     }
 
     /// A recovered provider console remains provisional until its native actor
     /// and durable Chat association have both been installed by typed recovery.
     pub(super) fn native_terminal_binding_known(&self, id: TerminalId) -> bool {
-        let Some(terminal) = self.terminals.get(&id) else { return false; };
-        let Some(chat) = self.chats.get(&id) else { return false; };
-        let Some(pair) = chat.session.terminal.as_ref() else { return false; };
+        let Some(terminal) = self.terminals.get(&id) else {
+            return false;
+        };
+        let Some(chat) = self.chats.get(&id) else {
+            return false;
+        };
+        let Some(pair) = chat.session.terminal.as_ref() else {
+            return false;
+        };
         if chat.session.proof.as_ref() != Some(self.proof())
-            || !chat.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&terminal.handle)) { return false; }
+            || !chat
+                .paired_terminal
+                .as_ref()
+                .is_some_and(|expected| expected.same_worker(&terminal.handle))
+        {
+            return false;
+        }
         match pair.continuity.live_proof() {
             Some(proof) if &proof == self.proof() => {}
-            None if matches!(pair.continuity, TerminalContinuity::Exited { .. }
-                | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }) => {}
+            None if matches!(
+                pair.continuity,
+                TerminalContinuity::Exited { .. }
+                    | TerminalContinuity::RelaunchAvailable {
+                        last_exit: Some(_),
+                        ..
+                    }
+            ) => {}
             _ => return false,
         }
         // Identity survives completion: a busy native actor can still require
         // consent after its PTY ends. This does not authorize recovery/replay.
-        let Ok(current) = self.native_terminal_owner_projection(id) else { return false; };
+        let Ok(current) = self.native_terminal_owner_projection(id) else {
+            return false;
+        };
         let mut pair = pair.clone();
         pair.continuity = current.continuity.clone();
         pair.resume_hint = current.resume_hint.clone();
@@ -1296,8 +1343,14 @@ impl HostState {
     pub(super) fn confirm_native_terminal_binding(&mut self, id: TerminalId) -> bool {
         if !self.native_terminal_binding_known(id)
             || self.terminals[&id].handle.is_completed()
-            || self.chats[&id].handle.is_completed() { return false; }
-        self.terminals.get_mut(&id).expect("the validated pair remains under this host lock").authority_rebind_pending = false;
+            || self.chats[&id].handle.is_completed()
+        {
+            return false;
+        }
+        self.terminals
+            .get_mut(&id)
+            .expect("the validated pair remains under this host lock")
+            .authority_rebind_pending = false;
         true
     }
 
@@ -2586,14 +2639,24 @@ fn restore_terminal_execution_authority(
     use crate::agent_execution::HostedSession;
     let (successor, expected, proof) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = state.terminals.get(&source.id).ok_or("The restored terminal disappeared before authority binding")?;
+        let record = state
+            .terminals
+            .get(&source.id)
+            .ok_or("The restored terminal disappeared before authority binding")?;
         let proof = state.proof().clone();
         let mut successor = record.session.clone();
-        successor.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        successor.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
         (successor, record.handle.clone(), proof)
     };
     let registry = super::agent_execution::registry(host)?;
-    let authority = registry.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_authority_source(source.id)?;
+    let authority = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_authority_source(source.id)?;
     if matches!(&authority, Some(HostedSession::Terminal(_))) {
         let mut retained = Vec::new();
         for source in previous.iter().chain(std::iter::once(source)) {
@@ -2601,22 +2664,34 @@ fn restore_terminal_execution_authority(
             if let Some(proof) = source.continuity.live_proof() {
                 let mut attached = source.clone();
                 attached.continuity = TerminalContinuity::Live {
-                    host_session_id: proof.host_session_id, boot_id: proof.boot_id, host_incarnation: proof.host_incarnation,
+                    host_session_id: proof.host_session_id,
+                    boot_id: proof.boot_id,
+                    host_incarnation: proof.host_incarnation,
                 };
                 retained.push(HostedSession::Terminal(attached.clone()));
-                attached.resume_hint = crate::model::agent_recovery::observed_hint_from_launch(&attached.launch);
+                attached.resume_hint =
+                    crate::model::agent_recovery::observed_hint_from_launch(&attached.launch);
                 retained.push(HostedSession::Terminal(attached));
             }
         }
-        registry.lock().unwrap_or_else(|p| p.into_inner())
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .adopt_authenticated_agent_session(&retained, &HostedSession::Terminal(successor))?;
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if matches!(&authority, Some(HostedSession::Chat(_))) && !state.native_terminal_binding_known(source.id) {
+    if matches!(&authority, Some(HostedSession::Chat(_)))
+        && !state.native_terminal_binding_known(source.id)
+    {
         return Err("This console belongs to a native conversation whose exact actor and terminal pair have not reconnected; its original processes were preserved".into());
     }
-    if state.proof() != &proof { return Err("Daemon ownership changed during terminal authority binding".into()); }
-    let record = state.terminals.get_mut(&source.id).filter(|record| record.handle.same_worker(&expected))
+    if state.proof() != &proof {
+        return Err("Daemon ownership changed during terminal authority binding".into());
+    }
+    let record = state
+        .terminals
+        .get_mut(&source.id)
+        .filter(|record| record.handle.same_worker(&expected))
         .ok_or("The terminal worker changed during authority binding")?;
     record.authority_rebind_pending = false;
     Ok(())
@@ -3499,10 +3574,18 @@ fn start_terminal_view_owned(
     pending_pane: Option<crate::model::CardId>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
-    if adoption.is_none() && !fs::metadata(&session.launch.working_directory).is_ok_and(|metadata| metadata.is_dir()) {
-        return Err(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
-            format!("{}: The saved terminal folder {} is unavailable. Locate or restore that folder before launching this terminal.",
-                crate::terminal_ipc::WORKING_DIRECTORY_UNAVAILABLE, session.launch.working_directory.display()), false));
+    if adoption.is_none()
+        && !fs::metadata(&session.launch.working_directory).is_ok_and(|metadata| metadata.is_dir())
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            format!(
+                "{}: The saved terminal folder {} is unavailable. Locate or restore that folder before launching this terminal.",
+                crate::terminal_ipc::WORKING_DIRECTORY_UNAVAILABLE,
+                session.launch.working_directory.display()
+            ),
+            false,
+        ));
     }
     validate_spawn_options(&options)?;
     if let Some(environment) = &mut execution_environment {
@@ -3709,7 +3792,11 @@ fn start_terminal_view_owned(
             finish_pending_terminal(&mut state, terminal_id);
         }
         if descriptor.is_ok() {
-            state.terminals.get_mut(&terminal_id).expect("finished spawn").authority_rebind_pending = adopting;
+            state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("finished spawn")
+                .authority_rebind_pending = adopting;
             state
                 .terminals
                 .get_mut(&terminal_id)

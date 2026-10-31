@@ -475,9 +475,14 @@ pub enum ClientRequest {
         options: TerminalSpawnOptions,
     },
     /// Authenticate and adopt only the original live PTY. Never relaunch.
-    ReconcileTerminal { session: TerminalSession },
+    ReconcileTerminal {
+        session: TerminalSession,
+    },
     /// Reconcile exact saved ownership, then apply the PTY owner's close policy.
-    ReconcileTerminalClose { session: TerminalSession, allow_active: bool },
+    ReconcileTerminalClose {
+        session: TerminalSession,
+        allow_active: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

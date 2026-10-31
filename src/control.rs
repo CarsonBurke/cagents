@@ -1011,30 +1011,58 @@ impl ControlClient {
         }
     }
 
-    pub fn reconcile_terminal(&mut self, session: crate::model::TerminalSession) -> Result<TerminalDescriptor, ControlError> {
+    pub fn reconcile_terminal(
+        &mut self,
+        session: crate::model::TerminalSession,
+    ) -> Result<TerminalDescriptor, ControlError> {
         let id = session.id;
-        let terminal = match self.request_attached(ClientRequest::ReconcileTerminal { session }, id)? {
-            ServerResponse::Spawned { terminal } if terminal.session.id == id => terminal,
-            response => return Err(unexpected_response("authenticated terminal reconciliation", &response)),
-        };
+        let terminal =
+            match self.request_attached(ClientRequest::ReconcileTerminal { session }, id)? {
+                ServerResponse::Spawned { terminal } if terminal.session.id == id => terminal,
+                response => {
+                    return Err(unexpected_response(
+                        "authenticated terminal reconciliation",
+                        &response,
+                    ));
+                }
+            };
         self.read_attachment_replay(id)?;
         self.finish_attachment(id, Ok(terminal))
     }
 
     pub fn reconcile_terminal_close(
-        &mut self, session: crate::model::TerminalSession, allow_active: bool,
+        &mut self,
+        session: crate::model::TerminalSession,
+        allow_active: bool,
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         let id = session.id;
-        let result = self.request_streaming_deadline(ClientRequest::ReconcileTerminalClose { session, allow_active }, Some(id), Instant::now() + CHAT_CLOSE_TIMEOUT)
+        let result = self
+            .request_streaming_deadline(
+                ClientRequest::ReconcileTerminalClose {
+                    session,
+                    allow_active,
+                },
+                Some(id),
+                Instant::now() + CHAT_CLOSE_TIMEOUT,
+            )
             .and_then(|response| match response {
-                ServerResponse::TerminalCloseChecked { terminal_id, outcome } if terminal_id == id => Ok(outcome),
+                ServerResponse::TerminalCloseChecked {
+                    terminal_id,
+                    outcome,
+                } if terminal_id == id => Ok(outcome),
                 response => Err(unexpected_response("reconciled terminal close", &response)),
             });
         let detached = self.detach(id);
         match (result, detached) {
             (Err(error), _) => Err(error),
             (Ok(outcome), Ok(())) => Ok(outcome),
-            (Ok(terminal::ipc::TerminalCloseResult::Closed), Err(ControlError::Remote { code: ProtocolErrorCode::TerminalNotFound, .. })) => Ok(terminal::ipc::TerminalCloseResult::Closed),
+            (
+                Ok(terminal::ipc::TerminalCloseResult::Closed),
+                Err(ControlError::Remote {
+                    code: ProtocolErrorCode::TerminalNotFound,
+                    ..
+                }),
+            ) => Ok(terminal::ipc::TerminalCloseResult::Closed),
             (Ok(_), Err(error)) => Err(error),
         }
     }

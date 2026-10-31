@@ -1879,9 +1879,14 @@ fn serve_connection(
                 (
                     PendingRequest::Spawn,
                     if spawn.session.continuity.live_proof().is_some() {
-                        ClientRequest::ReconcileTerminal { session: spawn.session.clone() }
+                        ClientRequest::ReconcileTerminal {
+                            session: spawn.session.clone(),
+                        }
                     } else {
-                        ClientRequest::Spawn { session: spawn.session.clone(), options }
+                        ClientRequest::Spawn {
+                            session: spawn.session.clone(),
+                            options,
+                        }
                     },
                 )
             }

@@ -59,7 +59,10 @@ pub(super) struct Details {
 fn known_failure(code: &str) -> (&'static str, &'static str) {
     match code {
         "start_failed" => ("start_failed", "The terminal could not be started."),
-        "working_directory_unavailable" => ("working_directory_unavailable", "The saved terminal folder is unavailable. Locate or restore that folder, then Retry."),
+        "working_directory_unavailable" => (
+            "working_directory_unavailable",
+            "The saved terminal folder is unavailable. Locate or restore that folder, then Retry.",
+        ),
         "runtime_hydration_failed" => (
             "runtime_hydration_failed",
             "The terminal could not be restored.",

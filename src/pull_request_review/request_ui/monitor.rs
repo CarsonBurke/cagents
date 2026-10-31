@@ -370,7 +370,9 @@ mod tests {
                 },
                 [repository.clone()],
             ));
-            monitor.entries[&repository].due.saturating_duration_since(before)
+            monitor.entries[&repository]
+                .due
+                .saturating_duration_since(before)
         };
         drop(monitor.update(Action::Tick, [repository.clone()]));
         monitor.busy = None;
@@ -449,7 +451,9 @@ mod tests {
                 },
                 [repository.clone()],
             ));
-            let wait = monitor.entries[&repository].due.saturating_duration_since(before);
+            let wait = monitor.entries[&repository]
+                .due
+                .saturating_duration_since(before);
             (wait.as_secs_f64() / 60.0).round() as u64
         };
         let first = Work::Page { cursor: None };
@@ -469,8 +473,8 @@ mod tests {
     #[test]
     fn a_read_that_ends_an_outage_clears_every_backoff() {
         let mut monitor = Monitor::default();
-        let repositories = ["a", "b", "c"]
-            .map(|name| GitHubRepoKey::new("github.com", None, "o", name).unwrap());
+        let repositories =
+            ["a", "b", "c"].map(|name| GitHubRepoKey::new("github.com", None, "o", name).unwrap());
         drop(monitor.update(Action::Tick, repositories.clone()));
         monitor.busy = None;
         let load = |monitor: &mut Monitor, index: usize, result: Result<Reply, String>| {

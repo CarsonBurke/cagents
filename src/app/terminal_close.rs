@@ -189,7 +189,11 @@ impl Cagents {
         }
         // A previous refusal is diagnostic state, not a permanent close lock.
         // Another explicit click retries current authenticated reconciliation.
-        if self.terminal_close.as_ref().is_some_and(|intent| intent.card == card && !intent.pending && intent.detail.is_some()) {
+        if self
+            .terminal_close
+            .as_ref()
+            .is_some_and(|intent| intent.card == card && !intent.pending && intent.detail.is_some())
+        {
             if let Some(intent) = self.terminal_close.take() {
                 self.terminal_close_attempts.remove(&intent.terminal);
                 self.core.set_keyboard_nav(intent.restore_keyboard_nav);
@@ -1043,11 +1047,14 @@ fn revalidate_and_close_at(intent: &CloseIntent, allow_active: bool, path: &Path
         // which a same-ID relaunch could replace the inspected worker.
         let run = || -> Result<CloseOutcome, String> {
             let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
-            client.reconcile_terminal_close(source.clone(), allow_active).map_err(|error| error.to_string()).map(|outcome| match outcome {
-                TerminalCloseResult::Closed => CloseOutcome::Closed,
-                TerminalCloseResult::Active => CloseOutcome::Active,
-                TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
-            })
+            client
+                .reconcile_terminal_close(source.clone(), allow_active)
+                .map_err(|error| error.to_string())
+                .map(|outcome| match outcome {
+                    TerminalCloseResult::Closed => CloseOutcome::Closed,
+                    TerminalCloseResult::Active => CloseOutcome::Active,
+                    TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
+                })
         };
         return run().unwrap_or_else(CloseOutcome::Unreachable);
     }
@@ -1069,7 +1076,12 @@ pub(super) fn close_hosted_terminal(
     }
 }
 
-fn close_hosted_terminal_at(path: &Path, terminal: TerminalId, proof: &HostSessionProof, allow_active: bool) -> CloseOutcome {
+fn close_hosted_terminal_at(
+    path: &Path,
+    terminal: TerminalId,
+    proof: &HostSessionProof,
+    allow_active: bool,
+) -> CloseOutcome {
     let run = || -> Result<CloseOutcome, String> {
         let mut client = ControlClient::connect(path).map_err(|error| error.to_string())?;
         if client.proof() != proof || !proof.is_complete() {
@@ -1116,7 +1128,10 @@ fn close_hosted_terminal_at(path: &Path, terminal: TerminalId, proof: &HostSessi
 #[cfg(test)]
 mod paired_close_regression {
     use super::*;
-    use crate::terminal_ipc::{ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor, read_frame, write_frame};
+    use crate::terminal_ipc::{
+        ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+        ServerResponse, TerminalDescriptor, read_frame, write_frame,
+    };
 
     #[test]
     fn authority_pending_close_carries_whole_source_and_keeps_failed_or_changed_targets() {
@@ -1273,32 +1288,102 @@ mod paired_close_regression {
 
     #[test]
     fn current_native_and_execution_console_close_carry_exact_source_without_an_id_only_gap() {
-        for (native_listener, stale_source) in [(true, false), (false, false), (true, true), (false, true)] {
+        for (native_listener, stale_source) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("daemon.sock");
             let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-            let proof = HostSessionProof { host_session_id: crate::model::HostSessionId::new("paired-close"), boot_id: crate::model::BootId::new("paired-boot"), host_incarnation: crate::model::HostIncarnation::new("paired-incarnation") };
+            let proof = HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("paired-close"),
+                boot_id: crate::model::BootId::new("paired-boot"),
+                host_incarnation: crate::model::HostIncarnation::new("paired-incarnation"),
+            };
             let id = TerminalId::new();
-            let recipe = LaunchRecipe { program: if native_listener { "codex".into() } else { "/usr/bin/cagents".into() }, arguments: if native_listener { vec!["--remote".into(), "unix:///private/native.sock".into()] } else { vec!["agent".into(), "console".into(), id.to_string()] }, working_directory: directory.path().to_owned(), environment: Default::default(), unset_environment: Default::default() };
+            let recipe = LaunchRecipe {
+                program: if native_listener {
+                    "codex".into()
+                } else {
+                    "/usr/bin/cagents".into()
+                },
+                arguments: if native_listener {
+                    vec!["--remote".into(), "unix:///private/native.sock".into()]
+                } else {
+                    vec!["agent".into(), "console".into(), id.to_string()]
+                },
+                working_directory: directory.path().to_owned(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            };
             let mut descriptor = TerminalDescriptor::relaunchable(id, recipe, None);
-            descriptor.session.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+            descriptor.session.continuity = TerminalContinuity::Live {
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
+                host_incarnation: proof.host_incarnation.clone(),
+            };
             if native_listener {
-                descriptor.session.owned_codex_listener = Some(crate::chat::OwnedCodexListener { socket: "/private/native.sock".into(), allocator: proof.clone() });
+                descriptor.session.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+                    socket: "/private/native.sock".into(),
+                    allocator: proof.clone(),
+                });
             }
-            let intent = CloseIntent { card: CardId::new(), terminal: id, proof: proof.clone(), completed_source: None, live_source: Some(descriptor.session.clone()), generation: 1, restore_card: None, pending: true, active: false, dont_ask_again: false, detail: None, focus: 0, restore_keyboard_nav: false };
+            let intent = CloseIntent {
+                card: CardId::new(),
+                terminal: id,
+                proof: proof.clone(),
+                completed_source: None,
+                live_source: Some(descriptor.session.clone()),
+                generation: 1,
+                restore_card: None,
+                pending: true,
+                active: false,
+                dont_ask_again: false,
+                detail: None,
+                focus: 0,
+                restore_keyboard_nav: false,
+            };
             descriptor.session.resume_hint = Some("new-foreground-observation".into());
-            if stale_source { descriptor.session.launch.arguments.push("different-current-recipe".into()); }
+            if stale_source {
+                descriptor
+                    .session
+                    .launch
+                    .arguments
+                    .push("different-current-recipe".into());
+            }
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
-                let send = |stream: &mut std::os::unix::net::UnixStream, request_id: u64, response| {
-                    write_frame(stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(request_id), proof: proof.clone(), message: ServerMessage::Response { response } }).unwrap();
-                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                let send =
+                    |stream: &mut std::os::unix::net::UnixStream, request_id: u64, response| {
+                        write_frame(
+                            stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request_id),
+                                proof: proof.clone(),
+                                message: ServerMessage::Response { response },
+                            },
+                        )
+                        .unwrap();
+                    };
                 let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
                 assert!(matches!(connect.request, ClientRequest::Connect { .. }));
-                send(&mut stream, connect.request_id, ServerResponse::Connected { proof: proof.clone(), resumed: vec![] });
+                send(
+                    &mut stream,
+                    connect.request_id,
+                    ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                );
                 let close: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-                let ClientRequest::ReconcileTerminalClose { session, allow_active: false } = close.request else {
+                let ClientRequest::ReconcileTerminalClose {
+                    session,
+                    allow_active: false,
+                } = close.request
+                else {
                     panic!("live consoles must use the exact-source atomic close RPC");
                 };
                 assert_eq!(session.id, id);
@@ -1308,19 +1393,41 @@ mod paired_close_regression {
                 observed.resume_hint = session.resume_hint.clone();
                 if stale_source {
                     assert_ne!(session, observed);
-                    write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(close.request_id), proof: proof.clone(),
-                        message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable, "source changed; current worker preserved", false)) }).unwrap();
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(close.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                                crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                                "source changed; current worker preserved",
+                                false,
+                            )),
+                        },
+                    )
+                    .unwrap();
                 } else {
                     assert_eq!(session, observed);
-                    send(&mut stream, close.request_id, ServerResponse::TerminalCloseChecked { terminal_id: id, outcome: TerminalCloseResult::Active });
+                    send(
+                        &mut stream,
+                        close.request_id,
+                        ServerResponse::TerminalCloseChecked {
+                            terminal_id: id,
+                            outcome: TerminalCloseResult::Active,
+                        },
+                    );
                 }
                 let detach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
                 assert_eq!(detach.request, ClientRequest::Detach { terminal_id: id });
                 send(&mut stream, detach.request_id, ServerResponse::Detached);
             });
             let outcome = revalidate_and_close_at(&intent, false, &socket);
-            if stale_source { assert!(matches!(outcome, CloseOutcome::Unreachable(_))); }
-            else { assert!(matches!(outcome, CloseOutcome::Active)); }
+            if stale_source {
+                assert!(matches!(outcome, CloseOutcome::Unreachable(_)));
+            } else {
+                assert!(matches!(outcome, CloseOutcome::Active));
+            }
             server.join().unwrap();
         }
     }
