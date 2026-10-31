@@ -1,0 +1,9 @@
+test_installer_attempt1_allowed_by_both_contexts (__main__.OriginalAttemptContextSourceTests.test_installer_attempt1_allowed_by_both_contexts) ... ok
+test_installer_reruns_and_nonliteral_one_refused_by_both_contexts (__main__.OriginalAttemptContextSourceTests.test_installer_reruns_and_nonliteral_one_refused_by_both_contexts) ... ok
+test_legacy_positive_attempt_semantics_preserved (__main__.OriginalAttemptContextSourceTests.test_legacy_positive_attempt_semantics_preserved) ... ok
+test_zero_remains_invalid_for_all_supported_cases (__main__.OriginalAttemptContextSourceTests.test_zero_remains_invalid_for_all_supported_cases) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.059s
+
+OK

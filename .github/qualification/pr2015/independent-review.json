@@ -1,0 +1,69 @@
+{
+  "schema": "issue2015-hosted-attempt1-runner-independent-source-review/v2",
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "reviewer_role": "Actual nonauthor independent source reviewer /root/fresh1549_search_cancellation",
+  "scope": "Minimal successor review of active run-packet.py's original-attempt fence and conserved plan/source/phase/result/custody/output behavior. Selector/gating/synthetic fixture/workflow/cache/legacy integration remain the disjoint peer's scope; no assembled peer clearance is asserted here.",
+  "head": "6dc09b9a1b5d205650e244401da0938b653d16da",
+  "tree": "aaab67a21378958066103707baf3abe8850577d6",
+  "runner_sha256": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
+  "plan_sha256": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
+  "control_commit": "143555931ca118d023b6ddeb8b7071f8bde5d98c",
+  "control_tree": "730a4787d4f3d9c18dffd602212dd7b87d8cce7b",
+  "control_parent": "182075edc8014ecf30767a9d376ec133fa8548ec",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2015-hosted-attempt1-control",
+  "freeze": {
+    "path": "/tmp/issue2015-hosted-attempt1-source-freeze-v2.json",
+    "sha256": "2bd0c301526fd9b9190518f1f4c1a3afc800bcffc25c87e7739ba4809928109a"
+  },
+  "commit_receipt": {
+    "path": "/tmp/issue2015-hosted-attempt1-commit-receipt-14355593.json",
+    "sha256": "ea371131552f031547798242c7b840b8d59d281ba971caee47f374836066d07b"
+  },
+  "prior_independent_runner_review": {
+    "path": "/tmp/issue2015-hosted-runner-independent-source-review-v1.json",
+    "sha256": "cecf9715b4dc2def99070b1600c51c6d15e025e629311f33712825f4e2e813d2",
+    "runner_sha256": "235e881b7448e98513b0848f1a4081e11d3b42f917f846684a58a1ade845ab9c",
+    "reuse": "Preserved unchanged for its exact prior source. Its detailed conclusions and limits are reused only where actual successor source is byte-conserved. No prior source clearance is converted into execution or original-attempt eligibility."
+  },
+  "findings": [],
+  "delta_proof": {
+    "method": "Read-only immutable Git show/diff between actual parent182075ed and successor14355593, plus SHA256 of committed and working source bytes; no Python import or controller/fixture execution.",
+    "old_runner_matches_prior_review": true,
+    "only_active_runner_delta": "Exactly one added line at run-packet.py:620: assert attempt == '1', 'Installer2015 requires one original attempt1; reruns are unsupported and no global C grant is implied'",
+    "fence_placement": "Inside dedicated hosted_context, after immutable selected case is parsed and asserted installer2015/never_merge, before return. main calls hosted_context before materialization, source children, custody acquisition or Cargo. source() rechecks hosted_context before/after normal phases and in final source observations.",
+    "literal_semantics": "Only the literal string1 passes this new predicate. Decimal positive2+ and nonliteral01 are refused; zero/nonnumeric/empty attempts remain refused by the existing positive-decimal check. Literal1 still must satisfy all other metadata/source/cache/review gates; it is not permission or a pass.",
+    "unchanged_committed_paths": [
+      ".github/qualification/pr2015/plan.json",
+      ".github/qualification/pr2015/cache-restore-gate.py",
+      ".github/qualification/pr2015/manifest.json",
+      ".github/qualification/pr2015/source-review-binding.json"
+    ],
+    "unchanged_sha256": {
+      "plan.json": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
+      "cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+      "manifest.json": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
+      "source-review-binding.json": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87"
+    },
+    "limit": "Only this runner delta and listed conserved dependencies are independently refreshed here. Freeze author claims about all42 files, synthetic fixture and workflow/selector semantics are not substituted for the peer's review."
+  },
+  "conserved_source_conclusions": [
+    "Ten serial CLI-only phases remain one check, two integration compiles, two full direct-ELF inventories and five exact owning parents. No HOST/UI/default/full/broad graph is added.",
+    "Original Cargo JSON must supply the genuine matching harness and CLI executable paths with features[]. Canonical same-target owned ELF identity/hash guards remain; no path or historical PID/ELF proof is fabricated.",
+    "Fresh complete inventory names/counts must match source predictions36/11 before selection. Actual N drives every singleton's running1, exact owning name,1P/0F/0I/0M and N-1. Compiles, inventories, passive helpers, guardian/lease children and inline cases stay nonadditive.",
+    "The legitimate external-installer refusal parser, ordered inspector-refused/inspector-missing diagnostics and friendly recovery plus actual ENOENT markers are unchanged. Historical5a4 stale-cause finding and source correction remain intact; original logs are not rewritten into successful output.",
+    "Genuine author source binding remains explicitly NOT_INDEPENDENT_REVIEW, while the executing runner still requires a separately supplied genuine independent controller receipt bound to exact product/runner/plan. Original source/lineage/review bytes remain retained; archived Root-local paths are not active runtime routing.",
+    "Product HEAD/tree/clean status/source hashes, hosted metadata correlation, archive/review/runner/plan and physical tool hashes continue to surround normal phase work, with final observations on failure. Actual argv/cwd and original stdout/stderr/results remain evidence, rather than predictions.",
+    "Original successful-spawn attempts and direct wait/evidence states stay separate; null exits, supervision errors, timeout/forced cleanup and uncertain custody cannot become qualification. Direct pidfd closure, two final custody passes around final source checks, original job-owned fd closure and no ambiguous close retry are unchanged.",
+    "Full original process/phase/parent ledger stays on disk; compact terminal retains its checksummed evidence/summary/receipt paths. Job-owned fd closure still does not allocate or return global C."
+  ],
+  "preserved_limits": [
+    "Original attempt1 fencing rejects reruns of that GitHub run; it is not once-only global allocation across distinct run IDs. Actual Root grant/scheduling and whole original job terminal/independent RAW/external return acceptance remain external.",
+    "Hosted environment flags and event correlations are not independently authenticated provenance. Future original GitHub run/job/source/log/artifact RAW must bind the actual original attempt; local spoofed context is not eligibility.",
+    "No genuine assembled workflow/case/cache/authority clearance is supplied by this runner-only receipt. Original source HOLD for the missing attempt fence remains preserved as historical negative evidence, not relabeled as a prior pass.",
+    "No SourceReady, actual User permission, C grant/return, cache visibility/warm payload, compiled artifact, product/job/runtime/native/provider/install or performance qualification is claimed. All are UNKNOWN/UNRUN as applicable.",
+    "The failed-invoke post-use ELF-check limitation, pre-controller process-custody boundary, external process-loss limit and labeled Python-inspector versus actual HOST inspection distinction remain exactly as in the prior independent review."
+  ],
+  "source_identity_observations": "Immutable commit/tree/parent and old/new runner hashes were verified. Current runner/plan/cache/manifest/source-binding bytes match committed expected hashes after inspection. Freeze, commit receipt and prior actual independent review hashes match the supplied immutable values.",
+  "execution": "ALL_UNRUN",
+  "activity": "Only read immutable Git/source/receipts, compare/hash text and write this requested task-owned independent report. No import, controller/fixture/helper execution, build/test/Cargo, cache/target/runtime/process/environment/account/provider probes, source/Git/GitHub/cagents writes, new agents, allocation or local User eligibility attempt."
+}

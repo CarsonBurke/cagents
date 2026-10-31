@@ -1,0 +1,195 @@
+{
+  "schema": "pr1921-cli-cache-producer/v1",
+  "prepared_only": true,
+  "never_merge": true,
+  "product_head": "375c37ff01aab0b226c58f547012af74e93a8643",
+  "product_tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+  "worktree": null,
+  "runner_path": ".github/qualification/pr2015/cli-cache-producer.py",
+  "source_review": ".github/qualification/pr2015/cli-cache-producer-review.json",
+  "source_review_sha256": null,
+  "physical_tool_bin": null,
+  "tool_sha256": null,
+  "source_paths_sha256": {
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/companion.rs": "76d991bd5ff1cd73a4252d6f5961bc1b19e50b0936dc4d00b699fbf56d93af00",
+    "src/install_guard.rs": "b735f0b9564a0e7f4b90e496af57fe06319e07ee64477073a377f9517849356a",
+    "src/instance.rs": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+    "src/update.rs": "48a9c75b73a3948063f4fca76e0ecf3159e0065a3a9ab19d6d8749a8446eec55",
+    "src/app.rs": "c405ea52503acc5076a5e77d3bc81d5e9ab341b1a78e313147e9ca70dfc67e77",
+    "src/app/update_ui.rs": "5bae66ddb5fd6ef6bb50de4add827f5212e390aa8d0d495a1678b225e8748e2f",
+    "install.sh": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+    "tests/installer_lifecycle_contract.rs": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec",
+    "tests/installer_guard_contract.rs": "a4413f4a235ef796438d32fa538f0e1d46fa5221283a588e1f36aaac01d92a00",
+    "tests/support/user_fixture.rs": "a016d99771e4ffdd6d413fcb89a0671462c56dda32956e0b89c09bd50b848079"
+  },
+  "lane": {
+    "id": "externally-reserved-C-one-hosted-job",
+    "jobs": 2,
+    "new_cache": true,
+    "target": null,
+    "lock": null
+  },
+  "packet_deadline_seconds": 2400,
+  "planned_phase_count": 3,
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-installer_lifecycle_contract",
+    "compile-installer_guard_contract"
+  ],
+  "counts": {
+    "qualifying_outer_parents": 0,
+    "planned_compile_commands": 3,
+    "inventory_invocations": 0,
+    "installer_invocations": 0,
+    "native_invocations": 0,
+    "provider_invocations": 0
+  },
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 600
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "installer_lifecycle_contract",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_kind": [
+        "test"
+      ],
+      "target_name": "installer_lifecycle_contract",
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_lifecycle_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "selectors": []
+    },
+    {
+      "id": "installer_guard_contract",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_kind": [
+        "test"
+      ],
+      "target_name": "installer_guard_contract",
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_guard_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "selectors": []
+    }
+  ],
+  "archive_bindings": [
+    {
+      "name": "original-hosted-driver.py",
+      "path": ".github/qualification/pr2015/run-packet.py",
+      "sha256": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20"
+    },
+    {
+      "name": "original-cache-restore-gate.py",
+      "path": ".github/qualification/pr2015/cache-restore-gate.py",
+      "sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4"
+    },
+    {
+      "name": "canonical_function.py",
+      "path": ".github/qualification/pr2015/cli-cache-producer-source/canonical_function.py",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+    },
+    {
+      "name": "producer-design.md",
+      "path": ".github/qualification/pr2015/cli-cache-producer-source/design.md",
+      "sha256": "b4dc6906d49d436d73b4dd02c564a14dcd3035aae057d35b4b0d7060d0a839a6"
+    },
+    {
+      "name": "producer-design-bindings.json",
+      "path": ".github/qualification/pr2015/cli-cache-producer-source/bindings.json",
+      "sha256": "374edb25fb8330becf179b96474ac09927db12f6c048d32f4da6478b4dbd9865"
+    },
+    {
+      "name": "original-installer-case-ac4.json",
+      "path": ".github/qualification/pr2015/lineage/installer2015-case-ac4.json",
+      "sha256": "9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f"
+    }
+  ],
+  "cache": {
+    "prefix": "held1922-Linux-X64-rust193-bca4125b50134707a8afdb92ce04572c6ca6b3d3e43d177c5c679cecbc89c91b-",
+    "lock_sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "hashFiles_single_file": "bca4125b50134707a8afdb92ce04572c6ca6b3d3e43d177c5c679cecbc89c91b",
+    "key_expression": "held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}",
+    "paths_in_original_order": [
+      "${{ env.CARGO_TARGET_DIR }}",
+      "~/.cargo/registry",
+      "~/.cargo/git"
+    ],
+    "target": "$RUNNER_TEMP/held-scope-target",
+    "action": "actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830",
+    "future_restore": "Keep original installer restore key/prefix/paths and cache gate byte-exact; actual future visibility/version/payload admission still mandatory.",
+    "actual_cache": null
+  },
+  "tool_setup": {
+    "source_child_deadline_seconds": 10,
+    "combined_setup_deadline_seconds": 120,
+    "physical_toolchain": "1.93.0",
+    "host": "x86_64-unknown-linux-gnu",
+    "raw_original_stdout_stderr_exit": true,
+    "incremental_original_channel_files_and_status": true,
+    "all_postchild_initialization_exits_guarded_for_unknown_custody": true,
+    "successful_and_partial_captures_retained_before_materialization_complete": true
+  },
+  "payload_validation": {
+    "shape": "Existing cache gate feature-empty native library shape, new task-owned target only",
+    "max_seconds": 90,
+    "shared_workload_deadline_clamp": true,
+    "max_metadata_candidates": 128,
+    "deadline_checked_during_enumeration_candidates_and_chunks": true,
+    "enumeration": "Explicit os.scandir, check remaining deadline for every entry before filename filtering, cap128 matching paths before sorting"
+  },
+  "actual": {
+    "grant": null,
+    "run": null,
+    "cache": null,
+    "parent_results": null
+  },
+  "limits": [
+    "Separate producer source, not an installer cache-miss fallback. Original installer gate, runner, plan and historical negative remain unchanged.",
+    "One external shared C covers full original hosted job/setup/checkouts/three serial CLI compile commands/payload validation/cache save/post/upload/RAW/return; A and B remain counted occupied2. No global C allocation or return is supplied by this controller.",
+    "Exactly three feature-empty CLI check/compile phases, zero test parents/inventories/installer/native/provider invocations. No test pass, live provider, product outcome, installed application or merge qualification.",
+    "Physical tools and original verbose stdout/stderr/exits are observed through the same original owned supervision before target creation. No invented warm-cache receipt or authority stripping.",
+    "Original direct Popen-held pidfd timeout cleanup remains source-bound; adopted survivors are unsignaled under canonical9004 and force HOLD. Unknown initialization/custody/close retains original owner. No global kernel/every-exec proof.",
+    "600/900/900 phase ceilings share one2400-second workload deadline. Initial source/tool setup and finalization are separately bounded inherited stages, not a new enforced2400-second whole-job guarantee. Unknown custody holds indefinitely.",
+    "Produced payload shape is read-only bounded metadata/content evidence, not Cargo freshness, successful cache publication or future cache visibility. Cache save action exit0 alone is insufficient; original official exact-key saved confirmation and later original restore plus unchanged installer gate are required.",
+    "Only the samePR1921 merge ref/three ordered cache paths/key namespace are targeted. No producer-to-installer auto-chain, workflow dispatch/rerun or alternate rejected PR route.",
+    "Prepared source actual fields remain null. Runtime plan/tool observations and original artifacts are separate prospective evidence; all current workload/save/restore/qualification is UNRUN.",
+    "Incremental original tool channels persist on partial/nonzero/failing materialization. Per-capture status records direct waits and observations only; it does not independently prove descendant writer closure. Aggregate source/tool and separate recorded tool capture counts are nonparent accounting. A final outer exit guard retains unknown custody even when a failure-receipt write or handoff assessment raises."
+  ]
+}
