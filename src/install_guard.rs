@@ -63,6 +63,12 @@ pub(crate) fn record_deferred(stage: Option<(&Path, &Path)>) -> io::Result<()> {
     } else {
         crate::instance::validate_install_guard()?;
     }
+    write_receipt()
+}
+
+/// Tells the coordinator that the running windows keep their own UI. It is
+/// written before `current` changes, while the caller still holds the guard.
+fn write_receipt() -> io::Result<()> {
     let fd = std::env::var(RESULT_FD_ENV).ok().and_then(|value| value.parse::<i32>().ok())
         .filter(|fd| *fd >= 3).ok_or_else(|| io::Error::other("this update requires an external installer coordinator to defer daemon replacement"))?;
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -334,17 +340,14 @@ fn compatible_owner() -> io::Result<bool> {
     Ok(true)
 }
 
-fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let layout =
-        crate::update::locate(&version_root.join("bin/cagents")).map_err(io::Error::other)?;
-    if layout.prefix != prefix.canonicalize()?
-        || layout.version_root != version_root.canonicalize()?
-    {
-        return Err(io::Error::other(
-            "staged candidate belongs to another installation",
-        ));
-    }
+/// The runtime owner a staged transaction must preserve: the daemon's matched
+/// set, or that of the live windows when no daemon runs. Both must agree, and
+/// the daemon must be the one the coordinator observed (`OWNER_CLI_ENV`) and
+/// stay the same throughout. `pinned` runs while that daemon identity is held.
+fn stage_owner<T>(
+    prefix: &Path,
+    pinned: impl FnOnce(Option<&Path>) -> io::Result<T>,
+) -> io::Result<(Option<std::path::PathBuf>, T)> {
     let owner = crate::daemon::running_executable()
         .map_err(io::Error::other)?
         .map(|exe| running_owner_bin(prefix, &exe))
@@ -356,10 +359,7 @@ fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
             "daemon ownership changed while staging; installation was not changed",
         ));
     }
-    // A compatible candidate can attach to the preserved daemon, including
-    // after an older installed updater completes its reviewed UI handoff.
-    // Authenticate both the handshake proof and the kernel socket owner.
-    let daemon_compatible = owner.is_some() && compatible_owner()?;
+    let pinned = pinned(owner.as_deref())?;
     let after = crate::daemon::running_executable()
         .map_err(io::Error::other)?
         .map(|exe| running_owner_bin(prefix, &exe))
@@ -389,17 +389,36 @@ fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
             "daemon ownership changed while verifying live windows",
         ));
     }
-    let owner = owner.or(window_owner);
+    Ok((owner.or(window_owner), pinned))
+}
+
+/// The version directory name of an authenticated owner's `bin`.
+fn owner_version(bin: &Path) -> io::Result<&str> {
+    bin.parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("daemon version path is not UTF-8"))
+}
+
+fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let layout =
+        crate::update::locate(&version_root.join("bin/cagents")).map_err(io::Error::other)?;
+    if layout.prefix != prefix.canonicalize()?
+        || layout.version_root != version_root.canonicalize()?
+    {
+        return Err(io::Error::other(
+            "staged candidate belongs to another installation",
+        ));
+    }
+    // A compatible candidate can attach to the preserved daemon, including
+    // after an older installed updater completes its reviewed UI handoff.
+    // Authenticate both the handshake proof and the kernel socket owner.
+    let (owner, daemon_compatible) =
+        stage_owner(prefix, |daemon| Ok(daemon.is_some() && compatible_owner()?))?;
     let owner_version = owner
-        .as_ref()
-        .map(|bin| {
-            bin.parent()
-                .unwrap()
-                .file_name()
-                .unwrap()
-                .to_str()
-                .ok_or_else(|| io::Error::other("daemon version path is not UTF-8"))
-        })
+        .as_deref()
+        .map(owner_version)
         .transpose()?
         .map(str::to_owned);
     let mut file = std::fs::OpenOptions::new()
@@ -422,6 +441,173 @@ fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Serves an already installed version under the staging guard, without
+/// publishing files, closing windows, or touching the daemon.
+///
+/// Selecting the live runtime owner's own tree withdraws a staged offer: the
+/// windows then run what `current` serves. Any other tree must carry the marker
+/// its own candidate recorded when it was staged over that same owner, so that
+/// selecting it again restores exactly the routing staging established; this
+/// coordinator never rewrites a marker it could not have produced. Every tree
+/// and marker is kept. With no runtime owner nothing can be routed, and any
+/// complete tree of this installation may be served.
+pub(crate) fn select_staged(
+    prefix: &Path,
+    version_root: &Path,
+    expected_current: &Path,
+) -> io::Result<()> {
+    crate::instance::validate_stage_guard()?;
+    let prefix = prefix.canonicalize()?;
+    if std::fs::read_link(prefix.join("current"))? != expected_current {
+        return Err(io::Error::other(
+            "current installation changed while preparing the selection; installation was not changed",
+        ));
+    }
+    let target = selectable_root(&prefix, version_root)?;
+    let _jobs = crate::update::exclude_update_jobs(&prefix).map_err(|error| match error {
+        crate::update::UpdateError::Busy => io::Error::other(
+            "an application update is in progress; finish or cancel it, then retry; installation was not changed",
+        ),
+        error => io::Error::other(error),
+    })?;
+    let (owner, daemon_running) = stage_owner(&prefix, |daemon| Ok(daemon.is_some()))?;
+    if let Some(bin) = owner.as_deref()
+        && bin != target.join("bin")
+    {
+        let running = owner_version(bin)?;
+        let name = target.file_name().unwrap().to_string_lossy();
+        let marker = read_staged_owner(&target)?
+            .filter(|marker| marker.owner_version.as_deref() == Some(running))
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "{name} was not staged over the running version {running}; select {running}, or stage a build with --stage-only; installation was not changed",
+                ))
+            })?;
+        // A compatible marker lets the candidate attach to the daemon it was
+        // proven against. Without one it would start its own daemon beside the
+        // live windows, where staging today would have routed to their owner.
+        if marker.daemon_compatible && !daemon_running {
+            return Err(io::Error::other(format!(
+                "{name} was staged to share the {running} daemon, which is no longer running; stage it again with --stage-only; installation was not changed",
+            )));
+        }
+    }
+    write_receipt()?;
+    let link = Path::new("versions").join(target.file_name().unwrap());
+    if link == expected_current {
+        return Ok(());
+    }
+    exchange_current(&prefix, &link, expected_current)
+}
+
+/// A complete version directory directly inside this installation's
+/// `versions/`, by the same rules `current` must satisfy to be served.
+fn selectable_root(prefix: &Path, version_root: &Path) -> io::Result<std::path::PathBuf> {
+    let versions = prefix.join("versions");
+    let name = version_root
+        .file_name()
+        .filter(|_| {
+            version_root
+                .parent()
+                .and_then(|parent| parent.canonicalize().ok())
+                .is_some_and(|parent| parent == versions)
+        })
+        .ok_or_else(|| io::Error::other("selected version is not in this installation"))?;
+    let target = versions.join(name);
+    // `current` names the directory itself; an alias would serve some other
+    // tree, possibly of another installation, under this version's name.
+    let metadata = std::fs::symlink_metadata(&target).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("version {} is not installed", name.to_string_lossy()),
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(io::Error::other(format!(
+            "version {} is not an installed version directory",
+            name.to_string_lossy()
+        )));
+    }
+    let layout = crate::update::locate(&target.join("bin/cagents-ui")).map_err(|error| {
+        io::Error::other(format!(
+            "version {} is not a complete installation of this prefix: {error}",
+            name.to_string_lossy()
+        ))
+    })?;
+    if layout.prefix != prefix || layout.version_root != target {
+        return Err(io::Error::other(format!(
+            "version {} belongs to another installation",
+            name.to_string_lossy()
+        )));
+    }
+    Ok(target)
+}
+
+/// Atomically replaces `current` with `link`, provided it still holds
+/// `expected`. The exchange keeps the replaced link, so an independent change
+/// is put back exactly as found rather than overwritten.
+fn exchange_current(prefix: &Path, link: &Path, expected: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let current = prefix.join("current");
+    let next = prefix.join(format!(".select.{}", std::process::id()));
+    match std::fs::remove_file(&next) {
+        Ok(()) => (),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error),
+    }
+    std::os::unix::fs::symlink(link, &next)?;
+    let exchange = || -> io::Result<()> {
+        let from = std::ffi::CString::new(next.as_os_str().as_bytes())?;
+        let to = std::ffi::CString::new(current.as_os_str().as_bytes())?;
+        // SAFETY: both paths are NUL-terminated and outlive the call.
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_EXCHANGE,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    if let Err(error) = exchange() {
+        let _ = std::fs::remove_file(&next);
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot atomically switch {}: {error}", current.display()),
+        ));
+    }
+    // `next` now holds whatever `current` held at the instant of exchange.
+    if std::fs::read_link(&next).ok().as_deref() != Some(expected) {
+        let restored = exchange();
+        if restored.is_ok() {
+            let _ = std::fs::remove_file(&next);
+        }
+        return Err(io::Error::other(match restored {
+            Ok(()) => "current installation changed independently; it was left as found".into(),
+            Err(error) => format!(
+                "current installation changed independently, and restoring it failed ({error}); its replaced link is kept at {}",
+                next.display()
+            ),
+        }));
+    }
+    // `current` already serves the selection; failing now would misreport it.
+    if let Err(error) = std::fs::remove_file(&next)
+        .and_then(|()| File::open(prefix))
+        .and_then(|directory| directory.sync_all())
+    {
+        eprintln!(
+            "cagents: selected the installed version, but could not finish cleanup ({error}); remove {} if it remains",
+            next.display()
+        );
+    }
+    Ok(())
+}
+
 /// A marker only selects a complete same-prefix tree while the kernel still
 /// identifies that exact daemon or matching live windows as the runtime owner.
 /// Recovery can restart only their matched daemon under the launch fence; the
@@ -430,7 +616,6 @@ pub(crate) fn staged_owner_bin(
     executable: &Path,
     recover: bool,
 ) -> io::Result<Option<std::path::PathBuf>> {
-    use std::os::unix::fs::OpenOptionsExt;
     // Sealed update probes execute from anonymous FDs. Their kernel exe path
     // has no filesystem entry to canonicalize and carries no install routing.
     // Only an installed version shape can have our private ownership marker;
@@ -448,46 +633,10 @@ pub(crate) fn staged_owner_bin(
     }) else {
         return Ok(None);
     };
-    let marker = version_root.join(STAGED_OWNER);
-    let mut file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&marker)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(owner) = read_staged_owner(version_root)? else {
+        return Ok(None);
     };
-    let meta = file.metadata()?;
-    if !meta.is_file()
-        || meta.uid() != unsafe { libc::geteuid() }
-        || meta.mode() & 0o077 != 0
-        || meta.nlink() != 1
-        || meta.len() > 1024
-    {
-        return Err(io::Error::other(
-            "invalid staged installation ownership marker",
-        ));
-    }
     let layout = crate::update::locate(executable).map_err(io::Error::other)?;
-    let owner: StagedOwner = serde_json::from_reader(&mut file).map_err(io::Error::other)?;
-    if owner.version != 1 {
-        return Err(io::Error::other(
-            "unsupported staged installation ownership marker",
-        ));
-    }
-    if owner.owner_version.as_ref().is_some_and(|version| {
-        version.is_empty()
-            || !matches!(
-                (
-                    Path::new(version).components().next(),
-                    Path::new(version).components().nth(1)
-                ),
-                (Some(std::path::Component::Normal(_)), None)
-            )
-    }) {
-        return Err(io::Error::other("invalid staged daemon version"));
-    }
     if owner.daemon_compatible && owner.candidate_protocol != crate::terminal_ipc::PROTOCOL_VERSION
     {
         return Err(io::Error::other(
@@ -582,6 +731,52 @@ pub(crate) fn staged_owner_bin(
         ));
     }
     Ok(Some(expected))
+}
+
+/// The ownership marker a staging transaction recorded in `version_root`, if
+/// any. It is only private routing evidence; it never conveys authority.
+fn read_staged_owner(version_root: &Path) -> io::Result<Option<StagedOwner>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let marker = version_root.join(STAGED_OWNER);
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&marker)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.uid() != unsafe { libc::geteuid() }
+        || meta.mode() & 0o077 != 0
+        || meta.nlink() != 1
+        || meta.len() > 1024
+    {
+        return Err(io::Error::other(
+            "invalid staged installation ownership marker",
+        ));
+    }
+    let owner: StagedOwner = serde_json::from_reader(&mut file).map_err(io::Error::other)?;
+    if owner.version != 1 {
+        return Err(io::Error::other(
+            "unsupported staged installation ownership marker",
+        ));
+    }
+    if owner.owner_version.as_ref().is_some_and(|version| {
+        version.is_empty()
+            || !matches!(
+                (
+                    Path::new(version).components().next(),
+                    Path::new(version).components().nth(1)
+                ),
+                (Some(std::path::Component::Normal(_)), None)
+            )
+    }) {
+        return Err(io::Error::other("invalid staged daemon version"));
+    }
+    Ok(Some(owner))
 }
 
 fn window_owner_bin(
@@ -934,6 +1129,40 @@ mod tests {
         .unwrap_err();
         assert!(!error.spawned);
         assert_eq!(error.error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn selection_replaces_only_the_current_link_it_inspected() {
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path();
+        let current = prefix.join("current");
+        std::os::unix::fs::symlink("versions/old", &current).unwrap();
+        exchange_current(prefix, Path::new("versions/new"), Path::new("versions/old")).unwrap();
+        assert_eq!(
+            std::fs::read_link(&current).unwrap(),
+            Path::new("versions/new")
+        );
+        // The exchange itself is the comparison: whatever an independent
+        // writer published is put back, never replaced by this selection.
+        let error = exchange_current(
+            prefix,
+            Path::new("versions/old"),
+            Path::new("versions/other"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("changed independently"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_link(&current).unwrap(),
+            Path::new("versions/new")
+        );
+        let entries: Vec<_> = std::fs::read_dir(prefix)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, ["current"], "no temporary link may remain");
     }
 
     #[test]

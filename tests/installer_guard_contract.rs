@@ -1770,3 +1770,454 @@ fn sealed_anonymous_update_probe_does_not_require_installed_routing() {
         assert_eq!(response["data"]["running"], false);
     }
 }
+
+fn executable(path: &Path, body: &str) {
+    fs::write(path, body).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A verified release whose CLI delegates to this build's real coordinator,
+/// like a newer `dist/` release run against an installation that predates it.
+fn coordinator_release(dist: &Path, version: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let top = dist.join("tree").join(format!("cagents-{version}"));
+    fs::create_dir_all(top.join("bin")).unwrap();
+    executable(
+        &top.join("bin/cagents"),
+        r#"#!/bin/sh
+# Fixture only: an independent writer replaces current just as selection runs.
+if [ "$1" = select-install ] && [ "$2" != --help ] && [ -n "$TEST_RACE_CURRENT" ]; then
+  /usr/bin/ln -snf "$TEST_RACE_CURRENT" "$TEST_PREFIX/current" || exit 97
+fi
+exec "$TEST_REAL_CLI" "$@"
+"#,
+    );
+    for binary in ["cagents-ui", "cagentsd", "cagents-uninstall"] {
+        executable(
+            &top.join("bin").join(binary),
+            "#!/bin/sh\nprintf 'staged %s\\n' \"$0\" >> \"$TEST_LAUNCHES\"\nexit 90\n",
+        );
+    }
+    fs::write(top.join("bin/.cagents-ui-lease-v1"), "").unwrap();
+    for relative in [
+        "share/applications/dev.cagents.Cagents.desktop",
+        "share/autostart/dev.cagents.Cagents.Daemon.desktop",
+        "share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg",
+        "share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
+        "share/metainfo/dev.cagents.Cagents.metainfo.xml",
+        "share/doc/cagents/LICENSE",
+    ] {
+        let file = top.join(relative);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, "[Desktop Entry]\nExec=cagents ui\nIcon=cagents\n").unwrap();
+    }
+    let archive = dist.join(format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz"));
+    assert!(
+        Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(top.parent().unwrap())
+            .arg(top.file_name().unwrap())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let hash = Command::new("sha256sum").arg(&archive).output().unwrap();
+    assert!(hash.status.success());
+    let checksums = dist.join("SHA256SUMS");
+    fs::write(
+        &checksums,
+        format!(
+            "{}  {}\n",
+            String::from_utf8(hash.stdout)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap(),
+            archive.file_name().unwrap().to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    (archive, checksums)
+}
+
+#[test]
+fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners() {
+    if !user_fixture::enter() {
+        return;
+    }
+    let _fixture = OS_FIXTURE.lock().unwrap();
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = root.path();
+    let [home, data, config, cache, tmp, runtime, tools] =
+        ["home", "data", "config", "cache", "tmp", "runtime", "tools"].map(|leaf| root.join(leaf));
+    for directory in [&home, &data, &config, &cache, &tmp, &runtime, &tools] {
+        fs::create_dir(directory).unwrap();
+    }
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    for tool in ["gtk-update-icon-cache", "update-desktop-database"] {
+        executable(&tools.join(tool), "#!/bin/sh\nexit 0\n");
+    }
+    let prefix = data.join("cagents-install");
+    // The running tree carries this build's version so the window fixture can
+    // drive the application's own offer and apply checks from inside it.
+    let running = cagents::VERSION;
+    let staged = "9.9.9";
+    assert_ne!(running, staged);
+    let old = prefix.join("versions").join(running).join("bin");
+    fs::create_dir_all(&old).unwrap();
+    fs::write(
+        prefix.join(".cagents-install-root"),
+        "cagents install root\n",
+    )
+    .unwrap();
+    // Every invocation of an installed CLI is recorded: selection must not run
+    // one, and routed launches must reach exactly the running owner's CLI.
+    let old_cli = root.join("old-cli");
+    let launches = root.join("staged-launches");
+    executable(
+        &old.join("cagents"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_OLD_CLI\"\nprintf '%s\\n' \"$*\"\n",
+    );
+    fs::copy("/bin/sleep", old.join("cagentsd")).unwrap();
+    // This version was once staged itself. Its marker must stay obsolete.
+    let obsolete = prefix
+        .join("versions")
+        .join(running)
+        .join(".deferred-owner.json");
+    fs::write(&obsolete, r#"{"version":1,"owner_version":"0.0.1"}"#).unwrap();
+    fs::set_permissions(&obsolete, fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(Path::new("versions").join(running), prefix.join("current"))
+        .unwrap();
+
+    let daemon_dir = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir_all(&daemon_dir).unwrap();
+    fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = file(&daemon_dir.join("cagentsd.lock"));
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let fd = lock.as_raw_fd();
+    let mut command = Command::new(old.join("cagentsd"));
+    command.arg("600");
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    let mut daemon = OwnedProcess(command.spawn().unwrap());
+    let daemon_pid = daemon.0.id();
+    fs::write(
+        daemon_dir.join("cagentsd.lock"),
+        format!("{{\"pid\":{daemon_pid}}}"),
+    )
+    .unwrap();
+    drop(lock);
+    let mut window = OwnedProcess::window(
+        &old.join("cagents-ui"),
+        &runtime,
+        &root.join("window-ready"),
+    );
+    let window_pid = window.0.id();
+
+    let real_cli = root.join("coordinator/cagents");
+    fs::create_dir(real_cli.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), &real_cli).unwrap();
+    let (archive, checksums) = coordinator_release(&root.join("dist"), staged);
+    let install = |args: &[&str], race: Option<&str>| {
+        let mut command = Command::new("sh");
+        command
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+            .args(args)
+            .env("HOME", &home)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("TMPDIR", &tmp)
+            .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+            .env("CAGENTS_ARCHIVE", &archive)
+            .env("CAGENTS_CHECKSUMS", &checksums)
+            .env("TEST_REAL_CLI", &real_cli)
+            .env("TEST_PREFIX", &prefix)
+            .env("TEST_OLD_CLI", &old_cli)
+            .env("TEST_LAUNCHES", &launches)
+            .env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
+        if let Some(race) = race {
+            command.env("TEST_RACE_CURRENT", race);
+        }
+        command.output().unwrap()
+    };
+    let select = |version: &str| install(&["--select", version, "--stage-only"], None);
+    let current = || fs::read_link(prefix.join("current")).unwrap();
+    let canonical = prefix.canonicalize().unwrap();
+    let staged_ui = canonical
+        .join("versions")
+        .join(staged)
+        .join("bin/cagents-ui");
+    // Runs inside the live window's own executable: the offer it shows, and
+    // what its Update and reopen control does with a previously shown offer.
+    let offer = |stale: Option<&Path>| {
+        let report = root.join("offer-report");
+        let _ = fs::remove_file(&report);
+        let mut command = Command::new(old.join("cagents-ui"));
+        command
+            .args(["--exact", "selection_offer_fixture", "--nocapture"])
+            .env("CAGENTS_TEST_SELECTION_OFFER", &report)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_CACHE_HOME", &cache);
+        if let Some(stale) = stale {
+            command.env("CAGENTS_TEST_STALE_OFFER", stale);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&fs::read(report).unwrap()).unwrap()
+    };
+    // A launch through current, by the native resolver the desktop entry uses.
+    let launch_route = |expected: &str| {
+        let output = Command::new(prefix.join("current/bin/cagents-ui"))
+            .args(["--exact", "staged_native_ui_owner_fixture", "--nocapture"])
+            .env("CAGENTS_TEST_STAGED_NATIVE_OWNER", expected)
+            .env(
+                "CAGENTS_TEST_STAGED_OWNER_PATH",
+                canonical
+                    .join("versions")
+                    .join(running)
+                    .join("bin/cagents-ui"),
+            )
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{expected}: {output:?}");
+    };
+    let owners_untouched = |daemon: &mut OwnedProcess, window: &mut OwnedProcess| {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon must keep running"
+        );
+        assert!(
+            window.0.try_wait().unwrap().is_none(),
+            "window must keep running"
+        );
+        assert_eq!(daemon.0.id(), daemon_pid);
+        assert_eq!(window.0.id(), window_pid);
+        let lease = File::open(daemon_dir.join("cagentsd.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1,
+            "the original daemon must still hold its lease"
+        );
+        assert_eq!(fs::read_to_string(&old_cli).unwrap_or_default(), "");
+        assert!(!launches.exists(), "no staged executable may run");
+    };
+
+    let output = install(&["--stage-only"], None);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(staged));
+    let marker = prefix
+        .join("versions")
+        .join(staged)
+        .join(".deferred-owner.json");
+    let recorded = fs::read(&marker).unwrap();
+    let recorded_json: serde_json::Value = serde_json::from_slice(&recorded).unwrap();
+    assert_eq!(recorded_json["owner_version"], running);
+    // Give the staged tree a real native resolver, as an actual release has.
+    fs::copy(std::env::current_exe().unwrap(), &staged_ui).unwrap();
+    assert_eq!(offer(None)["offered"], staged_ui.to_str().unwrap());
+    launch_route("old");
+    owners_untouched(&mut daemon, &mut window);
+
+    // Withdraw: serve the version the window and daemon already run.
+    let output = select(running);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Serving installed cagents"));
+    assert_eq!(current(), Path::new("versions").join(running));
+    assert_eq!(
+        fs::read(&marker).unwrap(),
+        recorded,
+        "staged routing is kept"
+    );
+    assert_eq!(
+        fs::read_to_string(&obsolete).unwrap(),
+        r#"{"version":1,"owner_version":"0.0.1"}"#
+    );
+    let withdrawn = offer(Some(&staged_ui));
+    assert_eq!(withdrawn["offered"], serde_json::Value::Null, "{withdrawn}");
+    assert!(
+        withdrawn["refused"]
+            .as_str()
+            .unwrap()
+            .contains("the installed candidate changed"),
+        "a previously shown offer must not apply: {withdrawn}"
+    );
+    // The running version launches itself; its own old marker stays obsolete.
+    launch_route("candidate");
+    owners_untouched(&mut daemon, &mut window);
+
+    // Refusals leave current, every tree and both live owners exactly as found.
+    let refuse = |output: Output, reason: &str| {
+        assert!(!output.status.success(), "{reason}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(reason), "{reason}: {stderr}");
+        assert_eq!(current(), Path::new("versions").join(running), "{reason}");
+    };
+    let incomplete = prefix.join("versions/9.9.8/bin");
+    fs::create_dir_all(&incomplete).unwrap();
+    for name in ["cagents", "cagents-ui"] {
+        executable(&incomplete.join(name), "#!/bin/sh\nexit 90\n");
+    }
+    refuse(
+        select("9.9.8"),
+        "is not a complete installation of this prefix",
+    );
+    let elsewhere = root.join("elsewhere");
+    let foreign = elsewhere.join("versions/9.9.6/bin");
+    fs::create_dir_all(&foreign).unwrap();
+    fs::write(
+        elsewhere.join(".cagents-install-root"),
+        "cagents install root\n",
+    )
+    .unwrap();
+    for name in ["cagents", "cagents-ui", "cagentsd"] {
+        executable(&foreign.join(name), "#!/bin/sh\nexit 90\n");
+    }
+    std::os::unix::fs::symlink(
+        elsewhere.join("versions/9.9.6"),
+        prefix.join("versions/9.9.6"),
+    )
+    .unwrap();
+    refuse(select("9.9.6"), "is not an installed version directory");
+    let alias = prefix.join("versions/9.9.4");
+    fs::create_dir(&alias).unwrap();
+    std::os::unix::fs::symlink(&foreign, alias.join("bin")).unwrap();
+    refuse(
+        select("9.9.4"),
+        "version 9.9.4 belongs to another installation",
+    );
+    let unstaged = prefix.join("versions/9.9.7/bin");
+    fs::create_dir_all(&unstaged).unwrap();
+    for name in ["cagents", "cagents-ui", "cagentsd"] {
+        executable(&unstaged.join(name), "#!/bin/sh\nexit 90\n");
+    }
+    refuse(
+        select("9.9.7"),
+        &format!("9.9.7 was not staged over the running version {running}"),
+    );
+    refuse(select("9.9.5"), "version 9.9.5 is not installed");
+    let output = install(&["--select", staged], None);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--select requires --stage-only"));
+    // An update job holds its lease from review through completion.
+    // Selection takes the same private lease, which the withdrawal created.
+    let job = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(prefix.join(".update/lock"))
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(job.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    refuse(select(staged), "an application update is in progress");
+    drop(job);
+    // A link written after the installer inspected current is kept rather
+    // than overwritten. (The exchange-time comparison is a unit test.)
+    let independent = Path::new("versions/9.9.7");
+    let output = install(&["--select", staged, "--stage-only"], independent.to_str());
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("current installation changed while preparing the selection"),
+        "{output:?}"
+    );
+    assert_eq!(current(), independent);
+    fs::remove_file(prefix.join("current")).unwrap();
+    std::os::unix::fs::symlink(Path::new("versions").join(running), prefix.join("current"))
+        .unwrap();
+    owners_untouched(&mut daemon, &mut window);
+
+    // Reselect: the staged build and its offer return exactly as staged.
+    let output = select(staged);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(staged));
+    assert_eq!(fs::read(&marker).unwrap(), recorded);
+    assert_eq!(offer(None)["offered"], staged_ui.to_str().unwrap());
+    launch_route("old");
+    // Selecting what is already served changes nothing.
+    let output = select(staged);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(staged));
+    owners_untouched(&mut daemon, &mut window);
+    for version in [running, staged, "9.9.7", "9.9.8"] {
+        assert!(
+            prefix.join("versions").join(version).join("bin").is_dir(),
+            "{version}"
+        );
+    }
+    assert!(
+        fs::read_dir(&prefix).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".select.")),
+        "selection must not leave temporary links"
+    );
+
+    // With only the window left, it alone is the owner: withdrawing still
+    // works, and a marker that relied on sharing the stopped daemon cannot be
+    // restored, since its candidate would start a second daemon beside it.
+    daemon.stop_checked().unwrap();
+    drop(daemon);
+    let output = select(running);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(running));
+    fs::write(
+        &marker,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1, "owner_version": running, "daemon_compatible": true,
+            "candidate_protocol": cagents::terminal_ipc::PROTOCOL_VERSION,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    refuse(select(staged), "daemon, which is no longer running");
+    fs::write(&marker, &recorded).unwrap();
+    let output = select(staged);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(staged));
+    assert!(window.0.try_wait().unwrap().is_none());
+    assert_eq!(window.0.id(), window_pid);
+    assert_eq!(fs::read_to_string(&old_cli).unwrap_or_default(), "");
+    // With nothing running, nothing can be routed: any complete tree serves.
+    window.stop_checked().unwrap();
+    let output = select("9.9.7");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions/9.9.7"));
+    let output = install(&["--select", "", "--stage-only"], None);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--select requires a version"));
+    assert_eq!(current(), Path::new("versions/9.9.7"));
+    assert!(!launches.exists(), "no staged executable may run");
+}
+
+#[test]
+fn selection_offer_fixture() {
+    let Some(report) = std::env::var_os("CAGENTS_TEST_SELECTION_OFFER") else {
+        return;
+    };
+    let mut result = serde_json::json!({ "offered": cagents::update::superseding_ui() });
+    if let Some(stale) = std::env::var_os("CAGENTS_TEST_STALE_OFFER") {
+        result["refused"] = cagents::update::apply_installed(Path::new(&stale))
+            .unwrap_err()
+            .to_string()
+            .into();
+    }
+    fs::write(report, result.to_string()).unwrap();
+}

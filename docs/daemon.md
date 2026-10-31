@@ -124,7 +124,10 @@ validated running owner. While that owner's protocol is incompatible, ordinary
 CLI commands and desktop launches use its matching executables. Compatible
 candidates can attach to the preserved daemon, so reviewed reopening adopts the
 new UI without replacing a compatible daemon. The application handoff remains a
-separate reviewed operation, including its save checks.
+separate reviewed operation, including its save checks. `--select VERSION
+--stage-only` withdraws or restores a staged build under the same checks; it
+keeps the recorded owner, so re-selecting restores the same routing (see
+[Installation](installation.md#withdraw-or-re-select-a-staged-build)).
 
 If that incompatible daemon crashes while its old UI survives, the public
 launcher verifies each window's exact kernel flock, process lifetime and matched
