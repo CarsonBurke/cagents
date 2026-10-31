@@ -133,8 +133,11 @@ if [ "$1" = prepared ]; then
     fi
     if [ "$CAGENTS_PR_OLD" != "$CAGENTS_PR_NEW" ]; then
         (
-            if read_git status --porcelain=v2 --untracked-files=all --ignore-submodules=none -z \
-                2> "$CAGENTS_PR_PRIVATE/status-errors"; then
+            if {
+                read_git status --porcelain=v2 --untracked-files=all --ignore-submodules=none -z &&
+                read_git submodule foreach --quiet --recursive \
+                    '/bin/sh "$CAGENTS_PR_PRIVATE/submodule-status"'
+            } 2> "$CAGENTS_PR_PRIVATE/status-errors"; then
                 printf 0 > "$CAGENTS_PR_PRIVATE/status-exit"
             else
                 printf 1 > "$CAGENTS_PR_PRIVATE/status-exit"

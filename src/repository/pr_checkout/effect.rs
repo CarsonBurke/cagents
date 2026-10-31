@@ -318,20 +318,6 @@ fn repair_tracking<E: ProcessExecutor>(
     })
 }
 
-fn executable(program: &Path) -> Result<PathBuf, String> {
-    if program.is_absolute() || program.components().count() > 1 {
-        return fs::canonicalize(program).map_err(|error| error.to_string());
-    }
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|directory| directory.join(program))
-        .find(|path| {
-            fs::metadata(path)
-                .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
-        })
-        .ok_or_else(|| "Git executable could not be resolved before reconciliation".into())
-        .and_then(|path| fs::canonicalize(path).map_err(|error| error.to_string()))
-}
-
 fn transaction<E: ProcessExecutor>(
     service: &RepositoryService<E>,
     plan: &ExistingPrCheckoutPlan,
@@ -358,6 +344,11 @@ fn transaction<E: ProcessExecutor>(
         fs::write(&hook, include_bytes!("transaction.sh")).map_err(|error| error.to_string())?;
         fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
+        fs::write(
+            private.join("submodule-status"),
+            include_bytes!("submodule_status.sh"),
+        )
+        .map_err(|error| error.to_string())?;
         fs::write(
             private.join("check-new-paths"),
             include_bytes!("check_new_paths.sh"),
@@ -412,7 +403,10 @@ fn transaction<E: ProcessExecutor>(
             "--stdin".into(),
         ])
         .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("CAGENTS_PR_GIT", executable(&service.git)?)
+        .env(
+            "CAGENTS_PR_GIT",
+            complete_inventory::resolved_git_executable(&service.git)?,
+        )
         .env("CAGENTS_PR_PRIVATE", private)
         .env("CAGENTS_PR_MODE", if probe { "probe" } else { "effect" })
         .env("CAGENTS_PR_WORKTREE", &plan.worktree.path)
