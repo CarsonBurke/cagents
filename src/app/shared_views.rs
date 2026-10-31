@@ -1312,6 +1312,8 @@ impl Cagents {
             }
         }
         self.reproject_notification_unread();
+        // Restored shared panes queued for an attach wait for the registry.
+        tasks.push(self.attach_next_restored_agent());
         Task::batch(tasks)
     }
 
@@ -2062,6 +2064,7 @@ mod tests {
     mod history_start;
     mod published_card_edits;
     mod startup_admission;
+    mod startup_terminals;
 
     use super::*;
     use crate::model::{

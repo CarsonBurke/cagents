@@ -1,18 +1,83 @@
 //! A launched window is ready only after its saved conversations and workspace
 //! have actually recovered. Opening a native surface alone cannot finish an update.
 use super::*;
+use crate::terminal_ipc::TerminalVisibility;
 
 #[derive(Default)]
 pub(super) struct State {
     opened: Option<Instant>,
     saving: bool,
     reported: bool,
+    /// Terminals whose attach-only startup attempts ended without a surface.
+    /// Nothing else retries them until the card is opened, so qualification
+    /// tries again a few times and the gate then reports them.
+    detached: HashMap<CardId, Detached>,
 }
+
+/// The attach-only attempts made for one exact session.
+struct Detached {
+    terminal: TerminalId,
+    reason: String,
+    attempts: u32,
+    at: Instant,
+}
+
+/// A terminal the daemon has just restored can still be settling when the
+/// first attempt reaches it; more than this is a refusal to report.
+const ATTACH_ATTEMPTS: u32 = 3;
+const ATTACH_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 impl State {
     pub(super) fn window_opened(&self) -> bool {
         self.opened.is_some()
     }
+
+    pub(super) fn terminal_detached(&mut self, card: CardId, terminal: TerminalId, reason: String) {
+        let attempts = self
+            .detached
+            .get(&card)
+            .filter(|detached| detached.terminal == terminal)
+            .map_or(1, |detached| detached.attempts + 1);
+        self.detached.insert(
+            card,
+            Detached {
+                terminal,
+                reason,
+                attempts,
+                at: Instant::now(),
+            },
+        );
+    }
+
+    /// `session`'s attempts so far. A different session on the same card is
+    /// a new owner to qualify, not these outcomes.
+    fn detached(&self, card: CardId, session: &TerminalSession) -> Option<&Detached> {
+        self.detached
+            .get(&card)
+            .filter(|detached| detached.terminal == session.id)
+    }
+
+    /// Why `session` stays detached once its attempts are spent.
+    fn detached_reason(&self, card: CardId, session: &TerminalSession) -> Option<&str> {
+        self.detached(card, session)
+            .filter(|detached| detached.attempts >= ATTACH_ATTEMPTS)
+            .map(|detached| detached.reason.as_str())
+    }
+
+    /// Whether qualification may attempt `session` now.
+    fn may_attach(&self, card: CardId, session: &TerminalSession) -> bool {
+        self.detached(card, session).is_none_or(|detached| {
+            detached.attempts < ATTACH_ATTEMPTS && detached.at.elapsed() >= ATTACH_RETRY_DELAY
+        })
+    }
+    /// Lets every recorded attempt be retried at once.
+    #[cfg(test)]
+    pub(super) fn expire_attach_retries(&mut self) {
+        for detached in self.detached.values_mut() {
+            detached.at -= ATTACH_RETRY_DELAY;
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn fixture_opened() -> Self {
         Self {
@@ -58,6 +123,7 @@ impl Cagents {
         // or declaring a formerly shared workspace recovered.
         let mut pending = !self.shared_views_ready_for_startup();
         let mut failures = Vec::new();
+        let mut reasons = Vec::new();
         for card in self
             .durable
             .cards
@@ -68,14 +134,42 @@ impl Cagents {
                 if terminal_ended(session) || self.saved_terminal_ready(card.id) {
                     continue;
                 }
+                if let Some(reason) = self.saved_terminal_unavailable(card.id) {
+                    failures.push(card.id);
+                    reasons.push(reason);
+                    continue;
+                }
                 match self.cards.get(&card.id) {
+                    // A confirmed attachment pins the host proof. A hibernated
+                    // view holds a detached marker while it stays attached
+                    // for its row, so only an awake view's snapshot says its
+                    // attachment was lost.
                     Some(CardRuntime::Terminal(surface))
                         if surface.terminal_id() == session.id
                             && session.continuity.live_proof().is_some_and(|proof| {
                                 proof.is_complete() && surface.host_proof().as_ref() == Some(&proof)
                             })
-                            && !surface.snapshot().detached => {}
+                            && (surface.visibility() == TerminalVisibility::Hibernated
+                                || !surface.snapshot().detached) =>
+                    {
+                        if let Some(reason) = surface.attachment_failure() {
+                            failures.push(card.id);
+                            reasons.push(reason);
+                        }
+                    }
+                    Some(CardRuntime::Loading)
+                        if !self.terminal_start_in_flight(card.id)
+                            && let Some(reason) =
+                                self.startup_gate.detached_reason(card.id, session) =>
+                    {
+                        failures.push(card.id);
+                        reasons.push(reason.to_owned());
+                    }
                     Some(CardRuntime::Loading) | None => pending = true,
+                    Some(CardRuntime::Failed(failure)) => {
+                        failures.push(card.id);
+                        reasons.push(failure.message().to_owned());
+                    }
                     _ => failures.push(card.id),
                 }
                 continue;
@@ -107,8 +201,12 @@ impl Cagents {
             return Ok(false);
         }
         if !failures.is_empty() {
+            let reason = reasons
+                .first()
+                .map(|reason| format!(" A terminal reported: {reason}."))
+                .unwrap_or_default();
             return Err(format!(
-                "recovery-incomplete: {} saved panes could not reconnect (panes {}). Open the affected panes and use their recovery controls. Their drafts and recovery evidence are retained; this window remains available.",
+                "recovery-incomplete: {} saved panes could not reconnect (panes {}).{reason} Open the affected panes and use their recovery controls. Their drafts and recovery evidence are retained; this window remains available.",
                 failures.len(),
                 failures
                     .iter()
@@ -123,12 +221,25 @@ impl Cagents {
 
     /// Qualification attaches retained owners without waking their offscreen
     /// rendering surface or replaying a terminal launch recipe.
+    ///
+    /// It runs on every check until the gate settles: a shared view projects
+    /// its panes only once the registry admits it, and can replace a pane's
+    /// session afterwards. An attempt that ends detached is tried again a
+    /// few times, then reported by the check.
     pub(super) fn qualify_startup_terminals(&mut self) -> Task<Message> {
+        // Until then a shared pane's descriptor is a cache that opening the
+        // card would not attach either.
+        if !self.shared_views_ready_for_startup() {
+            return Task::none();
+        }
         for card in &self.durable.cards {
             if card.existence.is_open()
-                && matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
+                && matches!(&card.kind, CardKind::Terminal(session)
+                    if !terminal_ended(session)
+                        && self.startup_gate.may_attach(card.id, session))
                 && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
                 && self.saved_terminal_current(card.id).is_none()
+                && !self.terminal_start_in_flight(card.id)
                 && !self.restored_agent_attaches.contains(&card.id)
             {
                 self.restored_agent_attaches.push_back(card.id);
@@ -178,10 +289,12 @@ impl Cagents {
                     self.status = Some(TransientNotice::warning(reason.clone()));
                     return report(Err(reason));
                 }
-                cosmic::task::future(async {
+                let attach = self.qualify_startup_terminals();
+                let next = cosmic::task::future(async {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     Message::VerifyStartupPanes
-                })
+                });
+                Task::batch([attach, next])
             }
             Ok(true) => {
                 self.startup_gate.saving = true;

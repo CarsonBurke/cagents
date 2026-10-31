@@ -1062,6 +1062,19 @@ impl HostedTerminalHandle {
         confirmed.then(|| self.inner.published.proof()).flatten()
     }
 
+    /// Why the daemon refused this terminal's attachment for good, if it did.
+    /// Unlike a detached snapshot, which a hibernated view also holds, this
+    /// is only set by the refusal itself.
+    pub fn attachment_failure(&self) -> Option<String> {
+        self.inner
+            .published
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .failure
+            .clone()
+    }
+
     /// Waits for a successful terminal attach, spawn, or reconnect resume.
     /// Semantic events remain queued for the UI; authenticating the daemon alone
     /// does not confirm that it accepted this terminal.
@@ -1236,7 +1249,6 @@ impl HostedTerminalHandle {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn visibility(&self) -> TerminalVisibility {
         self.inner.published.desired_visibility()
     }
