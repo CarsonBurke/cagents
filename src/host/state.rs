@@ -5777,6 +5777,9 @@ mod tests {
 
     #[test]
     fn upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::Store;
         let directory = tempfile::tempdir().unwrap();
         // A real foreground process, recognized by its provider argv. Its
@@ -5887,6 +5890,9 @@ mod tests {
     /// one that already ended may hold an update hostage.
     #[test]
     fn idle_and_ended_claude_conversations_do_not_block_an_upgrade() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Command, Launch, Session},
@@ -6040,6 +6046,9 @@ for line in sys.stdin:
 
     #[test]
     fn native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{Command, Launch, Session},
@@ -6282,7 +6291,7 @@ for line in sys.stdin:
 
     fn upgrade_fixture_in_fresh_process() -> bool {
         // Capability validation consults process-global retained child custody.
-        // These metadata-only fixtures need a fresh service, not another test's
+        // These upgrade fixtures need a fresh service, not another test's
         // legitimate retained ownership. Preserve the caller's environment.
         const SELECTOR_ENV: &str = "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR";
         let current = std::thread::current();
@@ -6865,6 +6874,9 @@ for line in sys.stdin:
 
     #[test]
     fn restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::{Checkpoint, Phase, Store, Terminal};
         let directory = tempfile::tempdir().unwrap();
         let empty_proc = directory.path().join("proc");
