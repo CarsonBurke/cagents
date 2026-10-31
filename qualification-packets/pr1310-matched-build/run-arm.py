@@ -149,7 +149,7 @@ def cargo_artifact(raw, checkout, graph):
             'profile_name_not_present_in_Cargo_JSON': True, 'build_finished_line': finished[0][0],
             'unparsed_human_line_numbers': human, 'stream': 'ORIGINAL_COMBINED_STDOUT_STDERR',
             'raw_sha256': hashlib.sha256(raw).hexdigest(), 'raw_bytes': len(raw),
-            'source_limit': 'Actual Cargo report plus exact command/source/context; fresh=false is observed cached reuse, not a new compile claim'}
+            'source_limit': 'Actual Cargo report plus exact command/source/context; fresh=true reports an up-to-date artifact without rustc running; fresh=false reports rustc ran. Cargo-reported status is not independent timing or full-chain proof'}
 
 
 def identity(info):

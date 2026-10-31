@@ -78,8 +78,10 @@ features, non-test actual profile and Cargo-reported absolute executable under
 the fixed target/dev-runtime path. Malformed JSON, duplicate artifacts/completion,
 compiler errors, wrong sources/features or unknown original status refuse.
 The name `dev-runtime` comes from argv/source, **not a nonexistent JSON profile
-name**. Actual profile fields and Cargo `fresh` are retained; cache reuse is not
-called a new compile. The input stream is never relabelled separate stdout.
+name**. Actual profile fields and the raw Cargo `fresh` boolean are retained. Cargo
+reports `fresh=true` for an up-to-date artifact without running rustc, and
+`fresh=false` when rustc ran. This is Cargo-reported status, not independent
+timing or full-chain proof. The input stream is never relabelled separate stdout.
 
 Each copied ELF is source identity/hash bound across the actual bounded copy,
 with an actual x86_64 ELF header and private exclusive0700 destination, then
@@ -89,7 +91,14 @@ per-bin JSON receipts are created exclusively with O_NOFOLLOW|O_EXCL, never
 hardlinked, overwritten, deleted or repaired. Partial failures stay retained.
 Before the next graph/arm, actual immutable copy and receipt must have returned.
 This does not make a filesystem immutable against the owning UID or establish
-complete process/native dependency closure. Stdlib transient metadata opens and
+complete process/native dependency closure. The returned `matched` paths name
+immutable evidence copies, not ready native-owner runtime identities. Actual
+original executable paths are in each `actual_Cargo.executable`. A future real
+binder must separately correlate the normal `scripts/run-development` original
+UI path/incarnation/hash with retained copy evidence before native effects and
+satisfy the existing native-owner `exact_matches` contract. Never execute a
+copied app directly or substitute a copy path into existing native sources; no
+runtime mapping or adoption is implemented here. Stdlib transient metadata opens and
 kernel calls remain cooperative; no global FD/resource certificate is claimed.
 
 Ancestor and CARGO_HOME config files and selected environment inputs are observed

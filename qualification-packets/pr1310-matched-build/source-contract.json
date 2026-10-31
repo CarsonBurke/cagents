@@ -7,7 +7,7 @@
   },
   "producer": {
     "path": "qualification-packets/pr1310-matched-build/run-arm.py",
-    "sha256": "129fe858ad9b418c865a789ac557d55a0e3a8ad500b79326f4a5b72db2c04130",
+    "sha256": "f52e046a3bfaed0a3735e8c6fb3d50a5d08e4159123047aa2364842c69d64918",
     "API": "produce_arm(arm, checkout, evidence_root, inputs, retained, invoke, fence, failure)",
     "standalone": "ordinary Hold; no CLI/controller/supervisor/resource owner",
     "original_command_source_binding": null,
@@ -35,7 +35,7 @@
       "cargo_artifact": {
         "line": 93,
         "end_line": 152,
-        "body_sha256": "fb3fd8a4a7cfa00b3b964cb98b9fdd97bc18cb6fae769ba02c9912ce4c0dcfa1"
+        "body_sha256": "7f9787cc4f823b2ea3bb2f3c4aca19a443ac8f37e1ea073afbb6e2503f0cc37d"
       },
       "identity": {
         "line": 155,
@@ -296,11 +296,13 @@
     "FD_limit": "Persistent source/copy/receipt acquisition records only. Stdlib metadata-read transient FDs and cooperative syscalls are not a global FD certificate. No process/C descriptor acquired/closed by this library.",
     "context": "Bounded actual config/ancestor/CARGO_HOME identity/hash and opaque selected environment digests. Full effective config/includes/wrappers/shims/target runner resolution remains UNKNOWN.",
     "full_chain_before_native": "UNSUPPLIED: actual installed normal shell-Cargo-rustup/shim and target/ancestor/CARGO_HOME/env effective-runner source/status relation; cannot be substituted by tool hash/version banner",
-    "import_closure": "UNSUPPLIED: no complete actual Python/AX/PIL/native dependency closure producer/containment supplied"
+    "import_closure": "UNSUPPLIED: no complete actual Python/AX/PIL/native dependency closure producer/containment supplied",
+    "Cargo_fresh_reported_semantics": "Cargo reports fresh=true when the artifact was already up to date and rustc was not run; fresh=false when rustc ran. The raw boolean is preserved, not independent timing, successful native behavior or full-chain proof.",
+    "matched_evidence_copy_not_runtime_mapping": "The returned matched paths name immutable evidence copies only. Actual runtime original paths are recorded in each actual_Cargo.executable. Before native effects a future real binder must separately correlate the normal scripts/run-development UI original path/incarnation/hash with retained copy evidence and satisfy native-owner exact_matches. Never execute the copied app directly or substitute a copy path into existing native sources. No mapping/adoption implemented here."
   },
   "source_oracles": {
     "path": "qualification-packets/pr1310-matched-build/test_build_source.py",
-    "sha256": "fccca12007791b5f11d282deb364f9896c64f30aeb56be2c0df7db075b000d50",
+    "sha256": "f3a31cf6e1eaa855ee5da593e556827456d1b3ba64894fbdc8bd250b6a49c17b",
     "parents": 6,
     "status": "AUTHORED_UNRUN_AST_PARSE_ONLY",
     "scope": "Synthetic actual-parser/command/NULL-refusal/status selection; no copied desired selector or producer import/effect",

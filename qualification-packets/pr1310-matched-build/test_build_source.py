@@ -12,7 +12,7 @@ import re
 from types import SimpleNamespace
 import unittest
 
-EXPECTED_SOURCE_SHA256 = '129fe858ad9b418c865a789ac557d55a0e3a8ad500b79326f4a5b72db2c04130'
+EXPECTED_SOURCE_SHA256 = 'f52e046a3bfaed0a3735e8c6fb3d50a5d08e4159123047aa2364842c69d64918'
 
 
 def selected_source():
