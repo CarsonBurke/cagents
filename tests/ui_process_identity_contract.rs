@@ -10,10 +10,45 @@ use std::{
     fs,
     io::Write,
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-    process::{Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+/// Own only this test's original helper. The normal protocol has a deadline;
+/// failure cleanup retains the child through its original wait rather than
+/// abandoning it during an assertion unwind.
+struct Helper(Child);
+
+impl Helper {
+    fn wait_until(&mut self, deadline: Instant) -> std::io::Result<ExitStatus> {
+        loop {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "render helper did not finish after its document was closed",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // This is the original Child, with no other reaper or ownership
+        // transfer. Signal no descendant or process group. These best-effort
+        // failure operations never establish a passing cleanup receipt.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[test]
 fn a_running_helper_mode_is_not_mistaken_for_a_legacy_window() {
@@ -25,15 +60,17 @@ fn a_running_helper_mode_is_not_mistaken_for_a_legacy_window() {
 
     // The render helper opens the document after dispatching on its mode. A
     // FIFO without a writer holds it there, alive, until this test writes.
-    let mut helper = Command::new(env!("CARGO_BIN_EXE_cagents-ui"))
-        .args(["--internal-render-page"])
-        .arg(&document)
-        .args(["0", "original", "1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut helper = Helper(
+        Command::new(env!("CARGO_BIN_EXE_cagents-ui"))
+            .args(["--internal-render-page"])
+            .arg(&document)
+            .args(["0", "original", "1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
 
     // Opening the write end without blocking succeeds only once a reader is
     // waiting in open, which proves the helper is past its mode dispatch.
@@ -50,16 +87,21 @@ fn a_running_helper_mode_is_not_mistaken_for_a_legacy_window() {
                     Instant::now() < deadline,
                     "helper never opened the document"
                 );
-                assert!(helper.try_wait().unwrap().is_none(), "helper exited early");
+                assert!(
+                    helper.0.try_wait().unwrap().is_none(),
+                    "helper exited early"
+                );
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) => panic!("{error}"),
         }
     };
 
-    let name = fs::read_to_string(format!("/proc/{}/comm", helper.id())).unwrap();
+    let name = fs::read_to_string(format!("/proc/{}/comm", helper.0.id())).unwrap();
     writer.write_all(b"not a pdf").unwrap();
     drop(writer);
-    helper.wait().unwrap();
+    helper
+        .wait_until(Instant::now() + Duration::from_secs(5))
+        .unwrap();
     assert_ne!(name.trim_end(), "cagents-ui");
 }
