@@ -1,0 +1,150 @@
+name: Qualify separate final-main integration
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: held-scope-final-main-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  user-ui-integration:
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      PRODUCT_SHA: 183a12ac10cca527cf9406440ce47cfd55934e51
+      PRODUCT_TREE: abc8668a1697424c2854ba71f1da9c83c692a8e9
+      CARGO_BUILD_JOBS: '2'
+      RUSTUP_TOOLCHAIN: 1.93.0
+    steps:
+      - name: Require a genuine hosted User context
+        shell: bash
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
+            printf '%s\n' 'Refusing inherited caller authority; no environment changes were made.' >&2
+            exit 77
+          fi
+          printf '%s\n' "CARGO_TARGET_DIR=$RUNNER_TEMP/held-scope-target" "QUALIFICATION_EVIDENCE=$RUNNER_TEMP/held-scope-evidence" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: control
+          persist-credentials: false
+      - name: Verify the unchanged setup and warm-cache gate sources
+        shell: bash
+        run: |
+          printf '%s  %s\n' 82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052 control/.github/actions/setup-linux/action.yml | sha256sum --check --strict
+          printf '%s  %s\n' 3e06d35461148ca7fd32d9240dffbc4d9e1ba304e9feda7ba8990248acbcd281 control/.github/qualification/cache-restore-gate.py | sha256sum --check --strict
+      - uses: ./control/.github/actions/setup-linux
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ env.PRODUCT_SHA }}
+          path: product
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: b3e036c71e83c0168b8ff7b3a1f6607caa24cced
+          path: before
+          persist-credentials: false
+      - name: Install official Jammy private-desktop and portal tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xauth x11-utils openbox dbus-x11 at-spi2-core python3-pyatspi python3-gi python3-pil xdotool xclip imagemagick xdg-desktop-portal xdg-desktop-portal-gtk fuse3 libgl1-mesa-dri mesa-vulkan-drivers libxcb-shape0 libxcb-xfixes0 libxkbcommon-x11-0 adwaita-icon-theme fonts-noto-cjk
+          # No provider executable or authenticated login is part of this flow.
+          for provider in claude codex omp; do
+            if command -v "$provider"; then
+              printf '%s\n' 'Refusing a desktop with a real provider executable on PATH.' >&2
+              exit 77
+            fi
+          done
+      - name: Require a real accessible FUSE device before any compilation
+        shell: bash
+        run: |
+          mkdir -p "$QUALIFICATION_EVIDENCE"
+          if [ ! -c /dev/fuse ] || [ ! -r /dev/fuse ] || [ ! -w /dev/fuse ] || [ -L /dev/fuse ]; then
+            printf '%s\n' 'Real GTK portal requires the normal Documents FUSE mount; /dev/fuse is unavailable. No build or bypass attempted.' >&2
+            exit 77
+          fi
+          stat /dev/fuse > "$QUALIFICATION_EVIDENCE/fuse-prerequisite.log"
+      - name: Restore the original isolated PR1933 hosted cache prefix
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}
+          restore-keys: |
+            held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-
+      - name: Require the actual existing warm hosted debug UI cache
+        id: warm_cache
+        if: ${{ !cancelled() && steps.cache.outcome != 'skipped' }}
+        shell: bash
+        env:
+          CACHE_RESTORE_OUTCOME: ${{ steps.cache.outcome }}
+          CACHE_PRIMARY_KEY: ${{ steps.cache.outputs.cache-primary-key }}
+          CACHE_MATCHED_KEY: ${{ steps.cache.outputs.cache-matched-key }}
+          CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+          CACHE_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+          CACHE_LOCK_HASH: ${{ hashFiles('product/Cargo.lock') }}
+        run: python3 control/.github/qualification/cache-restore-gate.py "$GITHUB_WORKSPACE/product"
+      - name: Check and compile the UI and run four exact integration parents
+        id: focus
+        if: ${{ success() && steps.warm_cache.outcome == 'success' }}
+        shell: bash
+        run: python3 control/.github/qualification/final-main-qualification.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --focused-only
+      - name: Exercise one actual chooser flow on Before and After
+        id: native
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1600x1000x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 control/.github/qualification/final-main-native.py "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product"
+      - name: Upload the separate chooser-native evidence
+        if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: held-final-main-${{ env.PRODUCT_SHA }}-${{ github.run_attempt }}-native
+          path: ${{ runner.temp }}/held-scope-evidence
+          if-no-files-found: error
+          retention-days: 14
+      # Seven fresh UI records: check + no-run compile + four exact parents +
+      # UI broad. Original22/100 remain original b3 evidence; never fresh full100.
+      - name: Run the UI all-targets suite after complete private-desktop cleanup
+        if: ${{ !cancelled() && steps.focus.outcome == 'success' && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
+        shell: bash
+        run: python3 control/.github/qualification/final-main-qualification.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --ui-suites-only
+      - name: Check the bounded integration receipts
+        if: ${{ success() && steps.native.outcome == 'success' }}
+        shell: bash
+        run: python3 control/.github/qualification/final-main-check.py "$QUALIFICATION_EVIDENCE" "$GITHUB_WORKSPACE/control"
+      - name: Recompute all separate artifact checksums
+        if: always()
+        shell: bash
+        run: |
+          if [ -d "$QUALIFICATION_EVIDENCE" ]; then
+            cd "$QUALIFICATION_EVIDENCE"
+            find . -type f ! -name sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > sha256.txt
+          fi
+      - name: Upload source and seven-record integration receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: held-final-main-${{ env.PRODUCT_SHA }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/held-scope-evidence
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Preserve only a focused-build fallback cache
+        if: always() && steps.cache.outcome == 'success' && steps.warm_cache.outcome == 'success' && steps.native.outcome == 'skipped'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ steps.cache.outputs.cache-primary-key }}

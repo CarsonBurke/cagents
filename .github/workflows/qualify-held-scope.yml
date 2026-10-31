@@ -13,7 +13,9 @@ concurrency:
 
 jobs:
   user-ui:
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16'
+    # The frozen 3e full100 qualification stays at its original source. Future
+    # PR1933 heads run only the separate final-main integration workflow.
+    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16' && github.event.pull_request.head.sha == '3e2c925b4e05c9ad9687f3cc22c02b77807af7cc'
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:

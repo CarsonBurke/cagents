@@ -1,0 +1,59 @@
+{
+  "kind": "held-scope-final-main-integration-source-plan-v1",
+  "product": {
+    "sha": "183a12ac10cca527cf9406440ce47cfd55934e51",
+    "tree": "abc8668a1697424c2854ba71f1da9c83c692a8e9"
+  },
+  "before": {
+    "sha": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+    "tree": "fe98f00eb1d0d90a800c1e5808a0bbc756258ab5"
+  },
+  "retained_native_scope": {
+    "arms": 22,
+    "selected_captures": 100,
+    "original_product": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
+    "original_controller": "3e2c925b4e05c9ad9687f3cc22c02b77807af7cc",
+    "original_run": 41138272161,
+    "original_attempt": 1,
+    "original_job": 124346021374,
+    "applicability": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/final-integration-native-evidence-applicability-b3-to183-v1.json",
+      "sha256": "91e7bf6ca0119a25a8a89aba492bd5c555bdfe182040a4205476f0549ca23632",
+      "bytes": 33415
+    },
+    "qualified_capsule": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b3e3e2c-qualified-frozen-source-evidence-capsule-v1.json",
+      "sha256": "e8e7dd6f3d7ff56631910b0bf7c04ec8dacf58b69114f78cb06599d49cd41c4f",
+      "bytes": 5670
+    },
+    "claim": "Original source-bound native evidence only. No fresh full100 or final-head CLI/HOST functional test claim. Independent original custody, applicability and UX review remain required."
+  },
+  "fresh_rust_records": [
+    "ui-check",
+    "ui-all-targets-compile",
+    "a_draft_shows_and_starts_on_options_chosen_in_another_window",
+    "an_adopted_draft_keeps_its_failure_reason_until_its_account_changes",
+    "a_draft_choosing_a_file_takes_up_options_chosen_meanwhile_in_another_window",
+    "mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+    "ui-all-targets-suite"
+  ],
+  "selectors": [
+    "app::shared_views::tests::published_card_edits::a_draft_shows_and_starts_on_options_chosen_in_another_window",
+    "app::shared_views::tests::published_card_edits::an_adopted_draft_keeps_its_failure_reason_until_its_account_changes",
+    "app::shared_views::tests::published_card_edits::a_draft_choosing_a_file_takes_up_options_chosen_meanwhile_in_another_window",
+    "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel"
+  ],
+  "new_native": {
+    "flow": "idle-draft-peer-recipe-during-real-chooser-cancel",
+    "arms": ["before", "after"],
+    "wide": [1280, 800],
+    "narrow": [900, 700],
+    "permission_values": "constant; no permission or access-mode selector input",
+    "provider": "synthetic offline Claude recipe; no provider process or actor is permitted",
+    "portal": "official Jammy xdg-desktop-portal 1.14 and GTK backend, real OpenFile and Cancel Response 1",
+    "before_contract": "Record actual settled baseline footer, never require an invented failure or timeout.",
+    "after_contract": "Exact canonical recipe/account footer catches up after actual Cancel; text, image, focus, source identity and rejected sibling custody survive."
+  },
+  "future_actual": {"run": null, "attempt": null, "job": null, "artifact": null, "grant": null},
+  "outside_local_checker": ["official original download and whole-terminal collector", "sole independent RAW", "independent native UX", "retained evidence applicability", "execution allocation and merge approval"]
+}
