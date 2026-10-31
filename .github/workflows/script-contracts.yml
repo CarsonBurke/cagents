@@ -110,6 +110,12 @@ jobs:
                   raise SystemExit(result.returncode)
           PY
 
+      - name: Check qualifier source contracts
+        run: |
+          python3 -I -B .github/qualification/test-final-main-supervisor.py -v
+          python3 -I -B .github/qualification/test-preparation-byte-loading.py -v
+          python3 -I -B .github/qualification/test-final-main-local-settlement.py -v
+
       - name: Check all formatter contracts
         env:
           CHECK_FORMAT_CARGO_FIXTURE: "1"

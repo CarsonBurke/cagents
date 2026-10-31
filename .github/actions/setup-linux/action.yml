@@ -1,0 +1,83 @@
+name: Set up Linux build environment
+description: Install the pinned Rust and Zig toolchains and native Linux build dependencies
+
+inputs:
+  packaging:
+    description: Install the additional tools used to validate and build release packages
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install native build dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends \
+          build-essential \
+          clang \
+          cmake \
+          curl \
+          git \
+          libclang-dev \
+          libdbus-1-dev \
+          libegl1-mesa-dev \
+          libfontconfig1-dev \
+          libfreetype6-dev \
+          libgbm-dev \
+          libgl1-mesa-dev \
+          libssl-dev \
+          libudev-dev \
+          libwayland-dev \
+          libxkbcommon-dev \
+          ninja-build \
+          pkg-config \
+          python3 \
+          xz-utils
+
+    - name: Align Clang compiler and libclang
+      shell: bash
+      run: |
+        set -euo pipefail
+        test -x /usr/bin/clang
+        test -x /usr/bin/clang++
+        libclang_path=/usr/lib/llvm-14/lib
+        test -d "$libclang_path"
+        printf '%s\n' \
+          'CC=/usr/bin/clang' \
+          'CXX=/usr/bin/clang++' \
+          "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+
+    - name: Install packaging dependencies
+      if: inputs.packaging == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get install --yes --no-install-recommends \
+          appstream \
+          desktop-file-utils \
+          dpkg-dev
+
+    - name: Install Rust 1.93
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup toolchain install 1.93.0 --profile minimal
+        rustup default 1.93.0
+        rustc --version
+        cargo --version
+
+    - name: Install Zig 0.15.2
+      shell: bash
+      env:
+        ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+        ZIG_URL: https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+      run: |
+        set -euo pipefail
+        archive="$RUNNER_TEMP/zig-0.15.2.tar.xz"
+        curl --proto '=https' --tlsv1.2 --fail --location "$ZIG_URL" --output "$archive"
+        printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum --check --strict
+        tar -xJf "$archive" -C "$RUNNER_TEMP"
+        printf '%s\n' "$RUNNER_TEMP/zig-x86_64-linux-0.15.2" >> "$GITHUB_PATH"

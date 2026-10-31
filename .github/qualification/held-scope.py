@@ -1,0 +1,332 @@
+"""Temporary User-scoped qualification of one immutable product revision."""
+import hashlib
+import json
+import os
+import signal
+import stat
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import time
+
+product, control = map(Path, sys.argv[1:3])
+evidence = Path(os.environ['QUALIFICATION_EVIDENCE'])
+evidence.mkdir(parents=True, exist_ok=True)
+receipts = json.loads((evidence / "commands.json").read_text()) if (evidence / "commands.json").exists() else []
+failures = []
+
+
+def cancelled(signum, frame):
+    raise RuntimeError('Qualification cancelled; closing the active command')
+
+
+signal.signal(signal.SIGTERM, cancelled)
+
+
+def user_context():
+    if 'CAGENTS_AGENT_AUTHORITY' in os.environ:
+        raise RuntimeError('Inherited caller authority is present; qualification refused')
+    if os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted':
+        raise RuntimeError('A GitHub-hosted User process is required')
+
+
+def git(root, *arguments):
+    return subprocess.check_output(['git', '-C', str(root), *arguments], text=True).strip()
+
+
+def unchanged():
+    assert git(product, 'rev-parse', 'HEAD') == os.environ['PRODUCT_SHA']
+    assert git(product, 'rev-parse', 'HEAD^{tree}') == os.environ['PRODUCT_TREE']
+    assert not git(product, 'status', '--porcelain=v1')
+
+
+def run(name, arguments, cargo_json=False, required=True):
+    user_context()
+    unchanged()
+    started = time.monotonic()
+    output = evidence / (name + ('.jsonl' if cargo_json else '.log'))
+    errors = evidence / (name + '.stderr.log')
+    with output.open('wb') as stdout, errors.open('wb') as stderr:
+        process = subprocess.Popen(arguments, cwd=product, stdout=stdout, stderr=stderr, start_new_session=True)
+        try:
+            code = process.wait(timeout=4200)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            raise RuntimeError(f'{name} timed out; qualification aborted before any later build')
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=10)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                pass
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=10)
+            raise
+        result = subprocess.CompletedProcess(arguments, code)
+    receipts.append({'name': name, 'argv': arguments, 'exit_code': result.returncode,
+                     'elapsed_seconds': time.monotonic() - started})
+    unchanged()
+    if result.returncode:
+        print(output.read_text(errors='replace')[-6000:])
+        print(errors.read_text(errors='replace')[-6000:])
+        failures.append(name)
+        if required:
+            raise RuntimeError(f'{name} failed with exit {result.returncode}')
+    return output
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def file_identity(info):
+    return dict(device=info.st_dev, inode=info.st_ino, size=info.st_size,
+                mode=stat.S_IMODE(info.st_mode), uid=info.st_uid, links=info.st_nlink,
+                mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
+
+
+def observe_helper(path):
+    before = path.lstat()
+    assert stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid()
+    observation = dict(path=str(path), identity=file_identity(before), sha256=digest(path))
+    assert file_identity(path.lstat()) == observation['identity'], 'Helper changed during observation'
+    return observation
+
+
+def freeze_helper(source, artifact, directory):
+    source = Path(source).resolve(strict=True)
+    target = Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True)
+    assert source.is_relative_to(target)
+    assert not directory.is_relative_to(target)
+    directory.mkdir(mode=0o700)
+    frozen = directory / 'cagentsd'
+    copied_digest = hashlib.sha256()
+    with os.fdopen(os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC), 'rb') as original:
+        before = os.fstat(original.fileno())
+        assert stat.S_ISREG(before.st_mode) and before.st_uid == os.geteuid() and before.st_mode & 0o111
+        descriptor = os.open(frozen, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, 'wb') as output:
+            for block in iter(lambda: original.read(1024 * 1024), b''):
+                copied_digest.update(block)
+                output.write(block)
+            output.flush()
+            os.fchmod(output.fileno(), 0o500)
+            os.fsync(output.fileno())
+        assert file_identity(os.fstat(original.fileno())) == file_identity(before)
+    observed = observe_helper(frozen)
+    assert observed['sha256'] == copied_digest.hexdigest()
+    assert observed['identity']['links'] == 1 and observed['identity']['mode'] == 0o500
+    assert (observed['identity']['device'], observed['identity']['inode']) != (before.st_dev, before.st_ino)
+    record = dict(head=os.environ['PRODUCT_SHA'], tree=os.environ['PRODUCT_TREE'],
+                  artifact=artifact, source=dict(path=str(source), identity=file_identity(before),
+                                                 sha256=copied_digest.hexdigest()), frozen=observed)
+    (evidence / 'host-helper.json').write_text(json.dumps(record, indent=2) + '\n')
+    return frozen, observed
+
+
+try:
+    user_context()
+    unchanged()
+    ui_suites_only = '--ui-suites-only' in sys.argv[3:]
+    if ui_suites_only and any(mode in sys.argv[3:] for mode in ('--focused-only', '--suites-only')):
+        raise RuntimeError('--ui-suites-only cannot be combined with another qualification mode')
+    private_tmp = Path(tempfile.mkdtemp(prefix='h1922.', dir='/tmp')).resolve()
+    os.chmod(private_tmp, 0o700)
+    assert len(str(private_tmp)) < 30 and all(not (parent / '.git').exists() for parent in [private_tmp, *private_tmp.parents])
+    os.environ['TMPDIR'] = str(private_tmp)
+    (evidence / 'source.json').write_text(json.dumps({
+        'product_sha': git(product, 'rev-parse', 'HEAD'),
+        'product_tree': git(product, 'rev-parse', 'HEAD^{tree}'),
+        'control_sha': git(control, 'rev-parse', 'HEAD'),
+        'workflow_sha256': digest(control / '.github/workflows/qualify-held-scope.yml'),
+        'setup_sha256': digest(control / '.github/actions/setup-linux/action.yml'),
+        'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+        'cargo': subprocess.check_output(['cargo', '--version'], text=True).strip(),
+        'zig': subprocess.check_output(['zig', 'version'], text=True).strip(),
+        'run_id': os.environ['GITHUB_RUN_ID'], 'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+        'physical_tmpdir': str(private_tmp),
+        **({'qualification_plan': {
+            'fresh_command_count': 56,
+            'fresh_focused_and_preparation_count': 55,
+            'fresh_ui_broad_count': 1,
+            'retained_command_count': 5,
+            'retained_origin': {
+                'product_sha': '112e671cfe7df93fb1bfd9404f4cc960ad3dec15',
+                'product_tree': 'cc043b5c32501ec73164d506739256296908fb60',
+                'control_sha': '8259b7b0bdb227e1140fd60c34c5e457bfe5d708',
+                'run_id': '41071089029',
+            },
+            'retained_command_names': ['cli-check', 'host-check', 'cli-all-targets-suite',
+                                       'host-helper-build', 'host-all-targets-suite'],
+            'retention_validated': False,
+            'requires': 'Independent original final ZIP, reviewed two-origin retention map and actual accepted return.',
+        }} if ui_suites_only else {}),
+    }, indent=2) + '\n')
+    lane = ['--locked', '--no-default-features', '--features', 'ui']
+    if '--suites-only' not in sys.argv[3:] and not ui_suites_only:
+        version = subprocess.run(['systemd-run', '--version'], stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, timeout=5)
+        (evidence / 'systemd-run-version.log').write_bytes(version.stdout)
+        state_output = run('atspi-disabled-state-tests', ['cargo', 'test', '--locked',
+                           '-p', 'accesskit_atspi_common', '--lib',
+                           'node::disabled_state_tests::', '--', '--test-threads=1', '--color=never'])
+        state_text = state_output.read_text()
+        for selector in ['disabled_action_controls_do_not_advertise_enabled_or_sensitive',
+                         'read_only_text_state_behavior_is_preserved']:
+            assert state_text.splitlines().count('test node::disabled_state_tests::' + selector + ' ... ok') == 1
+        assert 'test result: ok. 2 passed; 0 failed; 0 ignored;' in state_text
+        run('ui-check', ['cargo', 'check', *lane, '--bin', 'cagents-ui'])
+        artifacts = run('ui-all-targets-compile', ['cargo', 'test', *lane, '--all-targets', '--no-run', '--message-format=json'], True)
+        rows = [json.loads(line) for line in artifacts.read_text().splitlines() if line.startswith('{')]
+        candidates = [row for row in rows if row.get('reason') == 'compiler-artifact'
+                      and row.get('target', {}).get('name') == 'cagents'
+                      and 'lib' in row.get('target', {}).get('kind', [])
+                      and row.get('profile', {}).get('test') and row.get('executable')]
+        assert len(candidates) == 1
+        selected = candidates[0]
+        assert 'ui' in selected['features']
+        assert not {'host', 'integrated-browser'} & set(selected['features'])
+        binary = selected['executable']
+        (evidence / 'selected-test.json').write_text(json.dumps({
+            'executable': binary, 'features': selected['features'],
+            'sha256': digest(Path(binary)),
+        }, indent=2) + '\n')
+        for name in ['active_mixed_managed_saved_scope_recovers_healthy_panes_only',
+                     'hidden_mixed_managed_saved_scope_recovers_healthy_panes_only',
+                     'ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection',
+                     'ranked_snapshot_retires_verified_pane_behind_newer_metadata',
+                     'ranked_snapshot_and_late_create_echo_preserve_closed_durable_denial',
+                     'mixed_scope_verified_retirement_preserves_runtime_only_managed_images',
+                     'quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner',
+                     'ordinary_closed_retained_chat_history_and_same_process_reopen_dispatch_only_the_explicit_resume',
+                     'keyboard_saved_draft_copy_preserves_the_first_attachment_locations_click',
+                     'saved_pane_check_results_survive_transport_recovery_and_follow_the_current_source',
+                     'quarantined_pane_removal_restores_the_surviving_native_control']:
+            test = 'app::shared_views::tests::startup_admission::' + name
+            output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
+            text = output.read_text()
+            if name not in failures:
+                assert text.splitlines().count('test ' + test + ' ... ok') == 1
+                assert 'test result: ok. 1 passed; 0 failed;' in text
+        for test in [
+            'app::chat_ui::image_only_peer_remove_tests::peer_remove_retains_ready_image_only_mounted_and_parked_drafts_after_writer_reopen',
+            'app::chat_ui::image_only_peer_remove_tests::ready_image_only_alias_blocks_canonical_adoption',
+            'app::chat_ui::image_only_peer_remove_tests::ready_image_only_canonical_destination_refuses_draft_rekey',
+            'app::chat_ui::image_only_peer_remove_tests::history_browsing_preserves_unsent_image_stash_without_treating_sent_images_as_local_work',
+            'app::chat_ui::image_only_peer_remove_tests::explicit_image_removal_and_local_close_keep_their_discard_semantics',
+            'app::chat_ui::image_only_peer_remove_tests::pending_images_and_text_remain_local_work_while_an_empty_draft_does_not',
+            'app::notification_ui::tests::notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot',
+            'app::workspace_model_sync::tests::model_read_publishes_new_managed_chat_before_initialized_view_projection',
+            'app::workspace_model_sync::tests::create_publisher_keeps_the_complete_canonical_rank_response',
+            'app::workspace_model_sync::tests::delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels',
+            'app::chat_ui::view::provider_context_tests::provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure',
+            'app::chat_ui::view::provider_context_tests::provider_context_closed_widget_and_catalog_preserve_literal_body',
+            'app::chat_ui::view::provider_context_tests::provider_context_find_reveals_selected_scope_and_restores_disclosure',
+            'app::chat_ui::view::tests::composer_attachment_tooltip_preserves_native_image_and_remove_ownership',
+            'app::chat_ui::view::tests::recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers',
+            'pull_request_review::discussion_ui::tests::file_row_discussion_tooltip_preserves_native_count_and_actions',
+            'persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement',
+            'persistence::tests::coherent_quarantine_still_isolates_refused_content_and_closed_tombstones',
+            'persistence::tests::restored_terminal_quarantine_still_isolates_content_and_tombstone_refusals',
+            'session::tests::a_rebased_quarantine_retains_its_exact_snapshot_across_writer_retries',
+            'session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat',
+            'persistence::tests::an_unstarted_chat_saves_new_launch_options_with_the_window',
+            'persistence::tests::a_refused_pane_keeps_its_stored_content_while_the_window_saves',
+            'session::tests::a_refused_snapshot_fails_a_barrier_and_the_clean_shutdown',
+            'session::tests::closing_a_card_drops_its_refused_relaunch',
+            'app::tests::a_refused_card_is_named_with_its_remedy',
+            'app::shared_views::tests::published_card_edits::a_draft_account_choice_survives_the_next_shared_projection',
+            'app::shared_views::tests::published_card_edits::a_chat_handed_to_its_terminal_stays_a_terminal_after_the_next_shared_projection',
+            'persistence::tests::a_chat_card_takes_a_new_conversation_only_through_its_replacement',
+            'persistence::tests::ownership_recovery_rolls_back_the_transfer_when_the_full_snapshot_is_refused',
+            'persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata',
+            'persistence::tests::quarantined_terminal_restore_downgrades_remain_inert_after_reopen_and_autosave',
+            'app::tests::terminal_handoff_flush_failure_keeps_all_receipts_pending',
+            'app::shared_views::tests::startup_admission::verified_retirement_survives_repeated_refresh_without_borrowing_metadata_sequence',
+            'app::shared_views::tests::startup_admission::verified_retirement_never_borrows_rejected_ambiguous_or_changed_sources',
+            'app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope',
+            'app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof',
+            'app::shared_views::tests::startup_admission::retirement_witness_binds_canonical_metadata_and_issuer_separately',
+            'app::shared_views::tests::startup_admission::verified_terminal_retirement_preserves_exact_ended_and_archived_sources',
+            'persistence::tests::migration_session_inventory_budget_spans_windows_and_precedes_json_decode',
+            'terminal::hosted::tests::systemd_scope_preserves_environment_arguments_and_isolates_cgroup',
+        ]:
+            name = test.rsplit('::', 1)[1]
+            output = run(name, [binary, '--exact', test, '--nocapture', '--test-threads=1', '--color=never'], required=False)
+            text = output.read_text()
+            if name not in failures:
+                assert text.splitlines().count('test ' + test + ' ... ok') == 1
+                assert 'test result: ok. 1 passed; 0 failed;' in text
+        if failures:
+            raise RuntimeError('User startup qualification failed: ' + ', '.join(failures))
+    if '--focused-only' in sys.argv[3:]:
+        sys.exit(0)
+    if ui_suites_only:
+        run('ui-all-targets-suite', ['cargo', 'test', *lane, '--all-targets', '--', '--test-threads=1'], required=False)
+        if failures:
+            raise RuntimeError('Qualification failures: ' + ', '.join(failures))
+        sys.exit(0)
+    run('cli-check', ['cargo', 'check', '--locked', '--no-default-features', '--bin', 'cagents'])
+    host = ['--locked', '--no-default-features', '--features', 'host']
+    run('host-check', ['cargo', 'check', *host, '--bin', 'cagentsd'])
+    run('cli-all-targets-suite', ['cargo', 'test', '--locked', '--no-default-features', '--all-targets', '--', '--test-threads=1'], required=False)
+    host_artifacts = run('host-helper-build', ['cargo', 'build', *host, '--bin', 'cagentsd', '--message-format=json'], True)
+    rows = [json.loads(line) for line in host_artifacts.read_text().splitlines() if line.startswith('{')]
+    helpers = [row['executable'] for row in rows if row.get('reason') == 'compiler-artifact'
+               and row.get('target', {}).get('name') == 'cagentsd' and row.get('executable')
+               and set(row.get('features', [])) == {'host'}]
+    assert len(helpers) == 1
+    selected_artifact = next(row for row in rows if row.get('reason') == 'compiler-artifact'
+                             and row.get('executable') == helpers[0] and row.get('target', {}).get('name') == 'cagentsd')
+    helper, helper_before = freeze_helper(helpers[0], selected_artifact, private_tmp / 'frozen-host-helper')
+    os.environ['CAGENTS_TEST_RETAINED_ACTOR_HELPER'] = str(helper)
+    assert observe_helper(helper) == helper_before, 'HOST helper changed before suite execution'
+    try:
+        host_output = run('host-all-targets-suite', ['cargo', 'test', *host, '--all-targets', '--', '--test-threads=1'], required=False)
+        host_lines = host_output.read_text(errors='replace').splitlines()
+        for test in [
+            'chat::runtime::store::text_copy::tests::provider_context_copy_reads_unloaded_body_and_revokes_stale_authority',
+            'chat::runtime::child_text_copy::tests::provider_context_copy_keeps_child_identity_and_rejects_rewrite_trim_and_user_notice',
+            'chat::protocol::claude::tests::synthetic_context_live_preserves_skill_calls_results_and_user_quotes',
+            'chat::protocol::claude::tests::synthetic_context_history_preserves_opaque_context_without_rewriting_source',
+        ]:
+            if host_lines.count('test ' + test + ' ... ok') != 1:
+                failures.append('host-owning-parent:' + test)
+    finally:
+        preceding_error = repr(sys.exc_info()[1]) if sys.exc_info()[1] else None
+        try:
+            helper_after = observe_helper(helper)
+        except BaseException as error:
+            (evidence / 'host-helper-after.json').write_text(json.dumps({
+                'preceding_error': preceding_error, 'observation_error': repr(error), 'matches': False,
+            }, indent=2) + '\n')
+            raise
+        (evidence / 'host-helper-after.json').write_text(json.dumps({
+            'preceding_error': preceding_error, 'observed': helper_after, 'matches': helper_after == helper_before,
+        }, indent=2) + '\n')
+        assert helper_after == helper_before, 'HOST helper changed during suite execution'
+    run('ui-all-targets-suite', ['cargo', 'test', *lane, '--all-targets', '--', '--test-threads=1'], required=False)
+    if failures:
+        raise RuntimeError('Qualification failures: ' + ', '.join(failures))
+finally:
+    (evidence / 'commands.json').write_text(json.dumps(receipts, indent=2) + '\n')
+    files = sorted(path for path in evidence.iterdir() if path.is_file() and path.name != 'sha256.txt')
+    (evidence / 'sha256.txt').write_text(''.join(f'{digest(path)}  {path.name}\n' for path in files))

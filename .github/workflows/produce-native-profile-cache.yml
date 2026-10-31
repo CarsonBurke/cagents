@@ -1,0 +1,107 @@
+name: Contingent original native-profile producer
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: held-scope-native-producer-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  original-compile-only:
+    # SAME approved PR merge ref. No sibling-PR cache sharing assumption.
+    if: false && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16' && github.event.pull_request.number == 1933
+    # Contingent SOURCE proposal only; no actual settings/token grant here.
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    env:
+      CARGO_BUILD_JOBS: '2'
+      RUSTUP_TOOLCHAIN: 1.93.0
+      PRODUCER_PULL_REQUEST: ${{ github.event.pull_request.number }}
+      PRODUCER_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Require the original genuine hosted User
+        shell: bash
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
+            printf '%s\n' 'Inherited caller authority refused; no variable was removed.' >&2
+            exit 77
+          fi
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: control
+          persist-credentials: false
+      - name: Refuse missing producer policy grant and prerequisite contracts
+        shell: bash
+        run: exec python3 control/.github/qualification/native-profile-producer.py --admission-only "$GITHUB_WORKSPACE/control"
+      - name: Verify the unchanged setup source
+        shell: bash
+        run: printf '%s  %s\n' 82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052 control/.github/actions/setup-linux/action.yml | sha256sum --check --strict
+      - uses: ./control/.github/actions/setup-linux
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: b3e036c71e83c0168b8ff7b3a1f6607caa24cced
+          path: before
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 91a8dff516e6fb76fadab432119e67c472fd9489
+          path: product
+          persist-credentials: false
+      - name: ORIGINAL serial compile-only payload production
+        id: produce
+        timeout-minutes: 115
+        shell: bash
+        run: exec python3 control/.github/qualification/native-profile-producer.py --produce "$GITHUB_WORKSPACE/control"
+      # M is immutable before this save. Only normal target output plus M;
+      # proof/P/A never enter the cache and no old native target is restored.
+      - name: Require complete original full-key absence immediately before save
+        id: pre_save
+        if: ${{ success() && steps.produce.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        env:
+          PRODUCER_READBACK_TOKEN: ${{ github.token }}
+        run: exec python3 control/.github/qualification/native-profile-producer.py --pre-save-readback "$GITHUB_WORKSPACE/control"
+      - name: Save the exact new payload and pre-save manifest
+        id: save_native
+        if: ${{ success() && steps.pre_save.outcome == 'success' }}
+        timeout-minutes: 10
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.produce.outputs.key }}
+          path: |
+            ${{ github.workspace }}/native-profile-v1/M.json
+            ${{ github.workspace }}/native-profile-v1/before
+            ${{ github.workspace }}/native-profile-v1/after
+      - name: Retain original post-save row as unqualified local observations
+        if: ${{ !cancelled() && steps.pre_save.outcome == 'success' && (steps.save_native.outcome == 'success' || steps.save_native.outcome == 'failure') }}
+        timeout-minutes: 2
+        shell: bash
+        env:
+          PRODUCER_READBACK_TOKEN: ${{ github.token }}
+          PRODUCER_SAVE_OUTCOME: ${{ steps.save_native.outcome }}
+          PRODUCER_SAVE_CONCLUSION: ${{ steps.save_native.conclusion }}
+        run: exec python3 control/.github/qualification/native-profile-producer.py --post-save-readback "$GITHUB_WORKSPACE/control"
+      - name: Upload separate producer proof or explicit partial diagnostics
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-profile-producer-${{ github.run_id }}-${{ github.run_attempt }}-proof-or-partial
+          path: ${{ runner.temp }}/native-profile-proof-v1
+          if-no-files-found: warn
+          retention-days: 14
+      # No consumer/native/test/helper execution, automatic continuation,
+      # success inference from save exit, or self-certified later entry wait.
+      # Official upload id/url/digest and terminal save logs arise AFTER this
+      # immutable ZIP; only later independent external A can join them.

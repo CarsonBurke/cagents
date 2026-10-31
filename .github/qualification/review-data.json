@@ -1,0 +1,580 @@
+{
+  "scope": "Synthetic read-only native fixture data; not actual authenticated GitHub tracking",
+  "allowlist": [
+    {
+      "case": "discover-repository",
+      "argv": [
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner,url"
+      ],
+      "response": "repo.json",
+      "cwd": [
+        "$REPOSITORY",
+        "$WORKTREE"
+      ],
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "discover-unauthenticated",
+      "argv": [
+        "auth",
+        "status",
+        "--active",
+        "--hostname",
+        "github.com",
+        "--json",
+        "hosts"
+      ],
+      "response": "auth-none.json",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "browser-list",
+      "argv": [
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!,$cursor:String){repository(owner:$owner,name:$name){pullRequests(first:50,after:$cursor,states:OPEN,orderBy:{field:CREATED_AT,direction:DESC}){nodes{id number title state isDraft headRefName headRefOid baseRefName baseRefOid author{login} updatedAt url reviewDecision commits(last:1){nodes{commit{statusCheckRollup{state}}}}} pageInfo{hasNextPage endCursor}}}}",
+        "-f",
+        "owner=fixture-native",
+        "-f",
+        "name=tooltip-data"
+      ],
+      "response": "list.json",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "review-context",
+      "argv": [
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!,$number:Int!){viewer{login} repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid baseRefOid viewerDidAuthor reviews(first:10,states:[PENDING]){nodes{id author{login} commit{oid} comments{totalCount}} pageInfo{hasNextPage endCursor}}}}}",
+        "-f",
+        "owner=fixture-native",
+        "-f",
+        "name=tooltip-data",
+        "-F",
+        "number=42"
+      ],
+      "response": "context.json",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "review-metadata",
+      "argv": [
+        "pr",
+        "view",
+        "42",
+        "-R",
+        "github.com/fixture-native/tooltip-data",
+        "--json",
+        "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup"
+      ],
+      "response": "pr.json",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "review-files",
+      "argv": [
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!,$number:Int!,$cursor:String){viewer{login} repository(owner:$owner,name:$name){pullRequest(number:$number){id headRefOid baseRefOid files(first:100,after:$cursor){nodes{path additions deletions changeType viewerViewedState} pageInfo{hasNextPage endCursor}}}}}",
+        "-f",
+        "owner=fixture-native",
+        "-f",
+        "name=tooltip-data",
+        "-F",
+        "number=42"
+      ],
+      "response": "files.json",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "conversation-reviewThreads",
+      "argv": [
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:50,after:$cursor){nodes{id path line originalLine startLine originalStartLine diffSide startDiffSide isOutdated isResolved isCollapsed viewerCanResolve viewerCanUnresolve comments(first:50){nodes{id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete commentState:state} pageInfo{hasNextPage endCursor}}} pageInfo{hasNextPage endCursor}}}}}",
+        "-f",
+        "owner=fixture-native",
+        "-f",
+        "name=tooltip-data",
+        "-F",
+        "number=42"
+      ],
+      "response": "threads.json",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "conversation-comments",
+      "argv": [
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){comments(first:50,after:$cursor){nodes{id author{login} body createdAt url viewerDidAuthor} pageInfo{hasNextPage endCursor}}}}}",
+        "-f",
+        "owner=fixture-native",
+        "-f",
+        "name=tooltip-data",
+        "-F",
+        "number=42"
+      ],
+      "response": "comments.json",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "conversation-reviews",
+      "argv": [
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){reviews(first:50,after:$cursor){nodes{id author{login} body createdAt url state viewerDidAuthor} pageInfo{hasNextPage endCursor}}}}}",
+        "-f",
+        "owner=fixture-native",
+        "-f",
+        "name=tooltip-data",
+        "-F",
+        "number=42"
+      ],
+      "response": "reviews.json",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact frozen UTF-8 response-file JSON bytes plus newline",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": true,
+      "consumer": "native-review"
+    },
+    {
+      "case": "daemon-authored-open",
+      "argv": [
+        "pr",
+        "list",
+        "-R",
+        "github.com/fixture-native/tooltip-data",
+        "--author",
+        "@me",
+        "--state",
+        "open",
+        "--search",
+        "sort:updated-desc",
+        "--limit",
+        "50",
+        "--json",
+        "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url,reviewDecision,statusCheckRollup"
+      ],
+      "response": "authored-empty.json",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": false,
+      "consumer": "daemon-background",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact synthetic empty JSON array plus newline; no authenticated @me identity"
+    },
+    {
+      "case": "daemon-authored-all",
+      "argv": [
+        "pr",
+        "list",
+        "-R",
+        "github.com/fixture-native/tooltip-data",
+        "--author",
+        "@me",
+        "--state",
+        "all",
+        "--search",
+        "sort:updated-desc",
+        "--limit",
+        "100",
+        "--json",
+        "number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,updatedAt,url"
+      ],
+      "response": "authored-empty.json",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": false,
+      "consumer": "daemon-background",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact synthetic empty JSON array plus newline; no authenticated @me identity"
+    },
+    {
+      "case": "daemon-branch-head",
+      "argv": [
+        "pr",
+        "list",
+        "-R",
+        "github.com/fixture-native/tooltip-data",
+        "--state",
+        "all",
+        "--limit",
+        "100",
+        "--json",
+        "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup",
+        "--head",
+        "fixture/native-review"
+      ],
+      "response": "branch-head.json",
+      "array_of_response": "pr.json",
+      "cwd": [
+        "$CHECKOUT"
+      ],
+      "required": false,
+      "consumer": "daemon-background",
+      "exit_code": 0,
+      "stderr": "",
+      "stdout": "exact one-element JSON array of the same materialized full pr.json DTO plus newline; synthetic branch match only"
+    }
+  ],
+  "responses": {
+    "repo.json": {
+      "nameWithOwner": "fixture-native/tooltip-data",
+      "url": "https://github.com/fixture-native/tooltip-data"
+    },
+    "auth-none.json": {
+      "hosts": {
+        "github.com": [
+          {
+            "state": "none",
+            "active": true,
+            "host": "github.com",
+            "login": null,
+            "scopes": null,
+            "gitProtocol": "https"
+          }
+        ]
+      }
+    },
+    "list.json": {
+      "data": {
+        "repository": {
+          "pullRequests": {
+            "nodes": [
+              {
+                "id": "PR_fixture_42",
+                "number": 42,
+                "title": "Synthetic discussion-count review",
+                "body": "Synthetic native data fixture; no production GitHub activity.",
+                "state": "OPEN",
+                "isDraft": false,
+                "headRefName": "fixture/native-review",
+                "headRefOid": "$HEAD_OID",
+                "headRepository": {
+                  "name": "tooltip-data"
+                },
+                "headRepositoryOwner": {
+                  "login": "fixture-native"
+                },
+                "baseRefName": "main",
+                "baseRefOid": "$BASE_OID",
+                "author": {
+                  "login": "fixture-author"
+                },
+                "createdAt": "2026-01-02T00:00:00Z",
+                "updatedAt": "2026-01-02T00:01:00Z",
+                "url": "https://github.com/fixture-native/tooltip-data/pull/42",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "reviewDecision": null,
+                "labels": [],
+                "additions": 1,
+                "deletions": 1,
+                "changedFiles": 1,
+                "statusCheckRollup": [],
+                "commits": {
+                  "nodes": [
+                    {
+                      "commit": {
+                        "statusCheckRollup": null
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": null
+            }
+          }
+        }
+      }
+    },
+    "pr.json": {
+      "id": "PR_fixture_42",
+      "number": 42,
+      "title": "Synthetic discussion-count review",
+      "body": "Synthetic native data fixture; no production GitHub activity.",
+      "state": "OPEN",
+      "isDraft": false,
+      "headRefName": "fixture/native-review",
+      "headRefOid": "$HEAD_OID",
+      "headRepository": {
+        "name": "tooltip-data"
+      },
+      "headRepositoryOwner": {
+        "login": "fixture-native"
+      },
+      "baseRefName": "main",
+      "baseRefOid": "$BASE_OID",
+      "author": {
+        "login": "fixture-author"
+      },
+      "createdAt": "2026-01-02T00:00:00Z",
+      "updatedAt": "2026-01-02T00:01:00Z",
+      "url": "https://github.com/fixture-native/tooltip-data/pull/42",
+      "mergeable": "MERGEABLE",
+      "mergeStateStatus": "CLEAN",
+      "reviewDecision": null,
+      "labels": [],
+      "additions": 1,
+      "deletions": 1,
+      "changedFiles": 1,
+      "statusCheckRollup": []
+    },
+    "context.json": {
+      "data": {
+        "viewer": {
+          "login": "fixture-viewer"
+        },
+        "repository": {
+          "pullRequest": {
+            "id": "PR_fixture_42",
+            "headRefOid": "$HEAD_OID",
+            "baseRefOid": "$BASE_OID",
+            "viewerDidAuthor": false,
+            "reviews": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    },
+    "files.json": {
+      "data": {
+        "viewer": {
+          "login": "fixture-viewer"
+        },
+        "repository": {
+          "pullRequest": {
+            "id": "PR_fixture_42",
+            "headRefOid": "$HEAD_OID",
+            "baseRefOid": "$BASE_OID",
+            "files": {
+              "nodes": [
+                {
+                  "path": "src/discussion.rs",
+                  "additions": 1,
+                  "deletions": 1,
+                  "changeType": "MODIFIED",
+                  "viewerViewedState": "UNVIEWED"
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    },
+    "threads.json": {
+      "data": {
+        "repository": {
+          "pullRequest": {
+            "reviewThreads": {
+              "nodes": [
+                {
+                  "id": "PRRT_fixture_1",
+                  "path": "src/discussion.rs",
+                  "line": 2,
+                  "originalLine": 2,
+                  "startLine": null,
+                  "originalStartLine": null,
+                  "diffSide": "RIGHT",
+                  "startDiffSide": null,
+                  "isOutdated": false,
+                  "isResolved": false,
+                  "isCollapsed": false,
+                  "viewerCanResolve": false,
+                  "viewerCanUnresolve": false,
+                  "comments": {
+                    "nodes": [
+                      {
+                        "id": "PRRC_fixture_1",
+                        "author": {
+                          "login": "fixture-reviewer-1"
+                        },
+                        "body": "Synthetic discussion 1: please clarify the value.",
+                        "createdAt": "2026-01-02T00:02:00Z",
+                        "url": "https://github.com/fixture-native/tooltip-data/pull/42#discussion_r1",
+                        "viewerDidAuthor": false,
+                        "viewerCanUpdate": false,
+                        "viewerCanDelete": false,
+                        "commentState": "SUBMITTED"
+                      }
+                    ],
+                    "pageInfo": {
+                      "hasNextPage": false,
+                      "endCursor": null
+                    }
+                  }
+                },
+                {
+                  "id": "PRRT_fixture_2",
+                  "path": "src/discussion.rs",
+                  "line": 2,
+                  "originalLine": 2,
+                  "startLine": null,
+                  "originalStartLine": null,
+                  "diffSide": "RIGHT",
+                  "startDiffSide": null,
+                  "isOutdated": false,
+                  "isResolved": true,
+                  "isCollapsed": false,
+                  "viewerCanResolve": false,
+                  "viewerCanUnresolve": false,
+                  "comments": {
+                    "nodes": [
+                      {
+                        "id": "PRRC_fixture_2",
+                        "author": {
+                          "login": "fixture-reviewer-2"
+                        },
+                        "body": "Synthetic discussion 2: resolved value naming note.",
+                        "createdAt": "2026-01-02T00:03:00Z",
+                        "url": "https://github.com/fixture-native/tooltip-data/pull/42#discussion_r2",
+                        "viewerDidAuthor": false,
+                        "viewerCanUpdate": false,
+                        "viewerCanDelete": false,
+                        "commentState": "SUBMITTED"
+                      }
+                    ],
+                    "pageInfo": {
+                      "hasNextPage": false,
+                      "endCursor": null
+                    }
+                  }
+                }
+              ],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    },
+    "comments.json": {
+      "data": {
+        "repository": {
+          "pullRequest": {
+            "comments": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    },
+    "reviews.json": {
+      "data": {
+        "repository": {
+          "pullRequest": {
+            "reviews": {
+              "nodes": [],
+              "pageInfo": {
+                "hasNextPage": false,
+                "endCursor": null
+              }
+            }
+          }
+        }
+      }
+    },
+    "authored-empty.json": []
+  }
+}
