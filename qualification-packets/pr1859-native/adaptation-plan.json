@@ -1,0 +1,173 @@
+{
+  "build_and_launch": {
+    "canonical_targets": 1,
+    "fresh_daemon": "fresh exclusive private root must have no existing instance; normal ensure kept; do not blindly use --fresh-daemon or stop unknown instance",
+    "graphs": "three isolated graphs; actual CargoJSON feature/bin/ELF/completion/hash; no UI+HOST reunion, coldfallback/newtarget or directcargo substitution",
+    "jobs": 2,
+    "prebuilds": [
+      {
+        "argv": [
+          "cargo",
+          "build",
+          "--locked",
+          "--message-format=json",
+          "--profile",
+          "dev-runtime",
+          "--no-default-features",
+          "--features",
+          "development",
+          "--bin",
+          "cagents"
+        ]
+      },
+      {
+        "argv": [
+          "cargo",
+          "build",
+          "--locked",
+          "--message-format=json",
+          "--profile",
+          "dev-runtime",
+          "--no-default-features",
+          "--features",
+          "development,host",
+          "--bin",
+          "cagentsd"
+        ]
+      },
+      {
+        "argv": [
+          "cargo",
+          "build",
+          "--locked",
+          "--message-format=json",
+          "--profile",
+          "dev-runtime",
+          "--no-default-features",
+          "--features",
+          "development,ui",
+          "--bin",
+          "cagents-ui"
+        ]
+      }
+    ],
+    "runner": [
+      "scripts/run-development",
+      "--browserless",
+      "--debug",
+      "--log-file",
+      "<original private side ui.log>"
+    ],
+    "runner_warm_builds": "explicit normal workflow; no skipbuild option"
+  },
+  "custody": {
+    "closure": "original Popen/waits/pidfds/family settlement; no arbitrary adoption. Timeout/cancel never success, positive cleanup unbounded. UNKNOWN retains all original ownership/descriptors/C.",
+    "final_helper_only": "after genuine scene positive settlement; never authorizes scene namespace; both owners positive before C release",
+    "helper_sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+    "maintained_engine_sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "natural_close": "pre-supervised-cleanup actual window disappearance/Closed + original UI exit; Case.close remains planned SIGTERM/SIGKILL teardown",
+    "one_original_union_each_side": [
+      "Xvfb",
+      "privatebus",
+      "runner/warmbuilds",
+      "UI",
+      "private daemon/holder/fixed offline provider",
+      "controller/input/capture/helper children"
+    ]
+  },
+  "namespace": "fresh owned0700 root + data/config/cache/state/runtime; bootstrap alone creates claude/public-project/create_new0600marker. No reset/delete/archive/reuse/adopt. suffix is not revision authority.",
+  "namespaces": {
+    "after": "/tmp/cagents-1859-native-preinit-advisory-pending-narrow-after",
+    "before": "/tmp/cagents-1859-native-preinit-advisory-pending-narrow-before"
+  },
+  "no_transfer": [
+    "donor source is not qualification/grant",
+    "no firstsend1757 or EC1912 implementation ownership",
+    "no native/WebP/UX/readiness/merge claim"
+  ],
+  "one_case": "preinit-advisory-pending/narrow only; other4 scenarios backlog",
+  "opaque_authority": "natural HOME/account retained unchanged; no liveprovider/login/home/config/skills/history; only private synthetic context. Python-ISB semantics source-reviewed but actual interpreter/libraries unbound. Future ownedX11 routing exactpolicy only; no blanket envscrub/guardbypass.",
+  "pair": {
+    "after": {
+      "head": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
+      "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8"
+    },
+    "before": {
+      "head": "2587e8cf8a9b4702a925f74960d2deb2c06d3d20",
+      "tree": "0185d76c81d034850686f345cc0faae7c03b178c"
+    }
+  },
+  "refusal": "missing required bindings refuse effects in original ordering; this data cannot acquire or execute anything",
+  "remaining_bindings": {
+    "actual_allocation_grant": null,
+    "actual_build_context": null,
+    "actual_matched_artifacts": null,
+    "canonical_C_lock_target_identity": null,
+    "compiler_Zig_Python_X11_PIL_tools_and_libraries": null,
+    "execution_common_import": null,
+    "final_controller_source_gate": null,
+    "frozen_physical_control_head_tree": null,
+    "initial_owned_slot_head_tree_registry": null,
+    "latest_accepted_return": null,
+    "original_runner_UI_daemon_provider_incarnations": null,
+    "private_display_and_routing": null
+  },
+  "required_code_seams": [
+    {
+      "gap": "current logs omit Starting/retiring/pending phase/providerPID; combine actual native review+original family evidence; never invent fields",
+      "id": "P1",
+      "minimal_change": "fixed1859 labels/DAG and strict original PREINIT_NATIVE stderr schema; remove all Account/F8/logicalclock oracle fields; retain original low-level ownership/capture/pointer/key implementations where unchanged",
+      "source": [
+        "controller.py accounts_phase/fixture_evidence/check_launch/load_launch/main",
+        "phases.json",
+        "input-contract.json"
+      ]
+    },
+    {
+      "gap": "donor has no native close request primitive; source request return not UI natural exit",
+      "id": "P2",
+      "minimal_change": "exact original-window WM_DELETE_WINDOW; verify supported native protocol; fresh root/client difference evidence; no generic X event API",
+      "source": [
+        "controller.py new fixed native close request",
+        "controller.py fixed phase dispatch"
+      ]
+    },
+    {
+      "gap": "do not extend donor pointer/hover/Tab equality exception; actual modal button remains strict",
+      "id": "P3",
+      "minimal_change": "use existing key down/up primitive with only Escape in actual modal; NEW fixed nonpointer policy with original identity/source/phase and complete differences",
+      "source": [
+        "controller.py fixed Escape dispatch"
+      ]
+    },
+    {
+      "gap": "must prove current original private daemon/provider through genuine maintained custody, original waits/pidfds, no process adoption/extra synthetic owner",
+      "id": "P4",
+      "minimal_change": "1859 optin and exact private CLAUDE_CONFIG_DIR/roots; bind actual original private ui.log, not runner stdout. Keep real private matched daemon ensure; source-bound original daemon/holder/provider family detection instead of donor no-daemon assertion",
+      "source": [
+        "run-native.py Case.start_native/fixture_receipts/launch guards",
+        "namespace.py fixed names"
+      ]
+    },
+    {
+      "gap": "UI is often indirect child; need positive original incarnation/wait disposition from original maintained custody. After SIGTERM observation cannot prove natural exit; null card/log cannot prove provider cleanup",
+      "id": "P5",
+      "minimal_change": "bounded passive wait separate from20s inputs; record original UI/window exit BEFORE unchanged supervised Case.close. Preserve all partial/failed captures and original cleanup",
+      "source": [
+        "run-native.py Case.inputs/close and precleanup natural-exit observation"
+      ]
+    },
+    {
+      "gap": "all live physical/import/control/slot/tool/context/return/grant facts still null; preserve repeated context/source/input guards and unknown-retains",
+      "id": "P6",
+      "minimal_change": "new exact1859 sources and11 identical overlay pins; Before->After exactCAS onecanonicalC; each original side owns its own exclusive fresh namespace; native+helper positive owners before C release",
+      "source": [
+        "adapter-plan/source-binding/main paired admission/context",
+        "namespace owner close/source-clean helper phase"
+      ]
+    }
+  ],
+  "runtime": "ALL_UNRUN",
+  "status": "HOLD_DATA_ONLY_NO_EXECUTABLE",
+  "version": 1
+}

@@ -1,0 +1,1197 @@
+{
+  "actual_grant": null,
+  "canonical_checkout": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout",
+  "canonical_common_git_dir": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-backend-control-ec204421/.git",
+  "client_size": [
+    900,
+    900
+  ],
+  "commands": {
+    "capture": "Actual root/client WebPs and original sparse log proof; UI live required.",
+    "list": "Owned display window metadata only; UI live required.",
+    "phase": "--phase FIXED --review PATH --review-sha256 SHA; one reviewed substep only.",
+    "window-state": "--predecessor PATH --predecessor-sha256 SHA; explicit same original --window and launch/session proof, server live; no UI-live requirement only in this read-only command."
+  },
+  "common_argv": [
+    "--expected-root",
+    "--receipt",
+    "--display",
+    "--xauthority",
+    "--launch",
+    "--launch-sha256",
+    "--window"
+  ],
+  "execution_authorized": false,
+  "first_consequence_seconds_from_original_send1": 75,
+  "input_seconds": 20,
+  "kind": "SOURCE_ONLY_FIXED_CONTROLLER_P1_P2_P3_NOT_EXECUTION_OR_GRANT",
+  "launch_exact_keys": [
+    "version",
+    "side",
+    "scene",
+    "viewport",
+    "fixture_log",
+    "head",
+    "tree",
+    "controller_sha256",
+    "controller_contract_sha256",
+    "source_contract_sha256",
+    "phase_contract_sha256",
+    "ownership_receipt_sha256",
+    "ui",
+    "server",
+    "ui_sha256",
+    "display",
+    "checkout",
+    "checkout_identity",
+    "common_identity",
+    "admin_git_dir",
+    "admin_identity",
+    "git_metadata_sha256",
+    "source_files",
+    "build_receipt"
+  ],
+  "max_native_Sends_per_side": 2,
+  "natural_close_receipt": "The final gesture records original dispatch/return and before root/client frames, then rechecks server/source with no-live-UI. It intentionally does not demand after-close live-UI capture. No windowabsence or originalUIexit inferred; executor owns exact prior phase ref + original exit/wait + window-state before teardown.",
+  "pair": {
+    "after": {
+      "head": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
+      "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8"
+    },
+    "before": {
+      "head": "2587e8cf8a9b4702a925f74960d2deb2c06d3d20",
+      "tree": "0185d76c81d034850686f345cc0faae7c03b178c"
+    }
+  },
+  "phase_contract": {
+    "path": "phase-contract.json",
+    "sha256": "0cd33537dde2a0a8793750e9193f39994ca8da2632937d770e7edec1b6f60b8f"
+  },
+  "phase_dispatch_clock": "dispatch_monotonic_ns is written before the original gesture; Send1+75s anchors await-error, never proves private runtime started Instant",
+  "phase_lock_basename": "1859-input.lock",
+  "phase_log_output": "fixture_before and fixture_after are original ui.log prefix and exact latest sparse PREINIT_NATIVE record, not invented pending/provider fields",
+  "phase_receipt_basename": "1859-phase-<fixed-substep>.json",
+  "phase_receipt_states_usable_only_as_input_predecessors": [
+    "operation-returned-awaiting-independent-review",
+    "observation-returned-awaiting-independent-review"
+  ],
+  "pixel_policies": {
+    "Escape": "Bare Escape only actual independently reviewed pending-close modal, same actual pending original generation, native focus; all unmasked full RGB differences retained. No notice Escape/global chord. Require zero actual core keyboard modifier bits immediately before the bare key; never release another held modifier.",
+    "WM_DELETE_WINDOW": "Exact original WM_PROTOCOLS/WM_DELETE_WINDOW only; supported protocol, current original native focus/log generation/state and full source/phase/predecessor/frame binding; all full RGB differences retained. No signal, XKillClient or generic event API.",
+    "passive": "No input. Actual changed full frames/log retained; missing expected state is failure, not success or retry.",
+    "pointer_hover_Tab": "Exact reviewed whole root/client RGB equality, no masks, no equal-frame hunt.",
+    "resize": "Fixed original initial layout only; actual fresh full frames and all unmasked RGB differences retained."
+  },
+  "remaining_physical_bindings": "NULL_HOLD",
+  "review_binding_exact_keys": [
+    "side",
+    "scene",
+    "head",
+    "tree",
+    "controller_sha256",
+    "controller_contract_sha256",
+    "source_contract_sha256",
+    "phase_contract_sha256",
+    "launch_sha256",
+    "ownership_receipt_sha256",
+    "window",
+    "ui",
+    "server",
+    "ui_sha256",
+    "display",
+    "geometry",
+    "root_size",
+    "viewport",
+    "scale_factor",
+    "theme"
+  ],
+  "review_exact_keys": [
+    "version",
+    "phase",
+    "binding",
+    "visible_state",
+    "target",
+    "frames",
+    "fixture_log",
+    "visual",
+    "predecessor",
+    "reviewed_unix_ns",
+    "review_reference"
+  ],
+  "review_visual_exact_keys": [
+    "modal_title",
+    "prompt_visible_exact",
+    "notice_visibility"
+  ],
+  "root": "/tmp/coord16-pr1859-native-fixed-97c1ce31/owned-native",
+  "runtime": "ALL_UNRUN",
+  "scale_factor": 1.0,
+  "scene": "preinit-advisory-pending",
+  "scope_limits": [
+    "P4/P5/P6 executor/namespace/physical/tool/context/import/build/launch/custody bindings remain HOLD and external.",
+    "No provider/auth/real user content/home/history/first-send or native UX qualification.",
+    "Before expected early future_advisory error; After expected real30s runtime timeout. Controller75s from native Send is not runtime private deadline proof.",
+    "No synthetic Ready, failure, logical clock, F8, account effects, pending/providerPID fields, automatic retry/reset/relaunch.",
+    "Unobserved pending phase stops branch and records missing evidence. No positive completion or artificial skip. LateReady not generated; only original executor can supply real lifecycle proof.",
+    "Notice Escape is deliberately excluded; actual modal Escape does not establish Cancel button coverage."
+  ],
+  "source_contract": {
+    "path": "source-contract.json",
+    "sha256": "619ad94b782ca95dac7c029fbfe270e0df8fc88717159c276080325a0aa3a75a"
+  },
+  "steps": {
+    "after": [
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "resize",
+        "phase": "layout",
+        "plan_phase": "layout",
+        "predecessors": [],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "layout"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "Tab",
+        "phase": "draft-controls.Tab",
+        "plan_phase": "draft-controls",
+        "predecessors": [
+          "layout"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-keyboard",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "draft-controls.Tab"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "shift-tab",
+        "phase": "draft-controls.ShiftTab",
+        "plan_phase": "draft-controls",
+        "predecessors": [
+          "draft-controls.Tab"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-keyboard",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "draft-controls.ShiftTab"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "motion",
+        "phase": "draft-controls.hover",
+        "plan_phase": "draft-controls",
+        "predecessors": [
+          "draft-controls.ShiftTab"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Send message",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "draft-controls.hover"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "send-1",
+        "plan_phase": "send-1",
+        "predecessors": [
+          "draft-controls.hover"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Send message",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "send-1"
+      },
+      {
+        "attempt": "send-1",
+        "condition": "pending",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "observe",
+        "phase": "pending",
+        "plan_phase": "pending",
+        "predecessors": [
+          "send-1"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "pending"
+      },
+      {
+        "attempt": "send-1",
+        "condition": "expected-error",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "await-error",
+        "phase": "deadline-consequence",
+        "plan_phase": "deadline-consequence",
+        "predecessors": [
+          "pending"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "deadline-consequence"
+      },
+      {
+        "attempt": null,
+        "condition": "expected-error",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "retain-and-recover.take-back",
+        "plan_phase": "retain-and-recover",
+        "predecessors": [
+          "deadline-consequence"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Take the message back to edit it",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "retain-and-recover.take-back"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "observe",
+        "phase": "retain-and-recover.restored",
+        "plan_phase": "retain-and-recover",
+        "predecessors": [
+          "retain-and-recover.take-back"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "retain-and-recover.restored"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "observe",
+        "phase": "retain-and-recover.already-composer",
+        "plan_phase": "retain-and-recover",
+        "predecessors": [
+          "deadline-consequence"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "retain-and-recover.already-composer"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "send-2",
+        "plan_phase": "send-2",
+        "predecessors": [
+          "retain-and-recover.restored",
+          "retain-and-recover.already-composer"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Send message",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "send-2"
+      },
+      {
+        "attempt": "send-2",
+        "condition": "pending",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "WM_DELETE_WINDOW",
+        "phase": "pending-close",
+        "plan_phase": "pending-close",
+        "predecessors": [
+          "send-2"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-nonpointer",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "pending-close"
+      },
+      {
+        "attempt": "send-2",
+        "condition": "pending",
+        "coverage_missing": [],
+        "modal_title": "Keep unsaved work before closing",
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "cancel-button",
+        "plan_phase": "cancel-button",
+        "predecessors": [
+          "pending-close"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Cancel close",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "cancel-button"
+      },
+      {
+        "attempt": "send-2",
+        "condition": "pending",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "WM_DELETE_WINDOW",
+        "phase": "pending-close-again",
+        "plan_phase": "pending-close-again",
+        "predecessors": [
+          "cancel-button"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-nonpointer",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "pending-close-again"
+      },
+      {
+        "attempt": "send-2",
+        "condition": "pending",
+        "coverage_missing": [],
+        "modal_title": "Keep unsaved work before closing",
+        "notice_visibility": "not-assessed",
+        "operation": "Escape",
+        "phase": "cancel-Escape",
+        "plan_phase": "cancel-Escape",
+        "predecessors": [
+          "pending-close-again"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-nonpointer",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "cancel-Escape"
+      },
+      {
+        "attempt": null,
+        "condition": "card-present",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "close-card",
+        "plan_phase": "close-card",
+        "predecessors": [
+          "cancel-Escape"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Close",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "close-card"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [
+          "late-Ready",
+          "provider-cleanup-proof",
+          "cleanup-error-notice-unless-real"
+        ],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "observe",
+        "phase": "cleanup-and-notices.observe",
+        "plan_phase": "cleanup-and-notices",
+        "predecessors": [
+          "close-card"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "cleanup-and-notices.observe"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [
+          "notice-controls"
+        ],
+        "modal_title": null,
+        "notice_visibility": "control-absent",
+        "operation": "observe",
+        "phase": "cleanup-and-notices.absent",
+        "plan_phase": "cleanup-and-notices",
+        "predecessors": [
+          "cleanup-and-notices.observe"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "cleanup-and-notices.absent"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "control-present",
+        "operation": "click",
+        "phase": "cleanup-and-notices.open",
+        "plan_phase": "cleanup-and-notices",
+        "predecessors": [
+          "cleanup-and-notices.observe"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Application errors",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "cleanup-and-notices.open"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-open",
+        "operation": "Tab",
+        "phase": "cleanup-and-notices.Tab",
+        "plan_phase": "cleanup-and-notices",
+        "predecessors": [
+          "cleanup-and-notices.open"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-keyboard",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "cleanup-and-notices.Tab"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-open",
+        "operation": "shift-tab",
+        "phase": "cleanup-and-notices.ShiftTab",
+        "plan_phase": "cleanup-and-notices",
+        "predecessors": [
+          "cleanup-and-notices.Tab"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-keyboard",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "cleanup-and-notices.ShiftTab"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-open",
+        "operation": "click",
+        "phase": "cleanup-and-notices.dismiss-all",
+        "plan_phase": "cleanup-and-notices",
+        "predecessors": [
+          "cleanup-and-notices.ShiftTab"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Dismiss all",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "cleanup-and-notices.dismiss-all"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-open",
+        "operation": "click",
+        "phase": "cleanup-and-notices.close-panel",
+        "plan_phase": "cleanup-and-notices",
+        "predecessors": [
+          "cleanup-and-notices.dismiss-all"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Close application notices",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "cleanup-and-notices.close-panel"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-closed",
+        "operation": "observe",
+        "phase": "cleanup-and-notices.panel-already-closed",
+        "plan_phase": "cleanup-and-notices",
+        "predecessors": [
+          "cleanup-and-notices.dismiss-all"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "cleanup-and-notices.panel-already-closed"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [
+          "natural-exit-until-original-executor-wait-proof"
+        ],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "WM_DELETE_WINDOW",
+        "phase": "natural-close",
+        "plan_phase": "natural-close",
+        "predecessors": [
+          "cleanup-and-notices.absent",
+          "cleanup-and-notices.close-panel",
+          "cleanup-and-notices.panel-already-closed"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-nonpointer",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "natural-close"
+      }
+    ],
+    "before": [
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "resize",
+        "phase": "layout",
+        "plan_phase": "layout",
+        "predecessors": [],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "layout"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "Tab",
+        "phase": "draft-controls.Tab",
+        "plan_phase": "draft-controls",
+        "predecessors": [
+          "layout"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-keyboard",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "draft-controls.Tab"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "shift-tab",
+        "phase": "draft-controls.ShiftTab",
+        "plan_phase": "draft-controls",
+        "predecessors": [
+          "draft-controls.Tab"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-keyboard",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "draft-controls.ShiftTab"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "motion",
+        "phase": "draft-controls.hover",
+        "plan_phase": "draft-controls",
+        "predecessors": [
+          "draft-controls.ShiftTab"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Send message",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "draft-controls.hover"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "send-1",
+        "plan_phase": "send-1",
+        "predecessors": [
+          "draft-controls.hover"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Send message",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "send-1"
+      },
+      {
+        "attempt": "send-1",
+        "condition": "expected-error",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "await-error",
+        "phase": "first-consequence",
+        "plan_phase": "first-consequence",
+        "predecessors": [
+          "send-1"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "first-consequence"
+      },
+      {
+        "attempt": null,
+        "condition": "expected-error",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "retain-and-recover.take-back",
+        "plan_phase": "retain-and-recover",
+        "predecessors": [
+          "first-consequence"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Take the message back to edit it",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "retain-and-recover.take-back"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "observe",
+        "phase": "retain-and-recover.restored",
+        "plan_phase": "retain-and-recover",
+        "predecessors": [
+          "retain-and-recover.take-back"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "retain-and-recover.restored"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "observe",
+        "phase": "retain-and-recover.already-composer",
+        "plan_phase": "retain-and-recover",
+        "predecessors": [
+          "first-consequence"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "retain-and-recover.already-composer"
+      },
+      {
+        "attempt": null,
+        "condition": "not-ready",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "send-2",
+        "plan_phase": "send-2",
+        "predecessors": [
+          "retain-and-recover.restored",
+          "retain-and-recover.already-composer"
+        ],
+        "prompt_visible_exact": true,
+        "target": {
+          "label": "Send message",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "send-2"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [
+          "notice-controls"
+        ],
+        "modal_title": null,
+        "notice_visibility": "control-absent",
+        "operation": "observe",
+        "phase": "notices.absent",
+        "plan_phase": "notices",
+        "predecessors": [
+          "send-2"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "notices.absent"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "control-present",
+        "operation": "click",
+        "phase": "notices.open",
+        "plan_phase": "notices",
+        "predecessors": [
+          "send-2"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Application errors",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "notices.open"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-open",
+        "operation": "Tab",
+        "phase": "notices.Tab",
+        "plan_phase": "notices",
+        "predecessors": [
+          "notices.open"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-keyboard",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "notices.Tab"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-open",
+        "operation": "shift-tab",
+        "phase": "notices.ShiftTab",
+        "plan_phase": "notices",
+        "predecessors": [
+          "notices.Tab"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-keyboard",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "notices.ShiftTab"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-open",
+        "operation": "click",
+        "phase": "notices.dismiss-all",
+        "plan_phase": "notices",
+        "predecessors": [
+          "notices.ShiftTab"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Dismiss all",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "notices.dismiss-all"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-open",
+        "operation": "click",
+        "phase": "notices.close-panel",
+        "plan_phase": "notices",
+        "predecessors": [
+          "notices.dismiss-all"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Close application notices",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "notices.close-panel"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "panel-closed",
+        "operation": "observe",
+        "phase": "notices.panel-already-closed",
+        "plan_phase": "notices",
+        "predecessors": [
+          "notices.dismiss-all"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "notices.panel-already-closed"
+      },
+      {
+        "attempt": null,
+        "condition": "card-present",
+        "coverage_missing": [],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "click",
+        "phase": "close-card",
+        "plan_phase": "close-card",
+        "predecessors": [
+          "notices.absent",
+          "notices.close-panel",
+          "notices.panel-already-closed"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Close",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "button",
+          "subject": "original-offline-Claude-card"
+        },
+        "visible_state": "close-card"
+      },
+      {
+        "attempt": null,
+        "condition": "any",
+        "coverage_missing": [
+          "natural-exit-until-original-executor-wait-proof"
+        ],
+        "modal_title": null,
+        "notice_visibility": "not-assessed",
+        "operation": "WM_DELETE_WINDOW",
+        "phase": "natural-close",
+        "plan_phase": "natural-close",
+        "predecessors": [
+          "close-card"
+        ],
+        "prompt_visible_exact": false,
+        "target": {
+          "label": "Original development window",
+          "occurrences": 1,
+          "ordinal": 0,
+          "role": "window-nonpointer",
+          "subject": "original-owned-development-window"
+        },
+        "visible_state": "natural-close"
+      }
+    ]
+  },
+  "target_exact_keys": [
+    "role",
+    "label",
+    "subject",
+    "ordinal",
+    "occurrences",
+    "rectangle",
+    "enabled",
+    "unoccluded",
+    "scrollbar"
+  ],
+  "terminal_close_request_state": "native-close-request-returned-exit-unqualified",
+  "theme": "dark",
+  "ui_log": {
+    "conversation_identity": "Installed conversation is history only. Real start_chat_draft makes a new conversation per Send. Stable original card; each Send postrecord must expose its new actual conversation, later attempt phases bind that ID. Current target_generation is actual reviewed sparse state and may change through source-owned Ready; fullprefix checked twice before input.",
+    "events": [
+      "installed",
+      "update",
+      "foreground-refused"
+    ],
+    "exact_keys": [
+      "path",
+      "device",
+      "inode",
+      "uid",
+      "mode"
+    ],
+    "launch_key": "fixture_log",
+    "max_bytes": 4194304,
+    "max_record_bytes": 16384,
+    "max_records": 4096,
+    "mode_permission_bits": 384,
+    "no_cleanup_inference_from_null": true,
+    "prefix": "PREINIT_NATIVE ",
+    "record_exact_keys": [
+      "event",
+      "scene",
+      "card",
+      "state",
+      "qualified",
+      "boundary"
+    ],
+    "state_exact_keys": [
+      "conversation",
+      "target_generation",
+      "ready",
+      "busy",
+      "exited",
+      "error",
+      "item_count",
+      "original_program"
+    ]
+  },
+  "version": 1,
+  "viewport": "narrow",
+  "window_state_constructor_exception": "Only exact readonly window-state skips live UI cookie/opening a new UI pidfd. All input/capture/list commands retain original live UI checks/pidfds. Earlier pinned phase binding provides original UI incarnation; no reselection/replacement/adoption. Window absence never proves original UI wait/exit or cleanup.",
+  "window_state_output_keys": [
+    "window",
+    "present",
+    "metadata",
+    "original_ui",
+    "original_server",
+    "predecessor",
+    "ui_live_cookie_required",
+    "natural_exit_or_cleanup_proven",
+    "limits"
+  ]
+}

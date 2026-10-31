@@ -1,0 +1,474 @@
+{
+  "after_source_anchors": {
+    "src/app.rs": [
+      {
+        "lines": [
+          13082
+        ],
+        "text": "fn window_close_transient_blocker"
+      },
+      {
+        "lines": [
+          13100
+        ],
+        "text": "\"Wait for the chat to finish starting"
+      },
+      {
+        "lines": [
+          18299
+        ],
+        "text": "\"Cancel close\""
+      },
+      {
+        "lines": [
+          18330
+        ],
+        "text": "\"Keep unsaved work before closing\""
+      }
+    ],
+    "src/app/chat_ui.rs": [
+      {
+        "lines": [
+          7685
+        ],
+        "text": "fn start_chat_draft"
+      },
+      {
+        "lines": [
+          7975
+        ],
+        "text": "fn cancel_queued"
+      },
+      {
+        "lines": [
+          7935
+        ],
+        "text": "fn revert_chat_draft"
+      },
+      {
+        "lines": [
+          8728
+        ],
+        "text": "Action::Ready(target, ready) =>"
+      },
+      {
+        "lines": [
+          7988,
+          9086
+        ],
+        "text": "runtime.unqueue();"
+      }
+    ],
+    "src/app/chat_ui/native_preinit_fixture.rs": [
+      {
+        "lines": [
+          105
+        ],
+        "text": "pub(in crate::app) fn context"
+      },
+      {
+        "lines": [
+          180
+        ],
+        "text": "pub(in crate::app) fn bootstrap"
+      },
+      {
+        "lines": [
+          221
+        ],
+        "text": "pub(in crate::app) fn install"
+      },
+      {
+        "lines": [
+          298
+        ],
+        "text": "fn record"
+      },
+      {
+        "lines": [
+          359
+        ],
+        "text": "pub(in crate::app) fn update"
+      },
+      {
+        "lines": [
+          544
+        ],
+        "text": "pub(in crate::app) fn subscription"
+      }
+    ],
+    "src/app/chat_ui/view.rs": [
+      {
+        "lines": [
+          274
+        ],
+        "text": "fn submit_control"
+      },
+      {
+        "lines": [
+          1092
+        ],
+        "text": "fn family_label"
+      },
+      {
+        "lines": [
+          4382
+        ],
+        "text": "fn queued_view"
+      },
+      {
+        "lines": [
+          4471
+        ],
+        "text": "\"Take the message back to edit it\""
+      },
+      {
+        "lines": [
+          2238
+        ],
+        "text": "\"Retry\""
+      }
+    ],
+    "src/app/chrome_ui.rs": [
+      {
+        "lines": [
+          2430
+        ],
+        "text": "NoticeSeverity::Error => \"Application errors\""
+      }
+    ],
+    "src/bin/cagents-ui.rs": [
+      {
+        "lines": [
+          361
+        ],
+        "text": "cagents::terminal::ensure_daemon_ready()?;"
+      }
+    ],
+    "src/chat/runtime.rs": [
+      {
+        "lines": [
+          42
+        ],
+        "text": "const IO_TIMEOUT:"
+      },
+      {
+        "lines": [
+          2164
+        ],
+        "text": "if (!self.first_frame || self.adapter.initialization_pending())"
+      },
+      {
+        "lines": [
+          2168
+        ],
+        "text": "\"Provider initialization timed out before handshake completion\""
+      }
+    ],
+    "src/ui_controls/gauge.rs": [
+      {
+        "lines": [
+          23
+        ],
+        "text": "const SPINNER_FRAME:"
+      },
+      {
+        "lines": [
+          103
+        ],
+        "text": "pub fn activity_spinner"
+      },
+      {
+        "lines": [
+          222
+        ],
+        "text": "shell.request_redraw_at"
+      }
+    ],
+    "tests/fixtures/claude-preinit-contract.py": [
+      {
+        "lines": [
+          176
+        ],
+        "text": "if scenario == \"preinit-advisory-pending\":"
+      }
+    ]
+  },
+  "before_source_anchors": {
+    "src/chat/protocol/claude.rs": {
+      "keep_alive_accepted": 2880,
+      "unknown_frame_error": 2881
+    },
+    "src/chat/runtime.rs": {
+      "IO_TIMEOUT_30s": 42,
+      "first_frame_only_deadline": 2138,
+      "poll_without_init_pending": 2193
+    }
+  },
+  "donor_source_only": {
+    "freeze": {
+      "path": "/var/tmp/coord16-1938-native-exact-lock-mode-successor-_rkqhk8y/freeze.json",
+      "sha256": "27e983e8d2e1842015580658f01e778238fe5c85a3f1dccebbb8e739df25fd94"
+    },
+    "sha256": {
+      "adapter-plan.json": "b26bda2ff6b9c3fbead80eeeb433b66144c759575b8fb6fc82cff2c2b8dcfce0",
+      "controller.py": "b41fe9b612ed014aa52be34611f0b6fa2256e9f24fe41fa4c4a5b7d67b21b39e",
+      "input-contract.json": "9e5eeafcfb233118ef8809e255090a81f4e64bd8f4caea88a74a6a3aa9876df5",
+      "manifest.json": "fa3aa8bbdb2212a88a2565c3db67ee0aa4ae2e308add287b96a64ac52753c68b",
+      "namespace.py": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2",
+      "phases.json": "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1",
+      "run-native.py": "94c2104b0404057eeafc64a35cc2fbee159a6efe31abf35af340a81ef860be0a",
+      "source-binding.json": "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77"
+    },
+    "snapshot": "/var/tmp/coord16-1938-native-exact-lock-mode-successor-_rkqhk8y/packet"
+  },
+  "identical_11_fixture_paths": [
+    "src/app/chat_ui/native_preinit_fixture.rs",
+    "src/app.rs",
+    "src/app/chat_ui.rs",
+    "src/bin/cagents-ui.rs",
+    "tests/fixtures/claude-preinit-contract.py",
+    "tests/fixtures/claude-preinit-healthy-advisory.py",
+    "tests/fixtures/claude-preinit-advisory-pending.py",
+    "tests/fixtures/claude-preinit-eof.py",
+    "tests/fixtures/claude-preinit-noise-eight.py",
+    "tests/fixtures/claude-preinit-noise-reset.py",
+    "tests/fixtures/claude-preinit-contract.md"
+  ],
+  "kind": "SOURCE_DATA_ONLY_NOT_QUALIFICATION",
+  "only_4_product_differences": [
+    "src/chat/protocol.rs",
+    "src/chat/protocol/claude.rs",
+    "src/chat/runtime.rs",
+    "tests/fixtures/claude-unknown-frames.py"
+  ],
+  "optional_tracked_config_absence": {
+    "after": [
+      "rust-toolchain.toml"
+    ],
+    "before": [
+      "rust-toolchain.toml"
+    ]
+  },
+  "paired_sources": {
+    "after": {
+      "files": {
+        ".cargo/config.toml": {
+          "blob": "0e2d20b442d9256e22ecbe4852d77e2a07c45409",
+          "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+        },
+        "Cargo.lock": {
+          "blob": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+          "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+        },
+        "Cargo.toml": {
+          "blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+          "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+        },
+        "docs/development.md": {
+          "blob": "1716e7c6ecc2a94dd3c61913d56f94e42e56a781",
+          "sha256": "cceaa574be6a5df7c72124add0a3c7cfa3307536fd5fa073c6eea541a6639d11"
+        },
+        "mise.toml": {
+          "blob": "4c98ba1df7ee301c7698893059de3adfda37f411",
+          "sha256": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe"
+        },
+        "scripts/run-development": {
+          "blob": "3044665920d638c081ec1efada45f27b3553cbc3",
+          "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016"
+        },
+        "src/app.rs": {
+          "blob": "d4376b39a124e611a2cf69f41727e12ed8d0c8b8",
+          "sha256": "46fb91c6867f16dda95f3332064e4536493475a980daf891eb83c3621f4426bb"
+        },
+        "src/app/chat_ui.rs": {
+          "blob": "b9fc055ba9bd472e0353a73402fd5d37f933423d",
+          "sha256": "451b95d912e4649aa0f937c532cea04f7d8124c4e5eff120e3945276f6895945"
+        },
+        "src/app/chat_ui/native_preinit_fixture.rs": {
+          "blob": "ead9243f2525e63e1b0bdac3114622efe367bc11",
+          "sha256": "dab620fe5f046dedfc744a3642976359a34fef63dd7581cc5e3f9da2f5436521"
+        },
+        "src/app/chat_ui/view.rs": {
+          "blob": "8bfc8f85628c45c559a20e8dd2f0ca522bf96916",
+          "sha256": "a114d400c23ec19e019a1da80c1be8bda9b3869133adcba260a9c9bcd506da21"
+        },
+        "src/app/chrome_ui.rs": {
+          "blob": "88887f8210dea0b4460f47df80aa8ac6e4d493bb",
+          "sha256": "40da54d1f8145f0fe914f692c910c2acc384a75a5f28d46425d62b6a75efc48f"
+        },
+        "src/app/dialog_ui.rs": {
+          "blob": "6cca70aafd7e637a88854fde031ada9e8410495d",
+          "sha256": "809a3b5bba8792c51d6c7f4cd1ae352567997676dadf7ebf941eeee5b5d6aad6"
+        },
+        "src/bin/cagents-ui.rs": {
+          "blob": "7d04b423cb0ab83020ec92a2328f4435a21a55c5",
+          "sha256": "7606d2a50584cf82b3f469b07771e37c8659a330477db0bc42a5e09835c923b7"
+        },
+        "src/chat/protocol.rs": {
+          "blob": "b617b2ac2c0dd01a868def8eb6c25f9abe92f29a",
+          "sha256": "89997fc782e188311a03f26a94f691d7f822844e33e3b61729945f662dd2c117"
+        },
+        "src/chat/protocol/claude.rs": {
+          "blob": "2626eed80c083a590baf4b6b5ad7aa32cb401c18",
+          "sha256": "d26cfc2e9d9257824765aa428c67fbb3f623bd895d669f531bedd54e0247aaed"
+        },
+        "src/chat/runtime.rs": {
+          "blob": "11ce81eab075ab96e6100583206a45d480a72638",
+          "sha256": "a6383391fdda3e7b8ea0cb949ef1387009b4b9aac4acaefa4a392aaa6530eda9"
+        },
+        "src/ui_controls/gauge.rs": {
+          "blob": "15e8a2a05bc06e4d8a0f2d0f47e9618ad5ef5516",
+          "sha256": "72a89032143778b499b28208095186d4cdb1325ae95649fb45402c6d954bc6a6"
+        },
+        "tests/fixtures/claude-preinit-advisory-pending.py": {
+          "blob": "8eb9f5a912c41ffa015934e81a9578100c14be43",
+          "sha256": "169f1450e74a978baf2672fd510ccd4370628dcc1f7c87bd9cd9e22305898a62"
+        },
+        "tests/fixtures/claude-preinit-contract.md": {
+          "blob": "2cadbab2b890c0571d43735799dbba3c33ad99d7",
+          "sha256": "65093e54c453da5f56dd1f61746326d02295b9b740ef66d31d60e09df5dc0174"
+        },
+        "tests/fixtures/claude-preinit-contract.py": {
+          "blob": "e3b6aad8fbc23c0abfc162f8ab220301b5532dc3",
+          "sha256": "faa9d1b795e25039773779de5efb9fe281394f8579e5a3d499945b14303eeba5"
+        },
+        "tests/fixtures/claude-preinit-eof.py": {
+          "blob": "c120179d729d6b5ff72bc5f379e9e6f041861729",
+          "sha256": "cc7941752a4eccba0588cfe9442983ef76fbc987022fc4de658cbd634d5c726e"
+        },
+        "tests/fixtures/claude-preinit-healthy-advisory.py": {
+          "blob": "d3fce6a3dc0e33305490b18032065cbeb6e287a0",
+          "sha256": "d43221dd5bdf0026c27646d19dd461a29430ba5f28540f84bf2b887513d94cf4"
+        },
+        "tests/fixtures/claude-preinit-noise-eight.py": {
+          "blob": "ad7c8c25fa99bb3c54bafc779f29d044210b3f20",
+          "sha256": "4658ae211b15ad8314935716c70e8803d5b15cb8b71c2c3ae799f40b51e76bc5"
+        },
+        "tests/fixtures/claude-preinit-noise-reset.py": {
+          "blob": "a0e104c516753c072127f46ced026911f1efdf1b",
+          "sha256": "badd55166d2e4e7bcf04e1cf6d1bfddaab8c12ae5ca8d6e43f455277b4cb6faf"
+        }
+      },
+      "head": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
+      "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8"
+    },
+    "before": {
+      "files": {
+        ".cargo/config.toml": {
+          "blob": "0e2d20b442d9256e22ecbe4852d77e2a07c45409",
+          "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+        },
+        "Cargo.lock": {
+          "blob": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+          "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+        },
+        "Cargo.toml": {
+          "blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+          "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+        },
+        "docs/development.md": {
+          "blob": "1716e7c6ecc2a94dd3c61913d56f94e42e56a781",
+          "sha256": "cceaa574be6a5df7c72124add0a3c7cfa3307536fd5fa073c6eea541a6639d11"
+        },
+        "mise.toml": {
+          "blob": "4c98ba1df7ee301c7698893059de3adfda37f411",
+          "sha256": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe"
+        },
+        "scripts/run-development": {
+          "blob": "3044665920d638c081ec1efada45f27b3553cbc3",
+          "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016"
+        },
+        "src/app.rs": {
+          "blob": "d4376b39a124e611a2cf69f41727e12ed8d0c8b8",
+          "sha256": "46fb91c6867f16dda95f3332064e4536493475a980daf891eb83c3621f4426bb"
+        },
+        "src/app/chat_ui.rs": {
+          "blob": "b9fc055ba9bd472e0353a73402fd5d37f933423d",
+          "sha256": "451b95d912e4649aa0f937c532cea04f7d8124c4e5eff120e3945276f6895945"
+        },
+        "src/app/chat_ui/native_preinit_fixture.rs": {
+          "blob": "ead9243f2525e63e1b0bdac3114622efe367bc11",
+          "sha256": "dab620fe5f046dedfc744a3642976359a34fef63dd7581cc5e3f9da2f5436521"
+        },
+        "src/app/chat_ui/view.rs": {
+          "blob": "8bfc8f85628c45c559a20e8dd2f0ca522bf96916",
+          "sha256": "a114d400c23ec19e019a1da80c1be8bda9b3869133adcba260a9c9bcd506da21"
+        },
+        "src/app/chrome_ui.rs": {
+          "blob": "88887f8210dea0b4460f47df80aa8ac6e4d493bb",
+          "sha256": "40da54d1f8145f0fe914f692c910c2acc384a75a5f28d46425d62b6a75efc48f"
+        },
+        "src/app/dialog_ui.rs": {
+          "blob": "6cca70aafd7e637a88854fde031ada9e8410495d",
+          "sha256": "809a3b5bba8792c51d6c7f4cd1ae352567997676dadf7ebf941eeee5b5d6aad6"
+        },
+        "src/bin/cagents-ui.rs": {
+          "blob": "7d04b423cb0ab83020ec92a2328f4435a21a55c5",
+          "sha256": "7606d2a50584cf82b3f469b07771e37c8659a330477db0bc42a5e09835c923b7"
+        },
+        "src/chat/protocol.rs": {
+          "blob": "04443013cad325d7845157958825de0632f6aabd",
+          "sha256": "26e6653206834540155a97b0a7fcb5be0b76285563e9baaa2bbd7e4d094d0b30"
+        },
+        "src/chat/protocol/claude.rs": {
+          "blob": "59584a6380bc3c149304d086bbc3d75f9e35986e",
+          "sha256": "ffa169629039fe3e5182add62d2c0e96ed997d4cee0f367ccd9d22492452c181"
+        },
+        "src/chat/runtime.rs": {
+          "blob": "028e2a1be89e10527798e01fb3c7dcab111b1f2e",
+          "sha256": "47ac6594942d47d925b278511d5d9ffeafd064b240d3d6fbd8e0fe47edbb6138"
+        },
+        "src/ui_controls/gauge.rs": {
+          "blob": "15e8a2a05bc06e4d8a0f2d0f47e9618ad5ef5516",
+          "sha256": "72a89032143778b499b28208095186d4cdb1325ae95649fb45402c6d954bc6a6"
+        },
+        "tests/fixtures/claude-preinit-advisory-pending.py": {
+          "blob": "8eb9f5a912c41ffa015934e81a9578100c14be43",
+          "sha256": "169f1450e74a978baf2672fd510ccd4370628dcc1f7c87bd9cd9e22305898a62"
+        },
+        "tests/fixtures/claude-preinit-contract.md": {
+          "blob": "2cadbab2b890c0571d43735799dbba3c33ad99d7",
+          "sha256": "65093e54c453da5f56dd1f61746326d02295b9b740ef66d31d60e09df5dc0174"
+        },
+        "tests/fixtures/claude-preinit-contract.py": {
+          "blob": "e3b6aad8fbc23c0abfc162f8ab220301b5532dc3",
+          "sha256": "faa9d1b795e25039773779de5efb9fe281394f8579e5a3d499945b14303eeba5"
+        },
+        "tests/fixtures/claude-preinit-eof.py": {
+          "blob": "c120179d729d6b5ff72bc5f379e9e6f041861729",
+          "sha256": "cc7941752a4eccba0588cfe9442983ef76fbc987022fc4de658cbd634d5c726e"
+        },
+        "tests/fixtures/claude-preinit-healthy-advisory.py": {
+          "blob": "d3fce6a3dc0e33305490b18032065cbeb6e287a0",
+          "sha256": "d43221dd5bdf0026c27646d19dd461a29430ba5f28540f84bf2b887513d94cf4"
+        },
+        "tests/fixtures/claude-preinit-noise-eight.py": {
+          "blob": "ad7c8c25fa99bb3c54bafc779f29d044210b3f20",
+          "sha256": "4658ae211b15ad8314935716c70e8803d5b15cb8b71c2c3ae799f40b51e76bc5"
+        },
+        "tests/fixtures/claude-preinit-noise-reset.py": {
+          "blob": "a0e104c516753c072127f46ced026911f1efdf1b",
+          "sha256": "badd55166d2e4e7bcf04e1cf6d1bfddaab8c12ae5ca8d6e43f455277b4cb6faf"
+        }
+      },
+      "head": "2587e8cf8a9b4702a925f74960d2deb2c06d3d20",
+      "tree": "0185d76c81d034850686f345cc0faae7c03b178c"
+    }
+  },
+  "runtime": "ALL_UNRUN",
+  "source_gates_not_runtime": [
+    {
+      "path": "/var/tmp/coord16-1859-native-hook-correction-independent-bl_yddjw.json",
+      "sha256": "d6981d52e49beeeb50fffa3734549fbfa94b25b3812e3ac6c655dc2e86dc5023"
+    },
+    {
+      "path": "/var/tmp/coord16-1859-preinit-privacy-successor-fcba1nj0/review.json",
+      "sha256": "586cb9ec865a5ef3b36ae740f08aacbfdbb80c6f05a9d4b5fcb1094646e3d214"
+    },
+    {
+      "path": "/var/tmp/coord16-1859-before-composition-independent-w4jbrrz4.json",
+      "sha256": "1f31667396fe370bc03a53743736f9bc6e480107e34badc4d8a1dd5d84474864"
+    }
+  ]
+}

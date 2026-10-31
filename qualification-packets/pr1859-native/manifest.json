@@ -1,0 +1,34 @@
+{
+  "base": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
+  "branch": "qualification/coord16-pr1859-native-packet",
+  "executables": [],
+  "kind": "AUTHOR_DATA_PHASE_SOURCE_CONTRACT_PENDING_REVIEW",
+  "members": {
+    "README.md": {
+      "bytes": 5750,
+      "sha256": "87b32828735d93ceeebfb58ce34abd869f4488b5e2c8592288b7e6fef261a471"
+    },
+    "adaptation-plan.json": {
+      "bytes": 7727,
+      "sha256": "31da483f5ba5c66865c1e282c6ef53a61e91f74242b8116c560ca028a860d889"
+    },
+    "phase-contract.json": {
+      "bytes": 11635,
+      "sha256": "0cd33537dde2a0a8793750e9193f39994ca8da2632937d770e7edec1b6f60b8f"
+    },
+    "source-checks.json": {
+      "bytes": 833,
+      "sha256": "247495fd6cf9771d412ca77480eae53d4874247c875af5c50ec316eb65b65ae2"
+    },
+    "source-contract.json": {
+      "bytes": 16414,
+      "sha256": "619ad94b782ca95dac7c029fbfe270e0df8fc88717159c276080325a0aa3a75a"
+    }
+  },
+  "physical_bindings": "NULL_HOLD",
+  "product_edits": [],
+  "runtime": "ALL_UNRUN",
+  "source_gate": "PENDING_ROOT_REVIEW",
+  "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1859-native-packet"
+}

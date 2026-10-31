@@ -1,0 +1,57 @@
+{
+  "allocation_fields": null,
+  "binding_status": "HOLD",
+  "capture_root": {
+    "identity": null,
+    "previous_receipt": null
+  },
+  "cargo_home_route": null,
+  "case_seconds": null,
+  "checkout": null,
+  "common_git_dir": null,
+  "compiler_environment_absent": null,
+  "compiler_overlay": null,
+  "context_files": null,
+  "control": null,
+  "display": null,
+  "expected_cargo_features": null,
+  "frozen_control_reference": {
+    "head": "359829626964afc78019dd32bd435696584dbb54",
+    "repository": null,
+    "role": "immutable source reference only, not current physical binding",
+    "tree": "fbaae5cafbc422c855b4e1ac39e2c3a52d64273c"
+  },
+  "hard_source_engine_HOLD": "ENGINE_COMPANION_COMPATIBLE=False: no effects possible, even if data/grant is later filled; needs reviewed maintained-owner source/API integration successor",
+  "holds": [
+    "Executor/controller/source hashes not yet assembled or independently reviewed",
+    "Original control/common/source import/current slot/latest accepted return unbound",
+    "Actual compiler/Python/X11/library/context/display/allocation/grant unbound",
+    "Maintained d9ee same-ELF retained-actor cleanup limitation requires explicit resolution or retained C"
+  ],
+  "initial_checkout": null,
+  "lock": null,
+  "lock_identity": null,
+  "maintained_engine_companion_API": null,
+  "owner": null,
+  "pair": {
+    "after": {
+      "head": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
+      "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8"
+    },
+    "before": {
+      "head": "2587e8cf8a9b4702a925f74960d2deb2c06d3d20",
+      "tree": "0185d76c81d034850686f345cc0faae7c03b178c"
+    }
+  },
+  "pair_seconds": null,
+  "reviewed_inputs": null,
+  "runtime": "ALL_UNRUN",
+  "scene": "preinit-advisory-pending",
+  "source_objects_available_in_execution_common": null,
+  "target": null,
+  "target_identity": null,
+  "tools": null,
+  "version": 1,
+  "viewport": "narrow",
+  "x11_routing": null
+}

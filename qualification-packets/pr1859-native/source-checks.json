@@ -1,0 +1,28 @@
+{
+  "JSON_only_no_executable": true,
+  "exact_tree_and_11_overlay_conservation": true,
+  "only4productpaths": [
+    "src/chat/protocol.rs",
+    "src/chat/protocol/claude.rs",
+    "src/chat/runtime.rs",
+    "tests/fixtures/claude-unknown-frames.py"
+  ],
+  "preserved_failed_source_author_attempt": {
+    "original": "ac103b EXIT1",
+    "reason": "rust-toolchain.toml absent in exact Before; no data files written; empty original temporary report retained; no target/runtime execution"
+  },
+  "source_worktree_creation": {
+    "branch_absence": "419ebe EXIT1",
+    "normal_worktree_add": "333dfd EXIT0",
+    "path_absence": "a2ca98 EXIT0"
+  },
+  "tests_build_native_candidateimports": "NOT_PERFORMED",
+  "tool_config_absence": {
+    "after": [
+      "rust-toolchain.toml"
+    ],
+    "before": [
+      "rust-toolchain.toml"
+    ]
+  }
+}

@@ -1,0 +1,245 @@
+{
+  "budgets_proposed_not_qualification": {
+    "each_input_original_absolute_seconds": 20,
+    "first_consequence_observation_seconds_from_Send": 75,
+    "positive_cleanup": "unbounded; unknown retains C"
+  },
+  "client_size": [
+    900,
+    900
+  ],
+  "coverage_missing_unless_actually_observed": [
+    "late Ready after real closecard",
+    "real cleanup-error notice",
+    "pending Cancel close button if spinner blocks equality",
+    "Escape modal if timeout wins",
+    "long-chat scroll/performance",
+    "four other scenarios and wide layout"
+  ],
+  "every_phase_requires": [
+    "side/head/tree/source/build/controller/launch hash binding",
+    "same original UI/server/window/custody incarnation and exact predecessor",
+    "fresh actual root/client lossless WebPs and raw/unmasked RGB hashes",
+    "actual geometry/theme/scale/data/control state and independent visual review",
+    "original ui.log stderr inode+bounded bytes/offset/hash",
+    "original input/capture monotonic times; no invented provider timestamp"
+  ],
+  "kind": "DATA_DRAFT_NOT_EXECUTABLE_ADMISSION_SCHEMA",
+  "max_real_native_Sends_per_side": 2,
+  "phases": {
+    "after": [
+      {
+        "index": 0,
+        "observations": "900x900/Dark/scale1.0/exact prompt; acquire native window focus and verify it; never infer widget focus",
+        "operation": "fixed-initial-resize",
+        "phase": "layout",
+        "predecessor": null,
+        "requires": "installed original fixture and one real draft card"
+      },
+      {
+        "index": 1,
+        "observations": "real focus ring/order and actual Send message tooltip; no global shortcuts",
+        "operation": "native-Tab-ShiftTab-hover",
+        "phase": "draft-controls",
+        "predecessor": "layout",
+        "requires": "reviewed real controls; exact fullframe equality"
+      },
+      {
+        "index": 2,
+        "observations": "real normal Submit/Session/ClientHandle/runtime; record actual generation and original wrapper/host family",
+        "operation": "native-click-Send",
+        "phase": "send-1",
+        "predecessor": "draft-controls",
+        "requires": "one unique enabled Send message target; exact fullframe equality"
+      },
+      {
+        "index": 3,
+        "observations": "Starting Claude\u2026 and real animated queued prompt if observed before failure; no frozen clock or equal-frame hunt",
+        "operation": "bounded-passive-root-client-captures",
+        "phase": "pending",
+        "predecessor": "send-1",
+        "requires": "same original first Send; actual readyfalse/source-bound window"
+      },
+      {
+        "index": 4,
+        "observations": "actual Provider initialization timed out before handshake completion; retained prompt; actual elapsed observation only. Outer75s timeout means missing expected deadline, not pass",
+        "operation": "bounded-passive-observation",
+        "phase": "deadline-consequence",
+        "predecessor": "pending",
+        "requires": "same original first Send with no user close/interrupt"
+      },
+      {
+        "index": 5,
+        "observations": "same real fixed recovery alternatives as Before; generic Retry is not assumed (capacity-only button)",
+        "operation": "native-visible-take-back-or-capture-restored-composer",
+        "phase": "retain-and-recover",
+        "predecessor": "deadline-consequence",
+        "requires": "actual terminal error and retained exact prompt"
+      },
+      {
+        "index": 6,
+        "observations": "ONE deliberate native user retry; no automatic process/controller retry or namespace reset",
+        "operation": "native-click-Send",
+        "phase": "send-2",
+        "predecessor": "retain-and-recover",
+        "requires": "prompt restored; real normal state permits next Send"
+      },
+      {
+        "index": 7,
+        "observations": "real WindowCloseRequested -> Keep unsaved work before closing / Cancel close; if deadline wins, pending branch missing and no recreation",
+        "operation": "fixed-owned-WM_DELETE_WINDOW",
+        "phase": "pending-close",
+        "predecessor": "send-2",
+        "requires": "actual original second attempt still pending; fresh frames+phase/source/owner/predecessor"
+      },
+      {
+        "index": 8,
+        "observations": "actual cancel/focus; spinner pixel change refuses input and leaves button coverage missing; no masks or repeat hunt",
+        "operation": "native-click-Cancel-close",
+        "phase": "cancel-button",
+        "predecessor": "pending-close",
+        "requires": "actual modal and unique enabled button; exact fullframe equality"
+      },
+      {
+        "index": 9,
+        "observations": "actual pending dialog again, otherwise Escape coverage missing",
+        "operation": "fixed-owned-WM_DELETE_WINDOW",
+        "phase": "pending-close-again",
+        "predecessor": "cancel-button",
+        "requires": "same second attempt remains actually pending; no fake phase"
+      },
+      {
+        "index": 10,
+        "observations": "real uncaptured/unmodified Escape -> CancelTransientWorkClose; retain fullframe differences under explicitly NEW fixed nonpointer policy",
+        "operation": "fixed-bare-native-Escape",
+        "phase": "cancel-Escape",
+        "predecessor": "pending-close-again",
+        "requires": "actual pending dialog; original window focus/owner/generation; fresh reviewed unmasked frames"
+      },
+      {
+        "index": 11,
+        "observations": "real close; late Ready cleanup only if actual callback ordering occurs. If Ready already arrived, do not claim race; spinner may make click inadmissible",
+        "operation": "native-click-original-card-close",
+        "phase": "close-card",
+        "predecessor": "cancel-Escape",
+        "requires": "same card and exact fullframe equality"
+      },
+      {
+        "index": 12,
+        "observations": "actual provider/holder cleanup; notice access only if real error exists; no fake Ready or cleanup failure; null state not closure",
+        "operation": "passive-original-lifecycle-and-real-native-notices",
+        "phase": "cleanup-and-notices",
+        "predecessor": "close-card",
+        "requires": "retain every real callback Task and original family owner"
+      },
+      {
+        "index": 13,
+        "observations": "native Closed/window disappearance plus original UI exit BEFORE supervised cleanup; no natural daemon/provider claim",
+        "operation": "fixed-owned-WM_DELETE_WINDOW",
+        "phase": "natural-close",
+        "predecessor": "cleanup-and-notices",
+        "requires": "original window present and actual normal close blocker absent"
+      }
+    ],
+    "before": [
+      {
+        "index": 0,
+        "observations": "900x900/Dark/scale1.0/exact prompt; acquire native window focus and verify it; never infer widget focus",
+        "operation": "fixed-initial-resize",
+        "phase": "layout",
+        "predecessor": null,
+        "requires": "installed original fixture and one real draft card"
+      },
+      {
+        "index": 1,
+        "observations": "real focus ring/order and actual Send message tooltip; no global shortcuts",
+        "operation": "native-Tab-ShiftTab-hover",
+        "phase": "draft-controls",
+        "predecessor": "layout",
+        "requires": "reviewed real controls; exact fullframe equality"
+      },
+      {
+        "index": 2,
+        "observations": "real normal Submit/Session/ClientHandle/runtime; record actual generation and original wrapper/host family",
+        "operation": "native-click-Send",
+        "phase": "send-1",
+        "predecessor": "draft-controls",
+        "requires": "one unique enabled Send message target; exact fullframe equality"
+      },
+      {
+        "index": 3,
+        "observations": "expected actual Unsupported Claude stream-json frame type future_advisory; keep_alive accepted first; capture prompt/error; outer75s timeout is missing/unexpected evidence, never old watchdog success",
+        "operation": "bounded-passive-capture",
+        "phase": "first-consequence",
+        "predecessor": "send-1",
+        "requires": "same original first Send"
+      },
+      {
+        "index": 4,
+        "observations": "if queued use real Take the message back to edit it; if already composer, no manufactured callback; actual source state chooses only these two fixed paths",
+        "operation": "native-visible-take-back-or-capture-restored-composer",
+        "phase": "retain-and-recover",
+        "predecessor": "first-consequence",
+        "requires": "actual terminal error and retained exact prompt"
+      },
+      {
+        "index": 5,
+        "observations": "ONE deliberate user retry; same early advisory failure expected; no controller retry/reset/relaunch",
+        "operation": "native-click-Send",
+        "phase": "send-2",
+        "predecessor": "retain-and-recover",
+        "requires": "prompt restored; real normal state allows new Send"
+      },
+      {
+        "index": 6,
+        "observations": "Application errors opens real notices; Tab/ShiftTab/Escape/dismiss/refocus; absent notice is recorded absent, never injected",
+        "operation": "native-real-notice-controls-if-present",
+        "phase": "notices",
+        "predecessor": "send-2",
+        "requires": "actual error glyph/retained notice and exact fullframe equality"
+      },
+      {
+        "index": 7,
+        "observations": "real begin_chat_close; original late callbacks retained; null state is only card absence",
+        "operation": "native-click-original-card-close",
+        "phase": "close-card",
+        "predecessor": "notices",
+        "requires": "actual unique source-derived card close target and exact fullframe equality"
+      },
+      {
+        "index": 8,
+        "observations": "actual native Closed/disappearance plus original UI exit BEFORE supervised cleanup; blocked/unknown remains unqualified",
+        "operation": "fixed-owned-WM_DELETE_WINDOW",
+        "phase": "natural-close",
+        "predecessor": "close-card",
+        "requires": "original window present; actual transition blocker absent"
+      }
+    ]
+  },
+  "policies": {
+    "F8_logical_clock": "excluded",
+    "deadline_race": "if phase ends before review/input record missing and stop branch; no retry/reset/synthetic state",
+    "keyboard_Submit": "not used without actual widget-focus evidence; Xfocus alone insufficient",
+    "new_Escape_proposal": "one bare Escape only actual pending-close modal with original nativefocus/source/phase/predecessor and fresh fullframes; retain all differences; no arbitrary chord/global dispatch",
+    "new_WindowCloseRequest_proposal": "only WM_PROTOCOLS/WM_DELETE_WINDOW for exact original owned window, supported protocol, exact source/currentphase/predecessor, fresh fullframes and all differences; no arbitrary atom/message, XKillClient, signal or success claim",
+    "pointer_hover_Tab": "donor exact fullframe equality preserved; no masks/ignored regions/equal-frame hunt",
+    "resize": "retain fixed initial nonpointer identity/freshframes/differences policy; no preexisting-focus requirement before exact resize_focus acquisition"
+  },
+  "prompt": "Show the offline initialization control.",
+  "runtime": "ALL_UNRUN",
+  "scale": 1.0,
+  "scene": "preinit-advisory-pending",
+  "screenshot_states": [
+    "matched initial draft",
+    "same actual elapsed post-Send checkpoint: Before error versus After pending if observed",
+    "actual terminal error+retained prompt",
+    "After pending-close/cancel if observed; mark missing Before counterpart"
+  ],
+  "serial_pair": [
+    "before",
+    "after"
+  ],
+  "theme": "Dark",
+  "version": 1,
+  "viewport": "narrow"
+}
