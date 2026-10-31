@@ -13,7 +13,18 @@ import sys
 A = '00000000-0000-4000-8000-000000002018'
 B = '00000000-0000-4000-8000-000000002019'
 BEFORE = {'sha': 'b3e036c71e83c0168b8ff7b3a1f6607caa24cced', 'tree': 'fe98f00eb1d0d90a800c1e5808a0bbc756258ab5'}
-PRODUCT = {'sha': 'b855f32573bf4f37dbb9ea415550ab330a01da71', 'tree': 'cb0913dca905addb9886a97f0d93d7e90f08d680'}
+PRODUCT = {'sha': '91a8dff516e6fb76fadab432119e67c472fd9489', 'tree': 'aea2db52b5ed089ea94e396e58dec8a4d81edb38'}
+LIBRARY_SELECTORS = [
+    'app::shared_views::tests::published_card_edits::a_draft_shows_and_starts_on_options_chosen_in_another_window',
+    'app::shared_views::tests::published_card_edits::an_adopted_draft_keeps_its_failure_reason_until_its_account_changes',
+    'app::shared_views::tests::published_card_edits::a_draft_choosing_a_file_takes_up_options_chosen_meanwhile_in_another_window',
+    'app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel',
+]
+REPOSITORY_SELECTORS = [
+    'a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock',
+    'owned_hook_pipe_holder_settles_when_no_hook_handoff_starts',
+    'owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff',
+]
 HEX = re.compile('[0-9a-f]{64}')
 OUTSIDE = ['official original artifact/download and whole-terminal provenance', 'sole independent RAW',
            'independent native UX', 'original22/100 applicability and custody', 'execution acceptance and merge decision']
@@ -53,35 +64,76 @@ def check_retained(value):
          sha256='e8e7dd6f3d7ff56631910b0bf7c04ec8dacf58b69114f78cb06599d49cd41c4f', bytes=5670), 'capsule-ref')
 
 
-def check_rust(plan, rows, logs, compiled, selected):
-    need([row['name'] for row in rows] == plan['fresh_rust_records'] and len(rows) == 7, 'rust-records')
+def check_rust_records(plan, rows, focused=False):
+    need(plan['selectors'] == LIBRARY_SELECTORS and plan['repository_selectors'] == REPOSITORY_SELECTORS, 'selector-partition')
+    names = ['ui-check', 'ui-all-targets-compile',
+             *[selector.rsplit('::', 1)[-1] for selector in LIBRARY_SELECTORS + REPOSITORY_SELECTORS], 'ui-all-targets-suite']
+    need(plan['fresh_rust_records'] == names, 'rust-records')
+    need([row['name'] for row in rows] == (names[:9] if focused else names),
+         'rust-focused-prefix' if focused else 'rust-records')
+
+
+def check_rust_source(source, plan_hash, workflow_hash):
+    need(source['product'] == PRODUCT and source['rust_records'] == 10
+         and source['plan_sha256'] == plan_hash and source['workflow_sha256'] == workflow_hash, 'rust-source-binding')
+
+
+def check_rust(plan, rows, logs, compiled, selected, repository_selected, product_directory, cargo_target_directory):
+    check_rust_records(plan, rows)
+    check_rust_records(plan, rows[:-1], focused=True)
     lane = ['--locked', '--no-default-features', '--features', 'ui']
     need(rows[0]['argv'] == ['cargo', 'check', *lane, '--bin', 'cagents-ui'], 'ui-check-argv')
     need(rows[1]['argv'] == ['cargo', 'test', *lane, '--all-targets', '--no-run', '--message-format=json'], 'compile-argv')
     need(rows[-1]['argv'] == ['cargo', 'test', *lane, '--all-targets', '--', '--test-threads=1', '--color=never'], 'broad-argv')
     need(all(row['exit_code'] == 0 and row['product'] == PRODUCT for row in rows), 'rust-exit-source')
-    artifacts = [row for row in compiled if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'cagents'
-                 and 'lib' in row.get('target', {}).get('kind', []) and row.get('profile', {}).get('test') and row.get('executable')]
-    need(len(artifacts) == 1 and selected['artifact'] == artifacts[0], 'selected-artifact')
-    artifact = artifacts[0]
-    need('ui' in artifact['features'] and not {'host', 'full', 'integrated-browser'} & set(artifact['features']), 'selected-features')
-    need(selected['executable'] == artifact['executable'] and HEX.fullmatch(selected['observed_binary_sha256']), 'selected-identity')
-    # Identical Cargo filenames across origins are legitimate. Binary bytes are
-    # CI-observed, not retained/rehashed here; official source custody is external.
-    need(selected['compile_stdout_sha256'] == rows[1]['stdout']['sha256'], 'selected-compile-ref')
-    for row, selector in zip(rows[2:6], plan['selectors'], strict=True):
-        need(row['argv'] == [selected['executable'], selector, '--exact', '--test-threads=1', '--nocapture', '--color=never'], 'focused-argv')
-        text = logs[row['name']]
-        need(text.splitlines().count('test ' + selector + ' ... ok') == 1, 'focused-owning-line')
-        summaries = re.findall(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;', text, re.M)
-        need(len(summaries) == 1 and summaries[0][:5] == ('ok', '1', '0', '0', '0'), 'focused-summary')
-        # Exact filtered count is allowed for an exact selector; its owning pass
-        # and one actual execution cannot be replaced by a filtered-only success.
+    # These ephemeral CI paths are observed/source-bound, not reopened here.
+    # Actual archive roots and member bytes are checked separately by inspect.
+    def canonical(value):
+        need(isinstance(value, str) and '\x00' not in value, 'selected-path')
+        path = Path(value)
+        need(path.is_absolute() and '..' not in path.parts and str(path) == value, 'selected-path')
+        return path
+    product, target = canonical(product_directory), canonical(cargo_target_directory)
+
+    def select(name, kind, relative_source, receipt, prefix):
+        artifacts = [row for row in compiled if row.get('reason') == 'compiler-artifact'
+                     and row.get('target', {}).get('name') == name
+                     and row.get('target', {}).get('kind') == [kind]
+                     and row.get('target', {}).get('src_path') == str(product / relative_source)
+                     and row.get('profile', {}).get('test') is True and row.get('executable')]
+        need(len(artifacts) == 1 and receipt['artifact'] == artifacts[0], prefix + '-artifact')
+        artifact = artifacts[0]
+        need(isinstance(artifact.get('package_id'), str) and artifact['package_id']
+             and artifact.get('manifest_path', str(product / 'Cargo.toml')) == str(product / 'Cargo.toml'), prefix + '-package')
+        need('ui' in artifact['features'] and not {'host', 'full', 'integrated-browser'} & set(artifact['features']), prefix + '-features')
+        binary = canonical(artifact['executable'])
+        need(binary.is_relative_to(target) and binary != target
+             and receipt['executable'] == str(binary)
+             and isinstance(receipt['observed_binary_sha256'], str)
+             and HEX.fullmatch(receipt['observed_binary_sha256']), prefix + '-identity')
+        # Identical Cargo filenames across origins are legitimate. Binary bytes
+        # are CI-observed, not retained/rehashed here; official custody is external.
+        need(receipt['compile_stdout_sha256'] == rows[1]['stdout']['sha256'], prefix + '-compile-ref')
+        return artifact
+
+    library = select('cagents', 'lib', 'src/lib.rs', selected, 'selected')
+    repository = select('repository_git_contract', 'test', 'tests/repository_git_contract.rs', repository_selected, 'selected-repository')
+    need(repository['package_id'] == library['package_id'], 'selected-repository-package')
+    for focused_rows, selectors, receipt in [(rows[2:6], plan['selectors'], selected),
+                                             (rows[6:9], plan['repository_selectors'], repository_selected)]:
+        for row, selector in zip(focused_rows, selectors, strict=True):
+            need(row['argv'] == [receipt['executable'], selector, '--exact', '--test-threads=1', '--nocapture', '--color=never'], 'focused-argv')
+            text = logs[row['name']]
+            need(text.splitlines().count('test ' + selector + ' ... ok') == 1, 'focused-owning-line')
+            summaries = re.findall(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;', text, re.M)
+            need(len(summaries) == 1 and summaries[0][:5] == ('ok', '1', '0', '0', '0'), 'focused-summary')
+            # Filtered counts are allowed for exact selectors. Caught inner
+            # panics may appear in stderr; only the real parent counts here.
     broad = logs['ui-all-targets-suite']
     summaries = re.findall(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;', broad, re.M)
     need(summaries and all(row[0] == 'ok' and row[2] == '0' and row[5] == '0' for row in summaries)
          and any(int(row[1]) > 0 for row in summaries), 'broad-summary')
-    for selector in plan['selectors']:
+    for selector in plan['selectors'] + plan['repository_selectors']:
         need(broad.splitlines().count('test ' + selector + ' ... ok') == 1, 'broad-owning-line')
 
 
@@ -249,11 +301,12 @@ def inspect(root, control):
         member(root, row['stderr'])
     compiled = [json.loads(line) for line in logs['ui-all-targets-compile'].splitlines() if line.startswith('{')]
     selected = json.loads((root / 'selected-test.json').read_text())
-    check_rust(plan, rows, logs, compiled, selected)
+    repository_selected = json.loads((root / 'selected-repository-test.json').read_text())
     source = json.loads((root / 'source.json').read_text())
-    need(source['product'] == PRODUCT and source['rust_records'] == 7
-         and source['plan_sha256'] == digest((control / '.github/qualification/final-main-plan.json').read_bytes())
-         and source['workflow_sha256'] == digest((control / '.github/workflows/qualify-final-main-integration.yml').read_bytes()), 'rust-source-binding')
+    check_rust_source(source, digest((control / '.github/qualification/final-main-plan.json').read_bytes()),
+                      digest((control / '.github/workflows/qualify-final-main-integration.yml').read_bytes()))
+    check_rust(plan, rows, logs, compiled, selected, repository_selected,
+               source['product_directory'], source['cargo_target_directory'])
     native_source = json.loads((root / 'native/source.json').read_text())
     need(native_source['product'] == PRODUCT and native_source['before'] == BEFORE
          and all(native_source[key] == source[key] for key in ('control_sha','control_tree','workflow_sha256','run','attempt')), 'native-source-binding')
@@ -282,7 +335,7 @@ def inspect(root, control):
              and cleanup['documents_graceful']['mounted_after'] is False
              and cleanup['owned_descendants_remaining'] == [] and all(owner is None for owner in cleanup['private_bus_names'].values()), 'arm-graceful-unmount')
     result = dict(kind='final-main-integration-local-contracts-v1', local_contracts_ok=True,
-        fresh_rust_records=7, new_native_revisions=2, new_native_flows=1,
+        fresh_rust_records=10, new_native_revisions=2, new_native_flows=1,
         original22_100_provenance=plan['retained_native_scope'], qualified=False,
         retained_evidence_verified_here=False, outside_local_checker=OUTSIDE, observed_members=members,
         limits=['Exact Runtime Target/editor/cursor/allocation and opaque full launch dimensions are asserted by the four owning Rust parents; native observes exact source, account/cwd footer, image/text, real portal and continuation input.',

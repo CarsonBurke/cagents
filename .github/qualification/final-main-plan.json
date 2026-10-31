@@ -1,8 +1,8 @@
 {
   "kind": "held-scope-final-main-integration-source-plan-v1",
   "product": {
-    "sha": "b855f32573bf4f37dbb9ea415550ab330a01da71",
-    "tree": "cb0913dca905addb9886a97f0d93d7e90f08d680"
+    "sha": "91a8dff516e6fb76fadab432119e67c472fd9489",
+    "tree": "aea2db52b5ed089ea94e396e58dec8a4d81edb38"
   },
   "before": {
     "sha": "b3e036c71e83c0168b8ff7b3a1f6607caa24cced",
@@ -35,6 +35,9 @@
     "an_adopted_draft_keeps_its_failure_reason_until_its_account_changes",
     "a_draft_choosing_a_file_takes_up_options_chosen_meanwhile_in_another_window",
     "mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+    "a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock",
+    "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts",
+    "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff",
     "ui-all-targets-suite"
   ],
   "selectors": [
@@ -42,6 +45,11 @@
     "app::shared_views::tests::published_card_edits::an_adopted_draft_keeps_its_failure_reason_until_its_account_changes",
     "app::shared_views::tests::published_card_edits::a_draft_choosing_a_file_takes_up_options_chosen_meanwhile_in_another_window",
     "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel"
+  ],
+  "repository_selectors": [
+    "a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock",
+    "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts",
+    "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff"
   ],
   "new_native": {
     "flow": "idle-draft-peer-recipe-during-real-chooser-cancel",

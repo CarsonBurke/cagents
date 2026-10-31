@@ -110,40 +110,132 @@ class BoundedCheckerTests(unittest.TestCase):
         before['receipt']['postcancel_footer'][0] = 'Synthetic initial account'
         validate(before,'before')
 
-    def test_N02_seven_ui_records_and_exact_parent_ownership(self):
+    def test_N02_ten_ui_records_and_exact_parent_ownership(self):
         plan = json.loads(Path(__file__).with_name('final-main-plan.json').read_text())
         lane = ['--locked','--no-default-features','--features','ui']
-        binary = '/target/debug/deps/cagents-same-name'
-        artifact = dict(reason='compiler-artifact',target=dict(name='cagents',kind=['lib']),profile=dict(test=True),features=['ui'],executable=binary)
-        compiled = [artifact]
-        selected = dict(artifact=artifact,executable=binary,observed_binary_sha256='a'*64,compile_stdout_sha256='b'*64)
+        product, target = '/work/product', '/target'
+        library_binary, repository_binary = target + '/debug/deps/cagents-same-name', target + '/debug/deps/repository_git_contract-same-name'
+        package = 'path+file:///work/product#cagents@0.1.0'
+        def artifact(name, kind, source, executable, test=True):
+            return dict(reason='compiler-artifact',package_id=package,manifest_path=product + '/Cargo.toml',
+                target=dict(name=name,kind=[kind],crate_types=['lib' if kind == 'lib' else 'bin'],src_path=product + '/' + source),
+                profile=dict(test=test),features=['ui'],executable=executable)
+        library = artifact('cagents','lib','src/lib.rs',library_binary)
+        repository = artifact('repository_git_contract','test','tests/repository_git_contract.rs',repository_binary)
+        # Shuffled real-shaped targets, including bin/test/lib distractors.
+        compiled = [artifact('other_contract','test','tests/other_contract.rs',target + '/debug/deps/other'),
+                    repository,artifact('cagents','lib','src/lib.rs',None,False),library,
+                    artifact('cagents-ui','bin','src/bin/cagents-ui.rs',target + '/debug/cagents-ui')]
+        def receipt(value):
+            return dict(artifact=copy.deepcopy(value),executable=value['executable'],observed_binary_sha256='a'*64,compile_stdout_sha256='b'*64)
+        selected, repository_selected = receipt(library), receipt(repository)
+        all_selectors = plan['selectors'] + plan['repository_selectors']
         argvs = [['cargo','check',*lane,'--bin','cagents-ui'],['cargo','test',*lane,'--all-targets','--no-run','--message-format=json']]
-        argvs += [[binary,selector,'--exact','--test-threads=1','--nocapture','--color=never'] for selector in plan['selectors']]
+        argvs += [[library_binary,selector,'--exact','--test-threads=1','--nocapture','--color=never'] for selector in plan['selectors']]
+        argvs += [[repository_binary,selector,'--exact','--test-threads=1','--nocapture','--color=never'] for selector in plan['repository_selectors']]
         argvs += [['cargo','test',*lane,'--all-targets','--','--test-threads=1','--color=never']]
         rows = [dict(name=name,argv=argv,exit_code=0,product=check.PRODUCT,stdout=dict(sha256='b'*64))
                 for name,argv in zip(plan['fresh_rust_records'],argvs,strict=True)]
         logs = {name:'test ' + selector + ' ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out;\n'
-                for name,selector in zip(plan['fresh_rust_records'][2:6],plan['selectors'],strict=True)}
-        logs['ui-all-targets-suite'] = ''.join('test ' + selector + ' ... ok\n' for selector in plan['selectors']) + 'test result: ok. 400 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n'
-        base = (rows,logs,compiled,selected)
-        def valid(data): check.check_rust(plan,*data)
-        valid(copy.deepcopy(base))
-        mutations = [
-            ('rust-records',lambda d:d[0].append(copy.deepcopy(d[0][0]))),
-            ('ui-check-argv',lambda d:d[0][0]['argv'].insert(2,'--features=host')),
-            ('rust-exit-source',lambda d:d[0][3].update(exit_code=1)),
-            ('selected-features',lambda d:d[2][0]['features'].append('host')),
-            ('selected-compile-ref',lambda d:d[3].update(compile_stdout_sha256='c'*64)),
-            ('focused-argv',lambda d:d[0][2]['argv'].__setitem__(1,'wrong-selector')),
-            ('focused-owning-line',lambda d:d[1].__setitem__(plan['fresh_rust_records'][2],d[1][plan['fresh_rust_records'][2]].replace(' ... ok',' ... ignored'))),
-            ('focused-summary',lambda d:d[1].__setitem__(plan['fresh_rust_records'][2],d[1][plan['fresh_rust_records'][2]].replace('1 passed','0 passed'))),
-            ('broad-summary',lambda d:d[1].__setitem__('ui-all-targets-suite',d[1]['ui-all-targets-suite'].replace('0 filtered out','4 filtered out'))),
-            ('broad-owning-line',lambda d:d[1].__setitem__('ui-all-targets-suite',d[1]['ui-all-targets-suite'] + 'test ' + plan['selectors'][0] + ' ... ok\n')),
-        ]
-        for reason, mutate in mutations:
-            with self.subTest(reason=reason):
-                data = copy.deepcopy(base); valid(data); mutate(data)
-                with self.assertRaisesRegex(ValueError,'^' + reason + '$'): valid(data)
+                for name,selector in zip(plan['fresh_rust_records'][2:9],all_selectors,strict=True)}
+        logs['ui-all-targets-suite'] = ''.join('test ' + selector + ' ... ok\n' for selector in all_selectors)
+        logs['ui-all-targets-suite'] += 'test result: ok. 400 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n'
+        logs['ui-all-targets-suite'] += 'test result: ok. 60 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n'
+        data = dict(plan=plan,rows=rows,logs=logs,compiled=compiled,selected=selected,repository_selected=repository_selected)
+        def rebind_compile(value):
+            raw = ''.join(json.dumps(row) + '\n' for row in value['compiled'])
+            value['logs']['ui-all-targets-compile'] = raw
+            sha = hashlib.sha256(raw.encode()).hexdigest()
+            value['rows'][1]['stdout']['sha256'] = sha
+            for key in ('selected','repository_selected'): value[key]['compile_stdout_sha256'] = sha
+        rebind_compile(data)
+        def valid(value):
+            check.check_rust(value['plan'],value['rows'],value['logs'],value['compiled'],value['selected'],value['repository_selected'],product,target)
+        def reject(reason, mutate):
+            value = copy.deepcopy(data); valid(value); mutate(value)
+            with self.assertRaisesRegex(ValueError,'^' + reason + '$'): valid(value)
+        def change_repository(value, mutate):
+            mutate(value['compiled'][1])
+            value['repository_selected']['artifact'] = copy.deepcopy(value['compiled'][1])
+            rebind_compile(value)
+        valid(copy.deepcopy(data))  # T1: correct routing, same-origin Cargo filenames are not a freshness oracle.
+        # T2: every repository target predicate is independently necessary.
+        for field, replacement in [('kind',['bin']),('name','cagents'),('src_path','/work/other/tests/repository_git_contract.rs')]:
+            with self.subTest(group='T2',field=field):
+                reject('selected-repository-artifact',lambda d,f=field,r=replacement:change_repository(d,lambda a:a['target'].__setitem__(f,r)))
+        for field, mutate in [('profile',lambda a:a['profile'].update(test=False)),('executable',lambda a:a.pop('executable'))]:
+            with self.subTest(group='T2',field=field):
+                reject('selected-repository-artifact',lambda d,m=mutate:change_repository(d,m))
+        def change_compilation(value, mutate):
+            mutate(value['compiled'])
+            rebind_compile(value)
+        reject('selected-repository-artifact',lambda d:change_compilation(d,lambda rows:rows.pop(1)))
+        reject('selected-repository-artifact',lambda d:change_compilation(d,lambda rows:rows.append(copy.deepcopy(rows[1]))))
+        reject('selected-repository-package',lambda d:change_repository(d,lambda a:a.update(package_id='path+file:///other#cagents@0.1.0')))
+        reject('selected-repository-package',lambda d:change_repository(d,lambda a:a.update(manifest_path='/other/Cargo.toml')))
+        # T3: artifact/receipt agree during feature mutations, so feature guards own the refusal.
+        for features in [['ui','host'],['ui','full'],['ui','integrated-browser'],[]]:
+            with self.subTest(group='T3',features=features):
+                reject('selected-repository-features',lambda d,f=features:change_repository(d,lambda a:a.update(features=f)))
+        reject('selected-repository-compile-ref',lambda d:d['repository_selected'].update(compile_stdout_sha256='c'*64))
+        reject('selected-repository-artifact',lambda d:d['repository_selected']['artifact']['target'].update(name='wrong'))
+        reject('selected-repository-identity',lambda d:d['repository_selected'].update(executable=library_binary))
+        reject('selected-repository-identity',lambda d:d['repository_selected'].update(observed_binary_sha256='not-a-sha256'))
+        reject('selected-repository-identity',lambda d:change_repository(d,lambda a:a.update(executable='/outside/repository_git_contract')))
+        def forbidden_library_feature(value):
+            value['compiled'][3]['features'].append('host')
+            value['selected']['artifact'] = copy.deepcopy(value['compiled'][3])
+            rebind_compile(value)
+        reject('selected-features',forbidden_library_feature)
+        reject('selected-compile-ref',lambda d:d['selected'].update(compile_stdout_sha256='c'*64))
+        # T4: exact four-plus-three partition, record order and binary routing.
+        for mutation in [lambda d:d['plan']['repository_selectors'].pop(),
+                         lambda d:d['plan']['repository_selectors'].append(d['plan']['repository_selectors'][0]),
+                         lambda d:d['plan']['repository_selectors'].__setitem__(0,'undeclared'),
+                         lambda d:d['plan']['selectors'].__setitem__(1,d['plan']['selectors'][0])]:
+            reject('selector-partition',mutation)
+        reject('rust-records',lambda d:d['rows'].pop(6))
+        reject('rust-records',lambda d:d['rows'].append(copy.deepcopy(d['rows'][6])))
+        reject('rust-records',lambda d:d['rows'].__setitem__(7,copy.deepcopy(d['rows'][6])))
+        reject('focused-argv',lambda d:d['rows'][6]['argv'].__setitem__(0,library_binary))
+        reject('ui-check-argv',lambda d:d['rows'][0]['argv'].insert(2,'--features=host'))
+        # T5: exact owning execution, not filtered/ignored text or a wrong argument.
+        repository_name = plan['fresh_rust_records'][6]
+        reject('rust-exit-source',lambda d:d['rows'][6].update(exit_code=101))
+        reject('focused-argv',lambda d:d['rows'][6]['argv'].__setitem__(1,'wrong-selector'))
+        for summary in ['ok. 0 passed; 0 failed; 0 ignored; 0 measured; 60 filtered out;',
+                        'ok. 0 passed; 0 failed; 1 ignored; 0 measured; 59 filtered out;']:
+            reject('focused-summary',lambda d,s=summary:d['logs'].__setitem__(repository_name,
+                'test ' + plan['repository_selectors'][0] + ' ... ok\ntest result: ' + s + '\n'))
+        reject('focused-owning-line',lambda d:d['logs'].__setitem__(repository_name,d['logs'][repository_name].replace(' ... ok',' ... ignored')))
+        reject('focused-owning-line',lambda d:d['logs'].__setitem__(repository_name,d['logs'][repository_name] + 'test ' + plan['repository_selectors'][0] + ' ... ok\n'))
+        # T6: real caught inner panic output is authenticated as opaque stderr;
+        # the two injections remain one successful Rust parent, never two rows.
+        preserved = plan['fresh_rust_records'][8]
+        caught = b"thread panicked: injected failure after actual hook handoff\nthread panicked: injected failure after original command timeout\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / 'caught.stderr.log').write_bytes(caught)
+            ref = dict(path='caught.stderr.log',sha256=hashlib.sha256(caught).hexdigest(),bytes=len(caught))
+            self.assertEqual(check.member(root,ref),caught)
+            positive = copy.deepcopy(data); positive['rows'][8]['stderr'] = ref; valid(positive)
+        reject('focused-summary',lambda d:d['logs'].__setitem__(preserved,d['logs'][preserved].replace('1 passed','2 passed')))
+        reject('rust-records',lambda d:d['rows'].append(dict(name='AfterHandoff')))
+        reject('rust-records',lambda d:d['rows'].append(dict(name='AfterTimeout')))
+        reject('focused-owning-line',lambda d:d['logs'].__setitem__(preserved,d['logs'][preserved] + 'test ' + plan['repository_selectors'][2] + ' ... ok\n'))
+        # T7: all seven broad owning lines, exact nine-record pre-native prefix,
+        # and ten-record metadata. No native cleanup prerequisite is bypassed.
+        for selector in plan['repository_selectors']:
+            reject('broad-owning-line',lambda d,s=selector:d['logs'].__setitem__('ui-all-targets-suite',d['logs']['ui-all-targets-suite'].replace('test ' + s + ' ... ok\n','')))
+            reject('broad-owning-line',lambda d,s=selector:d['logs'].__setitem__('ui-all-targets-suite',d['logs']['ui-all-targets-suite'] + 'test ' + s + ' ... ok\n'))
+        reject('broad-summary',lambda d:d['logs'].__setitem__('ui-all-targets-suite',d['logs']['ui-all-targets-suite'].replace('0 filtered out','4 filtered out')))
+        check.check_rust_records(plan,data['rows'][:9],focused=True)
+        for prefix in (data['rows'][:8],data['rows']):
+            with self.assertRaisesRegex(ValueError,'^rust-focused-prefix$'): check.check_rust_records(plan,prefix,focused=True)
+        source = dict(product=check.PRODUCT,rust_records=10,plan_sha256='a'*64,workflow_sha256='b'*64)
+        check.check_rust_source(source,'a'*64,'b'*64)
+        source['rust_records'] = 7
+        with self.assertRaisesRegex(ValueError,'^rust-source-binding$'): check.check_rust_source(source,'a'*64,'b'*64)
 
     def test_N03_ui_owner_and_generation(self):
         self.rejects('portal-caller',lambda v:v['receipt'].update(ui_pid=11))

@@ -1,4 +1,4 @@
-"""Seven isolated UI records for the separate final-main integration packet.
+"""Ten isolated UI records for the separate final-main integration packet.
 
 This runner does not execute the original 52-parent/full100 packet or reinterpret
 its historical registry. Matched native development builds are recorded separately.
@@ -34,6 +34,10 @@ def main():
         raise RuntimeError('Pass product control and exactly one stage')
     product, control = [Path(value).resolve(strict=True) for value in sys.argv[1:3]]
     plan = json.loads((control / '.github/qualification/final-main-plan.json').read_text())
+    assert len(plan['selectors']) == 4 and len(plan['repository_selectors']) == 3
+    assert len(set(plan['selectors'] + plan['repository_selectors'])) == 7
+    assert plan['fresh_rust_records'] == ['ui-check', 'ui-all-targets-compile',
+        *[selector.rsplit('::', 1)[-1] for selector in plan['selectors'] + plan['repository_selectors']], 'ui-all-targets-suite']
     out = Path(os.environ['QUALIFICATION_EVIDENCE'])
     out.mkdir(parents=True, exist_ok=True)
     private_tmp = Path(tempfile.mkdtemp(prefix='h2018.', dir='/tmp')).resolve(strict=True)
@@ -90,32 +94,48 @@ def main():
                   workflow_sha256=digest(control / '.github/workflows/qualify-final-main-integration.yml'),
                   plan_sha256=digest(control / '.github/qualification/final-main-plan.json'),
                   run=os.environ['GITHUB_RUN_ID'], attempt=os.environ['GITHUB_RUN_ATTEMPT'],
-                  rust_records=7, scope='Separate integration; retained22/100 stay original b3 evidence')
+                  rust_records=10,
+                  product_directory=str(product),
+                  cargo_target_directory=str(Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True)),
+                  scope='Separate integration; retained22/100 stay original b3 evidence')
     if sys.argv[3] == '--focused-only':
         assert not records
         (out / 'source.json').write_text(json.dumps(source, indent=2) + '\n')
         run('ui-check', ['cargo', 'check', *lane, '--bin', 'cagents-ui'])
         compiled = run('ui-all-targets-compile', ['cargo', 'test', *lane, '--all-targets', '--no-run', '--message-format=json'], True)
         rows = [json.loads(line) for line in compiled.read_text().splitlines() if line.startswith('{')]
-        candidates = [row for row in rows if row.get('reason') == 'compiler-artifact'
-                      and row.get('target', {}).get('name') == 'cagents'
-                      and 'lib' in row.get('target', {}).get('kind', [])
-                      and row.get('profile', {}).get('test') and row.get('executable')]
-        assert len(candidates) == 1
-        selected = candidates[0]
-        assert 'ui' in selected['features'] and not {'host', 'integrated-browser', 'full'} & set(selected['features'])
-        binary = Path(selected['executable']).resolve(strict=True)
-        assert binary.is_relative_to(Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True))
-        (out / 'selected-test.json').write_text(json.dumps(dict(artifact=selected, executable=str(binary),
-            observed_binary_sha256=digest(binary), compile_stdout_sha256=digest(compiled),
-            scope='CI-observed selected executable; binary bytes are not retained in the artifact'), indent=2) + '\n')
-        for selector, name in zip(plan['selectors'], plan['fresh_rust_records'][2:6], strict=True):
-            log = run(name, [str(binary), selector, '--exact', '--test-threads=1', '--nocapture', '--color=never'])
-            text = log.read_text()
-            assert text.splitlines().count('test ' + selector + ' ... ok') == 1
-            assert len(re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;', text, re.M)) == 1
+        def select(name, kind, relative_source):
+            candidates = [row for row in rows if row.get('reason') == 'compiler-artifact'
+                          and row.get('target', {}).get('name') == name
+                          and row.get('target', {}).get('kind') == [kind]
+                          and row.get('target', {}).get('src_path') == str(product / relative_source)
+                          and row.get('profile', {}).get('test') is True and row.get('executable')]
+            assert len(candidates) == 1
+            artifact = candidates[0]
+            assert artifact.get('package_id') and artifact.get('manifest_path', str(product / 'Cargo.toml')) == str(product / 'Cargo.toml')
+            assert 'ui' in artifact['features'] and not {'host', 'integrated-browser', 'full'} & set(artifact['features'])
+            binary = Path(artifact['executable']).resolve(strict=True)
+            assert str(binary) == artifact['executable'] and binary.is_relative_to(Path(source['cargo_target_directory']))
+            return artifact, binary
+
+        library, library_binary = select('cagents', 'lib', 'src/lib.rs')
+        repository, repository_binary = select('repository_git_contract', 'test', 'tests/repository_git_contract.rs')
+        assert repository['package_id'] == library['package_id']
+        for filename, artifact, binary in [('selected-test.json', library, library_binary),
+                                            ('selected-repository-test.json', repository, repository_binary)]:
+            (out / filename).write_text(json.dumps(dict(artifact=artifact, executable=str(binary),
+                observed_binary_sha256=digest(binary), compile_stdout_sha256=digest(compiled),
+                scope='CI-observed selected executable; binary bytes are not retained in the artifact'), indent=2) + '\n')
+        for selectors, names, binary in [(plan['selectors'], plan['fresh_rust_records'][2:6], library_binary),
+                                         (plan['repository_selectors'], plan['fresh_rust_records'][6:9], repository_binary)]:
+            for selector, name in zip(selectors, names, strict=True):
+                log = run(name, [str(binary), selector, '--exact', '--test-threads=1', '--nocapture', '--color=never'])
+                text = log.read_text()
+                assert text.splitlines().count('test ' + selector + ' ... ok') == 1
+                summaries = re.findall(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;', text, re.M)
+                assert len(summaries) == 1 and summaries[0][:5] == ('ok', '1', '0', '0', '0')
     else:
-        assert [row['name'] for row in records] == plan['fresh_rust_records'][:6]
+        assert [row['name'] for row in records] == plan['fresh_rust_records'][:9]
         assert json.loads((out / 'source.json').read_text()) == source
         cleanup = json.loads((out / 'native/cleanup.json').read_text())
         assert cleanup['errors'] == [] and cleanup['owned_descendants_remaining'] == []
@@ -125,7 +145,7 @@ def main():
         summaries = re.findall(r'^test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out;', text, re.M)
         assert summaries and all(status == 'ok' and failed == '0' and filtered == '0' for status, _, failed, _, _, filtered in summaries)
         assert any(int(passed) > 0 for _, passed, *_ in summaries)
-        for selector in plan['selectors']:
+        for selector in plan['selectors'] + plan['repository_selectors']:
             assert text.splitlines().count('test ' + selector + ' ... ok') == 1
     unchanged()
 

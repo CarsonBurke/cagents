@@ -17,8 +17,8 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
-      PRODUCT_SHA: b855f32573bf4f37dbb9ea415550ab330a01da71
-      PRODUCT_TREE: cb0913dca905addb9886a97f0d93d7e90f08d680
+      PRODUCT_SHA: 91a8dff516e6fb76fadab432119e67c472fd9489
+      PRODUCT_TREE: aea2db52b5ed089ea94e396e58dec8a4d81edb38
       CARGO_BUILD_JOBS: '2'
       RUSTUP_TOOLCHAIN: 1.93.0
     steps:
@@ -96,7 +96,7 @@ jobs:
           CACHE_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
           CACHE_LOCK_HASH: ${{ hashFiles('product/Cargo.lock') }}
         run: python3 control/.github/qualification/cache-restore-gate.py "$GITHUB_WORKSPACE/product"
-      - name: Check and compile the UI and run four exact integration parents
+      - name: Check and compile the UI and run seven exact integration parents
         id: focus
         if: ${{ success() && steps.warm_cache.outcome == 'success' }}
         shell: bash
@@ -113,7 +113,7 @@ jobs:
           path: ${{ runner.temp }}/held-scope-evidence
           if-no-files-found: error
           retention-days: 14
-      # Seven fresh UI records: check + no-run compile + four exact parents +
+      # Ten fresh UI records: check + no-run compile + seven exact parents +
       # UI broad. Original22/100 remain original b3 evidence; never fresh full100.
       - name: Run the UI all-targets suite after complete private-desktop cleanup
         if: ${{ !cancelled() && steps.focus.outcome == 'success' && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
@@ -131,7 +131,7 @@ jobs:
             cd "$QUALIFICATION_EVIDENCE"
             find . -type f ! -name sha256.txt -print0 | sort -z | xargs -0 -r sha256sum > sha256.txt
           fi
-      - name: Upload source and seven-record integration receipts
+      - name: Upload source and ten-record integration receipts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
