@@ -2956,7 +2956,9 @@ impl Server {
             &Ok::<_, String>(self.attached()?),
             Duration::from_secs(30),
         )?;
+        let mut orphans = OrphanSweep::new();
         loop {
+            orphans.run_if_due();
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
@@ -2992,6 +2994,7 @@ impl Server {
                             1,
                             crate::descriptor_frame::FrameByteOrder::LittleEndian,
                         );
+                        orphans.run();
                         continue;
                     }
                     let mut finished = false;
@@ -3008,6 +3011,7 @@ impl Server {
                     if finished {
                         break;
                     }
+                    orphans.run();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20))
@@ -3118,6 +3122,44 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
         return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(event.revents & (libc::POLLHUP | libc::POLLERR) != 0)
+}
+/// This actor is a subreaper, so every orphaned tool descendant of its
+/// provider becomes its child. Reap the exited ones while it serves; the
+/// provider and scope requests spawn through `adopted_orphans`, which reserves
+/// their statuses for their owners. Nothing here signals a live child.
+///
+/// The helper has no log sink, so a sweep failure is retried on the next tick
+/// rather than reported here. Its durable symptom is the per-holder zombie
+/// count that `cagents diagnostics` observes from outside the process.
+struct OrphanSweep {
+    due: Instant,
+}
+impl OrphanSweep {
+    const INTERVAL: Duration = Duration::from_millis(250);
+    /// Bounds one pass so a large backlog cannot stall the serve loop.
+    const LIMIT: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            due: Instant::now(),
+        }
+    }
+
+    fn run_if_due(&mut self) {
+        if Instant::now() >= self.due {
+            self.run();
+        }
+    }
+
+    fn run(&mut self) {
+        self.due = Instant::now() + Self::INTERVAL;
+        if let Ok(sweep) = crate::daemon::adopted_orphans::reap_exited(Self::LIMIT)
+            && sweep.truncated
+        {
+            // Continue the backlog on the next serve iteration.
+            self.due = Instant::now();
+        }
+    }
 }
 /// Only after the actor's ChildGuard has joined: no competing provider reaper
 /// remains. A child PID cannot be recycled until this sole reaper consumes it.
@@ -3451,6 +3493,155 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         serving.parent.take();
         serving.worker.take().unwrap().join().unwrap().unwrap();
         assert!(!socket.exists() && !record_path.exists());
+    }
+
+    #[test]
+    fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+        const CHILD: &str = "CAGENTS_RETAINED_ORPHAN_SWEEP_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let test = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", root.path())
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("HOME", root.path().join("home"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // This isolated process stands in for the helper: a subreaper that
+        // adopts every orphan its provider's tools leave behind.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let state = |pid: i32| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            stat[stat.rfind(')')? + 2..].chars().next()
+        };
+        let zombies = || {
+            crate::daemon::owned_children::direct_children()
+                .unwrap()
+                .into_iter()
+                .filter(|pid| state(*pid) == Some('Z'))
+                .count()
+        };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let cwd = root.path().join("cwd");
+        let home = root.path().join("claude");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let orphaned = root.path().join("orphaned");
+        let mut source = fixture_source();
+        source.launch.recipe.working_directory = cwd.clone();
+        source.launch.recipe.environment = BTreeMap::from([
+            ("HOME".into(), root.path().to_string_lossy().into_owned()),
+            (
+                "CLAUDE_CONFIG_DIR".into(),
+                home.to_string_lossy().into_owned(),
+            ),
+        ]);
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let (control, parent) = UnixStream::pair().unwrap();
+        let (spec, adapter) = chat::protocol::create(&source.launch).unwrap();
+        let session_id = spec
+            .arguments
+            .iter()
+            .find_map(|argument| argument.strip_prefix("--session-id="))
+            .unwrap()
+            .to_owned();
+        // After initializing, the provider's tools orphan 600 grandchildren in
+        // bursts that exit together after their parents, so their SIGCHLDs
+        // coalesce. One more orphaned daemon shares the provider's stdin, so
+        // both stay alive until the actor, or this process, closes it.
+        let startup = Startup {
+            protocol: PROTOCOL,
+            source: source.clone(),
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                r#"IFS= read -r frame || exit 2
+id=${frame#*\"request_id\":\"}
+id=${id%%\"*}
+printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"current_permission_mode":"default"}}}\n' "$id"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$1"
+exec 3<&0
+for burst in 1 2 3 4 5 6; do
+  i=0
+  while [ $i -lt 100 ]; do (/bin/sleep 0.2 &); i=$((i + 1)); done
+done
+(/bin/cat <&3 >/dev/null & echo $! > "$2")
+while IFS= read -r frame; do :; done
+"#
+                .into(),
+                "orphan-fixture".into(),
+                session_id,
+                orphaned.to_string_lossy().into_owned(),
+            ],
+            prepared_identity: adapter.prepared_launch_identity().unwrap(),
+            environment: source.launch.recipe.environment.clone(),
+            working_directory: cwd.clone(),
+            directory_fd: None,
+            directory_identity: None,
+            mailbox_recognition: None,
+            provider_directory_observed: false,
+            recovery_environment: BTreeMap::new(),
+        };
+        let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
+        let provider = server.identity.record.root.clone();
+        let mut parent = Some(parent);
+        let worker = thread::spawn(move || server.serve(control));
+        let attached: Result<Attached, String> =
+            receive(parent.as_ref().unwrap(), TIMEOUT).unwrap();
+        attached.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let live: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&orphaned)
+                .ok()
+                .and_then(|pid| pid.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "provider tools did not finish");
+            thread::sleep(Duration::from_millis(10));
+        };
+        // Every exited orphan is reaped within a bound while both the actor
+        // and its provider keep running.
+        let bound = Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = zombies();
+            if remaining == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < bound,
+                "{remaining} exited adopted orphans were not reaped while serving"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(provider.is_current(), "the provider must keep running");
+        assert!(!worker.is_finished(), "the actor must keep serving");
+        // The live adopted daemon is still this actor's unsignalled child.
+        assert_eq!(state(live), Some('S'));
+        assert!(
+            crate::daemon::owned_children::direct_children()
+                .unwrap()
+                .contains(&live)
+        );
+        // Startup EOF retires the actor through its existing cleanup.
+        parent.take();
+        worker.join().unwrap().unwrap();
+        assert!(!provider.is_current(), "original provider must be reaped");
     }
 
     thread_local! {
