@@ -4361,7 +4361,7 @@ mod tests {
         ] {
             let cached = CachedItem::new(
                 &ItemContent::Text {
-                    text: source,
+                    text: (source).into(),
                     thinking: false,
                     phase: chat::Phase::Final,
                 },

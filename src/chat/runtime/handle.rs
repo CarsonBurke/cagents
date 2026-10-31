@@ -24,6 +24,13 @@ pub(crate) enum RetainedInputOutcome {
 }
 
 impl Handle {
+    #[cfg(test)]
+    pub(in crate::chat::runtime) fn fixture_peer_page_pair(
+        local: LocalHandle,
+        remote: RemoteActor,
+    ) -> (Self, Self) {
+        (Self(Owner::Local(local)), Self(Owner::Remote(remote)))
+    }
     /// A real remote proxy with no external provider or helper. The returned
     /// responder waits for actual production admission before settling it.
     #[cfg(test)]
@@ -435,6 +442,19 @@ impl Handle {
             Owner::Remote(remote) => remote.call("file_query", serde_json::json!([command])),
         }
     }
+    /// A coherent cached observation, not a permission grant or a reservation
+    /// against later reset. The caller must recheck this exact attachment and
+    /// current source/permission at final delivery admission.
+    pub(crate) fn peer_page(
+        &self,
+        reader: &mut super::PeerReader,
+        after: Option<super::PeerCursor>,
+    ) -> Result<super::PeerPage, String> {
+        match &self.0 {
+            Owner::Local(local) => local.peer_page(reader, after),
+            Owner::Remote(remote) => remote.peer_page(reader, after),
+        }
+    }
     /// Copy is served by the same Store which published the immutable source.
     pub(crate) fn text_copy(
         &self,
@@ -527,9 +547,7 @@ impl Handle {
     ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
         match &self.0 {
             Owner::Local(local) => Ok(local.presentation(chat_id, after)),
-            Owner::Remote(remote) => {
-                remote.call("presentation", serde_json::json!([chat_id, after]))
-            }
+            Owner::Remote(remote) => remote.presentation(chat_id, after),
         }
     }
     pub fn session_id(&self) -> Option<String> {
