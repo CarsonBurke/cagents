@@ -1,0 +1,96 @@
+{
+  "caller_limits": "Original315 SOURCE classifier and f95 cab applicability plus exact bb8 dd632 two-title inert join, then genuine92b8 one-helper-local Operation import semantic/conservation layer. No runtime caller/authority proof, genuine originalUser5, native, whole52, whole inherited55-path stack or old execution transfer. Natural inherited Agent authority remains opaque and unaltered. Nested cases/peers/loops have no separate ordinary-parent, PID, wait or ELF credit.",
+  "genuine_User5_excluded": [
+    "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+    "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+    "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+    "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+    "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel"
+  ],
+  "graph": [
+    "host"
+  ],
+  "kind": "SOURCE_PINNED_ORDINARY_STARTUP_CALLER_MAP_NOT_EXECUTED_PARENT_INVENTORY",
+  "owning_harness_invocations_max": 1,
+  "owning_passes_max": 6,
+  "parents": [
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SOURCE_ONLY_FROM_315_CAB_DD632_JOIN",
+      "definition_line": 5059,
+      "expected_stdout_child_results": 0,
+      "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+      "ordinary_source_declaration": true,
+      "original_at": "src/host/state.rs:5037",
+      "selection_partition": "Root35",
+      "source": "src/host/state.rs",
+      "source_sha256": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SOURCE_ONLY_FROM_315_CAB_DD632_JOIN",
+      "definition_line": 6631,
+      "expected_stdout_child_results": 0,
+      "name": "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+      "ordinary_source_declaration": true,
+      "original_at": "src/persistence.rs:6631",
+      "selection_partition": "Main15_remaining17",
+      "source": "src/persistence.rs",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SOURCE_ONLY_FROM_315_CAB_DD632_JOIN",
+      "definition_line": 9227,
+      "expected_stdout_child_results": 0,
+      "name": "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+      "ordinary_source_declaration": true,
+      "original_at": "src/persistence.rs:9227",
+      "selection_partition": "Main15_remaining17",
+      "source": "src/persistence.rs",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SOURCE_ONLY_FROM_315_CAB_DD632_JOIN",
+      "definition_line": 8233,
+      "expected_stdout_child_results": 0,
+      "name": "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+      "ordinary_source_declaration": true,
+      "original_at": "src/persistence.rs:8233",
+      "selection_partition": "Main15_remaining17",
+      "source": "src/persistence.rs",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SOURCE_ONLY_FROM_315_CAB_DD632_JOIN",
+      "definition_line": 8328,
+      "expected_stdout_child_results": 0,
+      "name": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+      "ordinary_source_declaration": true,
+      "original_at": "src/persistence.rs:8328",
+      "selection_partition": "Main15_remaining17",
+      "source": "src/persistence.rs",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SOURCE_ONLY_FROM_315_CAB_DD632_JOIN",
+      "definition_line": 10701,
+      "expected_stdout_child_results": 0,
+      "name": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+      "ordinary_source_declaration": true,
+      "original_at": "src/persistence.rs:10701",
+      "selection_partition": "Main15_remaining17",
+      "source": "src/persistence.rs",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df"
+    }
+  ],
+  "product": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+  }
+}

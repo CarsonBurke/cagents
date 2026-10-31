@@ -1,0 +1,291 @@
+{
+  "kind": "issued-return-b8-bounded-source-correction-freeze-v1",
+  "status": "FROZEN_SOURCE_FOR_INDEPENDENT_DELTA_REVIEW_NOT_RUNTIME_QUALIFIED",
+  "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+  "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+  "parent_tree": "a4bed73ab90387d45052999f1f762545726eae04",
+  "API_composition_base": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+  "API_tree": "834d2844924ea655ecf84952d682e8c645089425",
+  "branch": "fix/fw16-stale-shared-return-error-main15",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15",
+  "tracked_clean": true,
+  "created_utc": "2026-10-31T16:22:41.296499+00:00",
+  "reviews_addressed": [
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b8ebb9ca-independent-assembled-UX-lifecycle-source-oracle-review-v1.json",
+      "sha256": "fe12f34e555ae6aae84815ce23934310e622d4f4a10b867b4c8fd06f351f2a35",
+      "bytes": 16798,
+      "mode": "0444"
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b8ebb9ca-issued-return-independent-authority-caller-source-review-v1.json",
+      "sha256": "5cd3b4a89a2f7cdd97c70e6009fc15ad6f47ce0413af8d78db5afc8a972e1e01",
+      "bytes": 14391,
+      "mode": "0444"
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b8ebb9ca-issued-return-consumer-independent-source-conservation-review-v1.json",
+      "sha256": "8b4e4723ad52c5d83161247eb7c04d06c42db28bf815725e9e136c19387b23f3",
+      "bytes": 27422,
+      "mode": "0444"
+    }
+  ],
+  "correction_paths": [
+    "src/app/chat_ui.rs",
+    "src/app/chrome_ui.rs"
+  ],
+  "full_consumer_paths_vs_API": [
+    "src/app.rs",
+    "src/app/chat_ui.rs",
+    "src/app/chrome_ui.rs"
+  ],
+  "source_blobs": {
+    "src/app.rs": {
+      "entry": "100644 blob be8e325257d237b5bd13ae14890591fea3b0ab0e",
+      "bytes": 1390648,
+      "sha256": "de2b68f872f4195e87a3cbdee1fa846ab2655726cf9e8540141ec0701f5aec4c"
+    },
+    "src/app/chat_ui.rs": {
+      "entry": "100644 blob 77681ebe5c3050ab212be626ed487e0d63618ba9",
+      "bytes": 1418988,
+      "sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+    },
+    "src/app/chrome_ui.rs": {
+      "entry": "100644 blob e94db20b119745f12f5e3d4069ff8fe25154be03",
+      "bytes": 160413,
+      "sha256": "651091245803497ff0705a287d952b839137c4cf842675617d4752e26eb0272c"
+    }
+  },
+  "implementation_corrections": [
+    "First valid pending current-operation issued Some keeps the captured queued C1/source/presentation/Arc/save caller independently of current presentation matching. Presentation conversion still requires the original current presentation; accepted recipe B is not converted. Late-after-firstErr, unknown context, duplicate and conflicting nonce rules remain unchanged.",
+    "Held first-valid queued C1 exposes a distinct owned ContinueClose purpose and existing RetryCleanup(C1 UUID) route. It cannot acquire D or substitute R/C2. Existing queued q checks still refuse; no q relaxation or orphan bypass.",
+    "Popup::Notices keyboard ring and mounted issued buttons share IssuedNotice.action_id from the same filtered rows/actions. Busy or blocked rows have no offered action. Owned keys still bind presentation UUID, operation, attempt and purpose; no receipt in UI IDs.",
+    "Missing native operation including nil now returns false before any mutation. A live matching Target alone cannot admit an Err.",
+    "The existing coarse retry severity is filtered against actual offered/blocked/error rows so a warning-only held issuance does not invent an Application errors anchor."
+  ],
+  "conservation": {
+    "total_entries": 2231,
+    "outside_three_equal_API_entries": 2228,
+    "outside_two_equal_b8_entries": 2229,
+    "API14": "All inherited published API entries remain exact615e; no API authorship or result transfer.",
+    "app_rs_exact_b8": true,
+    "protected_function_spans_equal_API_and_b8": 32,
+    "historical_full_early_Close_guard": {
+      "exact": true,
+      "bytes": 874,
+      "sha256": "bc7b40fa27a72af46891dfea62a93afbf65ec3d045e8134fb03fd3216300df21"
+    },
+    "static_lexical_ledgers": {
+      "615e": {
+        "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-consumer-static-vs615e-v1.json",
+        "sha256": "299ea0a155d7f8ddf6d9c6adbd3765124d2a9cdc67b393b61a9ec02a76d1c187",
+        "bytes": 36405,
+        "mode": "0444"
+      },
+      "b8": {
+        "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-consumer-static-vsb8-v1.json",
+        "sha256": "971df8817c59bf7e2727832ed040251b0d4d6a47f3663dc652c92b9526d6ddb5",
+        "bytes": 21446,
+        "mode": "0444"
+      }
+    },
+    "exact_bounded_patch": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-b8-bounded-correction-v1.patch",
+      "sha256": "37fac55564dc80bbe1bad4547a6c23ad96b6cd0dc6c8b20478f91f0f7fbb0e4e",
+      "bytes": 34868,
+      "mode": "0444"
+    },
+    "ledger_scope": "Author-generated static Git/text/hash observations, not an independent semantic review. Both ledgers include measured owning-body and uniquely named helper/function before/after hashes. Overloaded functions are not falsely claimed fully enumerated."
+  },
+  "source_oracles": {
+    "selectors": [
+      "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+      "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody"
+    ],
+    "new_owning_parents": 0,
+    "executed": false,
+    "nested_corrections": [
+      "Actual Switch with live !exited Arc, genuine shared/nonshared origin capture, C1 then C2, optional actual registry admission, real View.apply recipe-B update and App.update(Read), followed by first valid Some without prior Err. Mounted Tab/Shift-Tab ContinueClose uses original C1; typed component Closed leaves full B/open/order/focus/draft/readable original runtime unchanged.",
+      "Nil/unknown operation with matching live Target and wrong Target with real operation Err leave genuine pending flag/first-error/phase/C1/native stage/shared ledger/issued records untouched; existing real-operation Err controls remain in same parents.",
+      "The real supplied ControlClient exact-nonce refusal result and original tuple are returned from the framing component into the owning IssuedCloseFinished callback; original receipt/source/C1/error and mounted RetryClose/fresh attempt are asserted. No unrelated synthetic Unknown substitutes for that refusal.",
+      "Actual production Tab and Shift-Tab navigation focus operations run on mounted Notices widgets before Enter, with membership checks for Close/ContinueClose/RetryClose/RetryFlush/RetryAck. Busy and q issued controls are absent from the ring. Only future test-local widget focus operations are consumed; provider/cleanup/save Tasks remain dropped.",
+      "Existing current-A Some canonical ACK/Close positives, q/raw-managed verification, firstClose-after-B, late-after-firstErr/noClose/duplicate/conflict, stale callbacks, save/ACK ordering and retained-press controls remain."
+    ],
+    "measured_owning_bodies_vs_b8": {
+      "src/app.rs": {
+        "owning_count_before": 271,
+        "owning_count_after": 271,
+        "unchanged_body_count": 271,
+        "changed_bodies": [],
+        "added_owning_parents": [],
+        "executed": false
+      },
+      "src/app/chat_ui.rs": {
+        "owning_count_before": 286,
+        "owning_count_after": 286,
+        "unchanged_body_count": 285,
+        "changed_bodies": [
+          {
+            "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+            "before": {
+              "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+              "bytes": 12053,
+              "sha256": "5d6d6c2a11c3daaaaba5618e4893662b1c4194db1b43f2734ceb7b232c7c64e0"
+            },
+            "after": {
+              "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+              "bytes": 12109,
+              "sha256": "565bd3c418fc742f2d7b25dba2a66ad5aa28ae84fdbf651aacac2d4a350c56b7"
+            }
+          }
+        ],
+        "added_owning_parents": [],
+        "executed": false
+      },
+      "src/app/chrome_ui.rs": {
+        "owning_count_before": 27,
+        "owning_count_after": 27,
+        "unchanged_body_count": 27,
+        "changed_bodies": [],
+        "added_owning_parents": [],
+        "executed": false
+      }
+    },
+    "measured_owning_bodies_vs_API": {
+      "src/app.rs": {
+        "owning_count_before": 271,
+        "owning_count_after": 271,
+        "unchanged_body_count": 271,
+        "changed_bodies": [],
+        "added_owning_parents": [],
+        "executed": false
+      },
+      "src/app/chat_ui.rs": {
+        "owning_count_before": 286,
+        "owning_count_after": 286,
+        "unchanged_body_count": 281,
+        "changed_bodies": [
+          {
+            "name": "a_chat_whose_return_failed_reads_the_activity_it_missed",
+            "before": {
+              "name": "a_chat_whose_return_failed_reads_the_activity_it_missed",
+              "bytes": 1427,
+              "sha256": "80f092d1eb0fd68954f53ce692eae10296775c69056e65f099f067a480e87fd7"
+            },
+            "after": {
+              "name": "a_chat_whose_return_failed_reads_the_activity_it_missed",
+              "bytes": 1478,
+              "sha256": "02c208a8e5f37e6a8f12250cb34cb57fd49248b5609c9af5a9fabfb270e99f1a"
+            }
+          },
+          {
+            "name": "a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
+            "before": {
+              "name": "a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
+              "bytes": 3083,
+              "sha256": "ea0c1e1d6d9060b51368b548f871ee1c618b49d4d47c0a973a0eb8a4cd0fd142"
+            },
+            "after": {
+              "name": "a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
+              "bytes": 2617,
+              "sha256": "f342528f9df1670c7630d16682f098b23a6d0ee43376fed0dddf372a53a67e77"
+            }
+          },
+          {
+            "name": "current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+            "before": {
+              "name": "current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+              "bytes": 19848,
+              "sha256": "a088e29e57e17ff7f95a91931779f82c62ef9578aad0317329c5a4064cb26dab"
+            },
+            "after": {
+              "name": "current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+              "bytes": 21965,
+              "sha256": "6b8beced27863b65207fc2f4f2bb543ef991ed9e5ccf947f9170f28562f4bb58"
+            }
+          },
+          {
+            "name": "late_handoff_reply_cannot_consume_a_restart_close",
+            "before": {
+              "name": "late_handoff_reply_cannot_consume_a_restart_close",
+              "bytes": 669,
+              "sha256": "2fd2155737b9563e45802a627b1137da4126f8ac38f6aba8949a8cd0c5a1dd94"
+            },
+            "after": {
+              "name": "late_handoff_reply_cannot_consume_a_restart_close",
+              "bytes": 720,
+              "sha256": "f8cfa939b650860f81783d38eed3aeb055f8ec0b00ab5e506e3b677da414dbd5"
+            }
+          },
+          {
+            "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+            "before": {
+              "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+              "bytes": 11081,
+              "sha256": "435ed80d2089cc845459ffbb15538d2974cb793320b6f3948d3d0292bbe861dc"
+            },
+            "after": {
+              "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+              "bytes": 12109,
+              "sha256": "565bd3c418fc742f2d7b25dba2a66ad5aa28ae84fdbf651aacac2d4a350c56b7"
+            }
+          }
+        ],
+        "added_owning_parents": [],
+        "executed": false
+      },
+      "src/app/chrome_ui.rs": {
+        "owning_count_before": 27,
+        "owning_count_after": 27,
+        "unchanged_body_count": 27,
+        "changed_bodies": [],
+        "added_owning_parents": [],
+        "executed": false
+      }
+    },
+    "helper_hashes": "See both static_lexical_ledgers; same two owning selectors, but shared helper bodies changed and are explicitly measured. No blanket757-body credit."
+  },
+  "checks": [
+    {
+      "command": "rustfmt --edition 2024 --config skip_children=true src/app.rs src/app/chat_ui.rs src/app/chrome_ui.rs",
+      "exit": 0,
+      "scope": "Only approved source files; parser/formatter, no typecheck"
+    },
+    {
+      "command": "scripts/check-format",
+      "exit": 0,
+      "tool_chunk": "c49b72",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0,
+      "scope": "Formatting checks only; no implementation compilation"
+    },
+    {
+      "command": "git diff --check",
+      "exit": 0,
+      "tool_chunk": "2f31d0"
+    },
+    {
+      "command": "Own static source/Git/JSON/hash conservation scripts",
+      "exit": 0,
+      "scope": "No product import/function/helper/test/module/Task evaluation"
+    },
+    {
+      "command": "Private git commit",
+      "exit": 0,
+      "tool_chunk": "03ea46",
+      "note": "Hooks and commit signing disabled for this source-only private commit to avoid executing unadmitted hooks/tools; identity unchanged."
+    }
+  ],
+  "limits": [
+    "All edited-head Rust tests, compile/type checks, genuine User5 and native UX/host/provider effects remain UNRUN. A formatter parse is not compilation.",
+    "Framed socket peers, synthetic caller contexts, typed outcomes and save/ACK barriers are component source oracles only; no actual native owner, durable writer, worker/native process or complete User authority behavior was exercised.",
+    "Existing qclosed/general recovery HOLD remains; no q/proof/admission promotion or native result transfer.",
+    "Prior aeb47/b8/API/canonical results do not transfer to this head. No whole-product, native, runtime, merge, readiness, execution, lane or resource grant is claimed. PR1933 remains NEVER MERGE.",
+    "Source writes stop at this freeze pending exact-head independent correctness/authority/UX/conservation delta reviews. Root retains publication/stewardship."
+  ],
+  "grant": null,
+  "runtime_results": null,
+  "native_qualification": null,
+  "publication": null
+}

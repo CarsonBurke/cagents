@@ -1,0 +1,164 @@
+{
+  "kind": "FINITE_HOST16_TASK_LOGIC_PREPARATION_NOT_FINAL_PRODUCT_BINDING_OR_ADMISSION",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-issued-return-host16-preparation",
+  "branch": "qualification/coord16-main15-issued-return-host16-preparation",
+  "HEAD_donor_only": "993cea26a29b5a2cd6857a959628de4e5f04c096",
+  "HEAD_tree_donor_only": "7ea6b11b3b9a18ac87828a1ee39d7e5380eb5065",
+  "donor_runner_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
+  "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-issued-return-host16-preparation/qualification-packets/main15-issued-return-host16-preparation",
+  "files": {
+    "plan.json": {
+      "bytes": 20271,
+      "sha256": "def29c71f3015be9e4d16f1f6ca1be0af125e79c1b1f241889d8934a28db17bb"
+    },
+    "run-packet.py": {
+      "bytes": 74505,
+      "sha256": "85ab8f7669d55dc24ec36316048b2886c5a9f2f54003af6b4e632e34587e6a53"
+    },
+    "source-preparation-proof.json": {
+      "bytes": 450482,
+      "sha256": "ad16bb4f959aac3789e77a619b5c7e4fcc1295055d4100152a232be7bdbe488c"
+    }
+  },
+  "tracked_source_edits": [],
+  "new_uncommitted_packet_files": 3,
+  "local_commit_created": false,
+  "source_preservation": {
+    "other_top_level_definitions_byte_exact": 29,
+    "all_five_nested_byte_exact": true,
+    "canonical877byte_definition_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "full3790byte_close_block_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "execute_contracts_and_grouped_result_byte_exact": true,
+    "group_accounting_inverse_only_labels_counts": true,
+    "whole_module_inverse": "Exactly three task functions plus WT/PLAN/PLAN_SHA restore original993 runner; complete bounded line forward/true-inverse fragments in source-preparation-proof.json.",
+    "compact_terminal_final_return_original_Popen_wait_pidfd_family_cancel_error_stickyFAIL_HOLD_Cclose": "BYTE_EXACT"
+  },
+  "genuine_complete_DATA": {
+    "path": "/tmp/issued-return-cleanup-615e62c0-host-qualification-DATA-v1.json",
+    "sha256": "ee9956573d7fc627cf517897a66950c037eec1049c3c2f335e167cd09f492542",
+    "bytes": 49097,
+    "schema": "issued-return-cleanup-host-qualification-DATA-v1",
+    "scope": "IMMUTABLE_STAGING_DATA_NOT_EXECUTION_OR_FINAL_APPROVAL"
+  },
+  "precursor_API_reference_only": {
+    "api_head": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+    "api_tree": "834d2844924ea655ecf84952d682e8c645089425",
+    "api_parent": "9c19e1291c83c4a2f7d91fe2e6f59f4aa1d88478",
+    "worktree_locator_only": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issued-return-cleanup-api"
+  },
+  "selector_order": [
+    "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+    "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+    "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+    "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+    "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+    "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+    "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+    "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+    "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+    "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+    "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+    "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+    "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+    "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+    "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+    "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement"
+  ],
+  "selector_durations_seconds": [
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    45,
+    15,
+    45,
+    45,
+    45,
+    45
+  ],
+  "command_phase_count": 19,
+  "DATA_entry_count": 21,
+  "command_caps_sum_seconds": 2250,
+  "source_reservation_sum_seconds": 90,
+  "DATA_total_seconds": 2340,
+  "DATA_outer_slack_seconds": 60,
+  "original_absolute_workload_cap_seconds": 2400,
+  "source_reservation_exact_enforcement": false,
+  "source_reservations_create_command_or_wait_receipts": false,
+  "canonical_inventory_and_DATA_argv": {
+    "canonical_retained": [
+      null,
+      "--list",
+      "--color=never"
+    ],
+    "immutable_DATA": [
+      null,
+      "--list",
+      "--format",
+      "terse"
+    ],
+    "reconciled": null
+  },
+  "known_final_adapter_reconciliation": [
+    "Thirty-second prebinding and sixty-second postbinding/receipt entries are SOURCE DATA reservations only. Canonical main has no aggregate30s prelease deadline; final_observations/custody/HOLD cannot be abandoned after60s. They are not extra Popen invocations or original-wait receipts.",
+    "Canonical execute_contracts inventory argv is [ELF,--list,--color=never], while immutable DATA proposes [ELF,--list,--format,terse]. Preserve canonical code and both literal contracts. No equivalence or exact terse implementation is asserted; final additive DATA/argv reconciliation remains pending.",
+    "Nineteen command phases have2250s caps; two reservations add90s for DATA total2340 with60s outer slack. Original2400 workload cap and remaining clamps remain unchanged. No measured timing or full lifecycle bound is claimed.",
+    "Selected private /bin/cat/PTY/terminal/process/thread/file/scripted-Python fixtures are real future work, not inert arithmetic, genuine production User authority or commercial provider/account evidence.",
+    "Deferred retained_terminal_handoff_proves_original_console_cleanup is excluded and UNQUALIFIED. No emitted helper/envbinding/reexec/env_clear/nocapture/custom child mode is adopted.",
+    "Source eligibility/cfg/caller tables and pins are615e staging DATA only. Final combined API+UI consumer source and real owning declarations require fresh source binding; no615e runtime, final product adoption or transferred result."
+  ],
+  "deferred_affected_neighbor": {
+    "boundary": "Needs separate same-head helper, caller-preservation and custody qualification. No helper path override, invocation, authority clearing/downgrade or role change is proposed here. It remains an explicitly unqualified affected neighbor.",
+    "facts": "retained_turn_final_action462 requires CAGENTS_TEST_RETAINED_ACTOR_HELPER463 and reexecs current test binary487 with --exact/--nocapture and env_clear488. It is not an ordinary no-child-results parent.",
+    "selected": false,
+    "selector": "host::chat::retained_actor_tests::retained_terminal_handoff_proves_original_console_cleanup",
+    "source": "src/host/chat/retained_actor_tests.rs:448"
+  },
+  "caller_fixtures": {
+    "ack": "Private UnixStream pair and synthetic authority. Two captured receipt acknowledgements, scoped denial, wrong proof and nil receipt controls. Private unscoped case is not actual production User authority.",
+    "actual_scope": "UNKNOWN/UNREAD. Caller compatibility below is source classification, not runtime/admission authority.",
+    "existing3": "Private upgrade/paired fixtures and authored Python provider/credential sentinels. These create processes/threads/files; not inert data tests or commercial provider/account evidence.",
+    "new10": "Reuse exact physical review class: private HostState/synthetic clients and owned TerminalHandle/native targets, actual private /bin/cat/PTY workers. No real User endpoint or commercial provider auth oracle.",
+    "runtime_limit": "Some selected tests create PTYs/processes/threads/files. Source caller compatibility supplies no resource/cleanup grant; existing Root16 custody/return rules remain separate.",
+    "selected16": "No selected source requires inherited authority absence or genuine User producer. Preserve opaque inherited authority; no unset/clear/replace, new context/role, remote User proxy or credential probe.",
+    "wire_controls": "In-memory framing and private stream handshake, not actual installed-peer/provider endpoint."
+  },
+  "pending_final_bindings": [
+    "Genuine final combined Main15 product head/tree/sole parent, exact source objects and final API plus typed UI consumer/nonce/caller/presentation composition;615e is staging reference only.",
+    "Actual final source/cfg/fixture/caller classifications, source file/mode/blob/SHA pins and exact definition order for all16 ordinary HOST parents; DATA source claims alone do not establish executed bodies.",
+    "Genuine final API/caller/correctness/conservation/UX-source/adoption/publication proof chain in actual formats; fresh final source unions cannot inherit staging runtime qualification.",
+    "Task-main genuine typed proof reader, actual final product checkout and archive/source enrollment replacing the fixed intermediate refusal through separately reviewed SOURCE; no data flag enables this prototype.",
+    "Explicit final DATA/argv reconciliation for canonical inventory flags and honest30/60 reservation semantics; no protected cleanup deadline or invented source-phase invocation.",
+    "Frozen final controller/plan/manifest/inverses and fresh independent actual-code/conservation/argv review; later external final argv may leave only grant slot5 NULL.",
+    "Separate authentic current EC source/resource adoption and one-use scoped grant with actual source/context/tool/target/lock admission; current inherited authority remains opaque and unread.",
+    "Actual same-final-root HOST CargoJSON emitted libtest ELF and fresh full unique inventory N, then16 strict original singleton results and original waits/custody; no guessed N, child/footer inflation or historical pass transfer.",
+    "Deferred helper/reexec neighbor, full Host/UI/native cleanup/consumer flow, independent native UX and whole outcome remain separate unqualified obligations."
+  ],
+  "original_source_tools": {
+    "path": "/var/tmp/coord16-main15-issued-return-host16-preparation-original-tools-f2316b05.json",
+    "sha256": "24a63952ec33c0f26a63d6969addeaa9bc36fe451208db2a5db2cb6668379729"
+  },
+  "author_utility_errors": [],
+  "tool_display_limit_preserved": "Initial full DATA display truncated; first8 selection records reread. Complete immutable DATA bytes preserved as original_utf8 in source proof.",
+  "instruction_source": {
+    "filesystem_sha256": "efe6c9ee09c8c9a1fd6ff268568a1906280a1a58910b5dcc14a0668bd01d3456",
+    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+    "variance": true,
+    "index_flag": "H AGENTS.md",
+    "bytes_flags_changed_by_author": false,
+    "latest_user_AGENTS_instructions_followed": true
+  },
+  "current_final_product_proofs_inventory_ELF_results_grant": null,
+  "execution_authorized": false,
+  "queueable": false,
+  "runnable_final_packet": false,
+  "independent_final_review_requested": false,
+  "writer_released_after_finite_preparation": true,
+  "stop_boundary": "Fixed task-main refusal before resource actions; no source flag/data can enable it. Authentic final combined API+consumer tuple/proofs and separately reviewed final typed source adapter are required. Prior ee7 controllers/Main15UI2 draft/615e product WTs unchanged."
+}

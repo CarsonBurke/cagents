@@ -1,0 +1,188 @@
+{
+  "kind": "return-operation-trait-single-helper-import-source-freeze-v1",
+  "status": "FROZEN_SOURCE_FOR_INDEPENDENT_REVIEW_NOT_COMPILE_TEST_OR_RUNTIME_QUALIFIED",
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "parent_tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+  "branch": "fix/fw16-return-operation-trait-main15",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15",
+  "tracked_clean": true,
+  "created_utc": "2026-10-31T19:15:20.945649+00:00",
+  "changed_paths": [
+    "src/app/chat_ui.rs"
+  ],
+  "exact_diff": "diff --git a/src/app/chat_ui.rs b/src/app/chat_ui.rs\nindex 8aded4804..012698f59 100644\n--- a/src/app/chat_ui.rs\n+++ b/src/app/chat_ui.rs\n@@ -31656,7 +31656,7 @@ mod tests {\n     ) -> Vec<Message> {\n         use iced::advanced::{\n             Layout, Shell, clipboard, layout,\n-            widget::{Tree, operation},\n+            widget::{Operation, Tree, operation},\n         };\n         use iced::futures::StreamExt;\n         let ring = app.shared_return_notice_ring_for_test();\n",
+  "single_authorized_change": {
+    "function": "tab_mounted_return_control",
+    "scope": "Local use inside existing cfg(test) module",
+    "before": "widget::{Tree, operation}",
+    "after": "widget::{Operation, Tree, operation}",
+    "reason": "Bring the same local widget Operation trait that defines finish() into this helper scope; retain the existing probe.finish() expression and all navigation/Task/assertion logic."
+  },
+  "source": {
+    "src/app/chat_ui.rs": {
+      "before_entry": "100644 blob 8aded4804a4055f04fadba8054fd26e42eeeba75",
+      "after_entry": "100644 blob 012698f59a96bfb0639bd95a710646ea829afcda",
+      "before_bytes": 1419010,
+      "after_bytes": 1419021,
+      "before_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d",
+      "after_sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474"
+    }
+  },
+  "trait_static_evidence": {
+    "vendor/iced-core/src/widget.rs": {
+      "sha256": "7b0db7c4bcc3cea24a4482399732b5e6b9a7cfcd5a027886d265a3fef247286a",
+      "bytes": 4989,
+      "evidence": [
+        {
+          "line": 7,
+          "source": "pub use operation::Operation;"
+        }
+      ]
+    },
+    "vendor/iced-core/src/widget/operation.rs": {
+      "sha256": "bd70da7d8867aeab6953794e00dc8adcced21557aeffa0cb12e7952c69a06a7c",
+      "bytes": 15371,
+      "evidence": [
+        {
+          "line": 21,
+          "source": "pub trait Operation<T = ()>: Send {"
+        },
+        {
+          "line": 75,
+          "source": "fn finish(&self) -> Outcome<T> {"
+        },
+        {
+          "line": 140,
+          "source": "fn finish(&self) -> Outcome<O> {"
+        },
+        {
+          "line": 243,
+          "source": "fn finish(&self) -> Outcome<O> {"
+        },
+        {
+          "line": 403,
+          "source": "fn finish(&self) -> Outcome<B> {"
+        },
+        {
+          "line": 507,
+          "source": "fn finish(&self) -> Outcome<B> {"
+        },
+        {
+          "line": 557,
+          "source": "fn finish(&self) -> Outcome<Message> {"
+        }
+      ]
+    }
+  },
+  "conservation": {
+    "whole_file_exact_single_local_import_replacement": true,
+    "inverse_recovers_exact_bb8_file": true,
+    "total_entries": 2231,
+    "outside_one_entries_mode_type_blob_equal_bb8": 2230,
+    "all_entry_modes_and_types_unchanged": true,
+    "same_file_function_spans_total": 731,
+    "same_file_full_functions_byte_identical": 730,
+    "only_changed_function_span": [
+      {
+        "name": "tab_mounted_return_control",
+        "before": {
+          "name": "tab_mounted_return_control",
+          "bytes": 4517,
+          "sha256": "507b05533cd308dce4bcfb054adaab158bcc553fab66da84cf704a8aacbc5dbb"
+        },
+        "after": {
+          "name": "tab_mounted_return_control",
+          "bytes": 4528,
+          "sha256": "95dc043295d53527225dd674c958a6c5f05a3c003c419c617ce2f8956d92e847"
+        }
+      }
+    ],
+    "all_production_prefix_bytes_identical": 598988,
+    "all_same_file_owning_test_bodies_byte_identical": 286,
+    "all_other_test_bodies_equal_by_outside_file_tree_equality": true,
+    "new_tests_or_functions": 0,
+    "all_protected_guard_proof_caller_nonce_cleanup_API_retained_native_1749_sources_exact_bb8": true,
+    "ledger": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-function-conservation-v1.json",
+      "bytes": 148553,
+      "sha256": "d959b0214a49aaeb8493cd4d1b59c74d69f4ef3caa78b9a950c5f5bcbd80b555",
+      "mode": "0444"
+    },
+    "exact_patch": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-exact-single-import-diff-v1.patch",
+      "bytes": 480,
+      "sha256": "8bdfa3f37fa5bf5b9dd4482872bb0600676b5dd6657c889ce342184f630b7c48",
+      "mode": "0444"
+    },
+    "method": "Author static lexical full-function source spans, exact whole-file inverse and full-tree mode/type/blob equality. No independent correctness review or compiler success inferred."
+  },
+  "original_diagnostic": {
+    "code": "E0599",
+    "location_reported_by_lead": "src/app/chat_ui.rs:31723",
+    "expression": "let _ = probe.finish();",
+    "lead_reported_cause": "Operation trait absent from this test-helper scope",
+    "original_cargojson_path": null,
+    "original_cargojson_sha256": null,
+    "original_error_bytes_observed": false,
+    "binding_status": "PENDING_B9_EXACT_ORIGINAL_CARGOJSON_PATH_AND_HASH; not invented, no whole RAW audit. Any later original-error-only binding must be an additive receipt, not a rewritten freeze.",
+    "original_result_transfer": false
+  },
+  "source_only_checks": [
+    {
+      "command": "scripts/check-format",
+      "exit": 0,
+      "tool_chunk": "1e7de7",
+      "original_output": [
+        {
+          "path": "/tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stdout-v1.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "mode": "0444"
+        },
+        {
+          "path": "/tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stderr-v1.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "mode": "0444"
+        }
+      ],
+      "scope": "Official source formatter only; Cargo fmt/metadata within formatter authorized, no Cargo check/build/test/rustc/native."
+    },
+    {
+      "command": "git diff --check",
+      "exit": 0,
+      "tool_chunk": "84cfa0",
+      "stdout_bytes": 0,
+      "stderr_bytes": 0
+    },
+    {
+      "command": "Own static source/Git/JSON/hash conservation",
+      "exit": 0,
+      "tool_chunk": "4bce68",
+      "scope": "No product/helper/test/Task/module import/evaluation"
+    },
+    {
+      "command": "Private new worktree and source commit",
+      "exit": 0,
+      "tool_chunks": [
+        "8f8e02",
+        "79fad0"
+      ],
+      "scope": "Private Git common only; hooks and signing disabled to avoid executing unadmitted tools; existing identity preserved."
+    }
+  ],
+  "limitations": [
+    "No Cargo check/build/test/rustc/native, app/provider/helper/Task evaluation or environment/account/authority/process/resource/cache/target/permission probe. Official formatter is not a typecheck or test.",
+    "The lead-reported bb8 CLI0/UIbinary0/UIlib101 negative and all5 UNRUN remain original history. This successor has no compile, test or native result and no old grant/pass transfer.",
+    "Original bb8 and other old worktrees/refs/negative histories unchanged. No controller, publication, API or runtime state change.",
+    "Product writes stop at this immutable tuple. Independent bounded correctness/caller/UX and conservation reviews, then Root source adoption/publication and separately admitted controller/product binding remain required.",
+    "Native, genuine User5, whole-product and qclosed/general outcomes remain HOLD; no readiness, merge, lane/C/resource/grant or runtime authorization claim."
+  ],
+  "actual_grant": null,
+  "compile_result": null,
+  "test_results": null,
+  "native_result": null,
+  "publication": null
+}

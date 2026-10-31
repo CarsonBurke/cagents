@@ -1,0 +1,79 @@
+{
+  "kind": "main15-operation-trait-single-import-reviewed-source-assembly-handoff-v1",
+  "created_utc": "2026-10-31T19:28:13.274281+00:00",
+  "status": "BOUNDED_REVIEWED_SOURCE_FOR_EC_ADOPTION_PUBLICATION_ONLY",
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "parent_tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15",
+  "branch": "fix/fw16-return-operation-trait-main15",
+  "exact_change": "Only helper-local cfg(test) import in tab_mounted_return_control: widget::{Tree, operation} -> widget::{Operation, Tree, operation}. Existing probe.finish(), focus traversal, event handling, Task restrictions and assertions unchanged. Production source unchanged.",
+  "author_freeze": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-single-import-source-freeze-v1.json",
+    "bytes": 8301,
+    "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd"
+  },
+  "diagnostic_and_neighbor_addendum": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-diagnostic-neighbor-source-binding-addendum-v1.json",
+    "bytes": 7259,
+    "sha256": "92832731f3d2f00142e8d3473f1f85a5578c6166f5a2fa12eada0f18b265d4fe"
+  },
+  "lead_intake": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-main15-operation-trait-single-import-source-lead-intake-v1.json",
+    "bytes": 5375,
+    "sha256": "1f0dc2be5b7100c2703c984b8f7e2d87eb218d818b9ed42a0acd345e719e7534"
+  },
+  "independent_semantic_caller_ux_source_review": {
+    "path": "/tmp/92b8-operation-trait-single-import-independent-semantic-caller-ux-source-review-v1.json",
+    "bytes": 11908,
+    "sha256": "079eef1d3c39569141008ee704e9cdd4fefd4fab5e0850856aa6426a880921d4",
+    "reviewer": "/root/1239_provider_stream_order_review",
+    "verdict": "SOURCE_CLEAR",
+    "scope": "Exact helper-local cfg(test) Operation import and original E0599 applicability only; not whole55 stack, complete tree conservation, compile readiness or native qualification.",
+    "findings": []
+  },
+  "independent_source_conservation_review": {
+    "path": "/tmp/main15-92b8-import-conservation-hwrwp28k/review.json",
+    "bytes": 6445,
+    "sha256": "44daf3c9ac1f71d6a4b062e56e331077eb09cf2bc9c79a8c769ec35585352a4d",
+    "reviewer": "/root/1892_ready_attachment_review",
+    "verdict": "BOUNDED_CONSERVATION_CLEAR",
+    "scope": "Independent nonauthor exact-source conservation only; correctness/type resolution assigned1239. Author ledger treated as input and checked against actual Git bytes, not inherited as independent proof.",
+    "findings": []
+  },
+  "formatter_history": {
+    "original_physical_selection_unestablished": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-official-formatter-physical-toolchain-gap-addendum-v1.json",
+      "bytes": 4122,
+      "sha256": "69fe55e3b145b27d61379dc10321983bf0d7bf49b07b04c075adf5b30d3176a7"
+    },
+    "separate_current_explicit_physical_rust193_check_exit0": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-physical-rust193-official-format-check-v1.json",
+      "bytes": 2630,
+      "sha256": "4dab228c1f2406792174e942b0953cfb0d07055548166578d447eb35413f0a0d"
+    },
+    "current_check_terminal_tool_chunk": "19f2e3",
+    "not_retroactive_original_correction": true
+  },
+  "lead_assembly_assessment": "Independent scopes agree on exact immutable head/tree and no blocking source findings. Import restores the diagnosed trait method availability while preserving existing focus oracle; whole-file inverse and2230 outside Git entries conserve caller/proof/cleanup behavior. No production/visible-flow change from this correction, so no new screenshots solely for it. Original inherited visible flow still needs current native evidence and independent native UX review.",
+  "ownership": {
+    "implementation_owner": "Main15; product writes stopped at immutable head",
+    "independent_review_assignment": "EC supplied1239 semantic and1892 conservation; Main15 author/lead not self-independent",
+    "adoption_and_publication_owner": "EC only",
+    "controller_owner": "Root16; final bindings remain HOLD until authenticated adoption/publication",
+    "runtime_owner": "Separate exact authentic EC grant to B9 only; current Cda76 exclusively installer"
+  },
+  "limits": [
+    "Source clear only for this one-import delta, not whole55 stack, build readiness or merge.",
+    "Original accepted bb8 negative9475: CLI0/UI0/UIlib101; no test ELF/inventory and all five named tests UNRUN. No pass or grant transferred.",
+    "Successor compile/test/native results remain UNRUN. No runtime/host autochain or execution grant supplied here.",
+    "GenuineUser5/FULL52/physical retained helper/current native Before+After/WHOLE remain HOLD.",
+    "No source/controller/publication/permission/account/user-state changes while joining reviews."
+  ],
+  "successor_compile": null,
+  "successor_tests": null,
+  "successor_native": null,
+  "actual_grant": null,
+  "publication": null
+}

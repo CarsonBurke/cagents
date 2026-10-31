@@ -1,0 +1,25 @@
+{
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "276505a23858dcccd024e66417fecf3e2d702df743aa20a05e99a866d381206c",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source",
+  "execution_authorized": false,
+  "kind": "NOT_SUBMITTABLE_PRE_REVIEW_SOURCE_TEMPLATE",
+  "review_ABI": {
+    "controller_identity": "EXTERNAL_POSTCOMMIT",
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "review": "PENDING_GENUINE_FROZEN_CODE_REVIEW",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4"
+  }
+}

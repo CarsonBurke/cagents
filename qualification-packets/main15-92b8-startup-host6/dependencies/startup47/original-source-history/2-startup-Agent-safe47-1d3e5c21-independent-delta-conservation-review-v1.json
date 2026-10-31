@@ -1,0 +1,257 @@
+{
+  "actions": "Read-only immutable Git/source/hash/AST/JSON and in-memory diff inversion. No source/Git edits, builds/tests/candidate/controller/helper execution/import, native/provider/process/environment/account/DB/endpoint/target/resource probes, grants/remote writes or new workers. One task-owned successor /tmp receipt.",
+  "delta_conservation": {
+    "bidirectional_diffs": {
+      "from-579f9a58.diff.json": {
+        "sha256": "730855be531afb6b971f2ebbe7a7d5ef7b8c435f17f374761882c8c8a0b2b34e",
+        "true_byte_direction": true
+      },
+      "to-579f9a58.inverse.diff.json": {
+        "sha256": "d6450885415825d0d5ae77c60c685b4db0690bb3fa89ac98730f66c1cee961fc",
+        "true_byte_direction": true
+      }
+    },
+    "consequential_metadata": {
+      "adoption_and_execution_template_only_replace_exact_runner_pin": true,
+      "plan_command_data_required_contract_source_binding_entries_byte_exact": true,
+      "plan_sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043"
+    },
+    "history": {
+      "579_author_freeze_sha256": "8bff346f25a027c6d952a5a945b1bba65eb5e3d333d60ca8f89b1813267d9a11",
+      "579_historical_manifest_members_verified": 144,
+      "579_semantic_BLOCK_sha256": "27e9a935d6a732aedfd1c5904582573b8a4cb19e86c607a65d78d54bb7561b8f",
+      "579_semantic_BLOCK_top_fields": {
+        "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+        "scope": "Genuine fresh independent semantic/admission/source-join review of the one exact Agent-compatible47 packet. Existing generic execution machinery checked for conservation, not requalified as a whole engine. User5/FULL52/native/global scopes remain held.",
+        "verdict": "CONTROLLER_SOURCE_BLOCKED"
+      },
+      "all_other_old_history_entries_exact": true,
+      "five_579_snapshot_blobs_exact": [
+        "adoption-port.json",
+        "execution-template.json",
+        "manifest.json",
+        "run-packet.py",
+        "source-conservation.json"
+      ],
+      "old87_archive_bindings_byte_exact_and_hash_verified": true,
+      "original_579_Blocked_review_not_retargeted": true
+    },
+    "manifest": {
+      "all_hashes_lengths_modes_and_membership_verified": true,
+      "member_count": 153,
+      "packet_file_count": 154,
+      "sha256": "bf7bd79c16b5c9c77bdc98f368f3a1db82bab30d91fb8c1049b53d33298aa10e"
+    },
+    "runner": {
+      "adapter_first_line": 1211,
+      "adapter_nonblank_lines": 4,
+      "canonical9004_exact": true,
+      "complete_protected_execution_and_final_output_suffix_sha256": "84bbd6777acee6cc388c1f0d656df78c982165f53828eb956208bb00b03ed555",
+      "complete_protected_suffix_bytes": 8067,
+      "generic_parent_accounting_exact_to_579": true,
+      "nested_main_5": {
+        "context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
+        "invoke_fixture_group": "288e08759f96075a6a091c01f6626016f8ff55fda5a2033cf58c6d31537493f4",
+        "read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
+        "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06",
+        "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711"
+      },
+      "new_sha256": "93d01c01be059b8d64266afd293f176981285ac3a6255cb6b79cbe347f8bb54f",
+      "old_sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+      "only_delta_exact_adapter": "    parent_accounting = lambda *args, original=globals()['parent_accounting'], declared=len(selected): (\n        lambda result: ({**result[0], 'declared_requested_unique_parent_count': declared},\n                        result[1], result[2])\n    )(original(*args))\n\n",
+      "protected3790_exact": true,
+      "remove_adapter_restores_entire_579_bytes": true,
+      "top_functions_31": {
+        "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+        "cargo_helper_artifact": "cce4fa0819e7ce38157c45c4d8eb40df7e154d6d2fa94f3e39dfea52bd0d2712",
+        "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
+        "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+        "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+        "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+        "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+        "execute_contracts": "4e4a89a2ff0c78b44801023b9cf14a93757773baccf911a6886b3d38cbd43b8d",
+        "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+        "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+        "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+        "grouped_contracts": "a717b21552220893af18c2a2bf076134426141aff6e6cdfb2c18bef87c91d545",
+        "grouped_result": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115",
+        "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+        "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+        "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+        "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+        "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+        "parent_accounting": "b19820d92daeac72458a2ff1461eb0455f391c5cfa34630701aeff6ec74e6e37",
+        "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+        "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+        "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+        "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9",
+        "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+        "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+        "settle_children": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+        "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+        "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+        "task_elf_observation": "3cd165b37eb78c86f9bf35fe2ed7eef1401f073c3b166512763f6a7af75e2814",
+        "task_group_assets": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4",
+        "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
+      }
+    },
+    "selection": {
+      "CLI": 1,
+      "HOST": 6,
+      "UI": 40,
+      "actual_fields_null_no_admission": true,
+      "deferred5_no_invocation_causal_pass_credit": true,
+      "full52_and_User5_HOLD": true,
+      "selected47_distinct": true
+    },
+    "tree": {
+      "added_paths": [
+        "qualification-packets/startup30/from-579f9a58.diff.json",
+        "qualification-packets/startup30/history/579f9a58/adoption-port.json",
+        "qualification-packets/startup30/history/579f9a58/author-freeze.json",
+        "qualification-packets/startup30/history/579f9a58/execution-template.json",
+        "qualification-packets/startup30/history/579f9a58/independent-semantic-BLOCK.json",
+        "qualification-packets/startup30/history/579f9a58/manifest.json",
+        "qualification-packets/startup30/history/579f9a58/run-packet.py",
+        "qualification-packets/startup30/history/579f9a58/source-conservation.json",
+        "qualification-packets/startup30/to-579f9a58.inverse.diff.json"
+      ],
+      "all_other_preexisting_packet_entries_exact": 140,
+      "changed_paths": [
+        "qualification-packets/startup30/adoption-port.json",
+        "qualification-packets/startup30/execution-template.json",
+        "qualification-packets/startup30/from-579f9a58.diff.json",
+        "qualification-packets/startup30/history/579f9a58/adoption-port.json",
+        "qualification-packets/startup30/history/579f9a58/author-freeze.json",
+        "qualification-packets/startup30/history/579f9a58/execution-template.json",
+        "qualification-packets/startup30/history/579f9a58/independent-semantic-BLOCK.json",
+        "qualification-packets/startup30/history/579f9a58/manifest.json",
+        "qualification-packets/startup30/history/579f9a58/run-packet.py",
+        "qualification-packets/startup30/history/579f9a58/source-conservation.json",
+        "qualification-packets/startup30/manifest.json",
+        "qualification-packets/startup30/run-packet.py",
+        "qualification-packets/startup30/source-conservation.json",
+        "qualification-packets/startup30/to-579f9a58.inverse.diff.json"
+      ],
+      "modes_types_unchanged": true,
+      "modified_paths": [
+        "qualification-packets/startup30/adoption-port.json",
+        "qualification-packets/startup30/execution-template.json",
+        "qualification-packets/startup30/manifest.json",
+        "qualification-packets/startup30/run-packet.py",
+        "qualification-packets/startup30/source-conservation.json"
+      ],
+      "new_entries": 2376,
+      "no_deletions": true,
+      "old_entries": 2367,
+      "outside_packet_entries_exact": 2222
+    }
+  },
+  "final_recheck": {
+    "all_frozen_primary_pin_sha_length_and_working_bytes_exact": true,
+    "clean": true,
+    "exact_frozen_head_tree_parent": true,
+    "freeze_and_prior579_receipt_hashes_unchanged": true,
+    "no_replace_objects": true,
+    "old_semantic_BLOCK_still_bound_to_original579_runner_plan": true,
+    "plan466_unchanged": true
+  },
+  "finding_scope": {
+    "current_source": "The sole added main-local adapter captures len(selected) from unchanged validated task data and replaces only the declared-count dictionary field. The original generic function remains byte-exact, including its literal30; existing raw/error return paths, protected lifecycle and final writers remain unchanged.",
+    "original": "At579 the original unchanged parent_accounting function declares30 for selected47; old1335 BLOCK remains archived with exact27e9 hash.",
+    "semantic_owner": "1335 separately owns actual successor semantic refresh and genuine current controller-review ABI. This conservation receipt does not supply that verdict."
+  },
+  "freeze": {
+    "path": "/tmp/startup-Agent47-declared-count-successor-8ullap44/freeze.json",
+    "sha256": "15615f9f182f7593da6229f4f02f1661fa685c5b0873a1d5c47e6f72bd5cfcf5"
+  },
+  "limits": {
+    "ABI": "No CONTROLLER_SOURCE_CLEAR ABI record supplied by this receipt. No runtime/admission/grant/C acquisition, scheduling, publication, native WHOLE/full52/UX/merge/readiness approval.",
+    "original_negative": "579BLOCK and original347 EXIT1/only2 qualified CLI/HOST parents/nonqualifying UI retain their original heads and dispositions.",
+    "runtime": "All current Rust/test/native/provider/controller/helper execution UNRUN; no imports or extracted function calls. AST and JSON parsed as data only.",
+    "scope": "A bounded delta refresh, not a restart of prior generic semantics or a claim that conserved code is independently requalified at runtime."
+  },
+  "pins": {
+    "adoption-port.json": {
+      "bytes": 1621,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/adoption-port.json",
+      "sha256": "9ce7a30dc5dbee1f0c1f52b5dcd64ef3d9b1873d84e43c8cca3bd136f3ffd4df"
+    },
+    "command-data.json": {
+      "bytes": 63269,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/command-data.json",
+      "sha256": "18fd276bdb8496587cb21de0f03a52f1c1afc54fb54918e391f4cfe00b439355"
+    },
+    "execution-template.json": {
+      "bytes": 1747,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/execution-template.json",
+      "sha256": "cf9782d714545ae21bcabaa70951bb4cd6800a04ecf181d8c8627d667a5adbe6"
+    },
+    "from-579f9a58.diff.json": {
+      "bytes": 1087,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/from-579f9a58.diff.json",
+      "sha256": "730855be531afb6b971f2ebbe7a7d5ef7b8c435f17f374761882c8c8a0b2b34e"
+    },
+    "manifest.json": {
+      "bytes": 26987,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/manifest.json",
+      "sha256": "bf7bd79c16b5c9c77bdc98f368f3a1db82bab30d91fb8c1049b53d33298aa10e"
+    },
+    "plan.json": {
+      "bytes": 63927,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/plan.json",
+      "sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043"
+    },
+    "required-source-contract.json": {
+      "bytes": 39199,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/required-source-contract.json",
+      "sha256": "c48bd1259b424db7eaf2afbdd41c98478233ca42edb508e4eaded0f1727776b2"
+    },
+    "run-packet.py": {
+      "bytes": 81717,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/run-packet.py",
+      "sha256": "93d01c01be059b8d64266afd293f176981285ac3a6255cb6b79cbe347f8bb54f"
+    },
+    "source-binding.json": {
+      "bytes": 11871,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/source-binding.json",
+      "sha256": "92b313f6588178d976332f00fb6dbec93c776d14cc2e77347e492332c2a5c929"
+    },
+    "source-conservation.json": {
+      "bytes": 11243,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/source-conservation.json",
+      "sha256": "7aede250c645269ac4c05b1124f8c4aad1f3ed5c4956d4b779ad538910869492"
+    },
+    "to-579f9a58.inverse.diff.json": {
+      "bytes": 1099,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/to-579f9a58.inverse.diff.json",
+      "sha256": "d6450885415825d0d5ae77c60c685b4db0690bb3fa89ac98730f66c1cee961fc"
+    }
+  },
+  "prior_579_independent_scope": {
+    "disposition": "Preserved immutable conservation/AST/manifest evidence and its explicit known30/47 blocker; not retargeted. Only unchanged source scope composes with this new delta.",
+    "path": "/tmp/startup-Agent-safe47-579f9a58-independent-conservation-manifest-ast-review-v1.json",
+    "sha256": "9f72c8f186e65fca4b18f9999513eacb618f2d29d8307f174f970cd43a14820a"
+  },
+  "propagated_unchanged_scope": {
+    "authority": "No product or test guard changes, no new caller/User requirement or authority inspection/mutation. Actual actor/context/capability and runtime safety remain outside this source-only check.",
+    "historical_archives": "Original347B negative, older manifests/sources and all87 runtime archive input bindings are unchanged. No historical pass, RAW, custody or resource-return scope is enlarged.",
+    "partition": "Exactly47 selected: CLI1/HOST6/UI40. Required52 and five genuine-User source-classified deferred parents remain unchanged, held/uninvoked with null causal/pass credit. No skip/ignored/pass donation or authority bypass is supplied.",
+    "product": {
+      "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+      "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74"
+    },
+    "source_pins": "All30 product snapshots and source-contract entries remain exact579; their original immutable Git/materialized-source hash checks remain bounded to those unchanged bytes."
+  },
+  "schema": "startup-agent-safe47-declared-count-successor-independent-delta-conservation-review-v1",
+  "scope": "Only the declared-count successor delta from579. No generic controller re-audit, semantics/admission/review-ABI clearance, execution or runtime grant.",
+  "source_tuple": {
+    "head": "1d3e5c2134aab049b451a397c8bfca8fbd96c9a9",
+    "parents": [
+      "579f9a58eee6561f6f7317284091b99f72172281"
+    ],
+    "tree": "e2924fb9c4689f2ce0e897dbe1fc7e7fb875b9be"
+  },
+  "verdict": "BOUNDED_DELTA_CONSERVATION_MANIFEST_PROVENANCE_CLEAR",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source"
+}

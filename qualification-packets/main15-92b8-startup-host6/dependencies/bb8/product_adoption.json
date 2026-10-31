@@ -1,0 +1,70 @@
+{
+  "schema": "issued_return_bb8df653_title_ownership_root_source_adoption_v1",
+  "utc": "2026-10-31T18:13:46.600352+00:00",
+  "product": {
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+    "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "branch": "fix/fw16-return-title-ownership-main15",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15"
+  },
+  "handoff": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-main15-two-title-source-correction-reviewed-handoff-v1.json",
+    "sha256": "b3e3ead0f9d85260c5b2867dcbd4073c2c2825ea14c589f0489f6b4876e6227f"
+  },
+  "named_artifacts_rehashed": 8,
+  "genuine_correctness_caller_UX_review": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-independent-source-review-v1.json",
+    "sha256": "dd632b6257efaac8ffd24d22abc2b52129dc24ec3572beaff6fe96022d2c8e8e",
+    "bytes": 6860
+  },
+  "genuine_conservation_privacy_review": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-independent-conservation-privacy-source-review-v1.json",
+    "sha256": "949805650285374751f4b97cb8b1d938ce29c404a10080cff0ea3b2db245bbf6",
+    "bytes": 10214
+  },
+  "late_format_binding_addendum": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-source-review-freeze-format-binding-addendum-v1.json",
+    "sha256": "a305a7d79759a33a4083104fbfa62196295d4b0f03e191426cf88d5032b76f73",
+    "bytes": 2913
+  },
+  "official_format": {
+    "command": "scripts/check-format",
+    "exit": 0,
+    "tool_chunk": "b952be",
+    "original_output": [
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stdout.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "0444"
+      },
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "0444"
+      }
+    ],
+    "scope": "Official formatter only; parent explicitly permitted Cargo fmt/metadata within this formatter, no check/build/test/rustc/native."
+  },
+  "source_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d",
+  "exact_two_expression_inverse_verified": true,
+  "other_entries_modes_conserved": 2230,
+  "same_full_inherited_pathset_vs_main": 55,
+  "original_negative_acceptance": {
+    "path": "/tmp/fw16-backend-ec204421/main15-8e36e360-negative-ui5-root-acceptance-v1.json",
+    "sha256": "5e90f51b2a915f9ea32c748ee624d972e41279ea7746a15a5f2fadceb3d14a60"
+  },
+  "scope": "Only two .to_owned expressions fix actual borrowedtitle type errors; same visibleUTF8/time/caller/proof/guard/cleanup/no new nativeUX. API615e/full55 inheritedstack remains, not standalone3filePR.",
+  "runtime": "UNRUN_UNGRANTED",
+  "source_publication": "PENDING_NONFORCE_F95_TO_BB8_ON_EXISTING_FIX_BRANCH",
+  "next_actions": "Root16 sole two-controller source rebind after actualpublication with fresh reviews; no oldgrants/headpasses transfer.",
+  "limits": [
+    "Root EC reviews/adopts and normally publishes exact bb8 product source after these genuine source reviews; no public mutation done by Main15.",
+    "Root16 alone rebinds the TWO frozen UI5/HOST16 controllers to genuine bb8 provenance, then fresh independent code/conservation reviews. Preserve f95/a7c8/3dd2 and negative receipts.",
+    "New original runtime requires a separate authenticated one-use resource grant and fresh actual ELF/inventory/parent results. Root finite priority places SearchFront19 ahead while correction/rebinding completes.",
+    "Original startup47/genuineUser5/FULL52/full55stack/native UX/WebPs/physical teardown/WHOLE remain separately unqualified. Physical retained helper remains explicitly DEFERRED per Root1dda627d."
+  ]
+}

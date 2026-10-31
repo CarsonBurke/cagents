@@ -1,0 +1,58 @@
+{
+  "all_actual_runtime": null,
+  "canonical_group_argv": [
+    "ACTUAL_CURRENT_LIB_ELF",
+    "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+    "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+    "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+    "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+    "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+    "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+    "--exact",
+    "--format=pretty",
+    "--color=never"
+  ],
+  "canonical_inventory_argv": [
+    "ACTUAL_CURRENT_LIB_ELF",
+    "--list",
+    "--color=never"
+  ],
+  "command_caps_seconds": [
+    480,
+    600,
+    30,
+    60
+  ],
+  "command_caps_sum_seconds": 1170,
+  "current_profile": "host6",
+  "grouped_decision": {
+    "message": "01846f73-6a9d-47eb-b218-de105b0cb4e4",
+    "raw_input": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_grouped_decision_and_UI_hold.json",
+      "sha256": "305307b81a1d702356911bb0c295852cd17cf94fff39c475efd17f735947f5a7"
+    }
+  },
+  "kind": "ADDITIVE_ORIGINAL_GROUPED_STARTUP_BUDGET_AND_CANONICAL_ARGV_RECONCILIATION_NOT_RUNTIME_EQUIVALENCE",
+  "logical_parent_outcomes_max": 6,
+  "no_runtime_equivalence_or_prior_count_result_transfer": true,
+  "old_bb8_UI_hold_history": "Original bb8 UI lib compile101 E0599 and all five Return-component parents UNRUN remain negative history. Genuine92b8 one-import source correction closes the source cause only; no compilation, current47, originalUser5 or runtime pass transfer.",
+  "original_controller": {
+    "head": "1d3e5c2134aab049b451a397c8bfca8fbd96c9a9",
+    "tree": "e2924fb9c4689f2ce0e897dbe1fc7e7fb875b9be"
+  },
+  "original_plan_sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
+  "original_three_group_execution_caps_seconds": {
+    "cli": 60,
+    "host": 60,
+    "ui": 300
+  },
+  "owning_harness_invocations": 1,
+  "product": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+  },
+  "source_and_finalization_limit": "No aggregate source/finalization reservation is implemented. Original2400 workload cap and remaining clamps are unchanged; uncertain custody HOLD can be indefinite.",
+  "supersedes_unimplemented_author_singleton_expansion": true
+}

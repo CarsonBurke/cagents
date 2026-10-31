@@ -1,0 +1,521 @@
+{
+  "caller_admission_compatible_parents": [
+    {
+      "at": "src/control.rs:5943",
+      "graph": "cli",
+      "name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/host/state.rs:5037",
+      "graph": "host",
+      "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:118",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:156",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:171",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:191",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:229",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:254",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:271",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:351",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:417",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:454",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:600",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:719",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:850",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/attachment_tests.rs:154",
+      "graph": "ui",
+      "name": "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/attachment_tests.rs:232",
+      "graph": "ui",
+      "name": "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/attachment_tests.rs:285",
+      "graph": "ui",
+      "name": "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/attachment_tests.rs:349",
+      "graph": "ui",
+      "name": "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/attachment_tests.rs:425",
+      "graph": "ui",
+      "name": "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:297",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:322",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:350",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:373",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:415",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:449",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:481",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:493",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:702",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:770",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views.rs:3299",
+      "graph": "ui",
+      "name": "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:496",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/startup_gate/tests.rs:550",
+      "graph": "ui",
+      "name": "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_terminals.rs:664",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:983",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:2161",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:2869",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:715",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:754",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:4459",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:3345",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/session.rs:5916",
+      "graph": "ui",
+      "name": "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/persistence.rs:6631",
+      "graph": "host",
+      "name": "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/persistence.rs:9227",
+      "graph": "host",
+      "name": "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/persistence.rs:8233",
+      "graph": "host",
+      "name": "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/persistence.rs:8328",
+      "graph": "host",
+      "name": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/persistence.rs:10701",
+      "graph": "host",
+      "name": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+      "selection_partition": "Main15_remaining17"
+    }
+  ],
+  "conclusion": {
+    "Root_scope_update": "Root reports prospective packet restricted to Agent-compatible47, with original FULL52/User5 explicitly held separately and unqualified. This receipt classifies source; it did not inspect/freeze/approve that prospective executable packet.",
+    "User5_native_and_WHOLE_readiness": "HOLD / UNQUALIFIED; source selection and compiling all UI test bodies do not execute the five causal bodies.",
+    "caller_admission_compatible_source_only": {
+      "count": 47,
+      "graphs": {
+        "cli": 1,
+        "host": 6,
+        "ui": 40
+      },
+      "meaning": "No genuine-User-only refusal on the selected parent/helper source paths reviewed. This is the Agent-compatible prospective subset with inherited opaque authority preserved; it does not authorize execution, establish actual runtime caller authority, or prove fixture/resource/native safety."
+    },
+    "current_caller_authority": "UNKNOWN / UNREAD. No absence, presence or value was probed or inferred from being an agent.",
+    "genuine_User_bound": {
+      "count": 5,
+      "graphs": {
+        "cli": 0,
+        "host": 0,
+        "ui": 5
+      },
+      "meaning": "Existing guards require a legitimate genuine User producer. A session-authority producer cannot execute these causal bodies through the supported wrapper while preserving its authority."
+    },
+    "protected_policy": "Main15 retains final protected-policy ownership. Current Root16 HOST packet is outside this prospective whole52 classifier and unaffected."
+  },
+  "execution_limits": {
+    "GitHub_publication": "NONE",
+    "Tasks_or_runtime": "UNRUN",
+    "authority_or_env_context_probes": "NONE",
+    "candidate_imports": "NONE",
+    "compiles": "UNRUN",
+    "native": "UNRUN",
+    "new_agents": "NONE",
+    "process_account_DB_target_resource_probes": "NONE",
+    "source_or_Git_mutation": "NONE",
+    "tests": "UNRUN",
+    "writes": "This own compact /tmp JSON receipt and SHA256 sidecar only. No original source guard changed."
+  },
+  "existing_supported_invocation_and_missing_admission": {
+    "User5_condition": "Requires an independently legitimate genuine User producer and owning-body evidence through the unchanged existing wrapper. No such actual producer/context or new-head body execution is established here; therefore the five remain separately held and unqualified.",
+    "compatible47_condition": "An otherwise admitted Agent producer may retain inherited opaque session authority and invoke only the exact47 compatible selectors. This receipt supplies no current caller, lane, resource, ELF inventory, controller or execution grant.",
+    "existing_test_shape": "Existing Rust lib-test exact owning full selectors, in isolated no-default-feature CLI / host / ui graphs as selected. Do not combine UI and HOST. The old immutable347 plan gives compile and exact-test execution lineage for Root30, not a frozen or executed full52 packet.",
+    "no_authority_workaround": "No unset/clear/replace of opaque inherited authority, role forging, silent skip, scope waiver, remote User proxy, new context recipe, supervisor or framework is proposed or authorized.",
+    "not_evidence": "Compiling all UI test bodies, a broad filter including five refused parents, old-head passes/failure, a parent footer without causal child success, or source-only classification cannot qualify User5 or full WHOLE readiness."
+  },
+  "genuine_User_bound_parents": [
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:2552",
+      "graph": "ui",
+      "isolated_call_line": 2559,
+      "name": "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:3167",
+      "explicit_Authority_assertion_lines": [
+        3168,
+        3173
+      ],
+      "graph": "ui",
+      "isolated_call_line": 3174,
+      "name": "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:3181",
+      "explicit_Authority_assertion_lines": [
+        3182,
+        3187
+      ],
+      "graph": "ui",
+      "isolated_call_line": 3188,
+      "name": "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:3436",
+      "explicit_Authority_assertion_lines": [
+        3437,
+        3442
+      ],
+      "graph": "ui",
+      "isolated_call_line": 3443,
+      "name": "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:1097",
+      "graph": "ui",
+      "isolated_call_line": 1106,
+      "name": "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+      "selection_partition": "Main15_remaining17"
+    }
+  ],
+  "guard_source_chain": {
+    "Authority_semantics": {
+      "at": "src/agent_execution.rs:44",
+      "implementation_lines": [
+        62,
+        76
+      ],
+      "rule": "from_environment maps true NotPresent to None; any present Unicode token to Some, and non-Unicode presence to Some(empty). Presence does not become User. No authority value or method was evaluated by this review."
+    },
+    "common_wrapper": {
+      "assertion_lines": [
+        21,
+        24
+      ],
+      "at": "src/app/shared_views/tests/startup_admission.rs:20",
+      "rule": "var_os(CAGENTS_AGENT_AUTHORITY).is_none() is asserted before child-marker inspection (25-27), private directory construction (29-36), or subprocess setup (38-54). The marker therefore cannot bypass refusal. The wrapper contains env_clear at44 only after the genuine-User guard; it is existing source, not an authorized authority-clearing invocation recipe."
+    },
+    "explicit_pre_wrapper_checks": "Active mixed, hidden mixed and Remove additionally assert Authority::from_environment().token().is_none() before calling isolated(). Mixed image and stale CLOSED rely on the common wrapper guard.",
+    "wrapper_result_accounting": "Each selected parent returns after isolated() only when the exact child exits successfully and its stdout contains 1 passed (56-63). The child marker returns false only after the same User guard, reaching the body. This is one owning parent, not two. Guard panic/refusal or a body not reached does not establish causal-body coverage."
+  },
+  "indirect_paths_and_limits": [
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:3345",
+      "chain": "The test drops recheck_quarantined_pane Tasks at3357/3359/3367/3387/3405/3421 and injects callbacks. shared_views.rs:860 captures Authority::from_environment without requiring User; the returned Task defers socket/RPC work to861-879 and preserves captured session authentication at871-874. The fixture never polls those returned Tasks. Source classification is caller-compatible, not live authority or RPC qualification.",
+      "parent": "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence"
+    },
+    {
+      "finding": "The remaining selected reducer/private transport/persistence source paths have no isolated() or genuine-User entry assertion requiring a User producer. This is a bounded caller-admission review, not renewed semantic/native/process-family approval.",
+      "paths": [
+        "src/app/startup_gate/tests.rs",
+        "src/app/startup_gate/attachment_tests.rs",
+        "src/app/shared_views/tests/startup_terminals.rs",
+        "src/app/shared_views.rs:3299",
+        "src/control.rs:5943",
+        "src/host/state.rs:5037",
+        "src/persistence.rs",
+        "src/session.rs:5916"
+      ]
+    }
+  ],
+  "receipt_type": "finite prospective execution-admission SOURCE classifier; no execution grant",
+  "reviewer": "/root/1954_directory_durability_bound",
+  "selection_custody": {
+    "Main15_selected20_deduplicated_against_Root35": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/62c48646-minimal-additional-owning-test-parent-selection-v1.json",
+      "remaining": 17,
+      "sha256": "7945b9ee702787f57b5235cf2b197b86997264da9df96303b282e56a9df9dad6"
+    },
+    "excluded_refs": "No peer inbox/authority/context value was read; referenced peer-inbox files were not followed.",
+    "final_full_name_selection": {
+      "Main15_remaining17": 17,
+      "Root35": 35,
+      "distinct_union": 52,
+      "graph_counts": {
+        "cli": 1,
+        "host": 6,
+        "ui": 45
+      },
+      "path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-final-owning-test-parent-selection-refresh-v2.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef"
+    },
+    "final_source_freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-final-delivery-merge-freeze-v1.json",
+      "sha256": "e1c34ab4dbf29aa4eb5e133f925834365558dd0ed038e5cda1ea3d18193d2975"
+    },
+    "original_Root30": {
+      "commit": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+      "features_and_compile_arguments": [
+        {
+          "compile_argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "features": [],
+          "id": "cli-lib"
+        },
+        {
+          "compile_argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "host",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "features": [
+            "host"
+          ],
+          "id": "host-lib"
+        },
+        {
+          "compile_argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "ui",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "features": [
+            "ui"
+          ],
+          "id": "ui-lib"
+        }
+      ],
+      "names": 30,
+      "path": "qualification-packets/startup30/plan.json",
+      "sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31"
+    }
+  },
+  "source": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "immutable_git_source_sha256": {
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+      "src/app/shared_views.rs": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "src/app/shared_views/tests/startup_admission.rs": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "src/app/shared_views/tests/startup_terminals.rs": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "src/app/startup_gate.rs": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
+      "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "src/app/startup_gate/tests.rs": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/persistence.rs": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "src/session.rs": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052"
+    },
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery",
+    "worktree_selected_source_bytes_match_immutable_git": true
+  }
+}

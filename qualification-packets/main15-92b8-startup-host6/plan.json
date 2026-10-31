@@ -1,0 +1,1057 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "archive_bindings": [
+    {
+      "name": "source-archive/command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/command-data.json",
+      "sha256": "0b2ec6bff7b68fc100f3cec883b42de3c5a77ac388ba1e1a4c73f17ddeee4b83"
+    },
+    {
+      "name": "source-archive/current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/current-source-map.json",
+      "sha256": "270b6114542bcfe77484f8091b2d88682d92bb3bb53e9f519744d67eab35e32b"
+    },
+    {
+      "name": "source-archive/dependencies/base-f95-UI5-reviewed-handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/base-f95-UI5-reviewed-handoff.json",
+      "sha256": "438e152c1b00503e6c94c65869a8c8b2960825e95479640a39cd1d76691399b6"
+    },
+    {
+      "name": "source-archive/dependencies/base-f95-chat_ui.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/base-f95-chat_ui.rs",
+      "sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+    },
+    {
+      "name": "source-archive/dependencies/base-f95-reviewed-controller-handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/base-f95-reviewed-controller-handoff.json",
+      "sha256": "c1b55010a290dd01e74068c5ada0336a0a81ffa2850f89e32aa881fa5655f27a"
+    },
+    {
+      "name": "source-archive/dependencies/base-f95-source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/base-f95-source-binding.json",
+      "sha256": "1f8dbef099c8583fbaa0c009a44386ccb1e2c75a9baa763d8e5593a7df7af9a1"
+    },
+    {
+      "name": "source-archive/dependencies/base-search-UI5/plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/base-search-UI5/plan.json",
+      "sha256": "e14d5f9624be911fcf415b69028e5d0c21b81e12595960e80538597277b6e2a8"
+    },
+    {
+      "name": "source-archive/dependencies/base-search-UI5/run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/base-search-UI5/run-packet.py",
+      "sha256": "153bc925907ccd722407140f96b93b3d5bec53e11dd1b05ba114417cf799ab38"
+    },
+    {
+      "name": "source-archive/dependencies/base-search-UI5/source-conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/base-search-UI5/source-conservation.json",
+      "sha256": "c0de55fe090fb91ee817aa51913f4dcbbb20dbfeb8b499fedeb074d547a16eac"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/authority_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/authority_review.json",
+      "sha256": "dd632b6257efaac8ffd24d22abc2b52129dc24ec3572beaff6fe96022d2c8e8e"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/base_f95_UI5_postrun_scope_ABI.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/base_f95_UI5_postrun_scope_ABI.json",
+      "sha256": "7bfc05fea563f2837ef60ac3accd162b6dac0a6c00d27fc8caef3ad449e79138"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/bb8_readonly_intake.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/bb8_readonly_intake.json",
+      "sha256": "dce9494cd98907541d512c307c3bcfa2aeda542614c458d9e403fbcf39e53a9a"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/current_title_handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/current_title_handoff.json",
+      "sha256": "b3e3ead0f9d85260c5b2867dcbd4073c2c2825ea14c589f0489f6b4876e6227f"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/late_format_binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/late_format_binding.json",
+      "sha256": "a305a7d79759a33a4083104fbfa62196295d4b0f03e191426cf88d5032b76f73"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/original_f95_negative_acceptance.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/original_f95_negative_acceptance.json",
+      "sha256": "5e90f51b2a915f9ea32c748ee624d972e41279ea7746a15a5f2fadceb3d14a60"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/product_adoption.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/product_adoption.json",
+      "sha256": "81e5631986046571b2388fef51997daab6c370964a2c3463f3e61a89b0cc7a94"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/product_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/product_conservation.json",
+      "sha256": "949805650285374751f4b97cb8b1d938ce29c404a10080cff0ea3b2db245bbf6"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/product_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/product_freeze.json",
+      "sha256": "8131db186b26ee8af54b1aa623799e224634bc095741805237adc1c631b32efa"
+    },
+    {
+      "name": "source-archive/dependencies/bb8/product_publication.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/bb8/product_publication.json",
+      "sha256": "8d14ce129c0833d55f7fba198f84839cab095ae9ec8ee270c31a2e8bc1400141"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/adoption_conservation.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/adoption_freeze.json",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_function.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/adoption_function.py",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_intake.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/adoption_intake.json",
+      "sha256": "e9aa09101ca6d215e6876de5b50c1fe1bc57bb3cc14f7bdd397b7772cd1e5843"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_old_function.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/adoption_old_function.py",
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_original_finding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/adoption_original_finding.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_pure4_reference.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/adoption_pure4_reference.json",
+      "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_semantic.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/adoption_semantic.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_additive_hold.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/prior_ca_additive_hold.json",
+      "sha256": "a32b9501efcfc05ba117cd89f10d903a02434943ce0ac5d70440b7ea69767ef9"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_author_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/prior_ca_author_conservation.json",
+      "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/prior_ca_conservation.json",
+      "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_task_hold.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/canonical/prior_ca_task_hold.json",
+      "sha256": "e342ee5b3258889e2f258433b7cf3a47614d79e340a4313e678060b99bf53560"
+    },
+    {
+      "name": "source-archive/dependencies/donor-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/donor-plan.json",
+      "sha256": "d5c074fbea83b6863b73ae574a8b55fb8a4425cce527c6e0f87685dbf56990e9"
+    },
+    {
+      "name": "source-archive/dependencies/donor-run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/donor-run-packet.py",
+      "sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25"
+    },
+    {
+      "name": "source-archive/dependencies/donor-source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/donor-source-binding.json",
+      "sha256": "12aec1cd635793e24907149e5fffebbc1b594aec652947064a82afc9c9e7e785"
+    },
+    {
+      "name": "source-archive/dependencies/donor-source-conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/donor-source-conservation.json",
+      "sha256": "628dd034d9038b882f0213db0fd098086474d244714bb362d14e34ccdcbb8595"
+    },
+    {
+      "name": "source-archive/dependencies/historical-HOST16-preparation/plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/historical-HOST16-preparation/plan.json",
+      "sha256": "def29c71f3015be9e4d16f1f6ca1be0af125e79c1b1f241889d8934a28db17bb"
+    },
+    {
+      "name": "source-archive/dependencies/historical-HOST16-preparation/run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/historical-HOST16-preparation/run-packet.py",
+      "sha256": "85ab8f7669d55dc24ec36316048b2886c5a9f2f54003af6b4e632e34587e6a53"
+    },
+    {
+      "name": "source-archive/dependencies/historical-HOST16-preparation/source-preparation-proof.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/historical-HOST16-preparation/source-preparation-proof.json",
+      "sha256": "ad16bb4f959aac3789e77a619b5c7e4fcc1295055d4100152a232be7bdbe488c"
+    },
+    {
+      "name": "source-archive/dependencies/historical-UI2-preparation/plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/historical-UI2-preparation/plan.json",
+      "sha256": "c101aa17e6beed4682d3ccc07a4baf439f32c8814237ae368af666eb65b9642c"
+    },
+    {
+      "name": "source-archive/dependencies/historical-UI2-preparation/run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/historical-UI2-preparation/run-packet.py",
+      "sha256": "7bf9dba4a2653e6ffa42037660ae5c3b4d4bec9b42435b2bcf1ea3cb6edbffd2"
+    },
+    {
+      "name": "source-archive/dependencies/historical-UI2-preparation/source-preparation-proof.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/historical-UI2-preparation/source-preparation-proof.json",
+      "sha256": "cb1f32b9031feb9d4caecafc690a02885b43902415ee7add9397aee3da188bc5"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/README.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/README.md",
+      "sha256": "7619bc9db382680d400f8ffc07e581c308a550142c98d06048acae5f9dc9a83c"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/command-data.json",
+      "sha256": "aad51dff623a52014a4c5143db18ec66d3d822624d014764bba7ed02c2f9ecf6"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/current-source-map.json",
+      "sha256": "c6c974167a6578fa2112ef41b981e0f891593cfc1367d9d958365416321a890f"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/from-993-forward.diff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/from-993-forward.diff.json",
+      "sha256": "98079d0ee3e83ac548a6358750b90ccddff7a626e7f46bc6e63f6c3f00225eb8"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/from-HOST16-7c47-forward.diff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/from-HOST16-7c47-forward.diff.json",
+      "sha256": "90ad7ff45227fc5f6f245aeab80462ea2a12b9b60100b5d588c3b93c10f1ae4d"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/from-Search-UI5-b896-forward.diff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/from-Search-UI5-b896-forward.diff.json",
+      "sha256": "063fd8a302f22e4911cba2cbe0711a0f2e5caa27b95970c685c8a65188335d21"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/from-f95-HOST16-forward.diff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/from-f95-HOST16-forward.diff.json",
+      "sha256": "f03ffaa1386f8293ab639d9e05983cce8151bb4b25bdd3cfaae586aa2d660507"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/instruction-source.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/instruction-source.json",
+      "sha256": "1b9ba5668e22b6ba8bf02e53ea2811ff0d48e75deb1528a258b9ff124b46bf8b"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/invocation-template.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/invocation-template.json",
+      "sha256": "ed5d4b0706663f8d2b6af9f4bd18aa366dde505f67f236c75360880a1c56454a"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/manifest.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/manifest.json",
+      "sha256": "404e3b0db99a9098685ddba8aad513b57324f8ae67aef890aea14985f58fc78d"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/original-pre-freeze-source-tools.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/original-pre-freeze-source-tools.json",
+      "sha256": "8f5b330a19d7b625ed3492fa59d0707f351a5d65ddacb6b8f31c948322fc9310"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/plan.json",
+      "sha256": "15be44eec5bde2ec0846365fc720a1fe0c28b3c16cd7c4b0cb8eb9a05c1d4060"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/reconciliation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/reconciliation.json",
+      "sha256": "b8163d324b945bde62501589d038a7c095769064945b6d410428fc16b4cea215"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/run-packet.py",
+      "sha256": "aa6f77fcdc3efb98d466c3e79b3f663ca9b2edd71f0906a6d67d7b2a3d63172c"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/selected-source-contract.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/selected-source-contract.json",
+      "sha256": "3911d371197d67ae2b10f6e12fc1ee785e55ebbe80c19e64228c2f01513475db"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/source-binding.json",
+      "sha256": "49b63cca07b7c83fbb73ed586611a11880894067d801730b72c086171e27b111"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/source-conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/source-conservation.json",
+      "sha256": "f8b947878706341c7240f7ed85c254d48d81ca96e95c53d42e7bd60bddb7fecb"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/to-993-true-inverse.diff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/to-993-true-inverse.diff.json",
+      "sha256": "d97ec6e8fc5811a33eccc9e538636bf1ed73a80c816ca05930a506ef3dd49f19"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/to-HOST16-7c47-true-inverse.diff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/to-HOST16-7c47-true-inverse.diff.json",
+      "sha256": "933fd3dc6f64509978d2854fa0b58333596decee431a5aeb9709843d83a97108"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/to-Search-UI5-b896-true-inverse.diff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/to-Search-UI5-b896-true-inverse.diff.json",
+      "sha256": "3d3b3789a9295f16b65f2fcb3e84090b2725489e3ab807b4f99c5a58613c3a35"
+    },
+    {
+      "name": "source-archive/dependencies/immediate-host16-abi/to-f95-HOST16-true-inverse.diff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/immediate-host16-abi/to-f95-HOST16-true-inverse.diff.json",
+      "sha256": "b17ee5fe41bed1d681d0f51e087ad97e3f9c7761b89fedf4a3a9879d17392af8"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_adoption.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_adoption.json",
+      "sha256": "0bd78745ea46c83ba62cdd8d84efc5076a3713aa1ad4651fab3137b46e7e2195"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_assembly.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_assembly.json",
+      "sha256": "b76ef3abaf0188ba68578feb33aa46a14fe8e439dbf4db02bb3397ee36f014b3"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_conservation.json",
+      "sha256": "44daf3c9ac1f71d6a4b062e56e331077eb09cf2bc9c79a8c769ec35585352a4d"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_diagnostic.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_diagnostic.json",
+      "sha256": "92832731f3d2f00142e8d3473f1f85a5578c6166f5a2fa12eada0f18b265d4fe"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_freeze.json",
+      "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_lead_intake.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_lead_intake.json",
+      "sha256": "1f0dc2be5b7100c2703c984b8f7e2d87eb218d818b9ed42a0acd345e719e7534"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_original_formatter_gap.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_original_formatter_gap.json",
+      "sha256": "69fe55e3b145b27d61379dc10321983bf0d7bf49b07b04c075adf5b30d3176a7"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_physical_formatter.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_physical_formatter.json",
+      "sha256": "4dab228c1f2406792174e942b0953cfb0d07055548166578d447eb35413f0a0d"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_publication.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_publication.json",
+      "sha256": "1560ced27039fb2f3fc5f9fb7ed3390953bd492ad417fc3a8ece9a006e7fd59b"
+    },
+    {
+      "name": "source-archive/dependencies/product92/product92_semantic.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/product92/product92_semantic.json",
+      "sha256": "079eef1d3c39569141008ee704e9cdd4fefd4fab5e0850856aa6426a880921d4"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/API_inherited_physical_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/API_inherited_physical_review.json",
+      "sha256": "7ffd6b69f603c73edf13350926d6d87932bae550369d6383a6926591be759ee0"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/HOST16_DATA.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/HOST16_DATA.json",
+      "sha256": "ee9956573d7fc627cf517897a66950c037eec1049c3c2f335e167cd09f492542"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/HOST16_preparation_handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/HOST16_preparation_handoff.json",
+      "sha256": "88cc8a2107c7a7f438b96858c2dec8b2f41d30ec5f981ac73e18253326243ac1"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/Root_exact_source_import.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/Root_exact_source_import.json",
+      "sha256": "21e6e510dacbc7c4a0fe0b68c582e33ef3e7eed27a032d18db31fa1ad249bd6e"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/UI2_preparation_handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/UI2_preparation_handoff.json",
+      "sha256": "718be74c467fa7075f2e816abc2deaf614876b482c7742682afd040efdf1dc8a"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/UX_source_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/UX_source_review.json",
+      "sha256": "b6d1243588641887cdb80632b286985eb6bbd4cb5c032f4b4568443142c8688d"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/authority_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/authority_review.json",
+      "sha256": "1e1e872f25d98db457c3947fe6919993b13479bf24f9f7b125c33489c1118e1a"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/consumer_handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/consumer_handoff.json",
+      "sha256": "4df849a52f347731c626c635909815b4b9a93e00d53a458c780491403d8742ae"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/delivery_scope.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/delivery_scope.json",
+      "sha256": "0aa37edca542f46d862ae116553bc7e4d483988319ade491cf435ba982bd2107"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/product_adoption.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/product_adoption.json",
+      "sha256": "1510be9772e73e375bdeff0161f9e2f0ae215b05cb30d6b31182859f575ab402"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/product_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/product_conservation.json",
+      "sha256": "bc758675dcc4a05c97825a721ad36bac543f913ab2935b2cebab8295bbcc0fd8"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/product_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/product_freeze.json",
+      "sha256": "24ab6dc0d43d9ce328cf4e9cf445a9f1ea6405038a93201b175bf88d1fc84a54"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/product_publication.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/product_publication.json",
+      "sha256": "b2977545645c0cf1df6fb6eb9ec40004f72d4d03432ba6d0b94d9f5701e19166"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/readonly_author_intake.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/readonly_author_intake.json",
+      "sha256": "136055fab971f1809447a47ddb8448b46228a038f4e6da36c96fc9159ff8b62f"
+    },
+    {
+      "name": "source-archive/dependencies/source-proofs/three_caller_map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/source-proofs/three_caller_map.json",
+      "sha256": "cd719e229d0b1d8687157ff9fd3c25d626ae7a2e5b905d55175e33a3a87775b3"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/original-source-history/0-freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/original-source-history/0-freeze.json",
+      "sha256": "15615f9f182f7593da6229f4f02f1661fa685c5b0873a1d5c47e6f72bd5cfcf5"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/original-source-history/1-startup-Agent47-declared-count-independent-refresh-1d3e5c21-1335-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/original-source-history/1-startup-Agent47-declared-count-independent-refresh-1d3e5c21-1335-v1.json",
+      "sha256": "97a0810e7794261ff40f43b9c5af5bfb7ea33cf2686aa0fea2855e96a326e159"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/original-source-history/2-startup-Agent-safe47-1d3e5c21-independent-delta-conservation-review-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/original-source-history/2-startup-Agent-safe47-1d3e5c21-independent-delta-conservation-review-v1.json",
+      "sha256": "1cfaf20456ce1eb6a73055bbac91a6625fd1edf1a7f7781b8877d19656b8625f"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/original-source-history/3-startup-Agent-safe47-579f9a58-independent-conservation-manifest-ast-review-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/original-source-history/3-startup-Agent-safe47-579f9a58-independent-conservation-manifest-ast-review-v1.json",
+      "sha256": "9f72c8f186e65fca4b18f9999513eacb618f2d29d8307f174f970cd43a14820a"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/original-source-history/4-579f9a58-main15-safe47-deferred5-bounded-caller-contract-lead-join-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/original-source-history/4-579f9a58-main15-safe47-deferred5-bounded-caller-contract-lead-join-v1.json",
+      "sha256": "f85af59c242f2b2f050ca99227f96fec99a65c7642aa48938bde5d96ae9da233"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/startup_classifier.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_classifier.json",
+      "sha256": "315693dcdebbb93dee644e5fb05c192acfe6e6ad44a225d3ea128ad2b8f6a258"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/startup_f95_applicability.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_f95_applicability.json",
+      "sha256": "cab3632cef6f5e0f36eea1c46e340305265039862cde1d5e0e4793b88306292d"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/startup_grouped_decision_and_UI_hold.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_grouped_decision_and_UI_hold.json",
+      "sha256": "305307b81a1d702356911bb0c295852cd17cf94fff39c475efd17f735947f5a7"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/startup_initial_author_plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_initial_author_plan.json",
+      "sha256": "aed06947a9f5b45654d6e2d27dce34a229be1b0b736fcde1089f447c4407ba91"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/startup_lead_intake.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_lead_intake.json",
+      "sha256": "780d208401e793c756defe3605d81a1dd6722a246d92ac1d2ae99fe1ec4c1fdc"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/startup_original_adoption.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_original_adoption.json",
+      "sha256": "741b03cde68e0203b3ee08b0cb4fae241d1a73afe1a2a140b318969e92333fbd"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/startup_original_plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_original_plan.json",
+      "sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043"
+    },
+    {
+      "name": "source-archive/dependencies/startup47/startup_selection.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/dependencies/startup47/startup_selection.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef"
+    },
+    {
+      "name": "source-archive/instruction-source.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/instruction-source.json",
+      "sha256": "1b9ba5668e22b6ba8bf02e53ea2811ff0d48e75deb1528a258b9ff124b46bf8b"
+    },
+    {
+      "name": "source-archive/product-source/.cargo/config.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/.cargo/config.toml",
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+    },
+    {
+      "name": "source-archive/product-source/Cargo.lock",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/Cargo.lock",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    {
+      "name": "source-archive/product-source/Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/Cargo.toml",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    {
+      "name": "source-archive/product-source/build.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/build.rs",
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+    },
+    {
+      "name": "source-archive/product-source/crates/browser-import/Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/crates/browser-import/Cargo.toml",
+      "sha256": "f5b6050089d17dbbb3f939c2dfd064c9e5b79a2c4e72d621c6d9c8083ddb0158"
+    },
+    {
+      "name": "source-archive/product-source/crates/ceditor/Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/crates/ceditor/Cargo.toml",
+      "sha256": "ec03c70fe7f2151744e68208837dbe84e589b4940e0772c03427146be1237b76"
+    },
+    {
+      "name": "source-archive/product-source/crates/iced-contracts/Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/crates/iced-contracts/Cargo.toml",
+      "sha256": "2b52fa79d91cb859f66855d5ea3ff8b01cb7ff9b0da1d12dd56daea0942c4d94"
+    },
+    {
+      "name": "source-archive/product-source/scripts/qualification/process_custody.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/scripts/qualification/process_custody.py",
+      "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
+    },
+    {
+      "name": "source-archive/product-source/scripts/run-development",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/scripts/run-development",
+      "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016"
+    },
+    {
+      "name": "source-archive/product-source/src/agent_execution.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/agent_execution.rs",
+      "sha256": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452"
+    },
+    {
+      "name": "source-archive/product-source/src/app.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app.rs",
+      "sha256": "de2b68f872f4195e87a3cbdee1fa846ab2655726cf9e8540141ec0701f5aec4c"
+    },
+    {
+      "name": "source-archive/product-source/src/app/chat_ui.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app/chat_ui.rs",
+      "sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474"
+    },
+    {
+      "name": "source-archive/product-source/src/app/chrome_ui.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app/chrome_ui.rs",
+      "sha256": "651091245803497ff0705a287d952b839137c4cf842675617d4752e26eb0272c"
+    },
+    {
+      "name": "source-archive/product-source/src/app/shared_views.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app/shared_views.rs",
+      "sha256": "d9947f67e380f6c2df5aaab1a431f8c3df396bf380abf8eb4418982902b7af7f"
+    },
+    {
+      "name": "source-archive/product-source/src/app/shared_views/tests/startup_admission.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app/shared_views/tests/startup_admission.rs",
+      "sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786"
+    },
+    {
+      "name": "source-archive/product-source/src/app/shared_views/tests/startup_terminals.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app/shared_views/tests/startup_terminals.rs",
+      "sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7"
+    },
+    {
+      "name": "source-archive/product-source/src/app/startup_gate.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app/startup_gate.rs",
+      "sha256": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0"
+    },
+    {
+      "name": "source-archive/product-source/src/app/startup_gate/attachment_tests.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app/startup_gate/attachment_tests.rs",
+      "sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717"
+    },
+    {
+      "name": "source-archive/product-source/src/app/startup_gate/tests.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/app/startup_gate/tests.rs",
+      "sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b"
+    },
+    {
+      "name": "source-archive/product-source/src/bin/cagents-ui.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/bin/cagents-ui.rs",
+      "sha256": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c"
+    },
+    {
+      "name": "source-archive/product-source/src/bin/cagentsd.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/bin/cagentsd.rs",
+      "sha256": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830"
+    },
+    {
+      "name": "source-archive/product-source/src/chat.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/chat.rs",
+      "sha256": "bcba67f4e68578ebb07fb41d304725151a0829488151485c5a7e349377698967"
+    },
+    {
+      "name": "source-archive/product-source/src/chat/client.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/chat/client.rs",
+      "sha256": "2cbef29622dc3c6ee4f2af8e4d08705bed44948df90eb1a4bc6b285151ce4096"
+    },
+    {
+      "name": "source-archive/product-source/src/chat/protocol.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/chat/protocol.rs",
+      "sha256": "26e6653206834540155a97b0a7fcb5be0b76285563e9baaa2bbd7e4d094d0b30"
+    },
+    {
+      "name": "source-archive/product-source/src/chat/protocol/claude.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/chat/protocol/claude.rs",
+      "sha256": "ffa169629039fe3e5182add62d2c0e96ed997d4cee0f367ccd9d22492452c181"
+    },
+    {
+      "name": "source-archive/product-source/src/chat/runtime.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/chat/runtime.rs",
+      "sha256": "47ac6594942d47d925b278511d5d9ffeafd064b240d3d6fbd8e0fe47edbb6138"
+    },
+    {
+      "name": "source-archive/product-source/src/control.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/control.rs",
+      "sha256": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02"
+    },
+    {
+      "name": "source-archive/product-source/src/host/agent_execution/ownership.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/agent_execution/ownership.rs",
+      "sha256": "13c718709fa9c0aaef11fa8f24921c8812fb0a80761cc65c1f95330731e81edd"
+    },
+    {
+      "name": "source-archive/product-source/src/host/agent_execution/terminals.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/agent_execution/terminals.rs",
+      "sha256": "6ec8ed383db97bb9def9713ba1f863419ec63f29139785df1c88806b21ae7e3b"
+    },
+    {
+      "name": "source-archive/product-source/src/host/chat.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/chat.rs",
+      "sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d"
+    },
+    {
+      "name": "source-archive/product-source/src/host/chat/retained_actor_tests.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/chat/retained_actor_tests.rs",
+      "sha256": "ebafa0a8c9973a26f1fd8e74bfa3757c99be8dbfbada1cb9f1b343de934fa2c6"
+    },
+    {
+      "name": "source-archive/product-source/src/host/chat/terminal_return_cleanup.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/chat/terminal_return_cleanup.rs",
+      "sha256": "e6a6fc53f75abcdec789a34df1b3d3d4e27ce2b2ad0b4e120b38524237ad91b0"
+    },
+    {
+      "name": "source-archive/product-source/src/host/chat/terminal_return_cleanup/tests.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/chat/terminal_return_cleanup/tests.rs",
+      "sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "name": "source-archive/product-source/src/host/client.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/client.rs",
+      "sha256": "e755119e5d87e02b0f09782e8c4cd887546498702bfbbea2cf58c2a7173db9ad"
+    },
+    {
+      "name": "source-archive/product-source/src/host/mod.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/mod.rs",
+      "sha256": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864"
+    },
+    {
+      "name": "source-archive/product-source/src/host/state.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/state.rs",
+      "sha256": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6"
+    },
+    {
+      "name": "source-archive/product-source/src/host/state/update.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/state/update.rs",
+      "sha256": "5fedaab89811f4ac69e683b356e1ab5380b575831f848e372ead54b20d1d8b2d"
+    },
+    {
+      "name": "source-archive/product-source/src/host/worktree_removal.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/host/worktree_removal.rs",
+      "sha256": "80262d25b1284cc5598216a8066bcb2a1579eca4eddc69591124878daab6d6b1"
+    },
+    {
+      "name": "source-archive/product-source/src/interaction.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/interaction.rs",
+      "sha256": "7881579c46f30348f5b48c30319a38a89551e2bdbc9e47eda21cf2398a11f01e"
+    },
+    {
+      "name": "source-archive/product-source/src/lib.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/lib.rs",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+    },
+    {
+      "name": "source-archive/product-source/src/main.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/main.rs",
+      "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d"
+    },
+    {
+      "name": "source-archive/product-source/src/model.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/model.rs",
+      "sha256": "d49a2423a6a39df38c2bf83e6186954f40fa88d8f8d0e09ba72cb793a5451dde"
+    },
+    {
+      "name": "source-archive/product-source/src/modules.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/modules.rs",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+    },
+    {
+      "name": "source-archive/product-source/src/persistence.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/persistence.rs",
+      "sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df"
+    },
+    {
+      "name": "source-archive/product-source/src/process.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/process.rs",
+      "sha256": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47"
+    },
+    {
+      "name": "source-archive/product-source/src/session.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/session.rs",
+      "sha256": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052"
+    },
+    {
+      "name": "source-archive/product-source/src/settings.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/settings.rs",
+      "sha256": "36630b1b6d811d38cc25e7d055785bd0ff324b9ddd78e9538e81c053604ee1ba"
+    },
+    {
+      "name": "source-archive/product-source/src/terminal/ipc.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/terminal/ipc.rs",
+      "sha256": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d"
+    },
+    {
+      "name": "source-archive/product-source/src/terminal/mod.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/terminal/mod.rs",
+      "sha256": "cb89ea3c9acd9ea48f3d7894bd05996bcb14549b30e7658c331190f14b1f4614"
+    },
+    {
+      "name": "source-archive/product-source/src/ui_controls.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/ui_controls.rs",
+      "sha256": "2ffe8c62c9ff35fc498cdf6bcc070db665cdcea0794b713b6da12d275ba323dc"
+    },
+    {
+      "name": "source-archive/product-source/src/ui_controls/button.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/ui_controls/button.rs",
+      "sha256": "a03038b946f946a2afdec251bb4b8b99f1e8604e05ad3cc3413c8545293fce04"
+    },
+    {
+      "name": "source-archive/product-source/src/ui_controls/owned.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/src/ui_controls/owned.rs",
+      "sha256": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690"
+    },
+    {
+      "name": "source-archive/product-source/vendor/iced-core/src/widget.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/vendor/iced-core/src/widget.rs",
+      "sha256": "7b0db7c4bcc3cea24a4482399732b5e6b9a7cfcd5a027886d265a3fef247286a"
+    },
+    {
+      "name": "source-archive/product-source/vendor/iced-core/src/widget/operation.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/vendor/iced-core/src/widget/operation.rs",
+      "sha256": "bd70da7d8867aeab6953794e00dc8adcced21557aeffa0cb12e7952c69a06a7c"
+    },
+    {
+      "name": "source-archive/product-source/vendor/libcosmic/Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/vendor/libcosmic/Cargo.toml",
+      "sha256": "8fc4ff842d4c9d41334bfabc0828065c50797841904f1a2f856a1c62e4b2507f"
+    },
+    {
+      "name": "source-archive/product-source/vendor/libcosmic/src/lib.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/vendor/libcosmic/src/lib.rs",
+      "sha256": "80cb836ba7b40802774d44b51d70611225641bc045f106348b144e904c7fd752"
+    },
+    {
+      "name": "source-archive/product-source/vendor/libcosmic/src/widget/mod.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/product-source/vendor/libcosmic/src/widget/mod.rs",
+      "sha256": "2cb107e887d4b04f8de89c546c302c58394b28432d4fe3512f6355682de1c6a1"
+    },
+    {
+      "name": "source-archive/reconciliation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/reconciliation.json",
+      "sha256": "d3fe5fe700a6f6e89fb1eb282eaace990a2a4a6e0efc7cad88d0429559771bd9"
+    },
+    {
+      "name": "source-archive/selected-source-contract.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/selected-source-contract.json",
+      "sha256": "2c690c2330b254b32d35a492e93a2c6351d756a9c99fe1bbab36bdd6b5e02875"
+    },
+    {
+      "name": "source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/source-binding.json",
+      "sha256": "7d14055437f2383164613b9fe8ffaa0e4f35e55c2e6ff62eac655ded30340aaa"
+    }
+  ],
+  "artifact_groups": [
+    {
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "execution": {
+        "label": "parent-host-lib-exact",
+        "seconds": 60
+      },
+      "features": [
+        "host"
+      ],
+      "id": "host-lib",
+      "inventory_seconds": 30,
+      "manifest": "Cargo.toml",
+      "selectors": [
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests"
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema"
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources"
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers"
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata"
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
+        }
+      ],
+      "source_predicted_absent_names": [
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+        "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+        "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+        "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+        "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+        "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+        "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+        "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+        "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+        "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat"
+      ],
+      "source_predicted_compiled_names": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+        "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+        "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+        "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+        "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
+      ],
+      "target_kind": [
+        "lib"
+      ],
+      "target_name": "cagents"
+    }
+  ],
+  "binary_checks": [
+    {
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "label": "host-binary-check",
+      "seconds": 480
+    }
+  ],
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "issue": "MAIN15_ORIGINAL_STARTUP47_PARTIAL_HOST6",
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "limits": [
+    "Preparation supplies no runtime evidence; only original run phases/receipts and sole RAW can establish current bounded results. All actual runtime inputs are NULL in this source freeze.",
+    "Partial startup host6 only: one original harness invocation, at most 6 named ordinary outcomes. Cases, loops, child/footer counts, peers and per-name waits are nonadditive. No old47/User5/result transfer.",
+    "CLI/HOST/UI remain separate graphs. The genuine92b8 source correction establishes no new compiler/test/native result. This partial profile does not qualify the other startup profiles or full47/full52/native/whole55-path stack.",
+    "Current 480/600/30/60 command caps sum1170, each clamped to remaining original2400. Original grouped60/60/300 maxima are preserved. Natural opaque authority is inherited unchanged. No new cache, tool/version/current context/resource/grant observation.",
+    "Source-predicted selected/absent names are not an actual inventory N. Fresh original emitted root library ELF/inventory and exact K/N-K footer are required.",
+    "Canonical9004 leaves unproven adopted survivors unsignaled/unclean/unforced. Unknown supervision/evidence/custody retains acquired C indefinitely; workload2400 does not promise finite safe release.",
+    "Full ELF bytes are not archived. Original successful uses receive pre/post hashes; existing failed-invoke/posthash and kernel/every-child attestation limitations remain. Full original summary/ledgers persist; compact terminal is display only.",
+    "Original7bfc supplied POSTRUN ONLY to f95, archived prospectively here as historical source scope; no retroactive original-run admission or current whole/User credit.",
+    "AGENTS FS/Git baseline variance is preserved without flag/byte/config changes. Source-only code/AST/hash checks are not compiler, tests, native UX, or independent approval."
+  ],
+  "packet_deadline_seconds": 2400,
+  "phase_caps_sum_seconds": 1170,
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "planned_phase_count": 4,
+  "planned_phase_order": [
+    "host-binary-check",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-exact"
+  ],
+  "prepared_only": true,
+  "product_head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "product_parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "product_pr": null,
+  "product_tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "readiness": false,
+  "required_absent_environment_names": [
+    "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+    "CAGENTS_RETAINED_ACTOR_FIXTURE"
+  ],
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/run-packet.py",
+  "runtime_admission": {
+    "execution_authorized": false,
+    "helper_binding": null,
+    "state": "MAIN15_92B8_STARTUP_HOST6_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT"
+  },
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "crates/browser-import/Cargo.toml": "f5b6050089d17dbbb3f939c2dfd064c9e5b79a2c4e72d621c6d9c8083ddb0158",
+    "crates/ceditor/Cargo.toml": "ec03c70fe7f2151744e68208837dbe84e589b4940e0772c03427146be1237b76",
+    "crates/iced-contracts/Cargo.toml": "2b52fa79d91cb859f66855d5ea3ff8b01cb7ff9b0da1d12dd56daea0942c4d94",
+    "scripts/qualification/process_custody.py": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+    "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+    "src/app.rs": "de2b68f872f4195e87a3cbdee1fa846ab2655726cf9e8540141ec0701f5aec4c",
+    "src/app/chat_ui.rs": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+    "src/app/chrome_ui.rs": "651091245803497ff0705a287d952b839137c4cf842675617d4752e26eb0272c",
+    "src/app/shared_views.rs": "d9947f67e380f6c2df5aaab1a431f8c3df396bf380abf8eb4418982902b7af7f",
+    "src/app/shared_views/tests/startup_admission.rs": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+    "src/app/shared_views/tests/startup_terminals.rs": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+    "src/app/startup_gate.rs": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
+    "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+    "src/app/startup_gate/tests.rs": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+    "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+    "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+    "src/chat.rs": "bcba67f4e68578ebb07fb41d304725151a0829488151485c5a7e349377698967",
+    "src/chat/client.rs": "2cbef29622dc3c6ee4f2af8e4d08705bed44948df90eb1a4bc6b285151ce4096",
+    "src/chat/protocol.rs": "26e6653206834540155a97b0a7fcb5be0b76285563e9baaa2bbd7e4d094d0b30",
+    "src/chat/protocol/claude.rs": "ffa169629039fe3e5182add62d2c0e96ed997d4cee0f367ccd9d22492452c181",
+    "src/chat/runtime.rs": "47ac6594942d47d925b278511d5d9ffeafd064b240d3d6fbd8e0fe47edbb6138",
+    "src/control.rs": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02",
+    "src/host/agent_execution/ownership.rs": "13c718709fa9c0aaef11fa8f24921c8812fb0a80761cc65c1f95330731e81edd",
+    "src/host/agent_execution/terminals.rs": "6ec8ed383db97bb9def9713ba1f863419ec63f29139785df1c88806b21ae7e3b",
+    "src/host/chat.rs": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d",
+    "src/host/chat/retained_actor_tests.rs": "ebafa0a8c9973a26f1fd8e74bfa3757c99be8dbfbada1cb9f1b343de934fa2c6",
+    "src/host/chat/terminal_return_cleanup.rs": "e6a6fc53f75abcdec789a34df1b3d3d4e27ce2b2ad0b4e120b38524237ad91b0",
+    "src/host/chat/terminal_return_cleanup/tests.rs": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6",
+    "src/host/client.rs": "e755119e5d87e02b0f09782e8c4cd887546498702bfbbea2cf58c2a7173db9ad",
+    "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+    "src/host/state.rs": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6",
+    "src/host/state/update.rs": "5fedaab89811f4ac69e683b356e1ab5380b575831f848e372ead54b20d1d8b2d",
+    "src/host/worktree_removal.rs": "80262d25b1284cc5598216a8066bcb2a1579eca4eddc69591124878daab6d6b1",
+    "src/interaction.rs": "7881579c46f30348f5b48c30319a38a89551e2bdbc9e47eda21cf2398a11f01e",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/model.rs": "d49a2423a6a39df38c2bf83e6186954f40fa88d8f8d0e09ba72cb793a5451dde",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/persistence.rs": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+    "src/process.rs": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47",
+    "src/session.rs": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+    "src/settings.rs": "36630b1b6d811d38cc25e7d055785bd0ff324b9ddd78e9538e81c053604ee1ba",
+    "src/terminal/ipc.rs": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d",
+    "src/terminal/mod.rs": "cb89ea3c9acd9ea48f3d7894bd05996bcb14549b30e7658c331190f14b1f4614",
+    "src/ui_controls.rs": "2ffe8c62c9ff35fc498cdf6bcc070db665cdcea0794b713b6da12d275ba323dc",
+    "src/ui_controls/button.rs": "a03038b946f946a2afdec251bb4b8b99f1e8604e05ad3cc3413c8545293fce04",
+    "src/ui_controls/owned.rs": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690",
+    "vendor/iced-core/src/widget.rs": "7b0db7c4bcc3cea24a4482399732b5e6b9a7cfcd5a027886d265a3fef247286a",
+    "vendor/iced-core/src/widget/operation.rs": "bd70da7d8867aeab6953794e00dc8adcced21557aeffa0cb12e7952c69a06a7c",
+    "vendor/libcosmic/Cargo.toml": "8fc4ff842d4c9d41334bfabc0828065c50797841904f1a2f856a1c62e4b2507f",
+    "vendor/libcosmic/src/lib.rs": "80cb836ba7b40802774d44b51d70611225641bc045f106348b144e904c7fd752",
+    "vendor/libcosmic/src/widget/mod.rs": "2cb107e887d4b04f8de89c546c302c58394b28432d4fe3512f6355682de1c6a1"
+  },
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-host6-source/qualification-packets/main15-92b8-startup-host6/source-binding.json",
+  "source_review_sha256": "7d14055437f2383164613b9fe8ffaa0e4f35e55c2e6ff62eac655ded30340aaa",
+  "tool_pin_provenance": "Immutable donor source data only, no current installed-file/context observation",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+}

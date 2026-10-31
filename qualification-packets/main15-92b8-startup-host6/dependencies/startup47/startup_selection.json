@@ -1,0 +1,452 @@
+{
+  "kind": "final-head-additive-owning-test-parent-selection-refresh-v2",
+  "reviewer": "/root/async_races",
+  "status": "SOURCE_CONFIRMED_SELECTION_ONLY_ALL_CURRENT_EXECUTION_UNRUN",
+  "source": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-final-delivery-merge-freeze-v1.json",
+      "sha256": "e1c34ab4dbf29aa4eb5e133f925834365558dd0ed038e5cda1ea3d18193d2975"
+    },
+    "steering": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/20261031T115416819908Z-post-protected-review-peer-inbox-v1.json",
+      "sha256": "3e5e7147a642c758e780abb8e22a4cba55f1b301674665f5098f7817d9922848"
+    },
+    "file_sha256": {
+      "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "src/app/startup_gate/tests.rs": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "src/app/shared_views/tests/startup_terminals.rs": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "src/app/shared_views.rs": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "src/app/shared_views/tests/startup_admission.rs": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "src/session.rs": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+      "src/persistence.rs": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/app/startup_gate.rs": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    }
+  },
+  "immutable_prior_selection": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/62c48646-minimal-additional-owning-test-parent-selection-v1.json",
+    "sha256": "7945b9ee702787f57b5235cf2b197b86997264da9df96303b282e56a9df9dad6",
+    "role": "Retained20-parent causal/minimality basis. This additive refresh replaces only final-head source positions, pending-name status and deduplicated allocation; no historical results are retargeted."
+  },
+  "old_Root30_anchor": {
+    "commit": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "path": "qualification-packets/startup30/plan.json",
+    "sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+    "source": "Exact artifact_groups[*].selectors[*].name and per-group isolated features read from immutable git-show.",
+    "counts": {
+      "CLI": 1,
+      "HOST": 1,
+      "UI": 28,
+      "total": 30
+    },
+    "historical_results": "Old6ceb B UI27P1F and other old passes do not establish finalaeb body execution or combined-head coverage."
+  },
+  "reconciliation": {
+    "Root35": {
+      "old_Root30": 30,
+      "already_selected_62_guards": 3,
+      "newly_source_identified_parents": 2,
+      "CLI": 1,
+      "HOST": 1,
+      "UI": 33,
+      "total": 35
+    },
+    "remaining_Main15_17": {
+      "CLI": 0,
+      "HOST": 5,
+      "UI": 12,
+      "total": 17
+    },
+    "final_union": {
+      "CLI": 1,
+      "HOST": 6,
+      "UI": 45,
+      "total": 52,
+      "distinct_full_names": 52,
+      "Root35_Main15_17_name_intersection": 0
+    },
+    "guard_overlap_handling": "The first3 of prior20 are allocated once to Root35; they are not counted again in Main15's remaining17.",
+    "old_parent_correction": {
+      "name": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:702",
+      "counted": "Once in the original Root28 UI names; the7c fixture correction is not a new parent."
+    },
+    "other_affected_existing_parent": {
+      "name": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:770",
+      "counted": "Already in old Root28, once."
+    },
+    "count_unit": "Ordinary owning full test parent, never mode loop, assertion, isolated child footer, repeated suite appearance, helper function or command receipt."
+  },
+  "newly_identified_Root_parents": [
+    {
+      "name": "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:2552",
+      "source_test_attribute_at": "src/app/shared_views/tests/startup_admission.rs:2551",
+      "selection_contract": "Naturally CLOSED stale localA and current canonicalB of the same card plus healthyH: source-shaped seed/public-client/durable evidence boundary. CLOSED quarantine alone may permit Ready after H's actual admission. Detailed oracle review belongs to the separate reviewer.",
+      "caller_fixture": "Uses existing isolated(name) at line2559; that wrapper refuses inherited authority before its existing private child fixture. No body execution is claimed."
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:664",
+      "source_test_attribute_at": "src/app/shared_views/tests/startup_terminals.rs:663",
+      "selection_contract": "Owns the corrected unmanaged UI fixture's emitted SeedView reply construction: preserve canonical pane, apply closed before insert, retain tombstone and make duplicate reply idempotent. This is not Host SQL execution.",
+      "caller_fixture": "Pure in-process View fixture source; any actual execution still needs a separately admitted caller/resource context."
+    }
+  ],
+  "Root35_full_names_and_current_positions": [
+    {
+      "name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+      "graph": "cli",
+      "at": "src/control.rs:5943"
+    },
+    {
+      "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+      "graph": "host",
+      "at": "src/host/state.rs:5037"
+    },
+    {
+      "name": "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:118"
+    },
+    {
+      "name": "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:156"
+    },
+    {
+      "name": "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:171"
+    },
+    {
+      "name": "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:191"
+    },
+    {
+      "name": "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:229"
+    },
+    {
+      "name": "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:254"
+    },
+    {
+      "name": "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:271"
+    },
+    {
+      "name": "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:351"
+    },
+    {
+      "name": "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:417"
+    },
+    {
+      "name": "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:454"
+    },
+    {
+      "name": "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:600"
+    },
+    {
+      "name": "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:719"
+    },
+    {
+      "name": "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:850"
+    },
+    {
+      "name": "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+      "graph": "ui",
+      "at": "src/app/startup_gate/attachment_tests.rs:154"
+    },
+    {
+      "name": "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+      "graph": "ui",
+      "at": "src/app/startup_gate/attachment_tests.rs:232"
+    },
+    {
+      "name": "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+      "graph": "ui",
+      "at": "src/app/startup_gate/attachment_tests.rs:285"
+    },
+    {
+      "name": "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "graph": "ui",
+      "at": "src/app/startup_gate/attachment_tests.rs:349"
+    },
+    {
+      "name": "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+      "graph": "ui",
+      "at": "src/app/startup_gate/attachment_tests.rs:425"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:297"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:322"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:350"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:373"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:415"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:449"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:481"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:493"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:702"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:770"
+    },
+    {
+      "name": "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+      "graph": "ui",
+      "at": "src/app/shared_views.rs:3299"
+    },
+    {
+      "name": "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:496"
+    },
+    {
+      "name": "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+      "graph": "ui",
+      "at": "src/app/startup_gate/tests.rs:550"
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:2552"
+    },
+    {
+      "name": "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_terminals.rs:664"
+    }
+  ],
+  "Main15_remaining17_full_names_and_current_positions": [
+    {
+      "name": "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:983",
+      "contract": "Raw model before projection",
+      "why": "Wrong proof, duplicate issuer and optimism-masked membership must be classified before healthy-only SeedView; validates both panes and closed exclusion."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:2161",
+      "contract": "Owner and pending-source contract",
+      "why": "Six refusal modes exercise complete issuer/source/scope/pending proof; no attach or denied overlay survives. This is broader than Ready/inspection proof currentness."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:2869",
+      "contract": "Legitimate canonical/closed positive control",
+      "why": "Exact new canonical proof may replace old OPEN cache; an exact CLOSED source still publishes its legitimate close. Prevent blanket filtering."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:715",
+      "contract": "Closed retirement denial",
+      "why": "Six invalid scope/proof cases cannot borrow a retirement witness just because the local card is closed."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:754",
+      "contract": "Verified retirement positive control",
+      "why": "Genuinely validated peer retirement preserves unsent local work without fabricating quarantine; differs from canonical replacement/explicit closed publication."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:3167",
+      "contract": "Active mixed scope",
+      "why": "Actual scripted public attach/Ready for healthy source, per-pane denial and payload preservation for bad siblings in the active scope; no denied edit/close effect."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:3181",
+      "contract": "Hidden mixed scope",
+      "why": "Same ownership contract offscreen while retaining active focus/channel. Separate entry branch from active scope; Root28 offscreen terminals do not include managed quarantine siblings."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:4459",
+      "contract": "Durable restart denial",
+      "why": "DB save/reopen then initialization and missing issuer/new registry cannot revive denied chat or seed it; only exact authoritative revalidation clears original evidence."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:3345",
+      "contract": "Per-pane callback generation",
+      "why": "Duplicate checks, old request, wrong registry/source/endpoint cannot settle the successor; a final exact check can recover. Distinct from Root inspection-ticket currentness."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:3436",
+      "contract": "Local Remove effect ownership",
+      "why": "Six close/remove routes including a stale repaired button retain local evidence and send no query/attach/close against the real scripted inventory target."
+    },
+    {
+      "name": "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+      "graph": "ui",
+      "at": "src/app/shared_views/tests/startup_admission.rs:1097",
+      "contract": "Protected image draft/startup composition",
+      "why": "Natural Connected/Seed ACK, denied sibling, shared peer options and chooser cancel preserve saved image payload through the actual writer; one representative protected image flow, not the six image-only inventory."
+    },
+    {
+      "name": "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+      "graph": "ui",
+      "at": "src/session.rs:5916",
+      "contract": "Writer queue/barrier/retry owner",
+      "why": "SessionRuntime snapshot/flush/retry cannot overwrite same-card peer replacement or earn clean shutdown after a rejected final window; retains image/source and actual DB generations."
+    },
+    {
+      "name": "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+      "graph": "host",
+      "at": "src/persistence.rs:6631",
+      "contract": "Schema13 to14 admission",
+      "why": "Actual StateStore migration preserves stored rows/schema layout and quarantine marker across reopen. This owner is not included in CLI."
+    },
+    {
+      "name": "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+      "graph": "host",
+      "at": "src/persistence.rs:9227",
+      "contract": "Marker decode boundary",
+      "why": "Roundtrip exact marker, default only on true absence, and refuse malformed source metadata; distinct from migration policy and startup in-memory classification."
+    },
+    {
+      "name": "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+      "graph": "host",
+      "at": "src/persistence.rs:8233",
+      "contract": "Read-only migration inventory",
+      "why": "Chat+terminal exact denial excludes only the bad source while healthy work stays present; mismatch/malformed/oversized fail closed without rewriting DB."
+    },
+    {
+      "name": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+      "graph": "host",
+      "at": "src/persistence.rs:8328",
+      "contract": "History reader boundary",
+      "why": "History carries closed rejection provenance from every workspace and refuses invalid metadata without writes; separate public reader from migration inventory."
+    },
+    {
+      "name": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+      "graph": "host",
+      "at": "src/persistence.rs:10701",
+      "contract": "Transactional store ownership",
+      "why": "Open+closed stale snapshots/rebased bases cannot commit old proof/draft/image over a same-ID peer replacement; full-window rollback and dirty-reopen inventory remain coherent."
+    }
+  ],
+  "graph_basis": {
+    "target": "Existing cagents library unit-test target (--lib) only.",
+    "CLI": "src/modules.rs:33 includes control without ui/host cfg; existing Root CLI owner remains assigned to isolated no-default-features graph.",
+    "HOST": "src/modules.rs:73-74 gates host on host;97-98 includes persistence for ui||host. Existing Root host parent plus5 actual shared-persistence owners are assigned to isolated host --lib. No new CLI persistence graph or invented HOST owner.",
+    "UI": "src/modules.rs:18-19 and115-116 gate app/session on ui. shared_views.rs:3216-3221 declares tests::startup_admission and tests::startup_terminals. startup_gate.rs:715-719 declares tests/attachment_tests. All45 selected UI full names follow those actual modules.",
+    "affected_boundary_checks": "Compile checks remain separate from owning-parent counts. No new test target, ELF, broad suite, all-target inventory, feature union or framework is proposed.",
+    "templates_UNEXECUTED": {
+      "CLI": "cargo test --locked --no-default-features --lib <FULL_NAME> -- --exact --format=pretty --color=never",
+      "HOST": "cargo test --locked --no-default-features --features host --lib <FULL_NAME> -- --exact --format=pretty --color=never",
+      "UI": "cargo test --locked --no-default-features --features ui --lib <FULL_NAME> -- --exact --format=pretty --color=never"
+    }
+  },
+  "conservation": {
+    "from_62": "Immutable git diff62->aeb changes only startup_admission.rs and startup_terminals.rs. It adds exactly2 test attributes/owning fn names. All other previously selected source/module/feature boundaries are byte-conserved; their hashes are listed above.",
+    "current_name_checks": "All52 selected fn definitions found exactly once in their recorded final source files with their test attributes; full names derived from actual module nesting. These are source existence/selection facts, not an observed compiled test inventory.",
+    "prior_minimality": "The prior17 causal owners and exclusions remain as explained in immutable7945b9. No extra protected image/menu/repository/integration/broad parent is added.",
+    "pending_status": "Prior62 pending CLOSED and failed-seed-fixture source statuses are resolved here only to actual frozen name/source existence. They are not upgraded to passing results."
+  },
+  "fixture_admission_and_coverage_limit": {
+    "actual_public_client_parents": [
+      "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+      "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor"
+    ],
+    "existing_boundary": "startup_admission.rs:17-63 retains existing inherited-authority refusal before private subprocess setup. Active/hidden/remove also retain explicit genuine-User Authority checks. Preserve opaque authority and policy refusal; this note provides no scrub/context/admission recipe.",
+    "evidence_rule": "An ordinary ok footer reached through policy refusal/early return does not establish causal-body coverage. A separately admitted future execution must distinguish the existing isolated child's effect/assertion body from a refused/skipped body.",
+    "native": "Actual native role, supplier, chooser and native evidence remain HOLD."
+  },
+  "limits": {
+    "methods": "Immutable git-show/diff/rg, inert plan/prior JSON, source hashing and name/count joins only.",
+    "not_performed": "No source/helper/module/controller import/eval, tests, Cargo/rustc/ELF inventory, app/native/provider, environment/process/target/cache/context/resource probe, API, fetch/merge, new agent, source/public edit or old RAW re-audit.",
+    "all_current_Rust_tests": "UNRUN",
+    "actual_grant": null,
+    "source_adoption": false,
+    "queueable": false,
+    "native_qualified": false,
+    "whole_product_qualified": false,
+    "resource_return_or_acceptance": false,
+    "merge_approval": false,
+    "PR1933": "NEVER_MERGE"
+  },
+  "blockers": [],
+  "supersedes_for_incidental_source_locator_only": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-final-owning-test-parent-selection-refresh-v1.json",
+    "sha256": "f5713947e625985203ecd7b56d0cf5f098c76fe3ef5f74615d300dab89fe1b8f",
+    "correction": "Wrapper-call location2559, not2560. All selected parent names, owning definition positions, hashes and counts are unchanged. Prior sealed bytes retained."
+  }
+}
