@@ -59,7 +59,10 @@ impl BuildIdentity {
                 .and_then(|metadata| metadata.split('.').next())
                 .map(str::to_owned),
             capabilities: match kind {
-                Kind::Native => vec!["event-driven-orphan-reaping".into()],
+                Kind::Native => vec![
+                    "event-driven-orphan-reaping".into(),
+                    "provider-exit-diagnostics".into(),
+                ],
                 Kind::Terminal => Vec::new(),
             },
         }
@@ -271,6 +274,11 @@ impl Record {
                         .capabilities
                         .iter()
                         .any(|capability| capability == "event-driven-orphan-reaping"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-exit-diagnostics"))
         })
     }
 
@@ -933,6 +941,51 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn terminal_and_native_v4_are_discovered_without_accepting_native_v5() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut terminal = record();
+        terminal.version = 4;
+        terminal.create(directory.path()).unwrap();
+        assert_eq!(
+            evidence(&socket(directory.path(), terminal.terminal), Kind::Terminal).unwrap(),
+            Some(terminal.clone())
+        );
+        assert_eq!(
+            discover(directory.path(), &terminal.boot, Kind::Terminal).unwrap(),
+            vec![terminal.clone()]
+        );
+        let mut native = record();
+        native.kind = Kind::Native;
+        native.version = 4;
+        native.build = Some(BuildIdentity::current(Kind::Native));
+        native.create(directory.path()).unwrap();
+        assert_eq!(
+            evidence(&socket(directory.path(), native.terminal), Kind::Native).unwrap(),
+            Some(native.clone())
+        );
+        assert_eq!(
+            discover(directory.path(), &native.boot, Kind::Native).unwrap(),
+            vec![native.clone()]
+        );
+        let mut unsupported_native = native.clone();
+        unsupported_native.terminal = TerminalId::new();
+        unsupported_native.version = 5;
+        unsupported_native.create(directory.path()).unwrap();
+        assert!(
+            evidence(
+                &socket(directory.path(), unsupported_native.terminal),
+                Kind::Native
+            )
+            .is_err()
+        );
+        assert_eq!(
+            discover(directory.path(), &native.boot, Kind::Native).unwrap(),
+            vec![native]
+        );
+        assert!(unsupported_native.path(directory.path()).exists());
     }
 
     #[test]
