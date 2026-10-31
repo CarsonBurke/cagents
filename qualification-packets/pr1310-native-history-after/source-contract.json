@@ -5,7 +5,8 @@
     "callsites": [
       "cfg(development)+validated-fixture guard at start of App::view",
       "existing leaf Context::install targets allocated main ID only",
-      "existing leaf subscription observes original event_window before existing message mapping"
+      "existing leaf subscription observes original event_window before existing message mapping",
+      "existing fixture after_update and fixture-local StartupWindowOpened request actual initial scale only after original matching Opened"
     ],
     "common_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
     "composition_before_observer": "e5ec861ae0ea118adccbd0f0c622a140703f23ba",
@@ -17,17 +18,48 @@
         "crate::VERSION",
         "named literal compile-time fixture/App/bin byte SHA256 digests (no hardcoded self hash/head claim)",
         "original manifest SHA256/dataset",
-        "actual applied theme/UI scale and optional native factor/event generation"
+        "actual applied theme/UI scale and optional native factor with query/Rescaled provenance, Opened/native generations and accepted query request UUID"
       ],
       "bytes_max": 4096,
-      "dedup": "actual appearance+bounded workspace/source/history state, no frame/camera/scroll position keys",
+      "dedup": "actual appearance+bounded workspace/source/history state plus native-source/Open generation; no frame/camera/scroll position keys",
       "field": "appearance_json",
       "record": "history-native-appearance",
       "record_version": 1,
       "records_max": 256,
       "target": "cagents::native_history"
     },
-    "native_factor": "initial None; only original matching finite positive Rescaled sets Some; no native query/default/configured fallback",
+    "native_factor": "initial None; finite positive reply from the one real matching-opened window::scale_factor(original_id) Task or actual matching Rescaled; no guessed/configured/initialized fallback; stale/closed/foreign/invalid reply refuses",
+    "native_factor_query": {
+      "api": "vendor/iced-runtime/src/window.rs::scale_factor(Id) -> Task<f32> -> Action::GetScaleFactor(Id, oneshot::Sender<f32>)",
+      "backend": "vendor/iced-winit/src/lib.rs GetScaleFactor finds the exact Id and sends window.raw.scale_factor() as f32; missing window produces no factor callback",
+      "callback_binding": [
+        "observer UUID",
+        "original window ID",
+        "original Opened generation",
+        "query request UUID",
+        "native-scale source generation",
+        "still-open target",
+        "pending one-shot request",
+        "finite positive returned f32"
+      ],
+      "completion": "callback updates only the fixture observer and returns the existing fixture-intercepted StartupWindowOpened wake; no new App field/Message/root ABI or normal handshake",
+      "dependency_binding": "Cargo.toml patch of https://github.com/pop-os/libcosmic.git uses vendor/iced-runtime and vendor/iced-winit",
+      "not_claimed": [
+        "guaranteed callback",
+        "atomic scale/present state",
+        "OS XID mapping",
+        "native API execution",
+        "native scale qualification",
+        "capture/UX readiness"
+      ],
+      "owning_parents_UNRUN": [
+        "app::native_history_fixture::native_scale_tests::initial_native_scale_query_requires_opened_and_accepts_one_valid_reply",
+        "app::native_history_fixture::native_scale_tests::initial_native_scale_query_refuses_foreign_closed_and_superseded_sources"
+      ],
+      "request": "one per original matching Opened generation; original geometry mapping retained; fixture after_update and intercepted StartupWindowOpened share one issued-request latch",
+      "status": "SOURCE_ONLY_UNCOMPILED_UNRUN",
+      "supersession": "actual Rescaled wins over pending query, including equal-factor provenance change; Closed invalidates; invalid reply consumes its request without retry"
+    },
     "no_App_field_or_new_selector_or_timer": true,
     "no_ordinary_Message_enum_change": true,
     "observation_boundary": "view-state readback only, not compositor-present/renderer/log-sink delivery/User authority acknowledgement",
@@ -40,6 +72,7 @@
       "matched_executables": null,
       "native_Opened": null,
       "native_Rescaled": null,
+      "native_scale_query": null,
       "original_log_records": null,
       "performance": null,
       "ux": null

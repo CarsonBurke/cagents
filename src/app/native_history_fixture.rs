@@ -484,9 +484,8 @@ pub(super) fn local_message(message: &Message) -> Option<Task<Message>> {
         return Some(iced::exit().map(cosmic::Action::App));
     }
     match message {
-        Message::StartupWindowOpened(_) | Message::Sidebar(SidebarAction::ResizeFinished) => {
-            Some(Task::none())
-        }
+        Message::StartupWindowOpened(window) => Some(initial_native_scale_task(*window)),
+        Message::Sidebar(SidebarAction::ResizeFinished) => Some(Task::none()),
         Message::WindowCloseRequested(_) | Message::WindowClosed(_) => {
             Some(iced::exit().map(cosmic::Action::App))
         }
@@ -494,8 +493,43 @@ pub(super) fn local_message(message: &Message) -> Option<Task<Message>> {
     }
 }
 
+/// Request only after the observer has received the original matching Opened
+/// event. The normal Opened -> geometry mapping is retained; the native open
+/// task's StartupWindowOpened callback alone cannot establish that proof.
+fn initial_native_scale_task(window: window::Id) -> Task<Message> {
+    let Some(context) = context().expect("validated History fixture context") else {
+        return Task::none();
+    };
+    let request = context
+        .appearance
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .begin_native_scale_query(window);
+    let Some(request) = request else {
+        return Task::none();
+    };
+    window::scale_factor(window).map(move |scale| {
+        context
+            .appearance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .finish_native_scale_query(request, scale);
+        // An existing fixture-local message wakes a view without entering the
+        // normal startup handshake. The issued-request latch prevents recursion.
+        cosmic::Action::App(Message::StartupWindowOpened(window))
+    })
+}
+
 pub(super) fn after_update(app: &mut Cagents, task: Task<Message>) -> Task<Message> {
-    Task::batch([task, app.load_pending_history(), app.sync_chrome()])
+    Task::batch([
+        task,
+        app.load_pending_history(),
+        app.sync_chrome(),
+        app.core
+            .main_window_id()
+            .map(initial_native_scale_task)
+            .unwrap_or_else(Task::none),
+    ])
 }
 
 pub(super) fn subscription(app: &Cagents) -> Subscription<Message> {
@@ -532,12 +566,25 @@ pub(super) fn subscription(app: &Cagents) -> Subscription<Message> {
 const APPEARANCE_RECORD_LIMIT: u64 = 256;
 const APPEARANCE_RECORD_BYTES: usize = 4096;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NativeScaleRequest {
+    observer_instance: uuid::Uuid,
+    window: window::Id,
+    opened_generation: u64,
+    request: uuid::Uuid,
+    native_scale_generation: u64,
+}
+
 struct AppearanceObserver {
     instance: uuid::Uuid,
     target: Option<window::Id>,
     opened: Option<window::Id>,
+    opened_generation: u64,
     native_scale: Option<f32>,
+    native_scale_source: &'static str,
     native_scale_generation: u64,
+    native_scale_query: Option<NativeScaleRequest>,
+    native_scale_query_pending: bool,
     generation: u64,
     last: Option<AppearanceKey>,
     stopped: bool,
@@ -549,12 +596,100 @@ impl AppearanceObserver {
             instance: uuid::Uuid::new_v4(),
             target: None,
             opened: None,
+            opened_generation: 0,
             native_scale: None,
+            native_scale_source: "unknown",
             native_scale_generation: 0,
+            native_scale_query: None,
+            native_scale_query_pending: false,
             generation: 0,
             last: None,
             stopped: false,
         }
+    }
+
+    fn begin_native_scale_query(&mut self, window: window::Id) -> Option<NativeScaleRequest> {
+        if self.stopped
+            || self.target != Some(window)
+            || self.opened != Some(window)
+            || self.native_scale.is_some()
+            || self.native_scale_query.is_some()
+        {
+            return None;
+        }
+        let request = NativeScaleRequest {
+            observer_instance: self.instance,
+            window,
+            opened_generation: self.opened_generation,
+            request: uuid::Uuid::new_v4(),
+            native_scale_generation: self.native_scale_generation,
+        };
+        self.native_scale_query = Some(request);
+        self.native_scale_query_pending = true;
+        Some(request)
+    }
+
+    fn finish_native_scale_query(&mut self, request: NativeScaleRequest, scale: f32) -> bool {
+        if self.stopped
+            || !self.native_scale_query_pending
+            || self.native_scale_query != Some(request)
+            || self.instance != request.observer_instance
+            || self.target != Some(request.window)
+            || self.opened != Some(request.window)
+            || self.opened_generation != request.opened_generation
+            || self.native_scale_generation != request.native_scale_generation
+            || self.native_scale.is_some()
+        {
+            return false;
+        }
+        // Consume even an invalid actual reply. No retry guesses a scale or
+        // treats a duplicate completion as a fresh native observation.
+        self.native_scale_query_pending = false;
+        if !scale.is_finite() || scale <= 0.0 {
+            return false;
+        }
+        self.native_scale = Some(scale);
+        self.native_scale_source = "window_scale_factor_query";
+        self.native_scale_generation = self.native_scale_generation.saturating_add(1);
+        true
+    }
+
+    fn observe_window(&mut self, event_window: window::Id, event: &iced::Event) -> bool {
+        if self.target != Some(event_window) {
+            return false;
+        }
+        match event {
+            iced::Event::Window(window::Event::Opened { .. }) => {
+                if self.opened != Some(event_window) {
+                    self.opened = Some(event_window);
+                    self.opened_generation = self.opened_generation.saturating_add(1);
+                    self.native_scale_query = None;
+                    self.native_scale_query_pending = false;
+                }
+            }
+            iced::Event::Window(window::Event::Rescaled(scale))
+                if scale.is_finite() && *scale > 0.0 =>
+            {
+                if self.native_scale.map(f32::to_bits) != Some(scale.to_bits())
+                    || self.native_scale_source != "rescaled_event"
+                {
+                    self.native_scale = Some(*scale);
+                    self.native_scale_source = "rescaled_event";
+                    self.native_scale_generation = self.native_scale_generation.saturating_add(1);
+                }
+                // A later actual Rescaled event supersedes an in-flight query,
+                // including one whose reply happens to contain the same factor.
+                self.native_scale_query_pending = false;
+            }
+            iced::Event::Window(window::Event::Closed) => {
+                self.opened = None;
+                self.native_scale = None;
+                self.native_scale_source = "unknown";
+                self.native_scale_query_pending = false;
+            }
+            _ => {}
+        }
+        true
     }
 }
 
@@ -571,12 +706,16 @@ struct HistoryObservation {
 #[derive(Clone, PartialEq, Eq)]
 struct AppearanceKey {
     window: window::Id,
+    opened_generation: u64,
     theme_kind: &'static str,
     dark: bool,
     high_contrast: bool,
     exact_dark_class: bool,
     ui_scale_bits: Option<u32>,
     native_scale_bits: Option<u32>,
+    native_scale_source: &'static str,
+    native_scale_generation: u64,
+    native_scale_query_request: Option<uuid::Uuid>,
     workspace_generation: u64,
     source_generation: u64,
     inspector_open: bool,
@@ -593,29 +732,7 @@ fn observe_native_window(event_window: window::Id, event: &iced::Event) -> bool 
         .appearance
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if observer.target != Some(event_window) {
-        return false;
-    }
-    match event {
-        iced::Event::Window(window::Event::Opened { .. }) => {
-            observer.opened = Some(event_window);
-        }
-        iced::Event::Window(window::Event::Rescaled(scale))
-            if scale.is_finite() && *scale > 0.0 =>
-        {
-            if observer.native_scale.map(f32::to_bits) != Some(scale.to_bits()) {
-                observer.native_scale = Some(*scale);
-                observer.native_scale_generation =
-                    observer.native_scale_generation.saturating_add(1);
-            }
-        }
-        iced::Event::Window(window::Event::Closed) => {
-            observer.opened = None;
-            observer.native_scale = None;
-        }
-        _ => {}
-    }
-    true
+    observer.observe_window(event_window, event)
 }
 
 /// Read the same applied state used by Shell::theme/scale_factor, from a real
@@ -686,12 +803,19 @@ pub(super) fn observe_view(app: &Cagents) {
     }
     let key = AppearanceKey {
         window,
+        opened_generation: observer.opened_generation,
         theme_kind,
         dark: theme.theme_type.is_dark(),
         high_contrast: theme.theme_type.is_high_contrast(),
         exact_dark_class: matches!(theme.theme_type, cosmic::theme::ThemeType::Dark),
         ui_scale_bits,
         native_scale_bits: observer.native_scale.map(f32::to_bits),
+        native_scale_source: observer.native_scale_source,
+        native_scale_generation: observer.native_scale_generation,
+        native_scale_query_request: observer
+            .native_scale_query
+            .filter(|_| observer.native_scale_source == "window_scale_factor_query")
+            .map(|request| request.request),
         workspace_generation: app.durable.generation,
         source_generation: app.refresh_ui.source_generation,
         inspector_open: app.context_inspector_open,
@@ -716,6 +840,7 @@ pub(super) fn observe_view(app: &Cagents) {
         "window_id_kind": "iced_main_window_debug",
         "window_id": window_id,
         "window_open_source": "original_window_opened_event",
+        "window_open_generation": key.opened_generation,
         "product_version": crate::VERSION,
         "compiled_source_sha256": {
             "src/app/native_history_fixture.rs": &context.source_sha256[0],
@@ -732,8 +857,9 @@ pub(super) fn observe_view(app: &Cagents) {
         "applied_ui_scale_source": "Core::scale_factor_as_returned_by_Shell",
         "native_scale": key.native_scale_bits.map(|bits| f64::from(f32::from_bits(bits))),
         "native_scale_bits": key.native_scale_bits,
-        "native_scale_source": if key.native_scale_bits.is_some() { "rescaled_event" } else { "unknown" },
-        "native_scale_generation": observer.native_scale_generation,
+        "native_scale_source": key.native_scale_source,
+        "native_scale_generation": key.native_scale_generation,
+        "native_scale_query_request": key.native_scale_query_request,
         "state": {
             "workspace_generation": key.workspace_generation,
             "source_generation": key.source_generation,
@@ -761,4 +887,138 @@ pub(super) fn observe_view(app: &Cagents) {
     // be filtered or its sink unavailable. This call does not certify delivery.
     tracing::info!(target: "cagents::native_history", appearance_json = %serialized,
         "history native appearance state");
+}
+
+#[cfg(test)]
+mod native_scale_tests {
+    use super::*;
+
+    fn opened_observer(window: window::Id) -> AppearanceObserver {
+        let mut observer = AppearanceObserver::new();
+        observer.target = Some(window);
+        assert!(observer.observe_window(
+            window,
+            &iced::Event::Window(window::Event::Opened {
+                position: None,
+                size: iced::Size::new(1440.0, 900.0),
+            }),
+        ));
+        observer
+    }
+
+    #[test]
+    fn initial_native_scale_query_requires_opened_and_accepts_one_valid_reply() {
+        let window = window::Id::unique();
+        let foreign_window = window::Id::unique();
+        let mut observer = AppearanceObserver::new();
+        observer.target = Some(window);
+        assert!(observer.begin_native_scale_query(window).is_none());
+        assert!(!observer.observe_window(
+            foreign_window,
+            &iced::Event::Window(window::Event::Opened {
+                position: None,
+                size: iced::Size::new(1440.0, 900.0),
+            }),
+        ));
+        assert!(observer.begin_native_scale_query(window).is_none());
+        assert!(observer.native_scale.is_none());
+
+        let mut observer = opened_observer(window);
+        let request = observer.begin_native_scale_query(window).unwrap();
+        assert_eq!(request.observer_instance, observer.instance);
+        assert_eq!(request.window, window);
+        assert_eq!(request.opened_generation, observer.opened_generation);
+        assert!(observer.begin_native_scale_query(window).is_none());
+        assert!(observer.native_scale.is_none());
+        assert!(observer.finish_native_scale_query(request, 1.25));
+        assert_eq!(observer.native_scale, Some(1.25));
+        assert_eq!(observer.native_scale_source, "window_scale_factor_query");
+        assert_eq!(observer.native_scale_generation, 1);
+        assert!(!observer.finish_native_scale_query(request, 2.0));
+        assert_eq!(observer.native_scale, Some(1.25));
+        assert!(observer.begin_native_scale_query(window).is_none());
+
+        for invalid in [f32::NAN, f32::INFINITY, 0.0, -1.0] {
+            let mut observer = opened_observer(window);
+            let request = observer.begin_native_scale_query(window).unwrap();
+            assert!(!observer.finish_native_scale_query(request, invalid));
+            assert!(observer.native_scale.is_none());
+            assert_eq!(observer.native_scale_source, "unknown");
+            assert_eq!(observer.native_scale_generation, 0);
+            assert!(!observer.finish_native_scale_query(request, 1.25));
+            assert!(observer.begin_native_scale_query(window).is_none());
+        }
+    }
+
+    #[test]
+    fn initial_native_scale_query_refuses_foreign_closed_and_superseded_sources() {
+        let window = window::Id::unique();
+        let mut observer = opened_observer(window);
+        let request = observer.begin_native_scale_query(window).unwrap();
+        let mut foreign = request;
+        foreign.observer_instance = uuid::Uuid::new_v4();
+        assert!(!observer.finish_native_scale_query(foreign, 9.0));
+        foreign = request;
+        foreign.window = window::Id::unique();
+        assert!(!observer.finish_native_scale_query(foreign, 9.0));
+        foreign = request;
+        foreign.opened_generation += 1;
+        assert!(!observer.finish_native_scale_query(foreign, 9.0));
+        foreign = request;
+        foreign.request = uuid::Uuid::new_v4();
+        assert!(!observer.finish_native_scale_query(foreign, 9.0));
+        foreign = request;
+        foreign.native_scale_generation += 1;
+        assert!(!observer.finish_native_scale_query(foreign, 9.0));
+        assert!(observer.native_scale.is_none());
+        assert!(observer.native_scale_query_pending);
+
+        assert!(
+            observer.observe_window(window, &iced::Event::Window(window::Event::Rescaled(2.0)),)
+        );
+        assert!(!observer.finish_native_scale_query(request, 1.25));
+        assert_eq!(observer.native_scale, Some(2.0));
+        assert_eq!(observer.native_scale_source, "rescaled_event");
+        assert!(observer.begin_native_scale_query(window).is_none());
+
+        let mut observer = opened_observer(window);
+        let request = observer.begin_native_scale_query(window).unwrap();
+        assert!(observer.finish_native_scale_query(request, 1.25));
+        let query_generation = observer.native_scale_generation;
+        assert!(
+            observer.observe_window(window, &iced::Event::Window(window::Event::Rescaled(1.25)),)
+        );
+        assert_eq!(observer.native_scale, Some(1.25));
+        assert_eq!(observer.native_scale_source, "rescaled_event");
+        assert_eq!(observer.native_scale_generation, query_generation + 1);
+
+        let mut observer = opened_observer(window);
+        let request = observer.begin_native_scale_query(window).unwrap();
+        assert!(observer.observe_window(window, &iced::Event::Window(window::Event::Closed)));
+        assert!(!observer.finish_native_scale_query(request, 1.25));
+        assert!(observer.opened.is_none());
+        assert!(observer.native_scale.is_none());
+        assert!(observer.begin_native_scale_query(window).is_none());
+        assert!(observer.observe_window(
+            window,
+            &iced::Event::Window(window::Event::Opened {
+                position: None,
+                size: iced::Size::new(1440.0, 900.0),
+            }),
+        ));
+        let reopened_request = observer.begin_native_scale_query(window).unwrap();
+        assert_ne!(reopened_request.request, request.request);
+        assert!(reopened_request.opened_generation > request.opened_generation);
+        assert!(!observer.finish_native_scale_query(request, 9.0));
+        assert!(observer.finish_native_scale_query(reopened_request, 1.5));
+
+        let mut replacement = opened_observer(window);
+        let replacement_request = replacement.begin_native_scale_query(window).unwrap();
+        assert!(!replacement.finish_native_scale_query(request, 9.0));
+        replacement.stopped = true;
+        assert!(!replacement.finish_native_scale_query(replacement_request, 1.5));
+        assert!(replacement.native_scale.is_none());
+        // A log limit must not swallow the unchanged native close route.
+        assert!(replacement.observe_window(window, &iced::Event::Window(window::Event::Closed)));
+    }
 }
