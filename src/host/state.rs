@@ -23,7 +23,7 @@ use crate::{
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
-        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight, StartupState,
         TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
         WireTerminalEvent,
     },
@@ -1995,6 +1995,20 @@ impl HostState {
             (!self.startup_custody.is_empty())
                 .then_some("Original terminal ownership is awaiting its startup outcome")
         })
+    }
+
+    /// A retained failure outranks custody still awaiting its outcome: it is
+    /// never cleared, so waiting on the remaining custody cannot finish startup.
+    pub(super) fn startup_state(&self) -> StartupState {
+        match &self.startup_recovery {
+            Some(detail) => StartupState::Retained {
+                detail: detail.clone(),
+            },
+            None if self.startup_custody.is_empty() => StartupState::Ready,
+            None => StartupState::Restoring {
+                awaiting: self.startup_custody.len() as u64,
+            },
+        }
     }
 
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
@@ -4996,6 +5010,46 @@ mod tests {
     }
 
     #[test]
+    fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
+        use crate::terminal_ipc::{ClientRequest, ServerResponse};
+        let host = Arc::new(HostLock::new(test_host()));
+        let inspect =
+            || match crate::host::client::process_request(&host, 0, ClientRequest::StartupState)
+                .unwrap()
+                .0
+            {
+                ServerResponse::StartupState(state) => state,
+                response => panic!("unexpected startup state response: {response:?}"),
+            };
+        let refused = || {
+            crate::host::client::process_request(&host, 0, ClientRequest::BuildInfo)
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(inspect(), StartupState::Ready);
+
+        let custody = TerminalId::new();
+        host.lock().unwrap().startup_custody.insert(custody);
+        assert_eq!(inspect(), StartupState::Restoring { awaiting: 1 });
+        assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
+
+        let detail = "Upgrade restore retained original ownership: fixture restore failed";
+        host.lock().unwrap().retain_startup_recovery(detail.into());
+        let retained = StartupState::Retained {
+            detail: detail.into(),
+        };
+        assert_eq!(inspect(), retained);
+        // Custody settling afterwards does not end a retained recovery, and a
+        // later failure does not replace the original reason.
+        host.lock().unwrap().startup_custody.remove(&custody);
+        host.lock()
+            .unwrap()
+            .retain_startup_recovery("a later failure".into());
+        assert_eq!(inspect(), retained);
+        assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
+    }
+
+    #[test]
     fn terminal_spawn_accepts_byte_budgets_and_refuses_over_limit_before_spawn() {
         assert_eq!(
             TerminalSpawnOptions::default().max_scrollback_bytes,
@@ -6661,6 +6715,12 @@ for line in sys.stdin:
                     let state = failed.lock().unwrap();
                     assert_eq!(state.terminals.len(), 1);
                     assert_eq!(state.startup_recovery(), Some(failure.as_str()));
+                    assert_eq!(
+                        state.startup_state(),
+                        StartupState::Retained {
+                            detail: failure.clone()
+                        }
+                    );
                     let descriptor = state.descriptor(0, source.id).unwrap();
                     assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
                     assert_eq!(descriptor.session.launch, source.launch);
