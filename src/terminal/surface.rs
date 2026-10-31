@@ -75,6 +75,11 @@ impl TerminalSurface {
         self.handle.proof()
     }
 
+    /// See [`HostedTerminalHandle::current_attachment`].
+    pub fn current_attachment(&self) -> Result<Option<HostSessionProof>, String> {
+        self.handle.current_attachment()
+    }
+
     /// See [`HostedTerminalHandle::attachment_failure`].
     pub fn attachment_failure(&self) -> Option<String> {
         self.handle.attachment_failure()

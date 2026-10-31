@@ -152,21 +152,14 @@ impl Cagents {
                     continue;
                 }
                 match self.cards.get(&card.id) {
-                    // A confirmed attachment pins the host proof. A hibernated
-                    // view holds a detached marker while it stays attached
-                    // for its row, so only an awake view's snapshot says its
-                    // attachment was lost.
-                    Some(CardRuntime::Terminal(surface))
-                        if surface.terminal_id() == session.id
-                            && session.continuity.live_proof().is_some_and(|proof| {
-                                proof.is_complete() && surface.host_proof().as_ref() == Some(&proof)
-                            })
-                            && (surface.visibility() == TerminalVisibility::Hibernated
-                                || !surface.snapshot().detached) =>
-                    {
-                        if let Some(reason) = surface.attachment_failure() {
-                            failures.push(card.id);
-                            reasons.push(reason);
+                    Some(CardRuntime::Terminal(surface)) => {
+                        match terminal_surface_ready(session, surface) {
+                            Ok(true) => {}
+                            Ok(false) => pending = true,
+                            Err(reason) => {
+                                failures.push(card.id);
+                                reasons.push(reason);
+                            }
                         }
                     }
                     Some(CardRuntime::Loading)
@@ -215,7 +208,7 @@ impl Cagents {
         if !failures.is_empty() {
             let reason = reasons
                 .first()
-                .map(|reason| format!(" A terminal reported: {reason}."))
+                .map(|reason| format!(" A terminal reported: {}.", startup_detail(reason)))
                 .unwrap_or_default();
             return Err(format!(
                 "recovery-incomplete: {} saved panes could not reconnect (panes {}).{reason} Open the affected panes and use their recovery controls. Their drafts and recovery evidence are retained; this window remains available.",
@@ -343,6 +336,50 @@ impl Cagents {
     }
 }
 
+/// A hibernated screen marker is independent of its actual attachment. Only
+/// the current connection's accepted exact terminal can qualify this row.
+fn terminal_surface_ready(
+    session: &TerminalSession,
+    surface: &TerminalSurface,
+) -> Result<bool, String> {
+    if surface.terminal_id() != session.id {
+        return Err("The terminal surface no longer matches this saved pane".to_owned());
+    }
+    let Some(proof) = surface.current_attachment()? else {
+        return Ok(false);
+    };
+    if !proof.is_complete() || session.continuity.live_proof().as_ref() != Some(&proof) {
+        return Err("The terminal attachment no longer matches this saved pane's owner".to_owned());
+    }
+    Ok(surface.visibility() == TerminalVisibility::Hibernated || !surface.snapshot().detached)
+}
+
+/// Leave room for the launcher's fixed prefix and pane IDs in its 4 KiB line.
+/// Stop preparing text once the bounded summary is full; retain raw diagnostics
+/// in their existing recovery presentation.
+fn startup_detail(detail: &str) -> String {
+    const LIMIT: usize = 1024;
+    let mut text = String::new();
+    let mut space = false;
+    for ch in detail.chars() {
+        if ch.is_whitespace() {
+            space = !text.is_empty();
+            continue;
+        }
+        let width = ch.len_utf8() + usize::from(space);
+        if text.len() + width > LIMIT {
+            text.push('…');
+            break;
+        }
+        if space {
+            text.push(' ');
+            space = false;
+        }
+        text.push(ch);
+    }
+    text
+}
+
 fn report(result: Result<(), String>) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || instance::report_ui_startup(&result))
@@ -352,3 +389,6 @@ fn report(result: Result<(), String>) -> Task<Message> {
         Message::StartupReported(result)
     })
 }
+
+#[cfg(test)]
+mod attachment_tests;
