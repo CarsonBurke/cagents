@@ -1,0 +1,245 @@
+{
+  "actions": "Read-only Git/source/hash/receipt binding only. No edits, Git mutations, merge simulation, candidate import/execution, Cargo/build/tests/helpers/native, probes, push/remote write or new workers. One task-owned /tmp receipt.",
+  "ancestry": {
+    "1892_is_ancestor_of_delivery": true,
+    "d109_is_ancestor_of_delivery": true,
+    "first_parent_exact_d109": true,
+    "first_parent_fast_forward_available_by_ancestry": true,
+    "main4429_is_ancestor_of_1892": true,
+    "main4429_is_ancestor_of_delivery": true,
+    "merge_base_d109_1892": "a3221af83d56663f0dcbef90f67b30ad6d9fe53d",
+    "merge_base_main4429_delivery": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "second_parent_exact_1892": true
+  },
+  "evidence_limits": {
+    "all_final_Rust_tests_native": "UNRUN",
+    "fast_forward": "Verified ancestry makes an ordinary fast-forward from the pinned d109 endpoint possible. This is a source/history fact, not a push, permission, current-remote guarantee or readiness approval.",
+    "formatting": "Parent reports official Rust 1.93 formatting in progress; this review did not run or inspect its eventual result.",
+    "no_grant": "No build/test/native/provider execution, C/permission/grant, publication, merge/readiness or UX/whole-policy approval.",
+    "no_transfer": "Original negative/frozen evidence and prior executions remain scoped to their actual heads; none is converted to a final-head pass.",
+    "protocol": "Protocol128 is the exact existing reviewed 1892/Root blob. No new wire bytes or allocation relative to that product; no runtime compatibility claim.",
+    "remote_state": "Read-only local immutable Git and pinned supplied endpoints only; no public branch/main fetch or current remote-head verification."
+  },
+  "final_recheck": {
+    "clean": true,
+    "exact_frozen_head_tree_parents": true,
+    "freeze_plan_and_bound_receipt_hashes_unchanged": true,
+    "no_merge_added_duplicates_of_recorded_five_methods": true,
+    "no_replace_objects": true,
+    "startup_gate_named_method_declaration_counts": {
+      "detached": 1,
+      "detached_reason": 1,
+      "expire_attach_retries": 1,
+      "may_attach": 1,
+      "terminal_detached": 1
+    },
+    "whole_manifest_still_exact_1892": true
+  },
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/whole-startup-final-delivery-merge-freeze-v1.json",
+    "sha256": "e1c34ab4dbf29aa4eb5e133f925834365558dd0ed038e5cda1ea3d18193d2975"
+  },
+  "prior_review_bindings": {
+    "/tmp/startup-seed-d109cbb3-1892a6f4-source-binding-conservation-refresh-v1.json": {
+      "scope": "Final small immutable source binding/conservation refresh only; no semantic re-review of identical blobs.",
+      "sha256": "7c3b7228e9c69ca28bd573992758c33bbacfca6fb8e4c1cf651adb61db8ad59c",
+      "verdict": null
+    },
+    "/tmp/startup-seed-fixture-7c9c13c7-independent-conservation-review-v1.json": {
+      "scope": "Conservation only of the sole cfg(test) leaf relative to 6ceb2e98. Reviewer 1239 owns semantic sufficiency. This receipt does not repeat broad startup or native UX review.",
+      "sha256": "89ed32f94a9ad49130919803ff1a99e504619a23ac4631fddbb72795c000e093",
+      "verdict": "BOUNDED CONSERVATION CLEAR; source-only exact test delta"
+    },
+    "/tmp/startup-seed-fixture-semantic-source-review-7c9c13c7-v1.json": {
+      "scope": null,
+      "sha256": "e17114ea2b32027d0d82e1aebbfd2c766b9889e44885731137fbab0651a110fc",
+      "verdict": "SOURCE_CLEAR_WITHIN_7C9C13C7_TEST_ONLY_FIXTURE_SEMANTIC_SCOPE"
+    },
+    "/tmp/whole-stale-closed-c8ecf5f3-independent-conservation-review-v1.json": {
+      "scope": "Independent conservation only: committed tuple/source hashes, one317-line insertion, all original leaf bytes and named closed-positive controls, all other Git tree entries, protocol and genuine frozen author format receipt. Test semantics owned1954_directory and not duplicated.",
+      "sha256": "dd02db08d8bded0c1ac2febc77f845c02b7dc8f5b9d5d570b20d1343f1a4e00b",
+      "verdict": "BOUNDED_SOURCE_CONSERVATION_CLEAR"
+    },
+    "/tmp/whole-stale-closed-c8ecf5f3-semantic-test-source-review-v1.json": {
+      "scope": null,
+      "sha256": "56f4f24cacc378d7ba19f927d422552469f0d0da5bc3e6448cca0c0b99405f28",
+      "verdict": "BOUNDED_SEMANTIC_TEST_SOURCE_CLEAR"
+    },
+    "/tmp/whole-startup-62c48646-quarantine-guard-conservation-review-v1.json": {
+      "scope": null,
+      "sha256": "0bbd94fef5c34b57efd774f9e7a46197876585e0f595113abfbd23b6d39f0831",
+      "verdict": null
+    }
+  },
+  "resolution_provenance": {
+    "actual_complete_blob_bindings": {
+      "src/app/shared_views.rs": {
+        "final": {
+          "bytes": 289224,
+          "mode": "100644",
+          "oid": "249adfed754e7d63de1e0490bbdfef15545019e7",
+          "sha256": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+          "type": "blob"
+        },
+        "identical_to_complete_second_parent_entry": true
+      },
+      "src/app/startup_gate.rs": {
+        "final": {
+          "bytes": 28748,
+          "mode": "100644",
+          "oid": "c64192502ab12c0a44b953651034cf9dd88d4734",
+          "sha256": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
+          "type": "blob"
+        },
+        "identical_to_complete_second_parent_entry": true
+      },
+      "src/app/startup_gate/attachment_tests.rs": {
+        "final": {
+          "bytes": 18278,
+          "mode": "100644",
+          "oid": "b6b7e18be052072b4ec2d2df0a89f4e00d6470a0",
+          "sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+          "type": "blob"
+        },
+        "identical_to_complete_second_parent_entry": true
+      }
+    },
+    "conflict_evidence_scope": "The three-conflict census and historical marker-only hazard come from the sealed source plan/freeze. This review independently verifies actual final complete blobs against 1892, all final entries and ancestry; it did not rerun a merge calculation or replay.",
+    "declared_conflict_paths": [
+      "src/app/shared_views.rs",
+      "src/app/startup_gate.rs",
+      "src/app/startup_gate/attachment_tests.rs"
+    ],
+    "first_parent_changed_entry_count": 41,
+    "first_parent_delta_scope": "The final tree includes the recorded composition relative to d109, including six added paths and retained vendor edits. It is not byte-identical to d109. 'No new code/wire' here means zero delta relative to the exact reviewed second-parent product 1892.",
+    "method_duplication_bound": "Exact whole-file/tree identity proves the merge introduces no method copies or any bytes relative to reviewed 1892. It does not independently claim that all historical source methods are unique.",
+    "method_names_from_recorded_marker_only_hazard": [
+      "terminal_detached",
+      "detached",
+      "detached_reason",
+      "may_attach",
+      "expire_attach_retries"
+    ],
+    "source_plan": {
+      "path": "/tmp/startup-delivery-1892-d109-plan-je_j5216/report.json",
+      "sha256": "49a65f59f443cc77aeaeadc3052c2614fbf3c29a8ef8e6352b5fd5803f8a1984"
+    }
+  },
+  "retained_component_leaf_pins": {
+    "src/app/shared_views/tests/startup_admission.rs": {
+      "bytes": 247798,
+      "mode": "100644",
+      "oid": "9ceb6582a7c2c6e073ce77409c969dbb8a252eec",
+      "sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "type": "blob"
+    },
+    "src/app/shared_views/tests/startup_terminals.rs": {
+      "bytes": 35090,
+      "mode": "100644",
+      "oid": "36f8e17c7ff9118b99f931cc33d71a9f055dfe95",
+      "sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "type": "blob"
+    },
+    "src/app/startup_gate/tests.rs": {
+      "bytes": 34963,
+      "mode": "100644",
+      "oid": "bbf4e4eb6dce59ad24f2583ddd640b3073722b41",
+      "sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "type": "blob"
+    }
+  },
+  "retained_protocol": {
+    "bytes": 113283,
+    "entry_exact_1892": true,
+    "mode": "100644",
+    "oid": "1c610082dd9e4565ce4a3beb309351a346f0d158",
+    "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+    "type": "blob",
+    "version": 128
+  },
+  "review_scope_preservation": {
+    "c8": "The new c8 independent conservation and semantic-test source seals are both clear and bind exactly to the retained c8 admission leaf. No semantic test re-review was performed here.",
+    "components": "All earlier component review conclusions retain only their exact original file/API/behavior scope. Full tree identity binds those source bytes; it does not turn component review into final product, native WHOLE or merge readiness approval.",
+    "older_pending_receipt": "The previous d109/1892 binding receipt recorded c8 as pending at its own time. That historical receipt remains unchanged; its status was not retargeted or rewritten.",
+    "protected_review": "Root is separately routing this actual final head to Main15 protected review; this receipt does not supply that review."
+  },
+  "schema": "final-delivery-ancestry-source-conservation-review-v1",
+  "source_tuple": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "parents": [
+      "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "1892a6f458828d7b1f38f6e03457bf1a072efb73"
+    ],
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74"
+  },
+  "tree_conservation": {
+    "delta_from_1892": {
+      "added_paths": [],
+      "changed_entries": [],
+      "deleted_paths": [],
+      "mode_or_type_changes": []
+    },
+    "delta_from_d109": {
+      "added_paths": [
+        "src/app/chat_ui/image_only_peer_remove_tests.rs",
+        "src/app/chat_ui/managed_image_retention_test_support.rs",
+        "src/app/startup_gate/tests.rs",
+        "tests/support/owned_hook_pipe_holder.py",
+        "tests/support/owned_hook_pipe_holder.rs",
+        "tests/support/test_owned_hook_pipe_holder.py"
+      ],
+      "changed_entries": [
+        "src/app.rs",
+        "src/app/channel_ui.rs",
+        "src/app/chat_ui.rs",
+        "src/app/chat_ui/image_only_peer_remove_tests.rs",
+        "src/app/chat_ui/managed_image_retention_test_support.rs",
+        "src/app/chat_ui/session_links.rs",
+        "src/app/chat_ui/view.rs",
+        "src/app/notification_ui.rs",
+        "src/app/palette_ui.rs",
+        "src/app/project_ui.rs",
+        "src/app/resume_ui.rs",
+        "src/app/shared_views.rs",
+        "src/app/shared_views/tests/history_start.rs",
+        "src/app/shared_views/tests/startup_admission.rs",
+        "src/app/startup_gate.rs",
+        "src/app/startup_gate/attachment_tests.rs",
+        "src/app/startup_gate/tests.rs",
+        "src/app/terminal_adoption.rs",
+        "src/app/terminal_close.rs",
+        "src/app/workspace_model_sync.rs",
+        "src/app/worktree_ui.rs",
+        "src/control.rs",
+        "src/host/agent_execution/terminals.rs",
+        "src/host/chat/retained_actor_tests.rs",
+        "src/host/client.rs",
+        "src/host/state.rs",
+        "src/model.rs",
+        "src/persistence.rs",
+        "src/pull_request_review.rs",
+        "src/pull_request_review/discussion_ui.rs",
+        "src/session.rs",
+        "src/terminal/hosted.rs",
+        "src/terminal/ipc.rs",
+        "tests/repository_git_contract.rs",
+        "tests/session_restore_contract.rs",
+        "tests/support/owned_hook_pipe_holder.py",
+        "tests/support/owned_hook_pipe_holder.rs",
+        "tests/support/repository_scale.rs",
+        "tests/support/test_owned_hook_pipe_holder.py",
+        "vendor/accesskit-atspi-common/src/node.rs",
+        "vendor/libcosmic/src/widget/button/widget.rs"
+      ],
+      "deleted_paths": [],
+      "mode_or_type_changes": []
+    },
+    "final_entries": 2227,
+    "final_equals_reviewed_1892": true,
+    "manifest_sha256": "8b21009dbd3bcd1dffec4b8a2eb43004b9fe9b22992f202bfa3ef9206c901918",
+    "public_d109_entries": 2221,
+    "reviewed_1892_entries": 2227
+  },
+  "verdict": "BOUNDED FINAL DELIVERY ANCESTRY / FULL SOURCE CONSERVATION CLEAR",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery"
+}

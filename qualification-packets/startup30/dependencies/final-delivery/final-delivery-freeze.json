@@ -1,0 +1,26 @@
+{
+  "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+  "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+  "parents": [
+    "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+    "1892a6f458828d7b1f38f6e03457bf1a072efb73"
+  ],
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery",
+  "public_2030_ancestor": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+  "current_main_ancestor": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "resolution": "All three conflicted files taken complete from reviewed combined1892; final entiretree exactly1892. Marker-only resolutions prohibited because wouldduplicate5methods. No further source edits.",
+  "conflicted_paths": [
+    "src/app/shared_views.rs",
+    "src/app/startup_gate.rs",
+    "src/app/startup_gate/attachment_tests.rs"
+  ],
+  "source_plan": {
+    "path": "/tmp/startup-delivery-1892-d109-plan-je_j5216/report.json",
+    "sha256": "49a65f59f443cc77aeaeadc3052c2614fbf3c29a8ef8e6352b5fd5803f8a1984"
+  },
+  "all_source_component_reviews": "Retain exactleafscope; new commit/wholeprovenance and protectedreview pending",
+  "Rust_tests_native": "ALL UNRUN at finaldeliveryhead",
+  "grant": null,
+  "publication": null,
+  "created_utc": "2026-10-31T11:47:11.355995+00:00"
+}

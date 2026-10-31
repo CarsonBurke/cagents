@@ -1,0 +1,104 @@
+{
+  "authorship": "Root child1892 authored the test-only fix. Reviewer did not author this fix or its Seed reply helper; independent bfec24d9 diagnosis read as supporting source context.",
+  "blockers": [],
+  "conservation": {
+    "after": 11,
+    "all_original_assertions_retained_in_order": true,
+    "all_production_unchanged": true,
+    "before_after_exact_head_tree_parent_clean_worktree": true,
+    "both_ack_before_release_branches_retained": true,
+    "earlier_eight_test_parents_and_prefix_byte_exact": true,
+    "focus_parent_current_assertions": 16,
+    "focus_parent_original_assertions": 12,
+    "observed_window_model_body_byte_exact": true,
+    "only_changed_leaf": "src/app/shared_views/tests/startup_terminals.rs",
+    "only_old_assertion_expression_adaptations": "scope sets become retained payload maps: contains->contains_key and destination_seeds map binding; expected values/messages/order retained.",
+    "outside_leaf_modes_types_blobs_exact": 2221,
+    "test_parent_count_before": 10,
+    "total_tree_entries": 2222,
+    "transfer_parent_current_assertions": 17,
+    "transfer_parent_original_assertions": 17
+  },
+  "kind": "INDEPENDENT_STARTUP_SEED_FIXTURE_SEMANTIC_SOURCE_REVIEW_V1",
+  "limits": [
+    "Helper is a small component fixture for ordinary unmanaged unique-owner panes and existing scopes. It is not a general SQL Host reducer, authority, transaction or managed admission simulation. Cross-scope/same-resource collision admission, indexed ownership and persistence are not qualified by these tests.",
+    "Browser fixture supplies normal visible content. No browser/provider Task, actual native UI, external browser or live Host was executed by this source review.",
+    "All candidate tests/helpers/Tasks remain unexecuted here; source reasoning does not establish eventual test success, fixture-process closure or native behavior.",
+    "Original RootB exit101 /27 passed1failed remains the reported original negative from diagnosis; no raw-log re-audit or relabeling. New test results and combined port remain UNRUN.",
+    "Freeze reports official physical Rust1.93 formatter/check-format and diff-check exit0. Those were not rerun and original tool receipts were not independently inspected here.",
+    "No production change, no host+UI Cargo union, no broad reducer redesign, no new execution/admission/merge/C grant. Main15 combined WHOLE and separate correction reviews retain ownership."
+  ],
+  "method": "Read-only source text, immutable Git/show/diff/tree entries and JSON/hash inspection; assertion macros compared as source with only explicit map-container adaptations. No candidate/helper/test import, extracted calls, Tasks execution, build/test/native/process/env/account/provider/DB/endpoint/target/resource probe, source/Git/public write or new worker. Sole output is this task-owned /tmp receipt.",
+  "pins": {
+    "base_source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+    "complete_diff_sha256": "6c3ea3aa78b08c323e2d8489faf798e144ceb947b3cf7f500b9201cbf5815ca7",
+    "freeze": {
+      "bytes": 7251,
+      "path": "/tmp/startup-seed-fixture-7c9c13c7-source-freeze-v1/freeze.json",
+      "sha256": "9492040d25c29b22b7f25ac7bc31025a8b5721c322885fb37c7997d946ac8d59"
+    },
+    "head": "7c9c13c7afee3d16f677ec51fa90dea80a6df038",
+    "independent_diagnosis": {
+      "bytes": 10632,
+      "path": "/tmp/startup30-6ceb-failing-own-seed-focus-source-diagnosis-v1.json",
+      "sha256": "bfec24d93febf114275e31324d1f7e86e491aaec661fdab71b63514d5308a303"
+    },
+    "leaf": "src/app/shared_views/tests/startup_terminals.rs",
+    "parent": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+    "production_comparison_sources": {
+      "src/host/model.rs": {
+        "bytes": 60601,
+        "production_unchanged": true,
+        "sha256": "fbeb2c27bcd8bdf9e78286b9801f7b49f40d475ae6374b384adc51e18ed1d355"
+      },
+      "src/host/model/views.rs": {
+        "bytes": 89414,
+        "production_unchanged": true,
+        "sha256": "4fcde53fc87e36eb0e73518985edab78efb2aa43c2d483840552df8fc741e946"
+      },
+      "src/workspace_model/views.rs": {
+        "bytes": 51942,
+        "production_unchanged": true,
+        "sha256": "465d2d1dc6fc076ec8fd0d99ec1f6a6aa51598eafe1bf42a12cb9ae73cb7a808"
+      }
+    },
+    "source_bytes": 35090,
+    "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+    "tree": "ee76f4d8f3f4412200467aa05c6b930c8c1b48b8",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-seed-fixture-correction"
+  },
+  "reviewer": "/root/1239_provider_stream_order_review",
+  "semantic_findings": [
+    {
+      "anchors": "startup_terminals.rs:506-562,565-587,708-740,765-766",
+      "assessment": "Fixture now creates an ordinary Browser CardState from existing active fixture pane, assigns actual active channel membership plus channel/global focus, retains hidden terminal only as durable hidden content, and rebuilds visible workspace from active-only card. Before parent baseline capture, Some(active_id) and exact one-card visible order are asserted. The initial canonical active view stays empty, so actual Connected must emit active local content; captured active Seed IDs are asserted equal to the visible order. No None==None relaxation or canonical prepopulation masks the original defect.",
+      "subject": "Real active focus/order baseline"
+    },
+    {
+      "anchors": "startup_terminals.rs:590-623,715-751,782-794,851-865",
+      "assessment": "Collector retains complete actual SeedView edits, rejects non-Seed edits and duplicate scope submissions. ACK helper consumes exactly the emitted scope, checks issued scope and exactly one existing model view, and rejects managed issuers. Initial active and hidden ACKs each use the resulting mutable post-Seed model. Transfer target ACK is captured only after consuming its actual destination Seed; unrelated new scope is not acknowledged. This repairs the pre-Seed-as-post-Seed model error without inventing an authenticated host receipt.",
+      "subject": "Retained real emitted request before exact-scope ACK"
+    },
+    {
+      "anchors": "startup_terminals.rs:604-660; workspace_model/views.rs:471-546; host/model/views.rs:502-527,660-682,723-745; host/model.rs:431-450",
+      "assessment": "Helper applies actual closed IDs through public View::apply Remove before public Insert(before:None). The public reducer validates inserted panes, preserves existing same-ID descriptors/order, retains retirement tombstones and refuses their resurrection. For ordinary unmanaged unique-owner fixtures, helper skips another-scope ID ownership or different-ID same-resource conflicts rather than overwriting canonical data. Existing target view and unique selected scope are required. Actual fixture constructors use distinct CardId/terminal identities and transfer removes target from old view before adding destination; no ambiguous-owner model is passed by these parents.",
+      "subject": "Bounded additive reducer semantics"
+    },
+    {
+      "anchors": "startup_terminals.rs:637-659,671-698,797-845; host/model/views.rs:335-352,663-682; host/model.rs:431-450",
+      "assessment": "Revision0 is explicitly a fixture sentinel for not-yet-stored migration view; first seed, including an unchanged/empty seed, increments that view and global sequence once. Later actual View changes also increment once; unchanged registered duplicate seeds do not. This matches the cited first-storage/change contract for these constructed inputs. Explicit transfer Read revisions/sequence remain original fixture inputs, not synthetic Seed effects.",
+      "subject": "Revision and sequence"
+    },
+    {
+      "anchors": "startup_terminals.rs:664-698",
+      "assessment": "Starts with canonical existing and closable panes, submits a same-ID stale-title descriptor plus the closed pane plus a genuinely new pane. Explicit final panes preserve canonical descriptor/order, omit closed ID, append new pane; retired contains closed ID; revision/sequence are exactly2. Entire duplicate reply equality checks idempotence including metadata/tombstones, and both maps must be consumed. Returned-model-equals-model is supported by independent explicit state expectations rather than being the sole oracle. These checks guard nonoverwrite, tombstone non-resurrection and duplicate idempotence. Source order is directly verified; no runtime mutation test or universal ordering oracle is claimed.",
+      "subject": "Helper control is meaningful"
+    },
+    {
+      "anchors": "startup_terminals.rs:722-766,770-920",
+      "assessment": "Original 12 focus-parent and17 transfer-parent assertions remain in order, with only set-to-map lookup adaptations. Own-scope ACK gating, cached/target/other queue order, both ack_before_release cases, no premature starts, unrelated-scope-unready state, hibernated attachment/session proof outcomes, final empty queue/inflight and exact focus/order assertions retained. Entire earlier8-parent prefix, including original socket peers and no-Spawn checks, is byte-identical.",
+      "subject": "Existing queue/current-attachment outcomes preserved"
+    }
+  ],
+  "verdict": "SOURCE_CLEAR_WITHIN_7C9C13C7_TEST_ONLY_FIXTURE_SEMANTIC_SCOPE"
+}

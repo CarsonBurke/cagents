@@ -1,0 +1,505 @@
+{
+  "A2_context_comparison": {
+    "A2_recorded_context_sha256": "76c392ac1055afe0e3c866009a11382139307016b72a53567f05be12783e60b3",
+    "B_recorded_context_sha256": "76c392ac1055afe0e3c866009a11382139307016b72a53567f05be12783e60b3",
+    "continuity_limit": "Discrete sampled build-input/config/name context only. Equality transfers no three-check/test/native result and proves no continuous environment or current resource availability. No aggregate qualification claim is made here.",
+    "observed_drift": [],
+    "prior_RAW_receipt": "/tmp/coord-b9-startup-A2-6eca-sole-raw-review.json",
+    "prior_RAW_sha256": "90bd46ab882fd8780c823668acb3018de04c8960d2314c8d2e5cbc2466ac6245",
+    "prior_manifest_sha256": "3d71381920effed06fd511526e8bd7c4c33fbb37d6a694f28a08cdc5abac6792",
+    "recorded_context_bytes_equal": true,
+    "scope": "Only prior accepted A2 soleRAW/manifest/context hash bindings read; no A2 workload or wholeRAW re-audit."
+  },
+  "actual_accounting": {
+    "UI27_ok_are_partial_group_observations_not_qualified_global_credit": true,
+    "adoption_close": "UNKNOWN_UNQUALIFIED",
+    "fresh_inventory_invocations": 3,
+    "helper_builds": 0,
+    "ignored": 0,
+    "lib_compiles": 3,
+    "measured": 0,
+    "nonadditive_child_results": 0,
+    "ordinary_group_invocations": 3,
+    "per_parent_waits_fabricated": false,
+    "phase_count": 9,
+    "qualified_distinct_parents": 2,
+    "qualified_group_invocations": 2,
+    "raw_named_failures": 1,
+    "raw_named_passes": 29,
+    "scope_isolation": "UNKNOWN_UNQUALIFIED",
+    "selected_distinct_ordinary_parents": 30,
+    "whole_packet_qualified": false
+  },
+  "actual_groups": [
+    {
+      "Cargo_fresh": false,
+      "ELF_observed_before_after_identical": true,
+      "ELF_path": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target/debug/deps/cagents-57da86ebe978627c",
+      "ELF_sha256": "92d45f4901fca58bb10d7895e525d6dd4002242d428ca4d7b19c298f349db0c2",
+      "failed_use_posthash_preserved": true,
+      "footer": {
+        "failed": 0,
+        "filtered": 906,
+        "ignored": 0,
+        "measured": 0,
+        "passed": 1,
+        "seconds": 0.0,
+        "status": "ok"
+      },
+      "graph": "cli-lib",
+      "group_exit": 0,
+      "group_qualified": true,
+      "inventory_N": 907,
+      "raw_parent_results": [
+        {
+          "log_line": 3,
+          "name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+          "result": "ok"
+        }
+      ],
+      "selected": 1
+    },
+    {
+      "Cargo_fresh": false,
+      "ELF_observed_before_after_identical": true,
+      "ELF_path": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target/debug/deps/cagents-d41248e10186b69e",
+      "ELF_sha256": "0c074949ce592335f9be5976761aa0c34dfd3932a2fc8283292cd53fc523c9ab",
+      "failed_use_posthash_preserved": true,
+      "footer": {
+        "failed": 0,
+        "filtered": 3103,
+        "ignored": 0,
+        "measured": 0,
+        "passed": 1,
+        "seconds": 0.0,
+        "status": "ok"
+      },
+      "graph": "host-lib",
+      "group_exit": 0,
+      "group_qualified": true,
+      "inventory_N": 3104,
+      "raw_parent_results": [
+        {
+          "log_line": 3,
+          "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+          "result": "ok"
+        }
+      ],
+      "selected": 1
+    },
+    {
+      "Cargo_fresh": false,
+      "ELF_observed_before_after_identical": true,
+      "ELF_path": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target/debug/deps/cagents-2be7a4c20163cdf3",
+      "ELF_sha256": "a04db3314bb5ba78aec85e9bcbaa1f1883602fd0247e0bd90bff5a98b92b66a8",
+      "failed_use_posthash_preserved": true,
+      "footer": {
+        "failed": 1,
+        "filtered": 4652,
+        "ignored": 0,
+        "measured": 0,
+        "passed": 27,
+        "seconds": 1.39,
+        "status": "FAILED"
+      },
+      "graph": "ui-lib",
+      "group_exit": 101,
+      "group_qualified": false,
+      "inventory_N": 4680,
+      "raw_parent_results": [
+        {
+          "log_line": 3,
+          "name": "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+          "result": "ok"
+        },
+        {
+          "log_line": 4,
+          "name": "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+          "result": "ok"
+        },
+        {
+          "log_line": 5,
+          "name": "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+          "result": "ok"
+        },
+        {
+          "log_line": 6,
+          "name": "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+          "result": "ok"
+        },
+        {
+          "log_line": 7,
+          "name": "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+          "result": "ok"
+        },
+        {
+          "log_line": 8,
+          "name": "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+          "result": "ok"
+        },
+        {
+          "log_line": 9,
+          "name": "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+          "result": "ok"
+        },
+        {
+          "log_line": 10,
+          "name": "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+          "result": "ok"
+        },
+        {
+          "log_line": 11,
+          "name": "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+          "result": "ok"
+        },
+        {
+          "log_line": 12,
+          "name": "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+          "result": "ok"
+        },
+        {
+          "log_line": 13,
+          "name": "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+          "result": "ok"
+        },
+        {
+          "log_line": 14,
+          "name": "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+          "result": "ok"
+        },
+        {
+          "log_line": 15,
+          "name": "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+          "result": "ok"
+        },
+        {
+          "log_line": 16,
+          "name": "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+          "result": "ok"
+        },
+        {
+          "log_line": 17,
+          "name": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+          "result": "FAILED"
+        },
+        {
+          "log_line": 18,
+          "name": "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+          "result": "ok"
+        },
+        {
+          "log_line": 19,
+          "name": "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+          "result": "ok"
+        },
+        {
+          "log_line": 20,
+          "name": "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+          "result": "ok"
+        },
+        {
+          "log_line": 21,
+          "name": "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+          "result": "ok"
+        },
+        {
+          "log_line": 22,
+          "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+          "result": "ok"
+        },
+        {
+          "log_line": 23,
+          "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+          "result": "ok"
+        },
+        {
+          "log_line": 24,
+          "name": "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+          "result": "ok"
+        },
+        {
+          "log_line": 25,
+          "name": "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+          "result": "ok"
+        },
+        {
+          "log_line": 26,
+          "name": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+          "result": "ok"
+        },
+        {
+          "log_line": 27,
+          "name": "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+          "result": "ok"
+        },
+        {
+          "log_line": 28,
+          "name": "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+          "result": "ok"
+        },
+        {
+          "log_line": 29,
+          "name": "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+          "result": "ok"
+        },
+        {
+          "log_line": 30,
+          "name": "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+          "result": "ok"
+        }
+      ],
+      "selected": 28
+    }
+  ],
+  "actual_phases": [
+    {
+      "exit": 0,
+      "label": "compile-cli-lib",
+      "pid": 86,
+      "seconds": 28.75134269602131,
+      "stderr_sha256": "9e984c1ae01bf860472e76aae70d2bece7ad0f11ce30b0156fc4ec5b2393104c",
+      "stdout_sha256": "b839da56d41b927fda0ad3f4be3add44fb54341b76d3029605d110b3ad855f37"
+    },
+    {
+      "exit": 0,
+      "label": "inventory-cli-lib",
+      "pid": 409,
+      "seconds": 0.12395322893280536,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "c07139a26cf4caa2c0f93560fab43bab7cbb1f4aef6fe0ec1c15a5ee743f8c7a"
+    },
+    {
+      "exit": 0,
+      "label": "parent-cli-lib-exact",
+      "pid": 448,
+      "seconds": 0.1251707699848339,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "7069d4e0069352809b0676d6f5675ce6a474665056f0a26a8f91abe28cc5c116"
+    },
+    {
+      "exit": 0,
+      "label": "compile-host-lib",
+      "pid": 489,
+      "seconds": 87.94779634405859,
+      "stderr_sha256": "b49867c00186b6e1de9cfa7e6489a06d20f40a6fcdc06fe0a056fb5ddd21ba1d",
+      "stdout_sha256": "ccb7256a0a49de6ad8039036d27b3d886e9c7351373b597d3e2ecb2e717685e6"
+    },
+    {
+      "exit": 0,
+      "label": "inventory-host-lib",
+      "pid": 860,
+      "seconds": 0.1265077639836818,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "fc8cb95ae0ee5a89f084be6a99d00bdd2bf2497c5fa56132125ce9e7e02361bf"
+    },
+    {
+      "exit": 0,
+      "label": "parent-host-lib-exact",
+      "pid": 899,
+      "seconds": 0.1282028170535341,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "4368e2dd52dcafb5fa7a6ac921bdc9f17463d230e336264146558e0c7a4ae754"
+    },
+    {
+      "exit": 0,
+      "label": "compile-ui-lib",
+      "pid": 939,
+      "seconds": 143.68271788710263,
+      "stderr_sha256": "ad7368e1b43244dfcf47c269f34772caeb44fdd2d74514a1e4036cd70f0262fc",
+      "stdout_sha256": "594991bc8e8f082170ee07c175956d4d81861d022dd0d9851adf4da58dbd31d7"
+    },
+    {
+      "exit": 0,
+      "label": "inventory-ui-lib",
+      "pid": 3796,
+      "seconds": 0.1468500359915197,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "19f79538d45cdaf895f3dddf6c841135e9b228372dbd42259fc0a2f706581d5c"
+    },
+    {
+      "exit": 101,
+      "label": "parent-ui-lib-exact",
+      "pid": 3835,
+      "seconds": 1.5321333389729261,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "e1ea5827a348bcf3bea43c4a4b896aa3193f392c35dfc45fb50958be61c8e184"
+    }
+  ],
+  "auditor_only_schema_corrections": [
+    "Inspection initially treated group-contracts.json as an object; actual original schema is a list of three groups. Corrected the auditor reader only.",
+    "Recursive source-manifest basename lookup also found a historical manifest; selected the actual top-level startup30/manifest.json with exact reviewed SHA. Its members schema is a71-entry list. No original file was repaired or controller executed."
+  ],
+  "authorization": {
+    "allocation": "abefe703-0a61-4eea-b18a-26cad7b0f758",
+    "authenticated_recipient": "b9aa3f1d-524e-49e2-a43c-e5d9acf6bbc6",
+    "authenticated_sender": "ec204421-6a6d-4edc-a23d-c8f8fc1b5ab1",
+    "fixed_review_path_index": 9,
+    "fixed_review_sha_index": 11,
+    "grant": "8a680bff-944d-4b2d-a163-2e0db17b1903",
+    "no_new_authority_or_grant_from_review": true,
+    "only_actual_grant_substitution_index": 5,
+    "publication_handoff_sha256": "df16d64841d2318f698f823ab8c4afb4a3d66c4d81aad48ea2a9e5c82c18e661",
+    "reviewed_publication_handoff": "/tmp/fw16-backend-ec204421/startup30-B-347c2adc-reviewed-source-publication-v1.json"
+  },
+  "controller": {
+    "head": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "independent_review_sha256": "2fc2f6c84638f94187701f7763ac02a72737d82f1d43ff37fe3244236a52e005",
+    "manifest_sha256": "d150057e1dffb8eec77f7fa5ef726d72640778dab8766d3cc5758a6bdcc19a35",
+    "plan_sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+    "runner_sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+    "source_binding_sha256": "660afcf28d44317d2e2ce5340f59d7b0293f42b76562c6a0edb98fc84a3125a4",
+    "tree": "f7ebf371b7005f7ee7eb6de11228a26909ce4a64"
+  },
+  "evidence_blockers": [],
+  "evidence_directory": "/tmp/fw16-startup30-stable-validation-20261031T105822359510Z-2",
+  "executor_return_assessment": {
+    "EC_acceptance": false,
+    "actual_executor_return_by_reviewer": false,
+    "bounded_negative_return_admissible": true,
+    "logical_C": "HELD_UNTIL_SOLE_RAW_PLUS_EXECUTOR_RETURN_PLUS_EC_ACCEPTANCE",
+    "new_capacity_or_grant_claim": false
+  },
+  "failure": {
+    "actual_UI_exit": 101,
+    "actual_UI_footer": {
+      "failed": 1,
+      "filtered": 4652,
+      "ignored": 0,
+      "measured": 0,
+      "passed": 27,
+      "seconds": 1.39,
+      "status": "FAILED"
+    },
+    "assertion": "left None; right Some(CardId(original fixture UUID))",
+    "column": 5,
+    "error": "RuntimeError: Actual nonzero phase exit: parent-ui-lib-exact: 101",
+    "first_and_only_failed_parent": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+    "line": 633,
+    "next_step": "Source owner must inspect actual restored-row seed-ack fixture/production sequence at exact6ceb, preserve the failed assertion and diagnose the None outcome before any reviewed correction/new qualification. No fixture/product cause inferred, no rerun or waiver.",
+    "path": "src/app/shared_views/tests/startup_terminals.rs",
+    "source_owner": "EC Root; B9 executor only"
+  },
+  "integrity": {
+    "all22_match_exact_product_Git_blobs": true,
+    "all_archive_bytes_match_plan_and_exact_controller_blobs": true,
+    "all_hashes_verified_before_and_at_seal": true,
+    "all_members_match_exact_controller_Git_blobs": true,
+    "archived_inputs": 53,
+    "checksum_manifest_sha256": "c9b23807cbfa96a02ef18e4f9701ecc8a6f101ef54df1f9c11fedbee46eace6b",
+    "checksum_members": 121,
+    "context_before_after_bytes_equal": true,
+    "missing_unindexed_duplicate_unsafe_members_or_links": 0,
+    "original_files_including_checksum_file": 122,
+    "product_source_pins_and_archived_product_leaves": 22,
+    "source_before_after_bytes_equal": true,
+    "source_manifest_members": 71,
+    "source_packet_files": 72,
+    "source_recorded_status": "",
+    "summary_sha256": "8302934b7f78f805d098c97161f1724db576bf3c0d33d6cb8babc95c9bda972d",
+    "tools_record_matches_plan": true
+  },
+  "limits": [
+    "Actual nine-phase Rust qualification is negative because UI group101 has27P1F, not a complete30-parent PASS. No success from prior A2/donor tests transfers.",
+    "Full inventory counts907/3104/4680 are graph-specific, nonadditive; only30 planned distinct ordinary parents were invoked across three OS group waits. Internal child assertions/threads are not additional parents/waits.",
+    "No all-target/wholePR/native/UI screenshot/UX/provider/installed/release/performance/WHOLE/359/global or kernel-family closure follows. Scope isolation and adoption close remain UNKNOWN_UNQUALIFIED.",
+    "ELF evidence consists of actual Cargo artifact JSON and original no-follow pre/post observations, not archived ELF bytes or independent atomic exec-to-PID/kernel mapping. Source and context checkpoints are discrete, not continuous attestation.",
+    "All cleanup and fd conclusions are bounded recorded local facts. No current process/proc/account/DB/tool/environment/target/lock/resource probe, unknownPID action or current physical availability claim was made.",
+    "Original UIgroup-result.json and aggregate test-elfs.json are absent because the first nonzero phase stops the positive path; actual failed log/result and post-use ELF observation remain retained. This is not a missing-evidence waiver.",
+    "No authored controller/helper/function/module/case/test/Cargo/compiler/native execution, source mutation, GitHub action, session polling, new worker/context/account/model occurred."
+  ],
+  "original_ELF_and_writer_close_facts": {
+    "Cargo_artifact_fresh_values": [
+      false,
+      false,
+      false
+    ],
+    "Cargo_artifact_profile_test": true,
+    "UI_failed_use_posthash_recorded": true,
+    "actual_feature_graphs": [
+      [],
+      [
+        "host"
+      ],
+      [
+        "ui"
+      ]
+    ],
+    "atomic_test_PID_exe_inode_binding": "NOT_RECORDED; original path-based Popen plus current source/ELF pre-post observations only.",
+    "before_after_group_hash_and_metadata_identity_all_equal": true,
+    "full_ELF_archives": false,
+    "order": "Original phase log streams close before result hashes; final source/context lies between two final child censuses, then original handoff predicates precede Cfd close1279-1280. Full summary1309/checksums1311/compact stdout and RELEASE_STATUS follow close and are bounded by original toolterminal6930df EXIT1. Logical C remains held for explicit executor return and EC acceptance.",
+    "original_file_read_descriptors_reported_closed": true,
+    "recorded_Cfd_close_returned": true,
+    "recorded_LOCK_UN": false,
+    "recorded_actual_release": true,
+    "recorded_close_error": null,
+    "three_distinct_Cargo_reported_library_ELFs": true
+  },
+  "original_request": {
+    "all_available_outputs_untruncated": true,
+    "chunks": [
+      "c4029c",
+      "ef34d3",
+      "2e8766",
+      "6930df"
+    ],
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source",
+    "exact_admitted_argv": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/run-packet.py",
+      "--grant",
+      "8a680bff-944d-4b2d-a163-2e0db17b1903",
+      "--runner-sha256",
+      "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+      "--controller-review",
+      "/tmp/startup30-347c2adc-current-runner-binding-independent-refresh-v1.json",
+      "--controller-review-sha256",
+      "2fc2f6c84638f94187701f7763ac02a72737d82f1d43ff37fe3244236a52e005"
+    ],
+    "exact_saved_request_sha256": "b7334aa4aaf7a1ba85f90dd74992505c328b0bc23c0a4d117bd823f1e1a43915",
+    "original_controller_sys_argv_matches": true,
+    "retained_record_sha256": {
+      "000-start.json": "48a794cbfb36c33c9320822c4cb2939585b99c2e4c3e6051f1c5396aa9aaac6c",
+      "001-wait.json": "69b3d598bb11825a9b1907dd779e6f71da650170dfa882d5b4f1829422844282",
+      "002-wait.json": "1ce6e39157140f3595ccb137e70e7092c36ccba3c6d60772e9b0d4bab23a1f90",
+      "003-wait.json": "286c8225d726293285833ff566263633fd19d00339018488db14c7a9a3914ca8",
+      "admitted-argv.json": "d81b87aec25ad26dd5d068579258c743482a5125f2a3f1bd0142c15726714b62",
+      "authenticated-grant-readback.json": "e72c2846388474db6e4f8832bdb8f2abbbde412028e3ddc718997c2ede356724",
+      "exact-original-tool-request.json": "b7334aa4aaf7a1ba85f90dd74992505c328b0bc23c0a4d117bd823f1e1a43915"
+    },
+    "saved_before_execution": "Parent-provided original supported request provenance; no filesystem chronology fabricated.",
+    "saved_cmd_exact_and_shlex_match": true,
+    "session": 28356,
+    "session_polled_or_reopened_by_reviewer": false,
+    "terminal_exit": 1,
+    "tool_directory": "/tmp/coord-b9-startup-B-abefe-original-tools"
+  },
+  "product": {
+    "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+    "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4"
+  },
+  "recorded_waits_and_local_custody": {
+    "all_attempt_state_stage_label_PID_order_matches": true,
+    "all_clean_unforced_observed_empty": true,
+    "cancellation_signals": 0,
+    "direct_forced_cleanup_attempts": 0,
+    "exit0": 308,
+    "exit101": 1,
+    "final_local_censuses": 2,
+    "original_direct_attempts": 309,
+    "original_waits_settled": 309,
+    "phase_direct_waits": 9,
+    "phase_local_censuses": 9,
+    "recorded_only": "Original Child.wait results and local serialized custody; not each compiler/test thread descendant kernel status or global/namespace proof.",
+    "source_Git_waits": 300,
+    "supervision_or_evidence_errors": 0,
+    "unique_recorded_PIDs": 309,
+    "unknown": 0
+  },
+  "reviewed_at": "2026-10-31T11:09:49.832128+00:00",
+  "schema": "startup-packet-B-abefe-sole-original-RAW-review-v1",
+  "scope": "ONE nonauthor original whole-RAW audit for this exact B; no replay, repair, broad source review or live probes.",
+  "verdict": "ORIGINAL_UI_GROUP_FAILURE_CONFIRMED_BOUNDED_NEGATIVE_EXECUTOR_RETURN_ADMISSIBLE"
+}

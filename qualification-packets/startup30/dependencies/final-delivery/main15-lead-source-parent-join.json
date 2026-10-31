@@ -1,0 +1,138 @@
+{
+  "schema": "main15-final-protected-source-and-owning-parent-lead-handoff-v1",
+  "created_utc": "2026-10-31T12:02:21.157354+00:00",
+  "request": "EC ac551127-a8d1-49af-a891-184178ee667e",
+  "product": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "protected_baseline": "62c4864619e8d80cea6aebc9d1f309012484caca",
+    "source_locator": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery"
+  },
+  "verdict": "SOURCE_CLEAR_FOR_PROTECTED_PRESERVATION_AND_52_SOURCE_PARENT_SELECTION; CURRENT_EXECUTION_UNRUN",
+  "review_references": {
+    "protected_review": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-main15-final-protected-WHOLE-source-test-oracle-review-v1.json",
+      "sha256": "eeeeb413c2b06650abe514fb4c37df723af583aa70d52b6152da8679bf32a139",
+      "bytes": 19436,
+      "mode": "0o444"
+    },
+    "parent_selection": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-final-owning-test-parent-selection-refresh-v2.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef",
+      "bytes": 25829,
+      "mode": "0o444"
+    },
+    "baseline_protected_review": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/62c48646-main15-protected-WHOLE-composition-source-review-v1.json",
+      "sha256": "72ffb69533dbcebb4fe59f1b02d64ec81ed6438af7b43e7056d41ef1e8163b6e",
+      "bytes": 19834,
+      "mode": "0o444"
+    },
+    "baseline_lead_review": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/62c48646-main15-lead-assembled-protected-source-and-parent-response-v1.json",
+      "sha256": "79c11f77515b00b8a353780678bb0ec160f69d6af3aa6c61b5d16aa6b12c5659",
+      "bytes": 7313,
+      "mode": "0o444"
+    },
+    "latest_C_steering": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/20261031T120057338878Z-final-aeb-review-peer-inbox-v1.json",
+      "sha256": "63282549d35129baaf6701d11df2a2d6cd98693a40ac5d0c2b789e54a5e5606f",
+      "bytes": 2753,
+      "mode": "0o444"
+    },
+    "final_freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-final-delivery-merge-freeze-v1.json",
+      "sha256": "e1c34ab4dbf29aa4eb5e133f925834365558dd0ed038e5cda1ea3d18193d2975",
+      "bytes": 1259,
+      "mode": "0o644"
+    },
+    "combined_freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-fixture-composition-source-v1.json",
+      "sha256": "df677fd84d2ffc560704521704954616a284322498ada0c78659f61cb8e6c96b",
+      "bytes": 1309,
+      "mode": "0o644"
+    }
+  },
+  "lead_independent_checks": {
+    "complete_two_leaf_diff_read": true,
+    "recursive_entry_count_each": 2227,
+    "exact_entries": 2225,
+    "changed_paths": [
+      "src/app/shared_views/tests/startup_admission.rs",
+      "src/app/shared_views/tests/startup_terminals.rs"
+    ],
+    "all_other_paths_mode_type_blob_conserved": true,
+    "combined1892_tree_equals_final": true,
+    "source_hashes": {
+      "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "src/app/startup_gate/tests.rs": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "src/app/shared_views/tests/startup_terminals.rs": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "src/app/shared_views.rs": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "src/app/shared_views/tests/startup_admission.rs": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "src/session.rs": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+      "src/persistence.rs": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/app/startup_gate.rs": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    "all52_fn_names_once_with_test_attribute_and_exact_position": true,
+    "old_Root30_names_exact_once_in_union": true,
+    "Root35_remaining17_overlap": 0,
+    "counts": {
+      "cli": 1,
+      "host": 6,
+      "ui": 45
+    },
+    "count_total": 52
+  },
+  "lead_direct_source_assessment": [
+    "Natural regression starts real saved/reloaded CLOSED old proof A without preinstalled quarantine/local-only; valid current same-ID B and independent H both have exact open issuers. Normal Connected must quarantine raw A before any seed.",
+    "All emitted SeedView panes and closed lists exclude A; ChangeView may not target A. Exactly one hidden seed contains full H. Captured-scope ACK gating and scripted H ChatAttach/Ready are asserted rather than setting Ready directly.",
+    "A remains CLOSED with exact source/nonce/draft/image and retained History provenance after test-authored DB save/reopen. After H readiness, CLOSED quarantine alone correctly permits startup_pane_check Ok(true). Original legitimate CLOSED B positive control remains unchanged.",
+    "Fixture correction retains actual Some(activeID) focus and visible order, uses exact captured SeedView payloads to build typed ACK models, and preserves existing queue, own-ACK, another-scope and effect assertions. Closed-before-insert helper has a bounded unmanaged control; it is not a Host SQL/authenticated admission simulator.",
+    "Both new parents count once; the corrected restored_observed_row and queued_transfer parents already belong to old Root30. Protected production conclusions from72ff remain applicable because every production byte is exact62."
+  ],
+  "source_parent_map": {
+    "Root35": {
+      "cli": 1,
+      "host": 1,
+      "ui": 33,
+      "total": 35
+    },
+    "remaining17": {
+      "cli": 0,
+      "host": 5,
+      "ui": 12,
+      "total": 17
+    },
+    "union": {
+      "cli": 1,
+      "host": 6,
+      "ui": 45,
+      "total": 52
+    },
+    "full_names_and_rationale_reference": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-final-owning-test-parent-selection-refresh-v2.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef",
+      "bytes": 25829,
+      "mode": "0o444"
+    }
+  },
+  "causal_execution_limit": "Inherited authority refusal/early return with an ok footer is not causal-body evidence. Preserve opaque caller authority and all permission/proof checks. Existing public-client child/effect bodies require separately admitted actual evidence; this source map supplies no context or authority recipe.",
+  "validation_limit": {
+    "current_head_Rust_compile_test_SQLite_IPC_native": "UNRUN",
+    "prior_RootB_focus_failure": "Retained historical failure, not converted into PASS by source fixture correction.",
+    "test_authored_effects": "Described source assertions only; lead did not execute them.",
+    "actual_native": "Supplier/roles/outerstream HOLD; no current before-after evidence or UX qualification.",
+    "old91_Rust10": "HOLD; no silent retarget or execution requested.",
+    "C": "Root16-only allocation9995f81e-063f-41dc-9b07-6fe12bc6766f/grant8742aa82-fbc7-49dc-ac75-ddcd5e7c455e; Main15 no resource claim.",
+    "actual_grant": null,
+    "queue": false,
+    "product_merge_qualified": false,
+    "PR1933": "NEVER_MERGE"
+  },
+  "metadata_correction": "First lead metadata assertion assumed column-zero fn; source is indented. Corrected static matcher accepts leading whitespace. First attempt wrote no receipt and ran no authored source/controller.",
+  "scope": "Read-only immutable Git/source/diff/tree/name/hash and named inert evidence review; exclusive receipt write only. No product/controller edits, tests, Cargo/ELF inventory, target/cache/process/environment/authority probe, fetch/merge/public write or new descriptor."
+}

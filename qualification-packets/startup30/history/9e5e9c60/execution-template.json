@@ -1,0 +1,22 @@
+{
+  "kind": "TEMPLATE_NOT_SUBMITTABLE",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source",
+  "actual_grant": null,
+  "actual_independent_successor_review": null,
+  "execution": "UNRUN",
+  "authority": "Template strings are not authorization; Root must supply actual reviewed evidence and distinct actual grant."
+}

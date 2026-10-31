@@ -1,0 +1,131 @@
+{
+  "active_definition": {
+    "archive_path": "qualification-packets/startup30/dependencies/adopted-child-settlement/canonical-settle_children.py",
+    "byte_exact_full_definition_to_canonical_commit_and_archive": true,
+    "bytes": 877,
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_path": "policy-corrections/adopted-child-settlement/settle_children.py",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "lines": [
+      225,
+      246
+    ],
+    "only_changed_active_top_function": "settle_children",
+    "path": "qualification-packets/startup30/run-packet.py",
+    "replace_new_definition_with_original_reconstructs_entire_347_runner": true,
+    "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+  },
+  "caller_check": {
+    "HOLD_has_no_signaling_close_retry_new_cleanup_or_workload": "run-packet.py:822-841",
+    "acquired_C_finalization_exception_or_unconfirmed_handoff_calls_HOLD_before_close": "run-packet.py:1237-1256",
+    "bounded_distinction": "Settlement unclean/error under acquired C retains HOLD. An ordinary test failure with confirmed clean custody may still use the unchanged bounded negative-return/close path; not every error is reclassified as HOLD. Prelease refusal remains distinct.",
+    "custody_clean_refuses_clean_false_remaining_or_inspection_error": "run-packet.py:664-668",
+    "final_settlement_exceptions_become_unclean_and_first_unclean_final_pass_stays_unclean": "run-packet.py:784-808",
+    "original_direct_child_timeout_cleanup_unchanged": true,
+    "phase_settlement_result_or_inspection_exception_retained_in_state_custody": "run-packet.py:1126-1149",
+    "safe_handoff_requires_every_historical_phase_custody_and_both_final_passes_clean": "run-packet.py:670-686",
+    "unknown_adoptees_are_not_signaled_by_ported_settlement": true
+  },
+  "conservation": {
+    "all_15_frozen_changed_file_hash_size_tree_entry_and_local_bytes_checks_match": true,
+    "all_24_unchanged_claim": false,
+    "all_5_nested_main_functions_exact": true,
+    "full_summary_construction_save_hash_block": {
+      "bytes": 2511,
+      "sha256": "ddb619e94f0c86c9a613c75a78f9523a10541ba66df8dfad89844a081f84b484"
+    },
+    "generic_functions_byte_exact_to_347_and_original_donor": 23,
+    "main_direct_Popen_run_timeout_original_wait_held_pidfd_cleanup_parser_error_return_HOLD_close_finalwriters_output_exact": true,
+    "new_paths": 11,
+    "one_generic_function_explicitly_corrected": true,
+    "other_top_functions_byte_exact": 31,
+    "outside_packet_mode_type_blob_entries_exact": 2222,
+    "plan_sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+    "plan_source_binding_command_data_source_map_execution_template_and_all_product_source_blobs_exact": true,
+    "preexisting_modified_paths": [
+      "README.md",
+      "manifest.json",
+      "run-packet.py",
+      "source-conservation.json"
+    ],
+    "preexisting_packet_entries_exact": 68,
+    "protected_lifecycle_tail": {
+      "bytes": 3790,
+      "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4"
+    },
+    "removed_paths": 0
+  },
+  "execution_authority_limits": {
+    "candidate_import_call_run_test_build_native": "UNRUN",
+    "canonical_pure_tests_or_semantic_audit": "NOT_REPEATED",
+    "environment_process_target_resource_account_DB_probes": "NOT_PERFORMED",
+    "grant_queue_C_return_merge_readiness": "NOT_GRANTED_OR_REVIEWED",
+    "new_workers": "NONE",
+    "old_B_negative_and_decd_accepted_evidence": "PRESERVED_SEPARATE_NOT_REAUDITED_OR_RECLASSIFIED",
+    "runtime_native_global_custody_qualification_transfer": "NONE",
+    "source_Git_public_writes": "NONE"
+  },
+  "findings": [],
+  "historical_and_provenance": {
+    "all_preexisting_dependencies_history_and_product_blobs_preserved": true,
+    "genuine_original_and_archive_bytes_hash_size_match": [
+      {
+        "archive": "dependencies/adopted-child-settlement/canonical-freeze.json",
+        "bytes": 2591,
+        "original": "/tmp/fw16-backend-ec204421/c-unproven-adoption-policy-source-v1/freeze.json",
+        "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682"
+      },
+      {
+        "archive": "dependencies/adopted-child-settlement/semantic-caller-review.json",
+        "bytes": 8938,
+        "original": "/tmp/c-unproven-adoption-semantic-caller-review-upwkrg6v/review.json",
+        "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
+      },
+      {
+        "archive": "dependencies/adopted-child-settlement/original-source-negative.json",
+        "bytes": 13311,
+        "original": "/tmp/startup30-adopted-signal-source-audit-hlrnp0hy/review.json",
+        "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
+      }
+    ],
+    "historical_all24_records_not_retargeted": true,
+    "historical_runners_retaining_original_definition": [
+      "dependencies/donor_runner.py",
+      "dependencies/historical_982_run-packet.py",
+      "history/7e057dc0/run-packet.py",
+      "history/347c2adc/run-packet.py"
+    ],
+    "historical_settle_definition_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "new_history_347_runner_manifest_conservation_README_exact_original_blobs": true
+  },
+  "member_manifest": {
+    "covers_entire_tracked_packet_except_manifest_itself": true,
+    "hash_size_and_local_bytes_failures": [],
+    "members": 82,
+    "tracked_packet_files": 83
+  },
+  "pending_bindings": {
+    "actual_grant": null,
+    "final_corrected_product_and_source_binding_refresh_required": true,
+    "new_runner_path_does_not_match_retained_original_plan_runner_path": true,
+    "self_path_guard": "run-packet.py:861",
+    "source_port_is_not_runnable_or_queueable": true,
+    "unchanged_PLAN_plan_runner_path_source_binding_absolute_paths_template_still_refer_to_original_stable_source_packet": true
+  },
+  "pins": {
+    "author_freeze": {
+      "path": "/tmp/startup30-unsignaled-port-author-xaxptagt/freeze.json",
+      "sha256": "0df632ba9207a599ed6bc76e78f157d581fc729cae81098bee097c6d0b210671"
+    },
+    "head": "9e5e9c605b491365bdb75b83412d0a32872cd81a",
+    "manifest_sha256": "ae12121bc518ba258a7369cf74d37109725afce68173b4ef4d44740bcd7c4ab4",
+    "runner_sha256": "9b5d0ce0eb9e753ff1616674fd8853457a6dc82d1fc4a4e16e022dd981202e68",
+    "sole_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "tree": "e89dc85f0db49ec9d95158b0c91d223644b58fb2",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-unsignaled-port"
+  },
+  "reviewer": "/root/1335_full_output_copy_lease",
+  "schema": "startup30-unsignaled-port-independent-source-verification-v1",
+  "scope": "Exact active-function port, bounded owning-caller HOLD check, source conservation, historical provenance and manifest only. No duplicate canonical semantic audit or test invocation.",
+  "verdict": "SOURCE_PORT_CLEAR_EXACT_CANONICAL_AND_CONSERVATION_NOT_RUNNABLE_NOT_QUEUEABLE_NO_GRANT"
+}

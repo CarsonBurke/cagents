@@ -1,0 +1,247 @@
+{
+  "schema": "startup30-unsignaled-adoption-port-author-freeze-v1",
+  "utc": "2026-10-31T11:32:04.482021+00:00",
+  "role": "Bounded source-port author for Root; not the independent reviewer of this port",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-unsignaled-port",
+  "branch": "qualification/fw16-startup30-unsignaled-port",
+  "head": "9e5e9c605b491365bdb75b83412d0a32872cd81a",
+  "tree": "e89dc85f0db49ec9d95158b0c91d223644b58fb2",
+  "sole_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+  "scope": "Only qualification-packets/startup30; exact canonical settle_children port plus immutable347/canonical review archives and accurate current source metadata. Product and future fixture bindings not changed.",
+  "kind": "SOURCE_PORT_NOT_RUNNABLE_NOT_QUEUEABLE_NO_GRANT",
+  "pins": {
+    "runner": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-unsignaled-port/qualification-packets/startup30/run-packet.py",
+      "sha256": "9b5d0ce0eb9e753ff1616674fd8853457a6dc82d1fc4a4e16e022dd981202e68",
+      "bytes": 81062
+    },
+    "canonical_live_definition": {
+      "name": "settle_children",
+      "lines": [
+        225,
+        246
+      ],
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+      "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+      "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d"
+    },
+    "manifest": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-unsignaled-port/qualification-packets/startup30/manifest.json",
+      "sha256": "ae12121bc518ba258a7369cf74d37109725afce68173b4ef4d44740bcd7c4ab4",
+      "member_count": 82,
+      "all_members_and_lengths_verified": true
+    },
+    "conservation": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-unsignaled-port/qualification-packets/startup30/source-conservation.json",
+      "sha256": "e3fe7d160ae9e0d17a4d89bb44c0f54256f25e7b4e17ef9f3437980668042261"
+    },
+    "port_and_pending_bindings": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-unsignaled-port/qualification-packets/startup30/adoption-port.json",
+      "sha256": "a4d8765d9ff5c26f1174d14fc78ac78ee2cf6134ed74b988a6b57a3b688c9003"
+    },
+    "plan": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-unsignaled-port/qualification-packets/startup30/plan.json",
+      "sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+      "byte_exact_to347": true
+    },
+    "original_runner": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-unsignaled-port/qualification-packets/startup30/history/347c2adc/run-packet.py",
+      "sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+      "exact_original347": true
+    }
+  },
+  "frozen_changed_files": [
+    {
+      "path": "qualification-packets/startup30/README.md",
+      "tree_entry": "100644 blob f77a3c2c1f937fb150b536d6b2c751cd799ed5de",
+      "sha256": "d4542281bf0dbd40e3f8d1466f79bad838e729e8d93b4e6f3a38d94382a5746c",
+      "bytes": 2337
+    },
+    {
+      "path": "qualification-packets/startup30/adoption-port.json",
+      "tree_entry": "100644 blob 519ea3f80c3d88516a9627ccf7c795fa9eea39c6",
+      "sha256": "a4d8765d9ff5c26f1174d14fc78ac78ee2cf6134ed74b988a6b57a3b688c9003",
+      "bytes": 5730
+    },
+    {
+      "path": "qualification-packets/startup30/dependencies/adopted-child-settlement/canonical-freeze.json",
+      "tree_entry": "100644 blob 0dbfd6e0918055a5bf798f7057507bf2556f2793",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682",
+      "bytes": 2591
+    },
+    {
+      "path": "qualification-packets/startup30/dependencies/adopted-child-settlement/canonical-settle_children.py",
+      "tree_entry": "100644 blob fd31b863db8bb4ef36c3a328624e9f02e87884fa",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+      "bytes": 877
+    },
+    {
+      "path": "qualification-packets/startup30/dependencies/adopted-child-settlement/original-source-negative.json",
+      "tree_entry": "100644 blob e06759cfc0f907ebf2c036ac3769e6711ecfea6a",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8",
+      "bytes": 13311
+    },
+    {
+      "path": "qualification-packets/startup30/dependencies/adopted-child-settlement/semantic-caller-review.json",
+      "tree_entry": "100644 blob aa569e7a44ca46cfe0ead5bda0451c8e5248519f",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8",
+      "bytes": 8938
+    },
+    {
+      "path": "qualification-packets/startup30/from-347c2adc.diff.json",
+      "tree_entry": "100644 blob 8c9d14f16dd3385217d963cfb7c4c378239fed3a",
+      "sha256": "a0b49d8c8bb52f7b28b55bf754e5a954b0eaa01e5b100dcc6331bc5e03b6f063",
+      "bytes": 2090
+    },
+    {
+      "path": "qualification-packets/startup30/history/347c2adc/README.md",
+      "tree_entry": "100644 blob 045c3b8047b7681eb88128c7c5b6aba7c47bb7a9",
+      "sha256": "e41e91d6fe775ba939adbf8ccbf66d05469bdb71cdd5c969c8b3f0ce8b01c5b5",
+      "bytes": 1458
+    },
+    {
+      "path": "qualification-packets/startup30/history/347c2adc/manifest.json",
+      "tree_entry": "100644 blob cc5e1b4062e6b7f4e575c788c49d1126c9b736bc",
+      "sha256": "d150057e1dffb8eec77f7fa5ef726d72640778dab8766d3cc5758a6bdcc19a35",
+      "bytes": 12191
+    },
+    {
+      "path": "qualification-packets/startup30/history/347c2adc/run-packet.py",
+      "tree_entry": "100644 blob 39195ac75bc021704457e116ab79a8ce536b68a0",
+      "sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+      "bytes": 81778
+    },
+    {
+      "path": "qualification-packets/startup30/history/347c2adc/source-conservation.json",
+      "tree_entry": "100644 blob 10f16f4b658cb88f00d669f625399a58919cd829",
+      "sha256": "bcaf8b9a34f4de324f0e879303e2a9305ca6f90df6990a5b693f3239d664cdd4",
+      "bytes": 8277
+    },
+    {
+      "path": "qualification-packets/startup30/manifest.json",
+      "tree_entry": "100644 blob 4073c911e576103c7dc4ecc91dd3880bd1a957e4",
+      "sha256": "ae12121bc518ba258a7369cf74d37109725afce68173b4ef4d44740bcd7c4ab4",
+      "bytes": 14132
+    },
+    {
+      "path": "qualification-packets/startup30/run-packet.py",
+      "tree_entry": "100644 blob 7bb918015d58f3482a2da0604e2e5d6b6376c054",
+      "sha256": "9b5d0ce0eb9e753ff1616674fd8853457a6dc82d1fc4a4e16e022dd981202e68",
+      "bytes": 81062
+    },
+    {
+      "path": "qualification-packets/startup30/source-conservation.json",
+      "tree_entry": "100644 blob 43918793cd4b44d3d579823b0af33fc463205f8c",
+      "sha256": "e3fe7d160ae9e0d17a4d89bb44c0f54256f25e7b4e17ef9f3437980668042261",
+      "bytes": 8671
+    },
+    {
+      "path": "qualification-packets/startup30/to-347c2adc.inverse.diff.json",
+      "tree_entry": "100644 blob ec5d18ce68d8f283daca2c5bd9b64a6514deef74",
+      "sha256": "8bc200abf378c90371e0f2ff4a412280dfbf14ba91796294b57e01b79edaa09a",
+      "bytes": 2102
+    }
+  ],
+  "static_conservation": {
+    "outside_packet_mode_type_blob_entries_exact": 2222,
+    "preexisting_packet_entries_exact": 68,
+    "preexisting_modified_paths": [
+      "qualification-packets/startup30/README.md",
+      "qualification-packets/startup30/manifest.json",
+      "qualification-packets/startup30/run-packet.py",
+      "qualification-packets/startup30/source-conservation.json"
+    ],
+    "new_paths": 11,
+    "all_preexisting_historical_dependency_and_history_entries_exact": true,
+    "history_347_exact_originals": [
+      "run-packet.py",
+      "manifest.json",
+      "source-conservation.json",
+      "README.md"
+    ],
+    "only_changed_live_top_function": "settle_children",
+    "other_top_functions_exact": 31,
+    "generic_functions_exact_to347_and_actual_donor": 23,
+    "nested_main_functions_exact": 5,
+    "protected_lifecycle_tail": {
+      "bytes": 3790,
+      "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+      "byte_exact_to347": true
+    },
+    "main_parser_run_returns_and_original_direct_Popen_timeout_wait_held_pidfd_cleanup_exact": true,
+    "caller_HOLD": "Existing sticky phase custody, both final custody passes, complete original waits/evidence and no-forced cleanup predicates still gate original C close; unknown acquired-C handback retains original owner/HOLD.",
+    "all_bytes_outside_live_function_exact": true,
+    "all24_unchanged_claim": false
+  },
+  "genuine_provenance": [
+    {
+      "archive_path": "dependencies/adopted-child-settlement/canonical-freeze.json",
+      "original_path": "/tmp/fw16-backend-ec204421/c-unproven-adoption-policy-source-v1/freeze.json",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682",
+      "bytes": 2591,
+      "scope": "Root canonical-source freeze, not a runnable packet"
+    },
+    {
+      "archive_path": "dependencies/adopted-child-settlement/semantic-caller-review.json",
+      "original_path": "/tmp/c-unproven-adoption-semantic-caller-review-upwkrg6v/review.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8",
+      "bytes": 8938,
+      "scope": "Exact canonical function/caller source review; not this port review or runtime admission"
+    },
+    {
+      "archive_path": "dependencies/adopted-child-settlement/original-source-negative.json",
+      "original_path": "/tmp/startup30-adopted-signal-source-audit-hlrnp0hy/review.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8",
+      "bytes": 13311,
+      "scope": "Original inherited adopted-child signaling source finding; no historical incident claim"
+    }
+  ],
+  "pending_final_binding_refresh": {
+    "runner_PLAN_literal": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/plan.json",
+    "runner_PLAN_SHA_literal": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+    "plan_runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/run-packet.py",
+    "plan_source_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/source-binding.json",
+      "sha256": "660afcf28d44317d2e2ce5340f59d7b0293f42b76562c6a0edb98fc84a3125a4"
+    },
+    "plan_archive_bindings": "All original archive paths/hashes still bind the original stable-source packet; future final composition must bind its own exact retained artifacts.",
+    "source_binding_paths": "Original absolute packet paths in source-binding.json still bind original347 preparation/product evidence; no old receipt was retargeted.",
+    "execution_template": {
+      "path": "execution-template.json",
+      "argv_runner": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/run-packet.py",
+      "runner_sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source",
+      "scope": "Unchanged historical347 null-grant template; it is not an invocation for this port."
+    },
+    "product_tuple": {
+      "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+      "parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard",
+      "status": "Frozen6ceb remains unchanged; Root reports original27P1F. Future corrected fixture head/source/review bindings are separately owned and not supplied by this port."
+    },
+    "static_refusal": "At this new file path, the unchanged main runner_path equality guard is inconsistent with the retained original plan runner_path. No attempt was made to invoke it; exact source/context/product refresh and independent review are prerequisites.",
+    "source_preparation_not_admission": true
+  },
+  "product_status": "Unchanged6ceb/tree726b fixture source, original27P1F as reported by Root. No fix/pass/native qualification transferred by this port; future corrected fixture/product composition separately owned.",
+  "source_checks": {
+    "AST_parse": "PASS as inert text analysis only",
+    "all_JSON_and_manifest_members": "PASS",
+    "git_diff_check": "original0",
+    "staged_diff_check": "original0",
+    "commit": "original0 tool83525d",
+    "post_commit_status": "clean",
+    "candidate_import_call_compile_tests_build_native": "NONE"
+  },
+  "actual": {
+    "grant": null,
+    "queue_position": null,
+    "current_runtime_observation": null,
+    "runtime_results": null,
+    "release": null,
+    "publication": null
+  },
+  "historical_runtime": "Root accepted B347 negative separately. OldA2 adopted sets empty/no signal and accepted bounded4680 remain their original bounded evidence, not reaudited or transferred here.",
+  "independent_port_review": "PENDING. Canonical semantic/caller/source review remains its original scope. No automatic review transfer.",
+  "actions": "Only scoped packet source/artifact edits, source/Git/AST/JSON/hash checks and local source freeze commit. No candidate/helper import or invocation, test/Cargo/build/native execution, process/env/resource/target probes, lane acquisition, provider action, public write or new worker."
+}

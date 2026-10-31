@@ -1,0 +1,11 @@
+# Startup30 unsignaled-adoption source port
+
+This is a source-only successor of frozen347. Only the live `settle_children` definition changes: it is byte-exact to canonical fef275ca / SHA2569004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483. After the original three-second natural grace, unproven survivors remain unsignaled and return unclean custody. Existing phase/final guards retain acquired C/HOLD. Original direct-Popen cleanup, parser/run/returns and the3790-byte lifecycle block remain unchanged. Twenty-three other generic functions remain exact; no all24-unchanged claim applies to this port.
+
+The exact347 runner, manifest, README and conservation record are retained in `history/347c2adc/`. All other original historical copies, product snapshots, source receipts and prior diff artifacts remain unchanged. Canonical freeze, source finding and semantic/caller review bytes are retained under `dependencies/adopted-child-settlement/` for their original scopes; they do not independently review this port. The new forward/inverse347 diffs and current source-conservation.json identify the exact correction.
+
+This packet is NOT RUNNABLE and NOT QUEUEABLE. Plan, command data, product source and source-binding remain byte-exact to347. They still bind frozen6ceb/tree726b, whose original validation Root reports as27P1F. A future corrected fixture head and composed bindings are separately owned. `adoption-port.json` lists the unchanged absolute PLAN/plan/source/archive paths, original null-grant execution template and runner SHA that need final refresh. Do not use the old template to run this port.
+
+The30 parentnames,9 serial phases,2400s workload cap,2310s summed phase caps, isolated CLI1/HOST1/UI28, jobs2 and existing C target are unchanged task data, not new execution evidence. No helper, supervisor, authority flag or runtime effects are added. Full original summary/error/ledgers/hashmanifest handling, compact terminal output and error bounds remain exact. No pass, original failure, old A2/4680 result, native qualification or safe release transfers to this source.
+
+Independent exact-port review, final product/binding composition and a fresh Root admission remain required. No candidate import, call, test, Cargo/build, native execution, probe, publication or grant was performed for this port.

@@ -1,0 +1,86 @@
+{
+  "assessments": [
+    {
+      "anchors": "src/app/shared_views.rs:719-722,1327-1360",
+      "result": "pane_is_quarantined checks transient OR durable marker; new first guard refuses both before unattached true fallback and before normal model/ACK/source checks. Nonquarantined behavior retains exact original predicate. No state mutation or ownership manufacture.",
+      "subject": "Restore fallback guard"
+    },
+    {
+      "anchors": "src/app/shared_views.rs:3298-3318",
+      "result": "Each fresh fixture first asserts unattached and successful original fallback. Separate loop iterations install only transient marker or only durable marker, then assert quarantine and refusal while attached remains absent. Negative does not pass merely because model/source readiness was already false. Card is deliberately a predicate input rather than a naturally classified saved model fixture.",
+      "subject": "Fallback positive and two independent negative controls"
+    },
+    {
+      "anchors": "src/app/startup_gate/tests.rs:495-547",
+      "result": "Ended terminal uses existing typed end_terminals; Chat literal is_unstarted asserted with no provider identity/proof/terminal/listener and default ReconnectOnly. Pre-quarantine Ok(true) proves each waiver works. Both markers then force error with exact card ID and preserve whole CardState/markers. Closing only existence via existing removed_existence yields Ok(None)/Ok(true), preserves exact closed card, both markers and existing Loading runtime. It neither reopens closed evidence nor requires a visible Failed runtime for closed history.",
+      "subject": "Open refusal versus closed history"
+    },
+    {
+      "anchors": "src/app/startup_gate/tests.rs:549-577",
+      "result": "One terminal is explicitly ended; the other remains Loading. Exact Some(Pending{admission:false,panes:[healthy]}) is asserted before and after q insertion in both orders. No immediate failure or q-as-pending can satisfy these controls.",
+      "subject": "Pending priority in both card orders"
+    },
+    {
+      "anchors": "src/app/startup_gate/tests.rs:560-595; src/app/startup_gate.rs:453-484",
+      "result": "Existing inspection helper captures live Pending/current opened phase/connected-owner list, advances the ticket, and installs matching outstanding/inspect context. Its complete fixture proof and endpoint pass startup_observation_current before q insertion. After healthy ends, live check requires q failure; delivering the original issued answer must actually set reported reason containing q, leave saving false and daemon cache empty, preserve original OPEN CardState and both q markers. A merely ignored wrong-ticket answer would fail reported.expect; a missing q guard or Ready waiver would fail the error/report/save assertions.",
+      "subject": "Valid original delayed Ready does not waive denial"
+    }
+  ],
+  "blockers": [],
+  "causal_limits": [
+    "All assertions reviewed statically; no test or mutation run performed. Counterfactual failure descriptions are source reasoning, not execution results.",
+    "Delayed Ready has no connected owners in this fixture. Positive validity checks complete fixture proof/endpoint/phase/Pending/current empty-owner basis; it is not evidence of an actual accepted live terminal or RPC. Retained Root attachment tests are byte-exact and remain separately required.",
+    "Gate fixtures explicitly install quarantine markers and do not drive raw classifier, SeedView, persistence, host/provider effects or native UI. Shared/durable marker alternatives are isolated only in the fallback predicate regression.",
+    "Pending case exercises genuine pending panes with admission:false; it makes no new claim of registry-admission Pending coverage. Existing admission tests are retained.",
+    "Full Main15 protected WHOLE source review and combined native/user-flow qualification remain required. No old pass or runtime authority transfers."
+  ],
+  "kind": "BOUNDED_NONAUTHOR_QUARANTINE_GUARD_AND_CAUSAL_REGRESSION_SOURCE_REVIEW_V1",
+  "method": "Read-only immutable Git/show/diff and source/JSON/hash inspection. No candidate imports/calls/run, build/test/native/environment/process/provider/account/DB/resource probes, source/Git/public edits, new workers or grant. Sole write is this task-owned /tmp receipt.",
+  "pins": {
+    "changed_sources": {
+      "src/app/shared_views.rs": {
+        "bytes": 289224,
+        "sha256": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61"
+      },
+      "src/app/startup_gate/tests.rs": {
+        "bytes": 34963,
+        "sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b"
+      }
+    },
+    "closed_policy_addendum": {
+      "bytes": 9211,
+      "path": "/tmp/held-saved-scope-fw16-evidence/91a8-6ceb-stale-closed-source-fixture-design-addendum-v1.json",
+      "sha256": "f49fa64e5431ff26bba6eefea57cf79a1102095cc35a02eed95fdd40475431e4"
+    },
+    "complete_diff_sha256": "70f9ad357b2bb88f1fe47c2e3484e12bb08fac2223de8a643e5bca7ffc5f8182",
+    "freeze": {
+      "bytes": 916,
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-quarantine-guard-source-v1.json",
+      "sha256": "c2e6145ab55128e6a39eb4218ffb61b3775ce7c67731015c9f5afb6fbcb7f4a9"
+    },
+    "head": "62c4864619e8d80cea6aebc9d1f309012484caca",
+    "parent": "490017a7bf040c440b7240069f2fab7a2a8f5b78",
+    "tree": "73de2eae297f8807480b2aa9f28bde583ad483b7",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-composition"
+  },
+  "relationship": "Root authored this implementation. Reviewer supplied prior source-only guidance for the two startup gate regression shapes; this is a nonauthor correctness refresh, not an independent origin of that design.",
+  "reviewer": "/root/1239_provider_stream_order_review",
+  "source_conservation": {
+    "all_original_gate_tests_exact_after_removing_two_new_tests": true,
+    "all_original_shared_source_and_tests_exact_after_removing_declared_additions": true,
+    "initial_final_exact_head_tree_parent_clean_worktree": true,
+    "no_public_API_wire_protocol_change_in_delta": true,
+    "only_changed_tracked_paths": [
+      "src/app/shared_views.rs",
+      "src/app/startup_gate/tests.rs"
+    ],
+    "startup_gate_production_and_attachment_tests_byte_exact_to_parent": true
+  },
+  "validation": {
+    "Rust_tests_native": "ALL_UNRUN",
+    "format_diff": "Freeze reports official Rust1.93 scripts/check-format exit0 and diff-check0; receipt contents read, neither rerun nor original tool receipts independently inspected here.",
+    "grant_admission_release_merge": "NONE",
+    "protocol": "Existing128 unchanged; no new tag"
+  },
+  "verdict": "SOURCE_CLEAR_WITHIN_62C48646_GUARD_AND_THREE_TEST_DELTA_SCOPE"
+}

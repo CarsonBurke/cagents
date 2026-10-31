@@ -1,0 +1,451 @@
+{
+  "kind": "finite-whole-startup-additional-owning-test-parent-source-selection-v1",
+  "reviewer": "/root/async_races",
+  "status": "SOURCE_DERIVED_SELECTION_ONLY_NOT_EXECUTION_ADMISSION",
+  "source": {
+    "head": "62c4864619e8d80cea6aebc9d1f309012484caca",
+    "tree": "73de2eae297f8807480b2aa9f28bde583ad483b7",
+    "parent": "490017a7bf040c440b7240069f2fab7a2a8f5b78",
+    "merge_parent_tree": "8ef680d5f4bc231d41823ee479ce9111a465a568",
+    "merge_parents": [
+      "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "91a8dff516e6fb76fadab432119e67c472fd9489"
+    ],
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-composition",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-quarantine-guard-source-v1.json",
+      "sha256": "c2e6145ab55128e6a39eb4218ffb61b3775ce7c67731015c9f5afb6fbcb7f4a9"
+    },
+    "source_file_sha256": {
+      "src/app/shared_views.rs": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "src/app/shared_views/tests/startup_admission.rs": "fafbb5c809da2fedbd5147ad9368efad890e389d874636bcbef85d48f37c7c7d",
+      "src/app/startup_gate/tests.rs": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "src/persistence.rs": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "src/session.rs": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    }
+  },
+  "old_Root_baseline": {
+    "controller": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "plan": "347c2adc5ec7820477c49947b4906e2dc35f3986:qualification-packets/startup30/plan.json",
+    "physical_source": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source",
+    "plan_sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+    "selectors": {
+      "CLI": 1,
+      "HOST": 1,
+      "UI": 28,
+      "total": 30
+    },
+    "source_selection": "Read exact artifact_groups[*].selectors from this immutable plan, rather than guessing from observed output.",
+    "provenance_pointer": {
+      "path": "/tmp/coord-b9-startup-B-abefe-actual-executor-return.json",
+      "sha256": "e83479756d44b33fc1111ec9fc88c368d3463ed8f808ce1df0db69dc1fc0c0df"
+    },
+    "acceptance": {
+      "path": "/tmp/fw16-backend-ec204421/startup30-B-abefe-negative-return-root-acceptance-v1.json",
+      "sha256": "decd04bada3e86e0a372f1e1a8ba022333bca86191b2bd43e1be0358d1f73be7"
+    },
+    "limit": "Old6ceb CLI1/HOST1 and UI27P1F are historical results, not combined62 coverage. Retain all30 names for a future source-bound packet; do not credit the failed UI group or retarget old results."
+  },
+  "recommendation": {
+    "additional_ordinary_parents": 20,
+    "by_isolated_graph": {
+      "CLI": 0,
+      "HOST": 5,
+      "UI": 15
+    },
+    "source_unique_names": 20,
+    "duplicates_with_old_Root30": 0,
+    "combined_current_source_selection_counts": {
+      "CLI": 1,
+      "HOST": 6,
+      "UI": 43,
+      "total": 50
+    },
+    "minimality": "One owning parent per distinct protected entry/causal contract below, retaining both active/hidden branches and required valid-source controls. Existing nested mode loops are one parent each. This is a bounded startup/quarantine basis, not every Main15 test or exhaustive WHOLE qualification.",
+    "no_new_test_target_or_framework": "All additions join the existing cagents library UI/HOST groups. No new integration target, all-target suite, feature union, repository inventory or fixture framework is proposed.",
+    "selected": [
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+        "path": "src/app/shared_views.rs",
+        "line": 3299,
+        "contract": "New62 direct predicate guard",
+        "why": "Reject runtime and durable quarantine before the !attached restored-terminal fallback, preserving valid unattached control.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views.rs:3299",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+        "path": "src/app/startup_gate/tests.rs",
+        "line": 496,
+        "contract": "New62 gate ordering",
+        "why": "An OPEN quarantined ended terminal/unstarted chat cannot use Ready waivers; CLOSED evidence remains closed and may permit Ready.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/startup_gate/tests.rs:496",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+        "path": "src/app/startup_gate/tests.rs",
+        "line": 550,
+        "contract": "New62 pending/late reply",
+        "why": "Genuine healthy work keeps Pending; after it settles, delayed Ready cannot erase open quarantine or start the save.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/startup_gate/tests.rs:550",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 983,
+        "contract": "Raw model before projection",
+        "why": "Wrong proof, duplicate issuer and optimism-masked membership must be classified before healthy-only SeedView; validates both panes and closed exclusion.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:983",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 2161,
+        "contract": "Owner and pending-source contract",
+        "why": "Six refusal modes exercise complete issuer/source/scope/pending proof; no attach or denied overlay survives. This is broader than Ready/inspection proof currentness.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:2161",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 2552,
+        "contract": "Legitimate canonical/closed positive control",
+        "why": "Exact new canonical proof may replace old OPEN cache; an exact CLOSED source still publishes its legitimate close. Prevent blanket filtering.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:2552",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 715,
+        "contract": "Closed retirement denial",
+        "why": "Six invalid scope/proof cases cannot borrow a retirement witness just because the local card is closed.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:715",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 754,
+        "contract": "Verified retirement positive control",
+        "why": "Genuinely validated peer retirement preserves unsent local work without fabricating quarantine; differs from canonical replacement/explicit closed publication.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:754",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 2850,
+        "contract": "Active mixed scope",
+        "why": "Actual scripted public attach/Ready for healthy source, per-pane denial and payload preservation for bad siblings in the active scope; no denied edit/close effect.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:2850",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Requires separately admitted genuine-User invocation and the existing isolated public-client fixture. Preserve the inherited-authority refusal; do not scrub opaque authority or infer admission from this selection."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 2864,
+        "contract": "Hidden mixed scope",
+        "why": "Same ownership contract offscreen while retaining active focus/channel. Separate entry branch from active scope; Root28 offscreen terminals do not include managed quarantine siblings.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:2864",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Requires separately admitted genuine-User invocation and the existing isolated public-client fixture. Preserve the inherited-authority refusal; do not scrub opaque authority or infer admission from this selection."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 4142,
+        "contract": "Durable restart denial",
+        "why": "DB save/reopen then initialization and missing issuer/new registry cannot revive denied chat or seed it; only exact authoritative revalidation clears original evidence.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:4142",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 3028,
+        "contract": "Per-pane callback generation",
+        "why": "Duplicate checks, old request, wrong registry/source/endpoint cannot settle the successor; a final exact check can recover. Distinct from Root inspection-ticket currentness.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:3028",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 3119,
+        "contract": "Local Remove effect ownership",
+        "why": "Six close/remove routes including a stale repaired button retain local evidence and send no query/attach/close against the real scripted inventory target.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:3119",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Requires separately admitted genuine-User invocation and the existing isolated public-client fixture. Preserve the inherited-authority refusal; do not scrub opaque authority or infer admission from this selection."
+      },
+      {
+        "graph": "ui",
+        "name": "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "line": 1097,
+        "contract": "Protected image draft/startup composition",
+        "why": "Natural Connected/Seed ACK, denied sibling, shared peer options and chooser cancel preserve saved image payload through the actual writer; one representative protected image flow, not the six image-only inventory.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:1097",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Requires separately admitted genuine-User invocation and the existing isolated public-client fixture. Preserve the inherited-authority refusal; do not scrub opaque authority or infer admission from this selection."
+      },
+      {
+        "graph": "ui",
+        "name": "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+        "path": "src/session.rs",
+        "line": 5916,
+        "contract": "Writer queue/barrier/retry owner",
+        "why": "SessionRuntime snapshot/flush/retry cannot overwrite same-card peer replacement or earn clean shutdown after a rejected final window; retains image/source and actual DB generations.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/session.rs:5916",
+        "isolated_features": [
+          "ui"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "host",
+        "name": "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+        "path": "src/persistence.rs",
+        "line": 6631,
+        "contract": "Schema13 to14 admission",
+        "why": "Actual StateStore migration preserves stored rows/schema layout and quarantine marker across reopen. This owner is not included in CLI.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/persistence.rs:6631",
+        "isolated_features": [
+          "host"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "host",
+        "name": "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+        "path": "src/persistence.rs",
+        "line": 9227,
+        "contract": "Marker decode boundary",
+        "why": "Roundtrip exact marker, default only on true absence, and refuse malformed source metadata; distinct from migration policy and startup in-memory classification.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/persistence.rs:9227",
+        "isolated_features": [
+          "host"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "host",
+        "name": "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+        "path": "src/persistence.rs",
+        "line": 8233,
+        "contract": "Read-only migration inventory",
+        "why": "Chat+terminal exact denial excludes only the bad source while healthy work stays present; mismatch/malformed/oversized fail closed without rewriting DB.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/persistence.rs:8233",
+        "isolated_features": [
+          "host"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "host",
+        "name": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "path": "src/persistence.rs",
+        "line": 8328,
+        "contract": "History reader boundary",
+        "why": "History carries closed rejection provenance from every workspace and refuses invalid metadata without writes; separate public reader from migration inventory.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/persistence.rs:8328",
+        "isolated_features": [
+          "host"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      },
+      {
+        "graph": "host",
+        "name": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+        "path": "src/persistence.rs",
+        "line": 10701,
+        "contract": "Transactional store ownership",
+        "why": "Open+closed stale snapshots/rebased bases cannot commit old proof/draft/image over a same-ID peer replacement; full-window rollback and dirty-reopen inventory remain coherent.",
+        "target": "cagents library unit tests (--lib)",
+        "source_ref": "62c4864619e8d80cea6aebc9d1f309012484caca:src/persistence.rs:10701",
+        "isolated_features": [
+          "host"
+        ],
+        "no_default_features": true,
+        "old_Root30_duplicate": false,
+        "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context."
+      }
+    ]
+  },
+  "graph_and_module_source_basis": {
+    "UI": "src/modules.rs18–19 gates app on ui; src/app/shared_views.rs3216–3221 is cfg(test) tests::startup_admission; src/app/startup_gate.rs715–719 includes the gate test modules. src/modules.rs115–116 gates session on ui and src/session.rs2930–2931 declares tests. All15 chosen UI names belong to --no-default-features --features ui --lib.",
+    "HOST": "src/modules.rs97–98 includes persistence for ui||host and persistence.rs6233–6234 declares tests. The five chosen shared-store parents compile in isolated HOST and are assigned there to reuse Root's existing host-lib ELF. These are actual shared persistence contracts, not invented daemon-effect tests.",
+    "CLI": "The isolated CLI graph lacks app, session and persistence by the above cfgs. The new WorkspaceState.quarantined_panes model field is shared data; its storage/reader/writer behavior is owned by the selected HOST/UI tests. No independent new CLI owning branch was found for this protected delta. Keep the existing Root CLI startup transport parent and separate affected-boundary compile checks.",
+    "store_writer_nonduplication": "HOST rebased_quarantine tests direct StateStore open+closed transactional refusal and rollback. UI session runtime_barriers tests the queue, flush/retry health barrier and shutdown receipt. They are different owning boundaries.",
+    "templates_only": {
+      "UI": "cargo test --locked --no-default-features --features ui --lib <FULL_NAME> -- --exact --format=pretty --color=never",
+      "HOST": "cargo test --locked --no-default-features --features host --lib <FULL_NAME> -- --exact --format=pretty --color=never",
+      "batching": "A future authorized owner can add these exact names to the existing freshly compiled/inventoried per-graph libtest group. Actual ELF paths/inventory/counts remain unknown; templates are not executed instructions or a grant."
+    }
+  },
+  "fixture_admission_qualifier": {
+    "source": "62c4864619e8d80cea6aebc9d1f309012484caca:src/app/shared_views/tests/startup_admission.rs:17",
+    "existing_wrapper": "isolated(name) first refuses inherited CAGENTS_AGENT_AUTHORITY, then invokes the exact same test in its existing private process/path fixture. Active/hidden/remove additionally assert genuine User through Authority::from_environment before isolation. The selected mixed image test uses the same wrapper.",
+    "coverage_limit": "A future ordinary ok footer reached through policy refusal/early return must not be reported as execution of the causal body. Where the normal wrapper returns in the parent after its isolated child, future evidence must distinguish that child body and its existing effect/assertion path from a refused/skipped body. This selection supplies no such actual evidence.",
+    "no_authority_change": "Preserve opaque inherited authority and refusal behavior. No authority scrub, substitute account/role, new context recipe, probe or wrapper mechanism is proposed. Genuine-User/fixture admission remains a separate owner decision.",
+    "native_role": "Native role/supplier/chooser and actual native evidence remain HOLD; Rust fixture selection does not grant native authority."
+  },
+  "deliberate_exclusions": [
+    "Do not add the six image_only_peer_remove_tests or tooltip/discussion menus: the selected mixed saved image parent directly owns this startup/denied-sibling/payload seam.",
+    "Do not import Main15 Rust10's three repository parents or broad all-target counts: hook-pipe/repository coverage is outside the combined startup/quarantine contract.",
+    "Do not add session_restore_contract merely because its WorkspaceState initializer acquired the new default field. Cargo.toml190–192 and the file's cfg(feature=ui) make it a separate UI integration target; its test bodies are not changed by this protected merge. Selected DB reopen, shared-reader and SessionRuntime tests own the new quarantine contracts more directly.",
+    "Do not duplicate Main15 startup_gate_waits_for_shared_authority_and_requires_offscreen_attachment in this minimal basis: Root's retained28 already exercise registry/target ACK/offscreen inspection, and the selected active/hidden mixed tests add the missing managed-quarantine sibling behavior.",
+    "Do not turn subcases, child assertions, isolated child footers or repeated focused/broad appearances into extra ordinary parents."
+  ],
+  "pending_not_current_62": [
+    {
+      "subject": "Naturally derived CLOSED stale localA / valid current canonicalB sameCardId plus healthyH",
+      "status": "Pending new owning test; name/source unknown until next frozen successor. A suggested design name is not an existing selected parent.",
+      "current_gap": "Current exact_canonical_replacement test is the necessary legitimate close positive control, not the missing stale-CLOSED publication regression.",
+      "correct_oracle": "CLOSED denied evidence stays closed/inert; healthyH may reach Ready after its real emitted-scope ACK. Recovery-incomplete is required only with an additional OPEN denied pane. Do not fabricate/open a failure to force the CLOSED-only case.",
+      "design_addendum": {
+        "path": "/tmp/held-saved-scope-fw16-evidence/91a8-6ceb-stale-closed-source-fixture-design-addendum-v1.json",
+        "sha256": "f49fa64e5431ff26bba6eefea57cf79a1102095cc35a02eed95fdd40475431e4"
+      }
+    },
+    {
+      "subject": "Root's failed restored_observed_row SeedView-ACK fixture correction/7c9 ports",
+      "status": "Not part of62; no correction/name/head is assumed. The old selected owning name remains in Root28 and needs re-bound review at the next actual freeze.",
+      "no_result_transfer": "No old27 passes, failed footer or pending source correction establishes combined current coverage."
+    }
+  ],
+  "integration_map": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/91a8-6ceb-WHOLE-startup-source-integration-map-v1.json",
+    "sha256": "9b5ec3273b66d7c5b4d495e190a11d14440190d5c5f7de6ba463bb2769a32cfe",
+    "role": "Source ownership map only; its closed-only completion sentence is superseded by the bound addendum above."
+  },
+  "methods_and_limits": {
+    "methods": "Immutable git-show/diff/rg/hash and inert plan JSON only. Each added fn was found exactly once at the recorded62 line; full names follow actual cfg/module nesting;20 names independently deduplicated against exact Root30.",
+    "not_performed": "No Cargo metadata, Rust compiler/test/ELF inventory, authored import/evaluation, native/provider/environment/process/target/cache/context/resource probe, fetch/merge/source edit, new worker or public write.",
+    "current_combined_results": "UNRUN; no current owning-parent pass or compiled-name observation claimed.",
+    "scope": "Source-test selection only; no Root transport/#1749, production/proof/whole-controller or old RAW re-audit.",
+    "actual_grant": null,
+    "source_adoption": false,
+    "queueable": false,
+    "Rust_native_WHOLE_global_qualification": false,
+    "resource_return_or_acceptance": false,
+    "merge_approval": false,
+    "PR1933": "NEVER_MERGE"
+  }
+}

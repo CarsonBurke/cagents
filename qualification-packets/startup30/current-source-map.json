@@ -1,5 +1,78 @@
 {
   "new_product": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "parents": [
+      "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "1892a6f458828d7b1f38f6e03457bf1a072efb73"
+    ],
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery",
+    "source_paths_sha256": {
+      ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+      "src/app.rs": "12f950cc57f4190fd562b275e180293b2d761f60f2ca0fb952697a0b8a414ecc",
+      "src/app/chat_ui.rs": "7e25419906aa47126b819abcba65a741f48df523d488c9bc7b89cfa1d0e9ad53",
+      "src/app/saved_terminal.rs": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+      "src/app/shared_views.rs": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "src/app/shared_views/tests/startup_admission.rs": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "src/app/shared_views/tests/startup_terminals.rs": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "src/app/startup_gate.rs": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
+      "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "src/app/startup_gate/tests.rs": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "src/app/workspace_model_sync.rs": "15aef66eb5b6089b8ef7c023e43998fd0c389e551261c9d0208561018fe937a1",
+      "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "src/host/agent_execution/terminals.rs": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+      "src/host/client.rs": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+      "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+      "src/host/model.rs": "fbeb2c27bcd8bdf9e78286b9801f7b49f40d475ae6374b384adc51e18ed1d355",
+      "src/host/model/views.rs": "4fcde53fc87e36eb0e73518985edab78efb2aa43c2d483840552df8fc741e946",
+      "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/persistence.rs": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "src/session.rs": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+      "src/terminal/hosted.rs": "d17f5ab7f996051e1e859011a414d7307d73e8e77f9437b535348e119f2792d9",
+      "src/terminal/ipc.rs": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+      "src/terminal/surface.rs": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21",
+      "src/workspace_model/views.rs": "465d2d1dc6fc076ec8fd0d99ec1f6a6aa51598eafe1bf42a12cb9ae73cb7a808"
+    }
+  },
+  "scheduler": {
+    "required_absent_names": [
+      "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+      "RUST_TEST_NOCAPTURE",
+      "RUST_TEST_THREADS",
+      "CAGENTS_TEST_RETAINED_ACTOR_HELPER"
+    ],
+    "policy": "Outer default scheduler and capture; actual degree/overlap unobserved"
+  },
+  "runtime_admission": {
+    "state": "SOURCE_STARTUP30_CANDIDATE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null,
+    "required_future_admission": "Actual exact nonauthor Agent-safe47 controller review, accepted prior return and separate current Root C grant/source/context/resource guards. Inherited opaque authority remains untouched. This one partial plan excludes the five genuineUser-only invocations while preserving their source guards and FULL52 HOLD contract; it supplies no new User requirement or context."
+  },
+  "actual": {
+    "grant": null,
+    "queue_position": null,
+    "current_context": null,
+    "current_resources": null,
+    "current_tools": null,
+    "actual_elf": null,
+    "actual_inventory": null,
+    "actual_selected_names": null,
+    "actual_counts": null,
+    "actual_parallel_degree": null,
+    "actual_parallel_overlap": null,
+    "phase_receipts": null,
+    "runtime_results": null,
+    "RAW_review": null,
+    "safe_release": null
+  },
+  "historical_base_product": {
     "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
     "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
     "parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
@@ -29,74 +102,34 @@
       "src/terminal/surface.rs": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21"
     }
   },
-  "scheduler": {
-    "required_absent_names": [
-      "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
-      "RUST_TEST_NOCAPTURE",
-      "RUST_TEST_THREADS",
-      "CAGENTS_TEST_RETAINED_ACTOR_HELPER"
-    ],
-    "policy": "Outer default scheduler and capture; actual degree/overlap unobserved"
-  },
-  "runtime_admission": {
-    "state": "SOURCE_STARTUP30_CANDIDATE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
-    "execution_authorized": false,
-    "helper_binding": null,
-    "required_future_admission": "Actual accepted donor return and packet A positive return, then separately authenticated current Root C grant and reviewed source/context; source preparation is not authority."
-  },
-  "actual": {
-    "grant": null,
-    "queue_position": null,
-    "current_context": null,
-    "current_resources": null,
-    "current_tools": null,
-    "actual_elf": null,
-    "actual_inventory": null,
-    "actual_selected_names": null,
-    "actual_counts": null,
-    "actual_parallel_degree": null,
-    "actual_parallel_overlap": null,
-    "phase_receipts": null,
-    "runtime_results": null,
-    "RAW_review": null,
-    "safe_release": null
-  },
-  "historical_base_product": {
-    "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
-    "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
-    "parent": "b914f9d9b55527aa1bb22d591968c58958d717ee",
-    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
-    "source_paths_sha256": {
-      ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
-      "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
-      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
-      "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
-      "src/app.rs": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
-      "src/app/chat_ui.rs": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
-      "src/app/saved_terminal.rs": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
-      "src/app/shared_views.rs": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
-      "src/app/shared_views/tests/startup_terminals.rs": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
-      "src/app/startup_gate.rs": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
-      "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
-      "src/app/startup_gate/tests.rs": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
-      "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
-      "src/host/agent_execution/terminals.rs": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
-      "src/host/client.rs": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
-      "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
-      "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
-      "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
-      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
-      "src/terminal/hosted.rs": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
-      "src/terminal/ipc.rs": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
-      "src/terminal/surface.rs": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21"
-    }
-  },
   "current_delta": {
-    "path": "src/app/startup_gate.rs",
-    "original_sha256": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
-    "current_sha256": "6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339",
-    "source_review_sha256": "a81bc8b8f89c38deec1028a9b33b2648a434cf80ec69ca6736dfd163c721ee8f",
-    "source_publication_sha256": "ee9ab001aa3144c657de2db1fd379c1b9a6fc60263e14d5e45be6f4c28b528ef",
-    "runtime": "UNRUN"
+    "kind": "FINAL_FROZEN_TWO_PARENT_DELIVERY_SOURCE_BINDING_NOT_REVIEW",
+    "final_freeze": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/final-delivery-freeze.json",
+      "sha256": "e1c34ab4dbf29aa4eb5e133f925834365558dd0ed038e5cda1ea3d18193d2975",
+      "bytes": 1259
+    },
+    "ancestry_and_conservation_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/final-delivery-review.json",
+      "sha256": "2f35a3ef191930da3457a172b2e852428364bb28da2f7990c466609ca843e4d8",
+      "bytes": 12064
+    },
+    "main15_final_test_oracle_and52_recheck": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/main15-final-protected-review.json",
+      "sha256": "eeeeb413c2b06650abe514fb4c37df723af583aa70d52b6152da8679bf32a139",
+      "bytes": 19436
+    },
+    "parent_counts": {
+      "cli-lib": 1,
+      "host-lib": 6,
+      "ui-lib": 40
+    },
+    "fresh_inventory_and_runtime": "UNKNOWN_UNRUN",
+    "required_source_contract": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/required-source-contract.json",
+      "sha256": "c48bd1259b424db7eaf2afbdd41c98478233ca42edb508e4eaded0f1727776b2",
+      "bytes": 39199
+    },
+    "qualification_scope": "EXPLICIT_AGENT_SAFE47_PARTIAL_ONLY_FULL52_USER5_NATIVE_REMAIN_HOLD"
   }
 }

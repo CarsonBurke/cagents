@@ -1,0 +1,167 @@
+{
+  "schema": "whole-stale-closed-c8ecf5f3-independent-semantic-test-source-review-v1",
+  "reviewer": "/root/1954_directory_durability_bound",
+  "verdict": "BOUNDED_SEMANTIC_TEST_SOURCE_CLEAR",
+  "findings": [],
+  "pins": {
+    "head": "c8ecf5f3ed6ee3068bf6adc3a4bed996ca30dd39",
+    "tree": "7a57557e4d5cd92ded186dfc2cdfbc18fabeef6c",
+    "parent": "62c4864619e8d80cea6aebc9d1f309012484caca",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-stale-closed-regression",
+    "source_leaf": "src/app/shared_views/tests/startup_admission.rs",
+    "source_leaf_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786"
+  },
+  "inputs": {
+    "root_commit_freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-stale-closed-committed-source-v1.json",
+      "sha256": "493b92c4b666be1a404d21451c48de0c14de6e401bcbd1854d98ec0a9e938cde"
+    },
+    "author_freeze": {
+      "path": "/tmp/whole-stale-closed-62c48646-test-source-v1/freeze.json",
+      "sha256": "7b56bcb45060bcc6821a1a6f89c5492a6afa0c101a77bdc918f3f7973c75285f"
+    },
+    "Main15_design": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/91a8-6ceb-stale-closed-source-fixture-design-addendum-v1.json",
+      "sha256": "f49fa64e5431ff26bba6eefea57cf79a1102095cc35a02eed95fdd40475431e4"
+    }
+  },
+  "conservation": {
+    "only_changed_leaf": [
+      "src/app/shared_views/tests/startup_admission.rs"
+    ],
+    "inserted_lines": 317,
+    "deleted_lines": 0,
+    "inserted_span_lines": [
+      2549,
+      2865
+    ],
+    "new_parent_sha256": "2797887b2a1d35f540d772a748ef1af981bba297d45af1e29578a8a5f7891fb6",
+    "complete_leaf_after_removing_only_new_parent_equals_parent": true,
+    "reconstructed_parent_sha256": "fafbb5c809da2fedbd5147ad9368efad890e389d874636bcbef85d48f37c7c7d",
+    "existing_test_parents_retained": 50,
+    "only_new_parent": "stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+    "all_original_helpers_controls_and_assertions_byte_exact": true,
+    "all_other_leaf_entries_modes_types_blobs_conserved": 2226,
+    "production_source_unchanged": true,
+    "positive_controls_preserved": [
+      {
+        "selector": "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+        "sha256": "85a581089f94b111e19a5834a00a8304d5483a964e419c17c84b5920691504ad",
+        "byte_exact_from_base": true
+      },
+      {
+        "selector": "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "sha256": "fec7f77b0af0d1370ae6c1fc52659c25d432b327d07f9af326208b0ad89c6e5c",
+        "byte_exact_from_base": true
+      },
+      {
+        "selector": "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "sha256": "b709f8e23a0fb5e9dba927986274eeadfab20c2873b72899100e333f2a407a91",
+        "byte_exact_from_base": true
+      }
+    ]
+  },
+  "semantic_assessment": [
+    {
+      "boundary": "Raw saved input and natural classification",
+      "anchors": [
+        "startup_admission.rs:2563-2588",
+        "startup_admission.rs:2625-2667",
+        "startup_admission.rs:2680-2718"
+      ],
+      "conclusion": "cached_chat supplies complete old-proof A and NO_REGISTRY. Only the local CardState is made CLOSED. Canonical B is cloned from A with unchanged CardId/session/launch and a different complete current proof. H receives independent CardId/session identity. Initial real StateStore save/drop/reopen and assert_retained require raw CLOSED A/OPEN H with no quarantine/local-only marker. The test restores through for_workspace and calls normal initialize_runtimes and ModelUpdate::Connected; it does not inject quarantine or replace A with B."
+    },
+    {
+      "boundary": "Valid canonical claim rather than a missing/closed issuer shortcut",
+      "anchors": [
+        "startup_admission.rs:507-559",
+        "startup_admission.rs:2669-2690"
+      ],
+      "conclusion": "full contains raw canonical B and H, sequence10, hidden view revision7, and both exact managed_owner records with closed=false. The owner helper binds each CardId to its proper session, channel placement, repository/directory and Chat surface. Assertions require the B issuer to match B and fail matching stale A, while H matches its issuer. Thus rejection is not manufactured by a missing/closed owner or a prior quarantine."
+    },
+    {
+      "boundary": "Causal publication oracle and healthy control",
+      "anchors": [
+        "startup_admission.rs:2692-2707",
+        "startup_admission.rs:2734-2772"
+      ],
+      "conclusion": "workspace_model_tx is captured before initialization. NO_REGISTRY must emit no seed. After Connected, all captured SeedView edits must omit stale ID from BOTH panes and closed, and no ChangeView may target it. Exactly one hidden Seed must contain the full nonempty [H] payload, so suppressing every seed cannot pass. Restoring a closed-ID collector that includes stale A would fail the all-seeds closed-field assertion; this is a source-predicted causal negative, not a mutation execution."
+    },
+    {
+      "boundary": "Faithful acknowledgement model and real admission ordering within fixture",
+      "anchors": [
+        "startup_admission.rs:507-528",
+        "startup_admission.rs:2669-2679",
+        "startup_admission.rs:2774-2806",
+        "workspace_model_sync.rs:585-612"
+      ],
+      "conclusion": "Every ViewApplied scope comes from an actually captured Seed; no invented ACK is delivered. The acknowledged full model already contains the exact full submitted H pane, canonical B, and the empty active view, so its response omits no seeded local payload. Returning it is coherent for this idempotent-known-pane fixture. Before H's own hidden ACK, H must remain awaiting admission with no provider request; acknowledging another emitted scope cannot release it. The fixture does not exercise a real Host SeedView reducer or prove its returned sequence/revision behavior."
+    },
+    {
+      "boundary": "Scripted client attachment and Ready are exercised by authored Tasks",
+      "anchors": [
+        "startup_admission.rs:110-118",
+        "startup_admission.rs:212-285",
+        "startup_admission.rs:378-445",
+        "startup_admission.rs:2790-2808"
+      ],
+      "conclusion": "with_owner supplies only H as the exact scripted owner. The existing public client ChatAttach response carries H and ready=true; settle drains actual Task messages through app.update. The test requires requests exactly [H], no lineage resolutions, runtime.session==H and restored_pane_ready()==Ok(true). It does not manually set a runtime Ready bit. Unexpected scripted requests panic; explicit bad start/close/recover/return controls are additionally forbidden."
+    },
+    {
+      "boundary": "Closed-only quarantine and retained state follow corrected design",
+      "anchors": [
+        "startup_admission.rs:2594-2623",
+        "startup_admission.rs:2807-2838",
+        "startup_admission.rs:2840-2864",
+        "startup_gate.rs:195-247"
+      ],
+      "conclusion": "A stays CLOSED with exact original kind/title/width/draft/image and q evidence; its denial source/nonce remain stable, with no managed witness, runtime or pending start. The test correctly allows startup_pane_check()==Ok(true) only after H is genuinely Ready: closed history is not an OPEN readiness failure. It does not reopen A or manufacture Failed runtime to force recovery-incomplete. Post-admission persistent_workspace and actual StateStore save/drop/reopen assertions retain A and its quarantined closed History entry."
+    },
+    {
+      "boundary": "Persistence baseline and payload are not guessed",
+      "anchors": [
+        "startup_admission.rs:2633-2652",
+        "startup_admission.rs:2843-2864"
+      ],
+      "conclusion": "The first write is to a fresh private store with base0/empty card generations. The later write uses the first actual commit generation/card_generations after reloading that same store. Both require no refusals. Exact image reference/path metadata is retained and validated within the genuine test-image fixture lifetime. No live provider or cross-process asset durability is inferred."
+    }
+  ],
+  "controls_and_claim_limits": {
+    "preserved_controls": "The entire original leaf is byte-exact after removing the one parent, including exact canonical replacement/valid closed close intent and exact proof/scope retirement controls. The new regression does not replace those positive controls with blanket closed-ID filtering.",
+    "publication_vs_effect": "Captured SeedView.closed and ChangeView are App publication intent only. They do not run Host model/close behavior. ScriptedDaemon provides a separate synthetic IPC-effect oracle.",
+    "protected_WHOLE": "Main15 final protected WHOLE/classifier review remains pending and is not granted by this test review. Only fixture preconditions, causal assertions and integration into existing reducer/client helpers were assessed.",
+    "execution": "All Rust compilation/test, SQLite operations, scripted IPC/Task evaluation and native/provider interaction in this test remain UNRUN. Source clear does not establish the test passes.",
+    "format": "Author receipt reports official formatting0; no formatter was rerun here.",
+    "grant": "No execution, build, native, resource or publication grant."
+  },
+  "owning_selector": "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+  "source_pins": [
+    {
+      "path": "src/app/shared_views/tests/startup_admission.rs",
+      "blob": "9ceb6582a7c2c6e073ce77409c969dbb8a252eec",
+      "sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786"
+    },
+    {
+      "path": "src/app/shared_views.rs",
+      "blob": "249adfed754e7d63de1e0490bbdfef15545019e7",
+      "sha256": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61"
+    },
+    {
+      "path": "src/app/workspace_model_sync.rs",
+      "blob": "b46558887889a2a52c0a2e522697c5121fc45ea7",
+      "sha256": "15aef66eb5b6089b8ef7c023e43998fd0c389e551261c9d0208561018fe937a1"
+    },
+    {
+      "path": "src/app/startup_gate.rs",
+      "blob": "c64192502ab12c0a44b953651034cf9dd88d4734",
+      "sha256": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0"
+    },
+    {
+      "path": "src/persistence.rs",
+      "blob": "4e9da75b6afaeea3e8af79bee0adc52b0b6403e6",
+      "sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df"
+    }
+  ],
+  "coordination": "Bounded no-blocker semantic conclusion and the faithful-ACK reason sent to Root. Root/Main15 retain protected review and delivery decisions.",
+  "actions": "Read named freezes/design and immutable source/Git comparisons only; wrote this receipt/seal. No production edits, builds/tests/probes/Tasks/publication/grants or new workers."
+}

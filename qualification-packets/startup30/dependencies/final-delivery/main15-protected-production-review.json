@@ -1,0 +1,326 @@
+{
+  "schema": "main15-protected-WHOLE-production-composition-source-review-v1",
+  "reviewer": "/root/seedview_lifecycle",
+  "request": "EC 3c31f041-129c-42b1-af76-68d64d596cd5 via /root",
+  "verdict": "SOURCE_CLEAR_FOR_PROTECTED_MAIN15_PRODUCTION_PRESERVATION_AT_FROZEN_62C48646; EXECUTION_UNRUN",
+  "scope": "Complete Main15 protected production preservation from OUR91a through merge490 to frozen62, including semantic inspection of the five composition files. Not merely the final helper delta. Root startup/current-host behavior remains its separate owning contract. Later moving regression/failed-fixture heads are excluded.",
+  "pins": {
+    "ours": {
+      "commit": "91a8dff516e6fb76fadab432119e67c472fd9489",
+      "tree": "aea2db52b5ed089ea94e396e58dec8a4d81edb38"
+    },
+    "root_parent": {
+      "commit": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4"
+    },
+    "merge": {
+      "commit": "490017a7bf040c440b7240069f2fab7a2a8f5b78",
+      "tree": "8ef680d5f4bc231d41823ee479ce9111a465a568",
+      "parents": [
+        "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+        "91a8dff516e6fb76fadab432119e67c472fd9489"
+      ]
+    },
+    "frozen": {
+      "commit": "62c4864619e8d80cea6aebc9d1f309012484caca",
+      "tree": "73de2eae297f8807480b2aa9f28bde583ad483b7",
+      "parent": "490017a7bf040c440b7240069f2fab7a2a8f5b78"
+    },
+    "read_git": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-backend-control-ec204421/.git",
+    "source_worktree_locator_only": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-composition",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-quarantine-guard-source-v1.json",
+      "sha256": "c2e6145ab55128e6a39eb4218ffb61b3775ce7c67731015c9f5afb6fbcb7f4a9"
+    }
+  },
+  "method": {
+    "reads": "Immutable Git object metadata, complete 91a-to62 diffs of the five overlapping files, exact source slices and hash reads. Independent ls-tree comparison of all33 original Main15 changed paths. No moving worktree source inspected.",
+    "conservation": {
+      "original_Main15_paths": 33,
+      "byte_identical_mode_type_blob_at62": 28,
+      "changed_common_files": 5,
+      "changed_files_from91_total": 16,
+      "final62_delta": "Two files,129 added lines/1 removed line; production change is pane_is_quarantined in restored-attach first refusal condition; other additions are three tests."
+    },
+    "common_files": [
+      {
+        "path": "src/app.rs",
+        "ours_blob": "cbe6d67bd8cf09a8dd733e1b53f27abd4fc8976f",
+        "frozen_blob": "89ea8a584169db0a2439bbac0b6ab930f17d5781",
+        "frozen_sha256": "12f950cc57f4190fd562b275e180293b2d761f60f2ca0fb952697a0b8a414ecc",
+        "mode_type_preserved": true
+      },
+      {
+        "path": "src/app/chat_ui.rs",
+        "ours_blob": "b08a19e1ca612a6be1a8424239c61ac638a6637e",
+        "frozen_blob": "17b958cd4c91255e8e36bd4c96e64f5a579166c4",
+        "frozen_sha256": "7e25419906aa47126b819abcba65a741f48df523d488c9bc7b89cfa1d0e9ad53",
+        "mode_type_preserved": true
+      },
+      {
+        "path": "src/app/shared_views.rs",
+        "ours_blob": "666d529d9356e9f3592586e1cc03e3f38ccfe94a",
+        "frozen_blob": "249adfed754e7d63de1e0490bbdfef15545019e7",
+        "frozen_sha256": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+        "mode_type_preserved": true
+      },
+      {
+        "path": "src/app/startup_gate.rs",
+        "ours_blob": "e565f688515c8db56dc4aea923f31b2f45dea8e4",
+        "frozen_blob": "c64192502ab12c0a44b953651034cf9dd88d4734",
+        "frozen_sha256": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
+        "mode_type_preserved": true
+      },
+      {
+        "path": "src/terminal/hosted.rs",
+        "ours_blob": "0c48cf25c48f5b37058b54f0d7c8537c054486d9",
+        "frozen_blob": "8106a4b2089d6f77607fe0b3425ff9d2525d14ba",
+        "frozen_sha256": "d17f5ab7f996051e1e859011a414d7307d73e8e77f9437b535348e119f2792d9",
+        "mode_type_preserved": true
+      }
+    ],
+    "protected_byte_conservation": [
+      {
+        "path": "src/app/channel_ui.rs",
+        "blob": "d7ff62a4d99994554adc505f1eede5ce5ccc65e2"
+      },
+      {
+        "path": "src/app/chat_ui/image_only_peer_remove_tests.rs",
+        "blob": "b8c0e30a5eef09f2a133dd746f4d0c46ffe653b8"
+      },
+      {
+        "path": "src/app/chat_ui/managed_image_retention_test_support.rs",
+        "blob": "8eaed82dc98b3e90a8846c1d2a767faecbaa85ea"
+      },
+      {
+        "path": "src/app/chat_ui/session_links.rs",
+        "blob": "f90d217db6ab5414b51d6e8344c45f21ff24ffcb"
+      },
+      {
+        "path": "src/app/chat_ui/view.rs",
+        "blob": "41967ce5795197e4bf5dd5eb99a60e77ba2bc264"
+      },
+      {
+        "path": "src/app/notification_ui.rs",
+        "blob": "c09a1cb8ffbd70169302548f7dbbf7ab144864f4"
+      },
+      {
+        "path": "src/app/palette_ui.rs",
+        "blob": "2dd461ef996f1d8f389b145f42b887d5f2c383f6"
+      },
+      {
+        "path": "src/app/project_ui.rs",
+        "blob": "b16b485c612ab214c2fffaa53d633ac357a36988"
+      },
+      {
+        "path": "src/app/resume_ui.rs",
+        "blob": "d1a618b3ae270a7a7456b1aad007b299ab44afbc"
+      },
+      {
+        "path": "src/app/shared_views/tests/history_start.rs",
+        "blob": "9c5866a70d0aeafe8273a43b016d5098e74f060e"
+      },
+      {
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "blob": "c42f32c8d81bb2f5d4e1ed6af295771fdcd66c7f"
+      },
+      {
+        "path": "src/app/terminal_adoption.rs",
+        "blob": "7b2ac91c2f49cfcd48028df3d6bd58265d52c504"
+      },
+      {
+        "path": "src/app/terminal_close.rs",
+        "blob": "8e2097eda4d159c586eb3e3fde3ea752388a66ef"
+      },
+      {
+        "path": "src/app/workspace_model_sync.rs",
+        "blob": "b46558887889a2a52c0a2e522697c5121fc45ea7"
+      },
+      {
+        "path": "src/app/worktree_ui.rs",
+        "blob": "edeb28b9ed0b0beb70e7665fa97c8a360fc6ac5c"
+      },
+      {
+        "path": "src/model.rs",
+        "blob": "cb60b642e09673bc31d1276f61081500ca53c98c"
+      },
+      {
+        "path": "src/persistence.rs",
+        "blob": "4e9da75b6afaeea3e8af79bee0adc52b0b6403e6"
+      },
+      {
+        "path": "src/pull_request_review.rs",
+        "blob": "213e7fe5ee04ff18e76baafcdd45929ba9f6ee04"
+      },
+      {
+        "path": "src/pull_request_review/discussion_ui.rs",
+        "blob": "0db969fcb9f5efe0e22b8c116cbb63d2f6497b01"
+      },
+      {
+        "path": "src/session.rs",
+        "blob": "3caaf208179e912c49f5739d6dc21d08098c8654"
+      },
+      {
+        "path": "tests/repository_git_contract.rs",
+        "blob": "10d2147c50689a180b8fdaa35476df6d19b66358"
+      },
+      {
+        "path": "tests/session_restore_contract.rs",
+        "blob": "78a48d00229dbd45f4afbe9e52d987216fe20f7c"
+      },
+      {
+        "path": "tests/support/owned_hook_pipe_holder.py",
+        "blob": "9c0e7e013a7cfad99c7ce0a35faf8bbcc89c0c1e"
+      },
+      {
+        "path": "tests/support/owned_hook_pipe_holder.rs",
+        "blob": "df34164ac46b09b6960aeed3d44dc38b231b5ed5"
+      },
+      {
+        "path": "tests/support/repository_scale.rs",
+        "blob": "dd864f5eab519c2e263f6ef795133d50bb0248e2"
+      },
+      {
+        "path": "tests/support/test_owned_hook_pipe_holder.py",
+        "blob": "9c262f1b1c5fdefeb4ad613a6169380ffbd0b945"
+      },
+      {
+        "path": "vendor/accesskit-atspi-common/src/node.rs",
+        "blob": "90d98954dea034ce6ce18e1be0c4c6435fc377b1"
+      },
+      {
+        "path": "vendor/libcosmic/src/widget/button/widget.rs",
+        "blob": "6ef153a51fbb428a2b6eea0e9b65aa061f2c9298"
+      }
+    ]
+  },
+  "blockers": [],
+  "protected_findings": [
+    {
+      "topic": "Raw full-model proof precedes inherited publication and aliases",
+      "refs": [
+        "src/app/workspace_model_sync.rs:505-523",
+        "src/app/workspace_model_sync.rs:585-619",
+        "src/app/workspace_model_sync.rs:795-838",
+        "src/app/shared_views.rs:112-281",
+        "src/app/shared_views.rs:357-455",
+        "src/app/shared_views.rs:2191-2245"
+      ],
+      "fact": "The unchanged snapshot installer refreshes quarantine against the incoming complete views+agents before assigning or folding that snapshot. Connected and Read use it; ViewApplied installs/classifies before acknowledgement. Ordinary reconciliation refreshes again before retirement/projection. The original classifier retains duplicate ownership/issuer and source/scope checks on the raw full model; pending Insert/InsertIfEmpty/Update is checked with that original index before overlay/alias adoption. Root adds no SeedView producer or alternate classifier path."
+    },
+    {
+      "topic": "Invalid local/canonical/pending/alias cannot be masked by publication",
+      "refs": [
+        "src/app/shared_views.rs:239-281",
+        "src/app/shared_views.rs:372-455",
+        "src/app/shared_views.rs:1619-1645",
+        "src/app/shared_views.rs:1957-2005"
+      ],
+      "fact": "The q filter runs before choosing a canonical pane for uninitialized scopes. The sole SeedView producer remains at1998. Its panes derive from the q-filtered LocalViews; its separate closed collector explicitly excludes q and local_only IDs at1979-1982. Thus stale CLOSED local managed A versus valid current same-ID canonical B is still rejected by the local-source classifier: canonical_update requires OPEN at423, so it cannot waive stale closedA. B's validity does not authorize publishing A's close. Seed.closed is view/publication intent, not observed host/session close.",
+      "fresh_scope_distinction": "Fresh/unmanaged descriptors are admitted by their original construction path rather than being treated as managed merely because they lack a literal q check. Reserved terminal creations remain excluded from legacy seed and replay as stable ordinary Insert after ACK. This review found no newly added inherited-source Seed path."
+    },
+    {
+      "topic": "Durable source/draft/image custody and q synchronization",
+      "refs": [
+        "src/app/shared_views.rs:122-126",
+        "src/app/shared_views.rs:693-721",
+        "src/app/shared_views.rs:972-1087",
+        "src/app/shared_views.rs:1089-1118",
+        "src/app.rs:5739-5748",
+        "src/app/workspace_model_sync.rs:795-806"
+      ],
+      "fact": "The classifier begins with runtime and durable q evidence. for_workspace seeds the runtime set from durable metadata, including registry replacement; initialization refills/presents the fence before ordinary hydration. refresh updates runtime membership and durable source evidence in one nonfallible call. Presentation removes lifecycle and queued restored attach, and installs Failed only for OPEN cards. All source/draft/image persistence, image ownership, retained-work and History files are exact91a blobs; chat_ui's only production addition is a read-only connected startup_host_proof accessor. No payload deletion or custody replacement is introduced.",
+      "predicate_limit": "startup_pending tests the synchronized runtime set rather than the union helper. The constructor/reset/refresh production chain maintains the durable-set superset; an artificial durable-only test mutation is not evidence of a reachable production bypass. The new restored-attach helper separately checks the union."
+    },
+    {
+      "topic": "OPEN q fails before Root waivers; CLOSED evidence stays closed",
+      "refs": [
+        "src/app/startup_gate.rs:187-279",
+        "src/app/shared_views.rs:1089-1118",
+        "src/app/startup_gate/tests.rs:496-597"
+      ],
+      "fact": "The open-card loop checks q at201-204 and continues before terminal-ended/saved-ready and unstarted/retained-chat waivers. It preserves Root's Pending priority: genuine admission/pane work settles before reporting retained failures. Closed cards are excluded at199; a CLOSED-only rejected source may remain inert while healthy siblings finish and startup becomes Ready. Do not demand unconditional recovery-incomplete or reopen it. Only OPEN denied panes require incomplete once genuine pending work settles."
+    },
+    {
+      "topic": "New restored-terminal queue cannot pass the unattached fallback while q",
+      "refs": [
+        "src/app/shared_views.rs:1324-1359",
+        "src/app.rs:5987-6041",
+        "src/app/shared_views.rs:2367-2370",
+        "src/app.rs:5863-5882"
+      ],
+      "fact": "The new helper refuses pane_is_quarantined first, ahead of defaults, pending creation and !attached fallback. For an attached nonq source it still requires a real registry, exactly one canonical owner, nonretired scope, initialized/notseeding/notblocked scope, no pending start, and exact Terminal descriptor. The queue requires retained lifecycle and Loading runtime, calls the helper before converting Cold to Hibernated or starting an attach, and reinserts held items. present_quarantined_pane has already removed q queue/lifecycle and made OPEN runtime Failed. The post-admission queue kick is after completed projection/save, not an alternate admission grant."
+    },
+    {
+      "topic": "Late ACK/recheck/source replacement and terminal completion",
+      "refs": [
+        "src/app/workspace_model_sync.rs:585-619",
+        "src/app/shared_views.rs:2071-2083",
+        "src/app/shared_views.rs:844-888",
+        "src/app.rs:16923-16939",
+        "src/app.rs:6053-6073",
+        "src/app.rs:14742-14760",
+        "src/app/shared_views.rs:394-455"
+      ],
+      "fact": "ACK updates only scope seeding/initialized state and safe pending edits; accepted full-model data was classified first, so ACK alone cannot clear q. Recheck retains request/source/registry/endpoint checks and returns through ordinary Read; issuer absence or changed local source alone is not new proof. Existing explicit unique canonical OPEN replacement can legitimately re-enter ordinary validated admission; it is not a blanket ban on valid recovery. A late terminal success hitting q only disconnects its received surface with close=false and finishes bookkeeping; it cannot replace Failed. Nonq completion still requires current operation, local lifecycle/Loading acceptance and exact terminal ID."
+    },
+    {
+      "topic": "Fresh/live/legitimate closed and retirement contracts survive",
+      "refs": [
+        "src/app/shared_views.rs:282-355",
+        "src/app/shared_views.rs:394-455",
+        "src/app/shared_views/tests/startup_admission.rs:2552-2597",
+        "src/app/shared_views/tests/startup_admission.rs:581-829",
+        "src/app/shared_views.rs:1327-1359"
+      ],
+      "fact": "The exact closedB positive control is preserved byte-for-byte: matching canonical closed local source still appears in Seed.closed, while stale old canonical membership cannot reopen it. Verified retirement still requires unchanged independent raw source/issuer captures, unique ownership/scope, newer full snapshot/revision and exact local source; no pending overlay becomes a witness. Existing complete-source closed-history and exact observed terminal-end exceptions remain. The q-first helper does not alter nonq fresh unattached fallback or ordinary valid canonical attachment. Source and permission checks were not weakened."
+    },
+    {
+      "topic": "Five common-file semantic composition",
+      "refs": [
+        "src/app.rs:5942-6041",
+        "src/app/chat_ui.rs:startup_host_proof",
+        "src/app/shared_views.rs:1324-1359",
+        "src/app/shared_views.rs:2367-2370",
+        "src/app/startup_gate.rs:187-279",
+        "src/terminal/hosted.rs:AttachmentState/current_attachment/CurrentAttachment"
+      ],
+      "fact": "app.rs changes exact-host restored attach and queue orchestration without deleting the protected q start/completion fences. chat_ui adds only startup proof observation. shared_views adds the guarded helper and queue kick, leaving all original production bytes. startup_gate replaces the old gate with Root's richer pending/current-owner inspection while carrying the unconditional OPEN q failure ahead of waivers. hosted adds current-attachment proof/RAII clearing on disconnect; remembered proof alone cannot stand in for a current connection. These Root current-host semantics require their own matched validation and are not qualified by this protected-source preservation review.",
+      "authority_limit": "No managed matching/proof/caller permission implementation is dropped, no copied metadata is promoted to admission proof, and no protocol allocation is performed. Root protocol128 is retained as the separate composition contract; this is not transfer of qualification from Main15 protocol127."
+    }
+  ],
+  "source_regression_limits": {
+    "existing": "Original startup_admission/history/image regression source is byte-conserved. Final62 adds only the three source oracles named in its freeze/conservation review; they are not executions.",
+    "natural_closed_source_gap": "The later normal persisted CLOSED staleA/current validB same-ID plus healthyH causal regression is outside frozen62 and was not inspected or credited. It remains an appropriate composition validation oracle. Assert q derived naturally before real emitted healthy-only seeds, badID absent both panes+closed, healthy ACK/admission, unchanged CLOSED source/draft/image/evidence, and no bad actual client request if the fixture drives tasks. CLOSED A alone must not force incomplete.",
+    "remaining_execution": "Combined Rust compilation/tests and native startup/recovery are UNRUN for62. Owning selector reader is mapping minimum parent names; this review does not duplicate a broad inventory, allocate a resource grant, or waive affected-flow native evidence."
+  },
+  "related_evidence": [
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/91a8-6ceb-WHOLE-startup-source-integration-map-v1.json",
+      "sha256": "9b5ec3273b66d7c5b4d495e190a11d14440190d5c5f7de6ba463bb2769a32cfe",
+      "use": "Required original integration map; not execution."
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/91a8-6ceb-stale-closed-source-fixture-design-addendum-v1.json",
+      "sha256": "f49fa64e5431ff26bba6eefea57cf79a1102095cc35a02eed95fdd40475431e4",
+      "use": "Governing corrected CLOSED/OPEN oracle."
+    },
+    {
+      "path": "/tmp/whole-startup-quarantine-guard-source-review-62c48646-v1.json",
+      "sha256": "c5b51ecae97b38b58af56963560b7b63c7dbeddde64f2008eb165f74255deabd",
+      "use": "Read as bounded helper-delta review; not substituted for this full preservation inspection."
+    },
+    {
+      "path": "/tmp/whole-startup-62c48646-quarantine-guard-conservation-review-v1.json",
+      "sha256": "0bbd94fef5c34b57efd774f9e7a46197876585e0f595113abfbd23b6d39f0831",
+      "use": "Read final-child conservation scope; independent33-path comparison and5-file review performed here."
+    },
+    {
+      "path": "/tmp/startup-62c48646-persisted-quarantine-sync-invariant-review-v1.json",
+      "sha256": "caf5199bfa0ad1774e12546472a86112a1c81d6915f88e9b598a5a6d5660978e",
+      "use": "Corroborates source-backed q synchronization, not a classifier-policy or runtime pass."
+    }
+  ],
+  "holds": "No Main15 C grant/queue/runtime or merge approval.1933 NEVERMERGE. Existing WHOLE/native/installed holds unchanged; no result donation from Root component30/public347c2adc or original b3 native to newly composed startup flow.",
+  "actions": "Only immutable read-only Git/source/hash and existing evidence reads, plus this exclusive0444 receipt. One lookup in the old Main15 Git lacked62; the worktree gitdir pointer supplied its owning private Git without fetch/import/retry. No source or Git edits, moving source reads, builds/tests/imports/helpers/native/provider/app/authority/environment/process/target/cache/context/resource evaluation, public write or new agents."
+}

@@ -1,0 +1,30 @@
+{
+  "schema": "startup30-B-abefe-bounded-negative-return-root-acceptance-v1",
+  "accepted_utc": "2026-10-31T11:26:32.515368+00:00",
+  "allocation": "abefe703-0a61-4eea-b18a-26cad7b0f758",
+  "grant_message_id": "8a680bff-944d-4b2d-a163-2e0db17b1903",
+  "executor_session": "b9aa3f1d-524e-49e2-a43c-e5d9acf6bbc6",
+  "source_product": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+  "source_controller": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+  "decision": "ACCEPT_EXPLICIT_BOUNDED_NEGATIVE_EXECUTOR_RETURN",
+  "basis": {
+    "/tmp/coord-b9-startup-B-abefe-actual-executor-return.json": "e83479756d44b33fc1111ec9fc88c368d3463ed8f808ce1df0db69dc1fc0c0df",
+    "/tmp/coord-b9-startup-B-abefe-sole-raw-review.json": "bce883b2de5613edbba776deb4e38e08dd91de02b46ddb2a0d32bfe50265c788",
+    "/tmp/startup30-B-abefe-root-acceptance-hash-join-1335-v1.json": "028c60615775b72c4f38b0b6b3f5c646567f32b0171e13b038a49a3edba0d879"
+  },
+  "original_exit": 1,
+  "qualified_distinct_parents": 2,
+  "groups": {
+    "CLI": "1P0F qualified",
+    "HOST": "1P0F qualified",
+    "UI": "27P1F NONQUALIFYING failed group"
+  },
+  "C_logical_state": "RETURN_ACCEPTED_NO_NEW_ALLOCATION",
+  "limits": [
+    "Recorded original309waits/local unforced censuses/one-shotCclose and finalwriters only; no global359 or kernel-family claim.",
+    "Root hash/read-joins the sole RAW and independent131file hashjoin; no duplicate RAW semantic audit or live process probe.",
+    "Source safety finding remains prospective blocker for every future helper-backed packet until exact canonical no-unproven-signals correction is composed and reviewed.",
+    "No fixture correction, rerun, current public PR, whole-suite, WHOLE, native, UX, installed or merge qualification from this acceptance."
+  ],
+  "future_grant": null
+}

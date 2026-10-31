@@ -1,36 +1,47 @@
 {
-  "schema": "startup-6ceb-three-libtest-groups-task-data-v1",
+  "schema": "startup-aeb1345d-agent-safe47-three-libtest-groups-task-data-v1",
   "kind": "SOURCE_PREPARATION_NOT_ADMISSION",
   "product_pr": null,
   "scope_parent": null,
   "source": {
-    "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
-    "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
-    "parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
-    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard",
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "parents": [
+      "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "1892a6f458828d7b1f38f6e03457bf1a072efb73"
+    ],
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery",
     "source_paths_sha256": {
       ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
       "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
       "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
       "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
-      "src/app.rs": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
-      "src/app/chat_ui.rs": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+      "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+      "src/app.rs": "12f950cc57f4190fd562b275e180293b2d761f60f2ca0fb952697a0b8a414ecc",
+      "src/app/chat_ui.rs": "7e25419906aa47126b819abcba65a741f48df523d488c9bc7b89cfa1d0e9ad53",
       "src/app/saved_terminal.rs": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
-      "src/app/shared_views.rs": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
-      "src/app/shared_views/tests/startup_terminals.rs": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
-      "src/app/startup_gate.rs": "6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339",
+      "src/app/shared_views.rs": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "src/app/shared_views/tests/startup_admission.rs": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "src/app/shared_views/tests/startup_terminals.rs": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "src/app/startup_gate.rs": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
       "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
-      "src/app/startup_gate/tests.rs": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "src/app/startup_gate/tests.rs": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "src/app/workspace_model_sync.rs": "15aef66eb5b6089b8ef7c023e43998fd0c389e551261c9d0208561018fe937a1",
       "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
       "src/host/agent_execution/terminals.rs": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
       "src/host/client.rs": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
       "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+      "src/host/model.rs": "fbeb2c27bcd8bdf9e78286b9801f7b49f40d475ae6374b384adc51e18ed1d355",
+      "src/host/model/views.rs": "4fcde53fc87e36eb0e73518985edab78efb2aa43c2d483840552df8fc741e946",
       "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
       "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
       "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
-      "src/terminal/hosted.rs": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+      "src/persistence.rs": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "src/session.rs": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+      "src/terminal/hosted.rs": "d17f5ab7f996051e1e859011a414d7307d73e8e77f9437b535348e119f2792d9",
       "src/terminal/ipc.rs": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
-      "src/terminal/surface.rs": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21"
+      "src/terminal/surface.rs": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21",
+      "src/workspace_model/views.rs": "465d2d1dc6fc076ec8fd0d99ec1f6a6aa51598eafe1bf42a12cb9ae73cb7a808"
     }
   },
   "helper_build": null,
@@ -92,7 +103,24 @@
         "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
         "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
         "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
-        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+        "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+        "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+        "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+        "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+        "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+        "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+        "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+        "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+        "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+        "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+        "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+        "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+        "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
       ],
       "execution": {
         "label": "parent-cli-lib-exact",
@@ -126,11 +154,36 @@
         {
           "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
           "expected_stdout_child_results": 0
+        },
+        {
+          "name": "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+          "expected_stdout_child_results": 0
         }
       ],
       "source_predicted_compiled_names": [
         "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
-        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests"
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+        "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+        "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+        "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+        "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
       ],
       "source_predicted_absent_names": [
         "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
@@ -160,7 +213,19 @@
         "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
         "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
         "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
-        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+        "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+        "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+        "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+        "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+        "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+        "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+        "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+        "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+        "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat"
       ],
       "execution": {
         "label": "parent-host-lib-exact",
@@ -302,6 +367,54 @@
         {
           "name": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
           "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+          "expected_stdout_child_results": 0
         }
       ],
       "source_predicted_compiled_names": [
@@ -333,7 +446,24 @@
         "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
         "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
         "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
-        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+        "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+        "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+        "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+        "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+        "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+        "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+        "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+        "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+        "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+        "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+        "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+        "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+        "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
       ],
       "source_predicted_absent_names": [
         "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests"
@@ -355,7 +485,12 @@
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": true
+      "nonadditive_cases": true,
+      "compiled_in_groups": [
+        "cli-lib",
+        "host-lib",
+        "ui-lib"
+      ]
     },
     {
       "selector": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
@@ -367,163 +502,205 @@
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "host-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 118,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 156,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 171,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 191,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 229,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 254,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 271,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 351,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 417,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
       "line": 454,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
-      "line": 496,
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "line": 600,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
-      "line": 615,
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "line": 719,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
       "artifact_group": "ui-lib",
       "source_path": "src/app/startup_gate/tests.rs",
-      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
-      "line": 746,
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "line": 850,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
@@ -535,7 +712,10 @@
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
@@ -547,7 +727,10 @@
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
@@ -559,7 +742,10 @@
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
@@ -571,7 +757,10 @@
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
@@ -583,127 +772,450 @@
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
       "line": 297,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
       "line": 322,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
       "line": 350,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
       "line": 373,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
       "line": 415,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
       "line": 449,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
       "line": 481,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
       "line": 493,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
-      "line": 577,
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "line": 702,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
     },
     {
       "selector": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
       "artifact_group": "ui-lib",
       "source_path": "src/app/shared_views/tests/startup_terminals.rs",
-      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
-      "line": 638,
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "line": 770,
       "attributes": [
         "test"
       ],
       "ignored": false,
-      "nonadditive_cases": false
+      "nonadditive_cases": false,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Root five named source additions; inner cases are nonadditive",
+      "source_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "line": 664,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Root five named source additions; inner cases are nonadditive",
+      "source_sha256": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "line": 3299,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Root five named source additions; inner cases are nonadditive",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "line": 496,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Root five named source additions; inner cases are nonadditive",
+      "source_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "line": 550,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_admission.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "line": 983,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_admission.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "line": 2161,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_admission.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "line": 2869,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_admission.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "line": 715,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_admission.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "line": 754,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_admission.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "line": 4459,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_admission.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "line": 3345,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+      "artifact_group": "ui-lib",
+      "source_path": "src/session.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+      "line": 5916,
+      "compiled_in_groups": [
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+      "artifact_group": "host-lib",
+      "source_path": "src/persistence.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "line": 6631,
+      "compiled_in_groups": [
+        "host-lib",
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+      "artifact_group": "host-lib",
+      "source_path": "src/persistence.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "line": 9227,
+      "compiled_in_groups": [
+        "host-lib",
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+      "artifact_group": "host-lib",
+      "source_path": "src/persistence.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "line": 8233,
+      "compiled_in_groups": [
+        "host-lib",
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+      "artifact_group": "host-lib",
+      "source_path": "src/persistence.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "line": 8328,
+      "compiled_in_groups": [
+        "host-lib",
+        "ui-lib"
+      ]
+    },
+    {
+      "selector": "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+      "artifact_group": "host-lib",
+      "source_path": "src/persistence.rs",
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true,
+      "assignment": "Exact genuine Main15 selection; execution admission not granted",
+      "caller_fixture_admission": "Ordinary isolated-graph test source only; any future execution still requires separate admitted caller/fixture/resource context.",
+      "source_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "line": 10701,
+      "compiled_in_groups": [
+        "host-lib",
+        "ui-lib"
+      ]
     }
   ],
   "planned_phase_count": 9,
@@ -722,7 +1234,7 @@
     "state": "SOURCE_STARTUP30_CANDIDATE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
     "execution_authorized": false,
     "helper_binding": null,
-    "required_future_admission": "Actual accepted donor return and packet A positive return, then separately authenticated current Root C grant and reviewed source/context; source preparation is not authority."
+    "required_future_admission": "Actual exact nonauthor Agent-safe47 controller review, accepted prior return and separate current Root C grant/source/context/resource guards. Inherited opaque authority remains untouched. This one partial plan excludes the five genuineUser-only invocations while preserving their source guards and FULL52 HOLD contract; it supplies no new User requirement or context."
   },
   "actual": {
     "grant": null,
@@ -740,5 +1252,51 @@
     "runtime_results": null,
     "RAW_review": null,
     "safe_release": null
+  },
+  "root_additional_selectors": [
+    "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+    "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+    "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+    "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+    "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor"
+  ],
+  "source_assignment": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/dependencies/final-delivery/minimal-additional-selection.json",
+    "sha256": "7945b9ee702787f57b5235cf2b197b86997264da9df96303b282e56a9df9dad6",
+    "source_parent_count": 20,
+    "duplicates_with_root35": [
+      "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+      "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+      "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it"
+    ],
+    "remaining_count": 17,
+    "remaining_names": [
+      "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+      "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+      "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+      "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+      "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+      "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+      "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+      "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+      "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+      "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+      "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+      "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+      "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+      "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
+    ],
+    "qualified_pass_count": null,
+    "scope": "Original full52 dedup ownership assignment only; live Agent-safe47 is exactly the classified subset with deferred5 explicit HOLD."
+  },
+  "fixture_admission_limit": "The five classified genuineUser-only names remain required but NOT INVOKED by this47 partial plan. Their unchanged source still compiles in UI; no skipflag, ignored/pass count, early-return or child-footer credit is assigned. Existing authority/test guards stay intact. Agent-compatible is a source-path classification, not actual caller/fixture/resource/native admission.",
+  "qualification_scope": "EXPLICIT_AGENT_SAFE47_PARTIAL_ONLY_FULL52_USER5_NATIVE_REMAIN_HOLD",
+  "required_source_contract": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/required-source-contract.json",
+    "sha256": "c48bd1259b424db7eaf2afbdd41c98478233ca42edb508e4eaded0f1727776b2",
+    "bytes": 39199
   }
 }

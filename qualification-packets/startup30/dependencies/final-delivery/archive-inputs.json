@@ -1,0 +1,119 @@
+{
+  "kind": "GENUINE_SOURCE_INPUT_ARCHIVE_LEDGER_NOT_REVIEW",
+  "base": "9e5e9c605b491365bdb75b83412d0a32872cd81a",
+  "items": [
+    {
+      "path": "dependencies/final-delivery/port-review.json",
+      "original_path": "/tmp/startup30-unsignaled-port-independent-review-9e5e9c60-1335-v1.json",
+      "sha256": "ae273482c63f0b9ece1af53f7614c667165edea5cd51c70b10ac8d54a9bf1e6c",
+      "bytes": 7003
+    },
+    {
+      "path": "dependencies/final-delivery/port-author-freeze.json",
+      "original_path": "/tmp/startup30-unsignaled-port-author-xaxptagt/freeze.json",
+      "sha256": "0df632ba9207a599ed6bc76e78f157d581fc729cae81098bee097c6d0b210671",
+      "bytes": 13553
+    },
+    {
+      "path": "dependencies/final-delivery/final-delivery-freeze.json",
+      "original_path": "/tmp/fw16-backend-ec204421/whole-startup-final-delivery-merge-freeze-v1.json",
+      "sha256": "e1c34ab4dbf29aa4eb5e133f925834365558dd0ed038e5cda1ea3d18193d2975",
+      "bytes": 1259
+    },
+    {
+      "path": "dependencies/final-delivery/final-delivery-review.json",
+      "original_path": "/tmp/startup-aeb1345d-final-delivery-ancestry-conservation-review-v1.json",
+      "sha256": "2f35a3ef191930da3457a172b2e852428364bb28da2f7990c466609ca843e4d8",
+      "bytes": 12064
+    },
+    {
+      "path": "dependencies/final-delivery/final-delivery-plan.json",
+      "original_path": "/tmp/startup-delivery-1892-d109-plan-je_j5216/report.json",
+      "sha256": "49a65f59f443cc77aeaeadc3052c2614fbf3c29a8ef8e6352b5fd5803f8a1984",
+      "bytes": 15735
+    },
+    {
+      "path": "dependencies/final-delivery/quarantine-guard-review.json",
+      "original_path": "/tmp/whole-startup-quarantine-guard-source-review-62c48646-v1.json",
+      "sha256": "c5b51ecae97b38b58af56963560b7b63c7dbeddde64f2008eb165f74255deabd",
+      "bytes": 6748
+    },
+    {
+      "path": "dependencies/final-delivery/stale-closed-review.json",
+      "original_path": "/tmp/whole-stale-closed-c8ecf5f3-semantic-test-source-review-v1.json",
+      "sha256": "56f4f24cacc378d7ba19f927d422552469f0d0da5bc3e6448cca0c0b99405f28",
+      "bytes": 10993
+    },
+    {
+      "path": "dependencies/final-delivery/seed-fixture-review.json",
+      "original_path": "/tmp/startup-seed-fixture-semantic-source-review-7c9c13c7-v1.json",
+      "sha256": "e17114ea2b32027d0d82e1aebbfd2c766b9889e44885731137fbab0651a110fc",
+      "bytes": 9272
+    },
+    {
+      "path": "history/B347-negative/root-acceptance.json",
+      "original_path": "/tmp/fw16-backend-ec204421/startup30-B-abefe-negative-return-root-acceptance-v1.json",
+      "sha256": "decd04bada3e86e0a372f1e1a8ba022333bca86191b2bd43e1be0358d1f73be7",
+      "bytes": 1781,
+      "scope": "Immutable originalB EXIT1, onlyCLI1/HOST1 qualified; UI27P1F nonqualifying. Archive/hash only; no repeated RAW audit or pass transfer."
+    },
+    {
+      "path": "history/B347-negative/executor-return.json",
+      "original_path": "/tmp/coord-b9-startup-B-abefe-actual-executor-return.json",
+      "sha256": "e83479756d44b33fc1111ec9fc88c368d3463ed8f808ce1df0db69dc1fc0c0df",
+      "bytes": 22026,
+      "scope": "Immutable originalB EXIT1, onlyCLI1/HOST1 qualified; UI27P1F nonqualifying. Archive/hash only; no repeated RAW audit or pass transfer."
+    },
+    {
+      "path": "history/B347-negative/sole-RAW-review.json",
+      "original_path": "/tmp/coord-b9-startup-B-abefe-sole-raw-review.json",
+      "sha256": "bce883b2de5613edbba776deb4e38e08dd91de02b46ddb2a0d32bfe50265c788",
+      "bytes": 22286,
+      "scope": "Immutable originalB EXIT1, onlyCLI1/HOST1 qualified; UI27P1F nonqualifying. Archive/hash only; no repeated RAW audit or pass transfer."
+    },
+    {
+      "path": "history/B347-negative/acceptance-hash-join.json",
+      "original_path": "/tmp/startup30-B-abefe-root-acceptance-hash-join-1335-v1.json",
+      "sha256": "028c60615775b72c4f38b0b6b3f5c646567f32b0171e13b038a49a3edba0d879",
+      "bytes": 50577,
+      "scope": "Immutable originalB EXIT1, onlyCLI1/HOST1 qualified; UI27P1F nonqualifying. Archive/hash only; no repeated RAW audit or pass transfer."
+    },
+    {
+      "path": "dependencies/final-delivery/caller-classification.json",
+      "original_path": "/tmp/aeb1345d-52-parent-caller-admission-source-classification-v1.json",
+      "sha256": "315693dcdebbb93dee644e5fb05c192acfe6e6ad44a225d3ea128ad2b8f6a258",
+      "bytes": 24100
+    },
+    {
+      "path": "dependencies/final-delivery/main15-final-protected-review.json",
+      "original_path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-main15-final-protected-WHOLE-source-test-oracle-review-v1.json",
+      "sha256": "eeeeb413c2b06650abe514fb4c37df723af583aa70d52b6152da8679bf32a139",
+      "bytes": 19436
+    },
+    {
+      "path": "dependencies/final-delivery/final-owning-parent-selection.json",
+      "original_path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-final-owning-test-parent-selection-refresh-v2.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef",
+      "bytes": 25829
+    },
+    {
+      "path": "dependencies/final-delivery/main15-lead-source-parent-join.json",
+      "original_path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-main15-lead-assembled-final-protected-source-parent-handoff-v1.json",
+      "sha256": "804a167bcf87414a154372e6001506bd6e27702a3c1a7dae6df3d1764e330417",
+      "bytes": 8004
+    },
+    {
+      "path": "dependencies/final-delivery/minimal-additional-selection.json",
+      "original_path": "/tmp/held-saved-scope-fw16-evidence/62c48646-minimal-additional-owning-test-parent-selection-v1.json",
+      "sha256": "7945b9ee702787f57b5235cf2b197b86997264da9df96303b282e56a9df9dad6",
+      "bytes": 29858
+    },
+    {
+      "path": "dependencies/final-delivery/main15-protected-production-review.json",
+      "original_path": "/tmp/held-saved-scope-fw16-evidence/62c48646-main15-protected-WHOLE-composition-source-review-v1.json",
+      "sha256": "72ffb69533dbcebb4fe59f1b02d64ec81ed6438af7b43e7056d41ef1e8163b6e",
+      "bytes": 19834
+    }
+  ],
+  "pending": "Genuine final product/source52/classifier artifacts now archived. Exact Agent-safe47 controller review, actual grant/execution and User5 causal bodies remain unqualified; this ledger is author provenance, not approval."
+}

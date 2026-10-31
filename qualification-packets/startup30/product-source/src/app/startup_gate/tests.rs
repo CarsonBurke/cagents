@@ -493,6 +493,110 @@ fn end_terminals(app: &mut Cagents, cards: &[CardId]) {
 }
 
 #[test]
+fn open_quarantine_precedes_waivers_but_closed_evidence_stays_closed() {
+    for chat in [false, true] {
+        let (mut app, cards) = waiting(1);
+        let id = cards[0];
+        if chat {
+            let card = app.card_state_mut(id).unwrap();
+            let CardKind::Terminal(terminal) = &card.kind else {
+                unreachable!()
+            };
+            let session = crate::chat::Session {
+                id: terminal.id,
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: terminal.launch.clone(),
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+            };
+            assert!(session.is_unstarted());
+            card.kind = CardKind::Chat(session);
+        } else {
+            end_terminals(&mut app, &[id]);
+        }
+        assert_eq!(app.startup_pane_check(), Ok(true));
+        let original = app.card_state(id).unwrap().clone();
+        app.shared_views.quarantined.insert(id);
+        Arc::make_mut(&mut app.durable)
+            .quarantined_panes
+            .insert(id, original.kind.clone());
+        let reason = app.startup_pending().unwrap_err();
+        assert!(reason.starts_with("recovery-incomplete:"), "{reason}");
+        assert!(reason.contains(&id.to_string()), "{reason}");
+        assert_eq!(app.card_state(id), Some(&original));
+        assert!(app.shared_views.quarantined.contains(&id));
+        assert_eq!(app.durable.quarantined_panes.get(&id), Some(&original.kind));
+
+        // Closed history retains its evidence without becoming an open failure.
+        app.card_state_mut(id).unwrap().existence =
+            super::super::project_ui::removed_existence("fixture closed");
+        let closed = app.card_state(id).unwrap().clone();
+        assert_eq!(app.startup_pending(), Ok(None));
+        assert_eq!(app.startup_pane_check(), Ok(true));
+        assert_eq!(app.card_state(id), Some(&closed));
+        assert!(!closed.existence.is_open());
+        assert!(app.shared_views.quarantined.contains(&id));
+        assert_eq!(app.durable.quarantined_panes.get(&id), Some(&original.kind));
+        assert!(matches!(app.cards.get(&id), Some(CardRuntime::Loading)));
+    }
+}
+
+#[test]
+fn quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it() {
+    for quarantined_index in [0, 1] {
+        let (mut app, cards) = waiting(2);
+        let quarantined = cards[quarantined_index];
+        let healthy = cards[1 - quarantined_index];
+        end_terminals(&mut app, &[quarantined]);
+        let pending = Pending {
+            admission: false,
+            panes: vec![healthy],
+        };
+        assert_eq!(app.startup_pending(), Ok(Some(pending.clone())));
+        let delayed = inspection(&mut app, Ok(StartupState::Ready));
+        assert_eq!(delayed.context.pending, pending);
+        let observed = Observed {
+            context: delayed.context.clone(),
+            daemon: delayed.outcome.as_ref().unwrap().clone(),
+        };
+        assert!(app.startup_observation_current(&observed, &pending));
+
+        let original = app.card_state(quarantined).unwrap().clone();
+        app.shared_views.quarantined.insert(quarantined);
+        Arc::make_mut(&mut app.durable)
+            .quarantined_panes
+            .insert(quarantined, original.kind.clone());
+        assert_eq!(app.startup_pending(), Ok(Some(pending)));
+        assert_eq!(app.startup_pane_check(), Ok(false));
+        assert_eq!(reported(&app), None);
+        assert!(!app.startup_gate.saving);
+
+        end_terminals(&mut app, &[healthy]);
+        let reason = app.startup_pending().unwrap_err();
+        assert!(reason.starts_with("recovery-incomplete:"), "{reason}");
+        assert!(reason.contains(&quarantined.to_string()), "{reason}");
+        drop(app.startup_state_inspected(delayed));
+        let reported = reported(&app).expect("open quarantine must answer the launcher");
+        assert!(reported.contains("recovery-incomplete:"), "{reported}");
+        assert!(reported.contains(&quarantined.to_string()), "{reported}");
+        assert!(!app.startup_gate.saving);
+        assert!(app.startup_gate.daemon.is_none());
+        assert_eq!(app.card_state(quarantined), Some(&original));
+        assert!(original.existence.is_open());
+        assert!(app.shared_views.quarantined.contains(&quarantined));
+        assert_eq!(
+            app.durable.quarantined_panes.get(&quarantined),
+            Some(&original.kind)
+        );
+    }
+}
+
+#[test]
 fn delayed_retained_cannot_override_current_readiness_or_save_completion() {
     for before_save in [true, false] {
         let directory = tempfile::tempdir().unwrap();

@@ -1,0 +1,393 @@
+{
+  "schema": "main15-final-protected-WHOLE-source-test-oracle-refresh-v1",
+  "reviewer": "/root/seedview_lifecycle",
+  "request": "EC ac551127-a8d1-49af-a891-184178ee667e via /root",
+  "verdict": "SOURCE_CLEAR_FOR_FINAL_PROTECTED_PRESERVATION_AND_BOUNDED_TEST_ORACLES; ALL_FINAL_RUST_NATIVE_UNRUN",
+  "blockers": [],
+  "pins": {
+    "final": {
+      "commit": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+      "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+      "parents": [
+        "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+        "1892a6f458828d7b1f38f6e03457bf1a072efb73"
+      ]
+    },
+    "reviewed_protected_baseline": {
+      "commit": "62c4864619e8d80cea6aebc9d1f309012484caca",
+      "tree": "73de2eae297f8807480b2aa9f28bde583ad483b7",
+      "review": "/tmp/held-saved-scope-fw16-evidence/62c48646-main15-protected-WHOLE-composition-source-review-v1.json",
+      "review_sha256": "72ffb69533dbcebb4fe59f1b02d64ec81ed6438af7b43e7056d41ef1e8163b6e"
+    },
+    "combined": {
+      "commit": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+      "parent": "c8ecf5f3ed6ee3068bf6adc3a4bed996ca30dd39"
+    },
+    "closed_test": {
+      "commit": "c8ecf5f3ed6ee3068bf6adc3a4bed996ca30dd39",
+      "tree": "7a57557e4d5cd92ded186dfc2cdfbc18fabeef6c",
+      "parent": "62c4864619e8d80cea6aebc9d1f309012484caca"
+    },
+    "fixture_donor": {
+      "commit": "7c9c13c7afee3d16f677ec51fa90dea80a6df038",
+      "tree": "ee76f4d8f3f4412200467aa05c6b930c8c1b48b8",
+      "parent": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194"
+    },
+    "immutable_source_git": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-backend-control-ec204421/.git",
+    "source_worktree_locator_only": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery",
+    "final_freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-final-delivery-merge-freeze-v1.json",
+      "sha256": "e1c34ab4dbf29aa4eb5e133f925834365558dd0ed038e5cda1ea3d18193d2975"
+    },
+    "combined_freeze": {
+      "path": "/tmp/fw16-backend-ec204421/whole-startup-fixture-composition-source-v1.json",
+      "sha256": "df677fd84d2ffc560704521704954616a284322498ada0c78659f61cb8e6c96b"
+    },
+    "received_request": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/20261031T115416819908Z-post-protected-review-peer-inbox-v1.json",
+      "sha256": "3e5e7147a642c758e780abb8e22a4cba55f1b301674665f5098f7817d9922848"
+    }
+  },
+  "conservation": {
+    "method": "Independent recursive immutable Git entry comparison62 versus finalaeb, complete two-leaf delta read, exact donor/final blob and SHA256 reads. No moving worktree source, checkout/import/fetch or test execution.",
+    "base_entries": 2227,
+    "final_entries": 2227,
+    "unchanged_path_mode_type_blob_entries": 2225,
+    "changed_entries": [
+      {
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "base": {
+          "mode": "100644",
+          "type": "blob",
+          "blob": "c42f32c8d81bb2f5d4e1ed6af295771fdcd66c7f"
+        },
+        "final": {
+          "mode": "100644",
+          "type": "blob",
+          "blob": "9ceb6582a7c2c6e073ce77409c969dbb8a252eec"
+        }
+      },
+      {
+        "path": "src/app/shared_views/tests/startup_terminals.rs",
+        "base": {
+          "mode": "100644",
+          "type": "blob",
+          "blob": "2dab732885bb68e5b6d06fd433f4e0b3b5ef4812"
+        },
+        "final": {
+          "mode": "100644",
+          "type": "blob",
+          "blob": "36f8e17c7ff9118b99f931cc33d71a9f055dfe95"
+        }
+      }
+    ],
+    "added_paths": [],
+    "deleted_paths": [],
+    "mode_or_type_changes": [],
+    "production": "Every production source byte, protocol entry and protected guard at62 is exact at finalaeb. Both changed leaves are modules inside shared_views.rs cfg(test) tests. The final tree is exactly1892; second-parent1892-toaeb diff is empty.",
+    "changed_leaves": [
+      {
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+        "insertions": 317,
+        "deletions": 0,
+        "final_exact_donor": "c8ecf5f3ed6ee3068bf6adc3a4bed996ca30dd39",
+        "added_span": "2549-2865"
+      },
+      {
+        "path": "src/app/shared_views/tests/startup_terminals.rs",
+        "sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+        "insertions": 157,
+        "deletions": 19,
+        "final_exact_donor": "7c9c13c7afee3d16f677ec51fa90dea80a6df038"
+      }
+    ],
+    "actual_first_parent_d109_diff_paths": [
+      {
+        "status": "M",
+        "path": "src/app.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/channel_ui.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/chat_ui.rs"
+      },
+      {
+        "status": "A",
+        "path": "src/app/chat_ui/image_only_peer_remove_tests.rs"
+      },
+      {
+        "status": "A",
+        "path": "src/app/chat_ui/managed_image_retention_test_support.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/chat_ui/session_links.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/chat_ui/view.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/notification_ui.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/palette_ui.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/project_ui.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/resume_ui.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/shared_views.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/shared_views/tests/history_start.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/shared_views/tests/startup_admission.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/startup_gate.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/startup_gate/attachment_tests.rs"
+      },
+      {
+        "status": "A",
+        "path": "src/app/startup_gate/tests.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/terminal_adoption.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/terminal_close.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/workspace_model_sync.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/app/worktree_ui.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/control.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/host/agent_execution/terminals.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/host/chat/retained_actor_tests.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/host/client.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/host/state.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/model.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/persistence.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/pull_request_review.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/pull_request_review/discussion_ui.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/session.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/terminal/hosted.rs"
+      },
+      {
+        "status": "M",
+        "path": "src/terminal/ipc.rs"
+      },
+      {
+        "status": "M",
+        "path": "tests/repository_git_contract.rs"
+      },
+      {
+        "status": "M",
+        "path": "tests/session_restore_contract.rs"
+      },
+      {
+        "status": "A",
+        "path": "tests/support/owned_hook_pipe_holder.py"
+      },
+      {
+        "status": "A",
+        "path": "tests/support/owned_hook_pipe_holder.rs"
+      },
+      {
+        "status": "M",
+        "path": "tests/support/repository_scale.rs"
+      },
+      {
+        "status": "A",
+        "path": "tests/support/test_owned_hook_pipe_holder.py"
+      },
+      {
+        "status": "M",
+        "path": "vendor/accesskit-atspi-common/src/node.rs"
+      },
+      {
+        "status": "M",
+        "path": "vendor/libcosmic/src/widget/button/widget.rs"
+      }
+    ],
+    "parent_diff_limit": "First-parent path metadata recorded only; separate Root reader owns ancestry/delivery. This refresh judges final protected bytes against reviewed62 and the two actual test deltas, not a fresh Root transport/protocol audit."
+  },
+  "baseline_applicability": {
+    "status": "Full source conclusion of72ff applies to production at finalaeb because all production bytes are exact62.",
+    "retained": "Raw complete-model classifier before canonical/pending/alias projection; bad IDs omitted from both seed panes and closed; source/draft/image/evidence custody; early OPEN q failure before terminal/chat waivers with genuine Pending priority; q union guard before defaults/!attached restored fallback; Failed/lifecycle/queue fencing; late ACK/recheck/source replacement/completion guards; valid fresh/live/canonical/legitimate retirement and exact closedB paths.",
+    "closed_oracle": "CLOSED q stays closed/inert; only OPEN q requires recovery-incomplete after genuine pending work. No new source promotes a closed failure to an open pane or bypasses proof.",
+    "authority": "No caller permission/proof validator or protocol allocation changes from62. Root protocol128/current-host startup remains the separate owning contract. Source preservation does not establish new Root runtime or Host qualification."
+  },
+  "closed_test_source_review": [
+    {
+      "refs": [
+        "startup_admission.rs:2550-2588",
+        "startup_admission.rs:2594-2667"
+      ],
+      "finding": "The new parent starts from cached complete old-proof A, marks only local existence CLOSED, clones canonical B with same CardId/session/launch but different complete current proof, and creates independent H. It saves/drops/reopens a genuine StateStore before connecting. Raw saved A/H have no q or local_only marker; assert_retained requires exact original kind/title/width/draft/image, closedA/openH and empty initial q. A is not overwritten with B. No manufactured OPEN Failed runtime or manual q masks classification."
+    },
+    {
+      "refs": [
+        "startup_admission.rs:2669-2718",
+        "startup_admission.rs:507-560"
+      ],
+      "finding": "Full model sequence10/view revision7 carries canonical B and H with exact open managed issuers, rather than missing/closed-owner refusal. B issuer must match B and fail matching staleA; H issuer matches H. Before Connected, normal initialize_runtimes under NO_REGISTRY emits no seed/request. Normal Connected then naturally produces exactly qA and durable source A while raw model views/agents remain complete B/H."
+    },
+    {
+      "refs": [
+        "startup_admission.rs:2734-2772",
+        "startup_admission.rs:2774-2808"
+      ],
+      "finding": "Every captured SeedView is checked for badID absent from BOTH panes and closed; no ChangeView may target it. Exactly one hidden seed must contain the complete nonempty [H], so suppressing all publication cannot pass. Only actually captured scopes get ViewApplied ACKs. H remains held with no provider request until its own scope ACK; another emitted scope cannot release it.",
+      "ack_limit": "The returned full model already contains exact H plus canonical B and the empty active view, so this is coherent collection data for the known-pane seed. It is a typed UI ACK fixture; it does not run Host SQL storage or qualify its actual revision/sequence receipt."
+    },
+    {
+      "refs": [
+        "startup_admission.rs:110-118",
+        "startup_admission.rs:212-285",
+        "startup_admission.rs:378-445",
+        "startup_admission.rs:2790-2838"
+      ],
+      "finding": "with_owner admits only exact H on the scripted Unix transport. The real public client ChatAttach receives a typed ready ChatAttached response; settle drains actual App Task messages and widget effects through app.update. The parent requires requests exactly[H], no resolutions, full runtime.session H and restored_pane_ready Ok(true). It does not directly set runtime Ready. It additionally forbids ChatStart/PrepareResume/Close/CloseRetained/CloseTerminalChecked/RecoverAccount/StartSelected/ReturnTerminal controls."
+    },
+    {
+      "refs": [
+        "startup_admission.rs:2807-2864",
+        "startup_gate.rs:195-269"
+      ],
+      "finding": "A has no validated witness/runtime/pending start, keeps exact denial source and nonce, and remains CLOSED. After H's genuine fixture Ready the test correctly allows startup_pane_check Ok(true); it does not force incomplete for closed history. persistent_workspace then saves to the same store with the first actual commit generation/card_generations, requires no refusals, drops/reopens, validates retained full image/source/draft/q and closed quarantined History session A. The asset is genuine test-image custody within its lifetime; no cross-process or provider-history proof is inferred."
+    },
+    {
+      "refs": [
+        "startup_admission.rs:2869-2915"
+      ],
+      "finding": "The original exact-canonical/open replacement and valid local CLOSED B positive control is preserved in full by the insertion-only delta. Matching closedB must still publish its legitimate Seed.closed intent, and old membership cannot reopen it. Thus the new negative is not substituted for blanket filtering of closed IDs."
+    }
+  ],
+  "fixture_source_review": [
+    {
+      "refs": [
+        "startup_terminals.rs:506-562",
+        "startup_terminals.rs:565-587",
+        "startup_terminals.rs:702-740",
+        "startup_terminals.rs:765-766"
+      ],
+      "finding": "The corrected reopened fixture retains fixture()'s ordinary Browser pane as actual active channel content with global/channel Some(activeID) focus and exact one-pane visible order; hidden observed terminal stays durable offscreen. Initial canonical active view remains empty. Connected must therefore emit that visible local pane, and its actual seed IDs must equal the recorded visible order. Focus is not relaxed to None or prepopulated canonical content."
+    },
+    {
+      "refs": [
+        "startup_terminals.rs:590-660",
+        "startup_terminals.rs:715-751",
+        "startup_terminals.rs:782-794",
+        "startup_terminals.rs:851-865",
+        "host/model/views.rs:502-527",
+        "host/model/views.rs:663-682",
+        "workspace_model/views.rs:482-546"
+      ],
+      "finding": "The collector retains whole emitted SeedView values, rejects unexpected edits/duplicate scopes, and the ACK helper consumes the exact actual scope. It is explicitly ordinary-unmanaged-only, requires one existing target view, applies real public Remove before Insert, preserves same-ID canonical descriptors/order and tombstones, skips conflicting owners/resources, and advances fixture sequence/revision on first revision0 storage or actual change. Initial active/hidden and later moved-target ACKs use that resulting model rather than the pre-seed model.",
+      "limit": "This bounded fixture mirrors only these constructed ordinary unique-owner inputs; it is not Host SQL/authenticated authority/managed admission or general transaction simulation."
+    },
+    {
+      "refs": [
+        "startup_terminals.rs:664-698",
+        "startup_terminals.rs:702-766",
+        "startup_terminals.rs:770-920"
+      ],
+      "finding": "The added helper control independently asserts canonical nonoverwrite, additive order, closed-ID nonresurrection, retained tombstone, exact sequence/revision and duplicate idempotence. Original focus/queue/effect assertions remain, with only scope-set→payload-map container adaptations: own ACK gating, another-scope refusal, exact final focus/order, exact attachment/session proof, queue/inflight outcomes and both ACK-before-release branches. Unrelated scope stays unready while an admitted row can pass a held target. No failed assertion was waived.",
+      "effect_limit": "These terminal tests keep their existing component attached() completion supplied through Message::RestoredAgentAttached; they do not establish an actual Host terminal attach. The c8 chat parent separately authors actual scripted client IPC. Neither is native/live-provider evidence."
+    }
+  ],
+  "causal_negative_predictions": [
+    "Restoring the old closed-ID collector without its q exclusion would make naturally rejected CLOSED A appear in captured Seed.closed and fail the all-seeds assertion despite valid canonical B and real H publication.",
+    "Suppressing all seeds or admitting H before its own emitted-scope ACK fails explicit nonempty seed/pre-ACK request assertions.",
+    "Relaxing focus to None, returning the pre-Seed empty active model, or losing active order fails explicit Some(activeID), emitted active-payload and preserved focus/order oracles.",
+    "These are source-supported intended regressions, not executed mutations or pass results."
+  ],
+  "gaps_and_validation": {
+    "source_blockers": [],
+    "fixed_source_gap": "The previously excluded natural saved CLOSED staleA/currentB same-ID plus H regression now exists in frozen final bytes and follows the corrected oracle; no prospective execution is credited.",
+    "all_final_Rust_compile_tests_SQLite_IPC_tasks_native": "UNRUN. Test-authored SQLite/IPC/Task observations described above are source behavior only, not actions this reviewer performed.",
+    "native_and_live_provider": "UNRUN; no actual Host close/transaction, native rendering/focus/typing, live provider/history or whole-flow qualification claimed.",
+    "prior_failure": "Original RootB focus failure stays historical failure. The source-only fixture correction is not its passing rerun.",
+    "remaining": "Use separately owned exact additional-selector map for authorized focused validation, plus owning Root startup/Host/native evidence. No duplicate broad inventory or runtime/resource prerequisite imposed for already completed b3 evidence.",
+    "holds": "No C grant, queue, resource, merge or publication authority. Old91 Rust10 remains on HOLD; no quiet packet retarget.1933 NEVERMERGE and existing WHOLE/native/installed holds remain."
+  },
+  "supporting_reviews_read_not_substituted": [
+    {
+      "path": "/tmp/whole-stale-closed-c8ecf5f3-semantic-test-source-review-v1.json",
+      "sha256": "56f4f24cacc378d7ba19f927d422552469f0d0da5bc3e6448cca0c0b99405f28"
+    },
+    {
+      "path": "/tmp/whole-stale-closed-c8ecf5f3-independent-conservation-review-v1.json",
+      "sha256": "dd02db08d8bded0c1ac2febc77f845c02b7dc8f5b9d5d570b20d1343f1a4e00b"
+    },
+    {
+      "path": "/tmp/startup-seed-fixture-semantic-source-review-7c9c13c7-v1.json",
+      "sha256": "e17114ea2b32027d0d82e1aebbfd2c766b9889e44885731137fbab0651a110fc"
+    },
+    {
+      "path": "/tmp/startup-seed-fixture-7c9c13c7-independent-conservation-review-v1.json",
+      "sha256": "89ed32f94a9ad49130919803ff1a99e504619a23ac4631fddbb72795c000e093"
+    }
+  ],
+  "actions": "Read-only immutable Git/source/diff/tree/hash and named evidence inspection; wrote only this exclusive0444 receipt. No moving worktree source, candidate/helper/test/function import or evaluation, source/controller/Git writes, merge/fetch/import, Cargo/rustc/native/provider/environment/process/target/cache/context/resource evaluation, public write or new worker."
+}

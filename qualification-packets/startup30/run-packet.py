@@ -1,4 +1,4 @@
-"""Startup30 stable-guard source successor: same CLI1/HOST1/UI28 groups; no execution or native authority."""
+"""Agent-safe47 startup partial source packet: CLI1/HOST6/UI40; FULL52/User5 remain HOLD."""
 if not __debug__:
     raise RuntimeError("Startup30 requires assertions enabled before any effects")
 import argparse
@@ -18,16 +18,16 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard')
+WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-delivery')
 TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
 LOCK = TARGET.parent / 'lane-c.lock'
 TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/plan.json')
+PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/plan.json')
 PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
 PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
 SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
 CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
-PLAN_SHA = '46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31'
+PLAN_SHA = '46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043'
 SCOPE_PARENT = None  # No grouped contract enables the dormant donor staged-scope path.
 
 
@@ -869,11 +869,11 @@ def main():
     review_bytes = Path(plan['source_review']).read_bytes()
     review = json.loads(review_bytes)
     assert review['kind'] == 'AUTHOR_ASSEMBLED_STARTUP30_SOURCE_BINDING_NOT_APPROVAL'
-    assert review['verdict'] == 'BOUND_GENUINE_PRODUCT_SOURCE_REVIEW_SCOPES_CONTROLLER_REVIEW_PENDING'
-    assert (review['head'], review['tree'], review['parent']) == (
-        '6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194', '726b28c2d8d10abc2a2e8340b98e9e6015a089c4',
-        'eb7ff16beb8864349573231521c5d4eab5270cc6')
-    assert (plan['product_head'], plan['product_tree'], plan['product_parent']) == (review['head'], review['tree'], review['parent'])
+    assert review['verdict'] == 'BOUND_GENUINE_FINAL_DELIVERY_SOURCE_COMPONENT_SCOPES_CONTROLLER_REVIEW_PENDING'
+    assert (review['head'], review['tree'], review['parents']) == (
+        'aeb1345d5ca48e5999b799b5b607bc81dfdd06d8', 'fa12c3229556f732c4d7232d3d6a706e8cfc9a74',
+        ['d109cbb38b45e36f46bf58efb55abe3590ca2dbd', '1892a6f458828d7b1f38f6e03457bf1a072efb73'])
+    assert (plan['product_head'], plan['product_tree'], plan['product_parents']) == (review['head'], review['tree'], review['parents'])
     assert review['product_pr'] is plan['product_pr'] is None
     def read_bound(key, as_json=True):
         ref = review[key]
@@ -882,52 +882,54 @@ def main():
         return json.loads(payload) if as_json else payload.decode('utf-8')
     data = read_bound('command_data')
     source_map = read_bound('current_source_map')
-    composition = read_bound('composition_freeze')
-    conserved = read_bound('composition_conservation')
-    published = read_bound('composition_publication')
-    shared_freeze = read_bound('shared_test_freeze')
-    shared_review = read_bound('shared_test_review')
-    shared_publication = read_bound('shared_test_publication')
-    stable_review = read_bound('stable_guard_review')
-    stable_publication = read_bound('stable_guard_publication')
-    stable_receipt = read_bound('stable_guard_source_receipt')
-    base_product = review['base_product']
-    assert (base_product['head'], base_product['tree'], base_product['parent']) == (
-        'eb7ff16beb8864349573231521c5d4eab5270cc6', '8d60fb0154109a82861f9b595f2b7296e4f55c26',
-        'b914f9d9b55527aa1bb22d591968c58958d717ee')
-    assert review['parent'] == base_product['head']
-    assert stable_review['verdict'] == 'SOURCE_CLEAR_CURRENT_HEAD_STABLE_GUARD_DELTA_ONLY' and stable_review['findings'] == []
-    assert (stable_review['head'], stable_review['tree'], stable_review['parents']) == (review['head'], review['tree'], [base_product['head']])
-    assert (stable_publication['head'], stable_publication['tree'], stable_publication['sole_parent']) == (review['head'], review['tree'], base_product['head'])
-    assert (stable_receipt['head'], stable_receipt['tree'], stable_receipt['sole_parent']) == (review['head'], review['tree'], base_product['head'])
-    assert stable_publication['current_head_nonauthor_review']['sha256'] == review['stable_guard_review']['sha256']
-    assert stable_publication['source_receipt']['sha256'] == stable_review['author_receipt']['sha256'] == review['stable_guard_source_receipt']['sha256']
-    assert stable_review['binding_checks']['changed_paths'] == ['src/app/startup_gate.rs']
-    assert stable_review['binding_checks']['all_other_mode_type_blob_entries_exact'] == stable_publication['all_other_mode_type_blob_entries_exact'] == 2221
-    assert stable_review['binding_checks']['old_test_and_direct_helper_blobs_unchanged'] is True
-    assert stable_review['source_file']['original_sha256'] == base_product['source_paths_sha256']['src/app/startup_gate.rs']
-    assert stable_review['source_file']['current_sha256'] == plan['source_paths_sha256']['src/app/startup_gate.rs']
-    assert set(base_product['source_paths_sha256']) == set(plan['source_paths_sha256'])
-    assert all(value == plan['source_paths_sha256'][path] for path, value in base_product['source_paths_sha256'].items() if path != 'src/app/startup_gate.rs')
-    assert data['schema'] == 'startup-6ceb-three-libtest-groups-task-data-v1'
+    final_freeze = read_bound('final_delivery_freeze')
+    final_review = read_bound('final_delivery_review')
+    assignment = read_bound('minimal_additional_selection')
+    historical_plan = read_bound('historical_plan')
+    protected_review = read_bound('main15_protected_production_review')
+    final_protected = read_bound('main15_final_protected_review')
+    final_selection = read_bound('final_owning_parent_selection')
+    classifier = read_bound('caller_classification')
+    required_contract = read_bound('required_source_contract')
+    lead_join = read_bound('main15_lead_source_parent_join')
+    assert (final_freeze['head'], final_freeze['tree'], final_freeze['parents'], final_freeze['worktree']) == (review['head'], review['tree'], review['parents'], str(WT))
+    assert final_review['source_tuple'] == {'head': review['head'], 'tree': review['tree'], 'parents': review['parents']}
+    assert final_review['freeze']['sha256'] == review['final_delivery_freeze']['sha256']
+    assert final_review['tree_conservation']['final_equals_reviewed_1892'] is True
+    assert final_review['final_recheck']['exact_frozen_head_tree_parents'] is True
+    assert all(plan['source_paths_sha256'][path] == item['sha256'] for path, item in final_review['retained_component_leaf_pins'].items())
+    assert protected_review['verdict'] == 'SOURCE_CLEAR_FOR_PROTECTED_MAIN15_PRODUCTION_PRESERVATION_AT_FROZEN_62C48646; EXECUTION_UNRUN'
+    assert protected_review['blockers'] == []
+    assert assignment['status'] == 'SOURCE_DERIVED_SELECTION_ONLY_NOT_EXECUTION_ADMISSION'
+    assert data['schema'] == 'startup-aeb1345d-agent-safe47-three-libtest-groups-task-data-v1'
     assert data['product_pr'] is None and data['scope_parent'] is SCOPE_PARENT is None
     assert data['source'] == source_map['new_product']
-    assert (data['source']['head'], data['source']['tree'], data['source']['parent']) == (review['head'], review['tree'], review['parent'])
+    assert required_contract['product'] == data['source']
+    assert (data['source']['head'], data['source']['tree'], data['source']['parents']) == (review['head'], review['tree'], review['parents'])
     assert data['source']['worktree'] == str(WT)
     assert data['source']['source_paths_sha256'] == plan['source_paths_sha256'] == review['source_paths_sha256']
-    assert published['head'] == base_product['parent'] and published['tree'] == '21c43715d5de2288b27d5408e460fc7eaa7485de'
-    assert conserved['verdict'] == 'BOUNDED_OUTSIDE_GATE_SOURCE_CONSERVATION_CLEAR_RUNTIME_UNRUN'
-    assert conserved['pins']['calculated_uncommitted_source_tree'] == published['tree']
-    assert conserved['freeze']['sha256'] == review['composition_freeze']['sha256']
-    assert shared_review['result'] == 'SOURCE_CLEAR_BOUNDED_SHARED_TRANSPORT_TEST' and shared_review['blocking_findings'] == []
-    assert shared_review['freeze']['sha256'] == review['shared_test_freeze']['sha256']
-    assert shared_freeze['base'] == base_product['parent'] and shared_freeze['sha256'] == plan['source_paths_sha256']['src/control.rs']
-    assert (shared_publication['head'], shared_publication['tree'], shared_publication['parent']) == (base_product['head'], base_product['tree'], base_product['parent'])
-    assert shared_publication['source_review_sha256'] == review['shared_test_review']['sha256']
-    assert shared_review['freeze']['file_sha256_after'] == plan['source_paths_sha256']['src/control.rs']
-    assert shared_review['conservation']['production_prefix_before_cfg_test_module_byte_exact'] is True
-    assert shared_review['conservation']['inverse_delete_only_new_insertion_equals_full_base_file'] is True
-    assert all(value['sha256'] == base_product['source_paths_sha256'][path] for path, value in composition['files'].items() if path != 'src/control.rs')
+    original_names = [item['name'] for group in historical_plan['artifact_groups'] for item in group['selectors']]
+    assigned_names = [item['name'] for item in assignment['recommendation']['selected']]
+    required_names = {item['selector'] for item in required_contract['required_owning_parents']}
+    safe_names = {item['name'] for item in classifier['caller_admission_compatible_parents']}
+    deferred_names = {item['name'] for item in classifier['genuine_User_bound_parents']}
+    assert required_names == set(original_names + data['root_additional_selectors'] + assigned_names)
+    assert required_names == {item['name'] for key in ('Root35_full_names_and_current_positions', 'Main15_remaining17_full_names_and_current_positions') for item in final_selection[key]}
+    assert (classifier['source']['head'], classifier['source']['tree']) == (review['head'], review['tree'])
+    assert all(plan['source_paths_sha256'][path] == value for path, value in classifier['source']['immutable_git_source_sha256'].items())
+    assert not safe_names.intersection(deferred_names) and safe_names.union(deferred_names) == required_names
+    assert set(item['selector'] for item in data['selected_parents']) == safe_names
+    assert {item['name'] for item in required_contract['deferred_genuine_User_only']} == deferred_names
+    assert final_protected['verdict'] == 'SOURCE_CLEAR_FOR_FINAL_PROTECTED_PRESERVATION_AND_BOUNDED_TEST_ORACLES; ALL_FINAL_RUST_NATIVE_UNRUN'
+    assert final_protected['blockers'] == []
+    assert (final_protected['pins']['final']['commit'], final_protected['pins']['final']['tree'], final_protected['pins']['final']['parents']) == (review['head'], review['tree'], review['parents'])
+    assert (final_selection['source']['head'], final_selection['source']['tree']) == (review['head'], review['tree'])
+    assert all(plan['source_paths_sha256'][path] == value for path, value in final_selection['source']['file_sha256'].items())
+    assert (lead_join['product']['head'], lead_join['product']['tree']) == (review['head'], review['tree'])
+    assert lead_join['review_references']['protected_review']['sha256'] == review['main15_final_protected_review']['sha256']
+    assert lead_join['review_references']['parent_selection']['sha256'] == review['final_owning_parent_selection']['sha256']
+    assert data['required_source_contract'] == plan['required_source_contract'] == review['required_source_contract']
+    assert data['qualification_scope'] == plan['qualification_scope'] == review['qualification_scope'] == 'EXPLICIT_AGENT_SAFE47_PARTIAL_ONLY_FULL52_USER5_NATIVE_REMAIN_HOLD'
     assert data['runtime_admission'] == source_map['runtime_admission'] == review['runtime_admission'] == plan['runtime_admission']
     assert data['actual'] == source_map['actual'] == review['actual'] == plan['actual'] and all(value is None for value in plan['actual'].values())
     assert data['helper_build'] is plan['helper_build'] is None
@@ -935,15 +937,15 @@ def main():
     groups = plan['artifact_groups']
     assert [group['id'] for group in groups] == ['cli-lib', 'host-lib', 'ui-lib']
     assert [group['features'] for group in groups] == [[], ['host'], ['ui']]
-    assert [len(group['selectors']) for group in groups] == [1, 1, 28]
+    assert [len(group['selectors']) for group in groups] == [1, 6, 40]
     selected = [parent['selector'] for parent in data['selected_parents']]
-    assert len(selected) == len(set(selected)) == 30
+    assert len(selected) == len(set(selected)) == 47
     assert all(parent['attributes'] == ['test'] and not parent['ignored'] and parent['source_sha256'] == plan['source_paths_sha256'][parent['source_path']] for parent in data['selected_parents'])
-    cli, host = [group['selectors'][0]['name'] for group in groups[:2]]
-    ui = [item['name'] for item in groups[2]['selectors']]
-    assert cli == 'control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals'
-    assert host == 'host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests'
-    for group, features, present, absent, seconds in zip(groups, [[], ['host'], ['ui']], [[cli], [cli, host], [cli, *ui]], [[host, *ui], ui, [host]], [60, 60, 300]):
+    assert groups[0]['selectors'][0]['name'] == 'control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals'
+    assert groups[1]['selectors'][0]['name'] == 'host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests'
+    for group, features, seconds in zip(groups, [[], ['host'], ['ui']], [60, 60, 300]):
+        present = [parent['selector'] for parent in data['selected_parents'] if group['id'] in parent['compiled_in_groups']]
+        absent = [parent['selector'] for parent in data['selected_parents'] if group['id'] not in parent['compiled_in_groups']]
         assert group['manifest'] == 'Cargo.toml' and group['target_name'] == 'cagents' and group['target_kind'] == ['lib']
         expected = ['cargo', 'test', '--locked', '--no-default-features']
         if features:

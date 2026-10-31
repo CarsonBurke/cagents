@@ -1,0 +1,365 @@
+{
+  "schema": "source-delivery-ancestry-plan-v1",
+  "time_utc": "2026-10-31T11:45:55.523776+00:00",
+  "verdict": "SOURCE_DELIVERY_PLAN_CLEAR",
+  "scope": "Immutable ancestry and source-only merge calculation; not a new production correctness review or execution authorization.",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-whole-startup-composition",
+  "pins": {
+    "combined": {
+      "head": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+      "parents": [
+        "c8ecf5f3ed6ee3068bf6adc3a4bed996ca30dd39"
+      ],
+      "subject": "test(ui): apply emitted startup seeds before attachment acknowledgements"
+    },
+    "public_candidate": {
+      "head": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "tree": "7e0f688d3c2c84eb6f759ab6c956904caf5ef1d6",
+      "parents": [
+        "9a2e5502390f96381c37db8826f10783e37140be"
+      ],
+      "subject": "test(ui): apply emitted startup seeds before attachment acknowledgements"
+    },
+    "public_current_supplied": {
+      "head": "9a2e5502390f96381c37db8826f10783e37140be",
+      "tree": "42c2d36dd0a1140faa3e278b52e8758321328645",
+      "parents": [
+        "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37"
+      ],
+      "subject": "fix(ui): use a stable match arm for startup attachment refusal"
+    },
+    "main_supplied": {
+      "head": "4429728a1f179ea7f7eaca9667156553209a46ac",
+      "tree": "7fbf5b3c3eeb907af6cd3c01858d34f8f2644026",
+      "parents": [
+        "a3221af83d56663f0dcbef90f67b30ad6d9fe53d",
+        "b2ba9acc3d56adc2684f261f7fece85ab0b3feb2"
+      ],
+      "subject": "Merge pull request #2026 from CarsonBurke/fix/2023-retained-chat-restores-once"
+    },
+    "private_root": {
+      "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+      "parents": [
+        "eb7ff16beb8864349573231521c5d4eab5270cc6"
+      ],
+      "subject": "fix(ui): use stable match syntax for startup recovery"
+    },
+    "main15": {
+      "head": "91a8dff516e6fb76fadab432119e67c472fd9489",
+      "tree": "aea2db52b5ed089ea94e396e58dec8a4d81edb38",
+      "parents": [
+        "b855f32573bf4f37dbb9ea415550ab330a01da71",
+        "dea70f4bfb8f142c3ff036786a4ee3b5c45ec33d"
+      ],
+      "subject": "Merge reviewed owned hook pipe test fixture"
+    },
+    "original_fixture_correction": {
+      "head": "7c9c13c7afee3d16f677ec51fa90dea80a6df038",
+      "tree": "ee76f4d8f3f4412200467aa05c6b930c8c1b48b8",
+      "parents": [
+        "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194"
+      ],
+      "subject": "test(ui): apply emitted startup seeds before attachment acknowledgements"
+    }
+  },
+  "ancestry": [
+    {
+      "ancestor": "4429728a1f179ea7f7eaca9667156553209a46ac",
+      "descendant": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "is_ancestor": true,
+      "exit": 0
+    },
+    {
+      "ancestor": "9a2e5502390f96381c37db8826f10783e37140be",
+      "descendant": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "is_ancestor": false,
+      "exit": 1
+    },
+    {
+      "ancestor": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "descendant": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "is_ancestor": false,
+      "exit": 1
+    },
+    {
+      "ancestor": "9a2e5502390f96381c37db8826f10783e37140be",
+      "descendant": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "is_ancestor": true,
+      "exit": 0
+    },
+    {
+      "ancestor": "4429728a1f179ea7f7eaca9667156553209a46ac",
+      "descendant": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "is_ancestor": false,
+      "exit": 1
+    },
+    {
+      "ancestor": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "descendant": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "is_ancestor": false,
+      "exit": 1
+    },
+    {
+      "ancestor": "91a8dff516e6fb76fadab432119e67c472fd9489",
+      "descendant": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "is_ancestor": true,
+      "exit": 0
+    },
+    {
+      "ancestor": "7c9c13c7afee3d16f677ec51fa90dea80a6df038",
+      "descendant": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "is_ancestor": false,
+      "exit": 1
+    },
+    {
+      "ancestor": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "descendant": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "is_ancestor": true,
+      "exit": 0
+    },
+    {
+      "ancestor": "62c4864619e8d80cea6aebc9d1f309012484caca",
+      "descendant": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "is_ancestor": true,
+      "exit": 0
+    },
+    {
+      "ancestor": "c8ecf5f3ed6ee3068bf6adc3a4bed996ca30dd39",
+      "descendant": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "is_ancestor": true,
+      "exit": 0
+    }
+  ],
+  "common_bases": [
+    {
+      "left": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "right": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "bases": [
+        "a3221af83d56663f0dcbef90f67b30ad6d9fe53d"
+      ]
+    },
+    {
+      "left": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+      "right": "9a2e5502390f96381c37db8826f10783e37140be",
+      "bases": [
+        "a3221af83d56663f0dcbef90f67b30ad6d9fe53d"
+      ]
+    },
+    {
+      "left": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "right": "9a2e5502390f96381c37db8826f10783e37140be",
+      "bases": [
+        "a3221af83d56663f0dcbef90f67b30ad6d9fe53d"
+      ]
+    },
+    {
+      "left": "4429728a1f179ea7f7eaca9667156553209a46ac",
+      "right": "91a8dff516e6fb76fadab432119e67c472fd9489",
+      "bases": [
+        "a3221af83d56663f0dcbef90f67b30ad6d9fe53d"
+      ]
+    }
+  ],
+  "conclusion": {
+    "combined_includes_current_main": true,
+    "combined_descends_public_current": false,
+    "combined_descends_public_candidate": false,
+    "one_normal_merge_is_sufficient": true,
+    "additional_main_merge_required": false,
+    "new_product_semantics_required_for_delivery": false
+  },
+  "minimal_composition": {
+    "create_only_when_lead_assembles": "one ordinary two-parent merge commit; no commit was created by this analysis",
+    "recommended_first_parent": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+    "recommended_second_parent": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+    "resolution": "Retain automatic merge results and select the complete existing combined blob for each of the three reported conflicts. Marker-only selection leaves duplicate methods in startup_gate.rs.",
+    "expected_result_tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "publication": "After assembly/source readback and qualification, ordinary fast-forward existing PR2030 from pinned 9a or d109 to that merge. Recheck actual branch/main endpoints before publication. Do not push combined 1892 directly: it does not descend from the pinned public branch.",
+    "no_cherry_pick_duplicates": "Public initial/current-attachment/target-admission and fixture patches are already conserved; do not apply them again.",
+    "no_extra_refs": "No force push, new tag, replacement branch or history rewrite is needed."
+  },
+  "merge_calculation": {
+    "argv": [
+      "git",
+      "--no-replace-objects",
+      "--no-optional-locks",
+      "-c",
+      "core.fsmonitor=false",
+      "merge-tree",
+      "--write-tree",
+      "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+      "1892a6f458828d7b1f38f6e03457bf1a072efb73"
+    ],
+    "exit": 1,
+    "synthetic_conflicted_tree": "d743d80a144d67ed8e9dd4b187ab592959fa3f48",
+    "conflicts": [
+      {
+        "path": "src/app/shared_views.rs",
+        "kind": "content",
+        "conflict_blocks": 1,
+        "public_blob": "24b8e50a46abca271a46a35fdd3305293676f68b",
+        "combined_blob": "249adfed754e7d63de1e0490bbdfef15545019e7",
+        "combined_sha256": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+        "synthetic_blob": "68612c3ada878c5da6e39ad4486b50671288e041",
+        "choosing_only_marked_stage3_blocks_equals_combined": true,
+        "duplicated_methods_outside_conflict_markers": [],
+        "resolution": "Use the complete combined blob, not only the marked side."
+      },
+      {
+        "path": "src/app/startup_gate.rs",
+        "kind": "content",
+        "conflict_blocks": 10,
+        "public_blob": "21bf5ca53cdd173590a7630fb177ed9fe67d2820",
+        "combined_blob": "c64192502ab12c0a44b953651034cf9dd88d4734",
+        "combined_sha256": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0",
+        "synthetic_blob": "e905acb71b9ec203e726fb7a236095ba989c0c02",
+        "choosing_only_marked_stage3_blocks_equals_combined": false,
+        "duplicated_methods_outside_conflict_markers": [
+          "terminal_detached",
+          "detached",
+          "detached_reason",
+          "may_attach",
+          "expire_attach_retries"
+        ],
+        "resolution": "Use the complete combined blob, not only the marked side."
+      },
+      {
+        "path": "src/app/startup_gate/attachment_tests.rs",
+        "kind": "add/add",
+        "conflict_blocks": 1,
+        "public_blob": "1f035a2404b877e534f4710091ea95fcb39721da",
+        "combined_blob": "b6b7e18be052072b4ec2d2df0a89f4e00d6470a0",
+        "combined_sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+        "synthetic_blob": "8e30654281d47f8ec157e7032b00b629ba7e4f45",
+        "choosing_only_marked_stage3_blocks_equals_combined": true,
+        "duplicated_methods_outside_conflict_markers": [],
+        "resolution": "Use the complete combined blob, not only the marked side."
+      }
+    ],
+    "only_tree_differences_vs_combined": [
+      "src/app/shared_views.rs",
+      "src/app/startup_gate.rs",
+      "src/app/startup_gate/attachment_tests.rs"
+    ],
+    "all_other_leaf_entries_exact": 2224,
+    "combined_total_leaf_entries": 2227,
+    "synthetic_total_leaf_entries": 2227,
+    "pure_data_complete_blob_resolution_all_leaf_modes_types_oids_equal_combined": true,
+    "pure_data_recomputed_resolved_root_tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "automatic_app_and_hosted_merges_equal_combined": true,
+    "synthetic_conflict_markers_are_not_a_compilable_candidate": true
+  },
+  "equivalence": {
+    "byte_identical_commit_patches": [
+      {
+        "description": "initial attachment",
+        "public_commit": "34917347f849d92917bf6f42f206ec26cbfc4569",
+        "private_commit": "d65d1614a4f2cdaca9c4bb70771cd68c920bfd2b",
+        "unified_binary_patch_bytes_equal": true,
+        "patch_sha256": "4ae6fbb7fdad96d352b2933bc888a66cc750bd5ea9f190668a1a6cb62e4cf1c7"
+      },
+      {
+        "description": "current attachment",
+        "public_commit": "0c47aaba612b8a1021460cacd251401f430b6711",
+        "private_commit": "27b6755a557e0225be863be322d63324a7d88152",
+        "unified_binary_patch_bytes_equal": true,
+        "patch_sha256": "5b0c044c57e441f781636dbfeca47aeb428e1332d8a7a63aafd5b43098553617"
+      },
+      {
+        "description": "target admission",
+        "public_commit": "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+        "private_commit": "ac54c12bb54dc433366fe2eeb992faa348428acb",
+        "unified_binary_patch_bytes_equal": true,
+        "patch_sha256": "2575bd7671b4a12d8957a93102019344391035865a52fab4fc850b3dc77237c5"
+      },
+      {
+        "description": "fixture original",
+        "public_commit": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+        "private_commit": "7c9c13c7afee3d16f677ec51fa90dea80a6df038",
+        "unified_binary_patch_bytes_equal": true,
+        "patch_sha256": "6c3ea3aa78b08c323e2d8489faf798e144ceb947b3cf7f500b9201cbf5815ca7"
+      },
+      {
+        "description": "fixture combined",
+        "public_commit": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+        "private_commit": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+        "unified_binary_patch_bytes_equal": true,
+        "patch_sha256": "6c3ea3aa78b08c323e2d8489faf798e144ceb947b3cf7f500b9201cbf5815ca7"
+      }
+    ],
+    "fixture_leaf": "src/app/shared_views/tests/startup_terminals.rs",
+    "fixture_leaf_blobs": [
+      {
+        "commit": "d109cbb38b45e36f46bf58efb55abe3590ca2dbd",
+        "blob": "36f8e17c7ff9118b99f931cc33d71a9f055dfe95"
+      },
+      {
+        "commit": "7c9c13c7afee3d16f677ec51fa90dea80a6df038",
+        "blob": "36f8e17c7ff9118b99f931cc33d71a9f055dfe95"
+      },
+      {
+        "commit": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+        "blob": "36f8e17c7ff9118b99f931cc33d71a9f055dfe95"
+      }
+    ],
+    "stable_syntax_correction": "Public 9a uses if-let plus pending=true; private 6ceb uses a stable match plus panes.push(card). They are not identical patches. Keep combined startup_gate.rs as a unit so its Pending vector, inspection tickets/occupancy, current owners and progress behavior remain consistent.",
+    "protected_main15_and_root": "The proposed tree equals combined fa12 exactly, preserving all Main15 91a and Root6ceb/guard62/c8/fixture source bytes without duplicate semantic additions.",
+    "protocol": {
+      "path": "src/terminal/ipc.rs",
+      "blob": "1c610082dd9e4565ce4a3beb309351a346f0d158",
+      "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+      "line": 202,
+      "version": 128,
+      "exact_private_root_bytes": true
+    }
+  },
+  "resolution_anchors": [
+    {
+      "path": "src/app/shared_views.rs",
+      "combined_line": 1327,
+      "decision": "Use complete combined blob 249adfed754e7d63de1e0490bbdfef15545019e7; retain pane_is_quarantined(card) at1332 before defaults/pending and before !attached fallback. Preserve existing Main15 WHOLE-before-Seed body unchanged."
+    },
+    {
+      "path": "src/app/startup_gate.rs",
+      "combined_line": 18,
+      "decision": "Use complete combined blob c64192502ab12c0a44b953651034cf9dd88d4734. Keep state/ticket/outstanding/owner and Pending types, vector pending branches, inspection worker and bounded retained/stall reasons consistent; no union of old public pending bool. Remove the automatically duplicated five State methods by using this complete blob."
+    },
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "combined_line": 349,
+      "decision": "Use complete combined blob b6b7e18be052072b4ec2d2df0a89f4e00d6470a0. Existing public three parents are already included; preserve two appended current-owner/reconnect cross parents at349 and425."
+    }
+  ],
+  "source_after_read": {
+    "head": "1892a6f458828d7b1f38f6e03457bf1a072efb73",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "tracked_status_clean": true
+  },
+  "limits": [
+    "Public current/main are supplied exact endpoints; this analysis did not query GitHub or fetch.",
+    "No worktree/index/ref/source edit, commit, push or tag. merge-tree wrote source calculation objects only in the permitted private common Git object database.",
+    "No Cargo/build/test/compiler/check/native/provider/process/environment/account/endpoint probe or allocation.",
+    "Actual merge/source readback, current consumer packet bindings, combined Rust/native UX validation and independent review remain required; prior parent/RootB evidence does not qualify this proposed merge.",
+    "Prior negative/frozen evidence unchanged; no execution/grant/merge readiness claim."
+  ],
+  "files": {
+    "git-query-ledger.json": {
+      "sha256": "b36deec5ddc3daa9f197e42d39bca3984d0bcb56b228defa0ad1c990d25f9360",
+      "bytes": 22327
+    },
+    "merge-tree.stderr": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    "merge-tree.stdout": {
+      "sha256": "70e2799280fcfca1d7600ac4d8338cea3e2e58e0084f2d91d46b33b36534c6f1",
+      "bytes": 1059
+    },
+    "startup_gate-markers-only-duplicate-methods.diff": {
+      "sha256": "9d7a7586bb961a1154b78397c4e87811ea29928f41da62dc7da3ec678507f6d8",
+      "bytes": 2005
+    }
+  }
+}

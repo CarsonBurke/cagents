@@ -1,0 +1,81 @@
+{
+  "kind": "SOURCE_ONLY_EXACT_CANONICAL_PORT_NOT_RUNNABLE_OR_QUEUEABLE",
+  "base_controller": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+  "executing_source_path": "run-packet.py",
+  "executing_source_sha256": "9b5d0ce0eb9e753ff1616674fd8853457a6dc82d1fc4a4e16e022dd981202e68",
+  "only_live_function_change": "settle_children",
+  "canonical": {
+    "head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "source_path": "policy-corrections/adopted-child-settlement/settle_children.py",
+    "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "archive_path": "dependencies/adopted-child-settlement/canonical-settle_children.py"
+  },
+  "genuine_provenance": [
+    {
+      "archive_path": "dependencies/adopted-child-settlement/canonical-freeze.json",
+      "original_path": "/tmp/fw16-backend-ec204421/c-unproven-adoption-policy-source-v1/freeze.json",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682",
+      "bytes": 2591,
+      "scope": "Root canonical-source freeze, not a runnable packet"
+    },
+    {
+      "archive_path": "dependencies/adopted-child-settlement/semantic-caller-review.json",
+      "original_path": "/tmp/c-unproven-adoption-semantic-caller-review-upwkrg6v/review.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8",
+      "bytes": 8938,
+      "scope": "Exact canonical function/caller source review; not this port review or runtime admission"
+    },
+    {
+      "archive_path": "dependencies/adopted-child-settlement/original-source-negative.json",
+      "original_path": "/tmp/startup30-adopted-signal-source-audit-hlrnp0hy/review.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8",
+      "bytes": 13311,
+      "scope": "Original inherited adopted-child signaling source finding; no historical incident claim"
+    }
+  ],
+  "historical_base_runner": {
+    "path": "history/347c2adc/run-packet.py",
+    "sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca"
+  },
+  "source_behavior": "Exact canonical3s natural reap/census prefix; no fresh adopted pidfd or signal. Survivors return clean:false, forced:false, observed+remaining. Original direct-Popen cleanup and caller HOLD/one-shot close unchanged.",
+  "pending_final_binding_refresh": {
+    "runner_PLAN_literal": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/plan.json",
+    "runner_PLAN_SHA_literal": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+    "plan_runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/run-packet.py",
+    "plan_source_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/source-binding.json",
+      "sha256": "660afcf28d44317d2e2ce5340f59d7b0293f42b76562c6a0edb98fc84a3125a4"
+    },
+    "plan_archive_bindings": "All original archive paths/hashes still bind the original stable-source packet; future final composition must bind its own exact retained artifacts.",
+    "source_binding_paths": "Original absolute packet paths in source-binding.json still bind original347 preparation/product evidence; no old receipt was retargeted.",
+    "execution_template": {
+      "path": "execution-template.json",
+      "argv_runner": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/run-packet.py",
+      "runner_sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source",
+      "scope": "Unchanged historical347 null-grant template; it is not an invocation for this port."
+    },
+    "product_tuple": {
+      "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+      "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+      "parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard",
+      "status": "Frozen6ceb remains unchanged; Root reports original27P1F. Future corrected fixture head/source/review bindings are separately owned and not supplied by this port."
+    },
+    "static_refusal": "At this new file path, the unchanged main runner_path equality guard is inconsistent with the retained original plan runner_path. No attempt was made to invoke it; exact source/context/product refresh and independent review are prerequisites.",
+    "source_preparation_not_admission": true
+  },
+  "historical_diff_artifacts": "Existing from/to-d412,982feefc,7e057dc0 files are unchanged historical diffs ending at original347; new from/to347 files describe only this exact port.",
+  "historical_runtime": "Old A2 empty-adoption evidence and bounded4680 positive are not transferred or reclassified. Root B347 original negative is separate and unchanged. No current Rust, native, provider, installation, return or resource qualification is supplied here.",
+  "actual": {
+    "grant": null,
+    "queue_position": null,
+    "controller_review": null,
+    "execution": null,
+    "runtime_results": null,
+    "safe_release": null
+  },
+  "canonical_pure_tests": "Root reports separately accepted pure4 canonical result2f7085; this port did not rerun or qualify those tests and transfers no runtime claim.",
+  "requires": "Final corrected-product composition, refreshed exact packet bindings/manifest/source pins, independent review and fresh Root admission. No execution authority."
+}
