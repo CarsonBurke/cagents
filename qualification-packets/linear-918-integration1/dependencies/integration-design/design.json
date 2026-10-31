@@ -1,0 +1,523 @@
+{
+  "kind": "LINEAR918_STANDALONE_INTEGRATION_SOURCE_DESIGN_NOT_IMPLEMENTATION_OR_APPROVAL",
+  "status": "PROPOSED_FOR_INDEPENDENT_DESIGN_REVIEW_RUNTIME_HOLD",
+  "source_instruction": "Root relayed authenticated EC2fb5b28f: preserve generic cargo_test_artifact and execute_contracts; implement a separate task adapter only after LIB3 reviews and separate actual-design code review clear.",
+  "product": {
+    "head": "918920655d841600e1a44b66057a634940e0e132",
+    "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+    "parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+    "source_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract",
+    "PR": null,
+    "source_pins": {
+      ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "src/control.rs": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673",
+      "src/control/format.rs": "39dd6b05374050fc7e360e89ae04f3fe81c8dfb6938bd0976d77714dd27099b5",
+      "src/control/linear.rs": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e",
+      "src/control/linear_output.rs": "0063525d84429f2f7c362e908e7d505f14b813a1333490df6453d0824254554f",
+      "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "src/linear/api.rs": "330661d48559fecd1312b5fbc884906e19f175eb8e59d7b92cdacca325713922",
+      "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/process.rs": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47",
+      "tests/fixtures/linear-curl.sh": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee",
+      "tests/linear_cli_contract.rs": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a"
+    }
+  },
+  "frozen_source_bases": {
+    "donor993": {
+      "head": "993cea26a29b5a2cd6857a959628de4e5f04c096",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/run-packet.py",
+      "runner_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25"
+    },
+    "LIB3": {
+      "head": "543c8831c2efcc1f3bac34fb871b53d49ac8c222",
+      "tree": "eb09c1511dc04f02f817f56785c045b7d79ab59e",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/run-packet.py",
+      "runner_sha256": "d99afc2e01e460284691a9c07f2765bb9f338f40c79b4828298452c07d334d4e",
+      "manifest_sha256": "ef0bcf8d14a13f4a6b9b8f6782609256014a74e2ee15405579deb52e8d577c93",
+      "handoff": {
+        "path": "/var/tmp/coord16-linear918-lib3-author-handoff-4qg6ouwf/handoff.json",
+        "sha256": "8a66981974a57944f49f7269797be3156d4d5b052ccf305ee6be9de1c60447a7"
+      },
+      "limit": "Separate partial source candidate under review; no runtime result transfer."
+    }
+  },
+  "genuine_product_inputs": {
+    "adoption": {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-root-source-adoption-v1.json",
+      "sha256": "735621143f9cfac9169adedd28fa5df4ea0c61b38a6fd5bcdaaf06fa3be6395e"
+    },
+    "publication": {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-reviewed-source-publication-v1.json",
+      "sha256": "47b53631a33ea200e56cd1901864789d71233726513fc2d9e54c40871588f6e1"
+    },
+    "source_reader": "Reuse genuine d0 production result/conservation roles and 918 stdout result/conservation roles with their actual head/tree/parent/freeze schemas. Preserve original NULL freeze snapshots; later adoption/publication remains separate. No whole-head or execution approval inference."
+  },
+  "official_Cargo_mapping": {
+    "observation_receipt": {
+      "path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/official-cargo193-source-contract-note.json",
+      "sha256": "2aece1ee501032aa0dcf218c0d1188a17afad44f033a97aafea8610fbc282d22"
+    },
+    "upstream_url": "https://raw.githubusercontent.com/rust-lang/cargo/rust-1.93.0/src/doc/src/reference/environment-variables.md",
+    "version_ref": "rust-1.93.0",
+    "version_tag_not_resolved_commit_SHA": true,
+    "original_web_response_refs": [
+      {
+        "path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/rendered-doc-original-errors.json",
+        "sha256": "c6450e522eba9bb1bdb9ef6b4b7b5c4bb6d1da587aa204588780e705b7d3f40a",
+        "bytes": 665,
+        "kind": "original web-tool response, not raw upstream file bytes"
+      },
+      {
+        "path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/official-tag-doc-original-web-response.json",
+        "sha256": "75a10fb5683a34f20b4d558aa65e19c251c4cc90345181ef85a3d4c3205ff932",
+        "bytes": 30405,
+        "kind": "original web-tool response, not raw upstream file bytes"
+      }
+    ],
+    "response_hashes_are_not_raw_upstream_file_hashes": true,
+    "source_anchors": {
+      "210-219": "Cargo makes these variables available during compilation; env! can read them.",
+      "250-256": "CARGO_BIN_EXE_name designates an absolute path to the exact named binary executable during integration/benchmark builds; Cargo builds eligible binaries automatically."
+    },
+    "application": "Exact integration source env!(CARGO_BIN_EXE_cagents) at line101, the fixed root cagents/src/main.rs target, original same-invocation unique artifact pair and admitted source/toolchain binding jointly support the documented named-target absolute-path mapping.",
+    "not_claimed": [
+      "Extracted compiled embedded env! value",
+      "Actual child/every-exec syscall attestation",
+      "Fresh physical Cargo/context/runtime observations"
+    ],
+    "design_review_required": "Reviewer must assess this bounded source contract. Missing emitted CLI executable or inadequate mapping is STOP/HOLD unqualified; never guess a filename, replace env, scan ELF strings or add an implicit build."
+  },
+  "future_four_serial_phases": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "CARGO_FROM_EXISTING_PINNED_TOOL_PATH",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 300
+    },
+    {
+      "label": "compile-linear-cli-contract",
+      "argv": [
+        "CARGO_FROM_EXISTING_PINNED_TOOL_PATH",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "linear_cli_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "seconds": 600
+    },
+    {
+      "label": "inventory-linear-cli-contract",
+      "argv": [
+        "ACTUAL_PAIR_INTEGRATION_ELF",
+        "--list",
+        "--color=never"
+      ],
+      "seconds": 30
+    },
+    {
+      "label": "parent-linear-cli-contract-1",
+      "argv": [
+        "ACTUAL_PAIR_INTEGRATION_ELF",
+        "issue_context_connections_are_pageable",
+        "--exact",
+        "--format=pretty",
+        "--color=never"
+      ],
+      "seconds": 180
+    }
+  ],
+  "budgets": {
+    "command_caps_sum_seconds": 1110,
+    "original_absolute_workload_cap_seconds": 2400,
+    "phase_clamp": "Unchanged run min(original deadline, command start+cap). All new file observations use invoke.issue2025_deadline; no extension/reset/extra phase.",
+    "not_promised": "1110 is not total wall-clock/file-read/OS settlement bound. Uncertain custody HOLD remains indefinite; no resource reservation or availability observation."
+  },
+  "C_flow_and_fixed_dispatch": {
+    "existing_call": {
+      "source": "artifacts = execute_contracts(plan, run, save, tests)",
+      "inside_protected3790": true
+    },
+    "proposed_task_main_insertion": "execute_contracts = execute_linear_integration_contracts",
+    "insertion_position": "After existing run.issue2025_* attributes, immediately before the unchanged acquisition try block. Assignment only; no adapter invocation before C acquisition.",
+    "explicit_changed_callee": true,
+    "Python_scoping": "Only main's local name changes. The original module execute_contracts definition remains byte-exact and is unused by this standalone task. No preceding main use of that local; no global monkeypatch, dynamic module or plan-chosen callable.",
+    "review_obligation": "Reviewer must inspect fixed local resolution, original exception propagation and finalization. Preserved call text is not an unchanged-consumer claim.",
+    "unchanged_flow": "Original nonblocking Cfd acquire sets the original deadline, then the protected call invokes the fixed task adapter. The exact catch/finally records original error, final observations, raw accounting, sticky HOLD and original confirmed Cfd close.",
+    "callback_boundary": "Adapter receives only existing plan/invoke=run/save/parents. No new direct Popen, signals, locks, environment mutation, source helper or generic command interface."
+  },
+  "proposed_new_top_level_functions": [
+    {
+      "name": "linear_integration_artifact_pair",
+      "signature": "(original_cargo_stdout, fixed_product_contract) -> pair",
+      "contract": "Pure original JSON-line classification. Blank lines allowed; other lines must decode to JSON objects. Require exactly one build-finished success=True. Strictly collect only the two fixed roles, retaining full records/fresh. Missing, duplicate, ambiguous, wrong required metadata or unsupported stream syntax refuses; no incidental rootlib fallback."
+    },
+    {
+      "name": "linear_pair_observations",
+      "signature": "(fixed_pair_paths, original_deadline, stage) -> both observations/errors",
+      "contract": "Call unchanged task_elf_observation for each of two fixed Cargo-reported paths. Retain a successful other-file observation if one fails. Record each actual read/descriptor-close error with existing supervision_failure; no retry, fd adoption or env/authority access."
+    },
+    {
+      "name": "execute_linear_integration_contracts",
+      "signature": "(plan, invoke, save, parents) -> artifact receipt map",
+      "contract": "Four serial original invokes only. Read compile stdout, select pair, observe both and save required discovery before inventory. Call unchanged inventory_names and task grouped_contracts; save one group-contracts list. Invoke one exact parent through unchanged run(contract), use unchanged grouped_result, append at most one original parent record. Observe both originals around inventory and selected use; all writes/errors follow the declared sticky policy."
+    }
+  ],
+  "artifact_pair_contract": {
+    "original_invocation": "Same original compile-linear-cli-contract CargoJSON stdout, original exit0, cwd/argv/source/context/controller/product tuple and retained stdout/stderr hashes. No ELF adoption outside that invocation.",
+    "build_finished": "Exactly one success=True; original invoke nonzero fails before semantic parsing and cannot be waived.",
+    "common": {
+      "manifest_path": "Absolute canonical exact productWT/Cargo.toml; no alternate root/symlink.",
+      "package_id": "Same nonempty opaque original package_id on both roles. Root manifest/source pins identify package cagents/version0.1.3; do not guess opaque package-id encoding.",
+      "features": [],
+      "profile": "Retain full original profiles; integration profile.test exactlyTrue and CLI profile.test exactlyFalse. Full profiles need not equal because roles differ.",
+      "fresh": "Boolean retained exactly. freshTrue means cached/up-to-date, not fresh compilation; no cold rebuild/cache clearing.",
+      "filenames": "Retain original list; each role executable appears exactly once. Never select by basename, default output layout or find/glob.",
+      "path_and_file": "Executable absolute/canonical, regular/nonsymlink, current-owner ELF contained in unchanged canonical TARGET. Existing observer checks named/opened device,inode,mode,uid,gid,links,size,mtime_ns,ctime_ns, magic, full hash and original descriptor closure."
+    },
+    "integration_test": {
+      "target.kind": [
+        "test"
+      ],
+      "target.name": "linear_cli_contract",
+      "target.crate_types": [
+        "bin"
+      ],
+      "target.src_path": "Exact productWT/tests/linear_cli_contract.rs",
+      "source_sha256": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a",
+      "profile.test": true
+    },
+    "CLI_binary": {
+      "target.kind": [
+        "bin"
+      ],
+      "target.name": "cagents",
+      "target.crate_types": [
+        "bin"
+      ],
+      "target.src_path": "Exact productWT/src/main.rs",
+      "source_sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+      "target.test": false,
+      "profile.test": false,
+      "manifest_anchor": "Cargo.toml101-105: explicit src/main.rs,test=false,bench=false,no required-features"
+    },
+    "different_originals": "Reject same canonical path or device+inode for integration and CLI roles.",
+    "absent_or_ambiguous": "STOP/HOLD unqualified; no guessed target/debug/cagents, stale binary, extra build/list phase, embedded ELF parser or CARGO_BIN_EXE override. Physical C-release disposition still follows unchanged custody/error policy."
+  },
+  "source_mapping_limit": {
+    "documented_contract": "Cargo supplies CARGO_BIN_EXE_<name> at integration compilation as absolute named-target executable path. Source env! uses that exact key.",
+    "future_binding": "Source pin+same admitted product/package/features and same original Cargo invocation's unique binary executable record supply the proposed mapping, with both-file integrity. No independent embedded-value extraction.",
+    "unknown_until_run": [
+      "Actual original Cargo pair exists",
+      "Canonical executable paths and metadata",
+      "Actual inventory N/counts/results",
+      "Physical tool/context and authenticated grant"
+    ],
+    "no_environment_workaround": "No runtime/compiler CARGO_BIN_EXE assignment, copied value, unset/adopted inherited key, authority read or new helper. Retain five original required-absent names and natural compiler environment."
+  },
+  "required_receipt_schemas": {
+    "integration-discovery.json": {
+      "kind": "LINEAR918_ORIGINAL_CARGO_PAIR_DISCOVERY",
+      "product_controller": "Existing invoke.issue2025_controller_binding tuple and runner/plan/source-binding/review hashes.",
+      "compile": "Original label/cwd/argv/raw stream hashes/phase wait record; no extra compiler or fabricated wait.",
+      "artifacts": "Both full original Cargo records, opaque package id, manifest/source/features/profile/fresh.",
+      "files": "Both post-compile original task_elf_observation objects.",
+      "mapping": "Official note2aece and env! source pin; embedded_value_extractedFalse/every_child_exec_attestedFalse."
+    },
+    "pair-use-<stage>.json": {
+      "stages": [
+        "after-compile",
+        "pre-inventory",
+        "post-inventory",
+        "pre-parent",
+        "post-parent"
+      ],
+      "fields": "Both file observations compared with discovery; original phase label/PID from PROCESS_ATTEMPTS; original primary error and later diagnostics separately. No per-child fabricated wait or every-exec claim."
+    },
+    "group-contracts.json": "One contract only: label parent-linear-cli-contract-1; names/filters[issue_context_connections_are_pageable],exactTrue,seconds180, actual inventory ordinary+benchmark total N and N-1 filtered.",
+    "parent/group-result.json": "Exactly unchanged grouped_result schema, ordinary stdout syntax and failure rules."
+  },
+  "task_accounting_and_summary_changes": {
+    "grouped_contracts": "Fixed integration label/name/cardinality1 only; unchanged inventory_names and full total/benchmark uniqueness and selected-present checks.",
+    "parent_accounting": "Expected label list, cardinality1, requested1 and command-count4 metadata only; preserve complete raw reread, stdout phase hash, original wait, earlier-result reconciliation and raw-error/semantic-refusal distinction.",
+    "final_summary": "Task scope and exact one-parent/order predicate only. Compact print and final return expression exact. Full summary/logs/ledgers/SHA256SUMS completeness and error/release meanings exact.",
+    "strict_credit": "One running1/nameok/sole1P0F0I0M footer, actualN-1, exit0, original wait/evidence/custody and raw reconciliation. Missing, duplicate, ignored, failed, unexpected or zero-selected never earns credit.",
+    "nonadditive": "Eight rich/empty connection cases and full-issue positive control (18 added CLI invocations) plus original paging control belong to one outer parent. No body/subprocess/helper or per-child wait credit."
+  },
+  "failure_and_Cclose_contract": {
+    "original_nonzero": "Check/compile/inventory/parent original nonzero remains primary FAIL_STOP with known custody; metadata parser cannot relabel it.",
+    "pure_refusal": "Invalid JSON/metadata and fully observed identity mismatch refuse qualification; not automatically invented wait uncertainty or sticky HOLD.",
+    "read_close_required_write": "New stdout/file read or observer-close or required receipt-save failure calls supervision_failure(None,exc,stage) in a narrow task-specific guard and rethrows original. Sticky failures feed unchanged safe_lane_handoff/HOLD.",
+    "initial_discovery": "Guard initial both-file observation and required discovery save. Do not wrap actual invoke or pure artifact classification as a supervision failure.",
+    "after_requested_use": "Attempt both-file post observations and required pair-use receipt after requested inventory/parent even when original invoke failed, using same original deadline. Preserve original primary exception; diagnostics never replace it. No retry/replay/deadline reset.",
+    "finalization": "Original3790 catches original error, invokes final observations/raw accounting/sticky handoff and retains uncertain C before original close. Earlier unclean custody cannot be erased by later empty census. No unproven adopted descendant signals."
+  },
+  "unchanged_fixture_policy": {
+    "source_anchors": [
+      "tests/linear_cli_contract.rs20-135/358-452",
+      "tests/fixtures/linear-curl.sh",
+      "src/process.rs",
+      "src/linear/api.rs"
+    ],
+    "source_supported": "Existing selected fixture creates private TempDir HOME/PATH, fixed fakecurl/secret-tool and synthetic keys; Gitinit success asserted. Fakecurl serves private scripted response without network forwarding. Existing isolated child environment removes names except opaque AUTHORITY_ENV, then adds fixed private fixture settings.",
+    "controller_policy": "No new env_clear/overlay/helper binding, authority inspection/serialization/minting or CARGO_BIN_EXE substitution; inherited compiler environment/five names-only refusals stay exact.",
+    "limits": "Source behavior only; no real Linear auth/service, live network, user HOME correctness, every-exec binary proof or actual cleanup validation."
+  },
+  "source_inverse_whitelist": {
+    "remove_new_defs": [
+      "linear_integration_artifact_pair",
+      "linear_pair_observations",
+      "execute_linear_integration_contracts"
+    ],
+    "restore_original_task_defs": [
+      "grouped_contracts",
+      "parent_accounting",
+      "main"
+    ],
+    "restore_task_globals": [
+      "WT",
+      "PLAN",
+      "PLAN_SHA"
+    ],
+    "main_specific_additions": [
+      "Explicit fixed local execute_contracts callee binding",
+      "Typed task data/artifact-pair/source-admission/summary bindings"
+    ],
+    "must_restore_exact_LIB3_bytes": true,
+    "preserved_other29": {
+      "digest": {
+        "line": 32,
+        "end_line": 37,
+        "sha256": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9"
+      },
+      "now": {
+        "line": 40,
+        "end_line": 41,
+        "sha256": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2"
+      },
+      "observed_wait": {
+        "line": 44,
+        "end_line": 48,
+        "sha256": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0"
+      },
+      "supervision_failure": {
+        "line": 51,
+        "end_line": 57,
+        "sha256": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e"
+      },
+      "bounded_capture": {
+        "line": 60,
+        "end_line": 113,
+        "sha256": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911"
+      },
+      "refuse_git_routing": {
+        "line": 123,
+        "end_line": 125,
+        "sha256": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04"
+      },
+      "git": {
+        "line": 128,
+        "end_line": 135,
+        "sha256": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd"
+      },
+      "git_nul_fields": {
+        "line": 138,
+        "end_line": 140,
+        "sha256": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf"
+      },
+      "guard_git_metadata": {
+        "line": 143,
+        "end_line": 200,
+        "sha256": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193"
+      },
+      "signal_pidfd": {
+        "line": 203,
+        "end_line": 208,
+        "sha256": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679"
+      },
+      "children": {
+        "line": 211,
+        "end_line": 220,
+        "sha256": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460"
+      },
+      "settle_children": {
+        "line": 223,
+        "end_line": 244,
+        "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+      },
+      "cargo_test_artifact": {
+        "line": 247,
+        "end_line": 266,
+        "sha256": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285"
+      },
+      "inventory_names": {
+        "line": 269,
+        "end_line": 285,
+        "sha256": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f"
+      },
+      "parent_pass": {
+        "line": 288,
+        "end_line": 313,
+        "sha256": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972"
+      },
+      "scope_observation": {
+        "line": 316,
+        "end_line": 359,
+        "sha256": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387"
+      },
+      "validate_controller_review": {
+        "line": 362,
+        "end_line": 367,
+        "sha256": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
+      },
+      "evidence_copy": {
+        "line": 370,
+        "end_line": 375,
+        "sha256": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8"
+      },
+      "cargo_helper_artifact": {
+        "line": 378,
+        "end_line": 405,
+        "sha256": "cce4fa0819e7ce38157c45c4d8eb40df7e154d6d2fa94f3e39dfea52bd0d2712"
+      },
+      "task_elf_observation": {
+        "line": 408,
+        "end_line": 458,
+        "sha256": "3cd165b37eb78c86f9bf35fe2ed7eef1401f073c3b166512763f6a7af75e2814"
+      },
+      "task_group_assets": {
+        "line": 461,
+        "end_line": 472,
+        "sha256": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4"
+      },
+      "grouped_result": {
+        "line": 494,
+        "end_line": 562,
+        "sha256": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115"
+      },
+      "execute_contracts": {
+        "line": 565,
+        "end_line": 652,
+        "sha256": "584d6c3b8076b29a92d12454bd3c3e04b1d14abe5f46323c62cbd451151c41bc"
+      },
+      "custody_clean": {
+        "line": 655,
+        "end_line": 658,
+        "sha256": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b"
+      },
+      "safe_lane_handoff": {
+        "line": 661,
+        "end_line": 677,
+        "sha256": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329"
+      },
+      "final_observations": {
+        "line": 765,
+        "end_line": 789,
+        "sha256": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a"
+      },
+      "note_lane_cancellation": {
+        "line": 792,
+        "end_line": 795,
+        "sha256": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726"
+      },
+      "require_workload_allowed": {
+        "line": 798,
+        "end_line": 800,
+        "sha256": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9"
+      },
+      "retain_uncertain_lane": {
+        "line": 803,
+        "end_line": 822,
+        "sha256": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9"
+      }
+    },
+    "preserved_all_nested5": {
+      "read_bound": {
+        "line": 854,
+        "end_line": 858,
+        "sha256": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3"
+      },
+      "source": {
+        "line": 1040,
+        "end_line": 1055,
+        "sha256": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711"
+      },
+      "context": {
+        "line": 1057,
+        "end_line": 1078,
+        "sha256": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe"
+      },
+      "run": {
+        "line": 1095,
+        "end_line": 1180,
+        "sha256": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06"
+      },
+      "invoke_fixture_group": {
+        "line": 1182,
+        "end_line": 1226,
+        "sha256": "288e08759f96075a6a091c01f6626016f8ff55fda5a2033cf58c6d31537493f4"
+      }
+    },
+    "protected3790": {
+      "bytes": 3790,
+      "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4"
+    },
+    "mandatory_preserved": [
+      "cargo_test_artifact",
+      "execute_contracts",
+      "inventory_names",
+      "grouped_result",
+      "task_elf_observation",
+      "settle_children",
+      "observed_wait",
+      "safe_lane_handoff",
+      "final_observations",
+      "retain_uncertain_lane",
+      "evidence_copy"
+    ],
+    "no_product_LIB3_donor_edit": true
+  },
+  "pending_gates": {
+    "before_implementation": [
+      "LIB3 both source reviews completed",
+      "Separate actual-design code review accepts fixed callee/scoping/error policy and bounded Cargo mapping"
+    ],
+    "after_future_source_implementation": [
+      "Fresh exact code+conservation review and Root source binding/adoption",
+      "Current physical/source/context/tool/artifact/inventory admission and separate authenticated C grant"
+    ],
+    "actual_Cargo_stream": "Unknown. If pair is missing or the source mapping cannot be sustained within contract: stop unqualified, no fallback.",
+    "execution_authorized": false,
+    "queue": null,
+    "grant": null
+  },
+  "actual": {
+    "implementation": null,
+    "candidate_imports_calls_examples_algorithms_tests_builds_runtime": 0,
+    "ELFs_inventory_N_results": null,
+    "resource_context_profile": null,
+    "grant_queue": null,
+    "execution_authorized": false
+  },
+  "author_utility_error": {
+    "tool": "functions.exec",
+    "observed": "Script error: SyntaxError: Unexpected identifier 'execute_contracts'",
+    "cause": "Unescaped Markdown backticks in a JS raw-string author utility.",
+    "nested_exec_command_called": false,
+    "file_writes_before_error": false,
+    "candidate_runtime_failure": false
+  },
+  "readable_path": "/var/tmp/coord16-linear918-integration-source-design-2bw7h22_/readable.md"
+}

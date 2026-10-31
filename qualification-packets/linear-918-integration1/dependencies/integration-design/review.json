@@ -1,0 +1,184 @@
+{
+  "schema": "linear918_standalone_integration_independent_source_design_review_v1",
+  "verdict": "SOURCE_DESIGN_CLEAR_FOR_BOUNDED_IMPLEMENTATION_ONLY",
+  "head": "918920655d841600e1a44b66057a634940e0e132",
+  "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+  "product_parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "design_sha256": "3344744811a17274717693b7ea93adfee5c304beb438b828fd127a8fd477636b",
+  "reviewer": "/root/editor_recovery_review",
+  "independent_of_design_author": true,
+  "created_utc": "2026-10-31T16:25:40.721974+00:00",
+  "inputs": {
+    "design.json": {
+      "path": "/var/tmp/coord16-linear918-integration-source-design-2bw7h22_/design.json",
+      "sha256": "3344744811a17274717693b7ea93adfee5c304beb438b828fd127a8fd477636b",
+      "bytes": 27399
+    },
+    "readable.md": {
+      "path": "/var/tmp/coord16-linear918-integration-source-design-2bw7h22_/readable.md",
+      "sha256": "a591ee4ac25818b83ef7c8cefc4cd21f6771d3e75793ae566f08543b93982bdb",
+      "bytes": 2052
+    },
+    "freeze.json": {
+      "path": "/var/tmp/coord16-linear918-integration-source-design-2bw7h22_/freeze.json",
+      "sha256": "b4e2c4ecf6ba52d4cae06741570ca8bc1018cf616f22cf2c6b665031f7ad0d4c",
+      "bytes": 982
+    },
+    "original-source-tools.json": {
+      "path": "/var/tmp/coord16-linear918-integration-source-design-2bw7h22_/original-source-tools.json",
+      "sha256": "8b8f82683c369a239d451ff6868b771781ba94dbdcef1d915c34fe3572af9ddb",
+      "bytes": 55681
+    }
+  },
+  "scope": "Actual separate fixed four-phase integration-adapter design; no implementation review, executable controller ABI approval, runtime admission or transfer of LIB3 qualification.",
+  "findings": [],
+  "blockers": [],
+  "decision": "The proposed fixed adapter is coherent and may be implemented within the already-authorized source scope. Its Cargo env! mapping is accepted as a bounded documented source contract when the original strict same-command pair and all declared checks hold. Actual code and all physical/runtime facts remain unimplemented/unreviewed/unknown.",
+  "frozen_bases": {
+    "donor993": {
+      "head": "993cea26a29b5a2cd6857a959628de4e5f04c096",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/run-packet.py",
+      "runner_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25"
+    },
+    "LIB3": {
+      "head": "543c8831c2efcc1f3bac34fb871b53d49ac8c222",
+      "tree": "eb09c1511dc04f02f817f56785c045b7d79ab59e",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/run-packet.py",
+      "runner_sha256": "d99afc2e01e460284691a9c07f2765bb9f338f40c79b4828298452c07d334d4e",
+      "manifest_sha256": "ef0bcf8d14a13f4a6b9b8f6782609256014a74e2ee15405579deb52e8d577c93",
+      "handoff": {
+        "path": "/var/tmp/coord16-linear918-lib3-author-handoff-4qg6ouwf/handoff.json",
+        "sha256": "8a66981974a57944f49f7269797be3156d4d5b052ccf305ee6be9de1c60447a7"
+      },
+      "limit": "Separate partial source candidate under review; no runtime result transfer."
+    }
+  },
+  "genuine_product_inputs": {
+    "adoption": {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-root-source-adoption-v1.json",
+      "sha256": "735621143f9cfac9169adedd28fa5df4ea0c61b38a6fd5bcdaaf06fa3be6395e"
+    },
+    "publication": {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-reviewed-source-publication-v1.json",
+      "sha256": "47b53631a33ea200e56cd1901864789d71233726513fc2d9e54c40871588f6e1"
+    },
+    "source_reader": "Reuse genuine d0 production result/conservation roles and 918 stdout result/conservation roles with their actual head/tree/parent/freeze schemas. Preserve original NULL freeze snapshots; later adoption/publication remains separate. No whole-head or execution approval inference."
+  },
+  "relevant_prior_independent_LIB3_review": {
+    "path": "/var/tmp/coord16-linear918-lib3-code-independent-7hsdm7mv/review.json",
+    "sha256": "da53680f53155ab2208ea6404fba0e948196bb8d73efd2c27c91d50e507edbc5",
+    "reuse_limit": "Only immutable source context and genuine proof-role shapes; no integration implementation/runtime approval transfer."
+  },
+  "checked_design_facts": [
+    {
+      "id": "fixed_dispatch_scoping",
+      "source": "design.C_flow_and_fixed_dispatch; frozen LIB3 main:1232-1251",
+      "assessment": "The explicit main-local execute_contracts = execute_linear_integration_contracts is a real changed callee, not an unchanged consumer. Static AST of the frozen base finds exactly one execute_contracts Load in main, at the protected call. Inserting the fixed assignment before acquisition try and after run attributes avoids an earlier local read, adds no pre-C invocation, does not modify the module generic definition, and leaves the original catch/finally in control of adapter exceptions. No dynamic plan-selected callable or global monkeypatch is proposed."
+    },
+    {
+      "id": "preserved_generic_and_engine",
+      "source": "design.source_inverse_whitelist",
+      "assessment": "The generic cargo_test_artifact and execute_contracts definitions are expressly preserved and unused by this task-specific route. Reference full-line function hashes for these two, grouped_result, task_elf_observation and canonical settle_children match the frozen LIB3 source. Whole29+5/FULL3790 preservation is an enforceable future source-inverse obligation, not a claim that an unimplemented successor already conserves bytes."
+    },
+    {
+      "id": "four_phase_graph_and_budget",
+      "source": "design.future_four_serial_phases;budgets",
+      "assessment": "Exactly CLI check --locked --no-default-features --bin cagents (300), integration --test linear_cli_contract --no-run --message-format=json (600), actual integration ELF inventory (30), then exact issue_context_connections_are_pageable captured pretty singleton (180). Sum1110 within unchanged2400. No CLI/HOST/UI reunion, implicit build/list phase, new target/cache or fallback. Observations share the original absolute deadline; 1110 is not a hard I/O/settlement bound."
+    },
+    {
+      "id": "strict_original_pair",
+      "source": "design.artifact_pair_contract",
+      "assessment": "One original successful CargoJSON compile stdout must yield exactly one eligible integration test and one eligible cagents binary from the exact canonical product manifest, same nonempty opaque package_id and empty features. Roles require exact kinds/names/crate_types/source paths, integration test-profile true versus CLI false plus target.test false; original full profiles/fresh/filenames are retained. Each executable appears once in filenames, is canonical/regular/owner ELF inside the canonical target, and the roles cannot share path or device/inode. Missing/duplicate/ambiguous/wrong required metadata or unsupported stdout is STOP unqualified. Selection by basename, guessed path, rootlib fallback, extra build, env override and embedded-string scan are disallowed."
+    },
+    {
+      "id": "bounded_compile_time_mapping",
+      "source": "design.official_Cargo_mapping; official note2aece1ee; tests/linear_cli_contract.rs:100-111; Cargo.toml:101-105",
+      "assessment": "Pinned source uses env!(CARGO_BIN_EXE_cagents) directly for the subprocess command; the manifest names the exact ordinary src/main.rs target without required features. Saved official Cargo rust-1.93.0 documentation lines250-256 describes that variable as the named target absolute executable path during integration builds and says eligible binaries are built automatically. Together with admitted tool/source/context and the strict same-original-command/package pair, this supports the requested bounded name-to-artifact contract. It does not extract the compiled value, attest every child exec or establish a current physical Cargo version. The version tag is not a resolved commit and web-response hashes are not raw upstream-file hashes."
+    },
+    {
+      "id": "two_file_observation_and_error_priority",
+      "source": "design.proposed_new_top_level_functions;required_receipt_schemas;failure_and_Cclose_contract",
+      "assessment": "Both files must be observed after compilation and before/after inventory and selected use with unchanged descriptor observer and compared to discovery metadata/hash identity. After a requested failing invoke, both post observations and required receipt save are still attempted with the same deadline; no replay. Original primary exception retains priority while read/descriptor-close/required-write diagnostic failures are separately retained through supervision_failure. Pure fully observed metadata mismatch refuses qualification without inventing wait uncertainty. No such implementation has yet been reviewed."
+    },
+    {
+      "id": "strict_one_parent_accounting",
+      "source": "design.task_accounting_and_summary_changes; frozen inventory_names/grouped_result/parent_accounting",
+      "assessment": "Task grouped_contracts and cardinality/accounting labels change to exactly one named singleton and four phases. Fresh actual inventory total N, N-1 filtering, original wait/exit0/evidence/custody, sole1P0F0I0M result and final raw-stream SHA/earlier-result reconciliation remain required. Nonzero is FAIL_STOP, not an expected-negative pass or an automatic cleanup HOLD. Eight rich/empty detail variants, eighteen added CLI invocations, the full-issue control and original paging control add no owning-parent or per-child wait credit."
+    },
+    {
+      "id": "actual_fixture_policy",
+      "source": "tests/linear_cli_contract.rs:20-135,358-452; tests/fixtures/linear-curl.sh; design.unchanged_fixture_policy",
+      "assessment": "The existing fixture uses an asserted private Git init, private TempDir HOME/PATH, fixed fakecurl/secret-tool and synthetic keys; fixture transport only serves private saved responses. Its existing command isolation preserves the opaque authority name and uses compile-time named cagents. There is no selected-parent early skip or new controller env policy. The selected body checks real child JSON/human stdout under that private fixture, but does not prove live Linear authentication/service, real user HOME/config behavior, each internal exec or actual cleanup."
+    },
+    {
+      "id": "genuine_proofs_and_unknowns",
+      "source": "design.genuine_product_inputs;pending_gates;actual",
+      "assessment": "918/D0/main442 source identities and the genuine separate code .result versus conservation .verdict/nested.source schemas remain the required reader chain; adoption735621 and publication47b536 hashes match actual saved inputs. Source provenance is not execution approval. Implementation, actual ELF paths/N/results, current resource/context/tool identity, queue and authenticated grant remain null/unqualified. No old LIB3 or donor runtime result is transferred."
+    }
+  ],
+  "official_Cargo_source_observation": {
+    "note": {
+      "path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/official-cargo193-source-contract-note.json",
+      "sha256": "2aece1ee501032aa0dcf218c0d1188a17afad44f033a97aafea8610fbc282d22"
+    },
+    "upstream_url": "https://raw.githubusercontent.com/rust-lang/cargo/rust-1.93.0/src/doc/src/reference/environment-variables.md",
+    "version_ref": "rust-1.93.0",
+    "version_tag_resolved_to_commit": false,
+    "saved_responses": [
+      {
+        "path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/rendered-doc-original-errors.json",
+        "sha256": "c6450e522eba9bb1bdb9ef6b4b7b5c4bb6d1da587aa204588780e705b7d3f40a",
+        "bytes": 665,
+        "kind": "Original saved web-tool response, not raw upstream file bytes"
+      },
+      {
+        "path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/official-tag-doc-original-web-response.json",
+        "sha256": "75a10fb5683a34f20b4d558aa65e19c251c4cc90345181ef85a3d4c3205ff932",
+        "bytes": 30405,
+        "kind": "Original saved web-tool response, not raw upstream file bytes"
+      }
+    ],
+    "saved_response_hashes_verified": true,
+    "bounded_mapping_accepted": true,
+    "compiled_embedded_value_extracted": false,
+    "every_child_exec_attested": false
+  },
+  "implementation_review_obligations": [
+    "Enforce the fixed same-command pair strictly, preserving original records/fresh status and failing on missing, duplicate, ambiguous, wrong required metadata or missing emitted CLI executable. No guessed paths or new environment workaround.",
+    "Demonstrate the explicit local alias is at the declared location and is the actual protected call resolution; generic definitions, all29 other/five nested/FULL3790/parser/context/custody and final return remain exact as promised.",
+    "On initial discovery/read/save errors and after requested inventory/parent failures, keep all required observations and original primary exception priority; sticky required-evidence/read/close failures must feed existing C retention. Do not hide a failure by replacing the original exception or dropping a receipt.",
+    "Bind both original files, source/package/features and full original metadata at discovery and every declared pre/post stage, including failed use; keep exact one-parent raw reread/N-1/default scheduler and all no-child-credit limits.",
+    "Require future independent code plus conservation assessment and ordinary Root source assembly before any separately authenticated actual run. This is an implementation verification obligation within the authorized work, not a new user-permission requirement."
+  ],
+  "history_preserved": {
+    "author_orchestration_error": {
+      "tool": "functions.exec",
+      "observed": "Script error: SyntaxError: Unexpected identifier 'execute_contracts'",
+      "cause": "Unescaped Markdown backticks in a JS raw-string author utility.",
+      "nested_exec_command_called": false,
+      "file_writes_before_error": false,
+      "candidate_runtime_failure": false
+    },
+    "correction_tools": "Author records corrected b67dba0 then finale7f72d0; no candidate error, nested tool or write occurred before the JS parse failure.",
+    "original_design_and_LIB3_modified_by_review": false,
+    "reviewer_static_hash_note": "Initial ast.get_source_segment comparison omitted terminal newlines and differed from the design full-line-byte method; matching full-line slices including final newlines resolved all five reference hashes. No candidate function or algorithm was called."
+  },
+  "runtime": {
+    "implementation": null,
+    "implementation_review": "UNREVIEWED_UNIMPLEMENTED",
+    "candidate_execution": false,
+    "actual_ELFs": null,
+    "inventory_N": null,
+    "results": null,
+    "current_context_tools": null,
+    "grant": null,
+    "execution_authorized": false
+  },
+  "limits": [
+    "SOURCE DESIGN ONLY; this receipt intentionally is not a CONTROLLER_SOURCE_CLEAR executable ABI review.",
+    "No actual Cargo stream, ELF, compiler/version, environment, authority, target, account/config, process, resource or native observation occurred.",
+    "No candidate module/function/extracted algorithm/parser example, fixture, test, compiler, Cargo/helper or ELF was imported or executed. Only saved source/AST/JSON/text/hash checks and the new private review JSON were used.",
+    "No implementation/source or original evidence edits, public writes, children or new agent contexts.",
+    "At most one integration owning parent can be qualified by the future standalone adapter. No whole Linear4/feature, full PR/main composition, live provider, UI/native/UX, current CI or merge claim is made."
+  ]
+}

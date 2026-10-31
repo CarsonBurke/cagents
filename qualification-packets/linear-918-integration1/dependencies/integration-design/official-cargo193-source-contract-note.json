@@ -1,0 +1,35 @@
+{
+  "kind": "PINNED_OFFICIAL_CARGO_SOURCE_CONTRACT_OBSERVATION_NOT_RUNTIME_BINDING",
+  "upstream_url": "https://raw.githubusercontent.com/rust-lang/cargo/rust-1.93.0/src/doc/src/reference/environment-variables.md",
+  "version_ref": "rust-1.93.0",
+  "not_resolved_to_commit_SHA": true,
+  "observed_anchors": {
+    "210-219": "Cargo makes these variables available during compilation; env! can read them.",
+    "250-256": "CARGO_BIN_EXE_name designates an absolute path to the exact named binary executable during integration/benchmark builds; Cargo builds eligible binaries automatically."
+  },
+  "source_inference": "Pinned source env!(CARGO_BIN_EXE_cagents), exact manifest target and original unique same-command CargoJSON pair can supply the documented Cargo name-to-artifact contract. Design reviewer must assess this bounded binding.",
+  "not_established": [
+    "actual original CargoJSON pair or ELF paths",
+    "compiled embedded-value extraction",
+    "actual child exec/every-exec attestation",
+    "current physical tool/caller/context/runtime/grant"
+  ],
+  "required_later": "Both same-invocation artifacts must be selected strictly and hash/stat bound; absent, duplicate, ambiguous or mismatched records stop. No path guessing or environment override.",
+  "original_web_responses": [
+    {
+      "path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/rendered-doc-original-errors.json",
+      "sha256": "c6450e522eba9bb1bdb9ef6b4b7b5c4bb6d1da587aa204588780e705b7d3f40a",
+      "bytes": 665,
+      "kind": "original web-tool response, not raw upstream file bytes"
+    },
+    {
+      "path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/official-tag-doc-original-web-response.json",
+      "sha256": "75a10fb5683a34f20b4d558aa65e19c251c4cc90345181ef85a3d4c3205ff932",
+      "bytes": 30405,
+      "kind": "original web-tool response, not raw upstream file bytes"
+    }
+  ],
+  "rendered_docs_error_preserved": true,
+  "external_tools_reference_raw_error_preserved": true,
+  "local_runtime_or_environment_probe": false
+}

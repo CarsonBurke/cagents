@@ -1,0 +1,135 @@
+{
+  "LIB3_runner_sha256": "d99afc2e01e460284691a9c07f2765bb9f338f40c79b4828298452c07d334d4e",
+  "actual_ELFs_inventory_N_results": null,
+  "added_task_definitions": [
+    "linear_integration_artifact_pair",
+    "linear_pair_observations",
+    "execute_linear_integration_contracts"
+  ],
+  "all_candidate_imports_calls_examples_algorithms_tests_builds_runtime": "UNRUN",
+  "all_five_nested_exact": {
+    "context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
+    "invoke_fixture_group": "288e08759f96075a6a091c01f6626016f8ff55fda5a2033cf58c6d31537493f4",
+    "read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
+    "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06",
+    "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711"
+  },
+  "archive_composition": {
+    "actual_materialized_archives": null,
+    "binding_records": 52,
+    "bound_current_inputs": [
+      "command-data.json",
+      "current-source-map.json",
+      "instruction-source.json"
+    ],
+    "bound_originals": 49,
+    "physical_dependency_files": 34,
+    "physical_source_snapshots": 15,
+    "source_index_present_unarchived_originals": []
+  },
+  "bounded_line_forward_and_true_inverse": {
+    "from-993-forward.diff.json": "0fafc4b98657a51a4838b9d9a43af2e9476aedbecaf2924f3c36c97827fd79da",
+    "from-LIB3-543c-forward.diff.json": "6c8cb6fc99e5db090c675d0853cb2f7a9dcc0025faff00a6d345c7d27dd7db76",
+    "to-993-true-inverse.diff.json": "0d6588832ec0f5d6da780634089968350642c3a00e2293fa34cfbd3702fb7530",
+    "to-LIB3-543c-true-inverse.diff.json": "d62bb9f3ac44133ee7849c89b5d38c0dba4877d242633b6271d03ec17d7c546b"
+  },
+  "canonical9004_exact": true,
+  "canonical_definition_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+  "cap_sum": 1110,
+  "changed_original_task_definitions": [
+    "grouped_contracts",
+    "parent_accounting",
+    "main"
+  ],
+  "compact_output_and_final_return_exact": true,
+  "donor993_runner_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
+  "execution_authorized": false,
+  "explicit_fixed_main_local_callee": {
+    "assignment": "execute_contracts = execute_linear_integration_contracts",
+    "changes_actual_callee": true,
+    "not_unchanged_consumer_approval": true,
+    "position": "Immediately before unchanged protected3790 original acquire/call/finalize/Cclose block"
+  },
+  "full3790_exact": true,
+  "full3790_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+  "generic_cargo_test_artifact_and_execute_contracts_exact": true,
+  "grant": null,
+  "group_and_accounting_inverse_only_labels_cardinalities": true,
+  "instruction_baseline_variance": {
+    "bytes_flags_changed_by_author": false,
+    "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+    "index_flag": "H AGENTS.md",
+    "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+    "latest_user_AGENTS_instructions_followed": true,
+    "variance": true
+  },
+  "kind": "AUTHOR_LINEAR918_INTEGRATION1_SOURCE_CONSERVATION_NOT_INDEPENDENT_APPROVAL",
+  "limits": "Static AST/hash/JSON/source Git and line reconstruction only. New task functions are unexecuted. Original exact package/test/bin mapping is source-derived; no embedded/every-exec attestation, old LIB3 pass transfer or runtime admission.",
+  "original_absolute_workload_cap": 2400,
+  "original_park": {
+    "all57_original_member_bytes_unchanged": true,
+    "path": "/var/tmp/coord16-linear918-integration1-priority-park-xyjjpnty/wip.json",
+    "sha256": "c985958307b16a4bfb7ee7bc61715d16f40734766e64692d154b793017752166"
+  },
+  "planned_command_caps": [
+    300,
+    600,
+    30,
+    180
+  ],
+  "product_git_entries_before_packet": 2219,
+  "product_git_tree_manifest_sha256": "bbb4340bd4dc4897a9d8e3d8207b3e687f6f5d46202f835ad55457f3672693be",
+  "product_head": "918920655d841600e1a44b66057a634940e0e132",
+  "product_parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "product_tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+  "queue": null,
+  "review": null,
+  "runner_sha256": "ac80b9e7ea0495c43ab56c1806fdedc37d8880d1327365eaa5802181213014d2",
+  "source_mapping_limit": {
+    "binary_source_sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "embedded_value_extracted": false,
+    "environment_key": "CARGO_BIN_EXE_cagents",
+    "every_child_exec_attested": false,
+    "integration_source_sha256": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a",
+    "kind": "DOCUMENTED_CARGO193_NAMED_TARGET_MAPPING_NOT_EMBEDDED_OR_EVERY_EXEC_PROOF",
+    "official_source_observation_sha256": "2aece1ee501032aa0dcf218c0d1188a17afad44f033a97aafea8610fbc282d22",
+    "source": "tests/linear_cli_contract.rs:101 env!",
+    "version_ref": "rust-1.93.0",
+    "version_tag_resolved_to_commit": false,
+    "web_response_hashes_are_raw_upstream_bytes": false
+  },
+  "unchanged_definition_hashes": {
+    "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+    "cargo_helper_artifact": "cce4fa0819e7ce38157c45c4d8eb40df7e154d6d2fa94f3e39dfea52bd0d2712",
+    "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
+    "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+    "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+    "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+    "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+    "execute_contracts": "584d6c3b8076b29a92d12454bd3c3e04b1d14abe5f46323c62cbd451151c41bc",
+    "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+    "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+    "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+    "grouped_result": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115",
+    "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+    "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+    "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+    "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+    "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+    "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+    "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+    "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+    "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9",
+    "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+    "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+    "settle_children": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+    "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+    "task_elf_observation": "3cd165b37eb78c86f9bf35fe2ed7eef1401f073c3b166512763f6a7af75e2814",
+    "task_group_assets": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4",
+    "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
+  },
+  "unchanged_original_top_level_count": 29,
+  "whole_module_inverse_removes_only_three_added_defs_restores_three_task_defs_and_three_globals": true
+}

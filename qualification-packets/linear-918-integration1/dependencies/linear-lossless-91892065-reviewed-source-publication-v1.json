@@ -1,0 +1,23 @@
+{
+  "schema": "linear_lossless_91892065_reviewed_source_publication_v1",
+  "utc": "2026-10-31T16:01:58.396611+00:00",
+  "head": "918920655d841600e1a44b66057a634940e0e132",
+  "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+  "branch": "fix/fw16-linear-lossless-detail",
+  "adoption": {
+    "path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-root-source-adoption-v1.json",
+    "sha256": "735621143f9cfac9169adedd28fa5df4ea0c61b38a6fd5bcdaaf06fa3be6395e"
+  },
+  "ordinary_nonforce_push": {
+    "start": "3f7462",
+    "session": 58639,
+    "final": "4b49ea",
+    "exit": 0,
+    "nonfatal_warning": "credential store locked collection; push succeeded, no approval rejection"
+  },
+  "supported_GitHub_GET_readback": {
+    "ref": "refs/heads/fix/fw16-linear-lossless-detail",
+    "sha": "918920655d841600e1a44b66057a634940e0e132"
+  },
+  "qualification": "sourceclear/format0 only. Rustchecks/tests/currentCI UNRUN. No PR created/no oldhead acceptance transfer. Earlier autoPRcreate rejection preserved/no alternative route."
+}

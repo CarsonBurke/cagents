@@ -1,0 +1,146 @@
+{
+  "schema": "linear918-integration1-controller-task-data-v1",
+  "product_PR_reference": null,
+  "boundary": "cli",
+  "source": {
+    "head": "918920655d841600e1a44b66057a634940e0e132",
+    "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+    "parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract"
+  },
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "selected_names": [
+    "issue_context_connections_are_pageable"
+  ],
+  "selected_parents": [
+    {
+      "name": "issue_context_connections_are_pageable",
+      "source": "tests/linear_cli_contract.rs",
+      "line": 359,
+      "body_sha256": "5b1cf0d30123b979f4d67fdc3c9885d5e48f4d54106824267a28dd422535fb8b",
+      "cfg": "Existing ordinary #[test], Unix source; no ignore/zero-pass early return.",
+      "semantics": "Actual CARGO_BIN_EXE CLI via unchanged fakecurl/private Git/fixture credentials; eight connection cases/full issue/control and child calls nonadditive.",
+      "expected_stdout_child_results": 0
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "linear-cli-contract",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_name": "linear_cli_contract",
+      "target_kind": [
+        "test"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "linear_cli_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "issue_context_connections_are_pageable"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "issue_context_connections_are_pageable",
+          "seconds": 180,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 300
+    }
+  ],
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-linear-cli-contract",
+    "inventory-linear-cli-contract",
+    "parent-linear-cli-contract-1"
+  ],
+  "integration": {
+    "selector": "issue_context_connections_are_pageable",
+    "target": "linear_cli_contract",
+    "state": "SOURCE_ONLY_UNRUN_REQUIRES_FRESH_CODE_REVIEW_AND_GRANT",
+    "owning_parent_max": 1,
+    "source_child_calls_nonadditive": true,
+    "actual_result": null
+  },
+  "runtime_admission": {
+    "state": "LINEAR918_INTEGRATION1_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "integration_artifact_contract": {
+    "manifest_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract/Cargo.toml",
+    "integration_test": {
+      "name": "linear_cli_contract",
+      "kind": [
+        "test"
+      ],
+      "source_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract/tests/linear_cli_contract.rs",
+      "profile_test": true
+    },
+    "cli_bin": {
+      "name": "cagents",
+      "kind": [
+        "bin"
+      ],
+      "source_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract/src/main.rs",
+      "profile_test": false
+    }
+  },
+  "cargo_named_target_mapping": {
+    "kind": "DOCUMENTED_CARGO193_NAMED_TARGET_MAPPING_NOT_EMBEDDED_OR_EVERY_EXEC_PROOF",
+    "environment_key": "CARGO_BIN_EXE_cagents",
+    "source": "tests/linear_cli_contract.rs:101 env!",
+    "integration_source_sha256": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a",
+    "binary_source_sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "official_source_observation_sha256": "2aece1ee501032aa0dcf218c0d1188a17afad44f033a97aafea8610fbc282d22",
+    "version_ref": "rust-1.93.0",
+    "version_tag_resolved_to_commit": false,
+    "web_response_hashes_are_raw_upstream_bytes": false,
+    "embedded_value_extracted": false,
+    "every_child_exec_attested": false
+  }
+}

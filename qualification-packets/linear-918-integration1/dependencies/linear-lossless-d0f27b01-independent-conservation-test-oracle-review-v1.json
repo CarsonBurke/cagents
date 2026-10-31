@@ -1,0 +1,232 @@
+{
+  "anchors": {
+    "first_new": 1495,
+    "list_kind": 981,
+    "output": 429,
+    "process_capture": 34,
+    "process_isolated": 21,
+    "process_pagination_parent": 359,
+    "routine_control": 1449,
+    "second_new": 1528
+  },
+  "built_CLI_followup": {
+    "anchor": "tests/linear_cli_contract.rs:359",
+    "current_coverage": "JSON-only, as Fixture::command appends --json at113. Its actual built CLI response/path/pagination assertions do not currently exercise human stdout.",
+    "effect_boundaries": [
+      "Keep existing opaque AUTHORITY_ENV intact; no User fallback, fabricated authority or capability removal to make a test pass. Fixture isolation currently preserves it at21-26.",
+      "Existing private HOME/temp Git checkout, synthetic fixture API key, fake curl/secret-tool PATH and original process custody/time/output bounds remain unchanged. The shim reads scripted files and records requests; it makes no network call.",
+      "Use detail reads only; do not add link/unlink/mutation/account/keyring-service behavior to this follow-up. Existing private fixture Git initialization is already bounded and success-asserted; no live user checkout/state or real credential is needed.",
+      "Root has announced this future test-only extension off frozen d0 in a separate worktree. It is not present, reviewed, executed or qualified by this d0 receipt."
+    ],
+    "existing_parent": "issue_context_connections_are_pageable",
+    "existing_target": "tests/linear_cli_contract.rs",
+    "qualification": "The existing fixture can support bounded actual built-CLI output evidence, but current JSON-only process parents cannot be credited as human-output validation. All process execution remains future admitted work.",
+    "reuse_design": "A separately reviewed test-only successor can extend this same owning parent with human and --json complete rich/empty detail reads for the four actual commands. Reuse Fixture::read, original bounded SystemProcessExecutor and the installed curl shim. Choose output mode without changing the fixture's other command/isolation behavior; compare parsed human stdout with the complete original endpoint payload, compare JSON data likewise, and retain existing cursor/request assertions."
+  },
+  "causal_oracle_assessment": [
+    {
+      "basis": "The actual parser reads linear issue ENG-1 --full and the parent asserts Operation::Issue{full:true}. Its rich Value includes full description, comments/pageInfo with exact newline cursor, attachments, children, both relation directions and an unknown fetched field. Human JSON is parsed back and compared with the complete original Value; returned data must also equal it.",
+      "limits": "Tests output serialization of the supplied fetched Value. It does not validate GraphQL completeness, network retrieval or built-CLI stdout.",
+      "predecessor": "Unchanged list_kind maps Issue to None, so old main already pretty-prints this issue payload. Source predicts this parent also passes old output; no actual predecessor test was executed.",
+      "role": "Lossless positive control, not a predecessor-failing regression",
+      "selector": "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors"
+    },
+    {
+      "basis": "Real parser operations comments/relations/children use the actual detail ID literals and unchanged list_kind. Each runs populated plus empty/null-cursor data: three operations times two payload shapes are six nonadditive variants in one parent. Rich cases include long multiline Markdown, endpoint titles, child description, exact unsafe-for-shell newline cursors and unknown fetched fields. Parsed human output and returned data both equal the entire source Value.",
+      "limits": "Command IDs are supplied directly to output in this unit seam; actual production dispatch plus stdout remains a separate built-CLI follow-up, not established by parser use alone.",
+      "predecessor": "Current main maps all three operations to Some(List). Its unchanged human renderer returns COMMENT/RELATION/ISSUE tables, or explicit empty text; these are not JSON Values and omit rich metadata/exact cursor data. Therefore serde_json::from_str(...).unwrap is source-predicted to fail for all six old-renderer cases. No predecessor or corrected test was executed.",
+      "role": "Causal detail-rendering regression",
+      "selector": "control::linear::tests::human_comment_relation_and_child_details_are_lossless"
+    },
+    {
+      "basis": "All original assertions and branches remain exact; only one comment clarifies that linear.test intentionally checks the selected List renderer independently of actual detail-command rendering. Eleven parser/list variants plus the existing linear.set fallback are nested controls, not added test parents. Headers, data equality and nonlist pretty JSON assertions are not weakened.",
+      "limits": "Because the renderer call uses synthetic linear.test, this parent is not real command-ID detail routing evidence. The unchanged compact renderer's own tests remain outside this delta.",
+      "role": "Preserved routine projection/mutation fallback control",
+      "selector": "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json"
+    }
+  ],
+  "delta": {
+    "CommandOutput_command_data_ownership_fields_exact_parent": true,
+    "all2218_other_entries_exact_main_mode_type_blob": true,
+    "all_other_source_bytes_exact_main_after_only_output_comment_new_parent_removal": true,
+    "deletions": 3,
+    "full_actual_Git_patch_inverse_reconstructs_parent_bytes": true,
+    "hunks": 3,
+    "insertions": 99,
+    "no_added_deleted_path_or_mode_type_change": true,
+    "only_path": "src/control/linear.rs",
+    "parser_fetch_auth_query_request_error_retry_execute_source_exact": true,
+    "routine_list_render_and_nonlist_pretty_fallback_exact_parent": true
+  },
+  "existing_process_fixture": {
+    "bounded_SystemProcessExecutor_22seconds_1MiB_each_stream": true,
+    "built_CLI_via_CARGO_BIN_EXE": true,
+    "current_helper_forces_JSON_and_does_not_test_human": true,
+    "original_agent_authority_preserved": true,
+    "path": "tests/linear_cli_contract.rs",
+    "private_HOME_PATH_fake_key_and_curl_shim": true,
+    "real_Git_init_is_private_and_success_asserted": true,
+    "shell_shim_reads_only_scripted_fixture_response_not_network": true,
+    "static_parent_count": 17,
+    "static_parent_names": [
+      "issue_reads_link_current_and_unlink_need_no_daemon",
+      "inherited_git_overrides_cannot_redirect_worktree_link",
+      "paginated_search_preserves_cursor_and_truncation",
+      "setters_use_resolved_ids_and_uncertain_writes_are_single_attempt",
+      "missing_credentials_and_invalid_inputs_fail_without_network",
+      "create_uncertainty_preserves_uuid_and_selected_workspace",
+      "comments_accept_multiline_stdin_and_resolved_issue_id",
+      "ambiguous_metadata_never_selects_first_match_for_a_write",
+      "team_only_updates_and_empty_label_sets_send_the_intended_fields",
+      "label_names_include_parent_teams_but_exclude_unrelated_teams",
+      "issue_context_connections_are_pageable",
+      "uncertain_relation_deletion_identifies_relation_without_mistaking_it_for_issue",
+      "stored_key_authenticates_without_shell_environment_and_environment_overrides_it",
+      "team_and_state_names_use_filtered_connections_without_metadata_scans",
+      "unavailable_keyring_helper_reports_the_install_and_unlock_action",
+      "keyring_lookup_service_failure_preserves_guidance_without_exposing_diagnostics",
+      "keyring_stderr_writer_cannot_extend_the_original_helper_deadline"
+    ]
+  },
+  "limits": [
+    "All Rust compilation, unit/integration/CLI process bodies, fixture/helper/candidate execution, native/provider behavior and CI remain UNRUN by this review; no runtime N/pass/grant/merge/readiness claim.",
+    "Official formatter/diff0 is recorded in the freeze and was not rerun here.",
+    "Read-only source/Git/hash and prior receipt read plus this task-owned /tmp report. No source/Git edits, network/GitHub writes or query, account/environment/process/resource/target probe, new child/worker or state mutation.",
+    "No new blocker identified in this finite conservation/oracle scope. End-to-end fetch/dispatch/binary-output behavior is outside these two unit parents and needs the separately frozen built-CLI follow-up."
+  ],
+  "minimum_CLI_validation_plan": {
+    "check": "cargo check --locked --no-default-features --bin cagents",
+    "compile_inventory": "CLI-only lib test compilation and exact executable inventory at d0f27b0131ea018101fed58532e3c1bb0305c092, before claiming N or running selectors.",
+    "counts": "This file has11\u219213 static unit parent names; two are new. The six rich/empty detail variants are one parent, not six inventory entries. The17 unchanged process-contract names are a separate integration target, not lib inventory or proof that they ran.",
+    "exact_three_unit_parent_selectors": [
+      "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+      "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+      "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json"
+    ],
+    "execution_status": "UNRUN; no admission/grant supplied",
+    "narrow_command_shape": "cargo test --locked --no-default-features --lib <exact selector> -- --exact",
+    "no_transfer": "Historical a518/d57/other CLI inventories and passes from the reused report remain bound to those heads. No global CLI N or pass count is inferred for d0."
+  },
+  "parent_source_sha256": "133732a205ea377dca7749f301ebe26ea51fbd003275406d6dc0d6c9bc044208",
+  "pins": {
+    "Cargo.lock": {
+      "entry": {
+        "mode": "100644",
+        "oid": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    "Cargo.toml": {
+      "entry": {
+        "mode": "100644",
+        "oid": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    "src/control/format.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "62198b822299349410281137799638de68840bd6",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "39dd6b05374050fc7e360e89ae04f3fe81c8dfb6938bd0976d77714dd27099b5"
+    },
+    "src/control/linear.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "3bb92d8020aa34c4f137b2ea8ac3a1c9b6fd3878",
+        "type": "blob"
+      },
+      "exact_main": false,
+      "sha256": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e"
+    },
+    "src/control/linear_output.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "1acbc297d499b213a909099471cb42626366ea22",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "0063525d84429f2f7c362e908e7d505f14b813a1333490df6453d0824254554f"
+    },
+    "tests/fixtures/linear-curl.sh": {
+      "entry": {
+        "mode": "100755",
+        "oid": "77ff4f67a9bc416a3066de109fe71998640c79de",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee"
+    },
+    "tests/linear_cli_contract.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "e8447735228567f3c77d7c29a387ff8a6ac326b4",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "d41bf29c8d1accd7b03eaec7b315e466f5ec77aba682550b62f88c1d10ca8152"
+    }
+  },
+  "read_end_worktree": {
+    "head": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+    "status": ""
+  },
+  "reused_first": {
+    "path": "/tmp/pr1238-a518-main442-next-cli-delivery-source-review-v1.md",
+    "sha256": "708d9c2b3e29e77514f77eaa499e7902ad20d7b5769d65bcb8830de4f131c1d6"
+  },
+  "reviewer": "/root/1281_holder_reconcile_review",
+  "schema": "linear_lossless_d0f27b01_independent_conservation_test_oracle_review_v1",
+  "scope": "Exact one-file d0f extraction against requested main442; conservation, predecessor discrimination, exact unit selectors/static counts and bounded existing built-CLI fixture seam. Type/dispatch correctness is separately owned and was not re-audited.",
+  "source": {
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-main442-source-freeze-v1.json",
+      "sha256": "62368f7df0003fb1f2e8da2e80445e03681748753feb2a89d1f2b0b86e762687"
+    },
+    "head": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+    "parents": [
+      "4429728a1f179ea7f7eaca9667156553209a46ac"
+    ],
+    "status": "",
+    "tree": "d2bcdf354c4bad41be7058ed166938f2cdb32f9f",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-main442"
+  },
+  "source_and_data_conservation": [
+    "Only output's exact four-ID guard, one explanatory routine-test comment and two new parents differ. Reversing all actual Git hunks reconstructs the full parent source. All2218 other tracked entries/modes/types/blobs, including main control/CLI cases, auth/API/client, formatter/renderer, Cargo, HOST/UI/protocol/native/permissions/proof/Seed/1749, remain exact requestedmain442.",
+    "CommandOutput command/data construction is exact parent: fetched Value is not rewritten or projected, only its human serialization choice changes. Existing Some(List) renderer and None pretty fallback remain byte-identical inside the else branch.",
+    "Every original11 unit parent name/order and function body remains, apart from the single explanatory comment. Parsing, request/fetch/auth/credential/error/retry/execute source in this file and all other source entries are exact parent.",
+    "This extraction does not import donor1238's broader carrier/type/enum/global output stack or the separately owned channel partial-result change."
+  ],
+  "test_conservation": {
+    "all_old_function_bodies_exact_except_one_explanatory_comment": true,
+    "new_linear_static_parent_count": 13,
+    "new_parents": [
+      {
+        "body_sha256": "490aa4bf8d9977fa7532824d58d0f728f348bc9bafaf5d86c0f1752210fd1784",
+        "line": 1495,
+        "name": "human_issue_details_preserve_full_connections_and_cursors",
+        "selector": "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors"
+      },
+      {
+        "body_sha256": "831e17f50158609f4727431846c70ef4db298db9c5775ca5faa278e9c6b7a1fc",
+        "line": 1528,
+        "name": "human_comment_relation_and_child_details_are_lossless",
+        "selector": "control::linear::tests::human_comment_relation_and_child_details_are_lossless"
+      }
+    ],
+    "old_linear_static_parent_count": 11,
+    "old_names_retained_in_order": true,
+    "routine_parent": {
+      "exact_after_one_comment_removal": true,
+      "line": 1449,
+      "name": "readable_linear_actual_commands_select_columns_and_preserve_json"
+    }
+  },
+  "verdict": "BOUNDED_CONSERVATION_AND_UNIT_ORACLE_SOURCE_CLEAR_EXECUTION_UNRUN"
+}

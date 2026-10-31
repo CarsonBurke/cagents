@@ -1,0 +1,55 @@
+{
+  "schema": "linear_lossless_cli_stdout_successor_source_freeze_v1",
+  "utc": "2026-10-31T15:53:48.689086+00:00",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract",
+  "branch": "fix/fw16-linear-lossless-cli-contract",
+  "head": "918920655d841600e1a44b66057a634940e0e132",
+  "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+  "sole_parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "changed_from_parent": [
+    "tests/linear_cli_contract.rs"
+  ],
+  "changed_from_main": [
+    "src/control/linear.rs",
+    "tests/linear_cli_contract.rs"
+  ],
+  "production_exact_d0": true,
+  "scope": "Extend existing issue_context_connections_are_pageable parent only; no new integration parent/helper/transport/process/authority/environment policy. Eight rich/empty comments/outgoingrelations/children/inverseRelations cases and fullissue read each check realJSON envelope data then remove only leading --json argument to assert ordinary actualCLI stdout completepayload/empty stderr. Cases nonadditive; original paging assertions retained. Fakecurl/privateGit/fixturecredentials and inheritedopaqueauthority preservation unchanged.",
+  "pins": {
+    "src/control/linear.rs": {
+      "sha256": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e",
+      "blob": "3bb92d8020aa34c4f137b2ea8ac3a1c9b6fd3878"
+    },
+    "tests/linear_cli_contract.rs": {
+      "sha256": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a",
+      "blob": "952de8904f7fe812a13f9da40ad852e0f92c73d3"
+    },
+    "tests/fixtures/linear-curl.sh": {
+      "sha256": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee",
+      "blob": "77ff4f67a9bc416a3066de109fe71998640c79de"
+    },
+    "src/process.rs": {
+      "sha256": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47",
+      "blob": "a044a7e901cc28f02f4258b2679284eec19c4d9c"
+    },
+    "Cargo.toml": {
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5"
+    },
+    "Cargo.lock": {
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "blob": "9ff31301cf43f2219a56415069c4d3026765f9bb"
+    }
+  },
+  "format": {
+    "start": "1d3202",
+    "session": 63408,
+    "final": "6f06f8",
+    "exit": 0,
+    "diff_check_commit": "99c95b EXIT0"
+  },
+  "source_reviews": null,
+  "current_compile_tests_native": "UNRUN; no C grant or admission",
+  "publish": null
+}

@@ -1,0 +1,226 @@
+{
+  "actual_command_mapping": [
+    {
+      "fetch": "issue(...,full)",
+      "id": "linear.issue",
+      "operation": "Issue",
+      "operation_anchor": 1017
+    },
+    {
+      "fetch": "issue_connection comments",
+      "id": "linear.comments",
+      "operation": "Comments",
+      "operation_anchor": 1021
+    },
+    {
+      "fetch": "issue_connection children ISSUE fields",
+      "id": "linear.children",
+      "operation": "Children",
+      "operation_anchor": 1035
+    },
+    {
+      "fetch": "issue_connection relations or inverseRelations",
+      "id": "linear.relations",
+      "operation": "Relations (outgoing and --inverse)",
+      "operation_anchor": 1039
+    }
+  ],
+  "conservation": {
+    "changed_paths": [
+      "src/control/linear.rs"
+    ],
+    "exact_diff_sha256": "1a12c12b42e18f268880dfeaea35bd49652c836a34bfdebb59257cf99bc7e279",
+    "inverse_removing_two_new_tests_comment_and_output_delta_reconstructs_exact_main_leaf": true,
+    "numstat": {
+      "deletions": 3,
+      "insertions": 99
+    },
+    "outside_entries_exact_main_modes_types_blobs": 2218,
+    "production_delta_only_output_function": true,
+    "query_fetch_auth_mutation_parser_code_exact_main": true,
+    "unchanged_mode": "100644"
+  },
+  "findings": [],
+  "freeze": {
+    "all_source_pins_verified": true,
+    "path": "/tmp/fw16-backend-ec204421/linear-lossless-main442-source-freeze-v1.json",
+    "sha256": "62368f7df0003fb1f2e8da2e80445e03681748753feb2a89d1f2b0b86e762687"
+  },
+  "head": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "limits": {
+    "actual_built_cli_stdout": "UNRUN. Existing tests/linear_cli_contract.rs Fixture::command unconditionally adds --json at111, so its pageable issue-context test is JSON/fetch coverage and must not be claimed as actual human-output qualification.",
+    "evidence_transfer": "No donor/current-main/other-feature pass or native/whole-PR readiness transferred. No execution allocation or grant.",
+    "format": "Root freeze reports official format start26dfd5/session57983/final899142 EXIT0 and diff c29b80 EXIT0; reviewer did not rerun.",
+    "operations": "Immutable Git/source and supplied receipt reads, stdlib text/hash comparison, and this owned JSON only. No product edit, build/test/helper/candidate import/evaluation, provider/network/runtime/account/environment/process probe, child or public write.",
+    "rust_compilation_unit_tests": "ALL UNRUN at d0f27b01; source review is not a compilation pass or discovered test inventory."
+  },
+  "result": "BOUNDED_SOURCE_CLEAR_NO_CONCRETE_BLOCKER",
+  "reviewed_contract": [
+    {
+      "anchors": [
+        "src/control.rs:129",
+        "src/control.rs:2650",
+        "src/control/linear.rs:1000",
+        "src/control/linear.rs:1299",
+        "src/control.rs:4416"
+      ],
+      "conclusion": "TopCommand Linear dispatches actual parsed LinearCommand to execute. execute emits the exact four command IDs guarded by output; inverse relation reads share linear.relations. emit_success prints human unchanged plus a final newline for ordinary output, and prints the original command/data envelope for --json.",
+      "subject": "Real command routing and stdout"
+    },
+    {
+      "anchors": [
+        "src/control/linear.rs:429",
+        "src/control/linear.rs:981",
+        "src/control/linear_output.rs:37",
+        "src/control/format.rs:4"
+      ],
+      "conclusion": "Exact detail-ID guard runs before List projection and pretty-serializes the original Value by reference. It retains long/multiline text, nested objects/arrays, unknown fetched fields, exact cursor string values including whitespace/newlines, false flags, null cursors and empty nodes arrays. CommandOutput retains original data and command. List/search/attachments/team/project IDs do not match; they continue through the unchanged compact renderer. Singular mutation IDs remain on unchanged fallback.",
+      "subject": "Lossless detail selection and routine fallback"
+    },
+    {
+      "anchors": [
+        "src/control/linear.rs:584",
+        "src/control/linear.rs:1310"
+      ],
+      "conclusion": "This changes display of the fetched Value only. Existing --full uses first:100 per extra connection and preserves pageInfo; page reads honor existing --limit/--after. It neither automatically exhausts pagination nor claims raw HTTP-byte/duplicate-key preservation or fields not fetched by GraphQL. JSON escapes preserve string values rather than flattening text or making a shell cursor command.",
+      "subject": "Fetched payload boundary"
+    },
+    {
+      "anchors": [
+        "src/control.rs:97",
+        "src/control/linear.rs:11",
+        "src/control/linear.rs:23",
+        "src/control/linear.rs:148",
+        "src/control/linear.rs:158",
+        "src/control/linear.rs:1495",
+        "src/control/linear.rs:1528"
+      ],
+      "conclusion": "New fixtures invoke actual Cli::try_parse_from with Issue positional ID/--full and connection --id forms matching current clap definitions. Issue matches! only tests variant/full literal and binds no owned fields; parsed command remains usable by reference. The detail serializer borrows data then CommandOutput owns it. Value clones and per-case arrays move only owned fixture values as intended; no State/Drop-style struct-update or new borrowed-lifetime API is introduced. No additional narrow type/API blocker is evident, but no compiler was run.",
+      "subject": "Parser and ownership/type consistency"
+    },
+    {
+      "anchors": [
+        "src/lib.rs:5",
+        "src/modules.rs:33",
+        "src/modules.rs:88",
+        "src/control.rs:46",
+        "src/control/linear.rs:1418",
+        "Cargo.toml:101",
+        "Cargo.toml:211",
+        "Cargo.toml:264"
+      ],
+      "conclusion": "control and linear compile in the library without ui/host gates, and cfg(test) new parents are available to ordinary CLI --lib tests. Actual CLI binary calls library control. clap derive and serde_json are existing unconditional dependencies; Cargo files and every feature graph are exact main. The ui-only describe impl is unchanged.",
+      "subject": "Compiled feature path"
+    }
+  ],
+  "reviewer": "/root/1954_directory_durability_bound",
+  "schema": "linear_lossless_main442_d0f27b01_independent_code_user_contract_source_review_v1",
+  "sole_parent": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "source_pins": {
+    "Cargo.lock": {
+      "blob": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+      "mode": "100644",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    "Cargo.toml": {
+      "blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+      "mode": "100644",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    "src/control.rs": {
+      "blob": "d249a2f78aa0df6cef4e302f6b64444e1b2504b3",
+      "exact_main": true,
+      "mode": "100644",
+      "sha256": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673"
+    },
+    "src/control/format.rs": {
+      "blob": "62198b822299349410281137799638de68840bd6",
+      "mode": "100644",
+      "sha256": "39dd6b05374050fc7e360e89ae04f3fe81c8dfb6938bd0976d77714dd27099b5"
+    },
+    "src/control/linear.rs": {
+      "blob": "3bb92d8020aa34c4f137b2ea8ac3a1c9b6fd3878",
+      "mode": "100644",
+      "sha256": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e"
+    },
+    "src/control/linear_output.rs": {
+      "blob": "1acbc297d499b213a909099471cb42626366ea22",
+      "mode": "100644",
+      "sha256": "0063525d84429f2f7c362e908e7d505f14b813a1333490df6453d0824254554f"
+    },
+    "src/lib.rs": {
+      "blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e",
+      "exact_main": true,
+      "mode": "100644",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+    },
+    "src/main.rs": {
+      "blob": "429db35e164a3306f4e91c2576f4fc352606ebce",
+      "exact_main": true,
+      "mode": "100644",
+      "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d"
+    },
+    "src/modules.rs": {
+      "blob": "9e04bd958166835de80fc06502dd6cbe547111d6",
+      "exact_main": true,
+      "mode": "100644",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+    },
+    "tests/fixtures/linear-curl.sh": {
+      "blob": "77ff4f67a9bc416a3066de109fe71998640c79de",
+      "mode": "100755",
+      "sha256": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee"
+    },
+    "tests/linear_cli_contract.rs": {
+      "blob": "e8447735228567f3c77d7c29a387ff8a6ac326b4",
+      "mode": "100644",
+      "sha256": "d41bf29c8d1accd7b03eaec7b315e466f5ec77aba682550b62f88c1d10ca8152"
+    }
+  },
+  "source_plan": {
+    "path": "/tmp/pr1238-a518-main442-next-cli-delivery-source-review-v1.md",
+    "sha256": "708d9c2b3e29e77514f77eaa499e7902ad20d7b5769d65bcb8830de4f131c1d6",
+    "use": "Intent and bounded donor-contract scope only; actual candidate reviewed independently."
+  },
+  "test_assessment": {
+    "existing_projection_parent": "All existing assertions and parser cases retained byte-for-byte; added comment accurately identifies synthetic linear.test as an independent projection check. It is not misrepresented as real detail-route output coverage. Mutation fallback and routine tables remain covered.",
+    "namespaces": "linear_output.rs is included as child module human, so its actual test namespace is control::linear::human::tests.",
+    "new_connection_parent": "Meaningful truncation regression: three operations x populated/empty cases, six nonadditive cases in one parent. Main projects fixed columns or an empty notice, loses nested/unknown fields and exact nonshell cursor values, and fails the parsed-human-JSON equality. Long Markdown body and full child descriptions are explicit. Candidate roundtrip equality plus unchanged data equality expresses user data preservation rather than implementation formatting.",
+    "new_issue_parent": "Compatibility/control coverage for issue --full, all nested connections and unknown fields. Main already pretty-prints ordinary issue because list_kind returns None; this parent alone is not a predecessor-discriminating test for this extraction.",
+    "owning_oracles": [
+      {
+        "definition_line": 1495,
+        "path": "src/control/linear.rs",
+        "selector": "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 1528,
+        "path": "src/control/linear.rs",
+        "selector": "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 1449,
+        "path": "src/control/linear.rs",
+        "selector": "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 153,
+        "path": "src/control/linear_output.rs",
+        "selector": "control::linear::human::tests::readable_linear_collections_have_headers_and_explicit_empty_states",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 204,
+        "path": "src/control/linear_output.rs",
+        "selector": "control::linear::human::tests::readable_linear_output_sanitizes_controls_and_keeps_pagination_visible",
+        "status": "SOURCE_PRESENT_UNRUN"
+      }
+    ]
+  },
+  "tree": "d2bcdf354c4bad41be7058ed166938f2cdb32f9f",
+  "user_task": "Read complete fetched Linear issue, comments, relations and children data through ordinary human CLI output while routine discovery/list/search output remains compact.",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-main442"
+}

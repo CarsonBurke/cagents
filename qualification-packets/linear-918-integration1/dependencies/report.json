@@ -1,0 +1,147 @@
+{
+  "kind": "LINEAR4_SOURCE_INTERFACE_BLOCKER_AND_MINIMAL_SPLIT_PROPOSAL_NOT_RUNTIME",
+  "product": {
+    "head": "918920655d841600e1a44b66057a634940e0e132",
+    "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+    "parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+    "source_worktree_from_actual_successor_freeze": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract",
+    "pins": {
+      "tests/linear_cli_contract.rs": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a",
+      "tests/fixtures/linear-curl.sh": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee",
+      "src/control/linear.rs": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e",
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    }
+  },
+  "genuine_inputs": {
+    "adoption": {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-root-source-adoption-v1.json",
+      "sha256": "735621143f9cfac9169adedd28fa5df4ea0c61b38a6fd5bcdaaf06fa3be6395e"
+    },
+    "publication": {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-reviewed-source-publication-v1.json",
+      "sha256": "47b53631a33ea200e56cd1901864789d71233726513fc2d9e54c40871588f6e1"
+    },
+    "successor_freeze": {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-cli-stdout-successor-source-freeze-v1.json",
+      "sha256": "b0a826ef58fa7f782b61b08fc469ede7cae315ab63d88e4f46b8b434f9a0ad41"
+    }
+  },
+  "donor": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/run-packet.py",
+    "head": "993cea26a29b5a2cd6857a959628de4e5f04c096",
+    "sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
+    "relevant_definitions": {
+      "cargo_test_artifact": {
+        "line": 247,
+        "end_line": 266,
+        "sha256": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285"
+      },
+      "execute_contracts": {
+        "line": 565,
+        "end_line": 652,
+        "sha256": "584d6c3b8076b29a92d12454bd3c3e04b1d14abe5f46323c62cbd451151c41bc"
+      },
+      "grouped_contracts": {
+        "line": 475,
+        "end_line": 491,
+        "sha256": "d4f65a76fdc4cc7e6fba46e3ed4923caa2b733a56b9708b9392bc583af81e750"
+      },
+      "grouped_result": {
+        "line": 494,
+        "end_line": 562,
+        "sha256": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115"
+      },
+      "parent_accounting": {
+        "line": 680,
+        "end_line": 762,
+        "sha256": "d5e0b53a282078d8dd41e113776d78422ab37704bc2dc1bc44f366d40365ef16"
+      }
+    }
+  },
+  "source_interface_facts": [
+    {
+      "path": "tests/linear_cli_contract.rs",
+      "lines": "100-112",
+      "fact": "Fixture::command creates CommandSpec from compile-time env!(CARGO_BIN_EXE_cagents), not a controller-chosen test ELF or runtime helper variable."
+    },
+    {
+      "path": "tests/linear_cli_contract.rs",
+      "lines": "20-30,42-82,123-135",
+      "fact": "Existing fixture preserves the authority env only, supplies private HOME/PATH/fakecurl/fixture API keys and successful private Git init; selected positive commands avoid real Linear/keyring. This is source behavior only, not observed isolation."
+    },
+    {
+      "path": "Cargo.toml",
+      "lines": "7-11,101-105",
+      "fact": "Root cagents package, binary cagents at src/main.rs, test=false/bench=false, no required host/UI features. Integration tests auto-discovered; no linear_cli_contract feature-gating stanza."
+    },
+    {
+      "path": "tests/linear_cli_contract.rs",
+      "lines": "358-452",
+      "fact": "One ordinary parent issue_context_connections_are_pageable drives actual CLI stdout. Eight rich/empty variants and full-issue control/CLI subprocesses are nonadditive; no nested ordinary libtest footer is emitted by those captures."
+    }
+  ],
+  "blocking_interfaces": [
+    {
+      "id": "INTEGRATION_ARTIFACT_GRAMMAR",
+      "anchor": "donor cargo_test_artifact247-266; execute_contracts573",
+      "fact": "Unconditional helper accepts only test profile + target.kind exactly lib + target.name exactly cagents + same root manifest/features. It cannot select target.kind test/name linear_cli_contract; selecting an incidental root lib would be false target qualification."
+    },
+    {
+      "id": "COMPILETIME_CLI_BIN_BINDING",
+      "anchor": "tests/linear_cli_contract.rs101; donor execute_contracts574-600/602-637",
+      "fact": "Existing executor discovers/observes only the chosen rootlib ELF. It does not collect or bind the same-invocation cagents non-test binary artifact to the compile-time CARGO_BIN_EXE path, or observe that binary before/after the selected integration use."
+    },
+    {
+      "id": "PHASE_GROUP_ORDER",
+      "anchor": "donor execute_contracts570-650",
+      "fact": "Each artifact-group iteration compiles, inventories and executes its parents before the next group. The proposed two-compiles-before-inventories nine-phase order cannot be represented by unchanged data alone."
+    }
+  ],
+  "minimal_future_integration_only_adapter_proposal": {
+    "status": "SOURCE_PROPOSAL_HOLD_REQUIRES_SEPARATE_EXPLICIT_CODE_SCOPE_REVIEW",
+    "preserve": "Keep canonical9004, original invoke/waits/pidfd/family/source/context/HOLD/3790/strict ordinary results unchanged. Keep existing rootlib artifact parser intact for LIB3.",
+    "required_narrow_task_seams": [
+      "A task-specific integration compiler-artifact reader for exact root manifest, kind test/name linear_cli_contract/profile.test/features[]; require unique original successful Cargo build-finished.",
+      "A separate task-specific exact cagents bin artifact reader from that same integration compile stream: kind bin/name cagents/src/main.rs/non-test profile/features[]; retain original Cargo metadata/fresh and source tuple.",
+      "A genuine source-supported CARGO_BIN_EXE-to-emitted-bin relationship contract and actual compile provenance; no guessed target path, runtime env override, stale ELF or extra implicit command.",
+      "Bind both canonical absolute target-contained regular nonsymlink executable ELFs/digests to original compilation; observe selected-use assets before/after while retaining original nonzero primary/error-HOLD behavior and no fabricated subprocess waits.",
+      "Inventory actual integration ELF, invoke its one exact parent captured pretty/default scheduler, fresh N-1, strict1P0F0I0M and final raw reread. No body/subprocess/nonadditive variants pass inflation."
+    ],
+    "no_implementation_done": true,
+    "runtime_ELFs_counts_results_review_grant": null
+  },
+  "authorized_split_preparation": {
+    "kind": "STANDALONE_CLI_LIB3_ONLY",
+    "command_phase_count": 6,
+    "caps_seconds": [
+      300,
+      900,
+      30,
+      90,
+      90,
+      90
+    ],
+    "caps_sum": 1500,
+    "original_deadline_cap": 2400,
+    "names": [
+      "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+      "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+      "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json"
+    ],
+    "integration": "UNINVOKED_UNQUALIFIED_HOLD; no Linear4/full-feature result"
+  },
+  "actual": {
+    "candidate_calls_imports_tests_builds_runtime": 0,
+    "initial_object_lookup_exit": 128,
+    "normal_exact_source_import_exit": 0,
+    "runtime_ELF_inventory_N_results": null,
+    "grant": null,
+    "execution_authorized": false
+  },
+  "limits": [
+    "No production review was repeated; genuine separate source proofs stay bounded and immutable.",
+    "No new packet worktree or controller source was written for the blocked Linear4 design.",
+    "A split LIB3 result cannot qualify actual CLI stdout integration, full feature, native UI, current CI, merge or whole head."
+  ]
+}

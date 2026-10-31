@@ -1,0 +1,25 @@
+{
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "ac80b9e7ea0495c43ab56c1806fdedc37d8880d1327365eaa5802181213014d2",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source",
+  "execution_authorized": false,
+  "kind": "NOT_SUBMITTABLE_PRE_REVIEW_SOURCE_TEMPLATE",
+  "review_ABI": {
+    "controller_identity": "EXTERNAL_POSTCOMMIT",
+    "head": "918920655d841600e1a44b66057a634940e0e132",
+    "review": "PENDING_GENUINE_FROZEN_ACTUAL_CODE_REVIEW",
+    "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab"
+  }
+}
