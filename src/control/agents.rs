@@ -128,7 +128,7 @@ pub enum AgentCommand {
         #[arg(long = "field", value_name = "FIELD=VALUE")]
         fields: Vec<String>,
     },
-    /// Interrupt an owned agent's active run.
+    /// Interrupt an owned agent's active managed run.
     Interrupt {
         #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,

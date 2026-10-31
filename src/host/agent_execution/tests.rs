@@ -2809,9 +2809,26 @@ fn only_an_agents_owner_reads_its_requests_and_controls_it() {
     if isolated("only_an_agents_owner_reads_its_requests_and_controls_it").is_some() {
         return;
     }
-    let (host, request, _) = fixture();
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let provider = root.join("bin/claude");
+    let script = std::fs::read_to_string(&provider).unwrap();
+    let read_frame = "while IFS= read -r frame; do\n";
+    assert_eq!(script.matches(read_frame).count(), 1);
+    std::fs::write(
+        provider,
+        script.replacen(
+            read_frame,
+            &format!(
+                "{read_frame}  printf '%s\\n' \"$frame\" >> \"$HOME/../refusal-input.jsonl\"\n"
+            ),
+            1,
+        ),
+    )
+    .unwrap();
     let accepted = submit(&host, &Authority::default(), request.clone()).unwrap();
-    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let mut terminal = settled(&host, accepted.run.id);
+    assert_eq!(terminal.state, State::Succeeded);
     let owner = Authority::default();
     let agent = accepted.agent.id;
     let requests = |authority: &Authority, operation| -> Result<Vec<chat::Request>, String> {
@@ -2825,17 +2842,158 @@ fn only_an_agents_owner_reads_its_requests_and_controls_it() {
             .unwrap()
             .is_empty()
     );
-    let error = requests(
-        &owner,
-        Operation::Control {
-            agent,
-            command: Control::Interrupt {
-                including_subagents: false,
-            },
-        },
-    )
-    .unwrap_err();
-    assert!(error.contains("no active run"), "{error}");
+    let original_session = status(&host, &owner, agent).unwrap().0.session;
+    let session_id = original_session.as_ref().unwrap().id();
+    let original_handle = host.lock().unwrap().chats[&session_id].handle.clone();
+    let owner_origin = origin(&host, &owner).unwrap();
+    let mut background = None;
+    for state in [
+        State::Succeeded,
+        State::Failed,
+        State::Cancelled,
+        State::Interrupted,
+    ] {
+        if state == State::Interrupted {
+            // A managed followup is valid before the uncertain outcome, never
+            // after it. Its background decision then permits only a denial.
+            let followup = submit(
+                &host,
+                &owner,
+                Submit {
+                    name: None,
+                    destination: Destination::Existing(agent),
+                    prompt: "BACKGROUND_PERMISSION after terminal refusals".into(),
+                    idempotency_key: "after-terminal-refusals".into(),
+                },
+            )
+            .unwrap();
+            let asked = pending_requests(&host, agent);
+            assert_eq!(asked.len(), 1);
+            background = Some(asked[0].clone());
+            assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
+            assert_eq!(
+                status(&host, &owner, agent).unwrap().0.session,
+                original_session,
+                "refusals preserve the same provider session for the followup"
+            );
+        }
+        if state != State::Succeeded {
+            // Record a later outcome without dispatching another prompt. The
+            // earlier provider stays live; this state is not its activity.
+            let store = registry(&host).unwrap();
+            let mut store = store.lock().unwrap();
+            let fresh = store
+                .submit_agent(
+                    &owner_origin,
+                    &Submit {
+                        name: None,
+                        destination: Destination::Existing(agent),
+                        prompt: "undispatched terminal-state fixture".into(),
+                        idempotency_key: format!("terminal-refusal-{state:?}"),
+                    },
+                    now(),
+                )
+                .unwrap();
+            terminal = store
+                .update_agent_run(
+                    fresh.run.id,
+                    fresh.run.revision,
+                    Update::Finished {
+                        state,
+                        result: Default::default(),
+                    },
+                    now(),
+                )
+                .unwrap();
+            assert!(terminal.started_ms.is_none());
+        }
+        assert_eq!(status(&host, &owner, agent).unwrap().1, terminal);
+        assert!(!original_handle.is_completed());
+        assert!(
+            host.lock().unwrap().chats[&session_id]
+                .handle
+                .same_attachment(&original_handle)
+        );
+        for including_subagents in [false, true] {
+            let error = crate::host::client::process_request(
+                &host,
+                1,
+                ClientRequest::Agent {
+                    authority: owner.clone(),
+                    operation: Operation::Control {
+                        agent,
+                        command: Control::Interrupt {
+                            including_subagents,
+                        },
+                    },
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.code,
+                crate::terminal_ipc::ProtocolErrorCode::InvalidRequest
+            );
+            assert!(!error.retryable);
+            assert!(
+                error.message.contains(&format!(
+                    "latest managed run {} is {:?}",
+                    terminal.id, terminal.state
+                )),
+                "{error:?}"
+            );
+            assert!(error.message.contains("active managed run"), "{error:?}");
+            assert!(error.message.contains("no interrupt was sent"), "{error:?}");
+            assert_eq!(status(&host, &owner, agent).unwrap().1, terminal);
+        }
+    }
+    let background = background.unwrap();
+    assert_eq!(terminal.state, State::Interrupted);
+    assert!(!root.join("decisions").exists());
+    assert!(
+        requests(
+            &owner,
+            Operation::Control {
+                agent,
+                command: Control::Answer {
+                    request_id: background.id,
+                    action: "deny".into(),
+                    answers: Vec::new(),
+                },
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(root.join("decisions")).unwrap_or_default() != "deny\n" {
+        assert!(
+            Instant::now() < deadline,
+            "the denial never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(status(&host, &owner, agent).unwrap().1, terminal);
+    // The observed denial follows every refused control on the same provider,
+    // including Interrupted, without reopening uncertain work. Inspect the
+    // real input before any fixture cleanup traffic.
+    let frames: Vec<serde_json::Value> = std::fs::read_to_string(root.join("refusal-input.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame["type"] == "user")
+            .count(),
+        2,
+        "the recorder saw both the initial and same-session followup prompt"
+    );
+    assert!(
+        !frames.iter().any(|frame| frame["type"] == "control_request"
+            && frame["request"]["subtype"] == "interrupt"),
+        "terminal refusals must not write a provider interrupt: {frames:?}"
+    );
     // Controlling on its owner's behalf is not a person taking the agent over.
     assert!(
         !registry(&host)
@@ -2958,7 +3116,15 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
         including_subagents: true,
     })
     .unwrap_err();
-    assert!(error.contains("no active run"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "latest managed run {} is Succeeded",
+            accepted.run.id
+        )),
+        "{error}"
+    );
+    assert!(error.contains("active managed run"), "{error}");
+    assert!(error.contains("no interrupt was sent"), "{error}");
     let root = path.parent().unwrap();
     assert!(!root.join("decisions").exists(), "nothing was approved");
 
@@ -3258,7 +3424,15 @@ fn an_owner_answers_and_interrupts_only_its_own_active_run() {
         including_subagents: false,
     })
     .unwrap_err();
-    assert!(error.contains("no active run"), "{error}");
+    assert!(
+        error.contains(&format!(
+            "latest managed run {} is Succeeded",
+            accepted.run.id
+        )),
+        "{error}"
+    );
+    assert!(error.contains("active managed run"), "{error}");
+    assert!(error.contains("no interrupt was sent"), "{error}");
 
     // Once a person takes the agent over, the question its next turn raises
     // is theirs, though its owner may still see it.

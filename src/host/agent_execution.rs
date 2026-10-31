@@ -1027,8 +1027,12 @@ fn control(
     }
     if run.state.is_terminal() && !matches!(&command, Control::Answer { .. }) {
         return Err(format!(
-            "The agent has no active run; its latest is {:?}",
-            run.state
+            concat!(
+                "The latest managed run {} is {:?}. ",
+                "This command can interrupt only this agent's active managed run; ",
+                "no interrupt was sent."
+            ),
+            run.id, run.state
         ));
     }
     let answered = match command {
