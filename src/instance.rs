@@ -47,6 +47,18 @@ const MAX_ACTIVATION_LINE_BYTES: usize = 4096;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
 const LEGACY_PROCESS_NAME: &str = "cagents-ui";
+/// The modes `cagents-ui` spawns itself with, each its first argument. None of
+/// them takes the window lease or opens the session store.
+pub const CONFIRM_DAEMON_STOP_MODE: &str = "--confirm-daemon-stop";
+pub const STARTUP_ERROR_MODE: &str = "--startup-error";
+pub const STARTUP_UPDATE_MODE: &str = "--startup-update";
+pub const RENDER_PAGE_MODE: &str = "--internal-render-page";
+const HELPER_MODES: [&str; 4] = [
+    CONFIRM_DAEMON_STOP_MODE,
+    STARTUP_ERROR_MODE,
+    STARTUP_UPDATE_MODE,
+    RENDER_PAGE_MODE,
+];
 const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
 // `full` names the product that ships the embedded browser: it claims that
 // package's application id, window class, and peer directory. A UI built with
@@ -1953,7 +1965,13 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
     }
 }
 
-fn mark_lease_capable_process() -> io::Result<()> {
+/// Names this process so a starting window does not mistake it for a UI that
+/// predates the session-store lease.
+///
+/// Every mode of the current UI executable takes it, not only a window that
+/// holds the lease: the legacy scan matches any process still named
+/// `cagents-ui` that is not running a helper mode.
+pub fn mark_lease_capable_process() -> io::Result<()> {
     fs::write("/proc/self/comm", LEASE_CAPABLE_PROCESS_NAME)
 }
 fn peer_ui_predates_lease(peer_directory: &Path) -> bool {
@@ -2011,10 +2029,27 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
             if matches!(state, "Z" | "X") && fields.get(17) == Some(&"1") {
                 continue;
             }
+            // Every helper mode postdates the lease, so one still carrying the
+            // old name is a lease-aware build's helper. An update's progress
+            // window comes from the build being replaced, which may not rename
+            // its helpers; refusing on it would block the update's own windows.
+            if runs_helper_mode(&entry.path()) {
+                continue;
+            }
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Unreadable arguments are not evidence of a helper, so they keep the refusal.
+fn runs_helper_mode(process: &Path) -> bool {
+    fs::read(process.join("cmdline")).is_ok_and(|arguments| {
+        arguments
+            .split(|byte| *byte == 0)
+            .nth(1)
+            .is_some_and(|mode| HELPER_MODES.iter().any(|helper| helper.as_bytes() == mode))
+    })
 }
 
 fn current_uid() -> u32 {
@@ -2666,6 +2701,28 @@ mod tests {
         fields[17] = "2";
         fs::write(legacy.join("stat"), stat(&fields)).unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        for mode in HELPER_MODES {
+            fs::write(
+                legacy.join("cmdline"),
+                format!("/old/cagents-ui\0{mode}\0payload\0"),
+            )
+            .unwrap();
+            assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
+        }
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0primary\0",
+        )
+        .unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        // A helper flag is only a mode in first position.
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0--startup-update\0",
+        )
+        .unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        fs::remove_file(legacy.join("cmdline")).unwrap();
         fs::write(legacy.join("stat"), "malformed").unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).is_err());
         fs::remove_file(legacy.join("stat")).unwrap();

@@ -260,8 +260,11 @@ mod service {
             .map_err(|error| failed(error.to_string()))?;
         let capability = serde_json::to_string(&preflight.capability)
             .map_err(|error| failed(error.to_string()))?;
-        let output = spawn_child("cagents-ui", &["--confirm-daemon-stop".into(), capability])
-            .map_err(failed)?;
+        let output = spawn_child(
+            "cagents-ui",
+            &[crate::instance::CONFIRM_DAEMON_STOP_MODE.into(), capability],
+        )
+        .map_err(failed)?;
         confirmation_outcome(output.status.success(), &output.stdout, &output.stderr)
     }
 
