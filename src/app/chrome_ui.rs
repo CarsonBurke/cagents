@@ -1414,6 +1414,10 @@ pub enum Action {
     ToggleNotices,
     RetryCleanup(uuid::Uuid),
     OpenCleanupSource(uuid::Uuid),
+    CloseIssuedReturn(uuid::Uuid),
+    RetryIssuedClose(uuid::Uuid),
+    RetryIssuedFlush(uuid::Uuid),
+    RetryIssuedAck(uuid::Uuid),
     ToggleAttention,
     AttentionPage(usize),
     ShowNoticesFor(CardId),
@@ -1857,6 +1861,23 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::CloseIssuedReturn(id)
+            | Action::RetryIssuedClose(id)
+            | Action::RetryIssuedFlush(id)
+            | Action::RetryIssuedAck(id) => {
+                if self.chrome_ui.popup != Some(Popup::Notices) {
+                    return Task::none();
+                }
+                let purpose = match action {
+                    Action::CloseIssuedReturn(_) => chat_ui::IssuedNoticeAction::Close,
+                    Action::RetryIssuedClose(_) => chat_ui::IssuedNoticeAction::RetryClose,
+                    Action::RetryIssuedFlush(_) => chat_ui::IssuedNoticeAction::RetryFlush,
+                    Action::RetryIssuedAck(_) => chat_ui::IssuedNoticeAction::RetryAck,
+                    _ => unreachable!(),
+                };
+                let work = self.issued_action(id, purpose);
+                Task::batch([work, self.refocus_notices()])
+            }
             Action::OpenCleanupSource(id) => {
                 if self.chrome_ui.popup != Some(Popup::Notices) {
                     return Task::none();
@@ -2569,6 +2590,59 @@ impl Cagents {
                         })
                     };
                     notices.push(super::notice_surface(severity, body, retry, false));
+                }
+                for issued in self.issued_return_notices() {
+                    let severity = if issued.error {
+                        NoticeSeverity::Error
+                    } else {
+                        NoticeSeverity::Warning
+                    };
+                    let body = widget::column::with_children(vec![
+                        super::notice_body(issued.title),
+                        super::notice_surface_detail(severity, issued.detail),
+                    ])
+                    .spacing(space::XS)
+                    .into();
+                    let action = issued.action.map(|purpose| {
+                        let message = if let Some(owner) = issued.queued_retry {
+                            Action::RetryCleanup(owner)
+                        } else {
+                            match purpose {
+                                chat_ui::IssuedNoticeAction::Close => {
+                                    Action::CloseIssuedReturn(issued.id)
+                                }
+                                chat_ui::IssuedNoticeAction::RetryClose => {
+                                    Action::RetryIssuedClose(issued.id)
+                                }
+                                chat_ui::IssuedNoticeAction::RetryFlush => {
+                                    Action::RetryIssuedFlush(issued.id)
+                                }
+                                chat_ui::IssuedNoticeAction::RetryAck => {
+                                    Action::RetryIssuedAck(issued.id)
+                                }
+                            }
+                        };
+                        crate::ui_controls::owned(
+                            (
+                                issued.id,
+                                issued.operation,
+                                issued.attempt,
+                                purpose.purpose(),
+                            ),
+                            super::notice_surface_action(
+                                severity,
+                                purpose.label(),
+                                purpose.label(),
+                                widget::Id::new(format!(
+                                    "chrome.issued.{}.{}",
+                                    issued.id,
+                                    purpose.purpose()
+                                )),
+                                Message::ChromeUi(message),
+                            ),
+                        )
+                    });
+                    notices.push(super::notice_surface(severity, body, action, false));
                 }
                 if let Some(health) = &self.save_health {
                     notices.extend(save_health_views(

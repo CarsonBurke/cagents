@@ -4323,6 +4323,14 @@ pub enum Message {
     TerminalHandoffsCommitted {
         result: Result<Vec<(TerminalSession, Result<(), String>)>, String>,
     },
+    IssuedTerminalHandoffsFlushed {
+        bindings: Vec<chat_ui::IssuedBinding>,
+        result: Result<(), String>,
+    },
+    IssuedTerminalHandoffsCommitted {
+        binding: chat_ui::IssuedBinding,
+        result: Result<(), String>,
+    },
     /// Hosted terminals the daemon reports, either as its full inventory on
     /// connect or as one terminal another client just created.
     HostedTerminalsObserved(Vec<crate::terminal::ipc::TerminalDescriptor>),
@@ -7792,6 +7800,7 @@ impl Cagents {
         }
         self.pending_terminal_handoffs
             .insert(session.id, session.clone());
+        self.mark_issued_represented(card, &session);
         let commit = self.commit_terminal_handoffs();
         let attach = self.start_terminal(
             card,
@@ -7805,6 +7814,12 @@ impl Cagents {
     /// The flush is ordered after conversion snapshots. Never release daemon
     /// replay evidence based only on receiving or attaching its replacement.
     fn commit_terminal_handoffs(&mut self) -> Task<Message> {
+        let legacy = self.commit_legacy_terminal_handoffs();
+        let issued = self.commit_issued_terminal_handoffs();
+        Task::batch([legacy, issued])
+    }
+
+    fn commit_legacy_terminal_handoffs(&mut self) -> Task<Message> {
         // This existing refresh/save wake also releases observations when a
         // return was retired by closing or replacing its original card.
         let adopted = self.drain_pending_terminal_adoptions();
@@ -7822,7 +7837,10 @@ impl Cagents {
         let terminals = self
             .pending_terminal_handoffs
             .values()
-            .filter(|terminal| self.terminal_return_can_commit(terminal))
+            .filter(|terminal| {
+                !self.chat_ui.issued_id_held(terminal.id)
+                    && self.terminal_return_can_commit(terminal)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if terminals.is_empty() {
@@ -13181,6 +13199,11 @@ impl Cagents {
         if self.device_ui.busy() {
             return Some("Wait for the device operation to finish before closing the window.");
         }
+        if self.chat_ui.issued_unresolved() {
+            return Some(
+                "Resolve the returned sessions in Application notices before closing this window.",
+            );
+        }
         if self.chat_ui.return_cleanup_unresolved() {
             return Some(
                 "Finish closing the original conversation in Application notices before closing this window.",
@@ -14702,13 +14725,20 @@ impl Application for Cagents {
                 self.terminal_directory()
                     .unwrap_or_else(|| STARTING_DIRECTORY.clone()),
             ),
+            Message::IssuedTerminalHandoffsFlushed { bindings, result } => {
+                self.finish_issued_flush(bindings, result)
+            }
+            Message::IssuedTerminalHandoffsCommitted { binding, result } => {
+                self.finish_issued_ack(binding, result)
+            }
             Message::TerminalHandoffsCommitted { result } => {
                 self.terminal_handoff_commit_inflight = false;
                 let failure = match result {
                     Ok(results) => {
                         let mut failures = Vec::new();
                         for (terminal, result) in results {
-                            if self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal)
+                            if self.chat_ui.issued_id_held(terminal.id)
+                                || self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal)
                                 || !self.terminal_return_can_commit(&terminal) {
                                 continue;
                             }

@@ -388,7 +388,12 @@ pub enum Action {
     CompletionDismiss(Target),
     /// Where the completion list has been scrolled to.
     CompletionScrolled(Target, f32),
-    HandoffFinished(Target, Result<TerminalSession, String>),
+    HandoffFinished(Target, uuid::Uuid, Result<chat::ReturnedTerminal, String>),
+    IssuedCloseFinished(
+        IssuedBinding,
+        Result<crate::terminal::ipc::TerminalCloseResult, String>,
+    ),
+    NativeReturnCloseFinished(uuid::Uuid, Target, Result<(), String>),
     CloseFinished(Target, Result<(), String>),
     RetainedCloseFinished(Target, chat::Session, Result<(), String>),
     SharedReturnCloseFinished(Target, Result<(), String>),
@@ -455,6 +460,8 @@ impl Action {
                 | Self::CloseFinished(..)
                 | Self::RetainedCloseFinished(..)
                 | Self::SharedReturnCloseFinished(..)
+                | Self::IssuedCloseFinished(..)
+                | Self::NativeReturnCloseFinished(..)
                 | Self::Retired(..)
                 | Self::DispatchQueued(..)
                 | Self::ClearCopied(..)
@@ -634,6 +641,154 @@ impl CleanupNotice {
     }
 }
 
+/// One original native Return. These contexts are volatile and never saved.
+#[derive(Clone)]
+struct NativeReturnContext {
+    operation: uuid::Uuid,
+    target: Target,
+    source: chat::Session,
+    handle: Arc<ClientHandle>,
+    presentation: CardKind,
+    title: String,
+    origin: Option<super::shared_views::TerminalReturnOrigin>,
+    save_caller: crate::control::CallerContext,
+}
+
+struct NativeReturn {
+    context: NativeReturnContext,
+    pending: bool,
+    first_error: Option<String>,
+    first_issued: Option<uuid::Uuid>,
+    close: Option<IssuedCloseOwner>,
+    none_attempt: Option<Target>,
+    none_pending: bool,
+    none_error: Option<String>,
+    none_closed: bool,
+}
+
+#[derive(Clone)]
+struct IssuedCloseOwner {
+    id: uuid::Uuid,
+    caller: crate::control::CallerContext,
+    queued: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IssuedStage {
+    Held,
+    Conflict,
+    Converting,
+    Closing,
+    CloseFailed,
+    Closed,
+    Flushing,
+    FlushFailed,
+    Acknowledging,
+    AckFailed,
+}
+
+/// Callback identity is independent of the reusable terminal/card IDs. Caller
+/// custody stays in the original context identified by `operation`, never in a
+/// newly captured environment or the callback's public descriptor.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IssuedBinding {
+    id: uuid::Uuid,
+    operation: uuid::Uuid,
+    target: Target,
+    source: chat::Session,
+    returned: chat::ReturnedTerminal,
+    attempt: uuid::Uuid,
+    disposition: Option<uuid::Uuid>,
+}
+
+impl std::fmt::Debug for IssuedBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Message diagnostics may show presentation/attempt identity, never a
+        // cleanup capability or captured source/caller credentials.
+        formatter
+            .debug_struct("IssuedBinding")
+            .field("notice", &self.id)
+            .field("operation", &self.operation)
+            .field("attempt", &self.attempt)
+            .finish_non_exhaustive()
+    }
+}
+
+struct IssuedReturn {
+    id: uuid::Uuid,
+    context: NativeReturnContext,
+    returned: chat::ReturnedTerminal,
+    stage: IssuedStage,
+    attempt: uuid::Uuid,
+    close: Option<IssuedCloseOwner>,
+    linked_queued_close: bool,
+    represented: bool,
+    closed: bool,
+    return_error: Option<String>,
+    cleanup_error: Option<String>,
+    flush_error: Option<String>,
+    ack_error: Option<String>,
+}
+
+impl IssuedReturn {
+    fn binding(&self) -> IssuedBinding {
+        IssuedBinding {
+            id: self.id,
+            operation: self.context.operation,
+            target: self.context.target,
+            source: self.context.source.clone(),
+            returned: self.returned.clone(),
+            attempt: self.attempt,
+            disposition: self.close.as_ref().map(|owner| owner.id),
+        }
+    }
+}
+
+struct IssuedConflict {
+    id: uuid::Uuid,
+    target: Target,
+    returned: chat::ReturnedTerminal,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IssuedNoticeAction {
+    Close,
+    RetryClose,
+    RetryFlush,
+    RetryAck,
+}
+
+impl IssuedNoticeAction {
+    pub(super) fn purpose(self) -> &'static str {
+        match self {
+            Self::Close => "close-issued-first",
+            Self::RetryClose => "retry-issued-close",
+            Self::RetryFlush => "retry-issued-flush",
+            Self::RetryAck => "retry-issued-ack",
+        }
+    }
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Close => "Close returned terminal",
+            Self::RetryClose => "Retry close returned terminal",
+            Self::RetryFlush => "Retry saving",
+            Self::RetryAck => "Retry confirmation",
+        }
+    }
+}
+
+pub(super) struct IssuedNotice {
+    pub(super) id: uuid::Uuid,
+    pub(super) operation: uuid::Uuid,
+    pub(super) attempt: uuid::Uuid,
+    pub(super) title: String,
+    pub(super) detail: String,
+    pub(super) error: bool,
+    pub(super) action: Option<IssuedNoticeAction>,
+    pub(super) queued_retry: Option<uuid::Uuid>,
+}
+
 enum Phase {
     Starting(Attempt),
     Returning {
@@ -665,6 +820,10 @@ pub(super) struct State {
     generation: u64,
     phases: HashMap<CardId, Phase>,
     terminal_returns: HashMap<Target, SharedTerminalReturn>,
+    native_returns: HashMap<uuid::Uuid, NativeReturn>,
+    active_native_returns: HashMap<Target, uuid::Uuid>,
+    issued_returns: HashMap<uuid::Uuid, IssuedReturn>,
+    issued_conflicts: HashMap<uuid::Uuid, IssuedConflict>,
     terminal_return_owners: HashMap<
         TerminalId,
         (
@@ -723,6 +882,10 @@ impl Default for State {
             generation: 0,
             phases: HashMap::new(),
             terminal_returns: HashMap::new(),
+            native_returns: HashMap::new(),
+            active_native_returns: HashMap::new(),
+            issued_returns: HashMap::new(),
+            issued_conflicts: HashMap::new(),
             terminal_return_owners: HashMap::new(),
             return_cleanup: retirement::Ledger::new(),
             explicit_starts: HashMap::new(),
@@ -768,7 +931,8 @@ impl State {
     }
 
     pub(super) fn return_cleanup_unresolved(&self) -> bool {
-        !self.return_cleanup.is_empty()
+        self.issued_unresolved()
+            || !self.return_cleanup.is_empty()
             || self
                 .terminal_returns
                 .values()
@@ -776,13 +940,30 @@ impl State {
     }
 
     pub(super) fn return_cleanup_needs_retry(&self) -> bool {
-        self.terminal_returns.values().any(|pending| {
-            pending.close_owner.is_some()
-                && !pending
-                    .cleanup_target
-                    .is_some_and(|target| self.return_cleanup.is_pending(target))
-                && (pending.return_error.is_some() || pending.cleanup_target.is_some())
-        })
+        self.native_returns.values().any(|pending| {
+            pending.context.origin.is_none()
+                && pending.close.is_some()
+                && !pending.pending
+                && !pending.none_pending
+                && !pending.none_closed
+                && pending.first_issued.is_none()
+        }) || self.issued_returns.values().any(|record| {
+            matches!(
+                record.stage,
+                IssuedStage::Held
+                    | IssuedStage::Conflict
+                    | IssuedStage::CloseFailed
+                    | IssuedStage::FlushFailed
+                    | IssuedStage::AckFailed
+            )
+        }) || !self.issued_conflicts.is_empty()
+            || self.terminal_returns.values().any(|pending| {
+                pending.close_owner.is_some()
+                    && !pending
+                        .cleanup_target
+                        .is_some_and(|target| self.return_cleanup.is_pending(target))
+                    && (pending.return_error.is_some() || pending.cleanup_target.is_some())
+            })
     }
 
     pub(super) fn cleanup_notices(&self) -> Vec<CleanupNotice> {
@@ -808,6 +989,33 @@ impl State {
                 attempt: pending.cleanup_target,
             })
         }).collect::<Vec<_>>();
+        for pending in self.native_returns.values().filter(|pending| {
+            pending.context.origin.is_none()
+                && pending.first_issued.is_none()
+                && !pending.none_closed
+        }) {
+            let Some(owner) = &pending.close else {
+                continue;
+            };
+            let mut detail = pending
+                .first_error
+                .as_ref()
+                .map(|error| format!("Return to terminal failed: {error}"))
+                .unwrap_or_else(|| "Close is waiting for the original return.".into());
+            if let Some(error) = &pending.none_error {
+                detail.push_str(&format!("\nCleanup failed: {error}"));
+            }
+            rows.push(CleanupNotice {
+                id: owner.id,
+                title: pending.context.title.clone(),
+                detail,
+                retry: !pending.pending && !pending.none_pending,
+                restart: false,
+                blocked: false,
+                open_saved: None,
+                attempt: pending.none_attempt,
+            });
+        }
         rows.sort_by(|a, b| a.title.cmp(&b.title).then(a.id.cmp(&b.id)));
         rows
     }
@@ -6914,6 +7122,9 @@ impl Cagents {
     }
 
     pub(super) fn terminal_return_receipt_committed(&mut self, terminal: &TerminalSession) {
+        if self.chat_ui.issued_id_held(terminal.id) {
+            return;
+        }
         if self
             .chat_ui
             .terminal_return_owners
@@ -7052,7 +7263,39 @@ impl Cagents {
 
     pub(super) fn shared_return_cleanup_notices(&self) -> Vec<CleanupNotice> {
         let mut rows = self.chat_ui.cleanup_notices();
+        rows.retain(|row| {
+            let target = self
+                .chat_ui
+                .terminal_returns
+                .iter()
+                .find_map(|(target, pending)| {
+                    pending
+                        .close_owner
+                        .as_ref()
+                        .filter(|owner| owner.id == row.id)
+                        .map(|_| *target)
+                });
+            let Some(target) = target else {
+                return true;
+            };
+            let Some(id) = self.issued_for_target(target) else {
+                return true;
+            };
+            self.pane_is_quarantined(target.card) && !self.chat_ui.issued_returns[&id].closed
+        });
         for row in &mut rows {
+            if let Some(pending) = self.chat_ui.native_returns.values().find(|pending| {
+                pending.context.origin.is_none()
+                    && pending
+                        .close
+                        .as_ref()
+                        .is_some_and(|owner| owner.id == row.id)
+            }) && self.pane_is_quarantined(pending.context.target.card)
+            {
+                row.retry = false;
+                row.blocked = true;
+                row.detail.push_str("\nThe saved source needs verification. This close remains retained; no cleanup has been confirmed.");
+            }
             let Some(owner) = self.chat_ui.terminal_returns.values().find_map(|pending| {
                 pending
                     .close_owner
@@ -7204,6 +7447,9 @@ impl Cagents {
         if self.pane_is_quarantined(returned.card) {
             return Task::none();
         }
+        if let Some(id) = self.issued_for_target(returned) {
+            return self.begin_issued_close(id);
+        }
         let Some(pending) = self.chat_ui.terminal_returns.get(&returned) else {
             return Task::none();
         };
@@ -7245,6 +7491,27 @@ impl Cagents {
     }
 
     pub(super) fn retry_shared_return_cleanup(&mut self, id: uuid::Uuid) -> Task<Message> {
+        if let Some(record) = self.chat_ui.issued_returns.values().find(|record| {
+            record
+                .close
+                .as_ref()
+                .is_some_and(|owner| owner.queued && owner.id == id)
+        }) {
+            let record = record.id;
+            return self.issued_action(record, IssuedNoticeAction::RetryClose);
+        }
+        if let Some(operation) =
+            self.chat_ui
+                .native_returns
+                .iter()
+                .find_map(|(operation, pending)| {
+                    (pending.context.origin.is_none()
+                        && pending.close.as_ref().is_some_and(|owner| owner.id == id))
+                    .then_some(*operation)
+                })
+        {
+            return self.begin_native_none_cleanup(operation);
+        }
         let Some(returned) = self
             .chat_ui
             .terminal_returns
@@ -7261,6 +7528,9 @@ impl Cagents {
         };
         if self.pane_is_quarantined(returned.card) {
             return Task::none();
+        }
+        if let Some(id) = self.issued_for_target(returned) {
+            return self.issued_action(id, IssuedNoticeAction::RetryClose);
         }
         let pending = &self.chat_ui.terminal_returns[&returned];
         if pending.return_error.is_none() && pending.cleanup_target.is_none() {
@@ -7316,6 +7586,13 @@ impl Cagents {
             return Task::none();
         }
         let matches = self.return_close_presentation_matches(&owner);
+        for pending in self.chat_ui.native_returns.values_mut().filter(|pending| {
+            pending.context.target == owner.return_target
+                && pending.context.source == owner.source
+                && pending.first_issued.is_none()
+        }) {
+            pending.none_closed = true;
+        }
         // Only the exact successful attempt releases original A. A projected
         // B with the same IDs is never a presentation authorized by this receipt.
         if let Some(pending) = self.chat_ui.terminal_returns.remove(&owner.return_target)
@@ -7370,6 +7647,7 @@ impl Cagents {
     }
 
     fn refuse_shared_terminal_return(&mut self, target: Target, error: String) -> Task<Message> {
+        self.hold_issued_return(target, &error);
         let current = self.shared_terminal_return_source_current(target)
             && self
                 .chat_ui
@@ -7956,7 +8234,9 @@ impl Cagents {
             _ => None,
         };
         if let Some(target) = returning {
-            if self.capture_shared_return_close(target, caller) {
+            if self.capture_shared_return_close(target, caller.clone())
+                && self.capture_native_return_close(target, caller)
+            {
                 if let Some(Phase::Returning {
                     close_requested, ..
                 }) = self.chat_ui.phases.get_mut(&card)
@@ -7975,6 +8255,29 @@ impl Cagents {
             self.status = Some(TransientNotice::warning(
                 "Retry closing the original conversation from Application notices.",
             ));
+            return Task::none();
+        }
+        let native = self
+            .chat_ui
+            .phases
+            .get(&card)
+            .and_then(|phase| match phase {
+                Phase::Returning {
+                    target,
+                    local: None,
+                    ..
+                } => Some(*target),
+                _ => None,
+            });
+        if let Some(target) = native {
+            if self.capture_native_return_close(target, caller) {
+                if let Some(Phase::Returning {
+                    close_requested, ..
+                }) = self.chat_ui.phases.get_mut(&card)
+                {
+                    *close_requested = true;
+                }
+            }
             return Task::none();
         }
         if let Some(Phase::Returning {
@@ -9640,6 +9943,14 @@ impl Cagents {
                                 return Task::none();
                             }
                         };
+                        let Some(operation) = self.capture_native_return(
+                            target,
+                            source.clone(),
+                            handle.clone(),
+                            origin.clone(),
+                        ) else {
+                            return Task::none();
+                        };
                         if let Some(origin) = origin {
                             self.chat_ui.terminal_returns.insert(
                                 target,
@@ -9671,7 +9982,7 @@ impl Cagents {
                                     .await
                                     .map_err(|error| error.to_string())
                                     .and_then(|result| result);
-                            Message::ChatUi(Action::HandoffFinished(target, result))
+                            Message::ChatUi(Action::HandoffFinished(target, operation, result))
                         });
                     }
                     _ => return Task::none(),
@@ -12471,7 +12782,36 @@ impl Cagents {
                     runtime.completion.offset = offset;
                 }
             }
-            Action::HandoffFinished(target, result) => {
+            Action::HandoffFinished(target, operation, result) => {
+                let issued = match &result {
+                    Ok(returned) => {
+                        let Some(id) = self.retain_issued_return(target, operation, returned)
+                        else {
+                            if let Some(error) = self
+                                .chat_ui
+                                .native_returns
+                                .get(&operation)
+                                .and_then(|operation| operation.first_error.clone())
+                                && self.chat_ui.terminal_returns.get(&target).is_some_and(
+                                    |pending| {
+                                        pending.return_error.is_none() && pending.terminal.is_none()
+                                    },
+                                )
+                            {
+                                return self.refuse_shared_terminal_return(target, error);
+                            }
+                            return Task::none();
+                        };
+                        Some(id)
+                    }
+                    Err(error) => {
+                        if !self.native_result_error(target, operation, error) {
+                            return Task::none();
+                        }
+                        None
+                    }
+                };
+                let result = result.map(|returned| returned.session);
                 if self.chat_ui.terminal_returns.contains_key(&target) {
                     let pending = &self.chat_ui.terminal_returns[&target];
                     if pending.return_error.is_some()
@@ -12501,12 +12841,44 @@ impl Cagents {
                                 .terminal = Some(terminal.clone());
                             self.chat_ui
                                 .terminal_return_owners
-                                .insert(terminal.id, (target, origin, terminal.clone()));
+                                .entry(terminal.id)
+                                .or_insert((target, origin, terminal.clone()));
                             self.pending_terminal_handoffs.insert(terminal.id, terminal);
                             return self.publish_shared_terminal_return(target);
                         }
                         Err(error) => return self.refuse_shared_terminal_return(target, error),
                     }
+                }
+                if issued.is_none()
+                    && result.is_err()
+                    && self
+                        .chat_ui
+                        .native_returns
+                        .get(&operation)
+                        .is_some_and(|pending| pending.close.is_some())
+                {
+                    self.chat_ui.finish(target, |phase| {
+                        matches!(phase, Phase::Returning { local: None, .. })
+                    });
+                    if self
+                        .chat_ui
+                        .native_returns
+                        .get(&operation)
+                        .is_some_and(|pending| {
+                            self.native_return_presentation_matches(&pending.context)
+                        })
+                    {
+                        return self.begin_native_none_cleanup(operation);
+                    }
+                    return Task::none();
+                }
+                if let Some(id) = issued
+                    && self.chat_ui.issued_returns[&id].close.is_some()
+                {
+                    self.chat_ui.finish(target, |phase| {
+                        matches!(phase, Phase::Returning { local: None, .. })
+                    });
+                    return self.begin_issued_close(id);
                 }
                 if self.chat_runtime_mut(target).is_none() {
                     return Task::none();
@@ -12580,6 +12952,12 @@ impl Cagents {
                 } else {
                     task
                 };
+            }
+            Action::NativeReturnCloseFinished(operation, attempt, result) => {
+                return self.finish_native_none_cleanup(operation, attempt, result);
+            }
+            Action::IssuedCloseFinished(binding, result) => {
+                return self.finish_issued_close(binding, result);
             }
             Action::SharedReturnCloseFinished(target, result) => {
                 return self.finish_shared_return_cleanup(target, result);
@@ -12929,8 +13307,799 @@ pub(super) fn show_chat_snapshot_for_test(
     requests
 }
 
+fn close_issued_return_on(
+    client: &mut crate::control::ControlClient,
+    expected: Option<&crate::model::HostSessionProof>,
+    returned: &chat::ReturnedTerminal,
+) -> Result<crate::terminal::ipc::TerminalCloseResult, String> {
+    let expected = expected
+        .filter(|proof| proof.is_complete())
+        .ok_or("The original returned service could not be verified")?;
+    if returned.cleanup_receipt.is_nil()
+        || client.proof() != expected
+        || returned.session.continuity.live_proof().as_ref() != Some(expected)
+    {
+        return Err(
+            "The connected service differs from the original return; its receipt is retained"
+                .into(),
+        );
+    }
+    client
+        .close_returned_terminal(returned.session.id, returned.cleanup_receipt)
+        .map_err(|error| error.to_string())
+}
+
+impl State {
+    pub(super) fn issued_unresolved(&self) -> bool {
+        !self.issued_returns.is_empty()
+            || !self.issued_conflicts.is_empty()
+            || self.native_returns.values().any(|operation| {
+                operation.pending
+                    || (operation.context.origin.is_none()
+                        && operation.close.is_some()
+                        && !operation.none_closed)
+            })
+    }
+
+    pub(super) fn issued_id_held(&self, id: TerminalId) -> bool {
+        self.issued_returns
+            .values()
+            .any(|record| record.returned.session.id == id)
+            || self
+                .issued_conflicts
+                .values()
+                .any(|record| record.returned.session.id == id)
+    }
+
+    pub(super) fn issued_notices(&self) -> Vec<IssuedNotice> {
+        let mut rows = Vec::new();
+        for operation in self
+            .native_returns
+            .values()
+            .filter(|operation| operation.pending)
+        {
+            rows.push(IssuedNotice {
+                id: operation.context.operation,
+                operation: operation.context.operation,
+                attempt: operation.context.operation,
+                title: format!("Returning {} to terminal…", operation.context.title),
+                detail: "Waiting for the original return. Its context is retained even if the pane changes.".into(),
+                error: false,
+                action: None, queued_retry: None,
+            });
+        }
+        for record in self.issued_returns.values() {
+            let (message, action, error) = match record.stage {
+                IssuedStage::Held if !record.linked_queued_close && record.close.is_none() => (
+                    "A returned terminal is not open in this window. Close the returned terminal to finish this return.",
+                    Some(IssuedNoticeAction::Close),
+                    false,
+                ),
+                IssuedStage::Held | IssuedStage::Conflict => (
+                    "This return could not be matched safely. The original intent is retained; no cleanup or confirmation was inferred.",
+                    None,
+                    true,
+                ),
+                IssuedStage::Converting => ("Finishing return to terminal…", None, false),
+                IssuedStage::Closing => ("Closing the original returned terminal…", None, false),
+                IssuedStage::CloseFailed => (
+                    "Could not close the original returned terminal.",
+                    Some(IssuedNoticeAction::RetryClose),
+                    true,
+                ),
+                IssuedStage::Closed => (
+                    "The original returned terminal is closed. Saving this result…",
+                    None,
+                    false,
+                ),
+                IssuedStage::Flushing if record.closed => {
+                    ("The terminal is closed; saving the result…", None, false)
+                }
+                IssuedStage::Flushing => ("Saving the returned session…", None, false),
+                IssuedStage::FlushFailed if record.closed => (
+                    "The terminal is closed, but saving failed.",
+                    Some(IssuedNoticeAction::RetryFlush),
+                    true,
+                ),
+                IssuedStage::FlushFailed => (
+                    "The returned session could not be saved.",
+                    Some(IssuedNoticeAction::RetryFlush),
+                    true,
+                ),
+                IssuedStage::Acknowledging if record.closed => (
+                    "The terminal is closed and saved; finishing the return…",
+                    None,
+                    false,
+                ),
+                IssuedStage::Acknowledging => ("Finishing the saved return…", None, false),
+                IssuedStage::AckFailed => (
+                    "Saved, but this return could not be confirmed with the original service.",
+                    Some(IssuedNoticeAction::RetryAck),
+                    true,
+                ),
+            };
+            let mut detail = message.to_owned();
+            for (label, error) in [
+                ("Original return", &record.return_error),
+                ("Original cleanup", &record.cleanup_error),
+                ("Saving", &record.flush_error),
+                ("Confirmation", &record.ack_error),
+            ] {
+                if let Some(error) = error {
+                    detail.push_str(&format!("\n{label}: {error}"));
+                }
+            }
+            rows.push(IssuedNotice {
+                id: record.id,
+                operation: record.context.operation,
+                attempt: record.attempt,
+                title: record.context.title.clone(),
+                detail,
+                error,
+                action,
+                queued_retry: record
+                    .close
+                    .as_ref()
+                    .filter(|owner| owner.queued && record.stage == IssuedStage::CloseFailed)
+                    .map(|owner| owner.id),
+            });
+        }
+        for record in self.issued_conflicts.values() {
+            rows.push(IssuedNotice {
+                id: record.id,
+                operation: record.id,
+                attempt: record.id,
+                title: "A terminal return needs attention".into(),
+                detail: record.detail.clone(),
+                error: true,
+                action: None,
+                queued_retry: None,
+            });
+        }
+        rows.sort_by(|left, right| left.id.cmp(&right.id));
+        rows
+    }
+}
+
+impl Cagents {
+    pub(super) fn issued_return_notices(&self) -> Vec<IssuedNotice> {
+        self.chat_ui.issued_notices().into_iter().filter_map(|mut row| {
+            if let Some(record) = self.chat_ui.issued_returns.get(&row.id)
+                && record.close.as_ref().is_some_and(|owner| owner.queued)
+                && self.pane_is_quarantined(record.context.target.card) && !record.closed {
+                if record.context.origin.is_some() { return None; }
+                row.action = None;
+                row.queued_retry = None;
+                row.error = true;
+                row.detail.push_str("\nThe saved source needs verification. The original Close is retained; no cleanup has been confirmed.");
+            }
+            Some(row)
+        }).collect()
+    }
+
+    fn capture_native_return(
+        &mut self,
+        target: Target,
+        source: chat::Session,
+        handle: Arc<ClientHandle>,
+        origin: Option<super::shared_views::TerminalReturnOrigin>,
+    ) -> Option<uuid::Uuid> {
+        if self
+            .chat_ui
+            .active_native_returns
+            .get(&target)
+            .and_then(|operation| self.chat_ui.native_returns.get(operation))
+            .is_some_and(|pending| {
+                pending.pending
+                    || (pending.close.is_some() && !pending.none_closed)
+                    || pending
+                        .first_issued
+                        .is_some_and(|id| self.chat_ui.issued_returns.contains_key(&id))
+            })
+        {
+            return None;
+        }
+        let card = self.card_state(target.card)?;
+        let context = NativeReturnContext {
+            operation: uuid::Uuid::new_v4(),
+            target,
+            source,
+            handle,
+            presentation: card.kind.clone(),
+            title: self.card_display_title(card),
+            origin,
+            save_caller: crate::control::CallerContext::capture(),
+        };
+        let operation = context.operation;
+        self.chat_ui.native_returns.insert(
+            operation,
+            NativeReturn {
+                context,
+                pending: true,
+                first_error: None,
+                first_issued: None,
+                close: None,
+                none_attempt: None,
+                none_pending: false,
+                none_error: None,
+                none_closed: false,
+            },
+        );
+        self.chat_ui.active_native_returns.insert(target, operation);
+        Some(operation)
+    }
+
+    fn native_return_presentation_matches(&self, context: &NativeReturnContext) -> bool {
+        if let Some(origin) = &context.origin {
+            return self.return_close_presentation_matches(&ReturnCloseOwner {
+                id: context.operation,
+                return_target: context.target,
+                caller: context.save_caller.clone(),
+                source: context.source.clone(),
+                origin: origin.clone(),
+                handle: context.handle.clone(),
+                presentation: context.presentation.clone(),
+                title: context.title.clone(),
+            });
+        }
+        !self.pane_is_quarantined(context.target.card)
+            && self
+                .card_state(context.target.card)
+                .is_some_and(|card| card.existence.is_open() && card.kind == context.presentation)
+            && matches!(self.cards.get(&context.target.card), Some(CardRuntime::Chat(runtime))
+                if runtime.target == context.target
+                    && runtime.session == context.source
+                    && runtime.handle().is_some_and(|handle| Arc::ptr_eq(handle, &context.handle)))
+    }
+
+    fn capture_native_return_close(
+        &mut self,
+        target: Target,
+        caller: crate::control::CallerContext,
+    ) -> bool {
+        let Some(operation) = self.chat_ui.active_native_returns.get(&target).copied() else {
+            return false;
+        };
+        let pending = &self.chat_ui.native_returns[&operation];
+        if pending.close.is_some() {
+            return true;
+        }
+        if !self.native_return_presentation_matches(&pending.context) {
+            return false;
+        }
+        self.chat_ui
+            .native_returns
+            .get_mut(&operation)
+            .unwrap()
+            .close = Some(IssuedCloseOwner {
+            id: uuid::Uuid::new_v4(),
+            caller,
+            queued: true,
+        });
+        true
+    }
+
+    fn native_result_error(&mut self, target: Target, operation: uuid::Uuid, error: &str) -> bool {
+        let Some(pending) = self.chat_ui.native_returns.get_mut(&operation) else {
+            return operation.is_nil();
+        };
+        if pending.context.target != target || !pending.pending {
+            return false;
+        }
+        pending.pending = false;
+        pending.first_error = Some(error.to_owned());
+        self.chat_ui.active_native_returns.get(&target) == Some(&operation)
+    }
+
+    /// Retaining a response grants neither disposition nor ACK eligibility.
+    fn retain_issued_return(
+        &mut self,
+        target: Target,
+        operation: uuid::Uuid,
+        returned: &chat::ReturnedTerminal,
+    ) -> Option<uuid::Uuid> {
+        let Some(pending) = self.chat_ui.native_returns.get(&operation) else {
+            let id = uuid::Uuid::new_v4();
+            self.chat_ui.issued_conflicts.insert(id, IssuedConflict { id, target, returned: returned.clone(),
+                detail: "The original return context is unavailable. Its response is retained without cleanup or confirmation authority.".into() });
+            return None;
+        };
+        let context = pending.context.clone();
+        if self.chat_ui.issued_returns.values().any(|record| {
+            record.context.operation == operation
+                && record.context.target == target
+                && record.context.source == context.source
+                && record.returned == *returned
+        }) {
+            return None;
+        }
+        let proof = returned.session.continuity.live_proof();
+        let valid = !returned.cleanup_receipt.is_nil()
+            && context.target == target
+            && proof.as_ref().is_some_and(|proof| proof.is_complete())
+            && proof == context.source.proof;
+        let nonce_conflict = self
+            .chat_ui
+            .issued_returns
+            .values()
+            .any(|record| record.returned.cleanup_receipt == returned.cleanup_receipt);
+        let first =
+            pending.pending && pending.first_error.is_none() && pending.first_issued.is_none();
+        let current = valid
+            && first
+            && self.chat_ui.active_native_returns.get(&target) == Some(&operation)
+            && self.native_return_presentation_matches(&context);
+        let queued = pending.close.clone();
+        let id = uuid::Uuid::new_v4();
+        self.chat_ui.issued_returns.insert(
+            id,
+            IssuedReturn {
+                id,
+                context,
+                returned: returned.clone(),
+                stage: if !valid || nonce_conflict {
+                    IssuedStage::Conflict
+                } else if current {
+                    IssuedStage::Converting
+                } else {
+                    IssuedStage::Held
+                },
+                attempt: uuid::Uuid::new_v4(),
+                close: if current { queued.clone() } else { None },
+                linked_queued_close: queued.is_some(),
+                represented: false,
+                closed: false,
+                return_error: pending.first_error.clone(),
+                cleanup_error: None,
+                flush_error: None,
+                ack_error: None,
+            },
+        );
+        if first && valid && !nonce_conflict {
+            let pending = self.chat_ui.native_returns.get_mut(&operation).unwrap();
+            pending.pending = false;
+            pending.first_issued = Some(id);
+        }
+        (current && !nonce_conflict).then_some(id)
+    }
+
+    fn issued_for_target(&self, target: Target) -> Option<uuid::Uuid> {
+        self.chat_ui
+            .active_native_returns
+            .get(&target)
+            .and_then(|operation| self.chat_ui.native_returns.get(operation))
+            .and_then(|operation| operation.first_issued)
+    }
+
+    fn hold_issued_return(&mut self, target: Target, error: &str) {
+        if let Some(id) = self.issued_for_target(target)
+            && let Some(record) = self.chat_ui.issued_returns.get_mut(&id)
+            && !record.closed
+            && !matches!(record.stage, IssuedStage::Closing | IssuedStage::Conflict)
+        {
+            record.stage = IssuedStage::Held;
+            if record.return_error.is_none() {
+                record.return_error = Some(error.to_owned());
+            }
+        }
+    }
+
+    pub(super) fn issued_action(
+        &mut self,
+        id: uuid::Uuid,
+        action: IssuedNoticeAction,
+    ) -> Task<Message> {
+        let Some(record) = self.chat_ui.issued_returns.get(&id) else {
+            return Task::none();
+        };
+        match action {
+            IssuedNoticeAction::Close
+                if record.stage == IssuedStage::Held
+                    && !record.linked_queued_close
+                    && record.close.is_none() =>
+            {
+                // This explicit action supplies D. The response and save caller R do not.
+                let owner = IssuedCloseOwner {
+                    id: uuid::Uuid::new_v4(),
+                    caller: crate::control::CallerContext::capture(),
+                    queued: false,
+                };
+                self.chat_ui.issued_returns.get_mut(&id).unwrap().close = Some(owner);
+                self.begin_issued_close(id)
+            }
+            IssuedNoticeAction::RetryClose if record.stage == IssuedStage::CloseFailed => {
+                self.begin_issued_close(id)
+            }
+            IssuedNoticeAction::RetryFlush if record.stage == IssuedStage::FlushFailed => {
+                self.retry_issued_persistence(id)
+            }
+            IssuedNoticeAction::RetryAck if record.stage == IssuedStage::AckFailed => {
+                self.retry_issued_persistence(id)
+            }
+            _ => Task::none(),
+        }
+    }
+
+    fn begin_native_none_cleanup(&mut self, operation: uuid::Uuid) -> Task<Message> {
+        let Some(pending) = self.chat_ui.native_returns.get(&operation) else {
+            return Task::none();
+        };
+        let Some(owner) = pending.close.clone() else {
+            return Task::none();
+        };
+        if pending.context.origin.is_some()
+            || pending.pending
+            || pending.first_issued.is_some()
+            || pending.none_pending
+            || pending.none_closed
+            || self.pane_is_quarantined(pending.context.target.card)
+        {
+            return Task::none();
+        }
+        let context = pending.context.clone();
+        let attempt = self.chat_ui.next_target(context.target.card);
+        let pending = self.chat_ui.native_returns.get_mut(&operation).unwrap();
+        pending.none_attempt = Some(attempt);
+        pending.none_pending = true;
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                close_shared_return_worker(
+                    &context.source,
+                    None,
+                    || context.handle.close(),
+                    |source| {
+                        let mut client = owner.caller.connect_control()?;
+                        close_original_return_on(&mut client, source)
+                    },
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::ChatUi(Action::NativeReturnCloseFinished(
+                operation, attempt, result,
+            ))
+        })
+    }
+
+    fn finish_native_none_cleanup(
+        &mut self,
+        operation: uuid::Uuid,
+        attempt: Target,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let Some(pending) = self.chat_ui.native_returns.get(&operation) else {
+            return Task::none();
+        };
+        if pending.none_attempt != Some(attempt)
+            || !pending.none_pending
+            || pending.first_issued.is_some()
+        {
+            return Task::none();
+        }
+        let context = pending.context.clone();
+        let pending = self.chat_ui.native_returns.get_mut(&operation).unwrap();
+        pending.none_pending = false;
+        if let Err(error) = result {
+            pending.none_error = Some(error);
+            return Task::none();
+        }
+        pending.none_closed = true;
+        if self.native_return_presentation_matches(&context) {
+            self.remove_chat_card(context.target.card, None)
+                .unwrap_or_else(Task::none)
+        } else {
+            Task::none()
+        }
+    }
+
+    fn begin_issued_close(&mut self, id: uuid::Uuid) -> Task<Message> {
+        let Some(record) = self.chat_ui.issued_returns.get(&id) else {
+            return Task::none();
+        };
+        let Some(owner) = record.close.clone() else {
+            return Task::none();
+        };
+        if record.closed
+            || !matches!(
+                record.stage,
+                IssuedStage::Converting | IssuedStage::Held | IssuedStage::CloseFailed
+            )
+            || (owner.queued && self.pane_is_quarantined(record.context.target.card))
+        {
+            return Task::none();
+        }
+        let expected = record.context.source.proof.clone();
+        let record = self.chat_ui.issued_returns.get_mut(&id).unwrap();
+        record.stage = IssuedStage::Closing;
+        record.attempt = uuid::Uuid::new_v4();
+        let binding = record.binding();
+        cosmic::task::future(async move {
+            let input = binding.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut client = owner.caller.connect_control()?;
+                close_issued_return_on(&mut client, expected.as_ref(), &input.returned)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::ChatUi(Action::IssuedCloseFinished(binding, result))
+        })
+    }
+
+    fn finish_issued_close(
+        &mut self,
+        binding: IssuedBinding,
+        result: Result<crate::terminal::ipc::TerminalCloseResult, String>,
+    ) -> Task<Message> {
+        use crate::terminal::ipc::TerminalCloseResult;
+        let Some(record) = self.chat_ui.issued_returns.get(&binding.id) else {
+            return Task::none();
+        };
+        if record.binding() != binding || record.stage != IssuedStage::Closing {
+            return Task::none();
+        }
+        let result = match result {
+            Ok(TerminalCloseResult::Closed) => Ok(()),
+            Ok(TerminalCloseResult::Active) => {
+                Err("The original terminal is still active; cleanup was not confirmed".into())
+            }
+            Ok(TerminalCloseResult::Unknown(detail)) => {
+                Err(format!("Original cleanup could not be confirmed: {detail}"))
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            let record = self.chat_ui.issued_returns.get_mut(&binding.id).unwrap();
+            record.stage = IssuedStage::CloseFailed;
+            record.cleanup_error = Some(error);
+            return Task::none();
+        }
+        let context = record.context.clone();
+        let remove = self.native_return_presentation_matches(&context);
+        let record = self.chat_ui.issued_returns.get_mut(&binding.id).unwrap();
+        record.closed = true;
+        record.stage = IssuedStage::Closed;
+        self.chat_ui.finish(context.target, |phase| {
+            matches!(phase, Phase::Returning { local: None, .. })
+        });
+        let remove = if remove {
+            self.remove_chat_card(context.target.card, None)
+                .unwrap_or_else(Task::none)
+        } else {
+            Task::none()
+        };
+        Task::batch([remove, self.commit_issued_terminal_handoffs()])
+    }
+
+    pub(super) fn mark_issued_represented(&mut self, card: CardId, terminal: &TerminalSession) {
+        for record in self.chat_ui.issued_returns.values_mut().filter(|record| {
+            record.context.target.card == card
+                && record.returned.session == *terminal
+                && record.stage == IssuedStage::Converting
+                && record.close.is_none()
+        }) {
+            record.represented = true;
+        }
+    }
+
+    fn retry_issued_persistence(&mut self, id: uuid::Uuid) -> Task<Message> {
+        let Some(record) = self.chat_ui.issued_returns.get_mut(&id) else {
+            return Task::none();
+        };
+        if !matches!(
+            record.stage,
+            IssuedStage::FlushFailed | IssuedStage::AckFailed
+        ) {
+            return Task::none();
+        }
+        record.stage = if record.closed {
+            IssuedStage::Closed
+        } else {
+            IssuedStage::Converting
+        };
+        self.commit_issued_terminal_handoffs()
+    }
+
+    pub(super) fn commit_issued_terminal_handoffs(&mut self) -> Task<Message> {
+        let candidates = self
+            .chat_ui
+            .issued_returns
+            .values()
+            .filter(|record| {
+                record.stage == IssuedStage::Closed
+                    || (record.stage == IssuedStage::Converting
+                        && record.represented
+                        && record.close.is_none())
+            })
+            .map(|record| (record.id, record.closed, record.returned.session.clone()))
+            .collect::<Vec<_>>();
+        let mut bindings = Vec::new();
+        for (id, closed, terminal) in candidates {
+            if !closed && !self.terminal_return_can_commit(&terminal) {
+                self.chat_ui.issued_returns.get_mut(&id).unwrap().stage = IssuedStage::Held;
+                continue;
+            }
+            let record = self.chat_ui.issued_returns.get_mut(&id).unwrap();
+            record.stage = IssuedStage::Flushing;
+            record.attempt = uuid::Uuid::new_v4();
+            bindings.push(record.binding());
+        }
+        if bindings.is_empty() {
+            return Task::none();
+        }
+        let paused = self.save_health.as_ref().is_some_and(|health| {
+            !matches!(
+                health.health,
+                super::SessionSaveHealth::Healthy | super::SessionSaveHealth::Recovered { .. }
+            ) || health.window_state_refused()
+        });
+        if paused || self.session.is_none() {
+            return self.finish_issued_flush(
+                bindings,
+                Err("Saving is unavailable or paused; the original return is retained".into()),
+            );
+        }
+        let saved = self.persistent_workspace();
+        let writer = self.session.as_ref().unwrap();
+        writer.snapshot_conversion(saved);
+        let flush = match writer.request_flush() {
+            Ok(flush) => flush,
+            Err(error) => return self.finish_issued_flush(bindings, Err(error.to_string())),
+        };
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                flush
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .map_err(|error| format!("session flush: {error}"))?
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            Message::IssuedTerminalHandoffsFlushed { bindings, result }
+        })
+    }
+
+    pub(super) fn finish_issued_flush(
+        &mut self,
+        bindings: Vec<IssuedBinding>,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let mut tasks = Vec::new();
+        for binding in bindings {
+            let Some(record) = self.chat_ui.issued_returns.get(&binding.id) else {
+                continue;
+            };
+            if record.binding() != binding || record.stage != IssuedStage::Flushing {
+                continue;
+            }
+            if let Err(error) = &result {
+                let record = self.chat_ui.issued_returns.get_mut(&binding.id).unwrap();
+                record.stage = IssuedStage::FlushFailed;
+                record.flush_error = Some(error.clone());
+                continue;
+            }
+            if !record.closed && !self.terminal_return_can_commit(&record.returned.session) {
+                self.chat_ui
+                    .issued_returns
+                    .get_mut(&binding.id)
+                    .unwrap()
+                    .stage = IssuedStage::Held;
+                continue;
+            }
+            let caller = record.context.save_caller.clone();
+            let expected = record.context.source.proof.clone();
+            let record = self.chat_ui.issued_returns.get_mut(&binding.id).unwrap();
+            record.flush_error = None;
+            record.stage = IssuedStage::Acknowledging;
+            tasks.push(cosmic::task::future(async move {
+                let input = binding.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let expected = expected.filter(|proof| proof.is_complete()).ok_or(
+                        "The original service proof is unavailable; its receipt is retained",
+                    )?;
+                    let mut client = caller.connect_control()?;
+                    crate::chat::client::acknowledge_terminal_handoffs_with_receipts_on(
+                        &mut client,
+                        &expected,
+                        &[input.returned],
+                    )
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "The original acknowledgement result is missing".to_string())?
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::IssuedTerminalHandoffsCommitted { binding, result }
+            }));
+        }
+        Task::batch(tasks)
+    }
+
+    pub(super) fn finish_issued_ack(
+        &mut self,
+        binding: IssuedBinding,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        let Some(record) = self.chat_ui.issued_returns.get(&binding.id) else {
+            return Task::none();
+        };
+        if record.binding() != binding || record.stage != IssuedStage::Acknowledging {
+            return Task::none();
+        }
+        if let Err(error) = result {
+            let record = self.chat_ui.issued_returns.get_mut(&binding.id).unwrap();
+            record.stage = IssuedStage::AckFailed;
+            record.ack_error = Some(error);
+            return Task::none();
+        }
+        let record = self.chat_ui.issued_returns.remove(&binding.id).unwrap();
+        if !self.chat_ui.issued_id_held(record.returned.session.id)
+            && self
+                .pending_terminal_handoffs
+                .get(&record.returned.session.id)
+                == Some(&record.returned.session)
+        {
+            self.pending_terminal_handoffs
+                .remove(&record.returned.session.id);
+        }
+        // Remove only this exact owner's descriptor association, never another
+        // issued nonce or an unrelated same-ID replacement.
+        if !self.chat_ui.issued_id_held(record.returned.session.id) {
+            self.terminal_return_receipt_committed(&record.returned.session);
+        }
+        if self
+            .chat_ui
+            .native_returns
+            .get(&record.context.operation)
+            .is_some_and(|operation| operation.first_issued == Some(record.id))
+        {
+            if self
+                .chat_ui
+                .active_native_returns
+                .get(&record.context.target)
+                == Some(&record.context.operation)
+            {
+                if self
+                    .chat_ui
+                    .terminal_returns
+                    .get(&record.context.target)
+                    .is_some_and(|pending| pending.source == record.context.source)
+                {
+                    self.chat_ui.terminal_returns.remove(&record.context.target);
+                }
+                self.chat_ui
+                    .active_native_returns
+                    .remove(&record.context.target);
+            }
+            self.chat_ui
+                .native_returns
+                .remove(&record.context.operation);
+        }
+        self.drain_pending_terminal_adoptions()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn native_return_operation(app: &Cagents, target: Target) -> uuid::Uuid {
+        app.chat_ui
+            .active_native_returns
+            .get(&target)
+            .copied()
+            .unwrap_or(uuid::Uuid::nil())
+    }
+
+    // Explicit synthetic authority tuple: reducer/component evidence only.
+    fn issued_terminal_fixture(session: TerminalSession) -> chat::ReturnedTerminal {
+        chat::ReturnedTerminal {
+            session,
+            cleanup_receipt: uuid::Uuid::new_v4(),
+        }
+    }
+
     #[test]
     fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
         const CHILD: &str = "CAGENTS_TEST_REMOTE_RESUME_COMMAND";
@@ -22917,6 +24086,7 @@ mod tests {
         let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Activity)));
         let _ = app.update(Message::ChatUi(Action::HandoffFinished(
             target,
+            native_return_operation(&app, target),
             Err("fixture: the terminal could not start".into()),
         )));
         assert!(matches!(
@@ -23390,6 +24560,7 @@ mod tests {
         let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
         let _ = app.update(Message::ChatUi(Action::HandoffFinished(
             target,
+            native_return_operation(&app, target),
             Err("old handoff".into()),
         )));
         assert!(matches!(
@@ -23521,42 +24692,29 @@ mod tests {
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        let _ = app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(cli))));
-        // Drive every daemon request to success until nothing is left to do.
-        for _ in 0..8 {
-            if let Some(intent) = app.terminal_close.clone() {
-                assert!(intent.detail.is_none(), "{:?}", intent.detail);
-                let _ = app.update(Message::TerminalCloseFinished {
-                    card: intent.card,
-                    terminal: intent.terminal,
-                    proof: intent.proof,
-                    generation: intent.generation,
-                    outcome: crate::app::terminal_close::CloseOutcome::Closed,
-                });
-            } else if app
-                .workspace
-                .pending_close()
-                .is_some_and(|handoff| handoff.unmounting == card)
-            {
-                let _ = app.update(Message::CommitClose(card));
-            } else if let Some(closing) =
-                app.chat_ui.phases.values().find_map(|phase| match phase {
-                    Phase::Closing { target, .. } => Some(*target),
-                    _ => None,
-                })
-            {
-                let _ = app.update(Message::ChatUi(Action::CloseFinished(closing, Ok(()))));
-            } else {
-                break;
-            }
-        }
+        let _ = app.update(Message::ChatUi(Action::HandoffFinished(
+            target,
+            native_return_operation(&app, target),
+            Ok(issued_terminal_fixture(cli)),
+        )));
+        let id = app.issued_for_target(target).unwrap();
+        let close = app.chat_ui.issued_returns[&id].binding();
+        drop(app.update(Message::ChatUi(Action::IssuedCloseFinished(
+            close,
+            Ok(crate::terminal::ipc::TerminalCloseResult::Closed),
+        ))));
+        assert!(app.chat_ui.issued_returns[&id].closed);
+        // No writer is installed in this component fixture. Closed is not a
+        // durability/ACK claim and must remain visible instead of losing custody.
+        assert!(app.chat_ui.issued_returns[&id].stage == IssuedStage::FlushFailed);
+        assert!(app.chat_ui.transition_pending());
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
         assert!(!app.workspace.order().any(|id| id == card));
         assert!(!app.card_state(card).unwrap().existence.is_open());
         assert_eq!(app.workspace.pending_close(), None);
         assert!(app.terminal_close.is_none());
         assert!(!app.chat_has_parked_runtime(card));
-        assert!(!app.chat_ui.transition_pending());
+        assert!(app.chat_ui.return_cleanup_unresolved());
     }
 
     /// A chat that switches to a shell leaves its channel only for the shell
@@ -29495,7 +30653,8 @@ mod tests {
         use crate::workspace_model::{ModelEdit, views::Change};
         drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
             f.target,
-            Ok(f.terminal.clone()),
+            native_return_operation(&f.app, f.target),
+            Ok(issued_terminal_fixture(f.terminal.clone())),
         ))));
         while let Ok(edit) = f.edits.try_recv() {
             if let ModelEdit::ChangeView {
@@ -29541,6 +30700,676 @@ mod tests {
 
     /// Component transport only: this mock is deliberately not a host owner.
     /// It records actual ControlClient frames and accepts only its exact source.
+    /// Synthetic barrier completions only. No writer/Task is run by this
+    /// component fixture, so it grants no actual durable-save qualification.
+    fn complete_issued_persistence_component(app: &mut Cagents, id: uuid::Uuid) {
+        let record = app.chat_ui.issued_returns.get_mut(&id).unwrap();
+        assert!(record.closed || record.represented);
+        record.stage = IssuedStage::Flushing;
+        record.attempt = uuid::Uuid::new_v4();
+        let binding = record.binding();
+        drop(app.update(Message::IssuedTerminalHandoffsFlushed {
+            bindings: vec![binding.clone()],
+            result: Ok(()),
+        }));
+        assert!(app.chat_ui.issued_returns[&id].stage == IssuedStage::Acknowledging);
+        drop(app.update(Message::IssuedTerminalHandoffsCommitted {
+            binding,
+            result: Ok(()),
+        }));
+        assert!(!app.chat_ui.issued_returns.contains_key(&id));
+    }
+
+    /// Supplied sockets and explicit synthetic contexts, not a Host/provider.
+    /// This observes real Authenticate and exact nonce API framing, including
+    /// refusal and zero-request wrong-endpoint controls.
+    fn issued_request_component(
+        source: &chat::Session,
+        returned: &chat::ReturnedTerminal,
+        authority: crate::agent_execution::Authority,
+        ack: bool,
+        refuse: bool,
+        wrong_host: bool,
+    ) {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, TerminalCloseResult, read_frame,
+            write_frame,
+        };
+        use std::os::unix::net::UnixStream;
+        let expected = source.proof.clone().unwrap();
+        let mut endpoint = expected.clone();
+        if wrong_host {
+            endpoint.host_incarnation =
+                crate::model::HostIncarnation::new("synthetic-wrong-issuer");
+        }
+        let mut second = returned.clone();
+        second.session.id = TerminalId::new();
+        second.cleanup_receipt = uuid::Uuid::new_v4();
+        let tuples = if ack {
+            vec![returned.clone(), second]
+        } else {
+            vec![returned.clone()]
+        };
+        let frames = tuples.clone();
+        let caller = authority.clone();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            let reply = |request_id, message| ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(request_id),
+                proof: endpoint.clone(),
+                message,
+            };
+            write_frame(
+                &mut peer,
+                &reply(
+                    hello.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: endpoint.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                ),
+            )
+            .unwrap();
+            let auth: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(
+                auth.request,
+                ClientRequest::Authenticate { authority: caller }
+            );
+            write_frame(
+                &mut peer,
+                &reply(
+                    auth.request_id,
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                ),
+            )
+            .unwrap();
+            if wrong_host {
+                assert!(read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none());
+                return;
+            }
+            for original in frames {
+                let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(
+                    request.request,
+                    if ack {
+                        ClientRequest::ChatCommitTerminal {
+                            terminal_id: original.session.id,
+                            cleanup_receipt: Some(original.cleanup_receipt),
+                        }
+                    } else {
+                        ClientRequest::ChatCloseReturnedTerminal {
+                            terminal_id: original.session.id,
+                            cleanup_receipt: original.cleanup_receipt,
+                        }
+                    }
+                );
+                let message = if refuse {
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::PermissionDenied,
+                        "synthetic inherited caller refused",
+                        false,
+                    ))
+                } else {
+                    ServerMessage::Response {
+                        response: if ack {
+                            ServerResponse::Accepted
+                        } else {
+                            ServerResponse::TerminalCloseChecked {
+                                terminal_id: original.session.id,
+                                outcome: TerminalCloseResult::Closed,
+                            }
+                        },
+                    }
+                };
+                write_frame(&mut peer, &reply(request.request_id, message)).unwrap();
+            }
+            assert!(
+                read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                "no new connection, inventory or alternate cleanup follows"
+            );
+        });
+        let mut client = crate::control::ControlClient::from_stream(stream).unwrap();
+        client.authenticate(authority).unwrap();
+        if ack {
+            let results = crate::chat::client::acknowledge_terminal_handoffs_with_receipts_on(
+                &mut client,
+                &expected,
+                &tuples,
+            );
+            assert_eq!(results.len(), 2);
+            assert!(
+                results
+                    .iter()
+                    .all(|result| result.is_ok() == (!refuse && !wrong_host))
+            );
+        } else {
+            let result = close_issued_return_on(&mut client, Some(&expected), returned);
+            assert_eq!(result.is_ok(), !refuse && !wrong_host);
+        }
+        drop(client);
+        server.join().unwrap();
+    }
+
+    fn issued_orphan_and_persistence_controls() {
+        use super::super::chrome_ui::Action as Chrome;
+        use crate::workspace_model::views::Change;
+        let mut f = shared_return_fixture();
+        drop(f.app.update(Message::ChatUi(Action::Composer(
+            f.target,
+            text_editor::Action::SelectAll,
+        ))));
+        write(&mut f.app, f.card, "");
+        start_live_shared_return(&mut f);
+        let operation = native_return_operation(&f.app, f.target);
+        f.app
+            .chat_ui
+            .native_returns
+            .get_mut(&operation)
+            .unwrap()
+            .context
+            .save_caller = return_close_caller("synthetic-save-R");
+        assert!(!f.app.shared_chat_has_local_work(f.card));
+        assert!(
+            f.model.views[0]
+                .apply(&Change::Remove { id: f.card })
+                .unwrap()
+        );
+        f.model.views[0].revision += 1;
+        f.model.sequence += 1;
+        drop(f.app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+        )));
+        assert!(!f.app.card_state(f.card).unwrap().existence.is_open());
+        let returned = issued_terminal_fixture(f.terminal.clone());
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            operation,
+            Ok(returned.clone()),
+        ))));
+        let id = f.app.chat_ui.native_returns[&operation]
+            .first_issued
+            .unwrap();
+        assert!(f.app.chat_ui.issued_returns[&id].stage == IssuedStage::Held);
+        assert!(f.app.chat_ui.issued_returns[&id].close.is_none());
+        assert!(
+            f.app
+                .pending_terminal_handoffs
+                .get(&returned.session.id)
+                .is_none()
+        );
+        let count = f.app.chat_ui.issued_returns.len();
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            operation,
+            Ok(returned.clone()),
+        ))));
+        assert_eq!(f.app.chat_ui.issued_returns.len(), count);
+        assert_eq!(
+            f.app.chat_ui.native_returns[&operation].first_issued,
+            Some(id)
+        );
+        let mut wrong = returned.clone();
+        wrong.session.id = TerminalId::new();
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            operation,
+            Ok(wrong),
+        ))));
+        assert!(
+            f.app
+                .chat_ui
+                .issued_returns
+                .values()
+                .any(|record| record.stage == IssuedStage::Conflict)
+        );
+        assert_eq!(
+            f.app.chat_ui.native_returns[&operation].first_issued,
+            Some(id)
+        );
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            uuid::Uuid::new_v4(),
+            Ok(returned.clone()),
+        ))));
+        assert!(!f.app.chat_ui.issued_conflicts.is_empty());
+
+        assert!(
+            f.app
+                .window_close_transient_blocker()
+                .unwrap()
+                .contains("Application notices")
+        );
+        let window = window::Id::unique();
+        drop(f.app.update(Message::WindowCloseRequested(window)));
+        assert_eq!(f.app.transient_work_close, Some(window));
+        drop(f.app.update(Message::CancelTransientWorkClose));
+        drop(f.app.update(Message::ChromeUi(Chrome::ToggleNotices)));
+        drop(f.app.update(Message::DismissAllNotices));
+        drop(f.app.update(Message::ExpireNotices));
+        assert!(
+            f.app
+                .issued_return_notices()
+                .iter()
+                .any(|row| row.id == id && row.action == Some(IssuedNoticeAction::Close))
+        );
+        let messages = enter_mounted_return_control(
+            f.app.shared_return_notice_view_for_test(),
+            format!("chrome.issued.{id}.close-issued-first"),
+        );
+        assert!(messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::CloseIssuedReturn(found)) if *found == id)));
+        for message in messages {
+            drop(f.app.update(message));
+        }
+        let record = &f.app.chat_ui.issued_returns[&id];
+        let disposition = record.close.as_ref().unwrap().id;
+        let d = record.close.as_ref().unwrap().caller.authentication();
+        assert!(!record.close.as_ref().unwrap().queued);
+        assert_ne!(disposition, operation);
+        let close = record.binding();
+        drop(f.app.update(Message::ChatUi(Action::IssuedCloseFinished(
+            close.clone(),
+            Ok(crate::terminal::ipc::TerminalCloseResult::Active),
+        ))));
+        assert!(f.app.chat_ui.issued_returns[&id].stage == IssuedStage::CloseFailed);
+        drop(
+            f.app
+                .update(Message::ChromeUi(Chrome::RetryIssuedClose(id))),
+        );
+        assert_eq!(
+            f.app.chat_ui.issued_returns[&id].close.as_ref().unwrap().id,
+            disposition
+        );
+        assert_eq!(
+            f.app.chat_ui.issued_returns[&id]
+                .close
+                .as_ref()
+                .unwrap()
+                .caller
+                .authentication(),
+            d
+        );
+        let close = f.app.chat_ui.issued_returns[&id].binding();
+        drop(f.app.update(Message::ChatUi(Action::IssuedCloseFinished(
+            close.clone(),
+            Ok(crate::terminal::ipc::TerminalCloseResult::Closed),
+        ))));
+        assert!(f.app.chat_ui.issued_returns[&id].closed);
+        assert!(
+            f.app.chat_ui.issued_returns[&id].stage == IssuedStage::FlushFailed,
+            "component fixture has no writer"
+        );
+        assert_eq!(
+            f.app
+                .issued_return_notices()
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .action,
+            Some(IssuedNoticeAction::RetryFlush)
+        );
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = iced::advanced::widget::Tree::new(
+            f.app.shared_return_notice_view_for_test().as_widget(),
+        );
+        assert!(
+            send_return_control_pointer(
+                f.app.shared_return_notice_view_for_test(),
+                &mut tree,
+                &renderer,
+                format!("chrome.issued.{id}.retry-issued-flush"),
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)
+            )
+            .is_empty()
+        );
+        // Synthetic matching barrier: reducer ordering only, not actual storage.
+        let record = f.app.chat_ui.issued_returns.get_mut(&id).unwrap();
+        record.stage = IssuedStage::Flushing;
+        record.attempt = uuid::Uuid::new_v4();
+        let binding = record.binding();
+        drop(f.app.update(Message::IssuedTerminalHandoffsFlushed {
+            bindings: vec![binding.clone()],
+            result: Err("synthetic flush failure".into()),
+        }));
+        assert!(f.app.chat_ui.issued_returns[&id].stage == IssuedStage::FlushFailed);
+        let record = f.app.chat_ui.issued_returns.get_mut(&id).unwrap();
+        record.stage = IssuedStage::Flushing;
+        record.attempt = uuid::Uuid::new_v4();
+        let binding = record.binding();
+        drop(f.app.update(Message::IssuedTerminalHandoffsFlushed {
+            bindings: vec![binding.clone()],
+            result: Ok(()),
+        }));
+        drop(f.app.update(Message::IssuedTerminalHandoffsCommitted {
+            binding: binding.clone(),
+            result: Err("synthetic original R refused".into()),
+        }));
+        assert!(f.app.chat_ui.issued_returns[&id].stage == IssuedStage::AckFailed);
+        let released = send_return_control_pointer(
+            f.app.shared_return_notice_view_for_test(),
+            &mut tree,
+            &renderer,
+            format!("chrome.issued.{id}.retry-issued-ack"),
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+        );
+        assert!(
+            released.is_empty(),
+            "held save press cannot become acknowledgement retry"
+        );
+        assert!(
+            send_return_control_pointer(
+                f.app.shared_return_notice_view_for_test(),
+                &mut tree,
+                &renderer,
+                format!("chrome.issued.{id}.retry-issued-ack"),
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)
+            )
+            .is_empty()
+        );
+        let fresh = send_return_control_pointer(
+            f.app.shared_return_notice_view_for_test(),
+            &mut tree,
+            &renderer,
+            format!("chrome.issued.{id}.retry-issued-ack"),
+            iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+        );
+        assert!(fresh.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryIssuedAck(found)) if *found == id)));
+        for message in fresh {
+            drop(f.app.update(message));
+        }
+        assert!(f.app.chat_ui.issued_returns[&id].closed);
+        drop(f.app.update(Message::ChatUi(Action::IssuedCloseFinished(
+            close,
+            Err("stale cleanup callback".into()),
+        ))));
+        assert!(f.app.chat_ui.issued_returns[&id].stage == IssuedStage::FlushFailed);
+        assert!(
+            f.app.chat_ui.issued_returns[&id]
+                .cleanup_error
+                .as_deref()
+                .is_some_and(|error| error.contains("still active"))
+        );
+        let mut successor = returned.clone();
+        successor.cleanup_receipt = uuid::Uuid::new_v4();
+        drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+            f.target,
+            operation,
+            Ok(successor.clone()),
+        ))));
+        let later = f
+            .app
+            .chat_ui
+            .issued_returns
+            .values()
+            .find(|record| record.returned == successor)
+            .unwrap()
+            .id;
+        assert_ne!(later, id);
+        complete_issued_persistence_component(&mut f.app, id);
+        assert!(f.app.chat_ui.issued_returns.contains_key(&later));
+        assert!(f.app.chat_ui.return_cleanup_unresolved());
+        drop(f.app.update(Message::IssuedTerminalHandoffsCommitted {
+            binding,
+            result: Ok(()),
+        }));
+        assert!(f.app.chat_ui.issued_returns.contains_key(&later));
+        assert!(!f.app.card_state(f.card).unwrap().existence.is_open());
+    }
+
+    fn issued_nonshared_caller_controls() {
+        use super::super::chrome_ui::Action as Chrome;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let operation = native_return_operation(&app, target);
+        assert!(!operation.is_nil());
+        assert!(
+            app.chat_ui.native_returns[&operation]
+                .context
+                .origin
+                .is_none()
+        );
+        app.chat_ui
+            .native_returns
+            .get_mut(&operation)
+            .unwrap()
+            .context
+            .save_caller = return_close_caller("synthetic-save-R");
+        drop(app.begin_chat_close_as(return_close_caller("synthetic-close-C1"), card));
+        drop(app.begin_chat_close_as(return_close_caller("synthetic-close-C2"), card));
+        let context = app.chat_ui.native_returns[&operation].context.clone();
+        let c1 = app.chat_ui.native_returns[&operation]
+            .close
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            c1.caller.authentication(),
+            return_close_caller("synthetic-close-C1").authentication()
+        );
+        assert!(Arc::ptr_eq(
+            &context.handle,
+            chat_runtime(&app, card).handle().unwrap()
+        ));
+        let mut session = context.source.clone();
+        session.launch.session_id = Some(KNOWN_THREAD.into());
+        let mut terminal = return_terminal(&session).unwrap();
+        let proof = context.source.proof.clone().unwrap();
+        terminal.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let returned = issued_terminal_fixture(terminal);
+        drop(app.update(Message::ChatUi(Action::HandoffFinished(
+            target,
+            operation,
+            Ok(returned.clone()),
+        ))));
+        let id = app.chat_ui.native_returns[&operation].first_issued.unwrap();
+        let first = app.chat_ui.issued_returns[&id].binding();
+        assert_eq!(
+            app.chat_ui.issued_returns[&id]
+                .close
+                .as_ref()
+                .unwrap()
+                .caller
+                .authentication(),
+            c1.caller.authentication()
+        );
+        for refuse in [false, true] {
+            issued_request_component(
+                &context.source,
+                &returned,
+                c1.caller.authentication().unwrap(),
+                false,
+                refuse,
+                false,
+            );
+            issued_request_component(
+                &context.source,
+                &returned,
+                context.save_caller.authentication().unwrap(),
+                true,
+                refuse,
+                false,
+            );
+        }
+        issued_request_component(
+            &context.source,
+            &returned,
+            c1.caller.authentication().unwrap(),
+            false,
+            false,
+            true,
+        );
+        issued_request_component(
+            &context.source,
+            &returned,
+            context.save_caller.authentication().unwrap(),
+            true,
+            false,
+            true,
+        );
+        drop(app.update(Message::ChatUi(Action::IssuedCloseFinished(
+            first.clone(),
+            Ok(crate::terminal::ipc::TerminalCloseResult::Unknown(
+                "synthetic uncertain owner".into(),
+            )),
+        ))));
+        assert!(app.chat_ui.issued_returns[&id].stage == IssuedStage::CloseFailed);
+        drop(app.update(Message::ChromeUi(Chrome::ToggleNotices)));
+        let messages = enter_mounted_return_control(
+            app.shared_return_notice_view_for_test(),
+            format!("chrome.issued.{id}.retry-issued-close"),
+        );
+        assert!(messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryCleanup(owner)) if *owner == c1.id)));
+        for message in messages {
+            drop(app.update(message));
+        }
+        let retry = app.chat_ui.issued_returns[&id].binding();
+        assert_ne!(retry.attempt, first.attempt);
+        drop(app.update(Message::ChatUi(Action::IssuedCloseFinished(
+            first,
+            Ok(crate::terminal::ipc::TerminalCloseResult::Closed),
+        ))));
+        assert!(!app.chat_ui.issued_returns[&id].closed);
+        drop(app.update(Message::ChatUi(Action::IssuedCloseFinished(
+            retry,
+            Ok(crate::terminal::ipc::TerminalCloseResult::Closed),
+        ))));
+        assert!(app.chat_ui.issued_returns[&id].closed);
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.chat_ui.return_cleanup_unresolved());
+        complete_issued_persistence_component(&mut app, id);
+        assert!(!app.chat_ui.issued_returns.contains_key(&id));
+        // Nonshared Err/None uses the independently captured C1 as well.
+        {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            drop(app.update(Message::ChatUi(Action::Switch(card))));
+            let operation = native_return_operation(&app, target);
+            drop(app.begin_chat_close_as(return_close_caller("synthetic-none-C1"), card));
+            drop(app.begin_chat_close_as(return_close_caller("synthetic-none-C2"), card));
+            let owner = app.chat_ui.native_returns[&operation]
+                .close
+                .as_ref()
+                .unwrap()
+                .clone();
+            drop(app.update(Message::ChatUi(Action::HandoffFinished(
+                target,
+                operation,
+                Err("synthetic nonshared Return failed".into()),
+            ))));
+            let first = app.chat_ui.native_returns[&operation].none_attempt.unwrap();
+            assert!(app.chat_ui.native_returns[&operation].none_pending);
+            drop(
+                app.update(Message::ChatUi(Action::NativeReturnCloseFinished(
+                    operation,
+                    first,
+                    Err("synthetic None cleanup failed".into()),
+                ))),
+            );
+            assert_eq!(
+                app.chat_ui.native_returns[&operation]
+                    .first_error
+                    .as_deref(),
+                Some("synthetic nonshared Return failed")
+            );
+            assert_eq!(
+                app.chat_ui.native_returns[&operation]
+                    .close
+                    .as_ref()
+                    .unwrap()
+                    .caller
+                    .authentication(),
+                return_close_caller("synthetic-none-C1").authentication()
+            );
+            drop(app.update(Message::ChromeUi(Chrome::ToggleNotices)));
+            let messages = enter_mounted_return_control(
+                app.shared_return_notice_view_for_test(),
+                format!("chrome.notices.cleanup.{}", owner.id),
+            );
+            assert!(messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryCleanup(found)) if *found == owner.id)));
+            for message in messages {
+                drop(app.update(message));
+            }
+            let retry = app.chat_ui.native_returns[&operation].none_attempt.unwrap();
+            assert_ne!(first, retry);
+            drop(
+                app.update(Message::ChatUi(Action::NativeReturnCloseFinished(
+                    operation,
+                    first,
+                    Ok(()),
+                ))),
+            );
+            assert!(app.chat_ui.native_returns[&operation].none_pending);
+            drop(
+                app.update(Message::ChatUi(Action::NativeReturnCloseFinished(
+                    operation,
+                    retry,
+                    Ok(()),
+                ))),
+            );
+            assert!(app.chat_ui.native_returns[&operation].none_closed);
+            assert!(!app.card_state(card).unwrap().existence.is_open());
+        }
+        // A queued q Close cannot be laundered into the new orphan purpose.
+        {
+            let (mut q, _) = raw_quarantined_queued_return_fixture();
+            let operation = native_return_operation(&q.app, q.target);
+            let original_error = q.app.chat_ui.terminal_returns[&q.target]
+                .return_error
+                .clone();
+            drop(q.app.update(Message::ChatUi(Action::HandoffFinished(
+                q.target,
+                operation,
+                Ok(issued_terminal_fixture(q.terminal.clone())),
+            ))));
+            let record = q
+                .app
+                .chat_ui
+                .issued_returns
+                .values()
+                .find(|record| record.context.operation == operation)
+                .unwrap();
+            let id = record.id;
+            assert!(record.linked_queued_close && record.close.is_none());
+            assert_eq!(
+                q.app
+                    .issued_return_notices()
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .action,
+                None
+            );
+            drop(q.app.update(Message::ChromeUi(Chrome::ToggleNotices)));
+            drop(
+                q.app
+                    .update(Message::ChromeUi(Chrome::CloseIssuedReturn(id))),
+            );
+            assert!(q.app.chat_ui.issued_returns[&id].stage == IssuedStage::Held);
+            assert!(q.app.chat_ui.return_cleanup.is_empty());
+            assert_eq!(
+                q.app.chat_ui.terminal_returns[&q.target].return_error,
+                original_error
+            );
+            assert!(q.app.pane_is_quarantined(q.card));
+        }
+    }
+
     fn original_return_request_component(f: &SharedReturnFixture) -> String {
         use crate::terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
@@ -29966,6 +31795,7 @@ mod tests {
                 .app
                 .update(Message::ChatUi(Action::HandoffFinished(
                     quarantined.target,
+                    native_return_operation(&quarantined.app, quarantined.target),
                     Err("quarantined return failed".into()),
                 ))),
         );
@@ -30091,6 +31921,7 @@ mod tests {
     /// returned Task is dropped: they do not claim a provider/daemon was stopped.
     #[test]
     fn stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement() {
+        issued_orphan_and_persistence_controls();
         for close_timing in [
             "before-replacement",
             "first-close-after-replacement",
@@ -30132,6 +31963,7 @@ mod tests {
             }
             drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
                 f.target,
+                native_return_operation(&f.app, f.target),
                 Err("original return error A".into()),
             ))));
             assert!(!f.app.chat_ui.phases.contains_key(&f.card));
@@ -30157,11 +31989,13 @@ mod tests {
             );
             drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
                 f.target,
+                native_return_operation(&f.app, f.target),
                 Err("duplicate return error".into()),
             ))));
             drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
                 f.target,
-                Ok(f.terminal.clone()),
+                native_return_operation(&f.app, f.target),
+                Ok(issued_terminal_fixture(f.terminal.clone())),
             ))));
             // Real source housekeeping entry; it may forget presentation work,
             // but it cannot stand in for an original cleanup receipt.
@@ -30183,7 +32017,20 @@ mod tests {
                         .is_none()
                 );
                 assert!(f.app.chat_ui.cleanup_notices().is_empty());
-                assert!(!f.app.chat_ui.return_cleanup_unresolved());
+                assert!(f.app.chat_ui.return_cleanup_unresolved());
+                let issued = f.app.issued_return_notices();
+                assert!(
+                    issued
+                        .iter()
+                        .any(|row| row.action == Some(IssuedNoticeAction::Close))
+                );
+                assert!(
+                    f.app
+                        .chat_ui
+                        .issued_returns
+                        .values()
+                        .all(|record| record.stage == IssuedStage::Held && record.close.is_none())
+                );
                 drop(f.app.update(Message::ChromeUi(
                     super::super::chrome_ui::Action::ToggleNotices,
                 )));
@@ -30310,7 +32157,8 @@ mod tests {
             );
             drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
                 f.target,
-                Ok(f.terminal.clone()),
+                native_return_operation(&f.app, f.target),
+                Ok(issued_terminal_fixture(f.terminal.clone())),
             ))));
             assert!(f.app.chat_ui.return_cleanup.is_pending(retry));
             assert_eq!(f.app.card_state(f.card).unwrap().kind, replacement);
@@ -30323,10 +32171,13 @@ mod tests {
             );
             assert!(!f.app.chat_ui.terminal_returns.contains_key(&f.target));
             assert!(f.app.chat_ui.return_cleanup.is_empty());
-            assert!(!f.app.chat_ui.return_cleanup_unresolved());
-            assert!(!f.app.chat_ui.transition_pending());
             assert!(
-                !f.app
+                f.app.chat_ui.return_cleanup_unresolved(),
+                "late issuance retains its own custody after the original None cleanup"
+            );
+            assert!(f.app.chat_ui.transition_pending());
+            assert!(
+                f.app
                     .window_close_transient_blocker()
                     .is_some_and(|text| text.contains("Application notices"))
             );
@@ -30340,12 +32191,43 @@ mod tests {
 
     #[test]
     fn current_shared_return_error_continues_the_first_close_and_retains_retry_custody() {
+        issued_nonshared_caller_controls();
+        {
+            let mut issued = shared_return_fixture();
+            start_live_shared_return(&mut issued);
+            queue_first_shared_return_close(&mut issued);
+            let edit = stage_shared_return(&mut issued);
+            acknowledge_shared_return(&mut issued, edit);
+            let id = issued.app.issued_for_target(issued.target).unwrap();
+            assert!(issued.app.chat_ui.issued_returns[&id].stage == IssuedStage::Closing);
+            let binding = issued.app.chat_ui.issued_returns[&id].binding();
+            drop(
+                issued
+                    .app
+                    .update(Message::ChatUi(Action::IssuedCloseFinished(
+                        binding,
+                        Ok(crate::terminal::ipc::TerminalCloseResult::Closed),
+                    ))),
+            );
+            assert!(issued.app.chat_ui.issued_returns[&id].closed);
+            assert!(
+                !issued
+                    .app
+                    .card_state(issued.card)
+                    .unwrap()
+                    .existence
+                    .is_open()
+            );
+            complete_issued_persistence_component(&mut issued.app, id);
+        }
+
         let mut f = shared_return_fixture();
         let original = f.app.card_state(f.card).unwrap().kind.clone();
         let handle = start_live_shared_return(&mut f);
         let id = queue_first_shared_return_close(&mut f);
         drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
             f.target,
+            native_return_operation(&f.app, f.target),
             Err("current A return failed".into()),
         ))));
         let first = f.app.chat_ui.terminal_returns[&f.target]
@@ -30469,6 +32351,14 @@ mod tests {
             result: Ok(vec![(accepted.terminal.clone(), Ok(()))]),
         }));
         assert!(
+            accepted
+                .app
+                .pending_terminal_handoffs
+                .contains_key(&accepted.terminal.id)
+        );
+        let issued = accepted.app.issued_for_target(accepted.target).unwrap();
+        complete_issued_persistence_component(&mut accepted.app, issued);
+        assert!(
             !accepted
                 .app
                 .pending_terminal_handoffs
@@ -30487,16 +32377,28 @@ mod tests {
                 .app
                 .update(Message::ChatUi(Action::HandoffFinished(
                     bad_proof.target,
-                    Ok(wrong),
+                    native_return_operation(&bad_proof.app, bad_proof.target),
+                    Ok(issued_terminal_fixture(wrong)),
                 ))),
         );
         assert_shared_return_readable(&bad_proof);
         assert!(
             bad_proof.app.chat_ui.terminal_returns[&bad_proof.target]
                 .return_error
-                .as_deref()
-                .unwrap()
-                .contains("original host")
+                .is_none()
+        );
+        assert!(
+            bad_proof.app.chat_ui.native_returns
+                [&native_return_operation(&bad_proof.app, bad_proof.target)]
+                .pending
+        );
+        assert!(
+            bad_proof
+                .app
+                .chat_ui
+                .issued_returns
+                .values()
+                .any(|record| record.stage == IssuedStage::Conflict)
         );
         assert!(
             bad_proof.app.chat_ui.terminal_returns[&bad_proof.target]
@@ -30690,6 +32592,7 @@ mod tests {
         let original = detached.app.card_state(detached.card).unwrap().kind.clone();
         drop(detached.app.update(Message::ChatUi(Action::HandoffFinished(
             detached.target,
+            native_return_operation(&detached.app, detached.target),
             Err("detached A return failed".into()),
         ))));
         let failed = detached.app.chat_ui.terminal_returns[&detached.target]
