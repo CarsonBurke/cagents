@@ -20,8 +20,8 @@ use thiserror::Error;
 pub(crate) mod format;
 mod settings;
 pub use settings::SettingsCommand;
-mod completions;
 mod accounts;
+mod completions;
 pub use accounts::AccountCommand;
 mod agents;
 pub use agents::AgentCommand;
@@ -1969,7 +1969,14 @@ impl WaitOutcome {
 
 impl CommandOutput {
     fn exit_code(&self) -> ExitCode {
-        if !matches!(self.command, "agent.wait" | "agent.spawn" | "agent.send" | "automation.propose" | "automation.proposal") {
+        if !matches!(
+            self.command,
+            "agent.wait"
+                | "agent.spawn"
+                | "agent.send"
+                | "automation.propose"
+                | "automation.proposal"
+        ) {
             return ExitCode::SUCCESS;
         }
         let code = match self.data.get("outcome").and_then(Value::as_str) {
@@ -2020,14 +2027,18 @@ fn control_daemon_socket() -> Result<PathBuf, AppError> {
     match UnixStream::connect(&socket) {
         Ok(_) => Ok(socket),
         Err(error) if daemon_missing(&error) => Err(AppError::new(
-            "daemon_not_running", "The daemon is not running; omit --no-start to start it",
+            "daemon_not_running",
+            "The daemon is not running; omit --no-start to start it",
         )),
         Err(error) => Err(AppError::new("daemon_connection", error)),
     }
 }
 
 fn daemon_missing(error: &io::Error) -> bool {
-    matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn already_stopped() -> CommandOutput {
@@ -2064,9 +2075,16 @@ where
         }
     };
 
-    let stopping_daemon=matches!(&cli.command,TopCommand::Daemon{command:DaemonCommand::Stop{..}});
-    let no_start = stopping_daemon || cli.no_start || std::env::var("CAGENTS_NO_START")
-        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let stopping_daemon = matches!(
+        &cli.command,
+        TopCommand::Daemon {
+            command: DaemonCommand::Stop { .. }
+        }
+    );
+    let no_start = stopping_daemon
+        || cli.no_start
+        || std::env::var("CAGENTS_NO_START")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
     if let TopCommand::Completions { shell } = cli.command {
@@ -2099,10 +2117,20 @@ where
         };
     }
 
-    if matches!(&cli.command, TopCommand::Account { command: AccountCommand::Remove { .. } })
-        && Authority::from_environment().token().is_some()
+    if matches!(
+        &cli.command,
+        TopCommand::Account {
+            command: AccountCommand::Remove { .. }
+        }
+    ) && Authority::from_environment().token().is_some()
     {
-        emit_error(cli.json, &AppError::new("account_authority", "Account removal is refused under an agent capability; run it from your own shell"));
+        emit_error(
+            cli.json,
+            &AppError::new(
+                "account_authority",
+                "Account removal is refused under an agent capability; run it from your own shell",
+            ),
+        );
         return ExitCode::FAILURE;
     }
 
@@ -2158,7 +2186,7 @@ where
     ) {
         return match crate::device::serve_stdio() {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) if crate::device::daemon_absent(&error)=>{
+            Err(error) if crate::device::daemon_absent(&error) => {
                 crate::device::report_absent_bridge();
                 ExitCode::from(crate::device::BRIDGE_ABSENT_EXIT)
             }
@@ -2171,18 +2199,32 @@ where
     if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
         if let Err(error) = crate::device::prepare() {
             if crate::device::daemon_absent(&error) {
-                if stopping_daemon {emit_success(cli.json,already_stopped());return ExitCode::SUCCESS;}
-                emit_error(cli.json,&AppError::new("daemon_not_running",error));
+                if stopping_daemon {
+                    emit_success(cli.json, already_stopped());
+                    return ExitCode::SUCCESS;
+                }
+                emit_error(cli.json, &AppError::new("daemon_not_running", error));
                 return ExitCode::FAILURE;
             }
             emit_error(cli.json, &AppError::new("device", error));
             return ExitCode::FAILURE;
         }
     }
-    if let TopCommand::Agent { command: AgentCommand::Transcript { agent, follow, format } } = &cli.command {
+    if let TopCommand::Agent {
+        command:
+            AgentCommand::Transcript {
+                agent,
+                follow,
+                format,
+            },
+    } = &cli.command
+    {
         return match agents::stream_transcript(agent, *follow, format, cli.json) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => { emit_error(cli.json || format == "json", &error); ExitCode::FAILURE }
+            Err(error) => {
+                emit_error(cli.json || format == "json", &error);
+                ExitCode::FAILURE
+            }
         };
     }
     match execute(cli.command) {
@@ -2721,10 +2763,13 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             expected_generation,
             confirm,
         } => {
-            let socket = daemon_socket_path().map_err(|error|AppError::new("socket_path",error))?;
+            let socket =
+                daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let mut client = match ControlClient::connect(&socket) {
                 Ok(client) => client,
-                Err(ControlError::Connect(error)) if daemon_missing(&error) => return Ok(already_stopped()),
+                Err(ControlError::Connect(error)) if daemon_missing(&error) => {
+                    return Ok(already_stopped());
+                }
                 Err(error) => return Err(protocol_error(error)),
             };
             let outcome = match confirm {
@@ -3031,10 +3076,23 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
     }
     match command {
         TerminalCommand::List { all, exited } => {
-            let terminals = client.list().map_err(protocol_error)?.into_iter()
-                .filter(|terminal| all || if exited { terminal.completed } else { !terminal.completed })
+            let terminals = client
+                .list()
+                .map_err(protocol_error)?
+                .into_iter()
+                .filter(|terminal| {
+                    all || if exited {
+                        terminal.completed
+                    } else {
+                        !terminal.completed
+                    }
+                })
                 .collect::<Vec<_>>();
-            let human = format::table(&["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"], terminals.iter().map(terminal_row).collect(), "No terminals");
+            let human = format::table(
+                &["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"],
+                terminals.iter().map(terminal_row).collect(),
+                "No terminals",
+            );
             Ok(CommandOutput {
                 command: "terminal.list",
                 data: json!({ "terminals": terminals.iter().map(terminal_list_value).collect::<Vec<_>>() }),
@@ -3042,9 +3100,23 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
             })
         }
         TerminalCommand::Show { terminal_id } => {
-            let terminal = client.list().map_err(protocol_error)?.into_iter().find(|terminal| terminal.session.id == terminal_id)
-                .ok_or_else(|| AppError::new("terminal_not_found", format!("No terminal {terminal_id}")))?;
-            Ok(CommandOutput { command: "terminal.show", human: format::table(&["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"], vec![terminal_row(&terminal)], "No terminals"), data: json!({"terminal": terminal}) })
+            let terminal = client
+                .list()
+                .map_err(protocol_error)?
+                .into_iter()
+                .find(|terminal| terminal.session.id == terminal_id)
+                .ok_or_else(|| {
+                    AppError::new("terminal_not_found", format!("No terminal {terminal_id}"))
+                })?;
+            Ok(CommandOutput {
+                command: "terminal.show",
+                human: format::table(
+                    &["ID", "STATE", "TITLE", "PROGRAM", "DIRECTORY"],
+                    vec![terminal_row(&terminal)],
+                    "No terminals",
+                ),
+                data: json!({"terminal": terminal}),
+            })
         }
         TerminalCommand::Spawn { cwd, argv } => {
             let cwd = absolute_working_directory(cwd)
@@ -3237,7 +3309,12 @@ fn project_output(
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
     match command {
-        ResolvedProject::Open { repository, kind, checkout, primary_checkout } => {
+        ResolvedProject::Open {
+            repository,
+            kind,
+            checkout,
+            primary_checkout,
+        } => {
             // The same upsert a window publishes when it opens a repository,
             // carrying the name derived from the same key, so a project opened
             // from a shell and one opened in a window are one row that no
@@ -3270,9 +3347,14 @@ fn project_output(
             // the sidebar renders.
             let mut projects = model.projects.iter().collect::<Vec<_>>();
             projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = format::table(&["PATH", "NAME"], projects.iter().map(|project| vec![
-                project_display_path(project), project.name.clone(),
-            ]).collect(), "No open projects");
+            let human = format::table(
+                &["PATH", "NAME"],
+                projects
+                    .iter()
+                    .map(|project| vec![project_display_path(project), project.name.clone()])
+                    .collect(),
+                "No open projects",
+            );
             Ok(CommandOutput {
                 command: "project.list",
                 data: json!({ "projects": projects, "sequence": model.sequence }),
@@ -3356,22 +3438,43 @@ fn close_project(
 
 /// The verified checkout is presentation metadata, separate from Git identity.
 fn project_display_path(project: &ModelProject) -> String {
-    if let Some(path)=project.checkout.as_deref().or(project.primary_checkout.as_deref()).or_else(|| (project.kind==crate::model::ProjectKind::Folder).then_some(project.repository.as_path())) {
+    if let Some(path) = project
+        .checkout
+        .as_deref()
+        .or(project.primary_checkout.as_deref())
+        .or_else(|| {
+            (project.kind == crate::model::ProjectKind::Folder)
+                .then_some(project.repository.as_path())
+        })
+    {
         return path.display().to_string();
     }
     // Legacy rows only persisted Git identity. An ordinary .git spelling gives
     // a candidate, never proof: verify it against the selected device before
     // displaying it. Separate metadata directories have no reversible mapping.
-    if project.repository.file_name()==Some(OsStr::new(".git")) && let Some(candidate)=project.repository.parent() {
-        let verified=if crate::device::is_remote() {
-            match crate::device_service::request(crate::device_service::Operation::Discover{path:candidate.to_path_buf()}) {
-                Ok(crate::device_service::Reply::Project{key,checkout,..}) if key==project.repository=>checkout,
-                _=>None,
+    if project.repository.file_name() == Some(OsStr::new(".git"))
+        && let Some(candidate) = project.repository.parent()
+    {
+        let verified = if crate::device::is_remote() {
+            match crate::device_service::request(crate::device_service::Operation::Discover {
+                path: candidate.to_path_buf(),
+            }) {
+                Ok(crate::device_service::Reply::Project { key, checkout, .. })
+                    if key == project.repository =>
+                {
+                    checkout
+                }
+                _ => None,
             }
         } else {
-            crate::project_location::discover(candidate).ok().filter(|location|location.key==project.repository).and_then(|location|location.checkout)
+            crate::project_location::discover(candidate)
+                .ok()
+                .filter(|location| location.key == project.repository)
+                .and_then(|location| location.checkout)
         };
-        if let Some(checkout)=verified {return checkout.display().to_string();}
+        if let Some(checkout) = verified {
+            return checkout.display().to_string();
+        }
     }
     "(checkout unavailable)".into()
 }
@@ -3523,9 +3626,23 @@ fn channel_output(
                 })
                 .collect::<Vec<_>>();
             channels.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
-            let human = format::table(&["ID", "PROJECT", "TITLE"], channels.iter().map(|channel| vec![
-                channel.id.to_string(), model.project(&channel.repository).map(project_display_path).unwrap_or_else(||"(checkout unavailable)".into()), channel.title.clone(),
-            ]).collect(), "No channels");
+            let human = format::table(
+                &["ID", "PROJECT", "TITLE"],
+                channels
+                    .iter()
+                    .map(|channel| {
+                        vec![
+                            channel.id.to_string(),
+                            model
+                                .project(&channel.repository)
+                                .map(project_display_path)
+                                .unwrap_or_else(|| "(checkout unavailable)".into()),
+                            channel.title.clone(),
+                        ]
+                    })
+                    .collect(),
+                "No channels",
+            );
             Ok(CommandOutput {
                 command: "channel.list",
                 data: json!({ "channels": channels, "sequence": model.sequence }),
@@ -3614,9 +3731,18 @@ fn resolve_project_location(
         return match crate::device_service::request(crate::device_service::Operation::Discover {
             path: from,
         }) {
-            Ok(crate::device_service::Reply::Project { key, kind, checkout, primary_checkout, .. }) => {
-                Ok(crate::project_location::ProjectLocation { key, kind, checkout, primary_checkout })
-            }
+            Ok(crate::device_service::Reply::Project {
+                key,
+                kind,
+                checkout,
+                primary_checkout,
+                ..
+            }) => Ok(crate::project_location::ProjectLocation {
+                key,
+                kind,
+                checkout,
+                primary_checkout,
+            }),
             Ok(_) => Err(AppError::new(
                 "repository",
                 "unexpected remote project response",
@@ -3693,22 +3819,41 @@ fn terminal_state(terminal: &TerminalDescriptor) -> String {
         };
         match exit {
             Some(exit) if exit.code.is_some() => format!("exited({})", exit.code.unwrap()),
-            Some(exit) if exit.signal.is_some() => format!("exited({})", exit.signal.as_deref().unwrap()),
+            Some(exit) if exit.signal.is_some() => {
+                format!("exited({})", exit.signal.as_deref().unwrap())
+            }
             _ => "exited".into(),
         }
-    } else if terminal.visibility == TerminalVisibility::Hibernated { "hibernated".into() }
-    else { "running".into() }
+    } else if terminal.visibility == TerminalVisibility::Hibernated {
+        "hibernated".into()
+    } else {
+        "running".into()
+    }
 }
 
 fn terminal_row(terminal: &TerminalDescriptor) -> Vec<String> {
-    vec![terminal.session.id.to_string(), terminal_state(terminal), terminal.title.clone(),
-        terminal.session.launch.program.clone(), terminal.session.launch.working_directory.display().to_string()]
+    vec![
+        terminal.session.id.to_string(),
+        terminal_state(terminal),
+        terminal.title.clone(),
+        terminal.session.launch.program.clone(),
+        terminal
+            .session
+            .launch
+            .working_directory
+            .display()
+            .to_string(),
+    ]
 }
 
 fn terminal_list_value(terminal: &TerminalDescriptor) -> Value {
-    let state = if terminal.completed { "exited" }
-        else if terminal.visibility == TerminalVisibility::Hibernated { "hibernated" }
-        else { "running" };
+    let state = if terminal.completed {
+        "exited"
+    } else if terminal.visibility == TerminalVisibility::Hibernated {
+        "hibernated"
+    } else {
+        "running"
+    };
     let exit = match &terminal.session.continuity {
         TerminalContinuity::Exited { last_exit } => Some(last_exit),
         TerminalContinuity::RelaunchAvailable { last_exit, .. } => last_exit.as_ref(),
@@ -3720,7 +3865,9 @@ fn terminal_list_value(terminal: &TerminalDescriptor) -> Value {
         "directory": terminal.session.launch.working_directory, "generation": terminal.generation})
 }
 
-fn descriptor_line(terminal: &TerminalDescriptor) -> String { terminal_row(terminal).join("\t") }
+fn descriptor_line(terminal: &TerminalDescriptor) -> String {
+    terminal_row(terminal).join("\t")
+}
 
 fn absolute_working_directory(cwd: Option<PathBuf>) -> io::Result<PathBuf> {
     if crate::device::is_remote() {
@@ -3779,15 +3926,33 @@ fn emit_error(json_output: bool, error: &AppError) {
 mod tests {
     #[test]
     fn terminal_list_json_is_lean_while_show_retains_recovery_detail() {
-        let mut recipe = LaunchRecipe { program: "bash".into(), arguments: Vec::new(),
-            working_directory: "/tmp".into(), environment: BTreeMap::new(), unset_environment: Default::default() };
-        recipe.environment.insert("FIXTURE_PRIVATE".into(), "retained only in show".into());
+        let mut recipe = LaunchRecipe {
+            program: "bash".into(),
+            arguments: Vec::new(),
+            working_directory: "/tmp".into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        recipe
+            .environment
+            .insert("FIXTURE_PRIVATE".into(), "retained only in show".into());
         let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
         terminal.session.resume_hint = Some("fixture recipe".into());
         let value = terminal_list_value(&terminal);
         let text = value.to_string();
-        for forbidden in ["environment", "resume_hint", "continuity", "FIXTURE_PRIVATE"] { assert!(!text.contains(forbidden)); }
-        assert!(serde_json::to_value(&terminal).unwrap()["session"]["launch"]["environment"].get("FIXTURE_PRIVATE").is_some());
+        for forbidden in [
+            "environment",
+            "resume_hint",
+            "continuity",
+            "FIXTURE_PRIVATE",
+        ] {
+            assert!(!text.contains(forbidden));
+        }
+        assert!(
+            serde_json::to_value(&terminal).unwrap()["session"]["launch"]["environment"]
+                .get("FIXTURE_PRIVATE")
+                .is_some()
+        );
         terminal.completed = false;
         terminal.visibility = TerminalVisibility::Hidden;
         assert_eq!(terminal_state(&terminal), "running");
@@ -3795,9 +3960,13 @@ mod tests {
         assert_eq!(terminal_state(&terminal), "hibernated");
         terminal.completed = true;
         assert_eq!(terminal_state(&terminal), "exited");
-        terminal.session.continuity = TerminalContinuity::Exited { last_exit: crate::model::TerminalExit {
-            code: Some(3), signal: None, occurred_at_unix_ms: 0,
-        } };
+        terminal.session.continuity = TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(3),
+                signal: None,
+                occurred_at_unix_ms: 0,
+            },
+        };
         assert_eq!(terminal_state(&terminal), "exited(3)");
         assert_eq!(terminal_list_value(&terminal)["state"], "exited");
         assert_eq!(terminal_list_value(&terminal)["exit_code"], 3);
@@ -4372,50 +4541,109 @@ mod tests {
     /// the sidebar would fill with duplicates of the same repository.
     #[test]
     fn separate_git_directory_open_and_list_show_verified_checkout() {
-        let root=tempfile::tempdir().unwrap();
-        let checkout=root.path().join("checkout");
-        let metadata=root.path().join("metadata");
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        let metadata = root.path().join("metadata");
         std::fs::create_dir(&checkout).unwrap();
-        git(&checkout,&["init","--quiet","--separate-git-dir",metadata.to_str().unwrap()]);
-        let checkout=checkout.canonicalize().unwrap();
-        let metadata=metadata.canonicalize().unwrap();
-        let project=ModelProject{repository:metadata.clone(),checkout:Some(checkout.clone()),primary_checkout:Some(checkout.clone()),kind:crate::model::ProjectKind::Git,name:"checkout".into(),ordinal:1};
-        let (client_stream,mut server_stream)=UnixStream::pair().unwrap();
-        let peer_proof=proof("session","boot","incarnation");
-        let served=project.clone();
-        let server=thread::spawn(move || {
-            let _:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-            write_frame(&mut server_stream,&connected_envelope(1,peer_proof.clone(),peer_proof.clone())).unwrap();
-            let opened:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-            assert_eq!(opened.request,ClientRequest::EditWorkspaceModel{edit:ModelEdit::ReopenProject{repository:served.repository.clone(),checkout:served.checkout.clone(),primary_checkout:served.primary_checkout.clone(),kind:served.kind,name:served.name.clone()}});
-            let mut model=WorkspaceModel::default();model.projects.push(served);
-            write_frame(&mut server_stream,&model_envelope(opened.request_id,peer_proof.clone(),model.clone())).unwrap();
-            let listed:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-            assert_eq!(listed.request,ClientRequest::ReadWorkspaceModel);
-            write_frame(&mut server_stream,&model_envelope(listed.request_id,peer_proof,model)).unwrap();
+        git(
+            &checkout,
+            &[
+                "init",
+                "--quiet",
+                "--separate-git-dir",
+                metadata.to_str().unwrap(),
+            ],
+        );
+        let checkout = checkout.canonicalize().unwrap();
+        let metadata = metadata.canonicalize().unwrap();
+        let project = ModelProject {
+            repository: metadata.clone(),
+            checkout: Some(checkout.clone()),
+            primary_checkout: Some(checkout.clone()),
+            kind: crate::model::ProjectKind::Git,
+            name: "checkout".into(),
+            ordinal: 1,
+        };
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let served = project.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let opened: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(
+                opened.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::ReopenProject {
+                        repository: served.repository.clone(),
+                        checkout: served.checkout.clone(),
+                        primary_checkout: served.primary_checkout.clone(),
+                        kind: served.kind,
+                        name: served.name.clone()
+                    }
+                }
+            );
+            let mut model = WorkspaceModel::default();
+            model.projects.push(served);
+            write_frame(
+                &mut server_stream,
+                &model_envelope(opened.request_id, peer_proof.clone(), model.clone()),
+            )
+            .unwrap();
+            let listed: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert_eq!(listed.request, ClientRequest::ReadWorkspaceModel);
+            write_frame(
+                &mut server_stream,
+                &model_envelope(listed.request_id, peer_proof, model),
+            )
+            .unwrap();
         });
-        let resolved=ProjectCommand::Open{path:Some(checkout.clone())}.resolved().unwrap();
-        let mut client=ControlClient::from_stream(client_stream).unwrap();
-        let opened=project_output(&mut client,resolved).unwrap();
-        let listed=project_output(&mut client,ResolvedProject::List).unwrap();
+        let resolved = ProjectCommand::Open {
+            path: Some(checkout.clone()),
+        }
+        .resolved()
+        .unwrap();
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let opened = project_output(&mut client, resolved).unwrap();
+        let listed = project_output(&mut client, ResolvedProject::List).unwrap();
         server.join().unwrap();
-        assert_eq!(opened.human,format!("{}\tcheckout",checkout.display()));
-        assert_eq!(listed.human,format::table(&["PATH","NAME"],vec![vec![checkout.display().to_string(),"checkout".into()]],"No open projects"));
-        assert_eq!(opened.data["project"]["repository"],json!(metadata));
-        assert_eq!(opened.data["project"]["checkout"],json!(checkout));
+        assert_eq!(opened.human, format!("{}\tcheckout", checkout.display()));
+        assert_eq!(
+            listed.human,
+            format::table(
+                &["PATH", "NAME"],
+                vec![vec![checkout.display().to_string(), "checkout".into()]],
+                "No open projects"
+            )
+        );
+        assert_eq!(opened.data["project"]["repository"], json!(metadata));
+        assert_eq!(opened.data["project"]["checkout"], json!(checkout));
         assert!(!opened.human.contains("metadata"));
     }
 
     #[test]
     fn legacy_project_checkout_fallback_requires_verified_repository_identity() {
-        let Some(checkout)=git_checkout() else {return;};
-        let root=checkout.path().canonicalize().unwrap();
-        let mut project=ModelProject{kind:crate::model::ProjectKind::Git,repository:root.join(".git"),checkout:None,primary_checkout:None,name:"legacy".into(),ordinal:0};
-        assert_eq!(project_display_path(&project),root.display().to_string());
-        let unrelated=tempfile::tempdir().unwrap();
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
+        let root = checkout.path().canonicalize().unwrap();
+        let mut project = ModelProject {
+            kind: crate::model::ProjectKind::Git,
+            repository: root.join(".git"),
+            checkout: None,
+            primary_checkout: None,
+            name: "legacy".into(),
+            ordinal: 0,
+        };
+        assert_eq!(project_display_path(&project), root.display().to_string());
+        let unrelated = tempfile::tempdir().unwrap();
         std::fs::create_dir(unrelated.path().join(".git")).unwrap();
-        project.repository=unrelated.path().canonicalize().unwrap().join(".git");
-        assert_eq!(project_display_path(&project),"(checkout unavailable)");
+        project.repository = unrelated.path().canonicalize().unwrap().join(".git");
+        assert_eq!(project_display_path(&project), "(checkout unavailable)");
     }
 
     #[test]
@@ -4611,7 +4839,10 @@ mod tests {
         assert_eq!(output.data["sequence"], json!(4));
         assert_eq!(
             output.human,
-            format!("{}\t{name}", checkout.path().canonicalize().unwrap().display()),
+            format!(
+                "{}\t{name}",
+                checkout.path().canonicalize().unwrap().display()
+            ),
             "one tab-separated line: checkout path, name"
         );
     }
