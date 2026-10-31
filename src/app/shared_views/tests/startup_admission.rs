@@ -1202,8 +1202,23 @@ fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cance
         let daemon = ScriptedDaemon::start();
         let startup = app.initialize_runtimes();
         settle(&mut app, startup);
-        assert!(!app.chat_awaiting_admission(draft.id));
+        // A cached shared descriptor waits for its scope even when its
+        // conversation is unstarted. Only the actual seed ACK admits it.
+        assert!(app.chat_awaiting_admission(draft.id));
         assert!(app.chat_awaiting_admission(rejected.id));
+        assert_eq!(
+            app.durable.pending_chat_admissions.get(&draft.id),
+            Some(&original)
+        );
+        let CardKind::Chat(rejected_source) = &rejected.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            app.durable.pending_chat_admissions.get(&rejected.id),
+            Some(rejected_source)
+        );
+        assert!(daemon.requests().is_empty());
+        assert!(daemon.resolutions().is_empty());
         let rejected_target = match app.cards.get(&rejected.id) {
             Some(CardRuntime::Chat(runtime)) => runtime.target,
             _ => panic!("cached rejected source awaits its real model"),
@@ -1267,8 +1282,21 @@ fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cance
             if panes.iter().any(|pane| pane.id == rejected.id) || closed.contains(&rejected.id))
         ));
         assert_eq!(app.shared_views.quarantined, HashSet::from([rejected.id]));
+        assert!(app.chat_awaiting_admission(draft.id));
+        assert_eq!(
+            app.durable.pending_chat_admissions.get(&draft.id),
+            Some(&original)
+        );
         // ACK only the scopes the production Connected reducer actually seeded.
         for (scope, panes, closed) in seeds {
+            let admits_draft = scope == Scope::Channel(channel);
+            let draft_still_held = !app
+                .shared_views
+                .initialized
+                .contains(&Scope::Channel(channel));
+            if draft_still_held {
+                assert!(app.chat_awaiting_admission(draft.id));
+            }
             assert!(closed.is_empty());
             if scope != Scope::Channel(channel) {
                 assert_eq!(scope, Scope::Channel(active));
@@ -1280,6 +1308,12 @@ fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cance
                 model: full.clone(),
             });
             settle(&mut app, ack);
+            if admits_draft {
+                assert!(!app.chat_awaiting_admission(draft.id));
+                assert!(!app.durable.pending_chat_admissions.contains_key(&draft.id));
+            } else if draft_still_held {
+                assert!(app.chat_awaiting_admission(draft.id));
+            }
         }
         assert!(
             app.shared_views
@@ -1287,6 +1321,8 @@ fn mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cance
                 .contains(&Scope::Channel(channel))
         );
         assert!(!app.shared_views.seeding.contains(&Scope::Channel(channel)));
+        assert!(!app.chat_awaiting_admission(draft.id));
+        assert!(!app.shared_views.validated_managed.contains_key(&draft.id));
         assert_eq!(chat_ui::draft_launch_for_test(&app, draft.id).1, original);
         assert!(matches!(
             app.cards.get(&rejected.id),
