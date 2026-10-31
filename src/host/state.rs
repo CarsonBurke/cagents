@@ -6324,6 +6324,9 @@ for line in sys.stdin:
                             "--color=never",
                         ])
                         .env(SELECTOR_ENV, selector)
+                        // Update inspection reads the real application-data store.
+                        // Give each fresh fixture child its own private storage.
+                        .env("XDG_DATA_HOME", output.path().join("data"))
                         .stdout(fs::File::create(&stdout_path).unwrap())
                         .stderr(fs::File::create(&stderr_path).unwrap())
                         .spawn()
