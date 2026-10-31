@@ -368,6 +368,84 @@ fn issue_context_connections_are_pageable() {
     assert_eq!(result["nodes"][0]["body"], "Markdown");
     assert_eq!(result["pageInfo"]["endCursor"], "more-comments");
     assert!(f.request().contains("previous"));
+
+    // Exercise the real command names and stdout writer as well as JSON mode.
+    // The existing fixture curl reads these responses without contacting Linear.
+    let long_text = "Complete **Markdown** text\nwith another line ".repeat(20);
+    for (operation, field, node) in [
+        (
+            "comments",
+            "comments",
+            json!({"id": ISSUE_ID, "body": long_text,
+                "user": {"id": TEAM_ID, "name": "Comment author"}}),
+        ),
+        (
+            "relations",
+            "relations",
+            json!({"id": ISSUE_ID, "type": "related",
+                "issue": {"identifier": "ENG-12", "title": "Original issue"},
+                "relatedIssue": {"identifier": "ENG-13", "title": "Related issue"}}),
+        ),
+        (
+            "children",
+            "children",
+            json!({"id": ISSUE_ID, "identifier": "ENG-13", "description": long_text}),
+        ),
+        (
+            "relations",
+            "inverseRelations",
+            json!({"id": ISSUE_ID, "type": "blocks",
+                "issue": {"identifier": "ENG-14", "title": "Incoming issue"},
+                "relatedIssue": {"identifier": "ENG-12", "title": "Original issue"}}),
+        ),
+    ] {
+        let mut args = vec!["linear", operation, "--id", ISSUE_ID];
+        if field == "inverseRelations" {
+            args.push("--inverse");
+        }
+        for connection in [
+            json!({"nodes": [node],
+                "pageInfo": {"hasNextPage": true, "endCursor": "exact cursor\nwith spaces"},
+                "unknownFetchedField": {"kept": true}}),
+            json!({"nodes": [],
+                "pageInfo": {"hasNextPage": false, "endCursor": null},
+                "unknownFetchedField": {"kept": true}}),
+        ] {
+            f.read(json!({"issue": {"id": ISSUE_ID, (field): connection}}));
+            assert_eq!(f.success(&args), connection);
+            let mut command = f.command(&args);
+            assert_eq!(command.arguments.remove(0), "--json");
+            let human = capture(command);
+            assert!(human.success, "{human:?}");
+            assert!(human.stderr.is_empty(), "{human:?}");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&human.stdout).unwrap(),
+                connection
+            );
+        }
+    }
+
+    let issue = json!({"id": ISSUE_ID, "identifier": "ENG-12", "description": long_text,
+        "comments": {"nodes": [{"body": "Complete comment"}],
+            "pageInfo": {"hasNextPage": true, "endCursor": "comment cursor\nexact"}},
+        "attachments": {"nodes": [{"url": "https://example.invalid/file"}]},
+        "children": {"nodes": [{"identifier": "ENG-13", "description": "Complete child"}]},
+        "relations": {"nodes": [{"relatedIssue": {"identifier": "ENG-14"}}]},
+        "inverseRelations": {"nodes": [{"issue": {"identifier": "ENG-15"}}]},
+        "unknownFetchedField": {"kept": true}});
+    f.read(json!({"issue": issue}));
+    let args = ["linear", "issue", ISSUE_ID, "--full"];
+    assert_eq!(f.success(&args), issue);
+    let mut command = f.command(&args);
+    assert_eq!(command.arguments.remove(0), "--json");
+    let human = capture(command);
+    assert!(human.success, "{human:?}");
+    assert!(human.stderr.is_empty(), "{human:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&human.stdout).unwrap(),
+        issue
+    );
+    assert!(f.request().contains("inverseRelations(first:100)"));
 }
 
 #[test]
