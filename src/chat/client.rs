@@ -2758,13 +2758,6 @@ impl ClientHandle {
 pub fn acknowledge_terminal_handoffs(
     terminals: &[crate::model::TerminalSession],
 ) -> Vec<Result<(), String>> {
-    acknowledge_terminal_handoffs_with_receipts(terminals, &BTreeMap::new())
-}
-
-pub fn acknowledge_terminal_handoffs_with_receipts(
-    terminals: &[crate::model::TerminalSession],
-    cleanup_receipts: &BTreeMap<crate::model::TerminalId, uuid::Uuid>,
-) -> Vec<Result<(), String>> {
     if terminals.is_empty() {
         return Vec::new();
     }
@@ -2772,25 +2765,12 @@ pub fn acknowledge_terminal_handoffs_with_receipts(
         Ok(socket) => socket,
         Err(error) => return vec![Err(error.to_string()); terminals.len()],
     };
-    acknowledge_terminal_handoffs_with_receipts_on(
-        crate::control::ControlClient::connect(&socket),
-        terminals,
-        cleanup_receipts,
-    )
+    acknowledge_terminal_handoffs_on(crate::control::ControlClient::connect(&socket), terminals)
 }
 
-#[cfg(test)]
 fn acknowledge_terminal_handoffs_on(
     connection: Result<crate::control::ControlClient, crate::control::ControlError>,
     terminals: &[crate::model::TerminalSession],
-) -> Vec<Result<(), String>> {
-    acknowledge_terminal_handoffs_with_receipts_on(connection, terminals, &BTreeMap::new())
-}
-
-fn acknowledge_terminal_handoffs_with_receipts_on(
-    connection: Result<crate::control::ControlClient, crate::control::ControlError>,
-    terminals: &[crate::model::TerminalSession],
-    cleanup_receipts: &BTreeMap<crate::model::TerminalId, uuid::Uuid>,
 ) -> Vec<Result<(), String>> {
     use crate::control::ControlError;
 
@@ -2826,13 +2806,60 @@ fn acknowledge_terminal_handoffs_with_receipts_on(
             if let Some(error) = &connection_failure {
                 return Err(error.clone());
             }
-            match client
-                .commit_terminal_handoff(terminal.id, cleanup_receipts.get(&terminal.id).copied())
-            {
+            match client.commit_terminal_handoff(terminal.id, None) {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     // A correlated refusal leaves the stream in step. Transport
                     // and protocol failures may not; never reuse that connection.
+                    if !matches!(error, ControlError::Remote { .. }) {
+                        connection_failure = Some(error.to_string());
+                    }
+                    Err(error.to_string())
+                }
+            }
+        })
+        .collect()
+}
+
+/// Acknowledge issued returns on the original caller's authenticated connection.
+/// The caller retains that context across the durable save. This entry never
+/// resolves a socket, starts a service, or substitutes an unauthenticated client.
+pub(crate) fn acknowledge_terminal_handoffs_with_receipts_on(
+    client: &mut crate::control::ControlClient,
+    expected_host: &crate::model::HostSessionProof,
+    terminals: &[super::ReturnedTerminal],
+) -> Vec<Result<(), String>> {
+    use crate::control::ControlError;
+
+    if !expected_host.is_complete() || client.proof() != expected_host {
+        return vec![
+            Err("The original terminal handoff daemon could not be verified; its receipt is retained"
+                .into());
+            terminals.len()
+        ];
+    }
+    let mut connection_failure: Option<String> = None;
+    terminals
+        .iter()
+        .map(|returned| {
+            if returned.cleanup_receipt.is_nil() {
+                return Err("The original terminal cleanup receipt is missing".into());
+            }
+            let terminal = &returned.session;
+            if let Some(proof) = terminal.continuity.live_proof()
+                && (!proof.is_complete() || &proof != expected_host)
+            {
+                return Err(
+                    "The returned terminal belongs to a different daemon; its receipt is retained"
+                        .into(),
+                );
+            }
+            if let Some(error) = &connection_failure {
+                return Err(error.clone());
+            }
+            match client.commit_terminal_handoff(terminal.id, Some(returned.cleanup_receipt)) {
+                Ok(()) => Ok(()),
+                Err(error) => {
                     if !matches!(error, ControlError::Remote { .. }) {
                         connection_failure = Some(error.to_string());
                     }
@@ -3049,43 +3076,109 @@ mod tests {
 
     #[test]
     fn handoff_ack_transmits_only_the_captured_receipt_for_each_terminal() {
-        let terminals = vec![handoff_terminal(), handoff_terminal()];
-        let receipt = uuid::Uuid::new_v4();
-        let receipts = [(terminals[0].id, receipt)].into();
-        let expected = [(terminals[0].id, Some(receipt)), (terminals[1].id, None)];
-        let (client, mut server) = UnixStream::pair().unwrap();
-        let worker = thread::spawn(move || {
-            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-            handoff_handshake(&mut server, &mut codec);
-            for (terminal_id, cleanup_receipt) in expected {
-                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
-                assert_eq!(request.proof, Some(handoff_proof()));
-                assert_eq!(
-                    request.request,
-                    ClientRequest::ChatCommitTerminal {
-                        terminal_id,
-                        cleanup_receipt,
-                    }
-                );
-                handoff_reply(
-                    &mut server,
-                    &mut codec,
-                    Some(request.request_id),
-                    &handoff_proof(),
-                    ServerMessage::Response {
-                        response: ServerResponse::Accepted,
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+
+        for (scoped, wrong_host, missing_receipt) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let terminals: Vec<_> = (0..2)
+                .map(|_| super::super::ReturnedTerminal {
+                    session: handoff_terminal(),
+                    cleanup_receipt: if missing_receipt {
+                        uuid::Uuid::nil()
+                    } else {
+                        uuid::Uuid::new_v4()
                     },
-                );
+                })
+                .collect();
+            let expected: Vec<_> = terminals
+                .iter()
+                .map(|returned| (returned.session.id, returned.cleanup_receipt))
+                .collect();
+            // Synthetic framed-peer authority only; no real service accepts it.
+            let authority = crate::agent_execution::Authority::session("ack-fixture".into());
+            let expected_authority = authority.clone();
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || {
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                handoff_handshake(&mut server, &mut codec);
+                if scoped {
+                    let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    assert_eq!(
+                        request.request,
+                        ClientRequest::Authenticate {
+                            authority: expected_authority,
+                        }
+                    );
+                    handoff_reply(
+                        &mut server,
+                        &mut codec,
+                        Some(request.request_id),
+                        &handoff_proof(),
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted,
+                        },
+                    );
+                }
+                if wrong_host || missing_receipt {
+                    assert!(codec.read::<ClientEnvelope>(&mut server).unwrap().is_none());
+                    return;
+                }
+                for (terminal_id, cleanup_receipt) in expected {
+                    let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                    assert_eq!(request.proof, Some(handoff_proof()));
+                    assert_eq!(
+                        request.request,
+                        ClientRequest::ChatCommitTerminal {
+                            terminal_id,
+                            cleanup_receipt: Some(cleanup_receipt),
+                        }
+                    );
+                    let message = if scoped {
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::PermissionDenied,
+                            "scoped acknowledgement refused",
+                            false,
+                        ))
+                    } else {
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted,
+                        }
+                    };
+                    handoff_reply(
+                        &mut server,
+                        &mut codec,
+                        Some(request.request_id),
+                        &handoff_proof(),
+                        message,
+                    );
+                }
+            });
+            let mut client = crate::control::ControlClient::from_stream(client).unwrap();
+            if scoped {
+                client.authenticate(authority).unwrap();
             }
-        });
-        let results = acknowledge_terminal_handoffs_with_receipts_on(
-            crate::control::ControlClient::from_stream(client),
-            &terminals,
-            &receipts,
-        );
-        assert!(results.iter().all(Result::is_ok));
-        assert_eq!(results.len(), 2);
-        worker.join().unwrap();
+            let mut expected_host = handoff_proof();
+            if wrong_host {
+                expected_host.host_incarnation = crate::model::HostIncarnation::new("other");
+            }
+            let results = acknowledge_terminal_handoffs_with_receipts_on(
+                &mut client,
+                &expected_host,
+                &terminals,
+            );
+            assert_eq!(results.len(), 2);
+            if scoped || wrong_host || missing_receipt {
+                assert!(results.iter().all(Result::is_err));
+            } else {
+                assert!(results.iter().all(Result::is_ok));
+            }
+            drop(client);
+            worker.join().unwrap();
+        }
     }
 
     #[test]
