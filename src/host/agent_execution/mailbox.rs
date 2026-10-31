@@ -628,7 +628,7 @@ impl Handle {
         }
         match handle.try_idle_prompt(self.0.seal.seal(message, super::now())) {
             Ok(()) => {}
-            Err(Rejection::Refused(error)) => {
+            Err(Rejection::NotIdle(error) | Rejection::Refused(error)) => {
                 // Most often a person's own prompt won the idle conversation;
                 // the message waits for the turn that prompt starts to finish.
                 tracing::debug!(%error, message = %message.id, %session, "conversation refused a message");

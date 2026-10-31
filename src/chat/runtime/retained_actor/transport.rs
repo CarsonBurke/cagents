@@ -194,6 +194,7 @@ pub(crate) struct RemoteActor(Arc<Remote>);
 struct Pending {
     identity: InputIdentity,
     payload: Value,
+    managed_prompt: bool,
     bytes: usize,
     reply: Option<crossbeam_channel::Sender<Result<(), Rejection>>>,
 }
@@ -437,10 +438,12 @@ impl RemoteActor {
             RetainedInputOutcome::Acknowledged(result) => self.apply_receipts(&[InputReceipt {
                 identity: identity.clone(),
                 state: InputState::Acknowledged(result),
+                not_idle: false,
             }]),
             RetainedInputOutcome::Unknown(error) => self.apply_receipts(&[InputReceipt {
                 identity: identity.clone(),
                 state: InputState::Unknown(error),
+                not_idle: false,
             }]),
             RetainedInputOutcome::Unavailable => {
                 self.publish_unavailable("Retained actor attachment was superseded");
@@ -602,6 +605,18 @@ impl RemoteActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+    pub(in crate::chat::runtime) fn prompt_readiness(&self) -> Result<(bool, bool), String> {
+        let state = self.state();
+        if state.completed {
+            return Ok((false, true));
+        }
+        if self.0.stop.load(Ordering::Acquire) || self.0.preserved.load(Ordering::Acquire) {
+            return Err(state.failure.clone().unwrap_or_else(|| {
+                "Retained actor attachment is unavailable; its ownership was preserved".into()
+            }));
+        }
+        Ok((state.ready, state.close.exited))
     }
     pub fn refresh_state(&self) -> Result<(), String> {
         self.refresh_state_until(Instant::now() + TIMEOUT)
@@ -1390,6 +1405,14 @@ impl RemoteActor {
         if self.0.recovering_inputs.load(Ordering::Acquire) {
             return Err("Previous command receipts are settling after reattachment; no new command was admitted".into());
         }
+        let managed_prompt = matches!(
+            &payload,
+            InputPayload::Command {
+                run: Some(_),
+                command: Command::Prompt { .. },
+                decline_only: false,
+            }
+        );
         let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
         let identity;
@@ -1466,6 +1489,7 @@ impl RemoteActor {
             pending.push(Pending {
                 identity: identity.clone(),
                 payload: payload.clone(),
+                managed_prompt,
                 bytes: bytes.len(),
                 reply: Some(reply),
             });
@@ -1514,13 +1538,30 @@ impl RemoteActor {
             else {
                 return true;
             };
+            if receipt.not_idle
+                && (!pending.managed_prompt
+                    || !matches!(&receipt.state, InputState::Acknowledged(Err(_))))
+            {
+                if let Some(reply) = pending.reply.take() {
+                    let _ = reply.send(Err(Rejection::Unacknowledged(
+                        "Retained actor returned inconsistent idle-admission evidence; input ownership was preserved".into(),
+                    )));
+                }
+                return true;
+            }
             if uncertain.as_ref() == Some(&receipt.identity) {
                 *uncertain = None;
             }
             match &receipt.state {
                 InputState::Acknowledged(result) => {
                     if let Some(reply) = pending.reply.take() {
-                        let _ = reply.send(result.clone().map_err(Rejection::Refused));
+                        let _ = reply.send(result.clone().map_err(|error| {
+                            if receipt.not_idle {
+                                Rejection::NotIdle(error)
+                            } else {
+                                Rejection::Refused(error)
+                            }
+                        }));
                     }
                     completed.push(pending.identity.clone());
                     false
@@ -1554,9 +1595,11 @@ impl RemoteActor {
         }
         let receipts: Vec<InputReceipt> = self.call("acknowledged_inputs", Value::Null)?;
         if receipts.len() > 64
-            || receipts
-                .iter()
-                .any(|receipt| !matches!(&receipt.state, InputState::Acknowledged(_)))
+            || receipts.iter().any(|receipt| {
+                !matches!(&receipt.state, InputState::Acknowledged(_))
+                    || (receipt.not_idle
+                        && !matches!(&receipt.state, InputState::Acknowledged(Err(_))))
+            })
         {
             return Err("Helper returned an invalid terminal receipt page".into());
         }
@@ -2296,18 +2339,31 @@ impl Server {
         let journal = self.journal.clone();
         let completed = self.actor.is_completed();
         let changed = self.changed.clone();
-        self.pending.retain(|(identity,response,effects)| {
-            if !completed && effects.as_ref().is_some_and(|(_,state)|state.load(Ordering::Acquire)==0) {return true;}
-            let result=match response.try_recv() {Ok(result)=>Some(InputState::Acknowledged(result)),Err(crossbeam_channel::TryRecvError::Disconnected)=>Some(InputState::Unknown("The retained actor stopped before acknowledging this input; never replay it automatically".into())),Err(crossbeam_channel::TryRecvError::Empty)=>None};
-            if let Some(state)=result {
-                let mut journal=journal.lock().unwrap_or_else(|p|p.into_inner());
-                if matches!(&state,InputState::Acknowledged(Err(_))) && let Some((run,effects))=effects && effects.load(Ordering::Acquire)==1 {
-                    if let Err(error)=journal.refuse_unexecuted_run(*run) {let _=journal.record_loss(&error);}
+        self.pending.retain(|(identity, response, effects)| {
+            let observed = effects.as_ref().map(|(_, state)| state.load(Ordering::Acquire));
+            if !completed && observed == Some(0) {
+                return true;
+            }
+            let outcome = match response.try_recv() {
+                Ok(Err(error)) if observed == Some(2) => InputState::Unknown(error),
+                Ok(result) => InputState::Acknowledged(result),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => InputState::Unknown(
+                    "The retained actor stopped before acknowledging this input; never replay it automatically".into(),
+                ),
+                Err(crossbeam_channel::TryRecvError::Empty) => return true,
+            };
+            let mut journal = journal.lock().unwrap_or_else(|p| p.into_inner());
+            let result = match (&outcome, effects, observed) {
+                (InputState::Acknowledged(Err(error)), Some((run, _)), Some(1 | 3)) => {
+                    journal.finish_unexecuted(identity, *run, error.clone(), observed == Some(3))
                 }
-                if let Err(error)=journal.finish(identity,state) {let _=journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));}
-                changed.fetch_add(1,Ordering::Release);
-                false
-            } else {true}
+                _ => journal.finish(identity, outcome),
+            };
+            if let Err(error) = result {
+                let _ = journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));
+            }
+            changed.fetch_add(1, Ordering::Release);
+            false
         });
     }
     fn pinned_launch_directory(
@@ -2624,9 +2680,10 @@ impl Server {
                 match self.actor.enqueue_actor(command) {
                     Ok(reply) => self.pending.push((identity, reply, effects)),
                     Err(error) => {
-                        journal.finish(&identity, InputState::Acknowledged(Err(error)))?;
                         if let Some(run) = run {
-                            journal.refuse_unexecuted_run(run)?;
+                            journal.finish_unexecuted(&identity, run, error, false)?;
+                        } else {
+                            journal.finish(&identity, InputState::Acknowledged(Err(error)))?;
                         }
                     }
                 }
@@ -5593,6 +5650,79 @@ done"#;
     }
 
     #[test]
+    fn managed_idle_refusal_uses_receipt_metadata_without_parsing_legacy_errors() {
+        for not_idle in [true, false] {
+            let actor = RemoteActor::fixture();
+            let response = actor
+                .enqueue(
+                    Some(crate::model::RunId::new()),
+                    Command::Prompt {
+                        text: "one managed prompt".into(),
+                        attachments: Vec::new(),
+                        mode: chat::PromptMode::Send,
+                    },
+                )
+                .unwrap();
+            let identity = actor.pending_inputs().pop().unwrap();
+            actor.apply_receipts(&[InputReceipt {
+                identity: identity.clone(),
+                state: InputState::Acknowledged(Err("same legacy error text".into())),
+                not_idle,
+            }]);
+            let result = response.try_recv().unwrap();
+            assert!(if not_idle {
+                matches!(result, Err(Rejection::NotIdle(_)))
+            } else {
+                matches!(result, Err(Rejection::Refused(_)))
+            });
+            assert!(actor.pending_inputs().is_empty());
+            assert_eq!(*actor.0.retiring_inputs.lock().unwrap(), vec![identity]);
+        }
+    }
+
+    #[test]
+    fn contradictory_idle_refusal_receipts_preserve_input_uncertainty() {
+        for (managed, state) in [
+            (true, InputState::Acknowledged(Ok(()))),
+            (true, InputState::Unknown("outcome unknown".into())),
+            (
+                false,
+                InputState::Acknowledged(Err("not a managed prompt".into())),
+            ),
+        ] {
+            let actor = RemoteActor::fixture();
+            let run = managed.then(crate::model::RunId::new);
+            let command = if managed {
+                Command::Prompt {
+                    text: "managed".into(),
+                    attachments: Vec::new(),
+                    mode: chat::PromptMode::Send,
+                }
+            } else {
+                Command::Refresh
+            };
+            let response = actor.enqueue(run, command).unwrap();
+            let identity = actor.pending_inputs().pop().unwrap();
+            actor.apply_receipts(&[InputReceipt {
+                identity: identity.clone(),
+                state,
+                not_idle: true,
+            }]);
+            assert!(matches!(
+                response.try_recv().unwrap(),
+                Err(Rejection::Unacknowledged(_))
+            ));
+            assert_eq!(actor.pending_inputs(), vec![identity.clone()]);
+            assert_eq!(*actor.0.uncertain_input.lock().unwrap(), Some(identity));
+            assert!(actor.0.retiring_inputs.lock().unwrap().is_empty());
+            assert!(
+                actor.enqueue(None, Command::Refresh).is_err(),
+                "uncertain input cannot be replaced"
+            );
+        }
+    }
+
+    #[test]
     fn lost_retirement_reply_keeps_bounded_ack_metadata_and_never_resends_input() {
         let actor = RemoteActor::fixture();
         let response = actor.enqueue(None, Command::Refresh).unwrap();
@@ -5600,6 +5730,7 @@ done"#;
         actor.apply_receipts(&[InputReceipt {
             identity: identity.clone(),
             state: InputState::Acknowledged(Ok(())),
+            not_idle: false,
         }]);
         assert_eq!(response.try_recv(), Ok(Ok(())));
         assert!(actor.pending_inputs().is_empty());
@@ -5622,11 +5753,13 @@ done"#;
         actor.apply_receipts(&[InputReceipt {
             identity: other.clone(),
             state: InputState::Accepted,
+            not_idle: false,
         }]);
         assert!(response.try_recv().is_err());
         actor.apply_receipts(&[InputReceipt {
             identity: other,
             state: InputState::Unknown("uncertain".into()),
+            not_idle: false,
         }]);
         assert!(response.try_recv().unwrap().is_err());
         assert_eq!(*actor.0.retiring_inputs.lock().unwrap(), vec![identity]);

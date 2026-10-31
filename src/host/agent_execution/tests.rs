@@ -4,6 +4,7 @@ mod owned_late_decision;
 mod retained_automation;
 
 use super::*;
+use crate::chat::PromptMode;
 use crate::{
     agent::Provider,
     agent_execution::{Control, Operation, Reply, Target},

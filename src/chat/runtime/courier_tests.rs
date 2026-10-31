@@ -12,6 +12,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 struct Observed {
     prompts: Mutex<Vec<String>>,
     echoed: Mutex<Vec<String>>,
+    runs: Mutex<Vec<crate::model::RunId>>,
 }
 
 struct GatedAdapter {
@@ -96,6 +97,26 @@ impl Adapter for GatedAdapter {
             events,
             ..Step::default()
         })
+    }
+
+    fn command_for_run(
+        &mut self,
+        run: crate::model::RunId,
+        command: Command,
+    ) -> Result<Step, String> {
+        self.observed.runs.lock().unwrap().push(run);
+        if matches!(&command, Command::Prompt { text, .. } if text == "fixture uncertain Step") {
+            // The first frame can already be queued when a later frame fails
+            // the real size bound. The caller cannot infer no provider effects.
+            return Ok(Step {
+                writes: vec![
+                    json!({"courier_fixture_prompt": "uncertain"}),
+                    Value::String("x".repeat(FRAME_LIMIT)),
+                ],
+                ..Step::default()
+            });
+        }
+        self.command(command)
     }
 
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
@@ -234,6 +255,9 @@ impl RequestRaceFixture {
     pub(crate) fn provider_write_count(&self) -> usize {
         self.observed.echoed.lock().unwrap().len()
     }
+    pub(crate) fn correlated_runs(&self) -> Vec<crate::model::RunId> {
+        self.observed.runs.lock().unwrap().clone()
+    }
 
     pub(crate) fn close(&mut self) {
         assert!(self.request.is_none(), "release the request barrier first");
@@ -262,6 +286,20 @@ impl RequestRaceFixture {
         let (reply, result) = crossbeam_channel::bounded(1);
         self.attempts.push(thread::spawn(move || {
             let _ = reply.send(handle.try_idle_prompt(text));
+        }));
+        result
+    }
+
+    fn queue_managed_prompt(
+        &mut self,
+        run: crate::model::RunId,
+        text: &str,
+    ) -> Receiver<Result<(), Rejection>> {
+        let handle = self.handle.clone();
+        let text = text.to_owned();
+        let (reply, result) = crossbeam_channel::bounded(1);
+        self.attempts.push(thread::spawn(move || {
+            let _ = reply.send(handle.try_idle_prompt_for_run(run, text));
         }));
         result
     }
@@ -302,6 +340,75 @@ fn courier_prompt_rechecks_request_published_after_idle_observation() {
     assert_eq!(fixture.provider_write_count(), 0);
     assert_eq!(fixture.handle.requests()[0].id, REQUEST);
     fixture.close();
+}
+
+#[test]
+fn managed_prompt_rechecks_actor_contention_then_admits_the_same_run_once() {
+    let mut fixture = RequestRaceFixture::new();
+    let run = crate::model::RunId::new();
+    fixture.begin_request();
+    let delivery = fixture.queue_managed_prompt(run, "managed delivery");
+    fixture.wait_for_queued_prompt();
+    fixture.release_request();
+    assert!(matches!(
+        delivery.recv_timeout(TIMEOUT).unwrap(),
+        Err(Rejection::NotIdle(_))
+    ));
+    assert_eq!(fixture.prompt_count(), 0);
+    assert_eq!(fixture.provider_write_count(), 0);
+    assert!(
+        fixture.correlated_runs().is_empty(),
+        "refusal precedes adapter entry"
+    );
+    fixture.clear_request();
+    fixture
+        .handle
+        .try_idle_prompt_for_run(run, "managed delivery".into())
+        .unwrap();
+    fixture.wait_for_provider_writes(1);
+    assert_eq!(fixture.correlated_runs(), vec![run]);
+    assert_eq!(fixture.prompt_texts(), vec!["managed delivery"]);
+    fixture.close();
+}
+
+#[test]
+fn managed_prompt_waiting_unready_or_busy_never_enters_the_adapter() {
+    for model in ["busy", "unready", "waiting"] {
+        let mut fixture = RequestRaceFixture::new();
+        fixture
+            .handle
+            .command(Command::SetModel {
+                model: model.into(),
+                reasoning: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .handle
+                .try_idle_prompt_for_run(crate::model::RunId::new(), "deferred".into()),
+            Err(Rejection::NotIdle(_))
+        ));
+        assert!(fixture.correlated_runs().is_empty());
+        assert_eq!(fixture.prompt_count(), 0);
+        assert_eq!(fixture.provider_write_count(), 0);
+        fixture.close();
+    }
+}
+
+#[test]
+fn managed_prompt_step_failure_is_uncertain_after_possible_writes() {
+    let fixture = RequestRaceFixture::new();
+    let run = crate::model::RunId::new();
+    let result = fixture
+        .handle
+        .try_idle_prompt_for_run(run, "fixture uncertain Step".into());
+    assert!(
+        matches!(result, Err(Rejection::Unacknowledged(_))),
+        "{result:?}"
+    );
+    assert_eq!(fixture.correlated_runs(), vec![run]);
+    // The fixture's existing owner closes and waits its exact child. There is
+    // no automatic second prompt after this uncertain first attempt.
 }
 
 #[test]

@@ -337,6 +337,23 @@ impl Handle {
             Owner::Remote(remote) => remote.try_idle_prompt(text),
         }
     }
+    pub(crate) fn try_idle_prompt_for_run(
+        &self,
+        run: crate::model::RunId,
+        text: String,
+    ) -> Result<(), Rejection> {
+        match &self.0 {
+            Owner::Local(local) => local.try_idle_prompt_for_run(run, text),
+            Owner::Remote(remote) => remote.submit(
+                Some(run),
+                Command::Prompt {
+                    text,
+                    attachments: Vec::new(),
+                    mode: super::super::PromptMode::Send,
+                },
+            ),
+        }
+    }
     /// Exact source recognition is checked by the helper under this attachment epoch.
     pub(crate) fn recognize_retained_sources(
         &self,
@@ -607,6 +624,12 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.is_idle(),
             Owner::Remote(remote) => remote.state().idle,
+        }
+    }
+    pub(crate) fn prompt_readiness(&self) -> Result<(bool, bool), String> {
+        match &self.0 {
+            Owner::Local(local) => local.prompt_readiness(),
+            Owner::Remote(remote) => remote.prompt_readiness(),
         }
     }
     pub(crate) fn requests(&self) -> Vec<chat::Request> {

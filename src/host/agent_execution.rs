@@ -8,7 +8,7 @@ use crate::{
         Accepted, Agent, Authority, Destination, HostedSession, Origin, Run, Spec, State, Submit,
         Surface, Update,
     },
-    chat::{self, Command, PromptMode},
+    chat::{self, Command},
     model::{AgentId, RunId, TerminalId},
     terminal_ipc::{ClientRequest, ServerResponse},
 };
@@ -462,83 +462,116 @@ fn dispatch(
         announce(host, &registry);
         (session, handle)
     };
-    // A visible, bound startup may be closed while a provider is initializing.
-    // Reacquire and revalidate before the first external prompt, rather than
-    // making interactive close wait through the whole readiness deadline.
+    // Our own bind is an allowed change to the accepted agent. Later retries
+    // still compare every other authority/specification field, and only accept
+    // descriptor metadata from this exact captured provider process.
+    let mut expected = accepted.clone();
+    let captured = HostedSession::Chat(session.clone());
+    expected.agent.session = Some(captured.clone());
+    // Passive waiting must not hold either the update/shutdown barrier or the
+    // per-agent control gate. Reacquire both, in this order, for each attempt.
     drop(_dispatch);
+    drop(_control);
     let deadline = Instant::now() + Duration::from_secs(30);
+    let initial = provider_launch_snapshot(&handle)?;
+    if initial.exited {
+        return Err(before("Provider exited before accepting the prompt".into()));
+    }
+    let mut became_ready = initial.ready;
     loop {
-        let snapshot = provider_launch_snapshot(&handle)?;
-        if snapshot.exited || handle.is_completed() {
-            return Err(before("Provider exited before accepting the prompt".into()));
-        }
-        if snapshot.ready {
-            if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
+        let attempt = {
+            let _control = control.read().unwrap_or_else(|p| p.into_inner());
+            super::client::ensure_control_open(host).map_err(|error| before(error.message))?;
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            {
+                let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                let current = registry.agent(accepted.agent.id).map_err(before)?;
+                if !current
+                    .session
+                    .as_ref()
+                    .is_some_and(|source| source.same_process(&captured))
+                {
+                    return Err(before(
+                        "The exact provider binding changed before prompt dispatch".into(),
+                    ));
+                }
+                expected.agent.session = current.session;
+                registry
+                    .validate_agent_dispatch(&expected)
+                    .map_err(before)?;
+                if matches!(accepted.agent.origin, Origin::Automation { .. })
+                    && !registry
+                        .agent_dispatch_is_authorized(accepted.agent.id, accepted.run.id)
+                        .map_err(before)?
+                {
+                    return Err(before(
+                        "Interactive work took ownership while the managed run waited".into(),
+                    ));
+                }
+            }
+            if !host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .chats
+                .get(&session.id)
+                .is_some_and(|record| record.handle.same_actor(&handle))
+            {
                 return Err(before(
-                    "The hosted provider is not idle; no additional prompt was submitted".into(),
+                    "The exact provider changed before prompt dispatch".into(),
                 ));
             }
-            break;
+            // The first readiness observation has a startup deadline. A ready
+            // parent's native turn or approval can last longer; keep this one
+            // managed run Accepted until its own atomic admission succeeds.
+            let (ready, exited) = handle
+                .prompt_readiness()
+                .map_err(|error| (State::Interrupted, error))?;
+            if exited || handle.is_completed() {
+                return Err(before("Provider exited before accepting the prompt".into()));
+            }
+            became_ready |= ready;
+            if !became_ready && Instant::now() >= deadline {
+                return Err(before(
+                    "Provider did not become ready before the launch deadline".into(),
+                ));
+            }
+            if !ready || !handle.is_idle() {
+                None
+            } else {
+                if accepted.agent.spec.surface == Surface::Terminal
+                    && expected.agent.console.is_none()
+                {
+                    create_console(host, &registry, accepted.agent.id, &session, &handle)
+                        .map_err(ConsoleError::run_failure)?;
+                    expected.agent.console = registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .agent(accepted.agent.id)
+                        .map_err(before)?
+                        .console;
+                }
+                context
+                    .verify_directory(&accepted.agent.spec.target.directory)
+                    .map_err(before)?;
+                if matches!(accepted.agent.origin, Origin::Automation { .. }) {
+                    selected_account(&accepted.agent.spec).map_err(before)?;
+                }
+                Some(handle.try_idle_prompt_for_run(accepted.run.id, request.prompt.clone()))
+            }
+        };
+        match attempt {
+            Some(Ok(())) => return Ok(()),
+            Some(Err(chat::runtime::Rejection::Refused(error))) => return Err(before(error)),
+            Some(Err(chat::runtime::Rejection::Unacknowledged(error))) => {
+                return Err((State::Interrupted, error));
+            }
+            Some(Err(chat::runtime::Rejection::NotIdle(error))) => {
+                tracing::debug!(%error, run = %accepted.run.id, "managed prompt waits for its parent conversation");
+            }
+            None => {}
         }
-        if Instant::now() >= deadline {
-            return Err(before(
-                "Provider did not become ready before the launch deadline".into(),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(250));
     }
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-    {
-        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        if registry.agent(accepted.agent.id).map_err(before)?.closed
-            || registry.agent_run(accepted.run.id).map_err(before)? != accepted.run
-            || (matches!(accepted.agent.origin, Origin::Automation { .. })
-                && !registry
-                    .agent_dispatch_is_authorized(accepted.agent.id, accepted.run.id)
-                    .map_err(before)?)
-        {
-            return Err(before(
-                "Execution ownership changed while the provider initialized".into(),
-            ));
-        }
-    }
-    if !host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&session.id)
-        .is_some_and(|record| record.handle.same_actor(&handle))
-    {
-        return Err(before(
-            "The exact provider changed before prompt dispatch".into(),
-        ));
-    }
-    if accepted.agent.spec.surface == Surface::Terminal && accepted.agent.console.is_none() {
-        create_console(host, &registry, accepted.agent.id, &session, &handle)
-            .map_err(ConsoleError::run_failure)?;
-    }
-    context
-        .verify_directory(&accepted.agent.spec.target.directory)
-        .map_err(before)?;
-    if matches!(accepted.agent.origin, Origin::Automation { .. }) {
-        // Live interactive work may survive removal; each scheduled prompt
-        // still requires its explicitly selected account to be registered.
-        selected_account(&accepted.agent.spec).map_err(before)?;
-    }
-    // Once command submission begins an absent acknowledgement is ambiguous.
-    // Only the adapter's exact correlated result may declare success.
-    handle
-        .command_for_run(
-            accepted.run.id,
-            Command::Prompt {
-                text: request.prompt,
-                attachments: Vec::new(),
-                mode: PromptMode::Send,
-            },
-        )
-        .map_err(|error| (State::Interrupted, error))?;
-    let _ = session;
-    Ok(())
 }
 
 pub(super) fn observed(

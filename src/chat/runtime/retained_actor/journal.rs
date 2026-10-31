@@ -43,6 +43,10 @@ pub(crate) enum InputState {
 pub(crate) struct InputReceipt {
     pub identity: InputIdentity,
     pub state: InputState,
+    /// Additive v2 receipt metadata. Older helpers omit it; older clients can
+    /// still read and retire the ordinary acknowledged refusal underneath it.
+    #[serde(default)]
+    pub not_idle: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,7 +103,7 @@ impl Journal {
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL);
             CREATE TABLE retained_runs(run TEXT PRIMARY KEY,finished INTEGER);
-            CREATE TABLE inputs(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,hash BLOB NOT NULL,state BLOB NOT NULL);
+            CREATE TABLE inputs(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,hash BLOB NOT NULL,state BLOB NOT NULL,not_idle INTEGER NOT NULL DEFAULT 0 CHECK(not_idle IN (0,1)));
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL);
             INSERT INTO metadata VALUES('input_sequence','0'),('outcome_ack','0');")
             .map_err(|error| error.to_string())?;
@@ -387,22 +391,27 @@ impl Journal {
         Ok(())
     }
     pub fn input(&self, identity: &InputIdentity) -> Result<Option<InputReceipt>, String> {
-        let stored: Option<(String, Vec<u8>, Vec<u8>)> = self
+        let stored: Option<(String, Vec<u8>, Vec<u8>, bool)> = self
             .db
             .query_row(
-                "SELECT id,hash,state FROM inputs WHERE sequence=?1",
+                "SELECT id,hash,state,not_idle FROM inputs WHERE sequence=?1",
                 [identity.sequence],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        if let Some((id, hash, state)) = stored {
+        if let Some((id, hash, state, not_idle)) = stored {
             if id != identity.id.to_string() || hash != identity.hash {
                 return Err("Input sequence was already used for a different command".into());
             }
+            let state = serde_json::from_slice(&state).map_err(|error| error.to_string())?;
+            if not_idle && !matches!(&state, InputState::Acknowledged(Err(_))) {
+                return Err("Invalid retained idle-admission receipt".into());
+            }
             return Ok(Some(InputReceipt {
                 identity: identity.clone(),
-                state: serde_json::from_slice(&state).map_err(|error| error.to_string())?,
+                state,
+                not_idle,
             }));
         }
         if identity.sequence <= self.number("input_sequence")? {
@@ -423,15 +432,6 @@ impl Journal {
     }
     pub fn retained_runs(&self) -> Result<Vec<crate::model::RunId>, String> {
         Ok(self.run_ids.iter().copied().collect())
-    }
-    pub fn refuse_unexecuted_run(&mut self, run: crate::model::RunId) -> Result<(), String> {
-        self.ensure_writable()?;
-        self.db
-            .execute("DELETE FROM retained_runs WHERE run=?1", [run.to_string()])
-            .map_err(|error| error.to_string())?;
-        self.run_ids.remove(&run);
-        self.finished_runs.remove(&run);
-        Ok(())
     }
     pub fn admit(&mut self, identity: &InputIdentity) -> Result<InputReceipt, String> {
         self.admit_with_run(identity, None)
@@ -498,12 +498,33 @@ impl Journal {
         Ok(InputReceipt {
             identity: identity.clone(),
             state,
+            not_idle: false,
         })
     }
-    pub fn finish(
+    pub fn finish(&mut self, identity: &InputIdentity, state: InputState) -> Result<(), String> {
+        self.finish_input(identity, state, None)
+    }
+    /// The actor proved this input never prepared a Step. Persist that exact
+    /// refusal before releasing its run, in the same transaction, so a failed
+    /// receipt write cannot erase the ownership needed for loss recovery.
+    pub fn finish_unexecuted(
+        &mut self,
+        identity: &InputIdentity,
+        run: crate::model::RunId,
+        error: String,
+        not_idle: bool,
+    ) -> Result<(), String> {
+        self.finish_input(
+            identity,
+            InputState::Acknowledged(Err(error)),
+            Some((run, not_idle)),
+        )
+    }
+    fn finish_input(
         &mut self,
         identity: &InputIdentity,
         mut state: InputState,
+        unexecuted: Option<(crate::model::RunId, bool)>,
     ) -> Result<(), String> {
         self.ensure_writable()?;
         let error = match &mut state {
@@ -525,15 +546,28 @@ impl Journal {
         if receipt.state != InputState::Accepted {
             return Err("Input receipt already has an outcome".into());
         }
-        self.db
+        let not_idle = unexecuted.is_some_and(|(_, not_idle)| not_idle);
+        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        transaction
             .execute(
-                "UPDATE inputs SET state=?1 WHERE sequence=?2",
+                "UPDATE inputs SET state=?1,not_idle=?2 WHERE sequence=?3",
                 params![
                     serde_json::to_vec(&state).map_err(|error| error.to_string())?,
+                    not_idle,
                     identity.sequence
                 ],
             )
             .map_err(|error| error.to_string())?;
+        if let Some((run, _)) = unexecuted {
+            transaction
+                .execute("DELETE FROM retained_runs WHERE run=?1", [run.to_string()])
+                .map_err(|error| error.to_string())?;
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        if let Some((run, _)) = unexecuted {
+            self.run_ids.remove(&run);
+            self.finished_runs.remove(&run);
+        }
         if matches!(state, InputState::Acknowledged(_)) {
             self.acknowledged_inputs.insert(identity.sequence);
         }
@@ -545,12 +579,12 @@ impl Journal {
     pub fn acknowledged_input_page(&self) -> Result<Vec<InputReceipt>, String> {
         let mut page = Vec::new();
         for sequence in self.acknowledged_inputs.iter().take(64) {
-            let (id, hash, state): (String, Vec<u8>, Vec<u8>) = self
+            let (id, hash, state, not_idle): (String, Vec<u8>, Vec<u8>, bool) = self
                 .db
                 .query_row(
-                    "SELECT id,hash,state FROM inputs WHERE sequence=?1",
+                    "SELECT id,hash,state,not_idle FROM inputs WHERE sequence=?1",
                     [sequence],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .map_err(|error| error.to_string())?;
             let identity = InputIdentity {
@@ -561,10 +595,16 @@ impl Journal {
                     .map_err(|_| "Invalid retained input digest")?,
             };
             let state = serde_json::from_slice(&state).map_err(|error| error.to_string())?;
-            if !matches!(state, InputState::Acknowledged(_)) {
+            if !matches!(&state, InputState::Acknowledged(_))
+                || (not_idle && !matches!(&state, InputState::Acknowledged(Err(_))))
+            {
                 return Err("Input acknowledgement cache lost its terminal-state proof".into());
             }
-            page.push(InputReceipt { identity, state });
+            page.push(InputReceipt {
+                identity,
+                state,
+                not_idle,
+            });
         }
         Ok(page)
     }
@@ -1140,6 +1180,144 @@ mod tests {
                 "legacy/new metadata evidence coexist without later Snapshot reads"
             );
         }
+    }
+
+    #[test]
+    fn idle_refusal_replay_and_retirement_preserve_a_new_same_run_attempt() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(directory.path(), 4096).unwrap();
+        let run = crate::model::RunId::new();
+        let first = InputIdentity {
+            sequence: 1,
+            id: uuid::Uuid::new_v4(),
+            hash: [1; 32],
+        };
+        journal.admit_with_run(&first, Some(run)).unwrap();
+        journal
+            .finish_unexecuted(&first, run, "parent busy".into(), true)
+            .unwrap();
+        let refusal = journal.input(&first).unwrap().unwrap();
+        assert!(refusal.not_idle);
+        assert_eq!(
+            refusal.state,
+            InputState::Acknowledged(Err("parent busy".into()))
+        );
+        assert!(journal.retained_runs().unwrap().is_empty());
+        assert!(journal.acknowledged_input_page().unwrap()[0].not_idle);
+
+        let second = InputIdentity {
+            sequence: 2,
+            id: uuid::Uuid::new_v4(),
+            hash: [2; 32],
+        };
+        journal.admit_with_run(&second, Some(run)).unwrap();
+        let replay = journal.admit_with_run(&first, Some(run)).unwrap();
+        assert!(replay.not_idle);
+        assert_eq!(journal.retained_runs().unwrap(), vec![run]);
+        assert!(
+            journal
+                .finish_unexecuted(&first, run, "late refusal".into(), true)
+                .is_err()
+        );
+        journal
+            .retire_acknowledged_inputs(&[first.clone()])
+            .unwrap();
+        assert_eq!(journal.retained_runs().unwrap(), vec![run]);
+        assert!(
+            journal.input(&first).is_err(),
+            "retired input cannot be replayed"
+        );
+        journal
+            .finish_unexecuted(&second, run, "still busy".into(), true)
+            .unwrap();
+        journal.retire_acknowledged_inputs(&[second]).unwrap();
+        // A long contention period must retire receipts rather than consume
+        // the bounded input capacity with each safe admission attempt.
+        for sequence in 3..(3 + MAX_INPUTS as u64 * 2) {
+            let identity = InputIdentity {
+                sequence,
+                id: uuid::Uuid::new_v4(),
+                hash: [3; 32],
+            };
+            journal.admit_with_run(&identity, Some(run)).unwrap();
+            journal
+                .finish_unexecuted(&identity, run, "busy".into(), true)
+                .unwrap();
+            journal.retire_acknowledged_inputs(&[identity]).unwrap();
+        }
+        assert_eq!(journal.acknowledged_input_count(), 0);
+        assert!(journal.retained_runs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn idle_refusal_transaction_failure_preserves_input_and_run_for_loss_recovery() {
+        for trigger in [
+            "CREATE TRIGGER reject_refusal BEFORE UPDATE ON inputs BEGIN SELECT RAISE(ABORT,'receipt refused'); END;",
+            "CREATE TRIGGER reject_refusal BEFORE DELETE ON retained_runs BEGIN SELECT RAISE(ABORT,'run release refused'); END;",
+        ] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut journal = Journal::with_budget(directory.path(), 4096).unwrap();
+            let run = crate::model::RunId::new();
+            let identity = InputIdentity {
+                sequence: 1,
+                id: uuid::Uuid::new_v4(),
+                hash: [4; 32],
+            };
+            journal.admit_with_run(&identity, Some(run)).unwrap();
+            journal.db.execute_batch(trigger).unwrap();
+            let error = journal
+                .finish_unexecuted(&identity, run, "busy".into(), true)
+                .unwrap_err();
+            let pending = journal.input(&identity).unwrap().unwrap();
+            assert_eq!(pending.state, InputState::Accepted);
+            assert!(!pending.not_idle);
+            assert_eq!(journal.retained_runs().unwrap(), vec![run]);
+            assert_eq!(journal.acknowledged_input_count(), 0);
+            journal.record_loss(&error).unwrap();
+            assert!(
+                journal
+                    .continuity_loss()
+                    .unwrap()
+                    .unwrap()
+                    .affected_runs
+                    .contains(&run)
+            );
+        }
+    }
+
+    #[test]
+    fn additive_idle_refusal_receipt_preserves_legacy_v2_decoding() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyReceipt {
+            identity: InputIdentity,
+            state: InputState,
+        }
+        let identity = InputIdentity {
+            sequence: 1,
+            id: uuid::Uuid::new_v4(),
+            hash: [5; 32],
+        };
+        let state = InputState::Acknowledged(Err("not idle".into()));
+        let current = InputReceipt {
+            identity: identity.clone(),
+            state: state.clone(),
+            not_idle: true,
+        };
+        let old_reader: LegacyReceipt =
+            serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!(old_reader.identity, identity);
+        assert_eq!(old_reader.state, state);
+        let old_receipt = LegacyReceipt {
+            identity: identity.clone(),
+            state,
+        };
+        let new_reader: InputReceipt =
+            serde_json::from_slice(&serde_json::to_vec(&old_receipt).unwrap()).unwrap();
+        assert_eq!(new_reader.identity, identity);
+        assert!(
+            !new_reader.not_idle,
+            "legacy error text is not typed contention proof"
+        );
     }
 
     #[test]

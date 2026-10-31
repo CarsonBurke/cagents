@@ -93,6 +93,13 @@ enum ActorCommand {
 /// Step is admitted, an uncertain acknowledgement never authorizes replay.
 struct InputEffects(Option<Arc<AtomicU8>>);
 impl InputEffects {
+    fn not_idle(&self) {
+        if let Some(effects) = &self.0 {
+            // A typed no-effect refusal, distinct from ordinary refusal and
+            // from a Step whose provider effects are already possible.
+            effects.store(3, Ordering::Release);
+        }
+    }
     fn possible(&self) {
         if let Some(effects) = &self.0 {
             effects.store(2, Ordering::Release);
@@ -112,6 +119,9 @@ type CommandRequest = (ActorCommand, crossbeam_channel::Sender<Result<(), String
 /// Why a provider command may not have taken effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Rejection {
+    /// This exact run's prompt was refused before adapter preparation because
+    /// the parent was not idle. No prompt remains queued on the actor.
+    NotIdle(String),
     /// The actor never took the command, or refused it.
     Refused(String),
     /// The actor took the command but did not answer in time; the provider
@@ -122,7 +132,9 @@ pub(crate) enum Rejection {
 impl From<Rejection> for String {
     fn from(rejection: Rejection) -> Self {
         match rejection {
-            Rejection::Refused(error) | Rejection::Unacknowledged(error) => error,
+            Rejection::NotIdle(error)
+            | Rejection::Refused(error)
+            | Rejection::Unacknowledged(error) => error,
         }
     }
 }
@@ -742,6 +754,35 @@ impl LocalHandle {
         self.submit_actor_command(ActorCommand::IdlePrompt(text))
     }
 
+    /// One atomic admission attempt for an already accepted managed run.
+    /// Only NotIdle permits waiting and making another attempt; a lost reply
+    /// or failure after Step preparation preserves the original uncertainty.
+    pub(crate) fn try_idle_prompt_for_run(
+        &self,
+        run: crate::model::RunId,
+        text: String,
+    ) -> Result<(), Rejection> {
+        let effects = Arc::new(AtomicU8::new(0));
+        let result = self.submit_actor_command(ActorCommand::RetainedProvider {
+            run: Some(run),
+            command: Command::Prompt {
+                text,
+                attachments: Vec::new(),
+                mode: super::PromptMode::Send,
+            },
+            decline_only: false,
+            effects: effects.clone(),
+        });
+        match result {
+            Err(Rejection::Refused(error)) => match effects.load(Ordering::Acquire) {
+                3 => Err(Rejection::NotIdle(error)),
+                2 => Err(Rejection::Unacknowledged(error)),
+                _ => Err(Rejection::Refused(error)),
+            },
+            result => result,
+        }
+    }
+
     pub(crate) fn command_for_run(
         &self,
         run: crate::model::RunId,
@@ -1266,6 +1307,20 @@ impl LocalHandle {
     pub(crate) fn is_idle(&self) -> bool {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         accepts_prompt(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
+    }
+    /// Read only readiness and exit hints while a managed run waits. The
+    /// actor's eventual correlated admission remains authoritative.
+    pub(crate) fn prompt_readiness(&self) -> Result<(bool, bool), String> {
+        if self.is_completed() {
+            return Ok((false, true));
+        }
+        if self.0.draining.load(Ordering::Acquire) || self.0.stop.load(Ordering::Acquire) {
+            return Err(
+                "Provider actor is no longer accepting input; its ownership was preserved".into(),
+            );
+        }
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        Ok((state.ready, state.exited))
     }
     /// Pending questions and approvals, read without loading the transcript.
     pub(crate) fn requests(&self) -> Vec<super::Request> {
@@ -2491,7 +2546,12 @@ impl Actor {
             let starts_turn = matches!(&command, Command::Prompt { .. });
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
+                if state.exited {
+                    let _ = reply.send(Err("Provider exited before accepting the prompt".into()));
+                    continue;
+                }
+                if !accepts_prompt(&state) {
+                    effects.not_idle();
                     let _ = reply.send(Err(
                         "The provider is no longer idle for the accepted run".into()
                     ));
