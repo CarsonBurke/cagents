@@ -5,7 +5,7 @@ use std::{
     fs, io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt, net::UnixStream, process::CommandExt},
+        unix::{ffi::OsStrExt, net::UnixStream, process::CommandExt},
     },
     path::Path,
     process::{Command, Stdio},
@@ -41,10 +41,10 @@ pub(crate) fn manager_available() -> bool {
 /// A visible peer PID alone does not suffice: a descendant namespace's manager
 /// is visible too, but would interpret the same number differently. The peer
 /// pidfd binds its lifetime without reopening a reusable numeric PID, and its
-/// fdinfo names the namespaces it occupies. PIDFD_GET_PID_NAMESPACE cannot
-/// replace that: it requires ptrace access, which the OS user manager denies
-/// because PID 1 starts it non-dumpable. Missing kernel support or denied
-/// proof deliberately leaves launch unchanged.
+/// procfs fdinfo names the namespaces it occupies. The fdinfo needs no ptrace
+/// access, unlike PIDFD_GET_PID_NAMESPACE or /proc/PID/ns, which the OS user
+/// manager denies us because it holds CAP_WAKE_ALARM. Missing kernel support or
+/// denied proof deliberately leaves launch unchanged.
 struct ManagerNamespace {
     _connection: UnixStream,
     peer: OwnedFd,
@@ -106,8 +106,8 @@ impl ManagerNamespace {
         if size as usize != std::mem::size_of::<i32>() || !peer_alive(&peer) {
             return Err(io::Error::other("manager peer is no longer live"));
         }
-        let own = fs::read_to_string("/proc/self/status")?;
-        let peer_info = fs::read_to_string(format!("/proc/self/fdinfo/{}", peer.as_raw_fd()))?;
+        let own = read_procfs("/proc/self/status")?;
+        let peer_info = read_procfs(&format!("/proc/self/fdinfo/{}", peer.as_raw_fd()))?;
         if !same_namespace(&own, std::process::id(), &peer_info, credentials.pid)
             || !peer_alive(&peer)
         {
@@ -118,6 +118,24 @@ impl ManagerNamespace {
             peer,
         })
     }
+}
+
+/// Only the kernel's procfs reports namespaces; another filesystem mounted on
+/// /proc could claim any.
+fn read_procfs(path: &str) -> io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the open file and correctly sized output remain live.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), statfs.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs initialized the complete statfs above.
+    if unsafe { statfs.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+        return Err(io::Error::other("/proc is not procfs"));
+    }
+    let mut contents = String::new();
+    io::Read::read_to_string(&mut file, &mut contents)?;
+    Ok(contents)
 }
 
 /// procfs lists NSpid from its own PID namespace down to the process's. One
@@ -389,13 +407,7 @@ pub(crate) mod tests {
     use super::*;
     #[test]
     fn unproved_manager_never_attempts_numeric_pid_enrollment() {
-        for error in [
-            libc::ENOPROTOOPT,
-            libc::ENOTTY,
-            libc::EPERM,
-            libc::EACCES,
-            libc::ENOENT,
-        ] {
+        for error in [libc::ENOPROTOOPT, libc::EPERM, libc::EACCES, libc::ENOENT] {
             with_verified_manager(Err(io::Error::from_raw_os_error(error)), || {
                 panic!("unproved manager must not receive a scope request")
             })
@@ -418,6 +430,7 @@ pub(crate) mod tests {
             (own, 40, "Pid:\t-1\nNSpid:\t-1\n", 7, false),
             (own, 40, "pos:\t0\nPid:\t7\n", 7, false),
             (own, 41, peer, 7, false),
+            ("Name:\tcagentsd\n", 40, peer, 7, false),
         ];
         for (own, own_pid, peer, peer_pid, proved) in cases {
             assert_eq!(
@@ -429,12 +442,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_os_user_manager_is_proved_although_it_is_not_dumpable() {
+    fn the_os_user_manager_is_proved_without_ptrace_access() {
         if !manager_available() {
             eprintln!("no OS user manager; scope isolation unqualified here");
             return;
         }
-        ManagerNamespace::connect().unwrap();
+        match ManagerNamespace::connect() {
+            Ok(_) => {}
+            // A manager outside our PID namespace, as in a container sharing
+            // /run/user, is correctly refused without an OS error.
+            Err(error) if error.raw_os_error().is_none() => {
+                eprintln!("OS user manager is not provable here: {error}");
+            }
+            Err(error) => panic!("OS user manager proof failed: {error}"),
+        }
     }
 
     #[test]
@@ -476,7 +497,7 @@ pub(crate) mod tests {
                 // Verify real refusal, not a fictional positive manager proof.
                 assert!(matches!(
                     error.raw_os_error(),
-                    Some(libc::ENOPROTOOPT | libc::ENOTTY | libc::EPERM | libc::EACCES)
+                    Some(libc::ENOPROTOOPT) | None
                 ));
                 eprintln!("kernel manager proof unavailable; no scope request: {error}");
                 with_verified_manager(Err(error), || panic!("unproved peer request")).unwrap();
