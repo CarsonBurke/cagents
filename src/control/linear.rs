@@ -427,9 +427,17 @@ fn convert(error: linear::Error) -> AppError {
     }
 }
 fn output(command: &'static str, data: Value, list: Option<human::List>) -> CommandOutput {
-    let human = match list {
-        Some(list) => human::render(list, &data),
-        None => serde_json::to_string_pretty(&data).unwrap_or_default(),
+    let human = if matches!(
+        command,
+        "linear.issue" | "linear.comments" | "linear.relations" | "linear.children"
+    ) {
+        // Detail reads retain complete text, nested fields and exact page cursors.
+        serde_json::to_string_pretty(&data).expect("JSON values are serializable")
+    } else {
+        match list {
+            Some(list) => human::render(list, &data),
+            None => serde_json::to_string_pretty(&data).unwrap_or_default(),
+        }
     };
     CommandOutput {
         command,
@@ -1460,6 +1468,7 @@ mod tests {
             let super::super::TopCommand::Linear(command) = cli.command else {
                 panic!("expected Linear");
             };
+            // Check the list projection independently of detail-command rendering.
             let result = output("linear.test", data.clone(), list_kind(&command.command));
             assert!(result.human.starts_with(header), "{}", result.human);
             assert_eq!(result.data, data);
@@ -1480,6 +1489,93 @@ mod tests {
         let result = output("linear.set", data.clone(), list_kind(&command.command));
         assert_eq!(result.human, serde_json::to_string_pretty(&data).unwrap());
         assert_eq!(result.data, data);
+    }
+
+    #[test]
+    fn human_issue_details_preserve_full_connections_and_cursors() {
+        use clap::Parser;
+        let cli =
+            super::super::Cli::try_parse_from(["cagents", "linear", "issue", "ENG-1", "--full"])
+                .unwrap();
+        let super::super::TopCommand::Linear(command) = cli.command else {
+            panic!("expected Linear");
+        };
+        assert!(matches!(
+            command.command,
+            Operation::Issue { full: true, .. }
+        ));
+        let data = json!({
+            "identifier": "ENG-1",
+            "title": "Example",
+            "description": "Complete issue description\nwith a second line",
+            "comments": {"nodes": [{"body": "Requested full comment"}],
+                "pageInfo": {"hasNextPage": true, "endCursor": "comment next\nexact"}},
+            "attachments": {"nodes": [{"url": "https://example.invalid/file"}]},
+            "children": {"nodes": [{"identifier": "ENG-2"}]},
+            "relations": {"nodes": [{"relatedIssue": {"identifier": "ENG-3"}}]},
+            "inverseRelations": {"nodes": [{"issue": {"identifier": "ENG-4"}}]},
+            "unknownFetchedField": {"kept": true}
+        });
+        let rendered = output("linear.issue", data.clone(), list_kind(&command.command));
+        assert_eq!(rendered.data, data);
+        assert_eq!(
+            serde_json::from_str::<Value>(&rendered.human).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn human_comment_relation_and_child_details_are_lossless() {
+        use clap::Parser;
+        let comment = "complete comment body\nwith Markdown **content** ".repeat(20);
+        for (operation, command, populated) in [
+            (
+                "comments",
+                "linear.comments",
+                json!({"nodes": [{"id": "comment-1", "body": comment,
+                    "user": {"id": "user-1", "name": "Comment author"}}],
+                    "pageInfo": {"hasNextPage": true, "endCursor": "comment next\nexact"},
+                    "unknownFetchedField": {"kept": true}}),
+            ),
+            (
+                "relations",
+                "linear.relations",
+                json!({"nodes": [{"id": "relation-1", "type": "related",
+                    "issue": {"identifier": "ENG-1", "title": "Original issue"},
+                    "relatedIssue": {"identifier": "ENG-2", "title": "Related issue"}}],
+                    "pageInfo": {"hasNextPage": true, "endCursor": "relation next\nexact"},
+                    "unknownFetchedField": {"kept": true}}),
+            ),
+            (
+                "children",
+                "linear.children",
+                json!({"nodes": [{"identifier": "ENG-2",
+                    "description": "The complete child issue description\nwith another line"}],
+                    "pageInfo": {"hasNextPage": true, "endCursor": "child next\nexact"},
+                    "unknownFetchedField": {"kept": true}}),
+            ),
+        ] {
+            let cli = super::super::Cli::try_parse_from([
+                "cagents", "linear", operation, "--id", "ENG-1",
+            ])
+            .unwrap();
+            let super::super::TopCommand::Linear(parsed) = cli.command else {
+                panic!("expected Linear");
+            };
+            for data in [
+                populated,
+                json!({"nodes": [],
+                    "pageInfo": {"hasNextPage": false, "endCursor": null},
+                    "unknownFetchedField": {"kept": true}}),
+            ] {
+                let rendered = output(command, data.clone(), list_kind(&parsed.command));
+                assert_eq!(rendered.data, data);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&rendered.human).unwrap(),
+                    data
+                );
+            }
+        }
     }
 
     #[test]
