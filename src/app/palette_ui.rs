@@ -1010,6 +1010,9 @@ impl Cagents {
                     return Task::none();
                 };
                 let (card, saved_scope) = self.recently_closed[index].clone();
+                if self.refuse_quarantined_pane_recreation(card.id) {
+                    return Task::none();
+                }
                 if let CardKind::Chat(session) = &card.kind
                     && session.launch.session_id.is_some()
                 {
@@ -1019,6 +1022,7 @@ impl Cagents {
                             title: card.title.clone(),
                             session: session.clone(),
                             open: false,
+                            quarantined: self.pane_is_quarantined(card.id),
                             updated_at_unix_ms: crate::chat::now_ms().unwrap_or(0) as i64,
                         });
                     return task;

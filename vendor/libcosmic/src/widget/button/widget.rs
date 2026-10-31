@@ -865,7 +865,7 @@ pub fn update<'a, Message: Clone>(
             if let Some(on_press) = on_press {
                 let state = state();
                 if state.is_focused && *key == keyboard::Key::Named(keyboard::key::Named::Enter) {
-                    state.is_pressed = true;
+                    // Keyboard activation completes here; only pointer/touch presses await release.
                     let msg = (on_press)(layout.virtual_offset(), layout.bounds());
 
                     shell.publish(msg);

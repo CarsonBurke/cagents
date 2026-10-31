@@ -1248,6 +1248,11 @@ pub struct WorkspaceState {
     pub workspace_model_identity: Option<uuid::Uuid>,
     #[serde(default)]
     pub local_only_cards: HashSet<CardId>,
+    /// Rejected saved pane sources. These remain inert across restarts and
+    /// registry replacement until exact authoritative proof admits them.
+    /// This marker grants no provider, attachment or retirement authority.
+    #[serde(default)]
+    pub quarantined_panes: HashMap<CardId, CardKind>,
     /// Saved shared sources kept inert until their exact descriptor is admitted.
     /// This is local presentation state, never provider or retirement authority.
     #[serde(default)]
@@ -1280,6 +1285,7 @@ impl Default for WorkspaceState {
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
             local_only_cards: HashSet::new(),
+            quarantined_panes: Default::default(),
             pending_chat_admissions: Default::default(),
             pending_terminal_creations: HashSet::new(),
         }
