@@ -67,6 +67,8 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    mod window_controls;
+
     #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -2562,6 +2564,16 @@ impl Cagents {
         end: Option<Element<'a, Message>>,
         window_controls: bool,
     ) -> Element<'a, Message> {
+        self.native_header_surface(start, end, window_controls, true)
+    }
+
+    fn native_header_surface<'a>(
+        &'a self,
+        start: Element<'a, Message>,
+        end: Option<Element<'a, Message>>,
+        window_controls: bool,
+        background: bool,
+    ) -> Element<'a, Message> {
         let focused = self
             .core
             .focus_chain()
@@ -2599,7 +2611,11 @@ impl Cagents {
         widget::container(header)
             .center_y(design::HEADER_CONTENT_HEIGHT)
             .width(Length::Fill)
-            .class(cosmic::theme::Container::Background)
+            .class(if background {
+                cosmic::theme::Container::Background
+            } else {
+                cosmic::theme::Container::Transparent
+            })
             .into()
     }
 
@@ -2616,14 +2632,101 @@ impl Cagents {
         .into()
     }
 
+    pub(super) fn inspector_reserves_window_controls(&self) -> bool {
+        matches!(
+            self.context_inspector_mount(),
+            Some(InspectorLayout::Docked)
+        )
+    }
+
+    fn native_window_controls_width(&self) -> f32 {
+        let count =
+            usize::from(self.core.window.show_close && self.core.main_window_id().is_some())
+                + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
+                + usize::from(self.core.window.show_minimize && cosmic::config::show_minimize());
+        count as f32 * design::WINDOW_CONTROL_SIZE
+            + count.saturating_sub(1) as f32 * f32::from(cosmic::theme::spacing().space_xxs)
+    }
+
+    fn workspace_window_controls_overlap(&self) -> f32 {
+        let controls = self.native_window_controls_width();
+        match self.context_inspector_mount() {
+            Some(InspectorLayout::Docked) => {
+                let inspector = self
+                    .settings
+                    .inspector_width
+                    .clamp(design::INSPECTOR_MIN_WIDTH, design::INSPECTOR_MAX_WIDTH);
+                (controls - inspector * self.context_inspector_progress()).max(0.0)
+            }
+            Some(InspectorLayout::Overlay) => 0.0,
+            None => controls,
+        }
+    }
+
+    fn inspector_header<'a>(
+        &'a self,
+        start: Element<'a, Message>,
+        end: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let end = if self.inspector_reserves_window_controls() {
+            // Retain the end controls' positions beside the one stationary
+            // window-control owner, including while this pane is clipped.
+            widget::container(end)
+                .padding(Padding::ZERO.right(self.native_window_controls_width()))
+                .into()
+        } else {
+            end
+        };
+        self.native_header(start, Some(end), false)
+    }
+
+    pub(super) fn foreground_window_header(&self) -> Element<'_, Message> {
+        // Match native_header's compact horizontal padding at the actual
+        // window edge; this owner is never translated, clipped or input-gated.
+        let padding = if self.core.window.is_maximized {
+            8.0
+        } else {
+            7.0
+        };
+        widget::container(
+            widget::container(self.native_header_surface(
+                widget::Space::new().into(),
+                None,
+                true,
+                false,
+            ))
+            .width(self.native_window_controls_width() + 2.0 * padding),
+        )
+        .align_x(Alignment::End)
+        .width(Length::Fill)
+        .height(design::HEADER_HEIGHT)
+        .into()
+    }
+
+    // Preserve the modal header's material and vertical space. Its buttons
+    // live in the permanent foreground, so this backdrop has no input state.
+    pub(super) fn overlay_window_header_background(&self) -> Element<'_, Message> {
+        widget::container(
+            widget::container(widget::Space::new().height(design::HEADER_CONTENT_HEIGHT))
+                .width(160)
+                .class(cosmic::theme::Container::Background),
+        )
+        .align_x(Alignment::End)
+        .width(Length::Fill)
+        .height(design::HEADER_HEIGHT)
+        .into()
+    }
+
     fn workspace_header_width(&self) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
             design::PANE_NAVIGATOR_RESERVED_WIDTH
         } else {
             0.0
         };
-        let controls = if self.context_inspector_open {
-            0.0
+        let controls = if self.inspector_reserves_window_controls() {
+            // The stationary controls can extend over the workspace while
+            // the inspector is only a few pixels wide. Keep tabs out of it.
+            self.workspace_window_controls_overlap()
         } else {
             let count = usize::from(self.core.window.show_close)
                 + usize::from(self.core.window.show_maximize && cosmic::config::show_maximize())
@@ -2760,8 +2863,12 @@ impl Cagents {
             let actions = widget::row::with_children(self.workflow_header()).spacing(space::XXS);
             self.native_header(
                 iced::widget::Space::new().into(),
-                Some(actions.into()),
-                true,
+                Some(
+                    widget::container(actions)
+                        .padding(Padding::ZERO.right(self.workspace_window_controls_overlap()))
+                        .into(),
+                ),
+                false,
             )
         } else {
             let (_, tab_width) = self.tab_strip_geometry();
@@ -2796,8 +2903,12 @@ impl Cagents {
                 .align_y(Alignment::Center);
             self.native_header(
                 tabs.into(),
-                Some(actions.into()),
-                !self.context_inspector_open,
+                Some(
+                    widget::container(actions)
+                        .padding(Padding::ZERO.right(self.workspace_window_controls_overlap()))
+                        .into(),
+                ),
+                false,
             )
         };
         let mut rows = vec![header];
@@ -3352,7 +3463,7 @@ impl Cagents {
             .spacing(space::XXS)
             .align_y(Alignment::Center)
             .into();
-            let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+            let heading = self.inspector_header(self.sidebar_toggle(), end);
             return widget::column::with_children(vec![
                 heading,
                 crate::interaction::focused_escape(
@@ -3445,7 +3556,7 @@ impl Cagents {
         .spacing(space::XXS)
         .align_y(Alignment::Center)
         .into();
-        let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
+        let heading = self.inspector_header(self.sidebar_toggle(), end);
         let tabs = widget::row::with_children(vec![
             tabs.into(),
             crate::ui_controls::button::secondary("Channel work")
