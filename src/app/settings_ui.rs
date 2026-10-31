@@ -531,58 +531,70 @@ fn settings_category_controls<'a>(
                 ),
             ],
         )],
-        SettingsCategory::Editor => vec![
-            settings_group(
-                "Font",
-                "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal.",
-                vec![
-                    setting_input(
-                        "Monospace font family, or blank to follow the terminal.",
-                        &draft.editor_font_family,
-                        SettingsField::EditorFontFamily,
-                        invalid,
-                    ),
-                    setting_input(
-                        "8–40 logical pixels, or blank to follow the terminal.",
-                        &draft.editor_font_size,
-                        SettingsField::EditorFontSize,
-                        invalid,
-                    ),
-                ],
-            ),
-            settings_group("Editor", "Shared native editor and diff preferences.", {
-                let mut options = crate::settings_widgets::editor_options(
-                    draft.editor_auto_save,
-                    draft.editor_wrap_lines,
-                    draft.editor_syntax_theme,
-                    |enabled| Message::SettingsChanged {
-                        field: SettingsField::EditorAutoSave,
-                        value: enabled.to_string(),
-                    },
-                    |enabled| Message::SettingsChanged {
-                        field: SettingsField::EditorWrapLines,
-                        value: enabled.to_string(),
-                    },
-                    |theme| Message::SettingsChanged {
-                        field: SettingsField::EditorSyntaxTheme,
-                        value: theme.key().into(),
-                    },
-                );
-                options.push(setting_field(
-                    "Hide unchanged diff lines",
-                    "Fold unchanged context between hunks. Turn off to show the complete file.",
-                    crate::settings_widgets::toggle(
-                        "Hide unchanged diff lines",
-                        draft.diff_hide_unchanged,
+        SettingsCategory::Editor => {
+            vec![
+                settings_group(
+                    "Font",
+                    "Leave a field blank to follow the terminal font. Ctrl+=, Ctrl+− and Ctrl+0 zoom the focused editor or terminal.",
+                    vec![
+                        setting_input(
+                            "Monospace font family, or blank to follow the terminal.",
+                            &draft.editor_font_family,
+                            SettingsField::EditorFontFamily,
+                            invalid,
+                        ),
+                        setting_input(
+                            "8–40 logical pixels, or blank to follow the terminal.",
+                            &draft.editor_font_size,
+                            SettingsField::EditorFontSize,
+                            invalid,
+                        ),
+                    ],
+                ),
+                settings_group("Editor", "Shared native editor and diff preferences.", {
+                    let mut options = crate::settings_widgets::editor_options(
+                        draft.editor_auto_save,
+                        draft.editor_wrap_lines,
+                        draft.editor_syntax_theme,
                         |enabled| Message::SettingsChanged {
-                            field: SettingsField::DiffHideUnchanged,
+                            field: SettingsField::EditorAutoSave,
                             value: enabled.to_string(),
                         },
-                    ),
+                        |enabled| Message::SettingsChanged {
+                            field: SettingsField::EditorWrapLines,
+                            value: enabled.to_string(),
+                        },
+                        |theme| Message::SettingsChanged {
+                            field: SettingsField::EditorSyntaxTheme,
+                            value: theme.key().into(),
+                        },
+                    );
+                    options.push(setting_field(
+                    "Auto-close brackets and quotes", "Insert matching closers and type over existing closing brackets and quotes.",
+                    crate::settings_widgets::toggle("Auto-close brackets and quotes", draft.editor_auto_close, |enabled| Message::SettingsChanged { field: SettingsField::EditorAutoClose, value: enabled.to_string() }),
                 ));
-                options
-            }),
-        ],
+                    options.push(setting_field(
+                    "Tab width", "Display tab stops and default space indentation (1–16). File indentation and .editorconfig take precedence.",
+                    crate::ui_controls::field::text("4", &draft.editor_tab_width)
+                        .on_input(|value| Message::SettingsChanged { field: SettingsField::EditorTabWidth, value })
+                        .width(80).into(),
+                ));
+                    options.push(setting_field(
+                        "Hide unchanged diff lines",
+                        "Fold unchanged context between hunks. Turn off to show the complete file.",
+                        crate::settings_widgets::toggle(
+                            "Hide unchanged diff lines",
+                            draft.diff_hide_unchanged,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::DiffHideUnchanged,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ));
+                    options
+                }),
+            ]
+        }
         SettingsCategory::Appearance => vec![
             settings_group(
                 "Interface",

@@ -2524,11 +2524,12 @@ fn is_save_press(event: &keyboard::Event) -> bool {
     matches!(
         event,
         keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(key),
+            key,
+            physical_key,
             modifiers,
             repeat: false,
             ..
-        } if key.eq_ignore_ascii_case("s")
+        } if key.to_latin(*physical_key).is_some_and(|key| key.eq_ignore_ascii_case(&'s'))
             && modifiers.control()
             && !modifiers.alt()
             && !modifiers.shift()
@@ -2625,6 +2626,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::FileLoadedAt { .. }
             | RepositoryAction::DocumentChanged { .. }
             | RepositoryAction::DocumentReloaded { .. }
+            | RepositoryAction::BinaryPageLoaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
@@ -2774,6 +2776,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
+        Message::OpenLspFile { .. } => true,
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
@@ -3037,6 +3040,8 @@ pub enum SettingsField {
     LinkOpenDestination,
     EditorAutoSave,
     EditorWrapLines,
+    EditorTabWidth,
+    EditorAutoClose,
     DiffHideUnchanged,
     ChatEnterSends,
     ChatExpandToolGroups,
@@ -3168,6 +3173,8 @@ impl SettingsField {
             Self::LinkOpenDestination => "Open links in",
             Self::EditorAutoSave => "Auto-save",
             Self::EditorWrapLines => "Word wrap",
+            Self::EditorTabWidth => "Tab width",
+            Self::EditorAutoClose => "Auto-close brackets and quotes",
             Self::DiffHideUnchanged => "Hide unchanged diff lines",
             Self::EditorFontFamily => "Editor font family",
             Self::EditorFontSize => "Editor font size",
@@ -3264,6 +3271,8 @@ impl SettingsField {
             Self::DefaultNativePaneFraction => SettingsCategory::Appearance,
             Self::EditorAutoSave
             | Self::EditorWrapLines
+            | Self::EditorTabWidth
+            | Self::EditorAutoClose
             | Self::EditorSyntaxTheme
             | Self::EditorFontFamily
             | Self::EditorFontSize
@@ -3447,6 +3456,8 @@ struct SettingsDraft {
     default_column_fraction: String,
     editor_auto_save: bool,
     editor_wrap_lines: bool,
+    editor_tab_width: String,
+    editor_auto_close: bool,
     diff_hide_unchanged: bool,
     editor_syntax_theme: settings::EditorSyntaxTheme,
     confirm_terminal_close: bool,
@@ -3508,6 +3519,8 @@ impl SettingsDraft {
             default_channel_pane: settings.default_channel_pane,
             editor_auto_save: settings.editor_auto_save,
             editor_wrap_lines: settings.editor_wrap_lines,
+            editor_tab_width: settings.editor_tab_width.to_string(),
+            editor_auto_close: settings.editor_auto_close,
             diff_hide_unchanged: settings.diff_hide_unchanged,
             confirm_terminal_close: settings.confirm_terminal_close,
             confirm_multiline_paste: settings.confirm_multiline_paste,
@@ -3568,6 +3581,8 @@ impl SettingsDraft {
             SettingsField::DefaultColumnFraction => self.default_column_fraction = value,
             SettingsField::EditorAutoSave => self.editor_auto_save = value == "true",
             SettingsField::EditorWrapLines => self.editor_wrap_lines = value == "true",
+            SettingsField::EditorTabWidth => self.editor_tab_width = value,
+            SettingsField::EditorAutoClose => self.editor_auto_close = value == "true",
             SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = value == "true",
             SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = value == "true",
             SettingsField::ChatEnterSends => self.chat_enter_sends = value == "true",
@@ -3869,6 +3884,16 @@ fn settings_update(
         SettingsField::EditorSyntaxTheme => settings::EditorSyntaxTheme::from_key(value)
             .map(|theme| next.editor_syntax_theme = theme)
             .ok_or_else(|| "Choose one of the listed syntax themes.".to_owned()),
+        SettingsField::EditorAutoClose => value
+            .parse::<bool>()
+            .map(|enabled| next.editor_auto_close = enabled)
+            .map_err(|_| "Choose whether brackets and quotes auto-close".to_owned()),
+        SettingsField::EditorTabWidth => value
+            .parse::<u16>()
+            .ok()
+            .filter(|width| (1..=16).contains(width))
+            .map(|width| next.editor_tab_width = width)
+            .ok_or_else(|| "Tab width must be between 1 and 16".to_owned()),
         SettingsField::EditorWrapLines => value
             .parse::<bool>()
             .map(|enabled| next.editor_wrap_lines = enabled)
@@ -4357,6 +4382,10 @@ pub enum Message {
     /// One shared sidebar model update, from the daemon observer or publisher.
     WorkspaceModelObserved(workspace_model_sync::ModelUpdate),
     Repository(RepositoryAction),
+    OpenLspFile {
+        card: CardId,
+        request: Arc<()>,
+    },
     OperationRecovery(crate::operation_recovery::Action),
     ResolvedDiffBasis {
         card: CardId,
@@ -4745,6 +4774,7 @@ struct PendingPanelOpen {
     /// Worktree-relative, exactly as the card's own file list names paths.
     path: PathBuf,
     ignored: bool,
+    location: Option<(usize, usize)>,
 }
 
 struct DirtyRepositoryClose {
@@ -5044,6 +5074,10 @@ enum LspRequestKind {
 /// A caret jump waiting for its target file to be the card's open buffer.
 #[derive(Debug, Clone)]
 struct PendingLspJump {
+    // The queued open belongs only to this request, including at the same path.
+    queued: Option<Arc<()>>,
+    identity: Option<repository_widget::AsyncIdentity>,
+    origin: Option<crate::editor_navigation::Location>,
     path: PathBuf,
     at: LspPosition,
     coordinates: LspCoordinates,
@@ -6564,6 +6598,8 @@ impl Cagents {
             self.settings.editor_find_options,
             self.settings.editor_replace_preserve_case,
         );
+        runtime.set_editor_tab_width(self.settings.editor_tab_width);
+        runtime.set_editor_auto_close(self.settings.editor_auto_close);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         PullRequestPane {
@@ -7293,6 +7329,8 @@ impl Cagents {
             self.settings.editor_find_options,
             self.settings.editor_replace_preserve_case,
         );
+        runtime.set_editor_tab_width(self.settings.editor_tab_width);
+        runtime.set_editor_auto_close(self.settings.editor_auto_close);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
@@ -11159,6 +11197,9 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
+        let location =
+            crate::editor_navigation::parse_location(self.sidebar_state.files_query().trim())
+                .map(|(_, line, column)| (line, column));
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
@@ -11166,6 +11207,7 @@ impl Cagents {
                     card,
                     path,
                     ignored,
+                    location,
                 });
                 let focus = self
                     .workspace
@@ -11193,6 +11235,7 @@ impl Cagents {
                         card,
                         path,
                         ignored,
+                        location,
                     });
                 }
                 task
@@ -11355,7 +11398,13 @@ impl Cagents {
             // no server rather than reporting one that is broken.
             let state = self.lsp_contexts.entry(card).or_default();
             state.context.status = Some(LspStatus::Disabled);
-            self.lsp_pending_jumps.remove(&card);
+            if self
+                .lsp_pending_jumps
+                .get(&card)
+                .is_some_and(|jump| jump.queued.is_none())
+            {
+                self.lsp_pending_jumps.remove(&card);
+            }
             return Task::none();
         };
         let doc = LspDocumentId(self.next_lsp_document);
@@ -11419,7 +11468,14 @@ impl Cagents {
 
     /// Applies a parked jump now that `path` is the card's open buffer.
     fn flush_pending_lsp_jump(&mut self, card: CardId, path: &Path) -> Task<Message> {
-        // Taken on *any* open, not only a matching one. A jump is answered by
+        if self
+            .lsp_pending_jumps
+            .get(&card)
+            .is_some_and(|jump| jump.queued.is_some())
+        {
+            return Task::none();
+        }
+        // Once its queued open was admitted, take it on any later open. A jump is answered by
         // the open it asked for or by nothing: leaving it parked would let the
         // caret be yanked minutes later, when the user opens that file
         // themselves, to a position from an answer they have forgotten asking
@@ -11450,7 +11506,7 @@ impl Cagents {
                 }
             }
         };
-        self.move_lsp_caret(card, at)
+        self.move_lsp_caret_from(card, at, jump.origin)
     }
 
     /// Places the caret and gives the editor the keyboard.
@@ -11459,9 +11515,18 @@ impl Cagents {
     /// no caret at all, so a jump into a result would answer the user with a
     /// frame that looks exactly like the one they clicked in.
     fn move_lsp_caret(&mut self, card: CardId, at: LspPosition) -> Task<Message> {
+        self.move_lsp_caret_from(card, at, None)
+    }
+
+    fn move_lsp_caret_from(
+        &mut self,
+        card: CardId,
+        at: LspPosition,
+        origin: Option<crate::editor_navigation::Location>,
+    ) -> Task<Message> {
         let focus = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => runtime
-                .move_cursor_to(at)
+                .move_cursor_from(at, origin)
                 .then(|| runtime.focus_editor(card)),
             _ => None,
         };
@@ -11719,6 +11784,8 @@ impl Cagents {
         at: LspPosition,
         coordinates: LspCoordinates,
     ) -> Task<Message> {
+        // A fresh request supersedes even an open still queued in the App.
+        self.lsp_pending_jumps.remove(&card);
         let open_path = self
             .lsp_contexts
             .get(&card)
@@ -11777,18 +11844,23 @@ impl Cagents {
             )));
             return Task::none();
         }
+        let origin = match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.current_location(),
+            _ => None,
+        };
+        let request = Arc::new(());
         self.lsp_pending_jumps.insert(
             card,
             PendingLspJump {
+                queued: Some(request.clone()),
+                identity: None,
+                origin,
                 path,
                 at,
                 coordinates,
             },
         );
-        cosmic::task::message(Message::Repository(RepositoryAction::OpenFile {
-            card,
-            path: relative,
-        }))
+        cosmic::task::message(Message::OpenLspFile { card, request })
     }
 
     fn apply_lsp_completion(
@@ -11950,6 +12022,14 @@ impl Cagents {
             .pending_panel_open
             .take()
             .expect("the pending open was just matched");
+        if let Some((line, column)) = open.location {
+            return cosmic::task::message(Message::Repository(RepositoryAction::OpenLocation {
+                card,
+                path: open.path,
+                line: line - 1,
+                column: column - 1,
+            }));
+        }
         let action = if open.ignored {
             let Ok(path) = RepoPath::parse(&open.path) else {
                 return Task::none();
@@ -12013,7 +12093,7 @@ impl Cagents {
                 .map(|path| path.as_path().to_path_buf())
                 .collect::<Vec<_>>();
             let query = self.sidebar_state.files_query().to_owned();
-            let search = query.clone();
+            let search = crate::editor_navigation::file_query(&query).into_owned();
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     if !search.is_empty() {
@@ -13830,16 +13910,25 @@ impl Cagents {
             self.settings.editor_wrap_lines,
             self.settings.editor_syntax_theme,
         );
-        if previous.editor_wrap_lines != wrap_lines || previous.editor_syntax_theme != syntax_theme
+        if previous.editor_auto_close != self.settings.editor_auto_close
+            || previous.editor_tab_width != self.settings.editor_tab_width
+            || previous.editor_wrap_lines != wrap_lines
+            || previous.editor_syntax_theme != syntax_theme
         {
             for runtime in self.cards.values_mut() {
                 match runtime {
                     CardRuntime::Repository(runtime) => {
                         runtime.set_wrap_lines(wrap_lines);
+                        runtime.set_editor_tab_width(self.settings.editor_tab_width);
+                        runtime.set_editor_auto_close(self.settings.editor_auto_close);
                         runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::PullRequests(pane) => {
                         pane.runtime.set_wrap_lines(wrap_lines);
+                        pane.runtime
+                            .set_editor_tab_width(self.settings.editor_tab_width);
+                        pane.runtime
+                            .set_editor_auto_close(self.settings.editor_auto_close);
                         pane.runtime.set_syntax_theme(syntax_theme);
                     }
                     CardRuntime::Chat(runtime) => runtime.set_syntax_theme(syntax_theme),
@@ -14447,6 +14536,10 @@ impl Application for Cagents {
         let (message, pane_origin) = match message {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
+        };
+        let queued_lsp_open = match &message {
+            Message::OpenLspFile { card, request } => Some((*card, request.clone())),
+            _ => None,
         };
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
@@ -15196,6 +15289,34 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::Language { card, action }) => {
                 self.update_editor_lsp(card, action)
             }
+            Message::Repository(
+                action
+                @ (RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. }),
+            ) => {
+                let card = action.card();
+                if self.modal_is_open() || crate::device::is_remote() {
+                    return Task::none();
+                }
+                let reveal = matches!(action, RepositoryAction::RevealFile { .. });
+                let path = match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime
+                        .selected_path()
+                        .map(|path| runtime.descriptor.worktree.join(path)),
+                    _ => None,
+                };
+                path.map_or_else(Task::none, |path| {
+                    cosmic::task::future(async move {
+                        if reveal {
+                            Message::FileRevealed(file_manager::reveal(&path).await)
+                        } else {
+                            Message::ExternalUrlOpened(match url::Url::from_file_path(path) {
+                                Ok(url) => open_system_url(url).await,
+                                Err(_) => Err("Could not open file path".into()),
+                            })
+                        }
+                    })
+                })
+            }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let target = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
@@ -15311,6 +15432,38 @@ impl Application for Cagents {
                 }
                 Task::batch(tasks)
             }
+            Message::OpenLspFile { card, request } => {
+                if !self.lsp_pending_jumps.get(&card).is_some_and(|jump| {
+                    jump.queued.as_ref().is_some_and(|queued| Arc::ptr_eq(queued, &request))
+                }) {
+                    return Task::none();
+                }
+                let mut jump = self.lsp_pending_jumps.remove(&card).expect("the exact queued request exists");
+                if self.modal_is_open() { return Task::none(); }
+                let relative = match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => jump.path.strip_prefix(&runtime.descriptor.worktree).ok().map(Path::to_path_buf),
+                    _ => None,
+                };
+                let Some(path) = relative else { return Task::none() };
+                let before = match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime.selected_read_identity(card),
+                    _ => None,
+                };
+                // Retain the ordinary open reducer and all root/recovery
+                // guards. The departing Close must not cancel this request.
+                let task = self.update(Message::Repository(RepositoryAction::OpenFile { card, path }));
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                    && let Some(identity) = runtime.selected_read_identity(card)
+                    && before.as_ref() != Some(&identity)
+                    && identity.worktree.join(&identity.path) == jump.path
+                    && runtime.retains_lsp_jump(&identity)
+                {
+                    jump.queued = None;
+                    jump.identity = Some(identity);
+                    self.lsp_pending_jumps.insert(card, jump);
+                }
+                task
+            }
             Message::Repository(action) => {
                 self.retain_repository_operation(&action);
                 if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. }) && !self.prepare_editor_save(action.card()) {
@@ -15337,6 +15490,12 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                let before = self.lsp_pending_jumps.get(&card)
+                    .filter(|jump| jump.identity.is_none())
+                    .and_then(|_| match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => runtime.selected_read_identity(card),
+                        _ => None,
+                    });
                 let find_preferences_changed = matches!(
                     &action,
                     RepositoryAction::FindOptionsChanged { .. }
@@ -15390,6 +15549,16 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                let retire_jump = self.lsp_pending_jumps.get(&card).is_some_and(|jump| {
+                    match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => match &jump.identity {
+                            Some(identity) => !runtime.retains_lsp_jump(identity),
+                            None => before != runtime.selected_read_identity(card),
+                        },
+                        _ => true,
+                    }
+                });
+                if retire_jump { self.lsp_pending_jumps.remove(&card); }
                 if find_preferences_changed {
                     let preferences = match self.cards.get(&card) {
                         Some(CardRuntime::Repository(runtime)) => Some(runtime.find_preferences()),
@@ -17451,6 +17620,16 @@ impl Application for Cagents {
                         *modifiers,
                     );
                 }
+                if is_escape_press(&event)
+                    && !self.workspace_inputs_blocked()
+                    && let Some(card) = self.workspace.focused()
+                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                    && runtime.go_to_line_is_open()
+                {
+                    return repository_task(
+                        runtime.update(RepositoryAction::CloseGoToLine { card }),
+                    );
+                }
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
@@ -18103,6 +18282,18 @@ impl Application for Cagents {
             terminal_probes,
         ])
             })();
+        // Every early guard consumes this queued message too. An admitted
+        // open has already cleared `queued`; a superseding request has a
+        // different identity and must keep its own origin.
+        if let Some((card, request)) = queued_lsp_open
+            && self.lsp_pending_jumps.get(&card).is_some_and(|jump| {
+                jump.queued
+                    .as_ref()
+                    .is_some_and(|queued| Arc::ptr_eq(queued, &request))
+            })
+        {
+            self.lsp_pending_jumps.remove(&card);
+        }
         self.reconcile_chat_failure_presentations();
         if attention_scope_changed {
             self.notification_ui.scope_changed();
@@ -23858,6 +24049,7 @@ mod tests {
                 card,
                 path: PathBuf::from("tracked.rs"),
                 ignored,
+                location: None,
             };
             app.pending_panel_open = Some(pending.clone());
             let completion = |generation| {
@@ -26837,6 +27029,9 @@ mod tests {
         app.lsp_pending_jumps.insert(
             card,
             PendingLspJump {
+                queued: None,
+                identity: None,
+                origin: None,
                 path: PathBuf::from("/repo/b.rs"),
                 at: LspPosition::new(0, 0),
                 coordinates: LspCoordinates::Scalar,
@@ -28252,11 +28447,10 @@ mod tests {
         // Parking without asking the card to open the file is a jump that never
         // lands: that open is the only thing that releases it, and the file
         // list it addresses is keyed on the worktree-relative path.
-        assert!(matches!(
-            task_app_message(task),
-            Message::Repository(RepositoryAction::OpenFile { card: at, ref path })
-                if at == card && path == Path::new("src/other.rs")
-        ));
+        let Message::OpenLspFile { card: at, request } = task_app_message(task) else {
+            panic!("the open must retain its queued request identity");
+        };
+        assert_eq!(at, card);
         let parked = app
             .lsp_pending_jumps
             .get(&card)
@@ -28266,6 +28460,11 @@ mod tests {
         assert_eq!(parked.path, PathBuf::from("/repo/src/other.rs"));
         assert_eq!(parked.at, LspPosition::new(4, 2));
         assert_eq!(parked.coordinates, LspCoordinates::Utf16);
+        assert!(Arc::ptr_eq(parked.queued.as_ref().unwrap(), &request));
+        assert!(
+            parked.identity.is_none(),
+            "the file worker has not been admitted yet"
+        );
         assert_eq!(notice(&app), None);
     }
 
@@ -28917,6 +29116,408 @@ mod tests {
         assert_eq!(focused(&app, task), Some(title));
     }
 
+    fn lsp_history_runtime(app: &Cagents, card: CardId) -> &RepositoryRuntime {
+        match &app.cards[&card] {
+            CardRuntime::Repository(runtime) => runtime,
+            _ => panic!("the actual repository editor remains mounted"),
+        }
+    }
+
+    async fn settle_lsp_history_tasks(app: &mut Cagents, task: Task<Message>) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut pending = std::collections::VecDeque::from([task]);
+            let mut count = 0;
+            while let Some(task) = pending.pop_front() {
+                count += 1;
+                assert!(count < 64, "actual file callbacks must settle");
+                let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                    continue;
+                };
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(
+                        message @ (Message::Repository(_) | Message::OpenLspFile { .. }),
+                    )) = action
+                    {
+                        pending.push_back(app.update(message));
+                    }
+                }
+            }
+        })
+        .await
+        .expect("real file workers and App callbacks finish");
+    }
+
+    async fn queued_lsp_history_open(task: Task<Message>) -> Message {
+        let mut stream = iced::runtime::task::into_stream(task).expect("an actual queued LSP open");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(
+                message @ Message::OpenLspFile { .. },
+            )) = action
+            {
+                return message;
+            }
+        }
+        panic!("the request must publish its scoped open");
+    }
+
+    async fn lsp_history_app(manager: LspManager, root: &Path) -> (Cagents, CardId) {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.settings.editor_auto_save = false;
+        app.settings.language_servers = manager.servers().to_vec();
+        app.lsp = manager;
+        // The in-process transport fixture already owns document1.
+        app.next_lsp_document = 10;
+        let card = app.workspace.focused().unwrap();
+        let view = RepositoryView {
+            project: ProjectId::new(),
+            repository: root.to_owned(),
+            worktree: root.to_owned(),
+            selected_file: None,
+        };
+        app.card_state_mut(card).unwrap().kind = CardKind::Repository(view.clone());
+        let mut runtime =
+            RepositoryRuntime::file_list_fixture(view, &["a.rs", "b.rs", "c.rs", "d.rs"]);
+        runtime.set_auto_save(false);
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card,
+            path: "a.rs".into(),
+        }));
+        settle_lsp_history_tasks(&mut app, task).await;
+        let task = app.update(Message::Repository(RepositoryAction::OpenLocation {
+            card,
+            path: "a.rs".into(),
+            line: 0,
+            column: 2,
+        }));
+        settle_lsp_history_tasks(&mut app, task).await;
+        assert_eq!(
+            lsp_history_runtime(&app, card).cursor_position(),
+            Some(LspPosition::new(0, 2))
+        );
+        (app, card)
+    }
+
+    fn lsp_history_files(root: &Path) {
+        for (name, text) in [
+            ("a.rs", "alpha\nβeta😀\n"),
+            ("b.rs", "bravo\nsecond🌲\n"),
+            ("c.rs", "charlie\ncurrent😀\n"),
+            ("d.rs", "delta\nnewer🌲\n"),
+        ] {
+            std::fs::write(root.join(name), text).unwrap();
+        }
+    }
+
+    async fn assert_current_file_goto_returns_to_its_own_origin(app: &mut Cagents, card: CardId) {
+        let task = app.update(Message::Repository(RepositoryAction::OpenLocation {
+            card,
+            path: "c.rs".into(),
+            line: 0,
+            column: 2,
+        }));
+        settle_lsp_history_tasks(app, task).await;
+        let before = lsp_history_runtime(app, card).current_location().unwrap();
+        for action in [
+            RepositoryAction::OpenGoToLine { card },
+            RepositoryAction::GoToLineChanged {
+                card,
+                value: "2:3".into(),
+            },
+            RepositoryAction::SubmitGoToLine { card },
+        ] {
+            let task = app.update(Message::Repository(action));
+            settle_lsp_history_tasks(app, task).await;
+        }
+        assert_eq!(
+            lsp_history_runtime(app, card).cursor_position(),
+            Some(LspPosition::new(1, 2))
+        );
+        let task = app.update(Message::Repository(RepositoryAction::NavigateLocation {
+            card,
+            forward: false,
+        }));
+        settle_lsp_history_tasks(app, task).await;
+        let after = lsp_history_runtime(app, card).current_location().unwrap();
+        assert_eq!(after.path, before.path);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(
+            lsp_history_runtime(app, card).editor_text().as_deref(),
+            Some("charlie\ncurrent😀\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_deferred_lsp_open_cannot_supply_a_later_files_history_origin() {
+        let root = tempfile::tempdir().unwrap();
+        lsp_history_files(root.path());
+        std::fs::remove_file(root.path().join("b.rs")).unwrap();
+        let (manager, _transport) = crate::lsp::tests::progress_fixture().await;
+        let (mut app, card) = lsp_history_app(manager, root.path()).await;
+        let task = app.jump_to_lsp_location(
+            card,
+            root.path().join("b.rs"),
+            LspPosition::new(1, 1),
+            LspCoordinates::Scalar,
+        );
+        let queued = queued_lsp_history_open(task).await;
+        let task = app.update(queued);
+        settle_lsp_history_tasks(&mut app, task).await;
+        assert!(
+            !app.lsp_pending_jumps.contains_key(&card),
+            "the real failed FileRead retires its origin"
+        );
+        assert_eq!(
+            lsp_history_runtime(&app, card).selected_path(),
+            Some(Path::new("b.rs"))
+        );
+        assert!(lsp_history_runtime(&app, card).editor_text().is_none());
+        let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+            card,
+            path: "c.rs".into(),
+        }));
+        settle_lsp_history_tasks(&mut app, task).await;
+        assert_current_file_goto_returns_to_its_own_origin(&mut app, card).await;
+        app.lsp.begin_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_lsp_open_refusal_preserves_dirty_source_without_retaining_its_origin() {
+        let root = tempfile::tempdir().unwrap();
+        lsp_history_files(root.path());
+        let (manager, _transport) = crate::lsp::tests::progress_fixture().await;
+        let (mut app, card) = lsp_history_app(manager, root.path()).await;
+        let task = app.jump_to_lsp_location(
+            card,
+            root.path().join("b.rs"),
+            LspPosition::new(1, 1),
+            LspCoordinates::Scalar,
+        );
+        let queued = queued_lsp_history_open(task).await;
+        let task = app.update(Message::Repository(RepositoryAction::EditorAction {
+            card,
+            action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert(
+                'x',
+            )),
+        }));
+        settle_lsp_history_tasks(&mut app, task).await;
+        let before = lsp_history_runtime(&app, card).current_location().unwrap();
+        let source = lsp_history_runtime(&app, card).editor_text().unwrap();
+        assert!(lsp_history_runtime(&app, card).is_dirty());
+        let task = app.update(queued);
+        settle_lsp_history_tasks(&mut app, task).await;
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+        let after = lsp_history_runtime(&app, card).current_location().unwrap();
+        assert_eq!(after.path, before.path);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(
+            lsp_history_runtime(&app, card).editor_text().as_deref(),
+            Some(source.as_str())
+        );
+        assert!(lsp_history_runtime(&app, card).is_dirty());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.rs")).unwrap(),
+            "alpha\nβeta😀\n"
+        );
+        app.lsp.begin_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn early_refused_lsp_queue_retires_only_its_request_under_modal_chrome_and_update_guards()
+    {
+        for guard in ["modal", "chrome", "update"] {
+            let root = tempfile::tempdir().unwrap();
+            lsp_history_files(root.path());
+            let (manager, _transport) = crate::lsp::tests::progress_fixture().await;
+            let (mut app, card) = lsp_history_app(manager, root.path()).await;
+            let before = lsp_history_runtime(&app, card).current_location().unwrap();
+            let source = lsp_history_runtime(&app, card).editor_text().unwrap();
+            let task = app.jump_to_lsp_location(
+                card,
+                root.path().join("b.rs"),
+                LspPosition::new(1, 1),
+                LspCoordinates::Scalar,
+            );
+            let obsolete = queued_lsp_history_open(task).await;
+            let task = app.jump_to_lsp_location(
+                card,
+                root.path().join("d.rs"),
+                LspPosition::new(1, 2),
+                LspCoordinates::Scalar,
+            );
+            let current = queued_lsp_history_open(task).await;
+            let request = app.lsp_pending_jumps[&card]
+                .queued
+                .as_ref()
+                .unwrap()
+                .clone();
+            match guard {
+                "modal" => {
+                    drop(app.update(Message::ResetSettings));
+                    assert!(app.modal_is_open());
+                    assert!(cosmic::Application::dialog(&app).is_some());
+                }
+                "chrome" => {
+                    drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleNewTab)));
+                    assert!(app.chrome_ui.is_open());
+                }
+                "update" => app.update_prepared = true,
+                _ => unreachable!(),
+            }
+            // Both messages reach the real global refusal, before the
+            // OpenLspFile match arm. Refusing stale B cannot retire newer D.
+            let task = app.update(obsolete);
+            settle_lsp_history_tasks(&mut app, task).await;
+            assert!(Arc::ptr_eq(
+                app.lsp_pending_jumps[&card].queued.as_ref().unwrap(),
+                &request
+            ));
+            let task = app.update(current);
+            settle_lsp_history_tasks(&mut app, task).await;
+            assert!(
+                !app.lsp_pending_jumps.contains_key(&card),
+                "{guard} consumed its own queued open"
+            );
+            let after = lsp_history_runtime(&app, card).current_location().unwrap();
+            assert_eq!(after.path, before.path);
+            assert_eq!(after.cursor, before.cursor);
+            assert_eq!(
+                lsp_history_runtime(&app, card).editor_text().as_deref(),
+                Some(source.as_str())
+            );
+            match guard {
+                "modal" => {
+                    assert!(app.modal_is_open());
+                    assert!(cosmic::Application::dialog(&app).is_some());
+                    assert!(app.settings_reset_confirm);
+                    assert!(!app.settings_reset_focus_confirm);
+                    drop(app.update(Message::CancelResetSettings));
+                }
+                "chrome" => {
+                    assert!(app.chrome_ui.is_open());
+                    drop(app.update(Message::ChromeUi(chrome_ui::Action::Close)));
+                }
+                "update" => {
+                    assert!(app.update_prepared);
+                    app.update_prepared = false;
+                }
+                _ => unreachable!(),
+            }
+            let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+                card,
+                path: "c.rs".into(),
+            }));
+            settle_lsp_history_tasks(&mut app, task).await;
+            assert_current_file_goto_returns_to_its_own_origin(&mut app, card).await;
+            app.lsp.begin_shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_lsp_jump_records_only_its_own_origin() {
+        let root = tempfile::tempdir().unwrap();
+        lsp_history_files(root.path());
+        let (manager, _transport) = crate::lsp::tests::progress_fixture().await;
+        let (mut app, card) = lsp_history_app(manager, root.path()).await;
+        let before = lsp_history_runtime(&app, card).current_location().unwrap();
+        let task = app.jump_to_lsp_location(
+            card,
+            root.path().join("b.rs"),
+            LspPosition::new(1, 1),
+            LspCoordinates::Scalar,
+        );
+        settle_lsp_history_tasks(&mut app, task).await;
+        assert_eq!(
+            lsp_history_runtime(&app, card).selected_path(),
+            Some(Path::new("b.rs"))
+        );
+        assert_eq!(
+            lsp_history_runtime(&app, card).cursor_position(),
+            Some(LspPosition::new(1, 1))
+        );
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+        let task = app.update(Message::Repository(RepositoryAction::NavigateLocation {
+            card,
+            forward: false,
+        }));
+        settle_lsp_history_tasks(&mut app, task).await;
+        let after = lsp_history_runtime(&app, card).current_location().unwrap();
+        assert_eq!(after.path, before.path);
+        assert_eq!(after.cursor, before.cursor);
+        app.lsp.begin_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn superseded_queued_or_loading_lsp_open_cannot_retire_a_newer_jump() {
+        for started in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            lsp_history_files(root.path());
+            let (manager, _transport) = crate::lsp::tests::progress_fixture().await;
+            let (mut app, card) = lsp_history_app(manager, root.path()).await;
+            let task = app.jump_to_lsp_location(
+                card,
+                root.path().join("b.rs"),
+                LspPosition::new(1, 1),
+                LspCoordinates::Scalar,
+            );
+            let queued = queued_lsp_history_open(task).await;
+            let obsolete_read = if started {
+                Some(app.update(queued.clone()))
+            } else {
+                None
+            };
+            let task = app.update(Message::Repository(RepositoryAction::OpenFile {
+                card,
+                path: "c.rs".into(),
+            }));
+            settle_lsp_history_tasks(&mut app, task).await;
+            assert!(!app.lsp_pending_jumps.contains_key(&card));
+            assert_current_file_goto_returns_to_its_own_origin(&mut app, card).await;
+            let before = lsp_history_runtime(&app, card).current_location().unwrap();
+            let task = app.jump_to_lsp_location(
+                card,
+                root.path().join("d.rs"),
+                LspPosition::new(1, 2),
+                LspCoordinates::Scalar,
+            );
+            let current = queued_lsp_history_open(task).await;
+            if let Some(task) = obsolete_read {
+                settle_lsp_history_tasks(&mut app, task).await;
+            } else {
+                let task = app.update(queued);
+                settle_lsp_history_tasks(&mut app, task).await;
+            }
+            assert_eq!(
+                lsp_history_runtime(&app, card).selected_path(),
+                Some(Path::new("c.rs"))
+            );
+            assert_eq!(app.lsp_pending_jumps[&card].path, root.path().join("d.rs"));
+            assert!(app.lsp_pending_jumps[&card].queued.is_some());
+            let task = app.update(current);
+            settle_lsp_history_tasks(&mut app, task).await;
+            assert_eq!(
+                lsp_history_runtime(&app, card).selected_path(),
+                Some(Path::new("d.rs"))
+            );
+            assert_eq!(
+                lsp_history_runtime(&app, card).cursor_position(),
+                Some(LspPosition::new(1, 2))
+            );
+            assert!(!app.lsp_pending_jumps.contains_key(&card));
+            let task = app.update(Message::Repository(RepositoryAction::NavigateLocation {
+                card,
+                forward: false,
+            }));
+            settle_lsp_history_tasks(&mut app, task).await;
+            let after = lsp_history_runtime(&app, card).current_location().unwrap();
+            assert_eq!(after.path, before.path);
+            assert_eq!(after.cursor, before.cursor);
+            app.lsp.begin_shutdown().await;
+        }
+    }
+
     /// The same, for the jump that has to open a file first.
     ///
     /// Go to definition and Find references usually land in a *different*
@@ -28936,6 +29537,9 @@ mod tests {
         app.lsp_pending_jumps.insert(
             card,
             PendingLspJump {
+                queued: None,
+                identity: None,
+                origin: None,
                 path: path.clone(),
                 at: LspPosition::new(0, 0),
                 coordinates: LspCoordinates::Scalar,
@@ -28988,6 +29592,9 @@ mod tests {
         app.lsp_pending_jumps.insert(
             card,
             PendingLspJump {
+                queued: None,
+                identity: None,
+                origin: None,
                 path: PathBuf::from("/repo/src/other.rs"),
                 at: LspPosition::new(4, 2),
                 coordinates: LspCoordinates::Scalar,
@@ -29076,6 +29683,9 @@ mod tests {
         app.lsp_pending_jumps.insert(
             card,
             PendingLspJump {
+                queued: None,
+                identity: None,
+                origin: None,
                 path: PathBuf::from("/repo/gone.rs"),
                 at: LspPosition::new(1, 0),
                 coordinates: LspCoordinates::Scalar,
@@ -30999,6 +31609,100 @@ mod tests {
         app.settings_reset_confirm = true;
         drop(app.update(next()));
         assert_eq!(app.workspace.focused(), Some(ids[2]));
+    }
+
+    #[test]
+    fn captured_go_to_line_escape_closes_the_field_and_preserves_top_modal_priority() {
+        use cosmic::iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Tree, operation},
+        };
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "code.rs", "fn main() {}\n");
+        app.cards
+            .insert(card, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
+        let event = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        };
+        let renderer = headless_renderer();
+        let captured = {
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("editor");
+            };
+            let mut element = repository_widget::view(card, runtime);
+            let mut tree = Tree::new(&element);
+            let bounds = iced::Rectangle::with_size(iced::Size::new(1000.0, 700.0));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+            );
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::focusable::focus::<()>(widget::Id::new(format!(
+                    "repository.{card}.go-to-line"
+                ))),
+            );
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Keyboard(event.clone()),
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+            shell.is_event_captured()
+        };
+        assert!(
+            captured,
+            "the actual mounted native input captures Escape to blur"
+        );
+        drop(app.update(Message::KeyEvent {
+            event: event.clone(),
+            captured,
+        }));
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if !runtime.go_to_line_is_open())
+        );
+        drop(app.update(Message::Repository(RepositoryAction::OpenGoToLine { card })));
+        app.settings_reset_confirm = true;
+        drop(app.update(Message::KeyEvent {
+            event,
+            captured: true,
+        }));
+        assert!(!app.settings_reset_confirm);
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.go_to_line_is_open())
+        );
+    }
+
+    #[test]
+    fn save_matches_the_physical_key_on_non_latin_layouts() {
+        let event = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("ы".into()),
+            modified_key: keyboard::Key::Character("ы".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyS),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL,
+            text: None,
+            repeat: false,
+        };
+        assert!(is_save_press(&event));
     }
 
     #[test]
