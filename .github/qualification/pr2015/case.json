@@ -1,21 +1,23 @@
 {
   "schema": "immutable-research-case/v1",
-  "case": "cli-cache-producer-2015",
+  "case": "installer2015",
   "never_merge": true,
   "product_head": "375c37ff01aab0b226c58f547012af74e93a8643",
   "product_tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
-  "runner_sha256": "b2fda78cb29cf3a712d52f9cfbaa83c317ace3a0aa74a1da9f678b9af7f23dd6",
-  "plan_sha256": "c39055932062af3961999942c15df40239a761d2373472cd173a743d6c190e85",
+  "runner_sha256": "c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8",
+  "plan_sha256": "8e10fe09043d7ad8dbfa69744d49f9ecda2ce5d367a84e14ab320a7851e91a80",
   "selector_path": ".github/qualification/pr2015/case-select.py",
-  "selector_sha256": "bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d",
-  "independent_review_path": ".github/qualification/pr2015/cli-cache-producer-review.json",
-  "independent_review_input": "Genuine nonauthor process/tool/custody receipt copied byte-exact from external review at b881. Product/runner/plan ABI only; final wrapper/conservation review remains independently required. This copied receipt grants no execution/publication/allocation.",
+  "selector_sha256": "a8f84fe3efb6b4113cded99e142108e64aef8986b7dc24b97fda69a3981ad014",
+  "independent_review_path": ".github/qualification/pr2015/installer-custody-review.json",
+  "independent_review_input": "Genuine d32 installer process/tool/custody receipt copied byte-exact; exact product375/runnerc02/plan8e ABI only. It does not review this activation wrapper or grant publication/C/runtime. Fresh assembled-wrapper and conservation review remain mandatory.",
   "source_sha256": {
-    ".github/qualification/pr2015/case-select.py": "bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d",
-    ".github/qualification/pr2015/cli-cache-producer.py": "b2fda78cb29cf3a712d52f9cfbaa83c317ace3a0aa74a1da9f678b9af7f23dd6",
-    ".github/qualification/pr2015/cli-cache-producer-plan.json": "c39055932062af3961999942c15df40239a761d2373472cd173a743d6c190e85",
-    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
-    ".github/qualification/pr2015/cli-cache-producer-review.json": "6d504bf30051fc3460c03010483be3728324fabf8212e97703e6dccca643d228"
+    ".github/qualification/pr2015/case-select.py": "a8f84fe3efb6b4113cded99e142108e64aef8986b7dc24b97fda69a3981ad014",
+    ".github/qualification/pr2015/installer-custody-runner.py": "c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8",
+    ".github/qualification/pr2015/installer-custody-plan.json": "8e10fe09043d7ad8dbfa69744d49f9ecda2ce5d367a84e14ab320a7851e91a80",
+    ".github/qualification/pr2015/installer-custody-manifest.json": "e7eb0192eb3c347cc2905588dff93f3ee96e8f5e316cc785055ab8f67e07e33b",
+    ".github/qualification/pr2015/installer-custody-source-binding.json": "02fee817c9cf8cd5abf92279fcd0989e7a1084ee585c921f47b854cd22265c7c",
+    ".github/qualification/pr2015/installer-custody-review.json": "c79429e1c0e48216296b29118730070cf002ed8ea9532cb8aa3d59a81b70efa8",
+    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4"
   },
   "legacy_published_source": {
     "case": "legacy-final-save-1726",
@@ -38,11 +40,11 @@
   "current_allocation": null,
   "current_execution": null,
   "cache_constraints": [
-    "Standalone serial producer only; no cache-restore gate fabricated or weakened.",
-    "Save action success alone does not qualify cache publication. Require original official exact-key save confirmation.",
-    "Later independent installer restore and unchanged feature-empty payload gate remain mandatory. No auto-chain."
+    "Installer restore only: preserve existing trusted Main15 namespace, ordered paths, key/prefix and unchanged feature-empty gate. No target creation, cache save, alternate cache or cold fallback.",
+    "A separately qualified producer/save does not qualify the installer. Require the later actual independent restore and unchanged payload gate before ANY Cargo command.",
+    "Library presence does not establish Cargo freshness or integration-harness warmth. All ten installer phases and five owning parents remain UNRUN until the separately granted actual original installer run."
   ],
-  "publication_scope": "Existing researchPR1921 synchronize attempt1 only/NeverMerge. Fresh external Root C and genuine frozen-source review required BEFORE triggering nonforce publication. No rejected product-PR creation route retried.",
+  "publication_scope": "Prospective existing research PR1921 original nonforce synchronize attempt1 only/NeverMerge. Qualified producer/cache publication, fresh assembled wrapper reviews and separate external Root C required before triggering publication. Source original-attempt guards do not themselves consume or grant global C. No rerun/dispatch/rejected metadata route.",
   "prior_source_negative": {
     "head": "05f2f9ea33a45fdaed9b6b77e72eacc73117f877",
     "scope": "Original source-only findings, no execution: payload enumeration missed nonmatching entries; partial tool evidence and initialization failure-write exits needed strengthening. Original05f2 and reviews remain immutable.",
@@ -53,5 +55,12 @@
     "scope": "Source-only lock-acquisition refusal could return while handoff stayed unconfirmed because HOLD was conditioned on acquired. This successor removes that condition; no runtime result.",
     "runtime_result": null
   },
-  "independent_review_sha256": "6d504bf30051fc3460c03010483be3728324fabf8212e97703e6dccca643d228"
+  "independent_review_sha256": "c79429e1c0e48216296b29118730070cf002ed8ea9532cb8aa3d59a81b70efa8",
+  "cache_gate_sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+  "prior_selected_producer_source": {
+    "control_head": "26603cdeb870a571a95f0516bde52b2b2717be33",
+    "control_tree": "66cfade901bd232f81b90f58a83656b7d48fe8a1",
+    "case_sha256": "018edd110599229fe0bca8b44de1de3eb4f09f089db72cbecf7b8dfbe76efac0",
+    "role": "Immutable separate compile-only producer source. Actual producer/save and external accepted-return evidence are separate; no installer pass, warm restore or new grant is implied."
+  }
 }

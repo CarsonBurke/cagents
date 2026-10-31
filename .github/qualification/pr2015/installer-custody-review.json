@@ -1,0 +1,222 @@
+{
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "head": "375c37ff01aab0b226c58f547012af74e93a8643",
+  "tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+  "runner_sha256": "c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8",
+  "plan_sha256": "8e10fe09043d7ad8dbfa69744d49f9ecda2ce5d367a84e14ab320a7851e91a80",
+  "review_kind": "genuine independent bounded actual-code installer process/tool/custody source review; reviewer supplied prior design, Root alone authored implementation",
+  "created_utc": "2026-10-31T18:10:50.550636+00:00",
+  "controller_head": "d32dba8963abf1de93c87302634615154588b12c",
+  "controller_tree": "be183765954787bf5999d851368b2825d675618e",
+  "controller_parent": "d719e9d89ad28f727fc332f0f8cc051eca100b0a",
+  "preparation_base": "26603cdeb870a571a95f0516bde52b2b2717be33",
+  "control_source": {
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1921-installer-natural-custody",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1921-installer-natural-custody-source-freeze-v1.json",
+      "sha256": "a1158bd37afb85a2c12185be32476b99b97ded7ea2a8bcde9fcdf64475644bd9"
+    },
+    "runner": {
+      "path": ".github/qualification/pr2015/installer-custody-runner.py",
+      "blob": "19e2237c281c715dec44efe3c6749332554a9b4d",
+      "sha256": "c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8",
+      "bytes": 63370
+    },
+    "plan": {
+      "path": ".github/qualification/pr2015/installer-custody-plan.json",
+      "blob": "bcd902b86993f7cd68d531385c50b5eaa22c3f45",
+      "sha256": "8e10fe09043d7ad8dbfa69744d49f9ecda2ce5d367a84e14ab320a7851e91a80",
+      "bytes": 35435
+    },
+    "head_tree_clean_verified_before_after": true
+  },
+  "review_scope": "Only actual new installer process/custody/exception and ordinary-negative-return closure, original tool/read/wait interface, and narrow ten-phase/five-parent accounting. Exact donor source conservation is used to retain existing generic helper conclusions; this is not a broad24/28-helper re-audit. Directory/source admission, command-DATA and complete conservation have separate reviewers. Activation wrapper/shared case/selector/workflow/carrier eligibility remain unreviewed for a future installer selection.",
+  "findings": [],
+  "activation_status": "INTENTIONALLY_UNSELECTED_FAIL_CLOSED; NOT_A_RUNNABLE_OR_ACTIVATED_CONTROLLER_CLEARANCE",
+  "actual_code_findings_resolved": [
+    {
+      "contract": "Canonical adopted-child custody",
+      "anchors": [
+        223,
+        242
+      ],
+      "source_evidence": "New settle_children is exact9004 source. It retains the3s natural observation, never opens a fresh adopted pidfd or sends an adopted-child signal, and returns clean:false/remaining on survivors. Existing custody_clean/safe_lane_handoff and HOLD refuse unknown. Original ac4 force8cb801 branch remains historical in old driver, not imported into this runner."
+    },
+    {
+      "contract": "Initialization and evidence-write exception coverage",
+      "anchors": [
+        737,
+        759,
+        761,
+        811,
+        812,
+        813,
+        820,
+        830,
+        1020,
+        1023,
+        1026,
+        1042,
+        1048,
+        1052
+      ],
+      "source_evidence": "EVIDENCE_OUT exists before the first owning child; signal handlers and dedicated subreaper are installed before OWNERSHIP_INITIALIZED and first source(). Actual phases alias PROCESS_PHASES. Any exception after child ownership, including prelease failure-record writes or later baseline/evidence writes, reaches the outer BaseException guard. It takes two natural observations, treats assessment error as unconfirmed, catches emergency-write errors and retains through existing HOLD when unknown. No new launcher/supervisor/API is added."
+    },
+    {
+      "contract": "Ordinary failed-acquisition return cannot bypass retention",
+      "anchors": [
+        920,
+        927,
+        938,
+        946,
+        956,
+        963
+      ],
+      "source_evidence": "Inner finalization unconditionally requires HOLD when historical_handoff_clean is false, independently of acquired. Failed os.open/flock followed by unknown original source wait/unclean custody therefore cannot proceed to ordinary negative return or fd close. Known-clean acquisition refusal may return negative. Exceptions during assessment with acquired false reach the guarded outer path."
+    },
+    {
+      "contract": "Original direct-child identity/waits and positive close",
+      "anchors": [
+        57,
+        110,
+        833,
+        918,
+        963,
+        978,
+        979
+      ],
+      "source_evidence": "bounded_capture and owning run original Popen/held-pidfd timeout/wait/evidence semantics are conserved. No adopted-PID signalling authority replaces original direct ownership. Existing two final observations surround final source children; original waits/sticky failures/phase evidence must support safe handoff. Original fd close remains once/no LOCK_UN and ambiguous close is never retried. Local handback is not global C return."
+    },
+    {
+      "contract": "Ten phases and five original owning parents",
+      "anchors": [
+        389,
+        427,
+        455,
+        499,
+        934,
+        942,
+        989
+      ],
+      "source_evidence": "execute_contracts, inventory_names, parent_pass, Cargo JSON paired-artifact/ELF checks and parent_accounting are exact ac4. Plan binary checks, artifact groups/selected names/diagnostics, phase order/counts, jobs2/new_cache:false and2400 workload bound are exact old plan. No producer3-phase/zero-parent executor, fresh target, tool-version discovery path, cache save or fabricated warm gate was imported."
+    },
+    {
+      "contract": "New source bindings do not imply activation",
+      "anchors": [
+        570,
+        597,
+        598,
+        610,
+        659
+      ],
+      "source_evidence": "hosted_context changes only its literal product tuple to375/acb2; plan/runner paths point to the new task. Old materialize_plan body is exact and still demands a genuine restored-cache gate/tool receipt. Shared case/selector/workflow are exact26603 and still select producer; this installer refuses that case before child. No activation or carrier result follows from this scoped code clear."
+    }
+  ],
+  "conservation_source_evidence": {
+    "donor": "ac4bbf446957317d022a987e20887af4b3f70481:.github/qualification/pr2015/run-packet.py",
+    "donor_top_functions": 31,
+    "unchanged_function_count": 28,
+    "unchanged_functions": [
+      "bounded_capture",
+      "cargo_test_artifacts",
+      "children",
+      "control_path",
+      "custody_clean",
+      "digest",
+      "elf_record",
+      "evidence_copy",
+      "execute_contracts",
+      "final_observations",
+      "git",
+      "git_nul_fields",
+      "guard_git_metadata",
+      "inventory_names",
+      "materialize_plan",
+      "note_lane_cancellation",
+      "now",
+      "observed_wait",
+      "parent_accounting",
+      "parent_pass",
+      "refuse_git_routing",
+      "require_workload_allowed",
+      "retain_uncertain_lane",
+      "safe_lane_handoff",
+      "signal_pidfd",
+      "supervision_failure",
+      "validate_controller_review",
+      "verify_elf"
+    ],
+    "changed_named_donor_functions": [
+      "hosted_context",
+      "main",
+      "settle_children"
+    ],
+    "new_named_function": "installer_main",
+    "canonical_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "plan_preserved_keys": [
+      "binary_checks",
+      "artifact_groups",
+      "planned_phase_order",
+      "planned_phase_count",
+      "counts",
+      "lane",
+      "packet_deadline_seconds"
+    ],
+    "new_owning_function_pins": {
+      "hosted_context": {
+        "lines": [
+          570,
+          607
+        ],
+        "sha256_source_segment": "e2fbf006d98bf27acf491586a9249625d11bdb8d03439c0ac547a6199ed4f68e"
+      },
+      "settle_children": {
+        "lines": [
+          223,
+          244
+        ],
+        "sha256_source_segment": "44788c7cd704ee8b87eac08a10574f2799c46947c1e3843cde06d6ce623715c6"
+      },
+      "installer_main": {
+        "lines": [
+          662,
+          1016
+        ],
+        "sha256_source_segment": "94dfed4bc103ca48d37295d62b1ec834c41498a80ef8145913cf12579d37ca70"
+      },
+      "main": {
+        "lines": [
+          1020,
+          1053
+        ],
+        "sha256_source_segment": "e7b9a6aed5229b592d8f2bb89227d6d00de66deeb32f119908f19f2676ba4e7b"
+      }
+    }
+  },
+  "accounting": {
+    "planned_phases": 10,
+    "qualifying_outer_parents": 5,
+    "source_predicted_inventories": {
+      "installer_lifecycle_contract": 36,
+      "installer_guard_contract": 11
+    },
+    "expected_outer_stream_child_results": 0,
+    "inline_helpers_and_cases": "Nonadditive; strict actual fresh same-harness N and singleton1P0F0I0M/N-1 still required.",
+    "actual_counts": "ALL UNRUN"
+  },
+  "limits": [
+    "This genuine ABI covers the exact product/runner/plan and this stated process/tool/custody scope only. It is not full-controller readiness or carrier eligibility. The candidate is deliberately unselected and all actual workload/restore/parent outcomes remain UNRUN.",
+    "Future installer activation must obtain the applicable independent source-directory/command-DATA/conservation reviews, copy genuine receipts and review the actual shared case/selector/workflow/final assembled wrapper before any publication/run. This receipt does not review that future tree or select it.",
+    "Natural hosted User context and presence-only refusal of inherited CAGENTS names remain unchanged. No authority was read/copied/scrubbed or User fallback added. Existing fixtures and private HOME/XDG boundaries retain their original scope, not real-HOST/native/provider qualification.",
+    "Canonical physical custody/source proof does not waive actual cache save/restore/payload qualification, ten original phases/five owning results, complete original workflow/post/streams/RAW, fresh external Root C or external return/acceptance.",
+    "Original ac4 run41136465523 cache miss before Cargo/five parentsUNRUN and old force-source history remain immutable. No producer/design/old source/runtime result transfers to the installer.",
+    "No candidate/helper imports or calls, tool versions, builds/tests/Cargo/native, environment/process/target/cache/account/DB/resource probes, source/Git/GitHub writes, children/sessions or grants occurred. Only source/Git reads, source AST comparison and this own /tmp receipt."
+  ],
+  "validation": {
+    "mode": "SOURCE_ONLY",
+    "all_actuals": "UNRUN",
+    "grant": "NONE",
+    "activation": "UNSELECTED_UNREVIEWED",
+    "publication": "NONE"
+  }
+}

@@ -58,7 +58,7 @@ def hosted_context():
         assert case['product_tree'] == 'acb2cc6e049562469643e49a1ee5f7abc179c28b'
     if case['case'] == 'installer2015':
         assert attempt == '1', 'Installer2015 requires one original attempt1; reruns are unsupported and no global C grant is implied'
-        assert case['product_head'] == '6dc09b9a1b5d205650e244401da0938b653d16da' and case['product_tree'] == 'aaab67a21378958066103707baf3abe8850577d6'
+        assert case['product_head'] == '375c37ff01aab0b226c58f547012af74e93a8643' and case['product_tree'] == 'acb2cc6e049562469643e49a1ee5f7abc179c28b'
     return {'repository': 'CarsonBurke/cagents', 'pr': 1921, 'event': 'pull_request',
             'head_ref': head['ref'], 'control_head': head['sha'], 'run_id': run, 'run_attempt': attempt,
             'run_binding': run + ':' + attempt + ':' + head['sha'],
@@ -119,7 +119,7 @@ def main():
             product = Path(os.environ['GITHUB_WORKSPACE']) / 'product'
             head_file = product / '.git/HEAD'
             assert head_file.is_file() and not head_file.is_symlink() and head_file.read_text().strip() == case['product_head']
-            manifest = json.loads(Path(control_path('.github/qualification/pr2015/manifest.json')).read_bytes())
+            manifest = json.loads(Path(control_path('.github/qualification/pr2015/installer-custody-manifest.json')).read_bytes())
             assert all(digest(product / item['path']) == item['sha256'] for item in manifest['source_pins']), 'Immutable product bytes changed'
             receipt_path = Path(control_path(case['independent_review_path']))
             receipt = json.loads(receipt_path.read_bytes())

@@ -184,7 +184,7 @@ jobs:
     outputs:
       case: ${{ steps.select.outputs.case }}
     env:
-      PR2015_CASE_SHA256: 018edd110599229fe0bca8b44de1de3eb4f09f089db72cbecf7b8dfbe76efac0
+      PR2015_CASE_SHA256: b266005f09f40ef1f9a41a5aa8073830e5451711b697273b13e7a3a5e44e9092
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -196,7 +196,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s  %s\n' bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          printf '%s  %s\n' a8f84fe3efb6b4113cded99e142108e64aef8986b7dc24b97fda69a3981ad014 research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
           python3 research/.github/qualification/pr2015/case-select.py
       - name: Upload original source-selection receipt
         if: always()
@@ -566,7 +566,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      PR2015_CASE_SHA256: 018edd110599229fe0bca8b44de1de3eb4f09f089db72cbecf7b8dfbe76efac0
+      PR2015_CASE_SHA256: b266005f09f40ef1f9a41a5aa8073830e5451711b697273b13e7a3a5e44e9092
     defaults:
       run:
         shell: bash
@@ -602,14 +602,14 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: 6dc09b9a1b5d205650e244401da0938b653d16da
+          ref: 375c37ff01aab0b226c58f547012af74e93a8643
           path: product
           persist-credentials: false
       - name: Require exact product source and genuine independent controller review
         id: source_preflight
         run: |
           set -euo pipefail
-          printf '%s  %s\n' bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          printf '%s  %s\n' a8f84fe3efb6b4113cded99e142108e64aef8986b7dc24b97fda69a3981ad014 research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
           python3 research/.github/qualification/pr2015/case-select.py --require-installer-review
       - name: Install pinned compiler without invoking Cargo
         run: |
@@ -661,10 +661,10 @@ jobs:
         id: cli
         if: ${{ success() && steps.warm_cache.outcome == 'success' }}
         run: |
-          python3 "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/run-packet.py" \
+          python3 "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/installer-custody-runner.py" \
             --run-binding "$PR2015_RUN_BINDING" \
-            --runner-sha256 1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20 \
-            --controller-review "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/independent-review.json" \
+            --runner-sha256 c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8 \
+            --controller-review "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/installer-custody-review.json" \
             --controller-review-sha256 "$PR2015_CONTROLLER_REVIEW_SHA256"
       - name: Preserve original workflow step outcomes and artifact checksums
         if: always()
@@ -717,7 +717,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      PR2015_CASE_SHA256: 018edd110599229fe0bca8b44de1de3eb4f09f089db72cbecf7b8dfbe76efac0
+      PR2015_CASE_SHA256: b266005f09f40ef1f9a41a5aa8073830e5451711b697273b13e7a3a5e44e9092
     defaults:
       run:
         shell: bash
@@ -745,7 +745,7 @@ jobs:
         id: source_preflight
         run: |
           set -euo pipefail
-          printf '%s  %s\n' bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          printf '%s  %s\n' a8f84fe3efb6b4113cded99e142108e64aef8986b7dc24b97fda69a3981ad014 research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
           python3 research/.github/qualification/pr2015/case-select.py --require-producer-review
       - name: Install pinned compiler without invoking Cargo
         timeout-minutes: 12

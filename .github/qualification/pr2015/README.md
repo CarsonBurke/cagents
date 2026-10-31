@@ -1,3 +1,27 @@
+# Prospective current installer activation source
+
+This source routing selects `installer2015` for product `375c37ff01aab0b226c58f547012af74e93a8643` / tree `acb2cc6e049562469643e49a1ee5f7abc179c28b`. It uses the unchanged d32 installer runner `c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8`, plan `8e10fe09043d7ad8dbfa69744d49f9ecda2ce5d367a84e14ab320a7851e91a80`, and byte-exact genuine installer process/tool/custody review `c79429e1c0e48216296b29118730070cf002ed8ea9532cb8aa3d59a81b70efa8`. The copied review retains its d32 scope and excludes this new activation wrapper. The actual final wrapper identity and fresh independent selected-wrapper/conservation reviews belong in separate external records.
+
+All installer execution remains **UNRUN**. This source is privately prepared and is not a runtime grant. A qualified separate producer and original cache-save acceptance must precede any installer-triggering publication. A new external serial C reservation covers the entire original installer workflow, setup, restore, packet, posts, upload, sole RAW and accepted return. The later actual restore and unchanged feature-empty cache gate must succeed before ANY Cargo command. There is no cold fallback, target creation, cache save or producer-to-installer automatic chain.
+
+Current invocation (actual original runtime exports only):
+
+```sh
+python3 "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/installer-custody-runner.py" \
+  --run-binding "$PR2015_RUN_BINDING" \
+  --runner-sha256 c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8 \
+  --controller-review "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/installer-custody-review.json" \
+  --controller-review-sha256 "$PR2015_CONTROLLER_REVIEW_SHA256"
+```
+
+The five owning CLI parents preserve `--exact --nocapture --test-threads=1 --color=never`. Fresh actual inventories and strict one-pass/zero-failure/zero-ignored/zero-measured/N-minus-one accounting remain required; neither source-predicted 36/11 inventories nor a prior producer compilation substitutes for them. Ten serial phase ceilings sum to 3060 seconds but share the unchanged clamped 2400-second workload deadline. Natural custody observations do not bound finalization or unknown HOLD. Canonical9004 leaves unproven adopted survivors unsignaled; unknown custody retains its owner independently of lock acquisition.
+
+The eleven d32 installer source additions deliberately retain their immutable preparation-time UNSELECTED/UNRUN labels and manifest review checkpoint. Those labels describe that historical source checkpoint, not this prospective selected wrapper or actual execution. Original ac4 cache-miss and producer source negatives remain unchanged. A producer/save outcome does not establish installer restore, parent passes, installed product, native/provider behavior, whole-PR readiness or merge permission. This research PR is NEVER MERGE.
+
+## Retained historical source notes
+
+The text and older invocation below record historical ac4/6dc installer or producer preparation. They are preserved as history and are not the current invocation above.
+
 # Installer2015 hosted User research packet
 
 This source-only packet targets product `6dc09b9a1b5d205650e244401da0938b653d16da`, tree `aaab67a21378958066103707baf3abe8850577d6`, through the existing research PR1921 workflow. It is NeverMerge research. It creates no product PR and does not bypass the rejected product-PR creation. Nothing here has been executed, scheduled, pushed, or dispatched.
