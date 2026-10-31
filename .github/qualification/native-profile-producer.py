@@ -311,7 +311,8 @@ def fetch_readback(request, token, phase, factory, now, stamp, caps, retain):
     need(isinstance(token,str) and token and len(token) <= 16384 and '\r' not in token and '\n' not in token,
          'step-scoped-readback-token-required')
     record = dict(kind='original-cache-http-observation-v1',phase=phase,request=request,
-        status=None,complete=False,error=None,closure_errors=[],observed_start=stamp())
+        status=None,complete=False,error=None,closure_errors=[],observed_start=stamp(),
+        observed_finish=None,finish_error=None)
     body = bytearray(); headers = selected_headers([]); connection = response = None; failure = None
     deadline = now()+caps['request_seconds']
     try:
@@ -329,9 +330,10 @@ def fetch_readback(request, token, phase, factory, now, stamp, caps, retain):
             remaining = deadline-now(); need(remaining > 0,'readback-deadline')
             socket.settimeout(min(remaining,caps['socket_seconds']))
             raw = response.read1(min(65536,caps['body_bytes']+1-len(body)))
-            if not raw: break
-            body.extend(raw)
+            body.extend(raw)  # Keep bounded returned bytes even if the read crossed its deadline.
             need(len(body) <= caps['body_bytes'],'readback-body-cap')
+            need(now() < deadline,'readback-deadline')
+            if not raw: break
         complete_body_length(headers['values'],len(body),caps)
         record['complete'] = True
     except BaseException as error:
@@ -344,7 +346,13 @@ def fetch_readback(request, token, phase, factory, now, stamp, caps, retain):
                 except BaseException as error:
                     record['closure_errors'].append(type(error).__name__)
                     if failure is None: failure = error
-        record['observed_finish'] = stamp()
+        try:
+            record['observed_finish'] = stamp()
+        except BaseException as error:
+            record['finish_error'] = type(error).__name__
+            record['complete'] = False
+            if record['error'] is None: record['error'] = type(error).__name__
+            if failure is None: failure = error
         # These are genuine response BODY bytes plus explicitly PARSED safe
         # fields, never reconstructed bytes described as raw HTTP headers.
         try:
@@ -361,7 +369,8 @@ def http_observation(data, request, phase, caps):
     record,body,headers = data['observation'],data['body'],data['headers']
     need(record['kind'] == 'original-cache-http-observation-v1' and record['phase'] == phase
          and record['request'] == request and record['status'] == 200 and record['complete'] is True
-         and record['error'] is None and record['closure_errors'] == [],'readback-not-complete-success')
+         and record['error'] is None and record['closure_errors'] == []
+         and record.get('observed_finish') is not None and record.get('finish_error') is None,'readback-not-complete-success')
     for name,raw in [('body',body),('headers',headers)]:
         reference(record[name])
         need(len(raw) == record[name]['bytes'] and digest(raw) == record[name]['sha256'],'readback-response-bytes')

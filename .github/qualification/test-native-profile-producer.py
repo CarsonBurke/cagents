@@ -166,6 +166,8 @@ class HttpHarness:
                       ('Content-Type','application/json'),('Set-Cookie','must-not-retain'),('Authorization','must-not-retain')]
         self.chunks=[f.api['encoded'](dict(total_count=0,actions_caches=[])),b'']
         self.token='algorithm-only-readback-token';self.clock=lambda:0
+        self.after_read=lambda item:None
+        self.stamp=lambda:'algorithm-only'
     def factory(self, timeout):
         self.events.append(('factory',timeout));outer=self
         class Socket:
@@ -176,6 +178,7 @@ class HttpHarness:
             def read1(self, maximum):
                 outer.events.append(('read',maximum));item=outer.chunks.pop(0)
                 if isinstance(item,BaseException):raise item
+                outer.after_read(item)
                 return item
             def close(self):outer.events.append(('response-close',))
         class Connection:
@@ -194,7 +197,7 @@ class HttpHarness:
         return dict(path='/algorithm-only/'+name,sha256=self.f.api['digest'](raw),bytes=len(raw))
     def fetch(self):
         return self.f.api['fetch_readback'](self.request,self.token,'before',self.factory,self.clock,
-            lambda:'algorithm-only',self.f.plan['readback_caps'],self.retain)
+            self.stamp,self.f.plan['readback_caps'],self.retain)
 
 
 class ProducerAlgorithms(unittest.TestCase):
@@ -495,6 +498,58 @@ class ProducerAlgorithms(unittest.TestCase):
         f=Fixture();f.build();raw,request,*rest=publication_data(f);harness=HttpHarness(f,request);harness.token=None
         with self.assertRaisesRegex(ValueError,'step-scoped-readback-token-required'):harness.fetch()
         self.assertEqual(harness.events,[])
+
+    def test_returned_EOF_or_bytes_after_deadline_never_complete_or_admit_save(self):
+        for stage in ('in-cap-EOF','late-EOF','late-bytes'):
+            with self.subTest(stage=stage):
+                f=Fixture();f.build();raw,request,*rest=publication_data(f);harness=HttpHarness(f,request)
+                expected=harness.chunks[0];clock=[0];harness.clock=lambda:clock[0]
+                def returned(item):
+                    if stage=='late-EOF' and not item or stage=='late-bytes' and item:
+                        clock[0]=f.plan['readback_caps']['request_seconds']+1
+                harness.after_read=returned
+                if stage=='in-cap-EOF':
+                    observation=harness.fetch()
+                    rows,date=f.api['http_observation'](dict(observation=observation,
+                        body=harness.retained['body'],headers=harness.retained['headers.json']),
+                        request,'before',f.plan['readback_caps'])
+                    self.assertEqual(rows,[]);self.assertTrue(observation['complete'])
+                else:
+                    with self.assertRaisesRegex(ValueError,'readback-deadline'):harness.fetch()
+                    observation=json.loads(harness.retained['json'])
+                    self.assertFalse(observation['complete']);self.assertEqual(observation['error'],'ValueError')
+                    self.assertEqual(harness.retained['body'],expected)
+                    with self.assertRaisesRegex(ValueError,'readback-not-complete-success'):
+                        f.api['http_observation'](dict(observation=observation,
+                            body=harness.retained['body'],headers=harness.retained['headers.json']),
+                            request,'before',f.plan['readback_caps'])  # No validated absence -> no save gate.
+                self.assertEqual(len([event for event in harness.events if event[0]=='factory']),1)
+                self.assertEqual(len([event for event in harness.events if event[0]=='GET']),1)
+
+    def test_finish_stamp_failure_preserves_original_error_and_partial_response(self):
+        for original in (OSError('algorithm-only original read failure'),None):
+            with self.subTest(prior_failure=original is not None):
+                f=Fixture();f.build();raw,request,*rest=publication_data(f);harness=HttpHarness(f,request)
+                secondary=RuntimeError('algorithm-only finish stamp failure');stamps=[0]
+                def stamp():
+                    stamps[0]+=1
+                    if stamps[0]==1:return 'algorithm-only-start'
+                    raise secondary
+                harness.stamp=stamp
+                if original is not None:harness.chunks=[b'{retained-prefix',original]
+                expected=harness.chunks[0]
+                with self.assertRaises(type(original or secondary)) as caught:harness.fetch()
+                self.assertIs(caught.exception,original or secondary)
+                observation=json.loads(harness.retained['json'])
+                self.assertEqual(harness.retained['body'],expected)
+                self.assertFalse(observation['complete']);self.assertIsNone(observation['observed_finish'])
+                self.assertEqual(observation['finish_error'],'RuntimeError')
+                self.assertEqual(observation['error'],type(original or secondary).__name__)
+                self.assertIn(('response-close',),harness.events);self.assertIn(('connection-close',),harness.events)
+                with self.assertRaisesRegex(ValueError,'readback-not-complete-success'):
+                    f.api['http_observation'](dict(observation=observation,
+                        body=harness.retained['body'],headers=harness.retained['headers.json']),
+                        request,'before',f.plan['readback_caps'])
 
     def test_complete_pages_UTC_clock_row_and_save_binding_have_independent_negative_controls(self):
         cases=('incomplete-count','next-page','missing-row','zero-id','bool-id','empty-version','zero-size',
