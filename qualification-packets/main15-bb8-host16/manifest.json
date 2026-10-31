@@ -4,9 +4,9 @@
   "controller_identity": "EXTERNAL_POSTCOMMIT",
   "controller_review": null,
   "execution_authorized": false,
-  "file_count_including_manifest": 119,
+  "file_count_including_manifest": 121,
   "grant": null,
-  "hashed_payload_count": 118,
+  "hashed_payload_count": 120,
   "kind": "FROZEN_SOURCE_PAYLOAD_INDEX_SELF_EXCLUDED_NOT_ADMISSION",
   "limits": "Author source index only; current exact frozen controller requires separate genuine code/conservation review and a fresh grant. No source result or whole inherited stack qualification.",
   "members": [
@@ -21,9 +21,9 @@
       "sha256": "aad51dff623a52014a4c5143db18ec66d3d822624d014764bba7ed02c2f9ecf6"
     },
     {
-      "bytes": 17047,
+      "bytes": 17044,
       "path": "current-source-map.json",
-      "sha256": "7877d869eca5fbbc5e78f19178a21bf2ba26d0e4e9c23c8b64d0f274b40fd5d4"
+      "sha256": "c6c974167a6578fa2112ef41b981e0f891593cfc1367d9d958365416321a890f"
     },
     {
       "bytes": 19691,
@@ -306,19 +306,24 @@
       "sha256": "cd719e229d0b1d8687157ff9fd3c25d626ae7a2e5b905d55175e33a3a87775b3"
     },
     {
-      "bytes": 198677,
+      "bytes": 198681,
       "path": "from-993-forward.diff.json",
-      "sha256": "53759d7eef7f4de10239563c4ce372ab974bd54acfbfedfa9a86355645b0870f"
+      "sha256": "98079d0ee3e83ac548a6358750b90ccddff7a626e7f46bc6e63f6c3f00225eb8"
     },
     {
-      "bytes": 210352,
+      "bytes": 1663,
+      "path": "from-HOST16-7c47-forward.diff.json",
+      "sha256": "90ad7ff45227fc5f6f245aeab80462ea2a12b9b60100b5d588c3b93c10f1ae4d"
+    },
+    {
+      "bytes": 210356,
       "path": "from-Search-UI5-b896-forward.diff.json",
-      "sha256": "102e83294198f12b0ef647f0f5f78f5d686a71b015df8b12c922f8bca480c25d"
+      "sha256": "063fd8a302f22e4911cba2cbe0711a0f2e5caa27b95970c685c8a65188335d21"
     },
     {
-      "bytes": 160561,
+      "bytes": 160565,
       "path": "from-f95-HOST16-forward.diff.json",
-      "sha256": "b77123ca4dd8eec05d959e9e9bcb4904baf16a79af555cecfae4b8826df49558"
+      "sha256": "f03ffaa1386f8293ab639d9e05983cce8151bb4b25bdd3cfaae586aa2d660507"
     },
     {
       "bytes": 394,
@@ -326,9 +331,9 @@
       "sha256": "1b9ba5668e22b6ba8bf02e53ea2811ff0d48e75deb1528a258b9ff124b46bf8b"
     },
     {
-      "bytes": 838,
+      "bytes": 846,
       "path": "invocation-template.json",
-      "sha256": "3f1a3a3b49468da3b2c3af64ac647600072bcc313521f527c063fb1fc6a96545"
+      "sha256": "ed5d4b0706663f8d2b6af9f4bd18aa366dde505f67f236c75360880a1c56454a"
     },
     {
       "bytes": 144858,
@@ -336,9 +341,9 @@
       "sha256": "8f5b330a19d7b625ed3492fa59d0707f351a5d65ddacb6b8f31c948322fc9310"
     },
     {
-      "bytes": 51554,
+      "bytes": 51978,
       "path": "plan.json",
-      "sha256": "da46df9225f28401f56267ca61faa6fcc896b14d24a1bb20dee0cca8fbf850d3"
+      "sha256": "15be44eec5bde2ec0846365fc720a1fe0c28b3c16cd7c4b0cb8eb9a05c1d4060"
     },
     {
       "bytes": 412,
@@ -566,9 +571,9 @@
       "sha256": "b8163d324b945bde62501589d038a7c095769064945b6d410428fc16b4cea215"
     },
     {
-      "bytes": 98354,
+      "bytes": 98358,
       "path": "run-packet.py",
-      "sha256": "d448bd4291c5054271bdfcce37bc7cb8d29f101273491de59dae158bf5d1671d"
+      "sha256": "aa6f77fcdc3efb98d466c3e79b3f663ca9b2edd71f0906a6d67d7b2a3d63172c"
     },
     {
       "bytes": 9155,
@@ -576,29 +581,34 @@
       "sha256": "3911d371197d67ae2b10f6e12fc1ee785e55ebbe80c19e64228c2f01513475db"
     },
     {
-      "bytes": 21436,
+      "bytes": 21616,
       "path": "source-binding.json",
-      "sha256": "78f408083c5ebc3de92548be553a3446a61f4b4f17b37c6ca65eb8cf5fdbecce"
+      "sha256": "49b63cca07b7c83fbb73ed586611a11880894067d801730b72c086171e27b111"
     },
     {
-      "bytes": 10980,
+      "bytes": 15736,
       "path": "source-conservation.json",
-      "sha256": "cd1325372b6b7e233d2159266e186ca46d1c1cef42b7bdf268481c5850bff48f"
+      "sha256": "f8b947878706341c7240f7ed85c254d48d81ca96e95c53d42e7bd60bddb7fecb"
     },
     {
-      "bytes": 198682,
+      "bytes": 198686,
       "path": "to-993-true-inverse.diff.json",
-      "sha256": "ef3f49701d0949b32f36d6b8cf898541f4a6d3d66e82a15c7ad5832a641518f5"
+      "sha256": "d97ec6e8fc5811a33eccc9e538636bf1ed73a80c816ca05930a506ef3dd49f19"
     },
     {
-      "bytes": 210357,
+      "bytes": 1668,
+      "path": "to-HOST16-7c47-true-inverse.diff.json",
+      "sha256": "933fd3dc6f64509978d2854fa0b58333596decee431a5aeb9709843d83a97108"
+    },
+    {
+      "bytes": 210361,
       "path": "to-Search-UI5-b896-true-inverse.diff.json",
-      "sha256": "a6dd96ecb02e500e439ed8de2bf46eb78d88a8cf3fc794deff60a182477783cc"
+      "sha256": "3d3b3789a9295f16b65f2fcb3e84090b2725489e3ab807b4f99c5a58613c3a35"
     },
     {
-      "bytes": 160566,
+      "bytes": 160570,
       "path": "to-f95-HOST16-true-inverse.diff.json",
-      "sha256": "d743c5d7240f30ad9670d0e51de1dd46f8205e8c60ec806c16c273a43b950336"
+      "sha256": "b17ee5fe41bed1d681d0f51e087ad97e3f9c7761b89fedf4a3a9879d17392af8"
     }
   ],
   "preserved_input_trailing_whitespace": [],

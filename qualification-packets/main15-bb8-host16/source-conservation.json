@@ -2,12 +2,47 @@
   "accounting_group_inverse_labels_cardinalities_only": true,
   "actual_ELF_inventory_N_results": null,
   "actual_product_parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "all32_immediate_function_bodies_exact": true,
   "all_five_nested_exact": {
     "context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
     "invoke_fixture_group": "288e08759f96075a6a091c01f6626016f8ff55fda5a2033cf58c6d31537493f4",
     "read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
     "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06",
     "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711"
+  },
+  "all_immediate_definitions_sha256": {
+    "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+    "cargo_helper_artifact": "cce4fa0819e7ce38157c45c4d8eb40df7e154d6d2fa94f3e39dfea52bd0d2712",
+    "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
+    "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+    "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+    "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+    "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+    "execute_contracts": "584d6c3b8076b29a92d12454bd3c3e04b1d14abe5f46323c62cbd451151c41bc",
+    "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+    "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+    "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+    "grouped_contracts": "fadd5d267bf95d174015848ce145d1bc2aadde9452d2bf9ad70927b0fe4f62e3",
+    "grouped_result": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115",
+    "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+    "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+    "main": "046d8457b450c34d9a083862cc1a7bb72d4427e3ed27c7255bf6c499c3a7505b",
+    "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+    "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+    "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+    "parent_accounting": "6724b9487f4ceed2594e16dfb41a7557b8c25e775a944ac3dd7d6b710d801a38",
+    "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+    "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+    "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+    "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9",
+    "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+    "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+    "settle_children": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+    "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+    "task_elf_observation": "3cd165b37eb78c86f9bf35fe2ed7eef1401f073c3b166512763f6a7af75e2814",
+    "task_group_assets": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4",
+    "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
   },
   "all_other_immediate_definitions_sha256": {
     "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
@@ -65,9 +100,7 @@
   "bounded_line_forward_inverse_reconstruction_exact": true,
   "canonical9004_exact": true,
   "canonical_definition_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
-  "changed_functions": [
-    "main"
-  ],
+  "changed_functions": [],
   "changed_functions_versus_f95_immediate": [
     "main"
   ],
@@ -86,12 +119,14 @@
   "compact_terminal_expression_exact": true,
   "controller_review": null,
   "diff_envelopes": {
-    "from-993-forward.diff.json": "53759d7eef7f4de10239563c4ce372ab974bd54acfbfedfa9a86355645b0870f",
-    "from-Search-UI5-b896-forward.diff.json": "102e83294198f12b0ef647f0f5f78f5d686a71b015df8b12c922f8bca480c25d",
-    "from-f95-HOST16-forward.diff.json": "b77123ca4dd8eec05d959e9e9bcb4904baf16a79af555cecfae4b8826df49558",
-    "to-993-true-inverse.diff.json": "ef3f49701d0949b32f36d6b8cf898541f4a6d3d66e82a15c7ad5832a641518f5",
-    "to-Search-UI5-b896-true-inverse.diff.json": "a6dd96ecb02e500e439ed8de2bf46eb78d88a8cf3fc794deff60a182477783cc",
-    "to-f95-HOST16-true-inverse.diff.json": "d743c5d7240f30ad9670d0e51de1dd46f8205e8c60ec806c16c273a43b950336"
+    "from-993-forward.diff.json": "98079d0ee3e83ac548a6358750b90ccddff7a626e7f46bc6e63f6c3f00225eb8",
+    "from-HOST16-7c47-forward.diff.json": "90ad7ff45227fc5f6f245aeab80462ea2a12b9b60100b5d588c3b93c10f1ae4d",
+    "from-Search-UI5-b896-forward.diff.json": "063fd8a302f22e4911cba2cbe0711a0f2e5caa27b95970c685c8a65188335d21",
+    "from-f95-HOST16-forward.diff.json": "f03ffaa1386f8293ab639d9e05983cce8151bb4b25bdd3cfaae586aa2d660507",
+    "to-993-true-inverse.diff.json": "d97ec6e8fc5811a33eccc9e538636bf1ed73a80c816ca05930a506ef3dd49f19",
+    "to-HOST16-7c47-true-inverse.diff.json": "933fd3dc6f64509978d2854fa0b58333596decee431a5aeb9709843d83a97108",
+    "to-Search-UI5-b896-true-inverse.diff.json": "3d3b3789a9295f16b65f2fcb3e84090b2725489e3ab807b4f99c5a58613c3a35",
+    "to-f95-HOST16-true-inverse.diff.json": "b17ee5fe41bed1d681d0f51e087ad97e3f9c7761b89fedf4a3a9879d17392af8"
   },
   "donor": {
     "head": "993cea26a29b5a2cd6857a959628de4e5f04c096",
@@ -101,14 +136,38 @@
   "final_return_exact": true,
   "grant": null,
   "historical_POSTRUN_7bfc": "7bfc is unchanged f95/a7c8 source intake supplied POSTRUN ONLY to the original run, not retroactive archive/use/admission. New archival begins only with this successor; no HOST/current whole-stack/User credit.",
+  "historical_f95_reader_inverse_main_and_WT_PLAN_PLAN_SHA": true,
   "historical_f95_source_conservation": {
     "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-host16-source/qualification-packets/main15-bb8-host16/dependencies/base-f95-source-conservation.json",
     "sha256": "8b8f0cb4a1090ba692f6ff0fa0300388fbaf002d8b651533f756417cb0d234c3"
   },
-  "immediate_source": {
+  "historical_f95_to_bb8_reader_component_source": {
     "head": "3dd236df2ce3878ca059f6aadbb9b195d3c6fe0e",
     "runner_sha256": "471b91174f01c5d3262e8da3debb48421b4015fe6b91827620c9da40c28b7b5c"
   },
+  "immediate_source": {
+    "head": "7c47f7daa74a5918936da60631c90fd57648d77c",
+    "runner_sha256": "d448bd4291c5054271bdfcce37bc7cb8d29f101273491de59dae158bf5d1671d",
+    "source_conservation_sha256": "cd1325372b6b7e233d2159266e186ca46d1c1cef42b7bdf268481c5850bff48f"
+  },
+  "immutable_original_negative_refs": [
+    {
+      "path": "/var/tmp/coord16-bb8-host16-code-independent-h5by1raf/review.json",
+      "sha256": "a87e9da95d17d9b32c71a341871986bc12948f00d451f3555f535b4a8b3ec719"
+    },
+    {
+      "path": "/var/tmp/coord16-main15-bb8-host16-conservation-final-n6gj2r9k/review.json",
+      "sha256": "3c8d005e9670a2e7d460105da513c245ccee934359f6829f0ab575eea6a6d567"
+    },
+    {
+      "path": "/var/tmp/coord16-main15-bb8-two-packets-lead-w5ai_6ib/UI5-HOST16-template-product-identity-source-negative.json",
+      "sha256": "9ba36d284465b9a4f8b3f6229d678103b9fe876e3e2c31415fbef2f01c1bc537"
+    },
+    {
+      "path": "/var/tmp/coord16-main15-bb8-two-packets-lead-w5ai_6ib/UI5-HOST16-nested-current-contract-source-negative.json",
+      "sha256": "3310b83d55ce0dd57eb272a2fe75728f9f93b637a192605e947f12fb64d347aa"
+    }
+  ],
   "instruction_source": {
     "bytes_flags_changed_by_author": false,
     "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
@@ -118,7 +177,13 @@
     "latest_user_AGENTS_instructions_followed": true,
     "variance": true
   },
-  "kind": "AUTHOR_MAIN15_BB8_TASK_SOURCE_CONSERVATION_NOT_INDEPENDENT_APPROVAL",
+  "kind": "AUTHOR_MAIN15_BB8_HOST16_CURRENT_METADATA_ABI_SOURCE_CORRECTION_NOT_INDEPENDENT_APPROVAL",
+  "metadata_author_assertions": {
+    "both_product_identities_equal_current_plan_bb8": true,
+    "map_nested_caller_contract_derived_from_exact_standalone_current_contract": true,
+    "selected_names_and_source_pins_equal_current_plan": true,
+    "template_review_ABI_derived_from_current_plan": true
+  },
   "planned_serial_phases": 19,
   "product_entries_before_packet": 2231,
   "product_head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
@@ -128,8 +193,8 @@
   "proposed_command_caps_seconds": 2250,
   "protected3790_exact": true,
   "protected3790_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
-  "runner_sha256": "d448bd4291c5054271bdfcce37bc7cb8d29f101273491de59dae158bf5d1671d",
-  "source_change_limits": "Only main typed bb8 current/f95 BASE source-role admission and own WT/PLAN/PLAN_SHA bindings change versus immediate donor. Generic29+group/accounting and all5 nested/canonical9004/full3790/strict parser/execute/owner/context/HOLD/Cclose/compact output exact. No current algorithm/runtime execution.",
+  "runner_sha256": "aa6f77fcdc3efb98d466c3e79b3f663ca9b2edd71f0906a6d67d7b2a3d63172c",
+  "source_change_limits": "Only current metadata correction and own PLAN/PLAN_SHA/path/hash/inverse bindings differ from immediate7c47. All32 function bodies including main and all5 nested/canonical9004/FULL3790/strict parser/context/custody/phase counts/caps/compact tail exact. No candidate evaluation or runtime.",
   "source_pin_count": 44,
   "strict_grouped_result_and_execute_contracts_exact": true,
   "unchanged_function_sha256": {
@@ -164,7 +229,7 @@
     "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
   },
   "unchanged_top_level_count": 29,
-  "unchanged_top_level_count_versus_immediate": 31,
-  "whole_immediate_runner_inverse_only_main_and_WT_PLAN_PLAN_SHA": true,
+  "unchanged_top_level_count_versus_immediate": 32,
+  "whole_immediate_runner_inverse_only_PLAN_PLAN_SHA": true,
   "whole_module_inverse_only_three_task_functions_and_WT_PLAN_PLAN_SHA": "Historical donor993 relation; current immediate inverse changes only main and three task globals."
 }

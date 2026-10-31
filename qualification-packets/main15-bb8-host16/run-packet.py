@@ -20,12 +20,12 @@ WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ti
 TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
 LOCK = TARGET.parent / 'lane-c.lock'
 TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-host16-source/qualification-packets/main15-bb8-host16/plan.json')
+PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-host16-abi-source/qualification-packets/main15-bb8-host16/plan.json')
 PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
 PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
 SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
 CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
-PLAN_SHA = 'da46df9225f28401f56267ca61faa6fcc896b14d24a1bb20dee0cca8fbf850d3'
+PLAN_SHA = '15be44eec5bde2ec0846365fc720a1fe0c28b3c16cd7c4b0cb8eb9a05c1d4060'
 SCOPE_PARENT = None  # No grouped contract enables the dormant donor staged-scope path.
 
 
