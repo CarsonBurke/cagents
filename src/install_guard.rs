@@ -755,7 +755,7 @@ fn read_staged_owner(version_root: &Path) -> io::Result<Option<StagedOwner>> {
     let marker = version_root.join(STAGED_OWNER);
     let mut file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&marker)
     {
         Ok(file) => file,
@@ -1178,6 +1178,78 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, ["current"], "no temporary link may remain");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_staged_owner_marker_refuses_without_waiting_for_a_writer() {
+        use std::{
+            ffi::CString,
+            os::unix::{
+                ffi::OsStrExt,
+                fs::{OpenOptionsExt, PermissionsExt},
+            },
+            path::PathBuf,
+            sync::mpsc,
+        };
+
+        struct MarkerReader {
+            _root: tempfile::TempDir,
+            marker: PathBuf,
+            reader: Option<thread::JoinHandle<()>>,
+        }
+        impl MarkerReader {
+            fn settle(&mut self) -> (io::Result<()>, thread::Result<()>) {
+                // RDWR opens this owned FIFO immediately without a peer. It
+                // releases the old blocking reader if the prompt check timed
+                // out; keep the descriptor and root alive through its join.
+                let release = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(&self.marker);
+                let joined = match self.reader.take() {
+                    Some(reader) => reader.join(),
+                    None => Ok(()),
+                };
+                (release.map(drop), joined)
+            }
+        }
+        impl Drop for MarkerReader {
+            fn drop(&mut self) {
+                if self.reader.is_some() {
+                    let _ = self.settle();
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join(STAGED_OWNER);
+        let name = CString::new(marker.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path is inside this owned private root.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut owned = MarkerReader {
+            _root: root,
+            marker,
+            reader: None,
+        };
+        let version_root = owned._root.path().to_owned();
+        let (sender, receiver) = mpsc::channel();
+        owned.reader = Some(thread::spawn(move || {
+            let _ = sender.send(read_staged_owner(&version_root).map(|_| ()));
+        }));
+        let timely = receiver.recv_timeout(Duration::from_secs(2));
+        let (released, joined) = owned.settle();
+        released.expect("owned FIFO release descriptor");
+        joined.expect("original marker reader joined");
+        let error = timely
+            .expect("FIFO marker reader must promptly return without a writer")
+            .expect_err("a FIFO cannot be an ownership marker");
+        assert_eq!(
+            error.to_string(),
+            "invalid staged installation ownership marker"
+        );
     }
 
     #[test]
