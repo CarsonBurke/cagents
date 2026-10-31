@@ -91,6 +91,19 @@ impl Cagents {
         self.schedule_project_search()
     }
 
+    pub(super) fn retire_project_search_roots(
+        &mut self,
+        project: ProjectId,
+        retired: &std::collections::BTreeSet<PathBuf>,
+    ) -> Task<Message> {
+        if self.search_ui.root.as_ref().is_some_and(|root| {
+            root.project_id == project && retired.contains(&root.canonical_path)
+        }) {
+            return self.schedule_project_search();
+        }
+        Task::none()
+    }
+
     fn schedule_project_search(&mut self) -> Task<Message> {
         if let Some(cancel) = self.search_ui.cancel.take() {
             cancel.cancel();
@@ -1099,6 +1112,119 @@ mod tests {
         assert_eq!(runtime.navigation(), navigation);
         assert!(runtime.is_dirty());
         assert!(app.pending_panel_open.is_none());
+    }
+
+    #[test]
+    fn delivered_root_retirement_rejects_queued_old_progress_under_the_same_key() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let root = app.sidebar_state.active_worktree().unwrap().clone();
+        app.search_ui.root = Some(root.clone());
+        app.search_ui.generation = 10;
+        app.search_ui.options.query = "needle".into();
+        app.context_tab = ContextTab::Search;
+        let cancel = CancellationToken::default();
+        app.search_ui.cancel = Some(cancel.clone());
+        let matched = project_search::Match {
+            path: "original.rs".into(),
+            line: 0,
+            column: 0,
+            length: 6,
+            line_identity: project_search::LineIdentity::new("needle"),
+            snippet: "needle".into(),
+            highlight: 0..6,
+        };
+        app.search_ui.matches.push(matched.clone());
+        app.search_ui.error = Some("original error".into());
+        for (project, change) in [
+            (
+                root.project_id,
+                crate::git_watch::Change {
+                    topology: true,
+                    membership: true,
+                    coverage: Some(false),
+                    ..Default::default()
+                },
+            ),
+            (
+                root.project_id,
+                crate::git_watch::Change {
+                    retired_roots: [root.canonical_path.join("other")].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                ProjectId::new(),
+                crate::git_watch::Change {
+                    retired_roots: [root.canonical_path.clone()].into(),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            drop(app.apply_git_watch_change(project, change));
+            assert_eq!(app.search_ui.generation, 10);
+            assert!(!cancel.is_cancelled());
+            assert_eq!(app.search_ui.matches.len(), 1);
+        }
+        drop(app.apply_git_watch_change(
+            root.project_id,
+            crate::git_watch::Change {
+                retired_roots: [root.canonical_path.clone()].into(),
+                ..Default::default()
+            },
+        ));
+        let generation = app.search_ui.generation;
+        assert_ne!(generation, 10);
+        assert_eq!(app.search_ui.root.as_ref(), Some(&root));
+        assert!(cancel.is_cancelled());
+        assert!(app.search_ui.matches.is_empty());
+        assert!(app.search_ui.error.is_none());
+        assert!(app.search_ui.running);
+        for progress in [
+            Progress::Batch(vec![matched.clone()]),
+            Progress::Error("late original error".into()),
+            Progress::Finished {
+                capped: true,
+                skipped: 99,
+            },
+        ] {
+            drop(cosmic::Application::update(
+                &mut app,
+                Message::ProjectSearch(Action::Progress {
+                    generation: 10,
+                    root: root.clone(),
+                    progress,
+                }),
+            ));
+            assert!(app.search_ui.matches.is_empty());
+            assert!(app.search_ui.error.is_none());
+            assert!(app.search_ui.running);
+            assert!(!app.search_ui.capped);
+            assert_eq!(app.search_ui.skipped, 0);
+        }
+        drop(cosmic::Application::update(
+            &mut app,
+            Message::ProjectSearch(Action::Progress {
+                generation,
+                root: root.clone(),
+                progress: Progress::Batch(vec![matched]),
+            }),
+        ));
+        assert_eq!(app.search_ui.matches.len(), 1);
+        drop(cosmic::Application::update(
+            &mut app,
+            Message::ProjectSearch(Action::Progress {
+                generation,
+                root,
+                progress: Progress::Finished {
+                    capped: false,
+                    skipped: 2,
+                },
+            }),
+        ));
+        assert!(!app.search_ui.running);
+        assert_eq!(app.search_ui.skipped, 2);
     }
 
     #[test]

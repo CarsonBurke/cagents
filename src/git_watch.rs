@@ -304,6 +304,15 @@ impl Project {
                 .max_by_key(|worktree| worktree.git_dir.components().count())
                 .map(|worktree| worktree.id);
             for worktree in &self.worktrees {
+                if path == &worktree.root
+                    && matches!(
+                        event.kind,
+                        EventKind::Remove(_)
+                            | EventKind::Modify(notify::event::ModifyKind::Name(_))
+                    )
+                {
+                    change.retired_roots.insert(path.clone());
+                }
                 if path == &worktree.root.join(".git") {
                     change.topology = true;
                     change.membership = true;
@@ -375,6 +384,9 @@ fn access_only(event: &Event) -> bool {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Change {
+    /// Exact content roots retired by a native event or an observed identity
+    /// change. Ordinary file/metadata changes and rescans do not retire them.
+    pub retired_roots: BTreeSet<PathBuf>,
     /// Worktrees whose own files, index or `HEAD` changed.
     pub worktrees: BTreeSet<WorktreeId>,
     /// Shared refs or configuration changed: a commit, fetch or branch
@@ -389,6 +401,7 @@ pub(crate) struct Change {
 
 impl Change {
     pub fn merge(&mut self, other: Self) {
+        self.retired_roots.extend(other.retired_roots);
         self.worktrees.extend(other.worktrees);
         self.references |= other.references;
         self.topology |= other.topology;
@@ -715,6 +728,7 @@ impl Monitor {
                             .skip(1)
                             .any(|ancestor| recursive.contains(ancestor))
                     });
+                    let mut retired_roots = BTreeSet::new();
                     let rearmed = match &mut watcher {
                         Ok(watcher) => {
                             let faulted = std::mem::take(
@@ -726,7 +740,14 @@ impl Monitor {
                                 }
                                 registered.clear();
                             }
-                            reconcile(watcher, &mut registered, &desired, &owners, &mut failures)
+                            reconcile(
+                                watcher,
+                                &mut registered,
+                                &desired,
+                                &owners,
+                                &mut failures,
+                                &mut retired_roots,
+                            )
                         }
                         Err(error) => {
                             failures.extend(projects.keys().map(|id| (*id, error.to_string())));
@@ -758,6 +779,12 @@ impl Monitor {
                         // Acknowledge coverage even when the paths did not change:
                         // this settles fallback after a successful retry.
                         pending.changes.entry(id).or_default().merge(Change {
+                            retired_roots: project
+                                .worktrees
+                                .iter()
+                                .filter(|worktree| retired_roots.contains(&worktree.root))
+                                .map(|worktree| worktree.root.clone())
+                                .collect(),
                             worktrees,
                             coverage: Some(coverage),
                             error: failures.remove(&id),
@@ -802,17 +829,30 @@ fn reconcile(
     desired: &BTreeMap<PathBuf, RecursiveMode>,
     owners: &BTreeMap<PathBuf, BTreeSet<ProjectId>>,
     failures: &mut BTreeMap<ProjectId, String>,
+    retired_roots: &mut BTreeSet<PathBuf>,
 ) -> BTreeSet<ProjectId> {
     let mut rearmed = BTreeSet::new();
     registered.retain(|path, (mode, device, inode)| {
-        if desired.get(path) == Some(&*mode)
-            && std::fs::symlink_metadata(path)
-                .is_ok_and(|metadata| metadata.dev() == *device && metadata.ino() == *inode)
-        {
-            true
-        } else {
+        if desired.get(path) != Some(&*mode) {
             let _ = watcher.unwatch(path);
-            false
+            return false;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.dev() == *device && metadata.ino() == *inode => true,
+            observed => {
+                if observed.is_ok()
+                    || observed.as_ref().is_err_and(|error| {
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        )
+                    })
+                {
+                    retired_roots.insert(path.clone());
+                }
+                let _ = watcher.unwatch(path);
+                false
+            }
         }
     });
     for (path, &mode) in desired {
@@ -905,6 +945,108 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes() {
+        let project = project(Path::new("/fixture"));
+        let root = project.worktrees[0].root.clone();
+        let retired = project
+            .change(
+                &Event::new(EventKind::Remove(notify::event::RemoveKind::Folder))
+                    .add_path(root.clone()),
+            )
+            .unwrap();
+        assert_eq!(retired.retired_roots, BTreeSet::from([root.clone()]));
+        let ordinary = project
+            .change(
+                &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(root.join("src/main.rs")),
+            )
+            .unwrap();
+        assert!(ordinary.retired_roots.is_empty());
+        let metadata = project
+            .change(
+                &Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content)))
+                    .add_path(project.common_dir.join("index")),
+            )
+            .unwrap();
+        assert!(metadata.retired_roots.is_empty());
+        let mut pending = Change::default();
+        pending.merge(retired);
+        pending.merge(ordinary);
+        pending.merge(metadata);
+        assert_eq!(pending.retired_roots, BTreeSet::from([root]));
+    }
+
+    #[test]
+    fn reconciliation_reports_replaced_root_identity_but_not_configuration_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let project = ProjectId::new();
+        let desired = BTreeMap::from([(root.clone(), RecursiveMode::NonRecursive)]);
+        let owners = BTreeMap::from([(root.clone(), BTreeSet::from([project]))]);
+        let mut watcher = notify::recommended_watcher(|_| {}).unwrap();
+        let mut registered = BTreeMap::new();
+        let mut failures = BTreeMap::new();
+        let mut retired = BTreeSet::new();
+        assert_eq!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &owners,
+                &mut failures,
+                &mut retired
+            ),
+            BTreeSet::from([project])
+        );
+        assert!(retired.is_empty());
+        std::fs::write(root.join("ordinary"), b"edit").unwrap();
+        assert!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &owners,
+                &mut failures,
+                &mut retired
+            )
+            .is_empty()
+        );
+        assert!(retired.is_empty());
+        let old = registered[&root];
+        std::fs::rename(&root, directory.path().join("original")).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &desired,
+                &owners,
+                &mut failures,
+                &mut retired
+            ),
+            BTreeSet::from([project])
+        );
+        assert_eq!(retired, BTreeSet::from([root.clone()]));
+        assert_ne!((registered[&root].1, registered[&root].2), (old.1, old.2));
+        assert!(failures.is_empty());
+        retired.clear();
+        assert!(
+            reconcile(
+                &mut watcher,
+                &mut registered,
+                &BTreeMap::new(),
+                &owners,
+                &mut failures,
+                &mut retired
+            )
+            .is_empty()
+        );
+        assert!(retired.is_empty());
+        assert!(registered.is_empty());
     }
 
     #[test]
