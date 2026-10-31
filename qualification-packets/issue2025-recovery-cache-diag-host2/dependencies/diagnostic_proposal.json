@@ -1,0 +1,227 @@
+{
+  "kind": "FUTURE_TWO_RECOVERY_CACHE_PARENT_DIAGNOSTIC_CONTROLLER_SOURCE_PROPOSAL_NOT_IMPLEMENTATION_OR_ADMISSION",
+  "status": "HOLD_REQUIRES_NEW_PRODUCT_FREEZE_TYPED_PROOFS_NEW_TASK_ADAPTER_AND_INDEPENDENT_REVIEW",
+  "scope": "A separate diagnostic packet for fresh HOST rootlib compile, actual emitted ELF inventory, and exactly the two supplied original failed recovery_cache parents in one default-scheduled invocation. The original full owning issue2025 controller/gates/results remain immutable and are not replaced or satisfied by this packet.",
+  "existing_source": {
+    "controller_head": "2c213a967bfd653ee85ec300d45293fafa2076cc",
+    "controller_tree": "e92dd3384b72fa06907e5b0d279d8a389c37a3ea",
+    "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host",
+    "source_pins": {
+      "run-packet.py": "97444376c1f7dc012d506432dc7210682a28da1a71815c4d120be08cbb5b8992",
+      "plan.json": "b413abb9059840c4ed4412508a9c4b65b998f0e662d189ec25ec87bef90780c2",
+      "source-binding.json": "800216872c2941e54905e0c1a95bca67d9118bd2a3ad0eb43b449e857ea8415d"
+    },
+    "bound_product": {
+      "head": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+      "tree": "c004d7b3eab00e166f4393eb93ec99c91484d03b",
+      "parent": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386"
+    },
+    "canonical_function": {
+      "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+      "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+      "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+      "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+      "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+      "natural_grace_seconds_unchanged": 3,
+      "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD",
+      "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+      "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+      "fresh_successor_code_caller_conservation_review": null,
+      "execution_authorized": false
+    },
+    "generic_core": "23 unchanged generic functions plus corrected canonical settle_children9004 and4 original nested functions; existing direct-owner/custody/HOLD code remains source donor only, not runtime qualification."
+  },
+  "future_product": {
+    "head": null,
+    "tree": null,
+    "parent": null,
+    "controller_head": null,
+    "controller_tree": null,
+    "worktree": null,
+    "source_reviews": null,
+    "planned_root_authored_test_only_paths": [
+      "src/filesystem_recovery_context.rs",
+      "src/fs_safety/recovery_placement.rs"
+    ],
+    "root_is_product_writer": true,
+    "selector_source_verification": "These exact names were supplied by Root. This task inspected only existing controller/plan/bindings; actual owning test definitions and new diagnostic leaves must be source-pinned/independently reviewed at future freeze. No new parent or test hook is proposed.",
+    "selector_names": [
+      "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation",
+      "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation"
+    ],
+    "old_test_result_or_product_review_transfer": false
+  },
+  "minimal_phase_proposal": {
+    "phase_count": 3,
+    "phases": [
+      {
+        "label": "compile-host-lib",
+        "argv": [
+          "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "host",
+          "--lib",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "cap_seconds": 600,
+        "source": "Existing compile-host-lib feature graph and unique rootlib CargoJSON discovery, rebound to future exact diagnostic product."
+      },
+      {
+        "label": "inventory-host-lib",
+        "argv": [
+          null,
+          "--list",
+          "--color=never"
+        ],
+        "argv0_binding": "Only the unique absolute canonical regular non-symlink target-contained actual original CargoJSON HOST rootlib ELF, with original metadata/hash/source tuple; no find, old ELF or guessed executable.",
+        "cap_seconds": 30
+      },
+      {
+        "label": "parent-host-lib-recovery-cache-two",
+        "argv": [
+          null,
+          "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation",
+          "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation",
+          "--exact",
+          "--format=pretty",
+          "--color=never"
+        ],
+        "argv0_binding": "The same inventoried ELF and before/after identity contract.",
+        "cap_seconds": 180,
+        "ordinary_test_invocations": 1,
+        "selected_parents": 2,
+        "scheduler": "Default libtest scheduling. No --test-threads, no --nocapture and no environment substitution; retain required-absence preflight by name. Actual degree/overlap remains unknown."
+      }
+    ],
+    "proposed_phase_caps_sum_seconds": 810,
+    "proposed_total_workload_cap_seconds": 810,
+    "source_limit": "810 is proposed task data only, below donor2400 ceiling; future lead/admission must bind it. Preserve original remaining-deadline clamp and no resets/extensions. Settlement/HOLD is not abandoned when workload deadline expires.",
+    "helper_requirement": {
+      "build_phase": false,
+      "derived_helper_environment": false,
+      "same_head_cagentsd_or_retained_actor_claim": false,
+      "condition": "Requires future owning-source confirmation that these two recovery_cache parents need no retained-actor cagentsd helper. Such confirmation was not produced by this controller-only task."
+    }
+  },
+  "current_ABI_barriers": [
+    {
+      "anchor": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+        "function": "execute_contracts",
+        "line": 577,
+        "end_line": 692,
+        "sha256": "c93c31db7396f06e821a28cc387cabf9ac4368f7abe2c10a9cdafa53c86c042a"
+      },
+      "gap": "Unconditionally performs HOST cagentsd build/discovery, records helper, calls task_group_assets(helper,...) and invoke.issue2025_fixture_group. No existing plan value removes this phase or fixture environment.",
+      "minimal_future_task_adapter": "A distinct diagnostic execute_contracts must use only the existing HOSTlib compile/CargoJSON/discovery/inventory block and one two-parent invoke through unchanged nested run. It must not call the helper binder or set a helper variable. Preserve original stdout/stderr/command receipts, required-evidence error handling, source/context checks, original waits and negative priority. Keep known failed-invoke post-use hash limits explicit; no new observation guarantee is invented."
+    },
+    {
+      "anchor": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+        "function": "grouped_contracts",
+        "line": 475,
+        "end_line": 503,
+        "sha256": "1185e7d23d73b26cad9281f02e8e7ef7cb09478f784a83dcc8160c61ca70e13b"
+      },
+      "gap": "Hardcodes4 names, upgrade/retained/restore/native_recovery OR filters, mandatory broad parents and two returned contracts.",
+      "minimal_future_task_adapter": "A diagnostic-specific contract builder returns exactly one contract whose names/filters are the two exact source-pinned selectors, requires each actual inventory occurrence exactly once, rejects matching benchmarks, and derives filtered=N-2 from the full actual inventory. No broad filter or source self-child pass credit is copied into this contract."
+    },
+    {
+      "anchor": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+        "function": "parent_accounting",
+        "line": 720,
+        "end_line": 802,
+        "sha256": "d5bf9df5891c10ce25938517238fbde5c2430400d2812f352e75056178340af2"
+      },
+      "gap": "Hardcodes contract labels four+broad, at most2 invocations,5 phases, requested/unrun invocation count2 and final qualification requires2 raw reconciled rows.",
+      "minimal_future_task_adapter": "Change only task label/cardinality constants to one diagnostic invocation and3 phases; retain raw stdout hash comparison, strict grouped_result reread, earlier-result/raw reconciliation, original state/wait/evidence joins, semantic refusal versus raw read/decode/control error distinction, unique-name versus occurrence accounting and no fake per-parent waits."
+    },
+    {
+      "anchor": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+        "function": "main",
+        "preflight_line": 1119,
+        "owning_commands_qualified_line": 1455
+      },
+      "gap": "Current preflight binds current b68/full5phase helper/four+broad contract and final summary requires both owning labels plus all5 phases.",
+      "minimal_future_task_adapter": "A separate task main must consume genuine future diagnostic source/proof schemas and its one contract/3phase plan, explicitly exclude full2025/broad qualification, and change only task summary expected label/count predicates outside the protected3790B block. Preserve scalar error/return semantics and compact terminal/full evidence semantics. External fresh independent review and authenticated grant remain mandatory."
+    }
+  ],
+  "byte_exact_conservation_targets": {
+    "canonical_settle_children": {
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+      "meaning": "Original3s natural wait/census prefix; no fresh pidfd/signal for unproven adopted survivors; clean:false/forced:false retains acquired C/HOLD."
+    },
+    "protected3790B_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "strict_result_parser": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+      "function": "grouped_result",
+      "line": 506,
+      "end_line": 574,
+      "sha256": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115"
+    },
+    "preserve_functions_and_regions": [
+      "All generic custody/source/context/original Popen/wait/pidfd/evidence/final-observation/HOLD functions",
+      "Four original main nested read_bound/source/context/run functions",
+      "Direct original-child timeout cleanup and original wait recording",
+      "Protected acquire/finalization/Cfd-close ordering",
+      "Full original stdout/stderr/command receipts/summary/ledgers/SHA256SUMS and compact terminal/error/return semantics"
+    ],
+    "fixture_binder": "May remain byte-exact as unused code; must not be invoked or used to claim helper-backed coverage. Removing it or changing generic/context behavior is outside this minimal proposal."
+  },
+  "strict_future_qualification": {
+    "inventory_N": null,
+    "selected_names_runtime": null,
+    "expected_filtered_out_runtime": null,
+    "contract": "Fresh actual inventory must contain each exact selector once and no matching benchmark; one original invocation with one running2 record, each exact name once, sole successful footer P2/F0/I0/M0/filtered=N-2, exit0 and all original wait/evidence/custody/source/ELF checks. No diagnostic stdout normalization, mask, synthetic result or rerun.",
+    "original_nonzero": "Always FAIL_STOP, even if diagnostics fail parsing. Preserve original failure/stdout/stderr and partial records. Expected failure is not a PASS.",
+    "raw_reconciliation": "R1 unsupported nonempty lines fail closed; R2 final raw reread/earlier records/coverage must agree. Semantic refusal is failure, not automatically HOLD; genuine read/decode/control/evidence/close uncertainty follows unchanged sticky HOLD.",
+    "counts": "One actual test Popen/wait, two logical parent memberships; no synthetic per-name wait, child footer credit or claim about unexecuted broad parents."
+  },
+  "authority_and_resources": {
+    "required_absent_environment_names": [
+      "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+      "RUST_TEST_NOCAPTURE",
+      "RUST_TEST_THREADS",
+      "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+      "CAGENTS_RETAINED_ACTOR_FIXTURE"
+    ],
+    "absence_policy": "Names-only preflight; do not read, serialize, clear or override values. Inherited opaque authority unchanged. No derived helper environment for this diagnostic-only invocation.",
+    "lane_provenance": {
+      "jobs": 2,
+      "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+      "new_cache": false,
+      "rust": "1.93.0",
+      "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+    },
+    "current_resource_availability": null,
+    "current_tools": null,
+    "current_source_context": null,
+    "actual_elf": null,
+    "actual_inventory": null,
+    "actual_results": null,
+    "parallel_degree": null,
+    "parallel_overlap": null,
+    "queue": null,
+    "grant": null,
+    "execution_authorized": false
+  },
+  "required_before_any_implementation_or_attempt": [
+    "Root supplies exact frozen diagnostic product tuple and genuine independent source reviews for the two test-only seams.",
+    "Verify/pin owning parent definitions, HOST feature compilation and absence of retained-actor helper requirement from that frozen source.",
+    "Authorize the explicitly identified task-specific execute/selection/accounting/main adapter seams; existing five-phase packet cannot be reused unchanged.",
+    "Freeze new source/proofs/inverses and independently review actual diagnostic controller/callers/conservation.",
+    "Obtain fresh separate authenticated resource grant/current admission. No existing C or old result transfers."
+  ],
+  "limits": [
+    "This is proposal DATA only, not controller implementation, product review, source approval or execution authority.",
+    "Two-parent diagnostic results cannot settle full347/broad-only context, clear old failed aggregate, establish a root cause from diagnostic text alone or qualify issue2025 readiness.",
+    "Current product remains b68 in immutable donor; future diagnostic pins are NULL. Original full owning2025 gates, failures, HOLDs and canonical proof history remain untouched.",
+    "No source function/candidate/helper/algorithm/example/import/test/build/native/provider was executed; no environment/process/account/tool/target/cache/ELF/resource probes or Git mutation occurred."
+  ]
+}

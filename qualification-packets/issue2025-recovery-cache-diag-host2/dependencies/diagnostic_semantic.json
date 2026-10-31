@@ -1,0 +1,138 @@
+{
+  "author_format_checks": "Official physical Rust1.93 scripts/check-format exit0 and git diffcheck0 are genuine author receipt references only. This reviewer did not rerun either or treat formatting as compilation.",
+  "blocking_findings": [],
+  "end_frozen_source_hashes_match": true,
+  "evidence": {
+    "authenticated_source_assignment": {
+      "bytes": 3165,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/authenticated-source-assignment.json",
+      "sha256": "882d15741733ab9ef5e6260b481c455b27acb10fdeae9f9be4de931c453b30c0"
+    },
+    "author_freeze": {
+      "bytes": 6882,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/freeze.json",
+      "sha256": "5eba888b8a031dfcdd075a0d6bae1a7a6eeea890b8bec91e63bade78a08f0183"
+    },
+    "end_source_rechecks": {
+      "bytes": 2234,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/end-source-rechecks.json",
+      "sha256": "25869f3c19eee8f753ff742544cfba2d55374ae796cfc69239df0c02d73c12ac"
+    },
+    "genuine_prior_source_diagnosis": {
+      "bytes": 13330,
+      "path": "/tmp/c9995-recovery-cache-setup-failure-source-diagnosis-b68f940d-v1.json",
+      "sha256": "e011e3698240812218dd75e3fe7c7d7349ea5eb4faef94b0629bb8b6eb048562"
+    },
+    "necessary_metadata_definition": {
+      "bytes": 82672,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/fs_safety.rs",
+      "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34"
+    },
+    "necessary_recovery_owner_definition": {
+      "bytes": 20498,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/recovery_authority.rs",
+      "sha256": "f7a4b149cade60db513a02af124117779866d21c3e7ecaf6a37ed09c3312b64e"
+    },
+    "original_source_read_receipts": {
+      "bytes": 3359,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/original-Git-source-receipts.json",
+      "sha256": "0cb620b62b1024f0907d84c8a45cd132af3fe7c8d5f3860e3fde05ed1b352b96"
+    },
+    "two_file_source_diff": {
+      "bytes": 5879,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/two-file.diff",
+      "sha256": "2a9313db737051b227ec39cde7d8c8a77076b8bdb4649a6febfbe5efb393da63"
+    }
+  },
+  "execution": {
+    "Git_or_public_mutations": false,
+    "candidate_or_helper_calls": false,
+    "compiler_build_tests_native": "UNRUN",
+    "grant": null,
+    "new_workers": false,
+    "runtime_environment_resource_account_probes": false,
+    "source_edits": false
+  },
+  "findings": [],
+  "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+  "limitations": [
+    "Actual offending operand, temp base, relative/absolute path state, ancestor locator producer and runtime cause remain UNKNOWN.",
+    "No original2c/b68/C9995 result or RAW receipt is reinterpreted.",
+    "No Rust compiler, test, fixture, helper, native application, source parser or operational function was executed.",
+    "Future diagnostics need separately reviewed execution scope and fresh owner admission/grant; this review supplies neither.",
+    "No current setup success, fault-oracle reachability, error delivery, broader347 reproduction or issue completion is established."
+  ],
+  "observation_and_error_checks": [
+    {
+      "conclusion": "Both inspect_err calls receive &io::Error and return the original Result unchanged. No wrapper/conversion/replacement is introduced at these callsites; acquire ? propagates the same original Err. Original ErrorKind, payload/value and success behavior remain intact.",
+      "lines": [
+        627,
+        657
+      ],
+      "source": "src/filesystem_recovery_context.rs"
+    },
+    {
+      "conclusion": "Reporter reads error.kind(), source Root reporting path, and retained TempDir paths/is_absolute only. The Write trait is in local scope and let _ = writeln!(stderr.lock(),...) ignores an io::Result failure; there is no unwrap, expect, ? or new returned diagnostic error.",
+      "lines": [
+        628,
+        642
+      ],
+      "source": "src/filesystem_recovery_context.rs"
+    },
+    {
+      "conclusion": "Existing loop bound, source exclusion, held-FD metadata_beneath call, absence/error branches, ancestor termination and Unsupported return string are unchanged. Existing Ok metadata is bound rather than discarded. The diagnostic is cfg(test), after the already-successful metadata observation and before the same original refusal.",
+      "lines": [
+        137,
+        172
+      ],
+      "source": "src/fs_safety/recovery_placement.rs"
+    },
+    {
+      "conclusion": "New reported ancestor dev/inode/mount/index are existing locals. Locator FileType/dev/ino/mode are getters on the already-returned std::fs::Metadata, with existing Unix MetadataExt imported. Path.join/is_absolute are lexical reporting only; locator_is_absolute matches the joined .git spelling because the appended component is relative. No second metadata operation, namespace open, content read, symlink/FIFO follow, Git, proc, environment or registry lookup is added.",
+      "lines": [
+        155,
+        168
+      ],
+      "source": "src/fs_safety/recovery_placement.rs"
+    }
+  ],
+  "owner_and_Rust_type_checks": {
+    "API_scope": "Result::inspect_err, std::io::Write/writeln!, MetadataExt and FileType Debug are consistent with the declared Rust1.93 source APIs. This is static reasoning, not compiler evidence.",
+    "acquire_error": "Original local Arc<(guard,runtime,outside)> is created before RecoveryPlacement::acquire and is borrowed by the reporter. It remains live through inspect_err, so all three original owners survive the observation.",
+    "borrow_and_inference": "Closure borrows source and owner immutably and does not require a static capture; source.clone()/owner.clone() leave those borrows valid. Closure stage is inferred from literal &str callers. Arc tuple field access and cloned Arc owner satisfy the same original Send+Sync+static inner-owner requirements; no guard clone or fabricated context is added.",
+    "from_placement_error": "A cloned Arc, rather than the sole original tuple, is passed into from_placement. If any validation or RecoveryContext::with_guard call returns Err and drops its supplied Arc, the local Arc is still alive and borrowed by the final inspect_err reporter.",
+    "success": "Unchanged from_placement523\u2013556 stores the Arc clone in RecoveryContext::with_guard((owner,protection,placement.clone(),target.clone()),...). The local Arc drops on helper return, while the actual successful context retains the original tuple and guard through its lifetime. RecoveryContext ContextInner drops its guard before releasing charged capacity."
+  },
+  "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+  "production_scope": "Fixture helper remains cfg(all(test,target_os=linux)). The locator report is cfg(test); outside that block only unused binding names change, with identical production guard/return/effects. No production output, serialized schema, path authority or success behavior is added.",
+  "schema": "issue2025_test_fixture_diagnostics_observation_guard_semantic_review_v1",
+  "scope": "Independent nonauthor semantic/type/borrow/drop review of only new test-fixture setup diagnostics and existing locator-refusal observation. No product cause diagnosis, full-tree/inverse conservation, original RAW audit or execution.",
+  "shared_oracle_preservation": {
+    "before_after_sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db",
+    "bytes": 44980,
+    "conclusion": "All existing shared fixture callers and the two intended mode/payload fault, Retained, retry/repair oracle bodies in this file are byte-identical. No early pass/skip, new fallback, forced base, injected fault replacement or changed assertion is introduced.",
+    "full_tree_inverse_conservation": "Separate portability reviewer owns exhaustive verification; not aggregated here.",
+    "necessary_dependent_source": "src/fs_safety/recovery_cache.rs",
+    "source_equal": true
+  },
+  "source_pins": {
+    "src/filesystem_recovery_context.rs": {
+      "new": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d",
+      "old": "01d26513d7a778ed4de85cc0420f7c5e863255097f99fee9f5fe55996a8d5ea1"
+    },
+    "src/fs_safety/recovery_placement.rs": {
+      "new": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa",
+      "old": "ef75fa04c58c3ea48dd6d0959f96f6b40935e2f00277f7eb5dd9b6b4ea56bb54"
+    }
+  },
+  "stage_truthfulness_and_limits": {
+    "acquire_outside": "Denotes the RecoveryPlacement::acquire call result only. It does not identify the failing inner ancestor/namespace/source substage.",
+    "earlier_errors": "TempDir creation, fixture_protection, source.try_clone and the Root::open argument evaluation precede these two observed call results. Such early errors retain their existing propagation and are not newly covered by these labels.",
+    "from_placement": "Denotes that actual function boundary only. It may include placement/source revalidation, protection check, descriptor accounting or context budget failure; this label does not infer which one failed.",
+    "locator_spelling": "Root.path() is documented reporting spelling, not proof of current path authority or a valid repository. An observed .git entry still suffices for the unchanged refusal; its contents/producer remain unknown.",
+    "stderr_delivery": "Best-effort reporting may be absent or interleaved in concurrent test execution. No guaranteed diagnostic delivery, serialization or exact runtime ordering is claimed."
+  },
+  "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+  "verdict": "BOUNDED_SOURCE_CLEAR_OBSERVATION_AND_GUARD_SEMANTICS",
+  "writing_released": true
+}

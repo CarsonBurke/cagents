@@ -1,0 +1,390 @@
+{
+  "C_disposition": "C9995 explicit negative return accepted by EC4b11; no new allocation or physical-availability claim.",
+  "all_actual_execution": "UNRUN",
+  "artifact_manifest": {
+    "bytes": 4273,
+    "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/handoff-artifact-manifest.json",
+    "sha256": "49e9ab3b75706eded2f12d56c03dfe9aed5b4dc621ea0117eaef421a3f22679e"
+  },
+  "author_validation": {
+    "compiler_build_tests_native": "UNRUN",
+    "git_diff_check": {
+      "chunk": "136778",
+      "exit": 0
+    },
+    "official_physical_Rust193_scripts_check_format": {
+      "exit": 0,
+      "session": 85527,
+      "start_chunk": "7c4612",
+      "terminal_chunk": "eb1c05"
+    },
+    "source_publication": "NOT_PERFORMED"
+  },
+  "code_reviews": {
+    "conservation_test_only_truthful_scope": {
+      "bytes": 24364,
+      "checks": 59,
+      "outside_entries_exact": 2217,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-conservation-independent-jh2xlpb8/review.json",
+      "sha256": "202a53ecac61f7668148c26d72df1f3afe93363df2af709cb4733f0ef7308493",
+      "verdict": "SCOPED_TWO_FILE_CONSERVATION_TEST_ONLY_AND_TRUTHFUL_SCOPE_CLEAR"
+    },
+    "observation_guard_semantics": {
+      "bytes": 9720,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/review.json",
+      "sha256": "da302e697c254632ca1c8afa3072ff7186143f99a83d73d9912509d513305afd",
+      "verdict": "BOUNDED_SOURCE_CLEAR_OBSERVATION_AND_GUARD_SEMANTICS"
+    }
+  },
+  "created_utc": "2026-10-31T12:32:11.712089+00:00",
+  "current_useful_context_count": {
+    "active_workers": 0,
+    "all_finite_existing_workers_completed": true,
+    "coordinator": 1,
+    "not_account_model_token_usage_or_uplift_evidence": true,
+    "original_capacity_errors_untouched": 4
+  },
+  "future_diagnostic_packet_PROPOSAL_NOT_IMPLEMENTED": {
+    "actual_ELF": null,
+    "actual_existing_ABI_barriers_and_necessary_task_adapters": [
+      {
+        "anchor": {
+          "end_line": 692,
+          "function": "execute_contracts",
+          "line": 577,
+          "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+          "sha256": "c93c31db7396f06e821a28cc387cabf9ac4368f7abe2c10a9cdafa53c86c042a"
+        },
+        "gap": "Unconditionally performs HOST cagentsd build/discovery, records helper, calls task_group_assets(helper,...) and invoke.issue2025_fixture_group. No existing plan value removes this phase or fixture environment.",
+        "minimal_future_task_adapter": "A distinct diagnostic execute_contracts must use only the existing HOSTlib compile/CargoJSON/discovery/inventory block and one two-parent invoke through unchanged nested run. It must not call the helper binder or set a helper variable. Preserve original stdout/stderr/command receipts, required-evidence error handling, source/context checks, original waits and negative priority. Keep known failed-invoke post-use hash limits explicit; no new observation guarantee is invented."
+      },
+      {
+        "anchor": {
+          "end_line": 503,
+          "function": "grouped_contracts",
+          "line": 475,
+          "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+          "sha256": "1185e7d23d73b26cad9281f02e8e7ef7cb09478f784a83dcc8160c61ca70e13b"
+        },
+        "gap": "Hardcodes4 names, upgrade/retained/restore/native_recovery OR filters, mandatory broad parents and two returned contracts.",
+        "minimal_future_task_adapter": "A diagnostic-specific contract builder returns exactly one contract whose names/filters are the two exact source-pinned selectors, requires each actual inventory occurrence exactly once, rejects matching benchmarks, and derives filtered=N-2 from the full actual inventory. No broad filter or source self-child pass credit is copied into this contract."
+      },
+      {
+        "anchor": {
+          "end_line": 802,
+          "function": "parent_accounting",
+          "line": 720,
+          "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+          "sha256": "d5bf9df5891c10ce25938517238fbde5c2430400d2812f352e75056178340af2"
+        },
+        "gap": "Hardcodes contract labels four+broad, at most2 invocations,5 phases, requested/unrun invocation count2 and final qualification requires2 raw reconciled rows.",
+        "minimal_future_task_adapter": "Change only task label/cardinality constants to one diagnostic invocation and3 phases; retain raw stdout hash comparison, strict grouped_result reread, earlier-result/raw reconciliation, original state/wait/evidence joins, semantic refusal versus raw read/decode/control error distinction, unique-name versus occurrence accounting and no fake per-parent waits."
+      },
+      {
+        "anchor": {
+          "function": "main",
+          "owning_commands_qualified_line": 1455,
+          "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+          "preflight_line": 1119
+        },
+        "gap": "Current preflight binds current b68/full5phase helper/four+broad contract and final summary requires both owning labels plus all5 phases.",
+        "minimal_future_task_adapter": "A separate task main must consume genuine future diagnostic source/proof schemas and its one contract/3phase plan, explicitly exclude full2025/broad qualification, and change only task summary expected label/count predicates outside the protected3790B block. Preserve scalar error/return semantics and compact terminal/full evidence semantics. External fresh independent review and authenticated grant remain mandatory."
+      }
+    ],
+    "actual_inventory_N": null,
+    "actual_results": null,
+    "additive_helper_independence_source_proof": {
+      "bytes": 15706,
+      "path": "/var/tmp/coord16-recovery-cache-helper-independence-wds79vgw/source-proof.json",
+      "sha256": "a00af9948c807eef537774c5b24b4345bd6813c5a229c7a8106f475e0d5b9687"
+    },
+    "conservation_targets": {
+      "canonical_settle_children": {
+        "meaning": "Original3s natural wait/census prefix; no fresh pidfd/signal for unproven adopted survivors; clean:false/forced:false retains acquired C/HOLD.",
+        "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+      },
+      "fixture_binder": "May remain byte-exact as unused code; must not be invoked or used to claim helper-backed coverage. Removing it or changing generic/context behavior is outside this minimal proposal.",
+      "preserve_functions_and_regions": [
+        "All generic custody/source/context/original Popen/wait/pidfd/evidence/final-observation/HOLD functions",
+        "Four original main nested read_bound/source/context/run functions",
+        "Direct original-child timeout cleanup and original wait recording",
+        "Protected acquire/finalization/Cfd-close ordering",
+        "Full original stdout/stderr/command receipts/summary/ledgers/SHA256SUMS and compact terminal/error/return semantics"
+      ],
+      "protected3790B_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+      "strict_result_parser": {
+        "end_line": 574,
+        "function": "grouped_result",
+        "line": 506,
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+        "sha256": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115"
+      }
+    },
+    "controller_cwd": null,
+    "controller_head": null,
+    "controller_implementation": "NOT_AUTHORIZED_OR_PERFORMED_IN_THIS_SOURCE_ASSIGNMENT",
+    "controller_review": null,
+    "controller_tree": null,
+    "failure_policy": "Genuine nonzero remains FAIL_STOP, unknown custody/evidence/close remains HOLD. No expected-negative PASS, waiver or rerun.",
+    "full_2025_gate": "Original full347 gate remains unchanged and unresolved. Exact2 success would neither clear broad-only context nor reclassify C9995 negative.",
+    "future_resources_and_authority": {
+      "absence_policy": "Names-only preflight; do not read, serialize, clear or override values. Inherited opaque authority unchanged. No derived helper environment for this diagnostic-only invocation.",
+      "actual_elf": null,
+      "actual_inventory": null,
+      "actual_results": null,
+      "current_resource_availability": null,
+      "current_source_context": null,
+      "current_tools": null,
+      "execution_authorized": false,
+      "grant": null,
+      "lane_provenance": {
+        "jobs": 2,
+        "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+        "new_cache": false,
+        "rust": "1.93.0",
+        "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+      },
+      "parallel_degree": null,
+      "parallel_overlap": null,
+      "queue": null,
+      "required_absent_environment_names": [
+        "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+        "RUST_TEST_NOCAPTURE",
+        "RUST_TEST_THREADS",
+        "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+        "CAGENTS_RETAINED_ACTOR_FIXTURE"
+      ]
+    },
+    "grant": null,
+    "helper_condition": "Resolved by bounded application source trace for this Linux pair only; no emitted cagentsd or retained-actor executable prerequisite. Not exhaustive dependency/runtime qualification.",
+    "minimal_phase_proposal": {
+      "helper_requirement": {
+        "build_phase": false,
+        "condition": "Requires future owning-source confirmation that these two recovery_cache parents need no retained-actor cagentsd helper. Such confirmation was not produced by this controller-only task.",
+        "derived_helper_environment": false,
+        "same_head_cagentsd_or_retained_actor_claim": false
+      },
+      "phase_count": 3,
+      "phases": [
+        {
+          "argv": [
+            "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "host",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "cap_seconds": 600,
+          "label": "compile-host-lib",
+          "source": "Existing compile-host-lib feature graph and unique rootlib CargoJSON discovery, rebound to future exact diagnostic product."
+        },
+        {
+          "argv": [
+            null,
+            "--list",
+            "--color=never"
+          ],
+          "argv0_binding": "Only the unique absolute canonical regular non-symlink target-contained actual original CargoJSON HOST rootlib ELF, with original metadata/hash/source tuple; no find, old ELF or guessed executable.",
+          "cap_seconds": 30,
+          "label": "inventory-host-lib"
+        },
+        {
+          "argv": [
+            null,
+            "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation",
+            "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation",
+            "--exact",
+            "--format=pretty",
+            "--color=never"
+          ],
+          "argv0_binding": "The same inventoried ELF and before/after identity contract.",
+          "cap_seconds": 180,
+          "label": "parent-host-lib-recovery-cache-two",
+          "ordinary_test_invocations": 1,
+          "scheduler": "Default libtest scheduling. No --test-threads, no --nocapture and no environment substitution; retain required-absence preflight by name. Actual degree/overlap remains unknown.",
+          "selected_parents": 2
+        }
+      ],
+      "proposed_phase_caps_sum_seconds": 810,
+      "proposed_total_workload_cap_seconds": 810,
+      "source_limit": "810 is proposed task data only, below donor2400 ceiling; future lead/admission must bind it. Preserve original remaining-deadline clamp and no resets/extensions. Settlement/HOLD is not abandoned when workload deadline expires."
+    },
+    "new_product_binding": {
+      "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+      "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+      "source_reviews": [
+        {
+          "bytes": 9720,
+          "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/review.json",
+          "sha256": "da302e697c254632ca1c8afa3072ff7186143f99a83d73d9912509d513305afd"
+        },
+        {
+          "bytes": 24364,
+          "path": "/var/tmp/coord16-2025-fixture-diagnostics-conservation-independent-jh2xlpb8/review.json",
+          "sha256": "202a53ecac61f7668148c26d72df1f3afe93363df2af709cb4733f0ef7308493"
+        }
+      ],
+      "tree": "327355354507d895a0dc1ec8bef35012e21b3b32"
+    },
+    "original_proposal": {
+      "bytes": 15160,
+      "path": "/var/tmp/coord16-recovery-cache-two-parent-proposal-ltupxht8/proposal.json",
+      "sha256": "8f32011fc47b13f205dd7bf82c4e9f51e5690bc23c89847451868f091aed5421"
+    },
+    "original_proposal_NULL_future_product_fields": "Immutable original planning snapshot. This additive handoff supplies the actual frozen diagnostic product, reviews and owning source proof; no old receipt is retargeted.",
+    "queue_place": null,
+    "readiness": "HOLD_FOR_TASK_ADAPTER_SOURCE_REVIEW_AND_SEPARATE_ADMISSION",
+    "runnable_controller_argv": null,
+    "strict_future_qualification": {
+      "contract": "Fresh actual inventory must contain each exact selector once and no matching benchmark; one original invocation with one running2 record, each exact name once, sole successful footer P2/F0/I0/M0/filtered=N-2, exit0 and all original wait/evidence/custody/source/ELF checks. No diagnostic stdout normalization, mask, synthetic result or rerun.",
+      "counts": "One actual test Popen/wait, two logical parent memberships; no synthetic per-name wait, child footer credit or claim about unexecuted broad parents.",
+      "expected_filtered_out_runtime": null,
+      "inventory_N": null,
+      "original_nonzero": "Always FAIL_STOP, even if diagnostics fail parsing. Preserve original failure/stdout/stderr and partial records. Expected failure is not a PASS.",
+      "raw_reconciliation": "R1 unsupported nonempty lines fail closed; R2 final raw reread/earlier records/coverage must agree. Semantic refusal is failure, not automatically HOLD; genuine read/decode/control/evidence/close uncertainty follows unchanged sticky HOLD.",
+      "selected_names_runtime": null
+    }
+  },
+  "genuine_diagnosis": {
+    "bytes": 13330,
+    "path": "/tmp/c9995-recovery-cache-setup-failure-source-diagnosis-b68f940d-v1.json",
+    "sha256": "e011e3698240812218dd75e3fe7c7d7349ea5eb4faef94b0629bb8b6eb048562"
+  },
+  "history_preserved": "C9995 original b68/controller2c/F347 genuine negative and all RAW receipts immutable; actual operand/cause still UNKNOWN. Old4098 unchanged.",
+  "implemented_behavior": {
+    "fixture_fields": "Only source/runtime/outside lexical reporting spellings and is_absolute plus existing error kind; original io::Error returned untouched by inspect_err",
+    "fixture_stage": "acquire_outside versus from_placement call boundary, not an inferred substage",
+    "locator_fields": "Only existing observed locator metadata/type, held currentdev/inode/mount and zero-based walk index, lexical .git reporting spelling; no new namespace or content read",
+    "owners": "Arc retains original guard/runtime/outside owners while error observation and through actual successful context",
+    "scope": "Test-only diagnostics; no production output/guard weakening/skip/success/fallback/context/env/path authority change",
+    "stderr": "Best-effort write error ignored without replacing original Err"
+  },
+  "inverse_and_forward": {
+    "forward": {
+      "bytes": 4276,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/forward.diff",
+      "sha256": "e8892756ac33c7b09426029babbd8cd8a4201b00d67f168241847bcd39f83d3e"
+    },
+    "independent_reconstruction": true,
+    "inverse": {
+      "bytes": 4276,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/inverse.diff",
+      "sha256": "5b4f339ea691e56e826c9aaa33b65c608b6bcfa5f999ccea39be320593e491ef"
+    }
+  },
+  "lead_final_source_hash_identity_join": "Exact current head/tree/parent, clean owned worktree and frozen live source pins; no duplicate independent semantic/conservation/old RAW audit.",
+  "preserved_oracles": {
+    "all_nine_recovery_cache_callers": "BYTE_IDENTICAL",
+    "both_original_fault_Retained_retry_repair_bodies": "BYTE_IDENTICAL",
+    "source_blob_sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db"
+  },
+  "product": {
+    "PR": null,
+    "branch": "fix/coord16-issue2025-fixture-diagnostics",
+    "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+    "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+    "parent_tree": "c004d7b3eab00e166f4393eb93ec99c91484d03b",
+    "public_source_write": "NOT_PERFORMED",
+    "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-fixture-diagnostics"
+  },
+  "schema": "coord16-issue2025-reviewed-diagnostic-source-and-future-two-parent-proposal-handoff-v1",
+  "source_assignment": {
+    "bytes": 3165,
+    "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/authenticated-source-assignment.json",
+    "sha256": "882d15741733ab9ef5e6260b481c455b27acb10fdeae9f9be4de931c453b30c0"
+  },
+  "source_freeze": {
+    "bytes": 6882,
+    "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/freeze.json",
+    "sha256": "5eba888b8a031dfcdd075a0d6bae1a7a6eeea890b8bec91e63bade78a08f0183"
+  },
+  "source_pins": [
+    {
+      "base": {
+        "bytes": 31609,
+        "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__filesystem_recovery_context.rs",
+        "sha256": "01d26513d7a778ed4de85cc0420f7c5e863255097f99fee9f5fe55996a8d5ea1"
+      },
+      "changed": true,
+      "current": {
+        "bytes": 32812,
+        "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__filesystem_recovery_context.rs",
+        "sha256": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d"
+      },
+      "repository_path": "src/filesystem_recovery_context.rs"
+    },
+    {
+      "base": {
+        "bytes": 17367,
+        "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety__recovery_placement.rs",
+        "sha256": "ef75fa04c58c3ea48dd6d0959f96f6b40935e2f00277f7eb5dd9b6b4ea56bb54"
+      },
+      "changed": true,
+      "current": {
+        "bytes": 18455,
+        "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety__recovery_placement.rs",
+        "sha256": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa"
+      },
+      "repository_path": "src/fs_safety/recovery_placement.rs"
+    },
+    {
+      "base": {
+        "bytes": 44980,
+        "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety__recovery_cache.rs",
+        "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db"
+      },
+      "changed": false,
+      "current": {
+        "bytes": 44980,
+        "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety__recovery_cache.rs",
+        "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db"
+      },
+      "repository_path": "src/fs_safety/recovery_cache.rs"
+    },
+    {
+      "base": {
+        "bytes": 82672,
+        "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety.rs",
+        "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34"
+      },
+      "changed": false,
+      "current": {
+        "bytes": 82672,
+        "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety.rs",
+        "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34"
+      },
+      "repository_path": "src/fs_safety.rs"
+    }
+  ],
+  "source_review_limits": {
+    "conservation": [
+      "All current compiler/build/tests/native/runtime UNRUN; no C/slot/grant/queue/resource admission or readiness established.",
+      "Original b68/C9995/2c negatives remain immutable. No actual current operand, ancestor, locator producer, concurrency or production root-cause inference.",
+      "Author format0/diff0 are retained original author receipts only; reviewer did not execute formatter/compiler/helper/tests.",
+      "Extra test stderr and formatting/Arc allocation may affect timing, and stderr delivery is not guaranteed. No runtime performance or diagnostic-success proof.",
+      "No claim the diagnostic makes the two owning tests or broad347 pass; partial diagnostic success cannot waive the original broad gate/context.",
+      "No current filesystem, temporary placement, process, environment, account, DB, resource, tool, cache or target observation was made. Only declared frozen source/artifacts were read.",
+      "Source reading output15dbd4 was visibly truncated; precise changed ancestry lines were reread in44c4f0 and complete immutable blobs were independently compared as bytes. No lost output is treated as read."
+    ],
+    "semantic": [
+      "Actual offending operand, temp base, relative/absolute path state, ancestor locator producer and runtime cause remain UNKNOWN.",
+      "No original2c/b68/C9995 result or RAW receipt is reinterpreted.",
+      "No Rust compiler, test, fixture, helper, native application, source parser or operational function was executed.",
+      "Future diagnostics need separately reviewed execution scope and fresh owner admission/grant; this review supplies neither.",
+      "No current setup success, fault-oracle reachability, error delivery, broader347 reproduction or issue completion is established."
+    ],
+    "stage_boundaries": {
+      "acquire_outside": "Denotes the RecoveryPlacement::acquire call result only. It does not identify the failing inner ancestor/namespace/source substage.",
+      "earlier_errors": "TempDir creation, fixture_protection, source.try_clone and the Root::open argument evaluation precede these two observed call results. Such early errors retain their existing propagation and are not newly covered by these labels.",
+      "from_placement": "Denotes that actual function boundary only. It may include placement/source revalidation, protection check, descriptor accounting or context budget failure; this label does not infer which one failed.",
+      "locator_spelling": "Root.path() is documented reporting spelling, not proof of current path authority or a valid repository. An observed .git entry still suffices for the unchanged refusal; its contents/producer remain unknown.",
+      "stderr_delivery": "Best-effort reporting may be absent or interleaved in concurrent test execution. No guaranteed diagnostic delivery, serialization or exact runtime ordering is claimed."
+    }
+  },
+  "task_status": "ASSIGNED_TEST_DIAGNOSTIC_SOURCE_COMPLETE_SEPARATE_FUTURE_PACKET_PROPOSAL_ONLY"
+}

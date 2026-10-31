@@ -1,0 +1,659 @@
+{
+  "author_receipt": {
+    "bytes": 6882,
+    "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/freeze.json",
+    "sha256": "5eba888b8a031dfcdd075a0d6bae1a7a6eeea890b8bec91e63bade78a08f0183"
+  },
+  "author_validation_provenance": {
+    "format_and_diff_only": {
+      "compiler_build_tests_native": "UNRUN",
+      "git_diff_check": {
+        "chunk": "136778",
+        "exit": 0
+      },
+      "official_physical_Rust193_scripts_check_format": {
+        "exit": 0,
+        "session": 85527,
+        "start_chunk": "7c4612",
+        "terminal_chunk": "eb1c05"
+      },
+      "source_publication": "NOT_PERFORMED"
+    },
+    "original_initial_wrong_absolute_check_ignore_128": "Retained by author; corrected root-relative check0 is a separate original record, not hidden repair. No compiler/test/native result inferred.",
+    "original_tool_records": {
+      "bytes": 87564,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/original-author-tool-records.json",
+      "sha256": "0ac246127261a274b211fabd18b9f7958f077ffa06b4887e8ad7b50f8b2657b8"
+    },
+    "original_top_level_tool_statuses": {
+      "authenticated_source_inbox": {
+        "chunk_id": "b6a15d",
+        "exit_code": 0
+      },
+      "correct_root_relative_ignore_check": {
+        "chunk_id": "b3c51a",
+        "exit_code": 0
+      },
+      "frozen_identity_auth": {
+        "chunk_id": "f71dc7",
+        "exit_code": 0
+      },
+      "new_ignored_worktree": {
+        "chunk_id": "d11365",
+        "exit_code": 0
+      },
+      "official_format_source": {
+        "chunk_id": "8b067c",
+        "exit_code": 0
+      },
+      "official_physical193_format_original": {
+        "chunk_id": "7c4612",
+        "session_id": 85527
+      },
+      "official_physical193_format_terminal": {
+        "chunk_id": "eb1c05",
+        "exit_code": 0
+      },
+      "owner_signature": {
+        "chunk_id": "b398ff",
+        "exit_code": 0
+      },
+      "source_freeze_commit": {
+        "chunk_id": "95952a",
+        "exit_code": 0
+      },
+      "stage": {
+        "chunk_id": "36f504",
+        "exit_code": 0
+      },
+      "worktree_instructions": {
+        "chunk_id": "cc65d5",
+        "exit_code": 0
+      }
+    }
+  },
+  "blockers": [],
+  "check_count": 59,
+  "checks": [
+    {
+      "detail": null,
+      "name": "frozen_author_receipt_pin",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "head_tree_and_sole_parent",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "declared_source_HEAD",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "exact_two_changed_paths_and_entry_count",
+      "passed": true
+    },
+    {
+      "detail": {
+        "count": 2217
+      },
+      "name": "all_2217_outside_mode_type_blob_entries_exact",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "both_changed_paths_modes_preserved",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_external_ref_hash:/tmp/c9995-recovery-cache-setup-failure-source-diagnosis-b68f940d-v1.json",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:forward.diff",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:original-author-tool-records.json",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_external_ref_hash:/var/tmp/coord16-recovery-cache-two-parent-proposal-ltupxht8/proposal.json",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:inverse.diff",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:authenticated-source-assignment.json",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:source/before-src__filesystem_recovery_context.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:source/after-src__filesystem_recovery_context.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:source/before-src__fs_safety__recovery_placement.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:source/after-src__fs_safety__recovery_placement.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:source/before-src__fs_safety__recovery_cache.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:source/after-src__fs_safety__recovery_cache.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:source/before-src__fs_safety.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_member_hash:source/after-src__fs_safety.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "assignment_and_diagnosis_pins",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "source_archives_git_live:src/filesystem_recovery_context.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "source_archives_git_live:src/fs_safety/recovery_placement.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "source_archives_git_live:src/fs_safety/recovery_cache.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "source_archives_git_live:src/fs_safety.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_forward_exact_git_diff",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_inverse_exact_git_diff",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "independent_forward_reconstruction_exact",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "independent_inverse_reconstruction_exact",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "all_context_changes_inside_test_linux_fixtures",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "fixture_api_and_entry_forwarder_unchanged",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "fixture_namespace_operation_counts_unchanged",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "test_observer_best_effort_original_error_borrow",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "test_owner_retention_explicit",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "non_test_placement_projection_exact_after_binding_alpha_names",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "existing_locator_observation_and_ancestry_calls_counts_exact",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "added_locator_methods_no_namespace_or_content_read",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "locator_failure_text_unchanged",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "unchanged_test_inventory_and_test_suffix:src/filesystem_recovery_context.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "unchanged_test_inventory_and_test_suffix:src/fs_safety/recovery_placement.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "complete_recovery_cache_blob_exact",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "nine_unchanged_shared_fixture_callers",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "both_failed_fault_retry_repair_oracle_bodies_exact",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "author_format_and_diff_receipts_not_compiler_claims",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_head_and_source_stability",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/tmp/c9995-recovery-cache-setup-failure-source-diagnosis-b68f940d-v1.json",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/forward.diff",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/original-author-tool-records.json",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-recovery-cache-two-parent-proposal-ltupxht8/proposal.json",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/inverse.diff",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/authenticated-source-assignment.json",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__filesystem_recovery_context.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__filesystem_recovery_context.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety__recovery_placement.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety__recovery_placement.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety__recovery_cache.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety__recovery_cache.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety.rs",
+      "passed": true
+    },
+    {
+      "detail": null,
+      "name": "final_ref_stability:/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety.rs",
+      "passed": true
+    }
+  ],
+  "created_utc": "2026-10-31T12:27:00.457777+00:00",
+  "inverse_proof": {
+    "both_files_reconstructed_exact": true,
+    "forward": {
+      "bytes": 4276,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/forward.diff",
+      "sha256": "e8892756ac33c7b09426029babbd8cd8a4201b00d67f168241847bcd39f83d3e"
+    },
+    "inverse": {
+      "bytes": 4276,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/inverse.diff",
+      "sha256": "5b4f339ea691e56e826c9aaa33b65c608b6bcfa5f999ccea39be320593e491ef"
+    },
+    "method": "Independent exact unified-line hunk reconstruction over immutable old/new Git blobs; no candidate or helper invocation and no git apply/checkout/write"
+  },
+  "qualification_limits": [
+    "All current compiler/build/tests/native/runtime UNRUN; no C/slot/grant/queue/resource admission or readiness established.",
+    "Original b68/C9995/2c negatives remain immutable. No actual current operand, ancestor, locator producer, concurrency or production root-cause inference.",
+    "Author format0/diff0 are retained original author receipts only; reviewer did not execute formatter/compiler/helper/tests.",
+    "Extra test stderr and formatting/Arc allocation may affect timing, and stderr delivery is not guaranteed. No runtime performance or diagnostic-success proof.",
+    "No claim the diagnostic makes the two owning tests or broad347 pass; partial diagnostic success cannot waive the original broad gate/context.",
+    "No current filesystem, temporary placement, process, environment, account, DB, resource, tool, cache or target observation was made. Only declared frozen source/artifacts were read.",
+    "Source reading output15dbd4 was visibly truncated; precise changed ancestry lines were reread in44c4f0 and complete immutable blobs were independently compared as bytes. No lost output is treated as read."
+  ],
+  "review_activity": {
+    "candidate_or_extracted_calls": false,
+    "code_import_or_execution": false,
+    "own_output_only": "one new task-owned /var/tmp review.json",
+    "source_or_original_evidence_writes": false,
+    "source_read_tool_chunks": [
+      "c23712",
+      "c22672",
+      "9d4008",
+      "ff5ed8",
+      "15dbd4",
+      "44c4f0",
+      "21bada",
+      "83dce4",
+      "c86037",
+      "4b61e1"
+    ],
+    "tests_or_probes": false
+  },
+  "reviewer_scope": "Nonauthor conservation/test-only/truthful scope; detailed original error/owner semantics separately reviewed by Recovery. No original RAW or historical failure re-audit.",
+  "schema": "coord16-2025-fixture-diagnostics-independent-conservation-test-only-review-v1",
+  "source": {
+    "base_tree": "c004d7b3eab00e166f4393eb93ec99c91484d03b",
+    "changed_paths": [
+      "src/filesystem_recovery_context.rs",
+      "src/fs_safety/recovery_placement.rs"
+    ],
+    "entries_each": 2219,
+    "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+    "outside_mode_type_blob_entries_exact": 2217,
+    "pins": [
+      {
+        "base": {
+          "bytes": 31609,
+          "sha256": "01d26513d7a778ed4de85cc0420f7c5e863255097f99fee9f5fe55996a8d5ea1",
+          "tree_entry": "100644 blob 677587b948e04fa6641f2b05b0e2c19d28a87393"
+        },
+        "current": {
+          "bytes": 32812,
+          "sha256": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d",
+          "tree_entry": "100644 blob 77f64562656c9adc2384c7ed1042ee660a92f4fb"
+        },
+        "live_equal_current_git": true,
+        "path": "src/filesystem_recovery_context.rs"
+      },
+      {
+        "base": {
+          "bytes": 17367,
+          "sha256": "ef75fa04c58c3ea48dd6d0959f96f6b40935e2f00277f7eb5dd9b6b4ea56bb54",
+          "tree_entry": "100644 blob 573c3fa885dca7bf513125b16be051df2681a2fa"
+        },
+        "current": {
+          "bytes": 18455,
+          "sha256": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa",
+          "tree_entry": "100644 blob b9d97a397521a89a13cb225a91d2624763551405"
+        },
+        "live_equal_current_git": true,
+        "path": "src/fs_safety/recovery_placement.rs"
+      },
+      {
+        "base": {
+          "bytes": 44980,
+          "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db",
+          "tree_entry": "100644 blob 8191375d4ea6848c4384482e5c3da88874ff9ec3"
+        },
+        "current": {
+          "bytes": 44980,
+          "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db",
+          "tree_entry": "100644 blob 8191375d4ea6848c4384482e5c3da88874ff9ec3"
+        },
+        "live_equal_current_git": true,
+        "path": "src/fs_safety/recovery_cache.rs"
+      },
+      {
+        "base": {
+          "bytes": 82672,
+          "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34",
+          "tree_entry": "100644 blob f6012e1fcc9b625bce1ef76f2a0e2761e0ef8445"
+        },
+        "current": {
+          "bytes": 82672,
+          "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34",
+          "tree_entry": "100644 blob f6012e1fcc9b625bce1ef76f2a0e2761e0ef8445"
+        },
+        "live_equal_current_git": true,
+        "path": "src/fs_safety.rs"
+      }
+    ],
+    "sole_parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+    "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-fixture-diagnostics"
+  },
+  "source_observations": {
+    "best_effort_logging": "Both added writes ignore only stderr Write result; inspect_err borrows original io::Error and leaves the original Result. Source observation, not executed failure-I/O proof.",
+    "context_fixture_boundary": {
+      "api_and_nine_caller_arguments": "UNCHANGED",
+      "cfg": "all(test,target_os=\"linux\")",
+      "production_prefix_and_existing_tests_suffix": "EXACT_BASE",
+      "start_current_line": 604
+    },
+    "error_coverage_limit": "Labels identify only RecoveryPlacement::acquire return versus from_placement return. Earlier tempdir/protection/source-clone/Root::open failures remain outside these two observers; no claim that every setup error or inner stage is distinguished.",
+    "fixture_report_fields": [
+      "stage=acquire_outside|from_placement",
+      "existing io::Error.kind()",
+      "source/runtime/outside lexical reporting spellings",
+      "is_absolute() of those spellings"
+    ],
+    "guard_conservation": "Original predicates, bounds256, metadata_beneath lookup, namespace/ancestry call census, short-circuit order, refusal strings, Result flow and tests are source-conserved; no fallback/success/skip added.",
+    "lexical_vs_authority": "Reporting paths are not FD-derived canonical paths or authorization; original retained descriptors and checks remain authority.",
+    "locator_report_fields": [
+      "zero-based existing bounded ancestor loop index",
+      "already-read current device/inode/mount_id",
+      "cursor.path().join(\".git\") lexical reporting spelling",
+      "is_absolute()",
+      "already-observed locator file_type/device/inode/mode"
+    ],
+    "non_test_projection": "No added diagnostic output, path-join, metadata accessor, stderr lock or namespace access. Removing exactly the cfg(test) block and alpha-normalizing the two retained bindings gives byte-exact base placement file.",
+    "owner_lifetime_delta": "Test fixture tuple (guard,runtime,outside) is now wrapped in Arc; one clone is supplied to from_placement and the local Arc retains the original owners until error observation finishes. On success the real context retains its clone. This is a deliberate bounded owner-lifetime/drop-order delta and Arc allocation, not an exact-all-bytes/lifetime claim."
+  },
+  "unchanged_recovery_cache": {
+    "bytes": 44980,
+    "calls": [
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 702,
+        "owning_parent": "fs_safety::recovery_cache::tests::directory_sync_failure_is_strict_for_general_recovery_and_a_typed_save_warning"
+      },
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 777,
+        "owning_parent": "fs_safety::recovery_cache::tests::failed_preparation_cleanup_retires_save_custody_only_after_positive_removal"
+      },
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 858,
+        "owning_parent": "fs_safety::recovery_cache::tests::save_unverified_unlinked_observation_retires_before_stale_context_validation"
+      },
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 913,
+        "owning_parent": "fs_safety::recovery_cache::tests::save_only_resolved_staging_bypasses_stale_context_without_adopting_unknown_entries"
+      },
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 950,
+        "owning_parent": "fs_safety::recovery_cache::tests::one_shot_preparation_fault_uses_only_the_actual_save_factory_sync_path"
+      },
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 991,
+        "owning_parent": "fs_safety::recovery_cache::tests::save_factory_confirms_successful_directory_preparation"
+      },
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 1007,
+        "owning_parent": "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation"
+      },
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 1041,
+        "owning_parent": "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation"
+      },
+      {
+        "call": "let context = fixture_context(&source_root).unwrap();",
+        "line": 1072,
+        "owning_parent": "fs_safety::recovery_cache::tests::save_cancellation_after_real_publication_retains_the_original_receipt"
+      }
+    ],
+    "failed_parent_bodies": [
+      {
+        "bytes": 1540,
+        "entire_body_equal_base": true,
+        "owning_parent": "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation",
+        "sha256": "d05811ea12af6bfcad10c9ae9d4dd6da1db5af73e024c4b59b294c1ab725b0f4",
+        "unchanged_fault_retry_repair_oracles": true
+      },
+      {
+        "bytes": 1427,
+        "entire_body_equal_base": true,
+        "owning_parent": "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation",
+        "sha256": "533888bb9a1583cbf14236b723504512212cc9fc77a4514073b5ffdf40596be0",
+        "unchanged_fault_retry_repair_oracles": true
+      }
+    ],
+    "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db"
+  },
+  "verdict": "SCOPED_TWO_FILE_CONSERVATION_TEST_ONLY_AND_TRUTHFUL_SCOPE_CLEAR",
+  "verified_author_refs": [
+    {
+      "bytes": 13330,
+      "path": "/tmp/c9995-recovery-cache-setup-failure-source-diagnosis-b68f940d-v1.json",
+      "sha256": "e011e3698240812218dd75e3fe7c7d7349ea5eb4faef94b0629bb8b6eb048562"
+    },
+    {
+      "bytes": 4276,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/forward.diff",
+      "sha256": "e8892756ac33c7b09426029babbd8cd8a4201b00d67f168241847bcd39f83d3e"
+    },
+    {
+      "bytes": 87564,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/original-author-tool-records.json",
+      "sha256": "0ac246127261a274b211fabd18b9f7958f077ffa06b4887e8ad7b50f8b2657b8"
+    },
+    {
+      "bytes": 15160,
+      "path": "/var/tmp/coord16-recovery-cache-two-parent-proposal-ltupxht8/proposal.json",
+      "sha256": "8f32011fc47b13f205dd7bf82c4e9f51e5690bc23c89847451868f091aed5421"
+    },
+    {
+      "bytes": 4276,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/inverse.diff",
+      "sha256": "5b4f339ea691e56e826c9aaa33b65c608b6bcfa5f999ccea39be320593e491ef"
+    },
+    {
+      "bytes": 3165,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/authenticated-source-assignment.json",
+      "sha256": "882d15741733ab9ef5e6260b481c455b27acb10fdeae9f9be4de931c453b30c0"
+    },
+    {
+      "bytes": 31609,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__filesystem_recovery_context.rs",
+      "sha256": "01d26513d7a778ed4de85cc0420f7c5e863255097f99fee9f5fe55996a8d5ea1"
+    },
+    {
+      "bytes": 32812,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__filesystem_recovery_context.rs",
+      "sha256": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d"
+    },
+    {
+      "bytes": 17367,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety__recovery_placement.rs",
+      "sha256": "ef75fa04c58c3ea48dd6d0959f96f6b40935e2f00277f7eb5dd9b6b4ea56bb54"
+    },
+    {
+      "bytes": 18455,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety__recovery_placement.rs",
+      "sha256": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa"
+    },
+    {
+      "bytes": 44980,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety__recovery_cache.rs",
+      "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db"
+    },
+    {
+      "bytes": 44980,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety__recovery_cache.rs",
+      "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db"
+    },
+    {
+      "bytes": 82672,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/before-src__fs_safety.rs",
+      "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34"
+    },
+    {
+      "bytes": 82672,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/source/after-src__fs_safety.rs",
+      "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34"
+    }
+  ]
+}

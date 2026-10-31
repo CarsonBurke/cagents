@@ -1,0 +1,93 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "artifact_groups": [
+    {
+      "captured_success_stream_policy": {
+        "scope": "No executable helper in this exact owning source chain; no runtime child inference or credit."
+      },
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "diagnostic_seconds": 180,
+      "features": [
+        "host"
+      ],
+      "id": "host-lib",
+      "inventory_seconds": 30,
+      "manifest": "Cargo.toml",
+      "selectors": [
+        {
+          "expected_stdout_child_results": 0,
+          "name": "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation"
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation"
+        }
+      ],
+      "source_predicted_absent_names": [],
+      "source_predicted_compiled_names": [
+        "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation",
+        "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation"
+      ],
+      "source_self_child_membership": [],
+      "target_kind": [
+        "lib"
+      ],
+      "target_name": "cagents"
+    }
+  ],
+  "expected_source_only": "Linux ordinary test names only; fresh actual ELF/inventory/results required.",
+  "issue": 2025,
+  "original347_gate": "UNRESOLVED_UNCHANGED_NOT_INVOKED_OR_SATISFIED_BY_THIS_PACKET",
+  "planned_phase_order": [
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-recovery-cache-two"
+  ],
+  "runtime_admission": {
+    "execution_authorized": false,
+    "helper_binding": null,
+    "state": "DIAGNOSTIC_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT"
+  },
+  "schema": "issue2025-recovery-cache-two-partial-diagnostic-data-v1",
+  "selected_names": [
+    "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation",
+    "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation"
+  ],
+  "source": {
+    "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+    "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+    "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-fixture-diagnostics"
+  }
+}

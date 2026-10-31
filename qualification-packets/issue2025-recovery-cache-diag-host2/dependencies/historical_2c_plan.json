@@ -1,0 +1,624 @@
+{
+  "issue": 2025,
+  "product_pr": null,
+  "product_head": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+  "product_tree": "c004d7b3eab00e166f4393eb93ec99c91484d03b",
+  "product_parent": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-upgrade-client-runtime",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/source-binding.json",
+  "source_review_sha256": "800216872c2941e54905e0c1a95bca67d9118bd2a3ad0eb43b449e857ea8415d",
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+    "src/host/state.rs": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+    "src/host/state/retained_child_shutdown_tests.rs": "45501c8582b51ce5b72bd9165f8eda15f041da84a896434719bcda27d6eefc8e",
+    "src/host/chat.rs": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838",
+    "src/host/chat/retained_actor_tests.rs": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658",
+    "src/daemon/child_reaper.rs": "7c52d828e03b30a836c2cab79a172cdc2cda77189f8396cc7183ee7fce1c19fd",
+    "src/host/client.rs": "7e0a07181457290d13baa215b151d44b40c359737fdd03945061041519dda267"
+  },
+  "artifact_groups": [
+    {
+      "id": "host-lib",
+      "features": [
+        "host"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "selectors": [
+        {
+          "name": "host::state::tests::upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::state::tests::idle_and_ended_claude_conversations_do_not_block_an_upgrade",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::state::tests::native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::state::tests::restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint",
+          "expected_stdout_child_results": 0
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "host::state::tests::upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore",
+        "host::state::tests::idle_and_ended_claude_conversations_do_not_block_an_upgrade",
+        "host::state::tests::native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once",
+        "host::state::tests::restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint",
+        "host::state::retained_child_shutdown_tests::retained_original_child_refuses_empty_control_until_exact_reap",
+        "host::state::retained_child_shutdown_tests::quarantined_and_suspended_originals_keep_the_empty_inventory_refused",
+        "host::state::retained_child_shutdown_tests::upgrade_rechecks_original_custody_published_after_its_first_validation",
+        "host::chat::retained_actor_tests::committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment",
+        "host::chat::retained_actor_tests::failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment",
+        "host::client::tests::slow_chat_close_allows_list_but_fences_upgrade_and_shutdown"
+      ],
+      "source_predicted_absent_names": [],
+      "required_broad_names": [
+        "host::state::retained_child_shutdown_tests::retained_original_child_refuses_empty_control_until_exact_reap",
+        "host::state::retained_child_shutdown_tests::quarantined_and_suspended_originals_keep_the_empty_inventory_refused",
+        "host::state::retained_child_shutdown_tests::upgrade_rechecks_original_custody_published_after_its_first_validation",
+        "host::chat::retained_actor_tests::committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment",
+        "host::chat::retained_actor_tests::failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment",
+        "host::client::tests::slow_chat_close_allows_list_but_fences_upgrade_and_shutdown"
+      ],
+      "broad_filters": [
+        "upgrade",
+        "retained",
+        "restore",
+        "native_recovery"
+      ],
+      "four_seconds": 180,
+      "broad_seconds": 600,
+      "source_self_child_membership": [
+        {
+          "parent": "host::client::tests::slow_chat_close_allows_list_but_fences_upgrade_and_shutdown",
+          "source": "src/host/client.rs",
+          "source_sha256": "7e0a07181457290d13baa215b151d44b40c359737fdd03945061041519dda267",
+          "definition_line": 2103,
+          "guard_line": 2106,
+          "call": "super::super::state::tests::upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::a_handoff_no_window_can_still_save_stops_refusing_the_upgrade",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6483,
+          "guard_line": 6484,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::committed_upgrade_fences_control_and_retains_checkpoint_until_close",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6443,
+          "guard_line": 6444,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::idle_and_ended_claude_conversations_do_not_block_an_upgrade",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 5902,
+          "guard_line": 5903,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6058,
+          "guard_line": 6059,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6900,
+          "guard_line": 6901,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 5779,
+          "guard_line": 5780,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::upgrade_commit_failure_preserves_live_control_authority",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6401,
+          "guard_line": 6402,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6424,
+          "guard_line": 6425,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        }
+      ],
+      "captured_success_stream_policy": {
+        "helper_source": "src/host/state.rs",
+        "helper_source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+        "helper_body_sha256": "67db26ba110fd06e3ed08b5d68c06449759aa72bed1d0fd709606cfd443ecd6c",
+        "stdout_sink": "private stdout_path File",
+        "stderr_sink": "private stderr_path File",
+        "success_stream_action": "validate one exact child named result/footer then output.close(); no stdout replay",
+        "successful_stdout_replay_calls": [],
+        "derived_exposed_stdout_result_count": 0,
+        "scope": "Source-derived captured-success-stream policy, not observed child output/exit/custody/pass credit"
+      }
+    }
+  ],
+  "planned_phase_count": 5,
+  "planned_phase_order": [
+    "host-bin-build",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-four",
+    "parent-host-lib-broad"
+  ],
+  "packet_deadline_seconds": 2400,
+  "phase_caps_sum_seconds": 2310,
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "tool_pin_provenance": "Immutable donor source data only, no current installed-file/context observation",
+  "archive_bindings": [
+    {
+      "name": "input-barrier_handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/barrier_handoff.json",
+      "sha256": "15318b580693a69f503974b1c79ec3461b15b7bc33bb2ba6ebdbdfa115312ac8"
+    },
+    {
+      "name": "input-barrier_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/barrier_review.json",
+      "sha256": "84c516a3f453c6eab74be043e7536a51994156f552229c8194ca9ff8f1d23b3c"
+    },
+    {
+      "name": "input-conservation_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/conservation_review.json",
+      "sha256": "f9ed915d39429a57cfcfcb0741e2bc85b2dec03e620fc04d96e2f959d5c307d2"
+    },
+    {
+      "name": "input-donor-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/donor-plan.json",
+      "sha256": "638ee9161d67569532668e540132f166cb11e557e23440eca979818106ac5790"
+    },
+    {
+      "name": "input-donor-run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/donor-run-packet.py",
+      "sha256": "9a79bc3991854316421396b44a87b50486174a4995a6ff6e44a3fd7c0ac35369"
+    },
+    {
+      "name": "input-donor_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/donor_review.json",
+      "sha256": "52fdbd1b039cecc2de7b52cdc232fa644462a3549d581303429ca08cc90aaa16"
+    },
+    {
+      "name": "input-helper_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/helper_review.json",
+      "sha256": "da9de879a9826d172fcdeea76aba2f692084bdfe0b5de72de55a1ca80e73121f"
+    },
+    {
+      "name": "input-proposal.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/proposal.json",
+      "sha256": "80e64f9a111320d66b9f811e1aa356d62489fdc674fb6bda2d4410fe83645db7"
+    },
+    {
+      "name": "input-proposal_handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/proposal_handoff.json",
+      "sha256": "c0e7f5f5e1da32f4ea649190b8b9c24442afb923bc0d1b6329ca3d2e0fd570f1"
+    },
+    {
+      "name": "input-proposal_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/proposal_review.json",
+      "sha256": "c2bd1b2a74ec0d5b793b355ad0788fa8d0eb77fecea10340eef25ca243a0442a"
+    },
+    {
+      "name": "input-publication.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/publication.json",
+      "sha256": "f2e7f6a93f8ad396f7837cc1e3119f93b7edd924453ebb840c7d801e87fda798"
+    },
+    {
+      "name": "input-source_assignment.txt",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/source_assignment.txt",
+      "sha256": "4aa1c294e93cfcb8a0180496a1b6d98b68405dc489fc6fea719ba249166b6506"
+    },
+    {
+      "name": "input-source_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/source_freeze.json",
+      "sha256": "ad5b9cf7abf0a1f46c20e739e4f20efd443ea356cfb2c22605f0e5df63d57910"
+    },
+    {
+      "name": "input-source_intake.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/source_intake.json",
+      "sha256": "14c78b3145a78aecd4beab4fcf57d255abfb86f40fb8da7bbb2a1565bf349a00"
+    },
+    {
+      "name": "command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/command-data.json",
+      "sha256": "23ce7f08ceb3d48869a90e464bf9eb04ecde65e0930f7b472735eff9689d7510"
+    },
+    {
+      "name": "current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/current-source-map.json",
+      "sha256": "bf1acccfde0b8f6b33cb3683649cd9c8d42f04f1b73f05da714946db2e31c42f"
+    },
+    {
+      "name": "source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/source-binding.json",
+      "sha256": "800216872c2941e54905e0c1a95bca67d9118bd2a3ad0eb43b449e857ea8415d"
+    },
+    {
+      "name": "source-.cargo__config.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/.cargo/config.toml",
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+    },
+    {
+      "name": "source-Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/Cargo.toml",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    {
+      "name": "source-Cargo.lock",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/Cargo.lock",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    {
+      "name": "source-build.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/build.rs",
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+    },
+    {
+      "name": "source-src__lib.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/lib.rs",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+    },
+    {
+      "name": "source-src__modules.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/modules.rs",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+    },
+    {
+      "name": "source-src__bin__cagentsd.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/bin/cagentsd.rs",
+      "sha256": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830"
+    },
+    {
+      "name": "source-src__host__state.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/host/state.rs",
+      "sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b"
+    },
+    {
+      "name": "source-src__host__state__retained_child_shutdown_tests.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/host/state/retained_child_shutdown_tests.rs",
+      "sha256": "45501c8582b51ce5b72bd9165f8eda15f041da84a896434719bcda27d6eefc8e"
+    },
+    {
+      "name": "source-src__host__chat.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/host/chat.rs",
+      "sha256": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838"
+    },
+    {
+      "name": "source-src__host__chat__retained_actor_tests.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/host/chat/retained_actor_tests.rs",
+      "sha256": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658"
+    },
+    {
+      "name": "source-src__daemon__child_reaper.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/daemon/child_reaper.rs",
+      "sha256": "7c52d828e03b30a836c2cab79a172cdc2cda77189f8396cc7183ee7fce1c19fd"
+    },
+    {
+      "name": "input-primary-formatter-notes.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/primary-formatter-notes.json",
+      "sha256": "255eb315330e2104d15e1e2a9269e6edafa5bfe09ab53b6430717861436c5fb4"
+    },
+    {
+      "name": "input-option_b_assignment.txt",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/option_b_assignment.txt",
+      "sha256": "fcab311df82835adc42143800e3bf22d34829f5f749375eac92a6721fd708a9b"
+    },
+    {
+      "name": "input-option_b_steering.txt",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/option_b_steering.txt",
+      "sha256": "3f02d8801d274ab1c8c6d76474d646cf88d7278b55e8e825aacd71de22431b32"
+    },
+    {
+      "name": "input-prior_r1_r2_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/prior_r1_r2_review.json",
+      "sha256": "08123d01fba1129cbfe22f32c175cb7a75c41860f56718f0706ebf2f4ffbad44"
+    },
+    {
+      "name": "base-fff2-state-source",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/base-product-source/src/host/state.rs",
+      "sha256": "34d2272d1d614d5b0425befc89ee0666303fe0c4e1e0a2bbcf206951331ccca5"
+    },
+    {
+      "name": "input-private_source_freeze",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/private_data_freeze.json",
+      "sha256": "f6405cce728f294a322db655fc56c32ccf25a1da5fd44adefdf35c1b809a7054"
+    },
+    {
+      "name": "input-private_semantic_review",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/private_data_semantic_review.json",
+      "sha256": "df24b7f443b6694963a30679852c0f46debf2665834049950f375556359d4e01"
+    },
+    {
+      "name": "input-private_conservation_review",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/private_data_conservation_review.json",
+      "sha256": "406f527a968c4b56a9498e4e770a9842463b4c97751a5904bf71a5803b76426b"
+    },
+    {
+      "name": "intermediate-5bead-state-source",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/intermediate-product-source/src/host/state.rs",
+      "sha256": "aac7e678292efacb319e13d03d7507d032366c78d5cf72667fc78688ecb1206d"
+    },
+    {
+      "name": "input-roots_source_freeze",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/private_roots_freeze.json",
+      "sha256": "6a74457d74a12cfb2dd83b83c771f3440a4d1b627d692e3ad35823f63ff37819"
+    },
+    {
+      "name": "input-roots_runtime_review",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/private_roots_runtime_review.json",
+      "sha256": "6f7fc6b5f0f4f356a2ae3641a2fb1d645e345cf287faa2f29b31169ee2ef455d"
+    },
+    {
+      "name": "input-roots_provider_review",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/private_roots_provider_review.json",
+      "sha256": "222c57fd5969f3e9f9aa993c05c89ba8e0f93daee16973029b511b147fa25b75"
+    },
+    {
+      "name": "input-roots_conservation_review",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/private_roots_conservation_review.json",
+      "sha256": "e13170396828c77349647b2bee528bb6a542432e90131b09db9a7f3ea88a0bb2"
+    },
+    {
+      "name": "source-src__host__client.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/product-source/src/host/client.rs",
+      "sha256": "7e0a07181457290d13baa215b151d44b40c359737fdd03945061041519dda267"
+    },
+    {
+      "name": "predecessor0fa-src__host__state.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/predecessor-product-source/src/host/state.rs",
+      "sha256": "59616282704f9dd487bf480262db8ed01e629bc806ad941416c022bc83222008"
+    },
+    {
+      "name": "predecessor0fa-src__host__client.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/predecessor-product-source/src/host/client.rs",
+      "sha256": "a93049717e7cf637663d069816b5023eca799005814742389019eada0905aac9"
+    },
+    {
+      "name": "input-client_runtime_freeze",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_freeze.json",
+      "sha256": "cb3103c7a5dd2175f444504bead3e9f7e0a16e7352eff63545a9ac993aec5171"
+    },
+    {
+      "name": "input-client_runtime_publication",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_publication.json",
+      "sha256": "0828d2136be768e3c1203e94a9bbbd2ea7ae820fd4183cb0f26fb0253449931d"
+    },
+    {
+      "name": "input-client_runtime_semantic",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_semantic.json",
+      "sha256": "686d0105466bce94969c9210bb6ceec483bf7c76eb96ffc56de4dc16e34fb5b3"
+    },
+    {
+      "name": "input-client_runtime_conservation",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_conservation.json",
+      "sha256": "95b218d0fd74087da84d6b777208df37c26349bd49a7b24a18f98f1d73811f78"
+    },
+    {
+      "name": "input-client_runtime_finding",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_finding.json",
+      "sha256": "f199b0283f58288d2efe38b7050680a49e16228c1f9a979531906b471e56dbdd"
+    },
+    {
+      "name": "input-client_runtime_intake",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_intake.json",
+      "sha256": "5d6f82b81e6ba61d9b55dbc876b69b09537a294ef37055d157b490a50beba305"
+    },
+    {
+      "name": "self-child-source-membership",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/self-child-source-membership.json",
+      "sha256": "09fb65bcffefa41d66c20b9a0cf1ebda1edd2b319ad115962feb4d90a5e0a896"
+    },
+    {
+      "name": "input-adoption_intake",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/adoption_intake.json",
+      "sha256": "e9aa09101ca6d215e6876de5b50c1fe1bc57bb3cc14f7bdd397b7772cd1e5843"
+    },
+    {
+      "name": "input-adoption_freeze",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/adoption_freeze.json",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682"
+    },
+    {
+      "name": "input-adoption_semantic",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/adoption_semantic.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
+    },
+    {
+      "name": "input-adoption_conservation",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/adoption_conservation.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4"
+    },
+    {
+      "name": "input-adoption_pure4_reference",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/adoption_pure4_reference.json",
+      "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005"
+    },
+    {
+      "name": "input-adoption_function",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/canonical-adopted-child-settlement/settle_children.py",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+    },
+    {
+      "name": "input-adoption_leaf_from_347_function_diff_json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/canonical-adopted-child-settlement/from-347-function.diff.json",
+      "sha256": "3cdf58ec3a730e81b67d9470a63334f229e36c1621d272fba915ea02f3c911dc"
+    },
+    {
+      "name": "input-adoption_leaf_README_md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/canonical-adopted-child-settlement/README.md",
+      "sha256": "5a5ab2c919f74a054e0876a6694a58effe0a940b4839e907f37074f53ac9b7dd"
+    },
+    {
+      "name": "input-adoption_leaf_test_policy_py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/canonical-adopted-child-settlement/test_policy.py",
+      "sha256": "0a9e368a994d6c31c03b834b645055dd21ee432b8221e225bfc8c10f3fff0263"
+    },
+    {
+      "name": "input-adoption_original_finding",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/adoption_original_finding.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
+    },
+    {
+      "name": "input-prior_ca_task_hold",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/prior_ca_task_hold.json",
+      "sha256": "e342ee5b3258889e2f258433b7cf3a47614d79e340a4313e678060b99bf53560"
+    },
+    {
+      "name": "input-prior_ca_conservation",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/prior_ca_conservation.json",
+      "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d"
+    },
+    {
+      "name": "input-prior_ca_additive_hold",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/dependencies/prior_ca_additive_hold.json",
+      "sha256": "a32b9501efcfc05ba117cd89f10d903a02434943ce0ac5d70440b7ea69767ef9"
+    },
+    {
+      "name": "input-adoption_old_function",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/historical-source/ca-settle_children.py",
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
+    },
+    {
+      "name": "input-prior_ca_author_conservation",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host/historical-source/ca-source-conservation.json",
+      "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd"
+    }
+  ],
+  "runtime_admission": {
+    "state": "SOURCE_B_CANDIDATE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null,
+    "helper_provenance": "Only future phase1 original CargoJSON+source tuple and validated actual ELF; no preexisting helper data accepted",
+    "required_future_admission": "Genuine frozen Option B controller review plus separately authenticated current EC C grant/context; preparation is not authority"
+  },
+  "actual": {
+    "grant": null,
+    "queue_position": null,
+    "current_context": null,
+    "current_resources": null,
+    "current_tools": null,
+    "actual_elf": null,
+    "actual_inventory": null,
+    "actual_selected_names": null,
+    "actual_counts": null,
+    "actual_parallel_degree": null,
+    "actual_parallel_overlap": null,
+    "helper_path": null,
+    "helper_sha256": null,
+    "helper_provenance": null,
+    "phase_receipts": null,
+    "runtime_results": null,
+    "RAW_review": null,
+    "safe_release": null
+  },
+  "prepared_only": true,
+  "readiness": false,
+  "limits": "Preparation supplies no runtime evidence. Current b68 adds an existing client parent to shared captured-selfchild setup with no new test; caller membership is source-derived, distinct from exposed stdout and never childPID/wait/pass credit. Fresh actual inventory/counts only. All prior Linux/private-root/OSmanager/shell/opaqueauthority limits remain; fresh exactCODE review and separate grant/current admission required. Exact canonical settle_children9004 preserves the original3s natural grace; unproven adopted survivors remain unsignaled and unclean so acquired C stays HOLD.23 generic functions unchanged/1 corrected plus4 original nested unchanged. Canonical pure4 is reference only, not this packet or runtime qualification.",
+  "helper_build": {
+    "label": "host-bin-build",
+    "argv": [
+      "cargo",
+      "build",
+      "--locked",
+      "--no-default-features",
+      "--features",
+      "host",
+      "--bin",
+      "cagentsd",
+      "--message-format=json"
+    ],
+    "seconds": 900,
+    "manifest": "Cargo.toml",
+    "features": [
+      "host"
+    ],
+    "package": {
+      "name": "cagents",
+      "version": "0.1.3"
+    },
+    "target": {
+      "name": "cagentsd",
+      "path": "src/bin/cagentsd.rs",
+      "test": false,
+      "bench": false,
+      "required-features": [
+        "host"
+      ]
+    },
+    "profile": "Ordinary dev build; raw Cargo profile preserved, profile.test must be false; no invented debuginfo/opt-level metadata assertion"
+  },
+  "required_absent_environment_names": [
+    "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+    "CAGENTS_RETAINED_ACTOR_FIXTURE"
+  ]
+}

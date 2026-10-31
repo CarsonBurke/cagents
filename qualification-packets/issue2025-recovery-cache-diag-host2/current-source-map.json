@@ -1,0 +1,101 @@
+{
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "current_reviews": {
+    "diagnostic_assignment": {
+      "bytes": 1770,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_assignment.json",
+      "sha256": "69f535367b2a7a4363e6c14da9e284c787deb7cb5239c65e720778052bd95f76"
+    },
+    "diagnostic_conservation": {
+      "bytes": 24364,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_conservation.json",
+      "sha256": "202a53ecac61f7668148c26d72df1f3afe93363df2af709cb4733f0ef7308493"
+    },
+    "diagnostic_freeze": {
+      "bytes": 6882,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_freeze.json",
+      "sha256": "5eba888b8a031dfcdd075a0d6bae1a7a6eeea890b8bec91e63bade78a08f0183"
+    },
+    "diagnostic_handoff": {
+      "bytes": 23481,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_handoff.json",
+      "sha256": "7cfaee56000c53a8260bbfee025cf322fe5741fcaffd3dc441dd3552368b2dc9"
+    },
+    "diagnostic_helper_independence": {
+      "bytes": 15706,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_helper_independence.json",
+      "sha256": "a00af9948c807eef537774c5b24b4345bd6813c5a229c7a8106f475e0d5b9687"
+    },
+    "diagnostic_main_map": {
+      "bytes": 8605,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_main_map.json",
+      "sha256": "ee0c0c1ed915ba1db4f69cbb81ac9408981e0fca0a4087a32870139447aeba41"
+    },
+    "diagnostic_proposal": {
+      "bytes": 15160,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_proposal.json",
+      "sha256": "8f32011fc47b13f205dd7bf82c4e9f51e5690bc23c89847451868f091aed5421"
+    },
+    "diagnostic_publication": {
+      "bytes": 3655,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_publication.json",
+      "sha256": "c32b45b7f6783aa8c7076356ceae493c8e1a81215de6ced440c4ebc9f18736f4"
+    },
+    "diagnostic_root_adoption": {
+      "bytes": 1522,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_root_adoption.json",
+      "sha256": "7ebaf9b45498d52c1235d9f4605d1e3cd9f2b9b467a1d806de48a7e90b660a45"
+    },
+    "diagnostic_semantic": {
+      "bytes": 9720,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_semantic.json",
+      "sha256": "da302e697c254632ca1c8afa3072ff7186143f99a83d73d9912509d513305afd"
+    }
+  },
+  "diagnostic_only": true,
+  "historical_only": [
+    "historical_2c_runner",
+    "historical_2c_plan",
+    "historical_b68_binding",
+    "prior_ca_task_hold",
+    "prior_ca_conservation",
+    "prior_ca_additive_hold",
+    "prior_ca_author_conservation"
+  ],
+  "product": {
+    "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+    "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+    "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-fixture-diagnostics"
+  },
+  "schema": "issue2025-recovery-cache-two-partial-diagnostic-source-map-v1",
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/filesystem_recovery_context.rs": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d",
+    "src/fs_safety.rs": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34",
+    "src/fs_safety/directory_creation.rs": "f71e11e94fce6800a8c5da6009c75faeb47f2e7875cd2fc11099f57c33119a4a",
+    "src/fs_safety/recovery_cache.rs": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db",
+    "src/fs_safety/recovery_placement.rs": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa",
+    "src/instance.rs": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/recovery_authority.rs": "f7a4b149cade60db513a02af124117779866d21c3e7ecaf6a37ed09c3312b64e",
+    "src/secure_file.rs": "51bad3a87ed1fcdbaa00232695c5da9deed025f3448a928032eb4dc1a5ba51d0",
+    "src/worktree_cleanup.rs": "465c2f6b5ba8c16efbf6bd5d607420a045f5f0c22230016c15d45b5970c89cc5"
+  }
+}

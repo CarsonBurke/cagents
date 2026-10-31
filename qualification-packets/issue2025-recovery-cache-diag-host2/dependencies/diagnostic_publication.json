@@ -1,0 +1,65 @@
+{
+  "actions_excluded": [
+    "PR create",
+    "body/comment/review write",
+    "workflow dispatch",
+    "build/test/native trigger",
+    "authority/context/account changes"
+  ],
+  "branch": "refs/heads/fix/coord16-issue2025-fixture-diagnostics",
+  "compiler_tests_native": "UNRUN",
+  "created_utc": "2026-10-31T12:40:08.363861+00:00",
+  "credential_warning": "Original nonfatal locked collection warning retained; no retry or workaround",
+  "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+  "original_push": {
+    "nonforce": true,
+    "session": 52803,
+    "start_chunk": "67f6df",
+    "terminal": {
+      "chunk_id": "01fb86",
+      "exit_code": 0,
+      "original_token_count": 126,
+      "output": "\n** (process:92): CRITICAL **: 05:36:38.036: store failed: Cannot create an item in a locked collection\nremote: \nremote: Create a pull request for 'fix/coord16-issue2025-fixture-diagnostics' on GitHub by visiting:        \nremote:      https://github.com/CarsonBurke/cagents/pull/new/fix/coord16-issue2025-fixture-diagnostics        \nremote: \nTo https://github.com/CarsonBurke/cagents.git\n*\t88b3a7ed94f14619e166710ad09608fca1c3286f:refs/heads/fix/coord16-issue2025-fixture-diagnostics\t[new branch]\nDone\n",
+      "wall_time_seconds": 1.2403e-05
+    }
+  },
+  "original_source_handoff_publication_snapshot": "NOT_PERFORMED remains immutable prepublication snapshot; this separate receipt records later actual publication",
+  "original_tools": {
+    "bytes": 5979,
+    "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/publication-original-tools.json",
+    "sha256": "6147c714466b8c880db9ea869e6520329e0e1825adfffb39800f15715133e013"
+  },
+  "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+  "root_source_adoption": {
+    "bytes": 1522,
+    "path": "/tmp/fw16-backend-ec204421/issue2025-88b3-diagnostics-root-source-adoption-v1.json",
+    "sha256": "7ebaf9b45498d52c1235d9f4605d1e3cd9f2b9b467a1d806de48a7e90b660a45"
+  },
+  "schema": "coord16-issue2025-88b3-reviewed-diagnostics-source-publication-v1",
+  "source_handoff": {
+    "bytes": 23481,
+    "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/reviewed-handoff.json",
+    "sha256": "7cfaee56000c53a8260bbfee025cf322fe5741fcaffd3dc441dd3552368b2dc9"
+  },
+  "supported_remote_readback": {
+    "data": {
+      "node_id": "REF_kwDOUFbDENoANHJlZnMvaGVhZHMvZml4L2Nvb3JkMTYtaXNzdWUyMDI1LWZpeHR1cmUtZGlhZ25vc3RpY3M",
+      "object": {
+        "sha": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+        "type": "commit",
+        "url": "https://api.github.com/repos/CarsonBurke/cagents/git/commits/88b3a7ed94f14619e166710ad09608fca1c3286f"
+      },
+      "ref": "refs/heads/fix/coord16-issue2025-fixture-diagnostics",
+      "url": "https://api.github.com/repos/CarsonBurke/cagents/git/refs/heads/fix/coord16-issue2025-fixture-diagnostics"
+    },
+    "original_tool": {
+      "chunk_id": "e7f36a",
+      "exit_code": 0,
+      "original_token_count": 116,
+      "output": "{\"ref\":\"refs/heads/fix/coord16-issue2025-fixture-diagnostics\",\"node_id\":\"REF_kwDOUFbDENoANHJlZnMvaGVhZHMvZml4L2Nvb3JkMTYtaXNzdWUyMDI1LWZpeHR1cmUtZGlhZ25vc3RpY3M\",\"url\":\"https://api.github.com/repos/CarsonBurke/cagents/git/refs/heads/fix/coord16-issue2025-fixture-diagnostics\",\"object\":{\"sha\":\"88b3a7ed94f14619e166710ad09608fca1c3286f\",\"type\":\"commit\",\"url\":\"https://api.github.com/repos/CarsonBurke/cagents/git/commits/88b3a7ed94f14619e166710ad09608fca1c3286f\"}}",
+      "wall_time_seconds": 0.409053732
+    }
+  },
+  "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+  "workflow_source_result": "Only main push events at exact published head; no PR or dispatch created"
+}

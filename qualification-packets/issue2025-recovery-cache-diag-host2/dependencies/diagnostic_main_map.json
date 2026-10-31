@@ -1,0 +1,109 @@
+{
+  "kind": "READ_ONLY_MAIN_SOURCE_ADMISSION_FIELD_MAP_FOR_ROOT_AUTHORED_DIAGNOSTIC_ADAPTER_NOT_CODE_REVIEW",
+  "donor": {
+    "head": "2c213a967bfd653ee85ec300d45293fafa2076cc",
+    "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-adoption-hold-host-source/qualification-packets/issue2025-grouped-host",
+    "hashes": {
+      "run-packet.py": "97444376c1f7dc012d506432dc7210682a28da1a71815c4d120be08cbb5b8992",
+      "plan.json": "b413abb9059840c4ed4412508a9c4b65b998f0e662d189ec25ec87bef90780c2",
+      "source-binding.json": "800216872c2941e54905e0c1a95bca67d9118bd2a3ad0eb43b449e857ea8415d"
+    }
+  },
+  "current_diagnostic_tuple": {
+    "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+    "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+    "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-fixture-diagnostics"
+  },
+  "genuine_refs": {
+    "handoff": {
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/reviewed-handoff.json",
+      "sha256": "7cfaee56000c53a8260bbfee025cf322fe5741fcaffd3dc441dd3552368b2dc9"
+    },
+    "freeze": {
+      "bytes": 6882,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/freeze.json",
+      "sha256": "5eba888b8a031dfcdd075a0d6bae1a7a6eeea890b8bec91e63bade78a08f0183"
+    },
+    "semantic": {
+      "bytes": 9720,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/review.json",
+      "sha256": "da302e697c254632ca1c8afa3072ff7186143f99a83d73d9912509d513305afd",
+      "verdict": "BOUNDED_SOURCE_CLEAR_OBSERVATION_AND_GUARD_SEMANTICS"
+    },
+    "conservation": {
+      "bytes": 24364,
+      "checks": 59,
+      "outside_entries_exact": 2217,
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-conservation-independent-jh2xlpb8/review.json",
+      "sha256": "202a53ecac61f7668148c26d72df1f3afe93363df2af709cb4733f0ef7308493",
+      "verdict": "SCOPED_TWO_FILE_CONSERVATION_TEST_ONLY_AND_TRUTHFUL_SCOPE_CLEAR"
+    },
+    "helper": {
+      "bytes": 15706,
+      "path": "/var/tmp/coord16-recovery-cache-helper-independence-wds79vgw/source-proof.json",
+      "sha256": "a00af9948c807eef537774c5b24b4345bd6813c5a229c7a8106f475e0d5b9687"
+    }
+  },
+  "anchors": {
+    "old_current_binding_kind_tuple": 891,
+    "unchanged_read_bound_definition": 898,
+    "old_b68_client_proof_reads": 916,
+    "canonical_proof_reads": 923,
+    "old_task_schema_and_source_equality": 984,
+    "old_current_to_historical_chain_join": 977,
+    "old_client_current_tuple_checks": 1063,
+    "old_helper_build_and_full5phase_plan_checks": 1119,
+    "compiled_four_broad_selfchild_checks": 1131,
+    "actual_archived_input_hash_loop": 1149,
+    "owning_commands_qualified_task_predicate": 1455
+  },
+  "minimum_current_reader": {
+    "freeze": {
+      "schema": "coord16-issue2025-test-fixture-admission-diagnostics-source-freeze-v1",
+      "tuple": "freeze.head/tree/parent/worktree == new diagnostic tuple; parent is b68, not0fa",
+      "pins": "source_pins is ARRAY: key repository_path, hash current.sha256; changed_paths exact two diagnostic leaves",
+      "runtime_snapshot": "Keep compiler_build_tests_native UNRUN/no_current_execution_grant true and reviews.PENDING fields as immutable authored snapshot. Do not rewrite or require its old review status to be current final status."
+    },
+    "semantic": {
+      "schema": "issue2025_test_fixture_diagnostics_observation_guard_semantic_review_v1",
+      "verdict": "BOUNDED_SOURCE_CLEAR_OBSERVATION_AND_GUARD_SEMANTICS",
+      "tuple": "top-level head/tree/parent, not nested source_tuple",
+      "scope": "blocking_findings==[] and findings==[]; evidence.author_freeze.sha256 == freeze ref; source_pins is DICT for changed2 with .new/.old hashes; map .new to current pins; shared_oracle_preservation.before_after_sha256 equals unchanged cache hash and source_equal==true; execution remains source-only UNRUN."
+    },
+    "conservation": {
+      "schema": "coord16-2025-fixture-diagnostics-independent-conservation-test-only-review-v1",
+      "verdict": "SCOPED_TWO_FILE_CONSERVATION_TEST_ONLY_AND_TRUTHFUL_SCOPE_CLEAR",
+      "tuple": "source.head/tree/sole_parent, NOT top head/parent or source_tuple",
+      "scope": "blockers==[]; author_receipt.sha256 == freeze ref; source.changed_paths exact2; source.entries_each2219/outside_mode_type_blob_entries_exact2217; source.pins ARRAY keyed path/current.sha256; inverse_proof.both_files_reconstructed_exact; unchanged_recovery_cache.sha256 == cache pin. check_count59 is report metadata, not a fabricated executed count."
+    },
+    "helper_independence": {
+      "schema": "coord16-two-recovery-cache-parents-helper-independence-additive-source-proof-v1",
+      "disposition": "SCOPED_SOURCE_HELPER_INDEPENDENCE_FOR_EXACT_TWO_LINUX_HOST_LIB_PARENTS",
+      "tuple": "product.head/tree/parent; genuine_root_freeze.sha256 == freeze ref",
+      "scope": "exact_parents names equal new two selectors; source_pins DICT sha256/bytes covers reached source chain. controller_consequence three helper-needed booleans are false, ordinary_libtest_process_still_required true. Current helper proof has new_controller_head/review/actualELF/N/results/grant NULL; retain as source-only snapshot, not controller approval."
+    }
+  },
+  "minimum_current_source_pins_additions": {
+    "src/filesystem_recovery_context.rs": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d",
+    "src/fs_safety/recovery_placement.rs": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa",
+    "src/fs_safety/recovery_cache.rs": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db",
+    "src/fs_safety.rs": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34"
+  },
+  "new_task_DATA_only": {
+    "source": "New tuple88b3/tree3273/parentb68 and exact two source-pinned selectors. Add freeze4 current pins to retained donor source pin set as needed; do not replace actual full source/context guards with only review metadata.",
+    "plan": "Three actual labels compile-host-lib/inventory-host-lib/parent-host-lib-recovery-cache-two, one contract/invocation, two logical parents, inventory-derived N and N-2. Future actual ELF/N/results/context/resources/grant remain NULL.",
+    "remove_from_current_contract": "No helper_build, helper-use fixture environment, broad_filters, required_broad_names, four-selector assertions or state/client self-child membership requirements in this diagnostic scope. Keep such old fields only within explicit historical archive/data, never null placeholders that imply satisfied current obligations.",
+    "archive": "Archive raw genuine freeze/semantic/conservation/helper proof and relevant current source snapshots; keep old b68\u21920fa\u21925bead\u2192FFF2/4429 proof chain and held/negative receipts unchanged as predecessor provenance. Current read_bound and archive hash loops can consume new refs without schema invention."
+  },
+  "history_split_required": {
+    "trap": "Old current review is b68, old predecessor is0fa, and old assert review.parent==predecessor.head is valid only there. Replacing top tuple with88 while leaving old client/root checks pointed at it is invalid.",
+    "minimal_shape": "Use a clearly named current diagnostic binding for88 and separate hashed historical b68 task binding. Existing old raw proof reads may be kept as history against their OWN tuples, or archived without reinterpreting them as current admission; no current88 approval can be borrowed from them.",
+    "canonical": "Carry canonical9004 correction source/proofs/current policy map unchanged; fresh diagnostic controller caller/conservation review is still separate. Original direct-child/23generic+4nested/3790, default scheduler, five-name guard, no unknown signals and HOLD ordering stay conserved.",
+    "publication_snapshot": "reviewed-handoff7cfa product.public_source_write and author_validation.source_publication say NOT_PERFORMED. That immutable handoff predates later publication reported by Root. Bind any genuine later publication/readback separately; do not restamp this snapshot or invent a publication receipt."
+  },
+  "out_of_scope": "No adaptation code authored; no algorithms/imports/functions/helper/test/build/runtime/probes/Git mutation. No repeat semantic/conservation/helper audit or old RAW reinterpretation. Exact final code needs fresh independent review and authenticated execution admission.",
+  "controller_implementation": false,
+  "execution_authorized": false,
+  "current_runtime_grant": null
+}

@@ -1,0 +1,30 @@
+{
+  "schema": "issue2025-88b3-diagnostics-root-source-adoption-v1",
+  "utc": "2026-10-31T12:35:03.056549+00:00",
+  "product": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+  "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+  "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+  "source_reviews": [
+    {
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/reviewed-handoff.json",
+      "sha256": "7cfaee56000c53a8260bbfee025cf322fe5741fcaffd3dc441dd3552368b2dc9",
+      "bytes": 23481
+    },
+    {
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-semantic-uzo477zw/review.json",
+      "sha256": "da302e697c254632ca1c8afa3072ff7186143f99a83d73d9912509d513305afd",
+      "bytes": 9720
+    },
+    {
+      "path": "/var/tmp/coord16-2025-fixture-diagnostics-conservation-independent-jh2xlpb8/review.json",
+      "sha256": "202a53ecac61f7668148c26d72df1f3afe93363df2af709cb4733f0ef7308493",
+      "bytes": 24364
+    }
+  ],
+  "decision": "Adopt genuine independently reviewed cfg(test) diagnostic source only. Normal nonforce source publication is within existing authorized stewardship. No execution or new C allocation.",
+  "limits": [
+    "OriginalC9995 negative is immutable; cause/operand unknown; diagnostics have never executed.",
+    "Only existing observations and retained originalowner/error reported; no guard removal, environment override or new namespace probe.",
+    "Proposed threephase task adapter remains to implement and independently review; full347 qualification unchanged."
+  ]
+}

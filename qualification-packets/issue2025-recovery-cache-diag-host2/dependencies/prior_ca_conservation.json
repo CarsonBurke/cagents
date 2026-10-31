@@ -1,0 +1,1179 @@
+{
+  "schema": "coord16-2025-b68-independent-conservation-data-review-v1",
+  "recorded_utc": "2026-10-31T11:20:58.513234+00:00",
+  "verdict": "SCOPED_B68_CONSERVATION_AND_DATA_CLEAR",
+  "blocking_findings": [],
+  "scope": "Independent static BYTE conservation, complete sourcepayload hashes and proof/data joins only. Recovery separately owns new-main/caller-classification semantics. Not controller-wide semantic or runtime approval, RAW, resource/queue/grant admission.",
+  "identity": {
+    "controller_head": "ca92176d598775acb7dd94d54df8d54dec21ea9e",
+    "tree": "43709cf57725d905d3e9b2ff7438a54ed449874e",
+    "parent": "5a6a9b18769d70349dfd8a7151a1bb0d41580979",
+    "base": "9ad48800282e9195118efd030ac27748ec730a1e",
+    "product_head": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+    "product_tree": "c004d7b3eab00e166f4393eb93ec99c91484d03b",
+    "actual_product_parent": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386",
+    "runner_sha256": "6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01",
+    "plan_sha256": "91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78",
+    "manifest_sha256": "434beb67f4ae0bd7987d7e6bdcf67b6b69f4693e42a1d15a34e56826d566d3a6",
+    "binding_sha256": "4e40e5d09bd8a739dee208e4aa78244dbcdae0b340bf7a6177b490094f70f5d4",
+    "conservation_sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd",
+    "sourceproof_sha256": "b36fcdbaa6faff2f0b5b7399ef85e9253e7a9feeb9de2c9b5b41be68dc09cb20",
+    "9ad_runner_sha256": "29aa8c8336a6afe546a2587777bd47bd05746aeb6f542d9dc2a2d62b9e8a0032"
+  },
+  "verification_basis": {
+    "original_complete_static_check_tool": "801df2",
+    "original_static_check_count": 34,
+    "initial_passed": 33,
+    "initial_failed_predicate": "groupdata_remove_only_membership_policy_existingclient_presence_restores9ad",
+    "correction_tool": "106248",
+    "correction": "Reduced group dictionary was already exactly9ad. Incorrect extra predicate searched fully-qualified harness name as literal Rust source; source contains bare fn declaration. Corrected bare fn preexistence and dictionary inverse both pass.",
+    "all34_logical_checks_now_satisfied": true,
+    "final_revalidated": "All94 payload/Git/FS hashes,52archives,13pins,24+4/functions/block/tail, full inverse/literal restoration, corrected group inverse, external proofs and DAG rechecked by final receipt writer.",
+    "no_original_source_or_evidence_mutation": true
+  },
+  "all94_member_pins": {
+    "README.md": {
+      "sha256": "cb625ab26fd32d8cdda66da6b120063e3d4effb3f45816454e1993ef79607940",
+      "bytes": 5907,
+      "mode_type_blob": "100644 blob 90eb04ab9c4f7e6bb4d19d7b5d7a9d3ab8feb5b6"
+    },
+    "base-product-source/src/host/state.rs": {
+      "sha256": "34d2272d1d614d5b0425befc89ee0666303fe0c4e1e0a2bbcf206951331ccca5",
+      "bytes": 334528,
+      "mode_type_blob": "100644 blob 2a286e982b44065b3b1182119f9e603d2fedc67a"
+    },
+    "client-runtime-original-source-tool-results.json": {
+      "sha256": "4eeb9d85e00c661384e1fc3e46891139309d6efff72ea58b304cd3832bb37941",
+      "bytes": 235055,
+      "mode_type_blob": "100644 blob 39c97ec67c419109cfbf2a81995b276829553988"
+    },
+    "client-runtime-source-proof.json": {
+      "sha256": "b36fcdbaa6faff2f0b5b7399ef85e9253e7a9feeb9de2c9b5b41be68dc09cb20",
+      "bytes": 9619,
+      "mode_type_blob": "100644 blob 09aedff5c5e7c9ae6de2c79e6f0f555b67df199b"
+    },
+    "client-runtime-task.diff": {
+      "sha256": "01c365991aaed424983bc0093c5e38164757490f2d5012728b60dfec25be9212",
+      "bytes": 19713,
+      "mode_type_blob": "100644 blob cd1e1711e0ac190f59a9a6743ca2d24b1e21e637"
+    },
+    "client-runtime-task.inverse.diff": {
+      "sha256": "2b43f1951e1f753f4dc4c0fe54dc982402aba0c2346936a1a96cebaaa0d7e82a",
+      "bytes": 19713,
+      "mode_type_blob": "100644 blob aef0cbd2b719283024a5fba5afb4bac2d3005b19"
+    },
+    "command-data.json": {
+      "sha256": "2280bada4da3938cf0261a08b22bd8fcc19907a6ea2680d19467d328014836b6",
+      "bytes": 25228,
+      "mode_type_blob": "100644 blob b18a36eb3ef43823c835843c27a2d63e2ec95f58"
+    },
+    "compact-terminal-original-source-tool-results.json": {
+      "sha256": "ec1a2adedfad125567e6b2c9fae74ededaa9a10e0f77566e5bf7fbe7e1c07d2d",
+      "bytes": 59811,
+      "mode_type_blob": "100644 blob c01ca8ce549bf876a9e70dde9cbd65e205211ecd"
+    },
+    "compact-terminal-source-proof.json": {
+      "sha256": "e46d6b54a5907cbc0fdda7fdc87f503c22d6ae3a8bd4d50fd978d9b7a8b36924",
+      "bytes": 3850,
+      "mode_type_blob": "100644 blob 0a8e884c8973c16e3a0577c773d4999ba4603f28"
+    },
+    "compact-terminal.diff": {
+      "sha256": "3876732ded4e071f4c659bffe272b9368969dfa65713d9f4fbbb35d64542a133",
+      "bytes": 2377,
+      "mode_type_blob": "100644 blob 80ea5fff7f4ec2ae0f1d71159f2ed739bd4e5bde"
+    },
+    "compact-terminal.inverse.diff": {
+      "sha256": "7b9c00a4f41fcd727e3d2ec10e79da18493a56ad31733569ddc0bd56dbb90d54",
+      "bytes": 2377,
+      "mode_type_blob": "100644 blob bdda00d57aa945ef5992607a9f2d32016d1e1a10"
+    },
+    "current-source-map.json": {
+      "sha256": "9be378cd83c50d47b368ece7f4dbae68ebf82e54841da7153f338c1f766e8969",
+      "bytes": 19661,
+      "mode_type_blob": "100644 blob 9debc614f7b8a0335cf227b4192b9e08d9a189a6"
+    },
+    "dependencies/barrier_handoff.json": {
+      "sha256": "15318b580693a69f503974b1c79ec3461b15b7bc33bb2ba6ebdbdfa115312ac8",
+      "bytes": 2919,
+      "mode_type_blob": "100644 blob a59b91d99ca22de3d0cd77c78a4adc9e748de018"
+    },
+    "dependencies/barrier_review.json": {
+      "sha256": "84c516a3f453c6eab74be043e7536a51994156f552229c8194ca9ff8f1d23b3c",
+      "bytes": 6328,
+      "mode_type_blob": "100644 blob 3f96d543c7d8d192e2cdefd32e0fe29a63cde687"
+    },
+    "dependencies/client_runtime_conservation.json": {
+      "sha256": "95b218d0fd74087da84d6b777208df37c26349bd49a7b24a18f98f1d73811f78",
+      "bytes": 7642,
+      "mode_type_blob": "100644 blob fa66b44a62c58a898513730e3b658a65f5fad7c7"
+    },
+    "dependencies/client_runtime_finding.json": {
+      "sha256": "f199b0283f58288d2efe38b7050680a49e16228c1f9a979531906b471e56dbdd",
+      "bytes": 9753,
+      "mode_type_blob": "100644 blob b609ba10703b6c97de9b7b0e787e4331078b701e"
+    },
+    "dependencies/client_runtime_freeze.json": {
+      "sha256": "cb3103c7a5dd2175f444504bead3e9f7e0a16e7352eff63545a9ac993aec5171",
+      "bytes": 1973,
+      "mode_type_blob": "100644 blob cb1bce74e40caa9ac6c69e0bb6039188283dde61"
+    },
+    "dependencies/client_runtime_intake.json": {
+      "sha256": "5d6f82b81e6ba61d9b55dbc876b69b09537a294ef37055d157b490a50beba305",
+      "bytes": 4860,
+      "mode_type_blob": "100644 blob 0b537065f40193fe64343332be178a5d0238f7c6"
+    },
+    "dependencies/client_runtime_publication.json": {
+      "sha256": "0828d2136be768e3c1203e94a9bbbd2ea7ae820fd4183cb0f26fb0253449931d",
+      "bytes": 1966,
+      "mode_type_blob": "100644 blob 9ad7c44ca3e91926060a85c19feffc54c7f850da"
+    },
+    "dependencies/client_runtime_semantic.json": {
+      "sha256": "686d0105466bce94969c9210bb6ceec483bf7c76eb96ffc56de4dc16e34fb5b3",
+      "bytes": 6713,
+      "mode_type_blob": "100644 blob bd3fbfafcf9eac415e5b4e1cb83e9404271347cd"
+    },
+    "dependencies/conservation_review.json": {
+      "sha256": "f9ed915d39429a57cfcfcb0741e2bc85b2dec03e620fc04d96e2f959d5c307d2",
+      "bytes": 851665,
+      "mode_type_blob": "100644 blob c4bffde3527c8d5297184ba548827dce760d6855"
+    },
+    "dependencies/donor-plan.json": {
+      "sha256": "638ee9161d67569532668e540132f166cb11e557e23440eca979818106ac5790",
+      "bytes": 17690,
+      "mode_type_blob": "100644 blob b2c1a90713cd5867be315214383e0dc966993829"
+    },
+    "dependencies/donor-run-packet.py": {
+      "sha256": "9a79bc3991854316421396b44a87b50486174a4995a6ff6e44a3fd7c0ac35369",
+      "bytes": 60352,
+      "mode_type_blob": "100644 blob fb8c10db693ce5703e18f7152e9188be9e0086b7"
+    },
+    "dependencies/donor_review.json": {
+      "sha256": "52fdbd1b039cecc2de7b52cdc232fa644462a3549d581303429ca08cc90aaa16",
+      "bytes": 10178,
+      "mode_type_blob": "100644 blob 354ad09a01efaa90e2ed74f081fdb3999aa96081"
+    },
+    "dependencies/helper_review.json": {
+      "sha256": "da9de879a9826d172fcdeea76aba2f692084bdfe0b5de72de55a1ca80e73121f",
+      "bytes": 9452,
+      "mode_type_blob": "100644 blob 4c9e0468207cf8bbd7988145e6bab4ddc38b7552"
+    },
+    "dependencies/option_b_assignment.txt": {
+      "sha256": "fcab311df82835adc42143800e3bf22d34829f5f749375eac92a6721fd708a9b",
+      "bytes": 2247,
+      "mode_type_blob": "100644 blob 65301b15ce071a37b44d9f251c794318d5436f06"
+    },
+    "dependencies/option_b_r3_negative_review.json": {
+      "sha256": "a1d4c265730347e6fa1a716cb8f5381ae19ad63486499fd735fd11b7e1ad362b",
+      "bytes": 6279,
+      "mode_type_blob": "100644 blob 3aef0f9c717aa257a45e5f0584175f6278f9d958"
+    },
+    "dependencies/option_b_steering.txt": {
+      "sha256": "3f02d8801d274ab1c8c6d76474d646cf88d7278b55e8e825aacd71de22431b32",
+      "bytes": 1360,
+      "mode_type_blob": "100644 blob e07dcc7bbf3b4c2b63c0373bdc88439299e26afd"
+    },
+    "dependencies/primary-formatter-notes.json": {
+      "sha256": "255eb315330e2104d15e1e2a9269e6edafa5bfe09ab53b6430717861436c5fb4",
+      "bytes": 1694,
+      "mode_type_blob": "100644 blob 1d5bed213e6e3224ce39ce2705a16cfd48915b2c"
+    },
+    "dependencies/prior_r1_r2_review.json": {
+      "sha256": "08123d01fba1129cbfe22f32c175cb7a75c41860f56718f0706ebf2f4ffbad44",
+      "bytes": 6593,
+      "mode_type_blob": "100644 blob db3f5a33d1f8b87e5498acf412453baa84c30c1a"
+    },
+    "dependencies/private_data_conservation_review.json": {
+      "sha256": "406f527a968c4b56a9498e4e770a9842463b4c97751a5904bf71a5803b76426b",
+      "bytes": 6857,
+      "mode_type_blob": "100644 blob 9beb8b47e126d9684c027187c57ef9e06ed839f9"
+    },
+    "dependencies/private_data_freeze.json": {
+      "sha256": "f6405cce728f294a322db655fc56c32ccf25a1da5fd44adefdf35c1b809a7054",
+      "bytes": 1195,
+      "mode_type_blob": "100644 blob c473a83641bed3e5259459c4ae385ec89f9c023a"
+    },
+    "dependencies/private_data_semantic_review.json": {
+      "sha256": "df24b7f443b6694963a30679852c0f46debf2665834049950f375556359d4e01",
+      "bytes": 11174,
+      "mode_type_blob": "100644 blob f80905c5abd91fdbc5da2e3665e83cd5bf44d462"
+    },
+    "dependencies/private_roots_conservation_review.json": {
+      "sha256": "e13170396828c77349647b2bee528bb6a542432e90131b09db9a7f3ea88a0bb2",
+      "bytes": 10273,
+      "mode_type_blob": "100644 blob 13a6e7626fc504a3ef3aa4e39737bec75ca0c41e"
+    },
+    "dependencies/private_roots_freeze.json": {
+      "sha256": "6a74457d74a12cfb2dd83b83c771f3440a4d1b627d692e3ad35823f63ff37819",
+      "bytes": 1601,
+      "mode_type_blob": "100644 blob 043d3be6c9a92694dc90d04eed0bd5a38786821f"
+    },
+    "dependencies/private_roots_provider_review.json": {
+      "sha256": "222c57fd5969f3e9f9aa993c05c89ba8e0f93daee16973029b511b147fa25b75",
+      "bytes": 11053,
+      "mode_type_blob": "100644 blob d165242aed93f53e9c96ea943d7f70be6f85e63c"
+    },
+    "dependencies/private_roots_runtime_review.json": {
+      "sha256": "6f7fc6b5f0f4f356a2ae3641a2fb1d645e345cf287faa2f29b31169ee2ef455d",
+      "bytes": 11207,
+      "mode_type_blob": "100644 blob d42861ee54af6270f3eb99b355e94925a7564a4e"
+    },
+    "dependencies/proposal.json": {
+      "sha256": "80e64f9a111320d66b9f811e1aa356d62489fdc674fb6bda2d4410fe83645db7",
+      "bytes": 26758,
+      "mode_type_blob": "100644 blob 5f39e4e455867bbf362c53f3326fa29275f9342e"
+    },
+    "dependencies/proposal_handoff.json": {
+      "sha256": "c0e7f5f5e1da32f4ea649190b8b9c24442afb923bc0d1b6329ca3d2e0fd570f1",
+      "bytes": 8325,
+      "mode_type_blob": "100644 blob c99dc2e8b0025350c8796552d18a451dbe131542"
+    },
+    "dependencies/proposal_review.json": {
+      "sha256": "c2bd1b2a74ec0d5b793b355ad0788fa8d0eb77fecea10340eef25ca243a0442a",
+      "bytes": 9794,
+      "mode_type_blob": "100644 blob 8934d886d226c1d3f02ac19c8b3250f935624d1a"
+    },
+    "dependencies/publication.json": {
+      "sha256": "f2e7f6a93f8ad396f7837cc1e3119f93b7edd924453ebb840c7d801e87fda798",
+      "bytes": 1265,
+      "mode_type_blob": "100644 blob 774e9e5fb1f446cad922c019cad6e3d777d7be5a"
+    },
+    "dependencies/source_assignment.txt": {
+      "sha256": "4aa1c294e93cfcb8a0180496a1b6d98b68405dc489fc6fea719ba249166b6506",
+      "bytes": 2055,
+      "mode_type_blob": "100644 blob c7356ed7a2e72884f0ca92b5125431c888ca082b"
+    },
+    "dependencies/source_freeze.json": {
+      "sha256": "ad5b9cf7abf0a1f46c20e739e4f20efd443ea356cfb2c22605f0e5df63d57910",
+      "bytes": 1094,
+      "mode_type_blob": "100644 blob 976a784a9b2c7e3b6b6c5c2b0862941334c2653b"
+    },
+    "dependencies/source_intake.json": {
+      "sha256": "14c78b3145a78aecd4beab4fcf57d255abfb86f40fb8da7bbb2a1565bf349a00",
+      "bytes": 1708,
+      "mode_type_blob": "100644 blob 1bf14b87e1d40c94c5b30b063c825b20b5d2c679"
+    },
+    "from-cli5.diff": {
+      "sha256": "20bc844a18ff31525cbc108f6fa1a752d60021ad8d9dbb1d986b500d1d46ed3a",
+      "bytes": 54382,
+      "mode_type_blob": "100644 blob 4763fadfbde9093e4995e264a73aa3a0101b59f6"
+    },
+    "instruction-source-variance.json": {
+      "sha256": "cd9e52f842b2c5773f1e5f5577ceabb25fe6558a8db300dc2cbdf038d99f6aa2",
+      "bytes": 418,
+      "mode_type_blob": "100644 blob 2e00856e14e0ec4a382f1f80733ca97b77408ac4"
+    },
+    "intermediate-product-source/src/host/state.rs": {
+      "sha256": "aac7e678292efacb319e13d03d7507d032366c78d5cf72667fc78688ecb1206d",
+      "bytes": 334768,
+      "mode_type_blob": "100644 blob 29e72fae4627ceb00627f15d8969c1f22f10cda9"
+    },
+    "invocation-template.json": {
+      "sha256": "56d8d4376d5dd85af28c9d6b8caaf4fe42465470f594ca382c717039c32b4a7b",
+      "bytes": 1153,
+      "mode_type_blob": "100644 blob cbd696e54be37e34bce680998a037727bd8c5069"
+    },
+    "manifest.json": {
+      "sha256": "434beb67f4ae0bd7987d7e6bdcf67b6b69f4693e42a1d15a34e56826d566d3a6",
+      "bytes": 19370,
+      "mode_type_blob": "100644 blob e504e11cf1084a00c859862b41f82a3c4e1313ee"
+    },
+    "operational-gap-and-copy.json": {
+      "sha256": "58e5ae592c96894d95b4f72c4b223939c21097320bd67f65bdef15941ffccdc2",
+      "bytes": 9911,
+      "mode_type_blob": "100644 blob 7e0910f61b60c9875d99f334f7bdad3d749331e7"
+    },
+    "option-b-original-source-check-result.json": {
+      "sha256": "121d5f62ef514573c5b622ec32c291064fe039fe0443160a0abfdb59b204bd45",
+      "bytes": 3296,
+      "mode_type_blob": "100644 blob 2c9e997fe70a8b5590940f4b6d95beeebe2db446"
+    },
+    "option-b-source-proof.json": {
+      "sha256": "26eceafe2342a9493fe38fa1280c26ddec730bf76b63252d49193b4e1c177c45",
+      "bytes": 5043,
+      "mode_type_blob": "100644 blob c6e596ecdf399743c4ef3564aa1dd51db126695a"
+    },
+    "option-b.diff": {
+      "sha256": "1c110b24414494f9568d859a82b8cd367a9f04f92fd8470d4441d8bd5f02bad6",
+      "bytes": 24005,
+      "mode_type_blob": "100644 blob 7e7f958323dfeacf97e3c3f411b79c1041c7268a"
+    },
+    "option-b.inverse.diff": {
+      "sha256": "6cc02503c1e882e63f50aa95d1518021cdccc1fff39712238210bc9712852e08",
+      "bytes": 24005,
+      "mode_type_blob": "100644 blob fe991afea723f6d37b86379b834f325d541ac868"
+    },
+    "original-source-check-tool-results.json": {
+      "sha256": "a6ab492ee5fd5514b04942716f8434684e25d72038fe1f5f5dd8128239b38fb7",
+      "bytes": 2096,
+      "mode_type_blob": "100644 blob d5c7f8df1e524b8266f677987f93bd550d4f65c8"
+    },
+    "plan.json": {
+      "sha256": "91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78",
+      "bytes": 31743,
+      "mode_type_blob": "100644 blob f31bf95232fc623b2fadd6596c64b1042952d818"
+    },
+    "predecessor-product-source/src/host/client.rs": {
+      "sha256": "a93049717e7cf637663d069816b5023eca799005814742389019eada0905aac9",
+      "bytes": 154951,
+      "mode_type_blob": "100644 blob c0c095db53ee07e95482f9384962fe9bf80176e6"
+    },
+    "predecessor-product-source/src/host/state.rs": {
+      "sha256": "59616282704f9dd487bf480262db8ed01e629bc806ad941416c022bc83222008",
+      "bytes": 335768,
+      "mode_type_blob": "100644 blob c0d5be47718b855788a35000472b5c46d6461c45"
+    },
+    "private-data-current-instruction-source.json": {
+      "sha256": "dbf034e835b27512ad7dde82e1e80eb9de497410f85df9d06eec444fee8e82a4",
+      "bytes": 586,
+      "mode_type_blob": "100644 blob be83cb41f2d420dee5b27007413172f480c07dd5"
+    },
+    "private-data-original-source-check-tool-results.json": {
+      "sha256": "6a816cbf2d52c054e3b773c4cf4b5eb605eed210e5fcf1ffa68905c68b62a4b2",
+      "bytes": 128741,
+      "mode_type_blob": "100644 blob ea5f7fcec238827132cb874f755c04ef01b594a8"
+    },
+    "private-data-source-proof.json": {
+      "sha256": "ed598f2fb74d7d82d5203c1e4f9c50ca9530761fd6fd36ac456768c9367bb67a",
+      "bytes": 2661,
+      "mode_type_blob": "100644 blob 6362440cdbdbeb24034ffaa6895c35bcbae46e71"
+    },
+    "private-data-task.diff": {
+      "sha256": "9e43fcdfffae30e486b520d82d810ff011155828c630f81a375d6092d8c63b6e",
+      "bytes": 11198,
+      "mode_type_blob": "100644 blob 708c04da8b5b5f4ef1029e1f58d88ccb96cbcd6b"
+    },
+    "private-data-task.inverse.diff": {
+      "sha256": "5719573148870acff004232a22ff97bddd8acde2e6ac3ca64403f95bfdba66e9",
+      "bytes": 11198,
+      "mode_type_blob": "100644 blob 84f1cd4c2d2e3bed37e3a9bce0845b1023cd1be7"
+    },
+    "private-roots-original-source-tool-results.json": {
+      "sha256": "fc05b454e9aab4cd40825a25f73c51924f6d1c2a5422753dc06323a76d0a18b6",
+      "bytes": 78110,
+      "mode_type_blob": "100644 blob b6a0b0edd28430c15655195ce103fe1263472e29"
+    },
+    "private-roots-source-proof.json": {
+      "sha256": "0d0977bfa83d34240a2c3523302cfcbb0fab79ad3c7d62c2bebce1f0d7547b99",
+      "bytes": 4021,
+      "mode_type_blob": "100644 blob e48d63325e927f5572458e16bd3f1723653f0db2"
+    },
+    "private-roots-task.diff": {
+      "sha256": "35175a390d703c4494737d7b8c06ec5744a68b76d3bad1f898a2b408f5be6496",
+      "bytes": 17271,
+      "mode_type_blob": "100644 blob 95b8fa65ad99a56978f91b0498122286a9b5b751"
+    },
+    "private-roots-task.inverse.diff": {
+      "sha256": "887dfffe51c45ca9a108d68887ad53f314ad45d52d3196330298a3f04f6688ab",
+      "bytes": 17271,
+      "mode_type_blob": "100644 blob 3a8ce53832ec8bb63b64821fab12af86b5d7a5aa"
+    },
+    "product-source/.cargo/config.toml": {
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "bytes": 412,
+      "mode_type_blob": "100644 blob 0e2d20b442d9256e22ecbe4852d77e2a07c45409"
+    },
+    "product-source/Cargo.lock": {
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "bytes": 341188,
+      "mode_type_blob": "100644 blob 9ff31301cf43f2219a56415069c4d3026765f9bb"
+    },
+    "product-source/Cargo.toml": {
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "bytes": 13087,
+      "mode_type_blob": "100644 blob 3c67491c83a0077d18b41a73ff5850488ebdf0f5"
+    },
+    "product-source/build.rs": {
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "bytes": 4593,
+      "mode_type_blob": "100644 blob cc0447aee8720c7e850030ca36b5385665e6a275"
+    },
+    "product-source/src/bin/cagentsd.rs": {
+      "sha256": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+      "bytes": 4892,
+      "mode_type_blob": "100644 blob 1aa318c635fa46910bcd95b7d1dc1bbe7e178aae"
+    },
+    "product-source/src/daemon/child_reaper.rs": {
+      "sha256": "7c52d828e03b30a836c2cab79a172cdc2cda77189f8396cc7183ee7fce1c19fd",
+      "bytes": 68355,
+      "mode_type_blob": "100644 blob 81236f7f96a931e1e8d0a5faf414e7717016ca2a"
+    },
+    "product-source/src/host/chat.rs": {
+      "sha256": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838",
+      "bytes": 271017,
+      "mode_type_blob": "100644 blob e2fdeae4cf08c21a52e8bba396b5a0206cc64269"
+    },
+    "product-source/src/host/chat/retained_actor_tests.rs": {
+      "sha256": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658",
+      "bytes": 144063,
+      "mode_type_blob": "100644 blob f136959230e3a02fbd95e0975401e18141bfb266"
+    },
+    "product-source/src/host/client.rs": {
+      "sha256": "7e0a07181457290d13baa215b151d44b40c359737fdd03945061041519dda267",
+      "bytes": 155236,
+      "mode_type_blob": "100644 blob 4ce7f59a8cca0104ea00c3201660967493feaaf4"
+    },
+    "product-source/src/host/state.rs": {
+      "sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+      "bytes": 335799,
+      "mode_type_blob": "100644 blob 3e260c96907f6052960e34cb21b0ea1c0e603513"
+    },
+    "product-source/src/host/state/retained_child_shutdown_tests.rs": {
+      "sha256": "45501c8582b51ce5b72bd9165f8eda15f041da84a896434719bcda27d6eefc8e",
+      "bytes": 20565,
+      "mode_type_blob": "100644 blob 20a860b35b9999f2152b6b39aaf6b478f6620081"
+    },
+    "product-source/src/lib.rs": {
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "bytes": 350,
+      "mode_type_blob": "100644 blob f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e"
+    },
+    "product-source/src/modules.rs": {
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "bytes": 4143,
+      "mode_type_blob": "100644 blob 9e04bd958166835de80fc06502dd6cbe547111d6"
+    },
+    "r1-r2-correction.diff": {
+      "sha256": "98275743b9dd059f31024b5a94d17551128a6f26c4a4ea0f01aaea72f8d19d0b",
+      "bytes": 8571,
+      "mode_type_blob": "100644 blob d35141e6403876f4745572715797ae5e5f7b913d"
+    },
+    "r1-r2-correction.inverse.diff": {
+      "sha256": "cd5eecd06a4578c7247f31ba4538fb6f60371e4987dc24086e18b8362677df9d",
+      "bytes": 8571,
+      "mode_type_blob": "100644 blob b609df52dd0cca4325662f7759e9533c4cb699db"
+    },
+    "r1-r2-delta.json": {
+      "sha256": "f4351e09d3e9eca970031f669fc50834a7921437de4998de10ee4b629ba200ee",
+      "bytes": 1193,
+      "mode_type_blob": "100644 blob 3e143d866844cff3b1196bdee38785ecaec70954"
+    },
+    "r1-r2-original-source-check-result.json": {
+      "sha256": "8777db63b66dc0e67b26477ea9359bd127d3c3d380e90f38acdea6f14a1c6fa2",
+      "bytes": 2063,
+      "mode_type_blob": "100644 blob 6f95584398fe321d8b741a4ac101ec7a8cb17d9d"
+    },
+    "required-evidence-sticky-delta.json": {
+      "sha256": "fcf82b91b654f7f1f8ac9bd15c34489ccd404e1a2e2d169d7b89f560a5bd4243",
+      "bytes": 2583,
+      "mode_type_blob": "100644 blob dbc0992f5289db7a6f5fc225f0ee17c1875b5e64"
+    },
+    "required-evidence-sticky-original-source-check-result.json": {
+      "sha256": "ca410104fb5c3405e216af6cc9e3ed3aa643875adf230c995cca2a2a2cb0ebf5",
+      "bytes": 15399,
+      "mode_type_blob": "100644 blob 87e9a8412c626532b3736150a5b71d9528c92279"
+    },
+    "required-evidence-sticky.diff": {
+      "sha256": "3c053fdd9e21c5a65e362bf5c34be6e6fc785bf40ea103277eabfedfeca28c4a",
+      "bytes": 1962,
+      "mode_type_blob": "100644 blob 0c0b4b6b73ad8a0dadee7483ae86b3fa70b459fd"
+    },
+    "required-evidence-sticky.inverse.diff": {
+      "sha256": "c51d95565a6090b3312e90d0f6685a5b275faf5f2b43f048e2aeefcf4b0017b4",
+      "bytes": 1962,
+      "mode_type_blob": "100644 blob 297f1b04ea52228612c6013c63041b65fcbd78a4"
+    },
+    "run-packet.py": {
+      "sha256": "6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01",
+      "bytes": 96985,
+      "mode_type_blob": "100644 blob 923d4016243ec967d5fc8985a7a0ab03f3121a70"
+    },
+    "self-child-source-membership.json": {
+      "sha256": "09fb65bcffefa41d66c20b9a0cf1ebda1edd2b319ad115962feb4d90a5e0a896",
+      "bytes": 4896,
+      "mode_type_blob": "100644 blob 559b92c98ad40a7d6693ddb33601bc3cf6f2aa7b"
+    },
+    "source-binding.json": {
+      "sha256": "4e40e5d09bd8a739dee208e4aa78244dbcdae0b340bf7a6177b490094f70f5d4",
+      "bytes": 25048,
+      "mode_type_blob": "100644 blob 05e3033717fd16921f21e65e49989c99c2a478c4"
+    },
+    "source-checks.json": {
+      "sha256": "dd0ddfa355dcf593295e15357a4462e1d878da321d46d6f25c2802ae87932122",
+      "bytes": 2106,
+      "mode_type_blob": "100644 blob 0833a91a94082e49c154f2df928e97aede7f949a"
+    },
+    "source-conservation.json": {
+      "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd",
+      "bytes": 4605,
+      "mode_type_blob": "100644 blob 34c3816754aa13c41d95a2d4a2eb458f7f3b4b5a"
+    },
+    "to-cli5.inverse.diff": {
+      "sha256": "08186f5a85596463df3f46504c498abf151cbfa7a3f4b2d93c76443a482f5fff",
+      "bytes": 54382,
+      "mode_type_blob": "100644 blob 82eed7a2f9989a4f952dead95422f475d7d19163"
+    }
+  },
+  "tracked_tree_and_payload_fidelity": {
+    "all2219_nonpacket_modes_types_blobs_exact_b68": true,
+    "94members93payloads": true,
+    "52archives13sourcepins": true,
+    "all_member_FS_Git_hashes_stable": true,
+    "composition_only2sourcefiles": true,
+    "whole_live_FS_equality_claim": false
+  },
+  "runner_conservation": {
+    "only_changed_FunctionDefs": [
+      "grouped_contracts",
+      "main"
+    ],
+    "37others_BYTE_exact9ad": true,
+    "all24generic4originalnested_and5mainnested_exact": true,
+    "grouped_contracts_only4metadata_lines": [
+      "         'source_self_child_membership': [row for row in group['source_self_child_membership'] if row['parent'] in names],\n",
+      "         'captured_success_stream_policy': group['captured_success_stream_policy'],\n",
+      "         'source_self_child_membership': [row for row in group['source_self_child_membership'] if row['parent'] in broad],\n",
+      "         'captured_success_stream_policy': group['captured_success_stream_policy'],\n"
+    ],
+    "remove4metadata_restores_entire9ad_grouped_contracts": true,
+    "strict_result_accounting_execute_R1R2R3_helpers_binder_context": "BYTE_EXACT9AD",
+    "protected3790B_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "fullsummary_ledgers_Cclose_errors_HOLD_SHA256SUMS_compactExpr_markers_return_tail": "BYTE_EXACT9AD",
+    "tail_sha256": "33bdbde082e789ab562c1efc722cbc540e4cedded3c3aeded8bc729ffc8f254f",
+    "whole_runner_exact9ad_restore_twofunctions3literals": {
+      "literals": [
+        {
+          "name": "WT",
+          "current": "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-upgrade-client-runtime')",
+          "9ad": "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-upgrade-fixture-private-roots')"
+        },
+        {
+          "name": "PLAN",
+          "current": "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source/qualification-packets/issue2025-grouped-host/plan.json')",
+          "9ad": "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-private-roots-host-source/qualification-packets/issue2025-grouped-host/plan.json')"
+        },
+        {
+          "name": "PLAN_SHA",
+          "current": "PLAN_SHA = '91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78'",
+          "9ad": "PLAN_SHA = 'e4a3b455597d253bc36b9c52d698d7b7d8abca1b432d561143a75ff625f40ebc'"
+        }
+      ],
+      "restored_sha256": "29aa8c8336a6afe546a2587777bd47bd05746aeb6f542d9dc2a2d62b9e8a0032",
+      "exact": true
+    },
+    "true_forward_inverse": [
+      {
+        "path": "client-runtime-task.diff",
+        "sha256": "01c365991aaed424983bc0093c5e38164757490f2d5012728b60dfec25be9212",
+        "hunks": 9,
+        "result_sha256": "6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01",
+        "exact": true
+      },
+      {
+        "path": "client-runtime-task.inverse.diff",
+        "sha256": "2b43f1951e1f753f4dc4c0fe54dc982402aba0c2346936a1a96cebaaa0d7e82a",
+        "hunks": 9,
+        "result_sha256": "29aa8c8336a6afe546a2587777bd47bd05746aeb6f542d9dc2a2d62b9e8a0032",
+        "exact": true
+      }
+    ]
+  },
+  "source_proof_and_data": {
+    "current13source_pins": {
+      ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+      "src/host/state.rs": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+      "src/host/state/retained_child_shutdown_tests.rs": "45501c8582b51ce5b72bd9165f8eda15f041da84a896434719bcda27d6eefc8e",
+      "src/host/chat.rs": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838",
+      "src/host/chat/retained_actor_tests.rs": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658",
+      "src/daemon/child_reaper.rs": "7c52d828e03b30a836c2cab79a172cdc2cda77189f8396cc7183ee7fce1c19fd",
+      "src/host/client.rs": "7e0a07181457290d13baa215b151d44b40c359737fdd03945061041519dda267"
+    },
+    "actual4current_proof_originals_match_copies": {
+      "client_runtime_freeze": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_freeze.json",
+        "original_path": "/tmp/fw16-backend-ec204421/issue2025-client-runtime-source-v1/freeze.json",
+        "sha256": "cb3103c7a5dd2175f444504bead3e9f7e0a16e7352eff63545a9ac993aec5171",
+        "bytes": 1973,
+        "scope": "Genuine current b68 narrow source/publication metadata only; no runtime or wholehead approval"
+      },
+      "client_runtime_publication": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_publication.json",
+        "original_path": "/tmp/fw16-backend-ec204421/issue2025-b68f940d-reviewed-source-publication-v1.json",
+        "sha256": "0828d2136be768e3c1203e94a9bbbd2ea7ae820fd4183cb0f26fb0253449931d",
+        "bytes": 1966,
+        "scope": "Genuine current b68 narrow source/publication metadata only; no runtime or wholehead approval"
+      },
+      "client_runtime_semantic": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_semantic.json",
+        "original_path": "/tmp/issue2025-b68f940d-client-runtime-semantic-source-review-v1.json",
+        "sha256": "686d0105466bce94969c9210bb6ceec483bf7c76eb96ffc56de4dc16e34fb5b3",
+        "bytes": 6713,
+        "scope": "Genuine current b68 narrow source/publication metadata only; no runtime or wholehead approval"
+      },
+      "client_runtime_conservation": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source/qualification-packets/issue2025-grouped-host/dependencies/client_runtime_conservation.json",
+        "original_path": "/tmp/issue2025-b68f940d-client-runtime-conservation-review-v1.json",
+        "sha256": "95b218d0fd74087da84d6b777208df37c26349bd49a7b24a18f98f1d73811f78",
+        "bytes": 7642,
+        "scope": "Genuine current b68 narrow source/publication metadata only; no runtime or wholehead approval"
+      }
+    },
+    "current_b68_tuple": {
+      "head": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+      "tree": "c004d7b3eab00e166f4393eb93ec99c91484d03b",
+      "parent": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386"
+    },
+    "predecessor0fa": {
+      "head": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386",
+      "tree": "e183cf12a1f1546182192f29290e6ad805e913f1",
+      "parent": "5beadfd75cc74f5a3c59d82aad4e13b3dec210c0",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-upgrade-fixture-private-roots",
+      "source_paths_sha256": {
+        ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+        "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+        "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+        "src/host/state.rs": "59616282704f9dd487bf480262db8ed01e629bc806ad941416c022bc83222008",
+        "src/host/state/retained_child_shutdown_tests.rs": "45501c8582b51ce5b72bd9165f8eda15f041da84a896434719bcda27d6eefc8e",
+        "src/host/chat.rs": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838",
+        "src/host/chat/retained_actor_tests.rs": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658",
+        "src/daemon/child_reaper.rs": "7c52d828e03b30a836c2cab79a172cdc2cda77189f8396cc7183ee7fce1c19fd",
+        "src/host/client.rs": "a93049717e7cf637663d069816b5023eca799005814742389019eada0905aac9"
+      }
+    },
+    "intermediate5bead": {
+      "head": "5beadfd75cc74f5a3c59d82aad4e13b3dec210c0",
+      "tree": "9037a478fe198953e874979f2057e3fe7648016b",
+      "parent": "fff2a4d558a788ab70591baf93f0ff713537d38a",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-upgrade-fixture-data-isolation",
+      "source_paths_sha256": {
+        ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+        "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+        "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+        "src/host/state.rs": "aac7e678292efacb319e13d03d7507d032366c78d5cf72667fc78688ecb1206d",
+        "src/host/state/retained_child_shutdown_tests.rs": "45501c8582b51ce5b72bd9165f8eda15f041da84a896434719bcda27d6eefc8e",
+        "src/host/chat.rs": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838",
+        "src/host/chat/retained_actor_tests.rs": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658",
+        "src/daemon/child_reaper.rs": "7c52d828e03b30a836c2cab79a172cdc2cda77189f8396cc7183ee7fce1c19fd"
+      }
+    },
+    "BASEFFF2": {
+      "head": "fff2a4d558a788ab70591baf93f0ff713537d38a",
+      "tree": "45f9508843e11cc1d05b70d7fcc5b08aba3b9383",
+      "parent": "4429728a1f179ea7f7eaca9667156553209a46ac",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-upgrade-test-isolation-current-main",
+      "source_paths_sha256": {
+        ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+        "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+        "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+        "src/host/state.rs": "34d2272d1d614d5b0425befc89ee0666303fe0c4e1e0a2bbcf206951331ccca5",
+        "src/host/state/retained_child_shutdown_tests.rs": "45501c8582b51ce5b72bd9165f8eda15f041da84a896434719bcda27d6eefc8e",
+        "src/host/chat.rs": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838",
+        "src/host/chat/retained_actor_tests.rs": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658",
+        "src/daemon/child_reaper.rs": "7c52d828e03b30a836c2cab79a172cdc2cda77189f8396cc7183ee7fce1c19fd"
+      }
+    },
+    "all_prior_snapshots_and_rawproofs_preserved_not_retargeted": true,
+    "twofile_product_delta": {
+      "added7_removed2": true,
+      "client5lineguard_removal_restores_entire0fa_clientfile": true,
+      "state2visibility_normalization_restores_entire0fa_statefile_and_original_helperbody": true,
+      "old_assertions_and_client_body_exact_exceptnewguard": true,
+      "all2217_otherentries_exact0fa": true,
+      "no_new_test": "host::client::tests::slow_chat_close_allows_list_but_fences_upgrade_and_shutdown"
+    },
+    "source_self_child_contract": {
+      "kind": "SOURCE_DERIVED_SELF_CHILD_MEMBERSHIP_SEPARATE_FROM_EXPOSED_STDOUT",
+      "product": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+      "members": [
+        {
+          "parent": "host::client::tests::slow_chat_close_allows_list_but_fences_upgrade_and_shutdown",
+          "source": "src/host/client.rs",
+          "source_sha256": "7e0a07181457290d13baa215b151d44b40c359737fdd03945061041519dda267",
+          "definition_line": 2103,
+          "guard_line": 2106,
+          "call": "super::super::state::tests::upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::a_handoff_no_window_can_still_save_stops_refusing_the_upgrade",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6483,
+          "guard_line": 6484,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::committed_upgrade_fences_control_and_retains_checkpoint_until_close",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6443,
+          "guard_line": 6444,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::idle_and_ended_claude_conversations_do_not_block_an_upgrade",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 5902,
+          "guard_line": 5903,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::native_upgrade_retains_hidden_lineage_and_restarts_final_claude_conversation_once",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6058,
+          "guard_line": 6059,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6900,
+          "guard_line": 6901,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::upgrade_agent_relaunch_requires_opt_in_and_survives_repeated_restore",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 5779,
+          "guard_line": 5780,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::upgrade_commit_failure_preserves_live_control_authority",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6401,
+          "guard_line": 6402,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        },
+        {
+          "parent": "host::state::tests::upgrade_rejects_stale_inventory_and_pending_reservations_without_shutdown",
+          "source": "src/host/state.rs",
+          "source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+          "definition_line": 6424,
+          "guard_line": 6425,
+          "call": "upgrade_fixture_in_fresh_process()",
+          "role": "SOURCE_SELF_CHILD_MEMBERSHIP_NOT_OBSERVED_PID_WAIT_OR_PASS"
+        }
+      ],
+      "policy": {
+        "helper_source": "src/host/state.rs",
+        "helper_source_sha256": "5530dc5fe06ccf0f831e0ce714440ce35e462855d4bef107e02e61b0c210720b",
+        "helper_body_sha256": "67db26ba110fd06e3ed08b5d68c06449759aa72bed1d0fd709606cfd443ecd6c",
+        "stdout_sink": "private stdout_path File",
+        "stderr_sink": "private stderr_path File",
+        "success_stream_action": "validate one exact child named result/footer then output.close(); no stdout replay",
+        "successful_stdout_replay_calls": [],
+        "derived_exposed_stdout_result_count": 0,
+        "scope": "Source-derived captured-success-stream policy, not observed child output/exit/custody/pass credit"
+      },
+      "client_parent": "host::client::tests::slow_chat_close_allows_list_but_fences_upgrade_and_shutdown",
+      "source_caller_count": 9,
+      "runtime_child_count": null
+    },
+    "source_caller_limits": "Source records and captured-success-stream policy only. Runtime childcountNULL. No record becomes PID/wait/pass credit; Recovery independently owns classification/admission.",
+    "group_data_inverse": "Remove membership/policy metadata plus existing client presence from predicted inventory and mandatory broad list, exact9ad group restored. Same original narrow4 selectors/broadfilters, no added test or Npreset.",
+    "same5phases_defaultgroups_budgets": [
+      900,
+      600,
+      30,
+      180,
+      600
+    ],
+    "same2310within2400_jobs2_Rust193_existingtarget_HOSTonly": true,
+    "same5_refusal_NAMES": [
+      "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+      "RUST_TEST_NOCAPTURE",
+      "RUST_TEST_THREADS",
+      "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+      "CAGENTS_RETAINED_ACTOR_FIXTURE"
+    ],
+    "actual_runtime_counts_N347_helper_ELF_grant_results": "ALL_NULL",
+    "template": {
+      "kind": "CLIENT_RUNTIME_PRE_REVIEW_TEMPLATE_NOT_SUBMITTABLE_NOT_ADMITTED",
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+      "argv": [
+        "/usr/bin/python3",
+        "-I",
+        "-B",
+        "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source/qualification-packets/issue2025-grouped-host/run-packet.py",
+        "--grant",
+        null,
+        "--runner-sha256",
+        "6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01",
+        "--controller-review",
+        null,
+        "--controller-review-sha256",
+        null
+      ],
+      "plan_sha256": "91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78",
+      "external_handoff_required": "Fresh genuine finalCODE review remains external. Root binds exact frozen controller/product and actual review path/hash in a separate handoff after review, leaving only grant slot5 NULL. Current review/grant slots are NULL and template is NOT SUBMITTABLE.",
+      "execution_authorized": false,
+      "source_only_invocation_correction": "Absolute /usr/bin/python3 -I -B remains fixed; no interpreter or environment probe."
+    },
+    "manifest_selfexcluded_exactcurrent_JSONhash_DAG_acyclic": true
+  },
+  "original_static_tool_history": {
+    "author_frozen_receipts": {
+      "/var/tmp/coord16-2025-b68-author-freeze-kxx0ja6_/receipt.json": "a8b353479f4e367e608325812e4038202678757f670eba77df101dda3a3768ef",
+      "/var/tmp/coord16-2025-b68-author-freeze-kxx0ja6_/original-source-freeze-tool-results.json": "65dfdac54ace260e4098882f179514438e3e18b1a130b3d97b7bb56464abb785",
+      "/var/tmp/coord16-2025-final-private-roots-conservation-independent-tgqcmoar/review.json": "aeabae0a11aa830e35cdb1be43a7c602a0e7dfbd9fa11fdb9db811dcb8e11047"
+    },
+    "author_original_git_command_results": [
+      {
+        "argv": [
+          "git",
+          "add",
+          "--",
+          "qualification-packets/issue2025-grouped-host/"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "diff",
+          "--cached",
+          "--name-only",
+          "-z"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "qualification-packets/issue2025-grouped-host/README.md\u0000qualification-packets/issue2025-grouped-host/client-runtime-original-source-tool-results.json\u0000qualification-packets/issue2025-grouped-host/client-runtime-source-proof.json\u0000qualification-packets/issue2025-grouped-host/client-runtime-task.diff\u0000qualification-packets/issue2025-grouped-host/client-runtime-task.inverse.diff\u0000qualification-packets/issue2025-grouped-host/command-data.json\u0000qualification-packets/issue2025-grouped-host/current-source-map.json\u0000qualification-packets/issue2025-grouped-host/dependencies/client_runtime_conservation.json\u0000qualification-packets/issue2025-grouped-host/dependencies/client_runtime_finding.json\u0000qualification-packets/issue2025-grouped-host/dependencies/client_runtime_freeze.json\u0000qualification-packets/issue2025-grouped-host/dependencies/client_runtime_intake.json\u0000qualification-packets/issue2025-grouped-host/dependencies/client_runtime_publication.json\u0000qualification-packets/issue2025-grouped-host/dependencies/client_runtime_semantic.json\u0000qualification-packets/issue2025-grouped-host/invocation-template.json\u0000qualification-packets/issue2025-grouped-host/manifest.json\u0000qualification-packets/issue2025-grouped-host/plan.json\u0000qualification-packets/issue2025-grouped-host/predecessor-product-source/src/host/client.rs\u0000qualification-packets/issue2025-grouped-host/predecessor-product-source/src/host/state.rs\u0000qualification-packets/issue2025-grouped-host/product-source/src/host/client.rs\u0000qualification-packets/issue2025-grouped-host/product-source/src/host/state.rs\u0000qualification-packets/issue2025-grouped-host/run-packet.py\u0000qualification-packets/issue2025-grouped-host/self-child-source-membership.json\u0000qualification-packets/issue2025-grouped-host/source-binding.json\u0000qualification-packets/issue2025-grouped-host/source-checks.json\u0000qualification-packets/issue2025-grouped-host/source-conservation.json\u0000",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "diff",
+          "--cached",
+          "--check",
+          "--",
+          "qualification-packets/issue2025-grouped-host/README.md",
+          "qualification-packets/issue2025-grouped-host/client-runtime-original-source-tool-results.json",
+          "qualification-packets/issue2025-grouped-host/client-runtime-source-proof.json",
+          "qualification-packets/issue2025-grouped-host/command-data.json",
+          "qualification-packets/issue2025-grouped-host/current-source-map.json",
+          "qualification-packets/issue2025-grouped-host/dependencies/client_runtime_conservation.json",
+          "qualification-packets/issue2025-grouped-host/dependencies/client_runtime_finding.json",
+          "qualification-packets/issue2025-grouped-host/dependencies/client_runtime_freeze.json",
+          "qualification-packets/issue2025-grouped-host/dependencies/client_runtime_intake.json",
+          "qualification-packets/issue2025-grouped-host/dependencies/client_runtime_publication.json",
+          "qualification-packets/issue2025-grouped-host/dependencies/client_runtime_semantic.json",
+          "qualification-packets/issue2025-grouped-host/invocation-template.json",
+          "qualification-packets/issue2025-grouped-host/manifest.json",
+          "qualification-packets/issue2025-grouped-host/plan.json",
+          "qualification-packets/issue2025-grouped-host/predecessor-product-source/src/host/client.rs",
+          "qualification-packets/issue2025-grouped-host/predecessor-product-source/src/host/state.rs",
+          "qualification-packets/issue2025-grouped-host/product-source/src/host/client.rs",
+          "qualification-packets/issue2025-grouped-host/product-source/src/host/state.rs",
+          "qualification-packets/issue2025-grouped-host/run-packet.py",
+          "qualification-packets/issue2025-grouped-host/self-child-source-membership.json",
+          "qualification-packets/issue2025-grouped-host/source-binding.json",
+          "qualification-packets/issue2025-grouped-host/source-checks.json",
+          "qualification-packets/issue2025-grouped-host/source-conservation.json"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "diff",
+          "--cached",
+          "--check",
+          "--",
+          "qualification-packets/issue2025-grouped-host/"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 2,
+        "stdout": "qualification-packets/issue2025-grouped-host/client-runtime-task.diff:6: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.diff:21: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.diff:22: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.diff:35: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.diff:36: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.inverse.diff:6: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.inverse.diff:21: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.inverse.diff:22: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.inverse.diff:35: trailing whitespace.\n+ \nqualification-packets/issue2025-grouped-host/client-runtime-task.inverse.diff:36: trailing whitespace.\n+ \n",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "-c",
+          "core.hooksPath=/dev/null",
+          "commit",
+          "-m",
+          "Bind grouped HOST qualification source to reviewed client runtime fixture"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "[qualification/coord16-issue2025-client-runtime-host-source ca92176d5] Bind grouped HOST qualification source to reviewed client runtime fixture\n 25 files changed, 18543 insertions(+), 232 deletions(-)\n create mode 100644 qualification-packets/issue2025-grouped-host/client-runtime-original-source-tool-results.json\n create mode 100644 qualification-packets/issue2025-grouped-host/client-runtime-source-proof.json\n create mode 100644 qualification-packets/issue2025-grouped-host/client-runtime-task.diff\n create mode 100644 qualification-packets/issue2025-grouped-host/client-runtime-task.inverse.diff\n create mode 100644 qualification-packets/issue2025-grouped-host/dependencies/client_runtime_conservation.json\n create mode 100644 qualification-packets/issue2025-grouped-host/dependencies/client_runtime_finding.json\n create mode 100644 qualification-packets/issue2025-grouped-host/dependencies/client_runtime_freeze.json\n create mode 100644 qualification-packets/issue2025-grouped-host/dependencies/client_runtime_intake.json\n create mode 100644 qualification-packets/issue2025-grouped-host/dependencies/client_runtime_publication.json\n create mode 100644 qualification-packets/issue2025-grouped-host/dependencies/client_runtime_semantic.json\n create mode 100644 qualification-packets/issue2025-grouped-host/predecessor-product-source/src/host/client.rs\n create mode 100644 qualification-packets/issue2025-grouped-host/predecessor-product-source/src/host/state.rs\n create mode 100644 qualification-packets/issue2025-grouped-host/product-source/src/host/client.rs\n create mode 100644 qualification-packets/issue2025-grouped-host/self-child-source-membership.json\n",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "rev-parse",
+          "HEAD"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "ca92176d598775acb7dd94d54df8d54dec21ea9e\n",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "rev-parse",
+          "HEAD^{tree}"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "43709cf57725d905d3e9b2ff7438a54ed449874e\n",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "rev-parse",
+          "HEAD^"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "5a6a9b18769d70349dfd8a7151a1bb0d41580979\n",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "branch",
+          "--show-current"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "qualification/coord16-issue2025-client-runtime-host-source\n",
+        "stderr": ""
+      },
+      {
+        "argv": [
+          "git",
+          "status",
+          "--porcelain=v1"
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    ],
+    "original_source_freeze_metadata": {
+      "kind": "COMPLETE_ORIGINAL_SOURCE_FREEZE_EXEC_METADATA_NOT_RUNTIME",
+      "packet_frozen_head": "ca92176d598775acb7dd94d54df8d54dec21ea9e",
+      "packet_writing_released": true,
+      "manifest": {
+        "command": "python3 -I -B - <<'PY'\nfrom pathlib import Path\nimport hashlib,json\np=Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source/qualification-packets/issue2025-grouped-host')\nsha=lambda raw:hashlib.sha256(raw).hexdigest()\ndef pin(name):return sha((p/name).read_bytes())\nplan=json.loads((p/'plan.json').read_text());manifest=json.loads((p/'manifest.json').read_text())\nmanifest.update(kind='EXTERNAL_B68_TASK_SOURCE_PAYLOAD_INDEX_NOT_SELF_HASHED_NOT_RUNTIME_ADMISSION',controller_head=None,controller_tree=None,controller_component_base='9ad48800282e9195118efd030ac27748ec730a1e',controller_binding_base='9ad48800282e9195118efd030ac27748ec730a1e',product_head=plan['product_head'],product_tree=plan['product_tree'],product_parent=plan['product_parent'],runner_sha256=pin('run-packet.py'),plan_sha256=pin('plan.json'),source_binding_sha256=pin('source-binding.json'),source_conservation_sha256=pin('source-conservation.json'),current_source_proof_sha256=pin('client-runtime-source-proof.json'),original_source_tools_sha256=pin('client-runtime-original-source-tool-results.json'),invocation_template_sha256=pin('invocation-template.json'),source_pins=plan['source_paths_sha256'],runtime_archive_bindings=len(plan['archive_bindings']),source_assignment='Authenticated EC70f6635e-3077-4ad0-a9e3-7c312497c7f7 via Root intake5d6f82b8; SOURCE ONLY, no runtime grant',source_review_scopes='Actual b68 freeze/publication/semantic/conservation schemas with two current files; old0fa/5bead/FFF2/4429 genuine predecessor/base provenance retained separately. No wholehead/runtime/CI approval.',historical_evidence='9ad/0fa/fd6/3f6/5bead/d412/4098 and old utilityUNKNOWN/static failures/truncation/whitespace/instruction variance retained; no result transfer.')\nmanifest['payloads']=[{'path':str(x.relative_to(p)),'sha256':sha(x.read_bytes()),'bytes':x.stat().st_size}for x in sorted(p.rglob('*'))if x.is_file()and x.name!='manifest.json']\nmanifest['payload_count']=len(manifest['payloads']);manifest['manifest_excluded_from_index']=True\n(p/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\\n')\nfor row in manifest['payloads']:\n path=p/row['path'];assert pin(row['path'])==row['sha256'] and path.stat().st_size==row['bytes']\nassert all(value is None for value in plan['actual'].values())\nassert not manifest['execution_authorized']and manifest['current_controller_code_review']is None\nprint(json.dumps({'runner':pin('run-packet.py'),'plan':pin('plan.json'),'manifest':pin('manifest.json'),'source_binding':pin('source-binding.json'),'conservation':pin('source-conservation.json'),'proof':pin('client-runtime-source-proof.json'),'original_source_tools':pin('client-runtime-original-source-tool-results.json'),'template':pin('invocation-template.json'),'payload_count':manifest['payload_count'],'member_count':manifest['payload_count']+1,'archive_bindings':len(plan['archive_bindings']),'source_pins':len(plan['source_paths_sha256']),'runtime':None,'grant':None,'execution_authorized':False},sort_keys=True))\nPY",
+        "result": {
+          "chunk_id": "075a97",
+          "wall_time_seconds": 1.2534e-05,
+          "exit_code": 0,
+          "original_token_count": 201,
+          "output": "{\"archive_bindings\": 52, \"conservation\": \"6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd\", \"execution_authorized\": false, \"grant\": null, \"manifest\": \"434beb67f4ae0bd7987d7e6bdcf67b6b69f4693e42a1d15a34e56826d566d3a6\", \"member_count\": 94, \"original_source_tools\": \"4eeb9d85e00c661384e1fc3e46891139309d6efff72ea58b304cd3832bb37941\", \"payload_count\": 93, \"plan\": \"91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78\", \"proof\": \"b36fcdbaa6faff2f0b5b7399ef85e9253e7a9feeb9de2c9b5b41be68dc09cb20\", \"runner\": \"6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01\", \"runtime\": null, \"source_binding\": \"4e40e5d09bd8a739dee208e4aa78244dbcdae0b340bf7a6177b490094f70f5d4\", \"source_pins\": 13, \"template\": \"56d8d4376d5dd85af28c9d6b8caaf4fe42465470f594ca382c717039c32b4a7b\"}\n"
+        }
+      },
+      "local_commit": {
+        "command": "python3 -I -B - <<'PY'\nfrom pathlib import Path\nimport hashlib,json,subprocess,tempfile\nroot=Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source')\nprefix='qualification-packets/issue2025-grouped-host/'\np=root/prefix\nrecords=[]\ndef run(*args):\n result=subprocess.run(['git',*args],cwd=root,capture_output=True,text=True)\n records.append({'argv':['git',*args],'cwd':str(root),'exit_code':result.returncode,'stdout':result.stdout,'stderr':result.stderr})\n return result\nassert run('add','--',prefix).returncode==0\nstaged=run('diff','--cached','--name-only','-z');assert staged.returncode==0\npaths=[value for value in staged.stdout.split('\\0')if value];assert paths and all(name.startswith(prefix)for name in paths)\nauthored=run('diff','--cached','--check','--',*[name for name in paths if not name.endswith('.diff')]);assert authored.returncode==0\nall_data=run('diff','--cached','--check','--',prefix);assert all_data.returncode in (0,2)\n# Raw diff blank-context spaces remain DATA, never stripped or reported as all-folder PASS.\nif all_data.returncode:\n assert all(line.startswith(prefix)and '.diff:'in line or line.startswith('+')or line==''for line in all_data.stdout.splitlines())\ncommit=run('-c','core.hooksPath=/dev/null','commit','-m','Bind grouped HOST qualification source to reviewed client runtime fixture')\nassert commit.returncode==0\nhead=run('rev-parse','HEAD');tree=run('rev-parse','HEAD^{tree}');parent=run('rev-parse','HEAD^');branch=run('branch','--show-current');status=run('status','--porcelain=v1')\nassert all(row['exit_code']==0 for row in records[-5:])and not status.stdout\nsha=lambda raw:hashlib.sha256(raw).hexdigest()\nmanifest=json.loads((p/'manifest.json').read_text())\nreceipt={'kind':'B68_AUTHOR_LOCAL_PACKET_COMMIT_AND_CHEAP_SOURCE_GIT_RESULTS_NOT_REVIEW_OR_EXECUTION','worktree':str(root),'branch':branch.stdout.strip(),'head':head.stdout.strip(),'tree':tree.stdout.strip(),'parent':parent.stdout.strip(),'controller_base':'9ad48800282e9195118efd030ac27748ec730a1e','product':{'head':manifest['product_head'],'tree':manifest['product_tree'],'parent':manifest['product_parent']},'hashes':{name:sha((p/name).read_bytes())for name in ['run-packet.py','plan.json','manifest.json','source-binding.json','source-conservation.json','client-runtime-source-proof.json','client-runtime-original-source-tool-results.json','client-runtime-task.diff','client-runtime-task.inverse.diff','invocation-template.json']},'source_pins':manifest['source_pins'],'members':manifest['payload_count']+1,'payloads':manifest['payload_count'],'archive_bindings':manifest['runtime_archive_bindings'],'git_status_porcelain':status.stdout,'authored_non_diff_whitespace_exit':authored.returncode,'all_packet_including_raw_diff_whitespace_exit':all_data.returncode,'raw_diff_spaces_preserved':True,'full_original_git_command_results':records,'instruction_FS_Git_variance':json.loads((p/'client-runtime-source-proof.json').read_text())['current_instructions'],'writing_released':True,'independent_code_review':None,'current_runtime_facts':None,'execution_authorized':False,'candidate_algorithms_builds_tests_native':'UNRUN'}\nout=Path(tempfile.mkdtemp(prefix='coord16-2025-b68-author-freeze-',dir='/var/tmp'));(out/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\\n')\nprint(json.dumps({'receipt':str(out/'receipt.json'),'receipt_sha256':sha((out/'receipt.json').read_bytes()),'head':receipt['head'],'tree':receipt['tree'],'parent':receipt['parent'],'hashes':receipt['hashes'],'members':receipt['members'],'payloads':receipt['payloads'],'archives':receipt['archive_bindings'],'authored_whitespace_exit':authored.returncode,'raw_diff_whitespace_exit':all_data.returncode,'status_clean':not status.stdout,'writer_released':True,'current_execution_authorized':False},sort_keys=True))\nPY",
+        "result": {
+          "chunk_id": "4efb1a",
+          "wall_time_seconds": 0.014848485,
+          "exit_code": 0,
+          "original_token_count": 372,
+          "output": "{\"archives\": 52, \"authored_whitespace_exit\": 0, \"current_execution_authorized\": false, \"hashes\": {\"client-runtime-original-source-tool-results.json\": \"4eeb9d85e00c661384e1fc3e46891139309d6efff72ea58b304cd3832bb37941\", \"client-runtime-source-proof.json\": \"b36fcdbaa6faff2f0b5b7399ef85e9253e7a9feeb9de2c9b5b41be68dc09cb20\", \"client-runtime-task.diff\": \"01c365991aaed424983bc0093c5e38164757490f2d5012728b60dfec25be9212\", \"client-runtime-task.inverse.diff\": \"2b43f1951e1f753f4dc4c0fe54dc982402aba0c2346936a1a96cebaaa0d7e82a\", \"invocation-template.json\": \"56d8d4376d5dd85af28c9d6b8caaf4fe42465470f594ca382c717039c32b4a7b\", \"manifest.json\": \"434beb67f4ae0bd7987d7e6bdcf67b6b69f4693e42a1d15a34e56826d566d3a6\", \"plan.json\": \"91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78\", \"run-packet.py\": \"6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01\", \"source-binding.json\": \"4e40e5d09bd8a739dee208e4aa78244dbcdae0b340bf7a6177b490094f70f5d4\", \"source-conservation.json\": \"6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd\"}, \"head\": \"ca92176d598775acb7dd94d54df8d54dec21ea9e\", \"members\": 94, \"parent\": \"5a6a9b18769d70349dfd8a7151a1bb0d41580979\", \"payloads\": 93, \"raw_diff_whitespace_exit\": 2, \"receipt\": \"/var/tmp/coord16-2025-b68-author-freeze-kxx0ja6_/receipt.json\", \"receipt_sha256\": \"a8b353479f4e367e608325812e4038202678757f670eba77df101dda3a3768ef\", \"status_clean\": true, \"tree\": \"43709cf57725d905d3e9b2ff7438a54ed449874e\", \"writer_released\": true}\n"
+        }
+      },
+      "raw_source_archive_write_result": {},
+      "source_tools_in_packet": "qualification-packets/issue2025-grouped-host/client-runtime-original-source-tool-results.json",
+      "runtime_attempts": 0,
+      "execution_authorized": false
+    },
+    "archived_source_tools": {
+      "path": "client-runtime-original-source-tool-results.json",
+      "sha256": "4eeb9d85e00c661384e1fc3e46891139309d6efff72ea58b304cd3832bb37941",
+      "original_result_metadata": [
+        {
+          "field": "/tools/client_guard_readonly_controller_preparation_full_result",
+          "chunk_id": "958350",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "ca2cab9a9fba69405e05a6c64663fff350fdb9a0df8dde8515dc01d0f8c3222a",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_authenticated_source_intake_full_result",
+          "chunk_id": "7ec03a",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "d89fa3573b5935575030e912504cb70641ecbf2b5323cbb66e12233ad1aa0ad9",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_genuine_proofs_and_helper_source_full_result",
+          "chunk_id": "89ee45",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "872179222277108286cd5888b35292071dde20e0436bd8cf48ef58a8cc596841",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_new_worktree_ignore_full_result",
+          "chunk_id": "01de88",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "d1ea7b4e7e6dfbac5063631da17400b05a1ee3755381c45e609920160a58014a",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_new_worktree_create_full_result",
+          "chunk_id": "cba756",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "ac7e54d1d0ca8e65583d36ed73a47a7b4a3205051c6b404ce633d5d9044f1ca0",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_exact_product_composition_full_result",
+          "chunk_id": "04b4ab",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "82a3246b6cd4e2ba2048fca1a77650aec77e1ef32c25566e3a44e9fa1442cff4",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_task_adaptation_full_result",
+          "chunk_id": "f1e262",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "f4b5c83501b6e4081b646f37754cb114fd77967381d8cba12ace5d140c9e02b9",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_metadata_preproof_read_full_result",
+          "chunk_id": "4520a4",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "7d3991ac992edae652e519c1718e664f5f9674b48e4f4380ed82fb47cd24db73",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_current_source_structure_full_result",
+          "chunk_id": "6a4502",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "24a002041d1e4919f0b3cf13749894fa73a26c906be538e2d7639ea8e4e77bb2",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_protected_anchor_read_full_result",
+          "chunk_id": "135afc",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "5d31fcb502ff6a0e6efd67413b35340705fc7a54f78e6e8226d8f2818d4a77eb",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": true
+        },
+        {
+          "field": "/tools/b68_source_anchor_and_group_read_full_result",
+          "chunk_id": "012502",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "4e03d98aa3771a8847e8c58c91197c10de74c9230bcc834a88bbc3ec748d48f6",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_final_schema_read_full_result",
+          "chunk_id": "7a3a7f",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "4c810f583d67977d5a06ade55aeb4c1eb5688001ab9cfecdfe735c3f33ff1040",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_source_proof_full_result",
+          "chunk_id": "9ffd79",
+          "exit_code": 1,
+          "session_id": null,
+          "output_sha256": "4ecee6e6089a3804124a720dcb1879952126341b502354ee543246af59913675",
+          "AssertionError_in_original_output": true,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_source_proof_corrected_full_result",
+          "chunk_id": "93f8c6",
+          "exit_code": 1,
+          "session_id": null,
+          "output_sha256": "cbd739c10f08b916f75be05e8695653a1f942342b9f9f5a40aa90e1d1c30a0ea",
+          "AssertionError_in_original_output": true,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_helper_hash_boundary_read_full_result",
+          "chunk_id": "439adf",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "fcd99ffbe7288e3f8f19ceb08448c6524d7c087f08d7fa633e0da5d0d09abac0",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        },
+        {
+          "field": "/tools/b68_source_proof_final_full_result",
+          "chunk_id": "099d7c",
+          "exit_code": 0,
+          "session_id": null,
+          "output_sha256": "2d01cfb05eb10fc13ed11d2668f78b01285372386d82ffa61a349cca34eae36e",
+          "AssertionError_in_original_output": false,
+          "truncated_original_output": false
+        }
+      ]
+    },
+    "AssertionError_and_truncation_limits": "Original source-utility AssertionErrors and truncated source reads remain in exact archived records; no success inferred from missing display. Reviewer source display6ec462 was also explicitly truncated, and final needed data/hash/byte proofs were read/parsed directly. No actual runtime/usage meaning follows from source-tool output accounting.",
+    "whitespace": "Author narrow non-diff0 versus allpacket2/rawdiffspaces retained, no overallformatPASS.",
+    "old_UNKNOWN_instructionvariance_negative_raw": "Exact old artifacts remain historical only; no original RAW audit/retry/repair or result transfer."
+  },
+  "limits": {
+    "candidate_imports_calls_examples_extracted_algorithms_parser_tests_build_helper_runtime": 0,
+    "live_env_account_authority_process_cache_target_tool_API_probes": 0,
+    "current_resource_admission_queue_grant_runtimebinding": null,
+    "semantic_reader_caller_review": "SEPARATE_RECOVERY",
+    "output_semantics": "Unchanged reviewed9ad Expr transferred BYTE exact, not re-reviewed.",
+    "not_submittable_genuine_complete_controller_review": true,
+    "next_step": "Separate exact-code semantic gate and genuine external handoff/current authenticated grant before any original execution/soleRAW/return. This receipt creates no runtime permission."
+  },
+  "activities": "Read-only immutable Git and declared frozen sourcepacket/proof hashes, stdlib JSON/AST/text and bounded LINE reconstruction; only new own receipt written. No candidate import/call/execution/probe, oldRAW, source edit/publication/newcontext/children."
+}

@@ -1,0 +1,295 @@
+{
+  "schema": "coord16-two-recovery-cache-parents-helper-independence-additive-source-proof-v1",
+  "disposition": "SCOPED_SOURCE_HELPER_INDEPENDENCE_FOR_EXACT_TWO_LINUX_HOST_LIB_PARENTS",
+  "scope": "Only whether the exact two parents need an emitted cagentsd, retained-actor executable or separate process helper. Not correctness/owner/error-semantics or complete diagnostic source conservation review. No controller implementation or execution.",
+  "product": {
+    "head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+    "tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+    "parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+    "worktree_read_only": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-fixture-diagnostics"
+  },
+  "genuine_root_freeze": {
+    "path": "/var/tmp/coord16-2025-fixture-diagnostics-cffp6fje/freeze.json",
+    "sha256": "5eba888b8a031dfcdd075a0d6bae1a7a6eeea890b8bec91e63bade78a08f0183",
+    "scope": "Immutable source freeze; pending review fields remain honest snapshots, not restamped."
+  },
+  "additive_to_unmodified_proposal": {
+    "path": "/var/tmp/coord16-recovery-cache-two-parent-proposal-ltupxht8/proposal.json",
+    "sha256": "8f32011fc47b13f205dd7bf82c4e9f51e5690bc23c89847451868f091aed5421",
+    "original_modified": false,
+    "condition_resolved_at_source_level": "The no-retained-actor-helper precondition for the proposed compile/inventory/one-exact-two-parent diagnostic scope is supported by this bounded owning call-chain trace. Other future source/controller/admission requirements remain."
+  },
+  "source_pins": {
+    "src/fs_safety/recovery_cache.rs": {
+      "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db",
+      "bytes": 44980
+    },
+    "src/filesystem_recovery_context.rs": {
+      "sha256": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d",
+      "bytes": 32812
+    },
+    "src/fs_safety/recovery_placement.rs": {
+      "sha256": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa",
+      "bytes": 18455
+    },
+    "src/fs_safety.rs": {
+      "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34",
+      "bytes": 82672
+    },
+    "src/worktree_cleanup.rs": {
+      "sha256": "465c2f6b5ba8c16efbf6bd5d607420a045f5f0c22230016c15d45b5970c89cc5",
+      "bytes": 60047
+    },
+    "src/recovery_authority.rs": {
+      "sha256": "f7a4b149cade60db513a02af124117779866d21c3e7ecaf6a37ed09c3312b64e",
+      "bytes": 20498
+    },
+    "src/instance.rs": {
+      "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+      "bytes": 119199
+    },
+    "src/fs_safety/directory_creation.rs": {
+      "sha256": "f71e11e94fce6800a8c5da6009c75faeb47f2e7875cd2fc11099f57c33119a4a",
+      "bytes": 106330
+    },
+    "src/secure_file.rs": {
+      "sha256": "51bad3a87ed1fcdbaa00232695c5da9deed025f3448a928032eb4dc1a5ba51d0",
+      "bytes": 7967
+    },
+    "src/modules.rs": {
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "bytes": 4143
+    }
+  },
+  "exact_parents": [
+    {
+      "name": "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation",
+      "body": {
+        "path": "src/fs_safety/recovery_cache.rs",
+        "line": 1004,
+        "end_line": 1035,
+        "sha256": "238acc56e2147486bcaf25ab198590edd049e3b18474b4394af424a5a3b7aa2a"
+      },
+      "actual_calls": "tempfile::tempdir; Root::open; fixture_context; context.reserve_directory; prepare_directory_using with owner(), cancelled=false, local create_directory_in_namespace/chmod750 closure and panic-only sync; recovery.retry; metadata/chmod700; retry. No executable path, helper environment, command, daemon client or self-child guard."
+    },
+    {
+      "name": "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation",
+      "body": {
+        "path": "src/fs_safety/recovery_cache.rs",
+        "line": 1038,
+        "end_line": 1066,
+        "sha256": "ea6e5742f34bc733aca962ba5d6b580a14b5959af5f1fab705ec3c63f969d1fc"
+      },
+      "actual_calls": "Same local fixture/admission/preparation path with local create+std::fs::rename closure; retry refused while moved; rename original back; retry. No executable path, helper environment, command, daemon client or self-child guard."
+    }
+  ],
+  "unchanged_cache_blob_equals_parent": true,
+  "reachable_source_chain": [
+    {
+      "region": {
+        "path": "src/filesystem_recovery_context.rs",
+        "line": 604,
+        "end_line": 658,
+        "sha256": "91e116dc36c1e6b3d7609c5dce3abdc23809282180391f15a2ceb26a111c4252"
+      },
+      "calls": "fixture_context\u2192fixture_context_with_guard creates runtime/outside tempfile TempDirs700, calls fixture_protection with that explicit runtime and source, Root clones and RecoveryPlacement::acquire, then from_placement with guard/runtime/outside Arc and no target. New stderr diagnostics use existing source/error fields and std::io::Write, not any executable.",
+      "boundary": "No normal acquire_outside(), global runtime discovery, selected device, provider, transport, HOST daemon or retained-actor helper call is entered by this fixture constructor."
+    },
+    {
+      "region": {
+        "path": "src/worktree_cleanup.rs",
+        "line": 633,
+        "end_line": 640,
+        "sha256": "00494b00aa0f2101052b3a0dc44d11b7e59204c9cf95dc94688113e08d91851d"
+      },
+      "calls": "fixture_protection(runtime,directory,false) directly invokes acquire using supplied paths."
+    },
+    {
+      "region": {
+        "path": "src/worktree_cleanup.rs",
+        "line": 443,
+        "end_line": 526,
+        "sha256": "051c6773dea8f4de39abd7c3eeef2ff6cf7f767466baaffbf7ae2315a86c193b"
+      },
+      "calls": "lock_path prepares a private lock subdirectory using secure_file; acquire/acquire_with_directory_pin performs local symlink/canonical/ancestor .git metadata and opens directory descriptors; instance::owned_lock applies nonblocking local flock. Ancestor lock construction does not execute git."
+    },
+    {
+      "region": {
+        "path": "src/secure_file.rs",
+        "line": 33,
+        "end_line": 89,
+        "sha256": "b344497bf253b9c50582a3219f5f5ef502fe4e225ed2aaa2bdf16f78e60f29c6"
+      },
+      "calls": "reject_symlink_components and prepare_private_directory are std::fs/DirBuilder/permissions and effective-UID checks; no process or helper."
+    },
+    {
+      "region": {
+        "path": "src/instance.rs",
+        "line": 145,
+        "end_line": 188,
+        "sha256": "5c021585173650c811684f153ccb5d1e6f419c6f6ad6915b72103f828d8e4640"
+      },
+      "calls": "OwnedLock/owned_lock/owned_file_lock use OpenOptions, metadata/current_uid, permissions and libc::flock; Drop unlocks the file. No startup or daemon-ensure call."
+    },
+    {
+      "region": {
+        "path": "src/fs_safety/recovery_placement.rs",
+        "line": 118,
+        "end_line": 308,
+        "sha256": "b9f2fee59823b072794de0447274c90ad11ef205d5e67aeb4ee40ea86efeef14"
+      },
+      "calls": "RecoveryPlacement::acquire/validate/validate_for_source/validate_payload_root retain Roots, check metadata/device/inode/mount, acquire DirectoryNamespace and walk parent descriptors with .git presence observation. Linux mount_identity uses libc::statx; retained parent uses openat. No repository command, child process or executable parameter."
+    },
+    {
+      "region": {
+        "path": "src/filesystem_recovery_context.rs",
+        "line": 523,
+        "end_line": 556,
+        "sha256": "dee8584f5d2d3ca0a98764893bb1b35d69c931138a2242a64b290681b1c9db81"
+      },
+      "calls": "from_placement validates placement/source/protection and stores guard tuple via RecoveryContext::with_guard; it does not launch a worker or process."
+    },
+    {
+      "region": {
+        "path": "src/filesystem_recovery_context.rs",
+        "line": 589,
+        "end_line": 601,
+        "sha256": "27f80dcb62f755de7150ed2a4911214c315d08bf0eca6a61f9853e167d9559f1"
+      },
+      "calls": "reserve_directory\u2192reserve validates placement and reserves an in-process RecoverySlot."
+    },
+    {
+      "region": {
+        "path": "src/recovery_authority.rs",
+        "line": 66,
+        "end_line": 155,
+        "sha256": "0d7e2bfd2929afe5a713507e84fc4fe45363c46958be2b0c57bee9f2331e72d6"
+      },
+      "calls": "with_guard/from_budget and reserve/retain charge process-local Mutex/OnceLock/atomics and store the provided retry closure; no daemon/IPC/process scheduling."
+    },
+    {
+      "region": {
+        "path": "src/fs_safety/recovery_cache.rs",
+        "line": 501,
+        "end_line": 657,
+        "sha256": "0b98d5b1ba26e67ab778abc8d3b15fda7b91f2bb592548f204516564596c9821"
+      },
+      "calls": "prepare_directory_using synchronously invokes supplied cancelled/create/sync closures, qualifies actual directory and retains pending.retry_failed_preparation on error."
+    },
+    {
+      "region": {
+        "path": "src/fs_safety/recovery_cache.rs",
+        "line": 272,
+        "end_line": 310,
+        "sha256": "e4eaa3b9b52e715cee7e74169c036f27bc494944c16a490585c196a4cdf878a1"
+      },
+      "calls": "qualify_setup/retry_failed_preparation use retained publication private-mode checks, payload placement, resolve_recovery/cleanup_empty and directory sync. The two tests supply no external callback or executable."
+    },
+    {
+      "region": {
+        "path": "src/recovery_authority.rs",
+        "line": 253,
+        "end_line": 267,
+        "sha256": "10cf31187c007e7379d0c296cc5d319d20217788af67459547f989a6988350f2"
+      },
+      "calls": "RecoveryAuthority::retry locks in-process work and invokes its stored closure directly; no subprocess or worker launch."
+    },
+    {
+      "region": {
+        "path": "src/fs_safety/directory_creation.rs",
+        "line": 971,
+        "end_line": 1118,
+        "sha256": "af9b09ea95bbf7dae91146b0db722f5337fa616b329bf70f0566f5badb722462"
+      },
+      "calls": "create_directory_in_namespace\u2192create_with_hooks\u2192create_with_preparation_hook\u2192prepare_private_stage use local directory publication, metadata, mkdirat, permission setup and retained Roots. No executable argument or process spawn."
+    },
+    {
+      "region": {
+        "path": "src/fs_safety/directory_creation.rs",
+        "line": 1377,
+        "end_line": 1395,
+        "sha256": "77e6581e9f6f739de5e25bebf34b531033fa38ea897544a6591d14d7b9dbc009"
+      },
+      "calls": "DirectoryNamespace namespace_protected checks retained metadata/euid; native_acl_absent is the Linux Ok(true) branch. No external id/chmod command in this Linux path."
+    },
+    {
+      "region": {
+        "path": "src/fs_safety.rs",
+        "line": 95,
+        "end_line": 116,
+        "sha256": "c2953318af213ff681d4a71a7e41b1424f5d803a6af599af1ddc15cb8995058f"
+      },
+      "calls": "Root::open is local libc::open plus retained descriptor. The device::is_remote branch is cfg(feature=ui), outside the proposed isolated host-only graph."
+    },
+    {
+      "region": {
+        "path": "src/fs_safety.rs",
+        "line": 448,
+        "end_line": 454,
+        "sha256": "3f9a552167ef8fc9bb2f057fe1745b26d745132a33edc7aa241b4f340f37e3ed"
+      },
+      "calls": "set_directory_permissions uses std::fs::set_permissions on /proc/self/fd/<retained descriptor>; it does not invoke /bin/chmod. This is a future OS/filesystem dependency, not an author process/proc probe."
+    }
+  ],
+  "module_and_platform_scope": {
+    "modules": "src/modules.rs66/67/104/145 declare filesystem_recovery_context/fs_safety/recovery_authority/worktree_cleanup without requiring a UI or emitted daemon executable. fs_safety.rs479\u2013480 enroll recovery_cache.",
+    "test_gate": {
+      "path": "src/fs_safety/recovery_cache.rs",
+      "line": 677,
+      "end_line": 681,
+      "sha256": "dbb57c208c585fb18ebea9833428e686f7cba31dcebbd4286d765bdf0451bcbf"
+    },
+    "fixture_gate": {
+      "path": "src/filesystem_recovery_context.rs",
+      "line": 604,
+      "end_line": 607,
+      "sha256": "6d83be8871b17f79af79015b24b13620a136ee974856fb48379f67ed05818a61"
+    },
+    "conditions": "Exact parents and fixture require test + target_os=linux; proposed --no-default-features --features host --lib selects that source graph. This is source gate applicability only; actual compiled names/counts require future emitted ELF inventory."
+  },
+  "unrelated_process_commands_not_reachable": {
+    "source": "src/fs_safety/directory_creation.rs",
+    "cases": [
+      {
+        "line": 2122,
+        "function": "darwin_present_native_acl_is_not_private_namespace_authority",
+        "reason": "Separate #[test] with cfg(target_os=macos); its /usr/bin/id and /bin/chmod Commands are not called by the two Linux recovery_cache parents."
+      },
+      {
+        "line": 2299,
+        "function": "restrictive_umask_creation_uses_retained_descriptor",
+        "reason": "Separate #[test] owns its current_exe self-child. The two exact recovery_cache parents never call it; their exact selection does not select this name."
+      }
+    ],
+    "claim": "No blanket claim that the entire compiled library contains no helper-using tests."
+  },
+  "controller_consequence": {
+    "emitted_cagentsd_helper_needed_for_this_exact_pair": false,
+    "retained_actor_environment_binding_needed_for_this_exact_pair": false,
+    "separate_process_helper_needed_by_traced_application_chain": false,
+    "ordinary_libtest_process_still_required": true,
+    "mandatory_full2025_helper_and_broad_gate": "Unchanged and still required for the original owning full-scope task; this additive proof does not remove or satisfy it.",
+    "minimal_future_diagnostic_adapter": "The existing proposal three-phase task-specific compile/inventory/two-parent adapter can omit its own daemon-build/helper-env phase on this source basis, only after separate implementation/source review/admission. No existing controller was changed.",
+    "new_controller_head": null,
+    "new_controller_review": null,
+    "actual_elf": null,
+    "runtime_inventory_N": null,
+    "actual_results": null,
+    "grant": null,
+    "execution_authorized": false
+  },
+  "limits": [
+    "No candidate/source import or function/algorithm/helper call, test, compile, formatter, build, runtime, live filesystem/namespace/process/account/environment/ELF/target/cache/resource/DB/API probe occurred. Only immutable source Git reads and this private artifact write.",
+    "This bounded proof is application-level helper independence, not an exhaustive standard-library/third-party dynamic dependency audit or a test PASS. tempfile/Rust/native filesystem operations still require an admitted runtime.",
+    "Both tests perform real filesystem setup, lease locks, metadata/mount/ancestor validation, directory creation/chmod/rename and retry. They may fail before injected conditions; source helper independence does not diagnose or repair the original actual failure or qualify parallel/broad context.",
+    "Default libtest scheduling and original failure/evidence/HOLD semantics remain requirements. Two diagnostic successes cannot settle broad-only context or original full347 owning qualification.",
+    "Root diagnostic freeze and future exact controller/source/context/physical/review/grant bindings stay distinct; no old result/RAW/accepted C transfer."
+  ],
+  "original_source_read_limit": {
+    "first_read_chunk": "8f78ce",
+    "actual_output_truncated": true,
+    "subsequent_bounded_sources": "26e495/510a0e/cfa021/af03f7/aba366 provided exact scoped bodies and gates; no complete-source claim from truncated output."
+  },
+  "all_runtime": "UNRUN",
+  "writer_released": true
+}
