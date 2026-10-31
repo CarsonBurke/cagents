@@ -1,3 +1,5 @@
+#[cfg(feature = "development")]
+pub(super) mod native_preinit_fixture;
 mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};

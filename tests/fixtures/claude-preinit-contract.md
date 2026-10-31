@@ -63,8 +63,10 @@ scenario in the forwarded suffix is rejected as a duplicate by the original
 fixture. `--version` is forwarded in the same way and uses the fixture's existing
 version-only path without reading stdin. No executable has been invoked here.
 
-The helper is byte-identical to the independently reviewed source, SHA256
+The original helper review pinned SHA256
 `9ffa88df040ebdd7a7c548cdda9629977a9661c808e9e50a0d3b81730f284ec4`.
+This native-hook successor changes only the executable header in the helper
+and five fixed wrappers; all Python body bytes remain exact to that review.
 Future native source admission must pin each selected entrypoint **and** this
 sibling helper at their actual absolute paths, refuse changed or substituted
 sources, and retain the original generated argv. This source packet does not
@@ -82,3 +84,42 @@ launch context, runner/controller wiring, compiled checks, process-custody
 admission, live execution, screenshots and UX review are all still **UNRUN**.
 Only one fixed synthetic user turn is supported, not general conversation,
 authentication, tools, queued-message delivery or live Claude behavior.
+
+
+## Isolated interpreter entry
+
+All six executable Python files now start with `#!/usr/bin/python3 -ISB`.
+The native recipe executes the fixed absolute wrapper directly, so the
+interpreter receives the single combined `-ISB` option before the script.
+`-I` excludes user and script search paths and ignores Python environment
+routing; `-S` suppresses automatic `site` startup and customization;
+`-B` prevents bytecode writes. Parent environment and HOME are not rewritten.
+The wrappers still load only their fixed sibling in the same process.
+
+The combined option is source-supported by CPython 3.13.0's
+[short-option parser](https://raw.githubusercontent.com/python/cpython/v3.13.0/Python/getopt.c),
+which includes these three flags and advances within one option argument.
+The [Python 3.13 command-line reference](https://docs.python.org/3.13/using/cmdline.html)
+describes their startup behavior. This is source evidence, not provenance or
+execution evidence for the future selected `/usr/bin/python3`; its exact
+interpreter/library binding and actual invocation remain pending.
+Directly invoking an arbitrary interpreter without these flags is outside
+this fixed entrypoint contract.
+
+The development-only native hook uses exactly the five scenarios above,
+selected by `CAGENTS_DEVELOPMENT_PREINIT_FIXTURE`. It requires private owned
+0700 roots `/tmp/cagents-1859-native-<scenario>-<wide|narrow>-<before|after>`,
+with fixed `data`, `config`, `cache`, `state`, `runtime` XDG children and
+`CLAUDE_CONFIG_DIR` pointing at its `claude` child. The owning future runner
+creates the empty namespace; bootstrap creates a one-use marker and fresh
+synthetic project/config directories, without deletion or reuse.
+
+The actual native composer displays the fixed public prompt, “Show the
+offline initialization control.” Send, initialization, error, retry and
+retirement use the normal reducer/client/runtime. Cursor/selection validation
+retains the real editor state; slash, history, file, account and provider
+escapes are not fixture inputs. Pending-close Escape and application-error
+notices retain their existing controls. No Ready, completion, deadline,
+process exit or cleanup success is manufactured. All native interaction,
+interpreter execution, matched builds, screenshots and UX review remain
+UNRUN; the fixed suffix does not establish a tested revision or permission.

@@ -294,6 +294,19 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
 }
 
 fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "development")]
+    let preinit_fixture = cagents::app::Cagents::development_preinit_fixture_requested()?;
+    #[cfg(not(feature = "development"))]
+    let preinit_fixture = false;
+    if preinit_fixture
+        && (options.device.is_some()
+            || options.slot.is_some()
+            || options.source.is_some()
+            || options.new_window
+            || options.device_window_scoped)
+    {
+        return Err("offline fixture uses only its private local development window".into());
+    }
     let Options {
         new_window,
         slot,
@@ -302,9 +315,11 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device_window_scoped,
     } = options;
     let _device_cleanup = cagents::device::Cleanup;
-    cagents::device::select(device)?;
-    cagents::device::prepare()?;
-    if !cagents::device::is_remote() {
+    if !preinit_fixture {
+        cagents::device::select(device)?;
+        cagents::device::prepare()?;
+    }
+    if !preinit_fixture && !cagents::device::is_remote() {
         if let Some(executable) = cagents::control::staged_ui_executable()? {
             // exec preserves the launcher handshake pipe and window arguments.
             let mut command = std::process::Command::new(executable);
