@@ -46,6 +46,20 @@ impl Widget<Message, Theme, Renderer> for RedrawGeneration<'_> {
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            layout,
+            renderer,
+            destinations,
+        );
+    }
     fn operate(
         &mut self,
         tree: &mut Tree,
@@ -235,5 +249,55 @@ impl Cagents {
             restore_warnings: Vec::new(),
             settings_warnings: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace_widget::forwarding_test::{leaf, renderer};
+    use cosmic::iced::{Point, advanced::clipboard::DndDestinationRectangles};
+
+    #[test]
+    fn redraw_instrumentation_preserves_child_drop_targets_and_layout() {
+        let renderer = renderer();
+        let (content, visits) = leaf::<Message>(
+            Size::new(100.0, 60.0),
+            vec![(
+                1,
+                Rectangle::new(Point::new(5.0, 7.0), Size::new(80.0, 40.0)),
+            )],
+        );
+        let mut widget = instrument(content, None, false);
+        let mut tree = Tree::new(&widget);
+        let node = widget
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+            )
+            .move_to(Point::new(20.0, 30.0));
+        let offset = Vector::new(4.0, -20.0);
+        let mut destinations = DndDestinationRectangles::new();
+        widget.as_widget().drag_destinations(
+            &tree,
+            Layout::new(&node).with_virtual_offset(offset),
+            &renderer,
+            &mut destinations,
+        );
+        let actual: Vec<_> = destinations
+            .into_rectangles()
+            .into_iter()
+            .map(|destination| {
+                (
+                    destination.id,
+                    destination.rectangle.x,
+                    destination.rectangle.y,
+                )
+            })
+            .collect();
+        assert_eq!(actual, vec![(1, 25.0, 37.0)]);
+        assert_eq!(visits.offsets("drag"), vec![offset]);
     }
 }

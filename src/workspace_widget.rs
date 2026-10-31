@@ -2105,6 +2105,9 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
             &mut inner,
         );
         let mut rectangles = inner.into_rectangles();
+        // Extraction reverses stacking order. Preserve insertion order here;
+        // the enclosing native collection performs the final reversal.
+        rectangles.reverse();
         clip_drag_destinations(&mut rectangles, layout.bounds());
         destinations.append(&mut rectangles);
     }
@@ -2115,7 +2118,10 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
 /// The strip mounts cards past its edges and scrolls them without clipping
 /// their drop targets, so a card scrolled half out of view would otherwise
 /// reach under the sidebar and take a drop aimed there.
-fn clip_drag_destinations(rectangles: &mut Vec<DndDestinationRectangle>, bounds: Rectangle) {
+pub(crate) fn clip_drag_destinations(
+    rectangles: &mut Vec<DndDestinationRectangle>,
+    bounds: Rectangle,
+) {
     let (left, top) = (f64::from(bounds.x), f64::from(bounds.y));
     let (right, bottom) = (
         left + f64::from(bounds.width),
@@ -2149,6 +2155,106 @@ mod tests {
     use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};
     use std::collections::HashSet;
+
+    #[test]
+    fn workspace_surface_forwards_drop_targets_in_native_collection_order() {
+        use super::forwarding_test::{leaf, renderer};
+        use cosmic::iced::advanced::clipboard::DndDestinationRectangles;
+        use cosmic::iced::clipboard::dnd::{DndAction, Rectangle as DndRectangle};
+
+        let renderer = renderer();
+        let shortcuts = KeyboardShortcuts::default();
+        let offset = Vector::new(7.0, -22.0);
+        for nested in [false, true] {
+            let (content, visits) = leaf::<()>(
+                Size::new(100.0, 60.0),
+                vec![
+                    (
+                        1,
+                        Rectangle::new(Point::new(-30.0, 0.0), Size::new(100.0, 40.0)),
+                    ),
+                    (
+                        2,
+                        Rectangle::new(Point::new(10.0, 0.0), Size::new(70.0, 40.0)),
+                    ),
+                    (
+                        3,
+                        Rectangle::new(Point::new(200.0, 0.0), Size::new(50.0, 40.0)),
+                    ),
+                ],
+            );
+            let content: Element<'_, ()> = if nested {
+                WorkspaceSurface::new(content, &shortcuts, FocusedPane::Other, 100.0, |_| ()).into()
+            } else {
+                content
+            };
+            let mut surface: Element<'_, ()> =
+                WorkspaceSurface::new(content, &shortcuts, FocusedPane::Other, 100.0, |_| ())
+                    .into();
+            let mut tree = Tree::new(&surface);
+            let node = surface
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+                )
+                .move_to(Point::new(20.0, 30.0));
+            let mut destinations = DndDestinationRectangles::new();
+            // A preceding root sibling is already registered. The surface
+            // must preserve its own later child order within that collection.
+            destinations.push(DndDestinationRectangle {
+                id: 99,
+                rectangle: DndRectangle {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 10.0,
+                    height: 10.0,
+                },
+                mime_types: Vec::new(),
+                actions: DndAction::Copy,
+                preferred: DndAction::Copy,
+            });
+            surface.as_widget().drag_destinations(
+                &tree,
+                Layout::new(&node).with_virtual_offset(offset),
+                &renderer,
+                &mut destinations,
+            );
+            assert_eq!(
+                destinations
+                    .as_ref()
+                    .iter()
+                    .map(|target| target.id)
+                    .collect::<Vec<_>>(),
+                vec![99, 1, 2]
+            );
+            // This is the exact extraction performed by the iced native
+            // consumer, after all enclosing widgets finished registration.
+            let actual: Vec<_> = destinations
+                .into_rectangles()
+                .into_iter()
+                .map(|target| {
+                    (
+                        target.id,
+                        target.rectangle.x,
+                        target.rectangle.y,
+                        target.rectangle.width,
+                        target.rectangle.height,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                actual,
+                vec![
+                    (2, 30.0, 30.0, 70.0, 40.0),
+                    (1, 20.0, 30.0, 70.0, 40.0),
+                    (99, 0.0, 0.0, 10.0, 10.0)
+                ]
+            );
+            assert_eq!(visits.offsets("drag"), vec![offset]);
+        }
+    }
 
     #[test]
     fn drop_targets_end_at_the_edges_of_the_strip() {
@@ -4802,3 +4908,7 @@ mod tests {
         assert_eq!(positions, expected_overlay_positions(&moved, VIEWPORT));
     }
 }
+
+#[cfg(test)]
+#[path = "widget_forwarding_test.rs"]
+pub(crate) mod forwarding_test;
