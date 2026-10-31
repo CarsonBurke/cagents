@@ -1565,7 +1565,16 @@ impl ClientHandle {
         source: HostSessionProof,
     ) -> Result<super::BindingPreview, String> {
         let socket = caller.socket(NativeReadiness::Existing)?;
-        let mut stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::preview_on(caller, stream, session, source)
+    }
+
+    fn preview_on(
+        caller: &CallerContext,
+        mut stream: UnixStream,
+        session: Session,
+        source: HostSessionProof,
+    ) -> Result<super::BindingPreview, String> {
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .map_err(|error| error.to_string())?;
@@ -1628,7 +1637,16 @@ impl ClientHandle {
         source: HostSessionProof,
     ) -> Result<Vec<super::BindingCandidate>, String> {
         let socket = caller.socket(NativeReadiness::Existing)?;
-        let mut stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::candidates_on(caller, stream, session, source)
+    }
+
+    fn candidates_on(
+        caller: &CallerContext,
+        mut stream: UnixStream,
+        session: Session,
+        source: HostSessionProof,
+    ) -> Result<Vec<super::BindingCandidate>, String> {
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .map_err(|error| error.to_string())?;
