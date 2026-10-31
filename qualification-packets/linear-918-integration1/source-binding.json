@@ -58,220 +58,220 @@
     "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
   },
   "product_adoption": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-91892065-root-source-adoption-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-91892065-root-source-adoption-v1.json",
     "sha256": "735621143f9cfac9169adedd28fa5df4ea0c61b38a6fd5bcdaaf06fa3be6395e",
     "bytes": 2556,
     "original_path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-root-source-adoption-v1.json"
   },
   "product_publication": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-91892065-reviewed-source-publication-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-91892065-reviewed-source-publication-v1.json",
     "sha256": "47b53631a33ea200e56cd1901864789d71233726513fc2d9e54c40871588f6e1",
     "bytes": 1034,
     "original_path": "/tmp/fw16-backend-ec204421/linear-lossless-91892065-reviewed-source-publication-v1.json"
   },
   "production_freeze": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-main442-source-freeze-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-main442-source-freeze-v1.json",
     "sha256": "62368f7df0003fb1f2e8da2e80445e03681748753feb2a89d1f2b0b86e762687",
     "bytes": 2617,
     "original_path": "/tmp/fw16-backend-ec204421/linear-lossless-main442-source-freeze-v1.json"
   },
   "stdout_freeze": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-cli-stdout-successor-source-freeze-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-cli-stdout-successor-source-freeze-v1.json",
     "sha256": "b0a826ef58fa7f782b61b08fc469ede7cae315ab63d88e4f46b8b434f9a0ad41",
     "bytes": 2569,
     "original_path": "/tmp/fw16-backend-ec204421/linear-lossless-cli-stdout-successor-source-freeze-v1.json"
   },
   "product_production_code": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-d0f27b01-main442-independent-code-user-contract-source-review-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-d0f27b01-main442-independent-code-user-contract-source-review-v1.json",
     "sha256": "82e29e78f3d3cc1534edf02d3275208f90945fd2e3e547f09f3375a93fe4133d",
     "bytes": 11779,
     "original_path": "/tmp/linear-lossless-d0f27b01-main442-independent-code-user-contract-source-review-v1.json"
   },
   "product_production_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-d0f27b01-independent-conservation-test-oracle-review-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-d0f27b01-independent-conservation-test-oracle-review-v1.json",
     "sha256": "4350a7e9477f743234349de8a8b2bd54332c947e8892f44fb01880f3221595e9",
     "bytes": 15112,
     "original_path": "/tmp/linear-lossless-d0f27b01-independent-conservation-test-oracle-review-v1.json"
   },
   "product_stdout_code": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-91892065-cli-stdout-successor-independent-source-review-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-91892065-cli-stdout-successor-independent-source-review-v1.json",
     "sha256": "43e4958ff096c4c8be8704e43c6625d5afab064de7ff5dc5499e7bb950cb10ba",
     "bytes": 9975,
     "original_path": "/tmp/linear-lossless-91892065-cli-stdout-successor-independent-source-review-v1.json"
   },
   "product_stdout_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-91892065-independent-stdout-contract-conservation-review-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/linear-lossless-91892065-independent-stdout-contract-conservation-review-v1.json",
     "sha256": "306643a49f375f2a3883c0f572166b746557f98a6c7c5a950fa81ddbe6ce9595",
     "bytes": 10433,
     "original_path": "/tmp/linear-lossless-91892065-independent-stdout-contract-conservation-review-v1.json"
   },
   "integration_barrier": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/report.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/report.json",
     "sha256": "056243ec76c3c878bc591d1c82cd8a05e80c92b4f7bdbad1c2f3b830e00b4d08",
     "bytes": 8014,
     "original_path": "/var/tmp/coord16-linear4-source-interface-barrier-qcamwsa0/report.json"
   },
   "adoption_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_conservation.json",
     "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_conservation.json",
     "bytes": 13262
   },
   "adoption_freeze": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_freeze.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_freeze.json",
     "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_freeze.json",
     "bytes": 2591
   },
   "adoption_function": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_function.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_function.py",
     "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_function.py",
     "bytes": 877
   },
   "adoption_intake": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_intake.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_intake.json",
     "sha256": "e9aa09101ca6d215e6876de5b50c1fe1bc57bb3cc14f7bdd397b7772cd1e5843",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_intake.json",
     "bytes": 3200
   },
   "adoption_old_function": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_old_function.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_old_function.py",
     "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_old_function.py",
     "bytes": 1593
   },
   "adoption_original_finding": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_original_finding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_original_finding.json",
     "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_original_finding.json",
     "bytes": 13311
   },
   "adoption_pure4_reference": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_pure4_reference.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_pure4_reference.json",
     "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_pure4_reference.json",
     "bytes": 1760
   },
   "adoption_semantic": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_semantic.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/adoption_semantic.json",
     "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_semantic.json",
     "bytes": 8938
   },
   "prior_ca_additive_hold": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/prior_ca_additive_hold.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/prior_ca_additive_hold.json",
     "sha256": "a32b9501efcfc05ba117cd89f10d903a02434943ce0ac5d70440b7ea69767ef9",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/prior_ca_additive_hold.json",
     "bytes": 5709
   },
   "prior_ca_author_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/prior_ca_author_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/prior_ca_author_conservation.json",
     "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/prior_ca_author_conservation.json",
     "bytes": 4605
   },
   "prior_ca_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/prior_ca_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/prior_ca_conservation.json",
     "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/prior_ca_conservation.json",
     "bytes": 73422
   },
   "prior_ca_task_hold": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/canonical/prior_ca_task_hold.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/canonical/prior_ca_task_hold.json",
     "sha256": "e342ee5b3258889e2f258433b7cf3a47614d79e340a4313e678060b99bf53560",
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/prior_ca_task_hold.json",
     "bytes": 5835
   },
   "donor_run_packet_py": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/donor-run-packet.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/donor-run-packet.py",
     "sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
     "bytes": 82880,
     "source_commit": "993cea26a29b5a2cd6857a959628de4e5f04c096"
   },
   "donor_plan_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/donor-plan.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/donor-plan.json",
     "sha256": "d5c074fbea83b6863b73ae574a8b55fb8a4425cce527c6e0f87685dbf56990e9",
     "bytes": 19053,
     "source_commit": "993cea26a29b5a2cd6857a959628de4e5f04c096"
   },
   "donor_source_binding_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/donor-source-binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/donor-source-binding.json",
     "sha256": "12aec1cd635793e24907149e5fffebbc1b594aec652947064a82afc9c9e7e785",
     "bytes": 13594,
     "source_commit": "993cea26a29b5a2cd6857a959628de4e5f04c096"
   },
   "donor_source_conservation_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/donor-source-conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/donor-source-conservation.json",
     "sha256": "628dd034d9038b882f0213db0fd098086474d244714bb362d14e34ccdcbb8595",
     "bytes": 6013,
     "source_commit": "993cea26a29b5a2cd6857a959628de4e5f04c096"
   },
   "command_data": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/command-data.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/command-data.json",
     "sha256": "97e950d862715414c84d61bdd4c69ad5596200bca4f487cdacdbd2b840e3613e",
     "bytes": 5258
   },
   "current_source_map": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/current-source-map.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/current-source-map.json",
     "sha256": "366675316dc8777fc148252eb61237874e392838345b3ca46e430cdc7e915c8a",
     "bytes": 5182
   },
   "instruction_source": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/instruction-source.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/instruction-source.json",
     "sha256": "399f888da8d60f7825a6671ef1e995baba2309749c3bffca56315ab2166e4e93",
     "bytes": 394
   },
   "base_LIB3_run_packet_py": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/base-lib3/run-packet.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/base-lib3/run-packet.py",
     "sha256": "d99afc2e01e460284691a9c07f2765bb9f338f40c79b4828298452c07d334d4e",
     "bytes": 86990,
     "source_commit": "543c8831c2efcc1f3bac34fb871b53d49ac8c222"
   },
   "base_LIB3_plan_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/base-lib3/plan.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/base-lib3/plan.json",
     "sha256": "e217209bdaa8569bd96bbe354fa0b321e3e1c7fe3229f111a0a090d9eb1301e3",
     "bytes": 21727,
     "source_commit": "543c8831c2efcc1f3bac34fb871b53d49ac8c222"
   },
   "base_LIB3_source_binding_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/base-lib3/source-binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/base-lib3/source-binding.json",
     "sha256": "88241f0f48d06b792065e27f5823b54afa107a8f4c5139bd4fd561739b3719ad",
     "bytes": 16393,
     "source_commit": "543c8831c2efcc1f3bac34fb871b53d49ac8c222"
   },
   "base_LIB3_source_conservation_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/base-lib3/source-conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/base-lib3/source-conservation.json",
     "sha256": "9f4df3df18926cfb83ea0e978fa719c959bf4ddfaeee0767f7a84f0d2c4fbacc",
     "bytes": 5430,
     "source_commit": "543c8831c2efcc1f3bac34fb871b53d49ac8c222"
   },
   "design_source": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/integration-design/design.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/integration-design/design.json",
     "sha256": "3344744811a17274717693b7ea93adfee5c304beb438b828fd127a8fd477636b",
     "bytes": 27399,
     "original_path": "/var/tmp/coord16-linear918-integration-source-design-2bw7h22_/design.json"
   },
   "design_review": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/integration-design/review.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/integration-design/review.json",
     "sha256": "c0119a46fcecd2cf783b40b976c5c480c3fb59f8c11d07ee986d43f294a3ad0e",
     "bytes": 15684,
     "original_path": "/var/tmp/coord16-linear918-integration-design-independent-i_djj46l/review.json"
   },
   "cargo_source_note": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/integration-design/official-cargo193-source-contract-note.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/integration-design/official-cargo193-source-contract-note.json",
     "sha256": "2aece1ee501032aa0dcf218c0d1188a17afad44f033a97aafea8610fbc282d22",
     "bytes": 2030,
     "original_path": "/var/tmp/coord16-linear4-source-lead-99ilaxdf/official-cargo193-source-contract-note.json"
   },
   "cargo_original_web_response_0": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/integration-design/rendered-doc-original-errors.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/integration-design/rendered-doc-original-errors.json",
     "sha256": "c6450e522eba9bb1bdb9ef6b4b7b5c4bb6d1da587aa204588780e705b7d3f40a",
     "bytes": 665,
     "scope": "Original web-tool response, NOT raw upstream Cargo file bytes."
   },
   "cargo_original_web_response_1": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-source/qualification-packets/linear-918-integration1/dependencies/integration-design/official-tag-doc-original-web-response.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/dependencies/integration-design/official-tag-doc-original-web-response.json",
     "sha256": "75a10fb5683a34f20b4d558aa65e19c251c4cc90345181ef85a3d4c3205ff932",
     "bytes": 30405,
     "scope": "Original web-tool response, NOT raw upstream Cargo file bytes."

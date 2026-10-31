@@ -28,10 +28,10 @@
     "source_index_present_unarchived_originals": []
   },
   "bounded_line_forward_and_true_inverse": {
-    "from-993-forward.diff.json": "0fafc4b98657a51a4838b9d9a43af2e9476aedbecaf2924f3c36c97827fd79da",
-    "from-LIB3-543c-forward.diff.json": "6c8cb6fc99e5db090c675d0853cb2f7a9dcc0025faff00a6d345c7d27dd7db76",
-    "to-993-true-inverse.diff.json": "0d6588832ec0f5d6da780634089968350642c3a00e2293fa34cfbd3702fb7530",
-    "to-LIB3-543c-true-inverse.diff.json": "d62bb9f3ac44133ee7849c89b5d38c0dba4877d242633b6271d03ec17d7c546b"
+    "from-993-forward.diff.json": "2ea5b28bc83db7233933324e15964f2ea6ff27bda86f005d68d110f6e3d52e5e",
+    "from-LIB3-543c-forward.diff.json": "3000d106f66bc6747b0c07ca7960cce62b171c974ee0b87c0e3d864179c09a24",
+    "to-993-true-inverse.diff.json": "e777ea3806941b14d19bfe5a6eda6e8f6d7c9ab9c0295176e2164d87f75a071e",
+    "to-LIB3-543c-true-inverse.diff.json": "b1d6dd4c648add8e39b363b132e1c3aa9fc62a8f471aa5c5aa7f38336ca49892"
   },
   "canonical9004_exact": true,
   "canonical_definition_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
@@ -55,19 +55,7 @@
   "generic_cargo_test_artifact_and_execute_contracts_exact": true,
   "grant": null,
   "group_and_accounting_inverse_only_labels_cardinalities": true,
-  "instruction_baseline_variance": {
-    "bytes_flags_changed_by_author": false,
-    "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
-    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
-    "index_flag": "H AGENTS.md",
-    "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
-    "latest_user_AGENTS_instructions_followed": true,
-    "variance": true
-  },
-  "kind": "AUTHOR_LINEAR918_INTEGRATION1_SOURCE_CONSERVATION_NOT_INDEPENDENT_APPROVAL",
-  "limits": "Static AST/hash/JSON/source Git and line reconstruction only. New task functions are unexecuted. Original exact package/test/bin mapping is source-derived; no embedded/every-exec attestation, old LIB3 pass transfer or runtime admission.",
-  "original_absolute_workload_cap": 2400,
-  "original_park": {
+  "historical_45c_and_6af_vs_original_park": {
     "actual_frozen_byte_exact_member_count": 56,
     "actual_frozen_member_mismatches": [
       {
@@ -85,24 +73,15 @@
     ],
     "actual_frozen_original_member_count": 57,
     "all57_original_member_bytes_unchanged": false,
+    "comparison_scope": "45c and6af only; not a current rebased-candidate byte-preservation claim.",
     "old_template_raw_bytes_available": false,
     "old_template_semantic_delta": "UNKNOWN_NOT_RECONSTRUCTED",
     "path": "/var/tmp/coord16-linear918-integration1-priority-park-xyjjpnty/wip.json",
     "sha256": "c985958307b16a4bfb7ee7bc61715d16f40734766e64692d154b793017752166"
   },
-  "planned_command_caps": [
-    300,
-    600,
-    30,
-    180
-  ],
-  "product_git_entries_before_packet": 2219,
-  "product_git_tree_manifest_sha256": "bbb4340bd4dc4897a9d8e3d8207b3e687f6f5d46202f835ad55457f3672693be",
-  "product_head": "918920655d841600e1a44b66057a634940e0e132",
-  "product_parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
-  "product_tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
-  "provenance_correction": {
+  "historical_6af_provenance_correction": {
     "actual_frozen_conservation": "56 of57 parked member bytes identical; all57 original paths remain. Current invocation-template differs; six sealing files were added.",
+    "comparison_scope": "Metadata correction6af versus45c only; prior own-path geometry was not runnable from6af.",
     "current_template_bytes_hash": {
       "bytes": 863,
       "path": "invocation-template.json",
@@ -129,9 +108,68 @@
     "source_parent_head": "45c4c51eb37e73ad43bff2fd1c6ede32d7f02745",
     "unchanged_executable_and_policy_scope": "Runnerac80/planff147/sourcebinding0c53/current template2dd4 and every other packet/product byte remain exact45c. No algorithm, CargoJSON reader, fixture, parser, environment, authority, custody, phase or runtime change."
   },
+  "instruction_baseline_variance": {
+    "bytes_flags_changed_by_author": false,
+    "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+    "index_flag": "H AGENTS.md",
+    "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+    "latest_user_AGENTS_instructions_followed": true,
+    "variance": true
+  },
+  "kind": "AUTHOR_LINEAR918_INTEGRATION1_SOURCE_CONSERVATION_NOT_INDEPENDENT_APPROVAL",
+  "limits": "Static AST/hash/JSON/source Git and line reconstruction only. New task functions are unexecuted. Original exact package/test/bin mapping is source-derived; no embedded/every-exec attestation, old LIB3 pass transfer or runtime admission.",
+  "original_absolute_workload_cap": 2400,
+  "original_park": {
+    "current_successor_byte_conservation_claim": null,
+    "historical_comparison": "See historical_45c_and_6af_vs_original_park; old856-byte template raw bytes remain unavailable, semantic deltaUNKNOWN.",
+    "path": "/var/tmp/coord16-linear918-integration1-priority-park-xyjjpnty/wip.json",
+    "sha256": "c985958307b16a4bfb7ee7bc61715d16f40734766e64692d154b793017752166"
+  },
+  "own_path_binding_successor": {
+    "all_source_function_bodies_exact_6af": 35,
+    "current_park_56_of57_claim": false,
+    "current_plan_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/plan.json",
+    "current_runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/run-packet.py",
+    "current_source_binding_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source/qualification-packets/linear-918-integration1/source-binding.json",
+    "current_template_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source",
+    "current_template_vs6af": "Known exact own argv/cwd and runner digest binding changes only; not a reconstruction of unavailable original parked template.",
+    "execution_authorized": false,
+    "global_only_runner_delta": [
+      "PLAN",
+      "PLAN_SHA"
+    ],
+    "grant": null,
+    "kind": "OWN_CURRENT_PATH_BINDING_SUCCESSOR_SOURCE_CHECK_NOT_INDEPENDENT_APPROVAL",
+    "new_runner_sha256": "940fb2ad511d64cc5f2e583a9893d8eb74f768471f9a758d7139aaf2171069aa",
+    "old_PLAN_literal_source": "Old original45c controller worktree; static source barrier7f5706 showed6af own runner mismatched plan.runner_path.",
+    "old_park_template_bytes_unavailable_and_semantic_delta_UNKNOWN": true,
+    "old_runner_sha256": "ac80b9e7ea0495c43ab56c1806fdedc37d8880d1327365eaa5802181213014d2",
+    "own_runner_plan_source_review_archive_template_paths_coherent": true,
+    "parent": "6af40390301a1b7da5ef17d534431dd92f39eb3f",
+    "product_worktree_unchanged": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract",
+    "runner_functions_all35_exact_parent": true,
+    "runner_normalization_inverse_exact_parent": true,
+    "runtime": null,
+    "semantic_algorithms_changed": false,
+    "source_parent_tree": "aca73189d169a420eafa22d4e932692d63eb8fee",
+    "template_12argv_review_slots_provisional_null": true,
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-integration1-final-source"
+  },
+  "planned_command_caps": [
+    300,
+    600,
+    30,
+    180
+  ],
+  "product_git_entries_before_packet": 2219,
+  "product_git_tree_manifest_sha256": "bbb4340bd4dc4897a9d8e3d8207b3e687f6f5d46202f835ad55457f3672693be",
+  "product_head": "918920655d841600e1a44b66057a634940e0e132",
+  "product_parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "product_tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
   "queue": null,
   "review": null,
-  "runner_sha256": "ac80b9e7ea0495c43ab56c1806fdedc37d8880d1327365eaa5802181213014d2",
+  "runner_sha256": "940fb2ad511d64cc5f2e583a9893d8eb74f768471f9a758d7139aaf2171069aa",
   "source_mapping_limit": {
     "binary_source_sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
     "embedded_value_extracted": false,
