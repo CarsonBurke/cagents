@@ -28,7 +28,7 @@ use std::{
 };
 
 const ARGUMENT: &str = "--cagents-native-holder";
-const PROTOCOL: u32 = 3;
+const PROTOCOL: u32 = 4;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
@@ -98,7 +98,7 @@ impl Spawn {
             .envs(&self.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .process_group(0);
         crate::host::descriptor_limit::inherit(&mut command);
         // The helper's signalfd owns SIGCHLD; its provider must receive the
@@ -132,6 +132,7 @@ impl Spawn {
 
 #[derive(Serialize, Deserialize)]
 enum Request {
+    Diagnostic,
     Spawn {
         protocol: u32,
         spawn: Spawn,
@@ -161,9 +162,12 @@ enum Request {
 
 #[derive(Serialize, Deserialize)]
 enum Report {
+    Diagnostic(ExitDiagnostic),
     Started {
         protocol: u32,
         record: Record,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_error: Option<String>,
         #[serde(default)]
         directory_pin: bool,
     },
@@ -182,6 +186,48 @@ enum Report {
     Failed(String),
 }
 
+/// Raw transport evidence. Presentation strips escape sequences and selects a
+/// short reason; keeping this separate prevents transport errors hiding exits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ExitDiagnostic {
+    // Preserve the original wire keys for older clients, but name the owner
+    // explicitly in Rust. A launcher can exit before its confirmed server.
+    #[serde(rename = "code")]
+    pub launcher_code: Option<i32>,
+    #[serde(rename = "signal")]
+    pub launcher_signal: Option<i32>,
+    #[serde(default)]
+    pub launcher: Option<Process>,
+    #[serde(default)]
+    pub confirmed_server: Option<ServerObservation>,
+    pub stderr: String,
+    pub log_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ServerObservation {
+    pub process: Process,
+    // This observes the exact /proc identity, not an exit status. An adopted
+    // descendant's wait status may already have been consumed by tool reaping.
+    pub identity_current: bool,
+}
+
+impl ExitDiagnostic {
+    fn identify_launcher(mut self, launcher: &Process) -> Result<Self, String> {
+        if self
+            .launcher
+            .as_ref()
+            .is_some_and(|actual| actual != launcher)
+        {
+            return Err("Native holder diagnostic belongs to another launcher".into());
+        }
+        // Old v4 holders return only code/signal. Their known meaning is the
+        // original child, so label that identity without inventing a server.
+        self.launcher = Some(launcher.clone());
+        Ok(self)
+    }
+}
+
 /// Dropping an intentionally closed actor releases its server. An unexpected
 /// daemon exit instead closes the socket without sending Release.
 pub(crate) struct Holder {
@@ -195,6 +241,32 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    pub fn diagnostic(&mut self) -> Result<ExitDiagnostic, String> {
+        if self.control_poisoned {
+            return Err(
+                "Native holder control framing is uncertain; only exact cleanup is available"
+                    .into(),
+            );
+        }
+        if !self.identity.record.build.as_ref().is_some_and(|build| {
+            build
+                .capabilities
+                .iter()
+                .any(|capability| capability == "provider-exit-diagnostics")
+        }) {
+            return Err("This older provider holder has no exit diagnostics; restart the session to update it".into());
+        }
+        let control = self.control.as_ref().ok_or("Native holder is detached")?;
+        send(control, &Request::Diagnostic, TIMEOUT)?;
+        match receive(control, TIMEOUT)? {
+            Some(Report::Diagnostic(diagnostic)) => {
+                diagnostic.identify_launcher(&self.identity.record.root)
+            }
+            Some(Report::Failed(error)) => Err(error),
+            _ => Err("Native holder did not report provider exit diagnostics".into()),
+        }
+    }
+
     pub(crate) fn pinned_launch_directory(
         &mut self,
     ) -> Result<
@@ -561,11 +633,23 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             Some(Report::Started {
                 protocol,
                 record,
+                scope_error,
                 directory_pin,
             }) if protocol == PROTOCOL
                 && record.holder.pid == pid
                 && record.holder.is_current() =>
             {
+                if let Some(error) = scope_error {
+                    tracing::warn!(
+                        %error,
+                        holder = record.holder.pid,
+                        "holder scope enrollment failed; provider uses existing launch fallback"
+                    );
+                    // Execed holders have null stderr and no subscriber. Keep
+                    // the refusal visible in staged owning-test failure output.
+                    #[cfg(test)]
+                    eprintln!("native holder scope enrollment failed: {error}");
+                }
                 crate::daemon::process_scope::warn_if_shared(
                     record.holder.pid as u32,
                     record.root.pid as u32,
@@ -648,7 +732,7 @@ fn inspect_with_directory_pin(
             recovery,
             exited,
             directory_pin,
-        }) if matches!(protocol, 2 | PROTOCOL) && actual == *record => {
+        }) if matches!(protocol, 2..=PROTOCOL) && actual == *record => {
             recovery.validate_original_role(&record.boot, &record.application)?;
             Ok((recovery, exited, directory_pin))
         }
@@ -768,6 +852,7 @@ struct Residence {
     recovery: Recovery,
     child: Server,
     child_events: ChildEvents,
+    stderr: StderrCapture,
     released: bool,
     _working_directory: Option<std::fs::File>,
     provider_pidfd: std::fs::File,
@@ -804,12 +889,13 @@ impl Residence {
             .map_err(|error| error.to_string())?;
         let socket = registry::socket(&directory, spawn.recovery.source.id);
         let listener = Listener::bind(socket)?;
-        let child = match spawn.command().spawn() {
+        let mut child = match spawn.command().spawn() {
             Ok(child) => Server(crate::daemon::owned_children::OwnedChildren::new(child)),
             Err(error) => {
                 return Err(error.to_string());
             }
         };
+        let stderr = StderrCapture::new(child.take_stderr(), spawn.recovery.source.id)?;
         let record = Record {
             version: 4,
             build: Some(registry::BuildIdentity::current(Kind::Native)),
@@ -830,6 +916,7 @@ impl Residence {
             recovery: spawn.recovery,
             child,
             child_events,
+            stderr,
             released: false,
             _working_directory: working_directory,
         };
@@ -903,7 +990,14 @@ impl Residence {
     }
     fn attend(&mut self, control: UnixStream) -> bool {
         loop {
-            if wait_for_control(control.as_raw_fd(), &self.child, &self.child_events).is_err() {
+            if wait_for_control_with_stderr(
+                control.as_raw_fd(),
+                &self.child,
+                &self.child_events,
+                Some(&mut self.stderr),
+            )
+            .is_err()
+            {
                 return self.recovery.is_durable();
             }
             let request = match receive(&control, TIMEOUT) {
@@ -937,6 +1031,44 @@ impl Residence {
                 continue;
             }
             let response = match request {
+                Request::Diagnostic => {
+                    use std::os::unix::process::ExitStatusExt;
+                    let result = self
+                        .stderr
+                        .drain()
+                        .and_then(|()| self.child.exit_status())
+                        .and_then(|status| {
+                            if status.is_some() {
+                                // Once the leader exited, drain its remaining pipe
+                                // bytes before publishing the last meaningful line.
+                                // Descendants may retain stderr; keep this bounded.
+                                for _ in 0..16 {
+                                    self.stderr.drain()?;
+                                    if self.stderr.reader.is_none() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(status)
+                        });
+                    match result {
+                        Ok(status) => Report::Diagnostic(ExitDiagnostic {
+                            launcher_code: status.and_then(|status| status.code()),
+                            launcher_signal: status.and_then(|status| status.signal()),
+                            launcher: Some(self.record.root.clone()),
+                            confirmed_server: self.recovery.server_process.as_ref().map(|server| {
+                                ServerObservation {
+                                    process: server.clone(),
+                                    identity_current: server.is_current(),
+                                }
+                            }),
+                            stderr: String::from_utf8_lossy(self.stderr.tail.make_contiguous())
+                                .into_owned(),
+                            log_path: self.stderr.log_path.clone(),
+                        }),
+                        Err(error) => Report::Failed(error.to_string()),
+                    }
+                }
                 Request::Release => match self.release() {
                     Ok(()) => {
                         let _ = send(&control, &Report::Released, TIMEOUT);
@@ -1024,10 +1156,11 @@ impl Residence {
 
     fn orphan(&mut self) -> bool {
         loop {
-            if wait_for_control(
+            if wait_for_control_with_stderr(
                 self.listener.socket.as_raw_fd(),
                 &self.child,
                 &self.child_events,
+                Some(&mut self.stderr),
             )
             .is_err()
             {
@@ -1100,6 +1233,93 @@ impl Residence {
     }
 }
 
+/// One bounded ring, drained on the holder's existing poll loop. No per-agent
+/// reader thread or periodic wakeup is needed. Full raw stderr is opt-in disk
+/// debug output, just like the daemon's direct provider transport.
+struct StderrCapture {
+    reader: Option<std::process::ChildStderr>,
+    tail: std::collections::VecDeque<u8>,
+    log: Option<std::fs::File>,
+    log_path: Option<PathBuf>,
+}
+impl StderrCapture {
+    fn new(
+        reader: Option<std::process::ChildStderr>,
+        terminal: crate::model::TerminalId,
+    ) -> Result<Self, String> {
+        if let Some(reader) = &reader {
+            let fd = reader.as_raw_fd();
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(io::Error::last_os_error().to_string());
+            }
+        }
+        let log_path = (std::env::var_os("CAGENTS_LOCAL_DEBUG").as_deref()
+            == Some(std::ffi::OsStr::new("1")))
+        .then(|| {
+            crate::instance::project_dirs().map(|dirs| {
+                dirs.cache_dir()
+                    .join("provider-stderr")
+                    .join(format!("{terminal}-{}.log", std::process::id()))
+            })
+        })
+        .flatten();
+        let log = log_path.as_ref().and_then(|path| {
+            use std::os::unix::fs::OpenOptionsExt;
+            let parent = path.parent()?;
+            crate::secure_file::prepare_private_directory(parent).ok()?;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .ok()
+        });
+        let log_path = log.is_some().then_some(log_path).flatten();
+        Ok(Self {
+            reader,
+            tail: Default::default(),
+            log,
+            log_path,
+        })
+    }
+    fn drain(&mut self) -> io::Result<()> {
+        let mut bytes = [0_u8; 8192];
+        // Bound work per poll so a noisy provider cannot starve Interrupt or
+        // ownership updates. A still-readable pipe immediately polls again.
+        for _ in 0..8 {
+            let Some(reader) = self.reader.as_mut() else {
+                break;
+            };
+            match reader.read(&mut bytes) {
+                Ok(0) => {
+                    self.reader.take();
+                    break;
+                }
+                Ok(count) => {
+                    if let Some(log) = self.log.as_mut()
+                        && log.write_all(&bytes[..count]).is_err()
+                    {
+                        self.log.take();
+                    }
+                    for byte in &bytes[..count] {
+                        if self.tail.len() == 64 * 1024 {
+                            self.tail.pop_front();
+                        }
+                        self.tail.push_back(*byte);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
 /// SIGCHLD is blocked only in the dedicated holder. The provider's pre-exec
 /// hook restores the ordinary mask so its own child management is unaffected.
 struct ChildEvents {
@@ -1158,6 +1378,7 @@ impl Drop for ChildEvents {
 
 /// A child exit or control message is the only source of idle wakeups. Reap
 /// once before blocking as well, including orphans already pending at startup.
+#[cfg(test)]
 fn wait_for_control(
     fd: RawFd,
     children: &crate::daemon::owned_children::OwnedChildren,
@@ -1166,9 +1387,30 @@ fn wait_for_control(
     wait_for_control_with_reaper(fd, child_events, || children.reap_exited_descendants())
 }
 
+#[cfg(test)]
 fn wait_for_control_with_reaper(
     fd: RawFd,
     child_events: &ChildEvents,
+    reap: impl FnMut() -> io::Result<()>,
+) -> io::Result<()> {
+    wait_for_control_with_stderr_and_reaper(fd, child_events, None, reap)
+}
+
+fn wait_for_control_with_stderr(
+    fd: RawFd,
+    children: &crate::daemon::owned_children::OwnedChildren,
+    child_events: &ChildEvents,
+    stderr: Option<&mut StderrCapture>,
+) -> io::Result<()> {
+    wait_for_control_with_stderr_and_reaper(fd, child_events, stderr, || {
+        children.reap_exited_descendants()
+    })
+}
+
+fn wait_for_control_with_stderr_and_reaper(
+    fd: RawFd,
+    child_events: &ChildEvents,
+    mut stderr: Option<&mut StderrCapture>,
     mut reap: impl FnMut() -> io::Result<()>,
 ) -> io::Result<()> {
     let mut reported = false;
@@ -1185,6 +1427,9 @@ fn wait_for_control_with_reaper(
         }
     };
     loop {
+        if let Some(stderr) = stderr.as_mut() {
+            stderr.drain()?;
+        }
         inspect_children();
         let mut poll = [
             libc::pollfd {
@@ -1194,6 +1439,14 @@ fn wait_for_control_with_reaper(
             },
             libc::pollfd {
                 fd: child_events.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stderr
+                    .as_ref()
+                    .and_then(|stderr| stderr.reader.as_ref())
+                    .map_or(-1, AsRawFd::as_raw_fd),
                 events: libc::POLLIN,
                 revents: 0,
             },
@@ -1445,7 +1698,9 @@ extern "C" fn serve_if_requested() {
         };
         // This is an execed holder, not a post-fork pre_exec hook. Complete
         // scope enrollment before the provider's first process can exist.
-        let _ = crate::daemon::process_scope::enroll_holder();
+        let scope_error = crate::daemon::process_scope::enroll_holder()
+            .err()
+            .map(|error| error.to_string());
         let mut residence = match Residence::start(spawn) {
             Ok(residence) => residence,
             Err(error) => {
@@ -1465,6 +1720,7 @@ extern "C" fn serve_if_requested() {
             &Report::Started {
                 protocol: PROTOCOL,
                 record: residence.record.clone(),
+                scope_error,
                 directory_pin: true,
             },
             START_TIMEOUT,
@@ -1527,6 +1783,323 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn startup_report_preserves_optional_scope_failure() {
+        let record = Record {
+            version: 4,
+            build: None,
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: crate::model::BootId::new("fixture-boot"),
+            terminal: crate::model::TerminalId::new(),
+            holder: Process { pid: 42, start: 17 },
+            root: Process { pid: 43, start: 18 },
+        };
+        let mut wire = serde_json::to_value(Report::Started {
+            protocol: PROTOCOL,
+            record: record.clone(),
+            scope_error: None,
+            directory_pin: false,
+        })
+        .unwrap();
+        assert!(wire["Started"].get("scope_error").is_none());
+        wire["Started"]
+            .as_object_mut()
+            .unwrap()
+            .remove("directory_pin");
+        let Report::Started {
+            protocol,
+            record: decoded,
+            scope_error,
+            directory_pin,
+        } = serde_json::from_value(wire.clone()).unwrap()
+        else {
+            panic!("legacy startup report changed type");
+        };
+        assert_eq!(protocol, PROTOCOL);
+        assert_eq!(decoded, record);
+        assert!(!directory_pin);
+        assert_eq!(scope_error, None);
+
+        wire["Started"]["scope_error"] = serde_json::json!("fixture enrollment refusal");
+        let Report::Started {
+            protocol,
+            record: decoded,
+            scope_error,
+            directory_pin,
+        } = serde_json::from_value(wire).unwrap()
+        else {
+            panic!("diagnostic startup report changed type");
+        };
+        assert_eq!(protocol, PROTOCOL);
+        assert_eq!(decoded, record);
+        assert!(!directory_pin);
+        assert_eq!(scope_error.as_deref(), Some("fixture enrollment refusal"));
+    }
+
+    #[test]
+    fn legacy_exit_diagnostics_identify_only_the_launcher() {
+        let legacy = serde_json::json!({
+            "code": 0,
+            "signal": null,
+            "stderr": "launcher finished\n",
+            "log_path": null,
+        });
+        let launcher = Process { pid: 42, start: 17 };
+        let diagnostic: ExitDiagnostic = serde_json::from_value(legacy).unwrap();
+        let diagnostic = diagnostic.identify_launcher(&launcher).unwrap();
+        assert_eq!(diagnostic.launcher.as_ref(), Some(&launcher));
+        assert_eq!(diagnostic.launcher_code, Some(0));
+        assert_eq!(diagnostic.launcher_signal, None);
+        assert!(diagnostic.confirmed_server.is_none());
+        let wire = serde_json::to_value(&diagnostic).unwrap();
+        assert_eq!(wire["code"], 0);
+        assert!(wire.get("launcher_code").is_none());
+        assert!(
+            diagnostic
+                .identify_launcher(&Process { pid: 42, start: 18 })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn launcher_success_is_distinct_from_confirmed_server_lifetime() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_IDENTITY_DIAGNOSTIC_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "chat::native_holder::transport::tests::launcher_success_is_distinct_from_confirmed_server_lifetime",
+                    "--nocapture",
+                ])
+                .env(STAGE, "1")
+                .env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        for name in ["launcher-gate", "server-gate"] {
+            use std::os::unix::ffi::OsStrExt;
+            let path =
+                std::ffi::CString::new(working.path().join(name).as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        // The launcher and confirmed server are distinct shell processes.
+        // FIFOs retain both until the test has inspected each phase; no sleep
+        // or unrelated long-lived tool supplies the server's identity.
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                r#"/bin/sh -c 'printf "%s\n" "$$" > "$1/server.pid"; IFS= read -r gate < "$1/server-gate"; printf "confirmed server failure\n" >&2; exit 7' server "$1" &
+IFS= read -r gate < "$1/launcher-gate"
+exit 0"#.into(),
+                "launcher".into(),
+                working.path().to_string_lossy().into_owned(),
+            ],
+            working_directory: working.path().to_owned(),
+            environment: Default::default(),
+        };
+        let mut holder = spawn(spec, source).unwrap();
+        let launcher = holder.identity.record.root.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let server = loop {
+            if let Ok(pid) = std::fs::read_to_string(working.path().join("server.pid"))
+                && let Ok(pid) = pid.trim().parse()
+                && let Ok(server) = Process::read(pid)
+            {
+                break server;
+            }
+            assert!(Instant::now() < deadline, "fixture server did not start");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_ne!(server, launcher);
+        holder
+            .confirm(
+                uuid::Uuid::new_v4().to_string(),
+                super::super::tests::server_identity(),
+                server.clone(),
+            )
+            .unwrap();
+        let initial = holder.diagnostic().unwrap();
+        assert_eq!(initial.launcher.as_ref(), Some(&launcher));
+        assert_eq!(initial.launcher_code, None);
+        assert_eq!(initial.launcher_signal, None);
+        let observed = initial.confirmed_server.unwrap();
+        assert_eq!(observed.process, server);
+        assert!(observed.identity_current);
+
+        let release = |name| {
+            use std::os::unix::fs::OpenOptionsExt;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+                    .open(working.path().join(name))
+                {
+                    Ok(mut writer) => {
+                        writer.write_all(b"continue\n").unwrap();
+                        break;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "fixture gate never opened: {name}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("fixture gate {name}: {error}"),
+                }
+            }
+        };
+        release("launcher-gate");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let diagnostic = loop {
+            let diagnostic = holder.diagnostic().unwrap();
+            if diagnostic.launcher_code == Some(0) {
+                break diagnostic;
+            }
+            assert!(Instant::now() < deadline, "fixture launcher did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(diagnostic.launcher.as_ref(), Some(&launcher));
+        assert_eq!(diagnostic.launcher_signal, None);
+        let observed = diagnostic.confirmed_server.unwrap();
+        assert_eq!(observed.process, server);
+        assert!(
+            observed.identity_current,
+            "launcher exit is not server exit"
+        );
+        assert!(server.is_current());
+
+        release("server-gate");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let diagnostic = loop {
+            let diagnostic = holder.diagnostic().unwrap();
+            if diagnostic
+                .confirmed_server
+                .as_ref()
+                .is_some_and(|server| !server.identity_current)
+            {
+                break diagnostic;
+            }
+            assert!(Instant::now() < deadline, "fixture server was not reaped");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // The confirmed server exited 7, but its reaped status is unavailable.
+        // The only retained code remains explicitly attributed to the launcher.
+        assert_eq!(diagnostic.launcher_code, Some(0));
+        assert_eq!(diagnostic.launcher_signal, None);
+        assert_eq!(diagnostic.launcher.as_ref(), Some(&launcher));
+        assert!(diagnostic.stderr.contains("confirmed server failure\n"));
+        let wire = serde_json::to_vec(&Report::Diagnostic(diagnostic)).unwrap();
+        let Report::Diagnostic(decoded) = serde_json::from_slice(&wire).unwrap() else {
+            panic!("missing diagnostic control response");
+        };
+        let observed = decoded.confirmed_server.unwrap();
+        assert_eq!(observed.process, server);
+        assert!(!observed.identity_current);
+        assert_eq!(decoded.launcher_code, Some(0));
+        holder.close().unwrap();
+        assert!(!server.is_current());
+        assert!(!launcher.is_current());
+    }
+
+    #[test]
+    fn holder_reports_exit_status_and_captured_stderr_over_control() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_STDERR_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::holder_reports_exit_status_and_captured_stderr_over_control", "--nocapture"])
+                .env(STAGE,"1").env("XDG_RUNTIME_DIR",directory.path())
+                .env("XDG_DATA_HOME",directory.path().join("data"))
+                .env("XDG_CACHE_HOME",directory.path().join("cache"))
+                .env("CAGENTS_LOCAL_DEBUG","1").output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "printf 'first diagnostic\nlast failure\n' >&2; exit 3".into(),
+            ],
+            working_directory: std::env::temp_dir(),
+            environment: Default::default(),
+        };
+        let mut holder = spawn(spec, source).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let diagnostic = loop {
+            let diagnostic = holder.diagnostic().unwrap();
+            if diagnostic.launcher_code.is_some() || diagnostic.launcher_signal.is_some() {
+                break diagnostic;
+            }
+            assert!(Instant::now() < deadline, "fixture provider did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(diagnostic.launcher_code, Some(3));
+        assert_eq!(diagnostic.launcher_signal, None);
+        assert_eq!(
+            diagnostic.launcher.as_ref(),
+            Some(&holder.identity.record.root)
+        );
+        assert!(diagnostic.confirmed_server.is_none());
+        assert_eq!(diagnostic.stderr, "first diagnostic\nlast failure\n");
+        assert_eq!(
+            std::fs::read_to_string(diagnostic.log_path.as_ref().unwrap()).unwrap(),
+            diagnostic.stderr
+        );
+        let frame = serde_json::to_vec(&Report::Diagnostic(diagnostic)).unwrap();
+        let Report::Diagnostic(decoded) = serde_json::from_slice(&frame).unwrap() else {
+            panic!("missing diagnostic control response")
+        };
+        assert_eq!(decoded.launcher_code, Some(3));
+        assert!(decoded.stderr.ends_with("last failure\n"));
+        holder.close().unwrap();
+    }
 
     #[test]
     fn idle_control_and_orphan_listener_reap_tools_without_reaping_or_killing_provider() {
@@ -2104,6 +2677,19 @@ exec /bin/sleep 60
                 .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
                 .env("XDG_DATA_HOME", directory.path().join("data"))
                 .output().unwrap();
+            // A successful staged child can still report unqualified scope
+            // isolation. Preserve both original streams, not only panic text.
+            // Send both labelled streams to stderr to keep the outer parent's
+            // stdout/libtest count intact. Reporting must not replace its exit.
+            {
+                let mut diagnostics = io::stderr().lock();
+                let _ = writeln!(diagnostics, "native adoption/close staged stdout begin");
+                let _ = diagnostics.write_all(&output.stdout);
+                let _ = writeln!(diagnostics, "\nnative adoption/close staged stdout end");
+                let _ = writeln!(diagnostics, "native adoption/close staged stderr begin");
+                let _ = diagnostics.write_all(&output.stderr);
+                let _ = writeln!(diagnostics, "\nnative adoption/close staged stderr end");
+            }
             assert!(
                 output.status.success(),
                 "{}",
@@ -2370,6 +2956,7 @@ exec /bin/sleep 60
         let mut legacy = serde_json::to_value(Report::Started {
             protocol: PROTOCOL,
             record: record.clone(),
+            scope_error: None,
             directory_pin: true,
         })
         .unwrap();
