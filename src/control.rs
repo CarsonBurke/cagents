@@ -3593,15 +3593,19 @@ fn channel_output(
             let model = client
                 .edit_workspace_model(ModelEdit::CreateChannel {
                     id,
-                    repository,
+                    repository: repository.clone(),
                     title,
                     title_source: Default::default(),
                 })
-                .map_err(protocol_error)?;
+                .map_err(|error| channel_spawn_error(protocol_error(error), id, &repository))?;
             let channel = model.channel(id).cloned().ok_or_else(|| {
-                AppError::new(
-                    "protocol",
-                    "the daemon accepted the channel but did not report it",
+                channel_spawn_error(
+                    AppError::new(
+                        "protocol",
+                        "the response did not contain the requested channel",
+                    ),
+                    id,
+                    &repository,
                 )
             })?;
             let human = channel_line(&channel);
@@ -3660,6 +3664,34 @@ fn channel_output(
             })
         }
     }
+}
+
+fn channel_spawn_error(mut error: AppError, id: ChannelId, repository: &Path) -> AppError {
+    // The project step was acknowledged, but a failed channel reply cannot
+    // establish whether the channel edit committed. Retain the original id so
+    // callers can reconcile it instead of blindly creating another channel.
+    let mut details = match error.details.take() {
+        Some(Value::Object(details)) => details,
+        Some(details) => serde_json::Map::from_iter([("cause_details".into(), details)]),
+        None => serde_json::Map::new(),
+    };
+    details.insert(
+        "partial_result".into(),
+        json!({
+            "command": "channel.spawn",
+            "repository": repository.to_str(),
+            "repository_display": repository.to_string_lossy(),
+            "channel_id": id,
+            "project_open_acknowledged": true,
+            "channel_create": "unconfirmed",
+        }),
+    );
+    error.details = Some(Value::Object(details));
+    error.message = format!(
+        "Channel {id} creation was not confirmed: {}. The project-open step was acknowledged; check for this ID in the channel list on the same device before retrying.",
+        error.message,
+    );
+    error
 }
 
 /// One channel per line: id, repository, title.
@@ -4480,6 +4512,229 @@ mod tests {
             format!("{id}\t{}\tprobe", expected.display()),
             "one tab-separated line: id, repository, title"
         );
+    }
+
+    #[test]
+    fn channel_spawn_preserves_partial_result_after_unconfirmed_create() {
+        #[derive(Clone, Copy, Debug)]
+        enum Reply {
+            Refused(bool),
+            Closed,
+            Malformed,
+            Unexpected,
+            MissingChannel,
+        }
+
+        for reply in [
+            Reply::Refused(false),
+            Reply::Refused(true),
+            Reply::Closed,
+            Reply::Malformed,
+            Reply::Unexpected,
+            Reply::MissingChannel,
+        ] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            server_stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let peer_proof = proof("session", "boot", "incarnation");
+            let repository = PathBuf::from("/fixture/project/.git");
+            let server_repository = repository.clone();
+            let server = thread::spawn(move || {
+                let connected: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(connected.request, ClientRequest::Connect { .. }));
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(
+                        connected.request_id,
+                        peer_proof.clone(),
+                        peer_proof.clone(),
+                    ),
+                )
+                .unwrap();
+                let opened: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert!(matches!(
+                    opened.request,
+                    ClientRequest::EditWorkspaceModel {
+                        edit: ModelEdit::OpenProject { repository: ref asked, .. }
+                    } if *asked == server_repository
+                ));
+                write_frame(
+                    &mut server_stream,
+                    &model_envelope(
+                        opened.request_id,
+                        peer_proof.clone(),
+                        WorkspaceModel::default(),
+                    ),
+                )
+                .unwrap();
+                let created: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                let ClientRequest::EditWorkspaceModel {
+                    edit:
+                        ModelEdit::CreateChannel {
+                            id,
+                            repository: asked,
+                            title,
+                            ..
+                        },
+                } = created.request
+                else {
+                    panic!("expected the sole channel edit");
+                };
+                assert_eq!(asked, server_repository);
+                assert_eq!(title, "probe");
+                match reply {
+                    Reply::Closed => server_stream.shutdown(std::net::Shutdown::Write).unwrap(),
+                    Reply::Malformed => server_stream.write_all(&0u32.to_be_bytes()).unwrap(),
+                    _ => {
+                        let message = match reply {
+                            Reply::Refused(retryable) => {
+                                ServerMessage::Error(crate::terminal::ipc::ProtocolError::new(
+                                    ProtocolErrorCode::InvalidRequest,
+                                    "fixture refusal",
+                                    retryable,
+                                ))
+                            }
+                            Reply::Unexpected => ServerMessage::Response {
+                                response: ServerResponse::Accepted,
+                            },
+                            Reply::MissingChannel => ServerMessage::Response {
+                                response: ServerResponse::WorkspaceModel {
+                                    model: WorkspaceModel::default(),
+                                },
+                            },
+                            _ => unreachable!(),
+                        };
+                        write_frame(
+                            &mut server_stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(created.request_id),
+                                proof: peer_proof,
+                                message,
+                            },
+                        )
+                        .unwrap();
+                    }
+                }
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut server_stream)
+                        .unwrap()
+                        .is_none(),
+                    "{reply:?}: no retry or rollback request"
+                );
+                id
+            });
+            let mut client = ControlClient::from_stream(client_stream).unwrap();
+            let result = channel_output(
+                &mut client,
+                ResolvedChannel::Spawn {
+                    repository: repository.clone(),
+                    title: "probe".into(),
+                    kind: Default::default(),
+                    checkout: None,
+                    primary_checkout: None,
+                },
+            );
+            drop(client);
+            let id = server.join().unwrap();
+            let error = result
+                .err()
+                .expect("unconfirmed creation must remain an error");
+            let expected_kind = match reply {
+                Reply::Closed | Reply::Malformed => "connection",
+                _ => "protocol",
+            };
+            assert_eq!(error.kind, expected_kind, "{reply:?}");
+            let details = error.details.unwrap();
+            assert_eq!(
+                details["partial_result"],
+                json!({
+                    "command": "channel.spawn", "repository": repository.to_str(),
+                    "repository_display": repository.to_string_lossy(), "channel_id": id, "project_open_acknowledged": true, "channel_create": "unconfirmed",
+                }),
+                "{reply:?}"
+            );
+            if let Reply::Refused(retryable) = reply {
+                assert_eq!(details["code"], json!(ProtocolErrorCode::InvalidRequest));
+                assert_eq!(details["retryable"], retryable);
+                assert!(error.message.contains("fixture refusal"));
+            } else {
+                assert!(details.get("code").is_none());
+                assert!(details.get("retryable").is_none());
+            }
+            assert!(error.message.contains(&id.to_string()), "{reply:?}");
+            assert!(
+                error.message.contains("channel list on the same device"),
+                "{reply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_spawn_project_refusal_has_no_channel_partial_result_or_retry() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let peer_proof = proof("session", "boot", "incarnation");
+        let server = thread::spawn(move || {
+            let connected: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(connected.request, ClientRequest::Connect { .. }));
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(connected.request_id, peer_proof.clone(), peer_proof.clone()),
+            )
+            .unwrap();
+            let opened: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(matches!(
+                opened.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::OpenProject { .. }
+                }
+            ));
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(opened.request_id),
+                    proof: peer_proof,
+                    message: ServerMessage::Error(crate::terminal::ipc::ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "fixture project refusal",
+                        false,
+                    )),
+                },
+            )
+            .unwrap();
+            assert!(
+                read_frame::<ClientEnvelope>(&mut server_stream)
+                    .unwrap()
+                    .is_none(),
+                "no channel edit after project refusal"
+            );
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let result = channel_output(
+            &mut client,
+            ResolvedChannel::Spawn {
+                repository: "/fixture/project/.git".into(),
+                title: "probe".into(),
+                kind: Default::default(),
+                checkout: None,
+                primary_checkout: None,
+            },
+        );
+        drop(client);
+        server.join().unwrap();
+        let error = result.err().expect("project refusal must remain an error");
+        assert_eq!(error.kind, "protocol");
+        assert_eq!(
+            error.details.unwrap(),
+            json!({ "code": ProtocolErrorCode::InvalidRequest, "retryable": false })
+        );
+        assert!(error.message.contains("fixture project refusal"));
+        assert!(!error.message.contains("acknowledged"));
     }
 
     fn model_envelope(
