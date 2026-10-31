@@ -1,23 +1,20 @@
 {
   "schema": "immutable-research-case/v1",
-  "case": "installer2015",
+  "case": "cli-cache-producer-2015",
   "never_merge": true,
-  "product_head": "6dc09b9a1b5d205650e244401da0938b653d16da",
-  "product_tree": "aaab67a21378958066103707baf3abe8850577d6",
-  "runner_sha256": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
-  "plan_sha256": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
-  "cache_gate_sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+  "product_head": "375c37ff01aab0b226c58f547012af74e93a8643",
+  "product_tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+  "runner_sha256": "c391a995e1c6432f00b56f91c82ab7edb45a22dbc331e909f9187de660b30a67",
+  "plan_sha256": "018fb6a8896a16c417cc2e0d722d29565d6ebf35d3b1d9c09899677e0e31f53d",
   "selector_path": ".github/qualification/pr2015/case-select.py",
-  "selector_sha256": "360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85",
-  "independent_review_path": ".github/qualification/pr2015/independent-review.json",
-  "independent_review_input": "No author-produced clear receipt exists. Root must copy the genuine reserved independent nonauthor receipt before research publication; absence or mismatched runner/plan/product pins fails before Cargo.",
+  "selector_sha256": "bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d",
+  "independent_review_path": ".github/qualification/pr2015/cli-cache-producer-review.json",
+  "independent_review_input": "No author clear/stub: missing genuine exact frozen runner/plan/product review refuses before output/setup/Cargo. Must copy actual independent receipt after freeze and perform final source-binding review before publication.",
   "source_sha256": {
-    ".github/qualification/pr2015/run-packet.py": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
-    ".github/qualification/pr2015/plan.json": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
-    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
-    ".github/qualification/pr2015/case-select.py": "360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85",
-    ".github/qualification/pr2015/manifest.json": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
-    ".github/qualification/pr2015/source-review-binding.json": "137abfaddf843a76597c03d7f9b0f10405ce732393d91d2f6d8958f5d21b3e87"
+    ".github/qualification/pr2015/case-select.py": "bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d",
+    ".github/qualification/pr2015/cli-cache-producer.py": "c391a995e1c6432f00b56f91c82ab7edb45a22dbc331e909f9187de660b30a67",
+    ".github/qualification/pr2015/cli-cache-producer-plan.json": "018fb6a8896a16c417cc2e0d722d29565d6ebf35d3b1d9c09899677e0e31f53d",
+    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4"
   },
   "legacy_published_source": {
     "case": "legacy-final-save-1726",
@@ -27,18 +24,22 @@
     "archive_path": ".github/qualification/pr2015/lineage/published-workflow-7dc.yml",
     "this_case_status": "UNRUN_DESELECTED"
   },
-  "unpublished_1951": {
-    "commit": "eea8b26a1b543847c9449f69fbedd15e23828ccb",
-    "disposition": "Untouched; no source imported and no publication."
+  "original_installer_case": {
+    "control_head": "ac4bbf446957317d022a987e20887af4b3f70481",
+    "path": ".github/qualification/pr2015/lineage/installer2015-case-ac4.json",
+    "sha256": "9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f",
+    "original_run": 41136465523,
+    "attempt": 1,
+    "outcome": "CACHE_MISS_BEFORE_CARGO_PRESERVED",
+    "parent_invocations": 0
   },
   "current_runtime": "ALL_UNRUN",
   "current_allocation": null,
   "current_execution": null,
   "cache_constraints": [
-    "Cache visibility from PR1921/current research branch is unverified.",
-    "Actual restored CLI payload is unknown and unprobed.",
-    "No integration-harness warmth or Cargo freshness is established by library cache presence."
+    "Standalone serial producer only; no cache-restore gate fabricated or weakened.",
+    "Save action success alone does not qualify cache publication. Require original official exact-key save confirmation.",
+    "Later independent installer restore and unchanged feature-empty payload gate remain mandatory. No auto-chain."
   ],
-  "publication_scope": "Research PR1921 only, NeverMerge. Creates no product PR and grants no mergeability or bypass of rejected product-PR creation. Source preparation allocates nothing; global C remains external and unavailable until Main15 return and Root scheduling.",
-  "installer_original_run_attempt": "1"
+  "publication_scope": "Existing researchPR1921 synchronize attempt1 only/NeverMerge. Fresh external Root C and genuine frozen-source review required BEFORE triggering nonforce publication. No rejected product-PR creation route retried."
 }

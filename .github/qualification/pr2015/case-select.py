@@ -51,7 +51,11 @@ def hosted_context():
     case_sha = os.environ.get('PR2015_CASE_SHA256', '')
     assert re.fullmatch(r'[0-9a-f]{64}', case_sha) and digest(case_path) == case_sha, 'Immutable selected research case differs'
     case = json.loads(case_path.read_bytes())
-    assert case['case'] in ('installer2015', 'legacy-final-save-1726') and case['never_merge'] is True
+    assert case['case'] in ('installer2015', 'legacy-final-save-1726', 'cli-cache-producer-2015') and case['never_merge'] is True
+    if case['case'] == 'cli-cache-producer-2015':
+        assert attempt == '1' and event.get('action') == 'synchronize', 'Producer requires original synchronize attempt1'
+        assert case['product_head'] == '375c37ff01aab0b226c58f547012af74e93a8643'
+        assert case['product_tree'] == 'acb2cc6e049562469643e49a1ee5f7abc179c28b'
     if case['case'] == 'installer2015':
         assert attempt == '1', 'Installer2015 requires one original attempt1; reruns are unsupported and no global C grant is implied'
         assert case['product_head'] == '6dc09b9a1b5d205650e244401da0938b653d16da' and case['product_tree'] == 'aaab67a21378958066103707baf3abe8850577d6'
@@ -67,19 +71,49 @@ def hosted_context():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--require-installer-review', action='store_true')
+    parser.add_argument('--require-producer-review', action='store_true')
     args = parser.parse_args()
     record = {'status': 'failed', 'case': None, 'heavy_execution': 'UNRUN', 'owning_passes': 0,
               'never_merge': True, 'global_C': 'External Root coordination required; source selection allocates nothing.'}
     output = Path(os.environ['RUNNER_TEMP']) / 'issue2015-hosted-evidence'
-    output.mkdir(mode=0o700, exist_ok=True)
     try:
         context = hosted_context()
         case = json.loads(Path(control_path('.github/qualification/pr2015/case.json')).read_bytes())
         record.update(context=context, case=case['case'], case_sha256=context['case_sha256'])
+        producer = case['case'] == 'cli-cache-producer-2015'
+        if not producer:
+            output.mkdir(mode=0o700, exist_ok=True)
         for name, expected in case['source_sha256'].items():
             assert digest(control_path(name)) == expected, 'Selected source pin changed: ' + name
         assert case['legacy_published_source']['head'] == '7dcf367268c51236ccd0b5e12cdb0bc5c64d273c'
         assert digest(control_path(case['legacy_published_source']['archive_path'])) == case['legacy_published_source']['workflow_sha256']
+        if producer:
+            assert not args.require_installer_review
+            plan = json.loads(Path(control_path('.github/qualification/pr2015/cli-cache-producer-plan.json')).read_bytes())
+            receipt_path = Path(control_path(case['independent_review_path']))
+            receipt = json.loads(receipt_path.read_bytes())
+            assert receipt['verdict'] == 'CONTROLLER_SOURCE_CLEAR'
+            assert receipt['head'] == case['product_head'] == plan['product_head']
+            assert receipt['tree'] == case['product_tree'] == plan['product_tree']
+            assert receipt['runner_sha256'] == case['runner_sha256']
+            assert receipt['plan_sha256'] == case['plan_sha256']
+            assert plan['counts']['qualifying_outer_parents'] == 0 and plan['planned_phase_count'] == 3
+            if args.require_producer_review:
+                product = Path(os.environ['GITHUB_WORKSPACE']) / 'product'
+                head_file = product / '.git/HEAD'
+                assert head_file.is_file() and not head_file.is_symlink() and head_file.read_text().strip() == case['product_head']
+                assert all(digest(product / path) == expected for path, expected in plan['source_paths_sha256'].items()), 'Exact current product source changed'
+            # No new-producer output/tool/setup/target effect precedes its source/review checks.
+            output.mkdir(mode=0o700, exist_ok=True)
+            record['independent_review_sha256'] = digest(receipt_path)
+            if args.require_producer_review:
+                with Path(os.environ['GITHUB_ENV']).open('a') as stream:
+                    stream.write('CARGO_TARGET_DIR=' + str(Path(os.environ['RUNNER_TEMP']) / 'held-scope-target') + '\n')
+                    stream.write('QUALIFICATION_EVIDENCE=' + str(output) + '\n')
+                    stream.write('PR2015_CONTROLLER_REVIEW_SHA256=' + record['independent_review_sha256'] + '\n')
+                    stream.write('PR2015_RUN_BINDING=' + context['run_binding'] + '\n')
+        else:
+            assert not args.require_producer_review
         if args.require_installer_review:
             assert case['case'] == 'installer2015'
             product = Path(os.environ['GITHUB_WORKSPACE']) / 'product'
@@ -100,12 +134,18 @@ def main():
                 stream.write('PR2015_RUN_BINDING=' + context['run_binding'] + '\n')
         record['legacy_final_save_1726'] = 'UNRUN_DESELECTED' if case['case'] == 'installer2015' else 'SELECTED_NOT_EXECUTED_BY_PREFLIGHT'
         record['installer2015'] = 'SELECTED_NOT_EXECUTED_BY_PREFLIGHT' if case['case'] == 'installer2015' else 'UNRUN_DESELECTED'
+        record['cli_cache_producer_2015'] = 'SELECTED_NOT_EXECUTED_BY_PREFLIGHT' if producer else 'UNRUN_DESELECTED'
+        if producer:
+            record['legacy_final_save_1726'] = 'UNRUN_DESELECTED'
         record['status'] = 'source_selected'
         with Path(os.environ['GITHUB_OUTPUT']).open('a') as stream:
             stream.write('case=' + case['case'] + '\n')
     except (AssertionError, KeyError, OSError, ValueError, TypeError) as error:
         record['error'] = {'type': type(error).__name__, 'message': str(error)}
-    receipt = output / ('installer-source-preflight.json' if args.require_installer_review else 'case-selection.json')
+    if not output.exists():
+        print(json.dumps({'status': record['status'], 'case': record['case'], 'heavy_execution': 'UNRUN', 'error': record.get('error'), 'receipt_path': None}))
+        return 1
+    receipt = output / ('producer-source-preflight.json' if args.require_producer_review else 'installer-source-preflight.json' if args.require_installer_review else 'case-selection.json')
     with receipt.open('x') as stream:
         json.dump(record, stream, indent=2)
         stream.write('\n')

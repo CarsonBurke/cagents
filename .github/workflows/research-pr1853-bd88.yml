@@ -184,7 +184,7 @@ jobs:
     outputs:
       case: ${{ steps.select.outputs.case }}
     env:
-      PR2015_CASE_SHA256: 9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f
+      PR2015_CASE_SHA256: 5bcf38760c42a3b79d3d61ffb65a2c503f108755d3d4f941b8ce20863911af11
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -196,7 +196,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s  %s\n' 360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85 research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          printf '%s  %s\n' bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
           python3 research/.github/qualification/pr2015/case-select.py
       - name: Upload original source-selection receipt
         if: always()
@@ -566,7 +566,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
-      PR2015_CASE_SHA256: 9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f
+      PR2015_CASE_SHA256: 5bcf38760c42a3b79d3d61ffb65a2c503f108755d3d4f941b8ce20863911af11
     defaults:
       run:
         shell: bash
@@ -609,7 +609,7 @@ jobs:
         id: source_preflight
         run: |
           set -euo pipefail
-          printf '%s  %s\n' 360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85 research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          printf '%s  %s\n' bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
           python3 research/.github/qualification/pr2015/case-select.py --require-installer-review
       - name: Install pinned compiler without invoking Cargo
         run: |
@@ -706,8 +706,130 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  cli-cache-producer-2015:
+    needs: select-case
+    if: >-
+      needs.select-case.outputs.case == 'cli-cache-producer-2015' &&
+      github.event.action == 'synchronize' && github.run_attempt == 1 &&
+      github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: Research separate CLI cache prerequisite producer
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      PR2015_CASE_SHA256: 5bcf38760c42a3b79d3d61ffb65a2c503f108755d3d4f941b8ce20863911af11
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require natural hosted User before checkout or setup
+        run: |
+          python3 - <<'PY'
+          import os, platform
+          assert not any(name.startswith('CAGENTS_') for name in os.environ), 'Inherited scope is unsupported; environment unchanged'
+          assert os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert os.environ.get('RUNNER_OS') == 'Linux' and os.environ.get('RUNNER_ARCH') == 'X64' and platform.system() == 'Linux'
+          assert os.environ.get('GITHUB_EVENT_NAME') == 'pull_request' and os.environ.get('GITHUB_RUN_ATTEMPT') == '1'
+          PY
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: 375c37ff01aab0b226c58f547012af74e93a8643
+          path: product
+          persist-credentials: false
+      - name: Require exact producer source and genuine independent review
+        id: source_preflight
+        run: |
+          set -euo pipefail
+          printf '%s  %s\n' bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d research/.github/qualification/pr2015/case-select.py | sha256sum --check --strict
+          python3 research/.github/qualification/pr2015/case-select.py --require-producer-review
+      - name: Install pinned compiler without invoking Cargo
+        timeout-minutes: 12
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=30s 600s rustup toolchain install 1.93.0 --profile minimal > "$QUALIFICATION_EVIDENCE/producer-rustup.stdout" 2> "$QUALIFICATION_EVIDENCE/producer-rustup.stderr"
+          setup_exit=$?
+          set -e
+          printf '%s\n' "$setup_exit" > "$QUALIFICATION_EVIDENCE/producer-rustup.original-exit"
+          exit "$setup_exit"
+      - name: Install bounded CLI dependencies for this separate producer
+        timeout-minutes: 22
+        run: |
+          set -euo pipefail
+          set +e
+          timeout --signal=TERM --kill-after=30s 1200s bash -c 'set -euo pipefail; sudo apt-get update; sudo apt-get install --yes --no-install-recommends build-essential clang cmake curl git libclang-dev libdbus-1-dev libssl-dev ninja-build pkg-config python3 xz-utils' > "$QUALIFICATION_EVIDENCE/producer-native-setup.stdout" 2> "$QUALIFICATION_EVIDENCE/producer-native-setup.stderr"
+          setup_exit=$?
+          set -e
+          printf '%s\n' "$setup_exit" > "$QUALIFICATION_EVIDENCE/producer-native-setup.original-exit"
+          test "$setup_exit" -eq 0
+          test -x /usr/bin/clang
+          test -x /usr/bin/clang++
+          test -d /usr/lib/llvm-14/lib
+          printf '%s\n' 'CC=/usr/bin/clang' 'CXX=/usr/bin/clang++' 'LIBCLANG_PATH=/usr/lib/llvm-14/lib' >> "$GITHUB_ENV"
+      - name: Execute exactly three original CLI compile commands and validate produced payload
+        id: producer
+        timeout-minutes: 45
+        run: |
+          python3 "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/cli-cache-producer.py" \
+            --run-binding "$PR2015_RUN_BINDING" \
+            --runner-sha256 c391a995e1c6432f00b56f91c82ab7edb45a22dbc331e909f9187de660b30a67 \
+            --controller-review "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/cli-cache-producer-review.json" \
+            --controller-review-sha256 "$PR2015_CONTROLLER_REVIEW_SHA256"
+      - name: Save only positively prepared CLI payload to the existing namespace
+        id: save_cache
+        if: ${{ success() && steps.producer.outcome == 'success' }}
+        timeout-minutes: 10
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ${{ env.CARGO_TARGET_DIR }}
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}
+      - name: Preserve source/build/save outcomes without claiming a saved cache
+        if: always()
+        env:
+          SOURCE_PREFLIGHT_OUTCOME: ${{ steps.source_preflight.outcome }}
+          PRODUCER_OUTCOME: ${{ steps.producer.outcome }}
+          SAVE_ACTION_OUTCOME: ${{ steps.save_cache.outcome }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'issue2015-hosted-evidence'
+          if not root.exists():
+              raise SystemExit('No admitted producer evidence directory; source/preflight failed')
+          record = {'outcomes': {name: os.environ[name] for name in ('SOURCE_PREFLIGHT_OUTCOME', 'PRODUCER_OUTCOME', 'SAVE_ACTION_OUTCOME')},
+                    'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+                    'cache_publication': 'UNQUALIFIED_PENDING_ORIGINAL_VENDOR_EXACT_KEY_CONFIRMATION',
+                    'future_restore': 'UNQUALIFIED_REQUIRES_SEPARATE_ORIGINAL_INSTALLER_GATE',
+                    'owning_passes': 0, 'installer_test_native_provider_invocations': 0,
+                    'workflow_job_terminal': 'NOT_YET_TERMINAL_POST_ACTIONS_PENDING', 'global_C_return': 'NOT_MADE'}
+          with (root / 'producer-workflow-step-outcomes.json').open('x') as stream:
+              json.dump(record, stream, indent=2)
+              stream.write('\n')
+          with (root / 'producer-workflow-sha256.txt').open('x') as stream:
+              for path in sorted(root.rglob('*')):
+                  if path.is_file() and not path.is_symlink() and path.name != 'producer-workflow-sha256.txt':
+                      stream.write(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + str(path.relative_to(root)) + '\n')
+          PY
+      - name: Upload complete original producer evidence
+        if: always()
+        timeout-minutes: 10
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cli-cache-producer2015-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/issue2015-hosted-evidence
+          if-no-files-found: error
+          retention-days: 14
+
   case-result:
-    needs: [select-case, qualify, installer2015]
+    needs: [select-case, qualify, installer2015, cli-cache-producer-2015]
     if: always()
     name: Report the selected research case without transferring passes
     runs-on: ubuntu-22.04
@@ -717,6 +839,7 @@ jobs:
       SELECT_RESULT: ${{ needs.select-case.result }}
       LEGACY_RESULT: ${{ needs.qualify.result }}
       INSTALLER_RESULT: ${{ needs.installer2015.result }}
+      PRODUCER_RESULT: ${{ needs.cli-cache-producer-2015.result }}
     steps:
       - name: Require only the actual selected case and disclose the unrun case
         shell: bash
@@ -726,13 +849,18 @@ jobs:
           from pathlib import Path
           selected = os.environ['SELECTED_CASE']
           legacy, installer = os.environ['LEGACY_RESULT'], os.environ['INSTALLER_RESULT']
-          selected_result = {'installer2015': installer, 'legacy-final-save-1726': legacy}.get(selected, 'unknown')
-          other_result = legacy if selected == 'installer2015' else installer
+          results = {'installer2015': installer, 'legacy-final-save-1726': legacy, 'cli-cache-producer-2015': os.environ['PRODUCER_RESULT']}
+          selected_result = results.get(selected, 'unknown')
+          others = {name: result for name, result in results.items() if name != selected}
+          other_result = str(others)
           with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as stream:
               stream.write('Research only / NeverMerge. Selected case: ' + selected + '.\n\n')
               stream.write('Selected job result: ' + selected_result + '; other case: UNRUN (' + other_result + ').\n\n')
               stream.write('No native, provider, installed, external process absence, whole-PR or mergeability claim. Original authenticated run/job/log/artifact review and external C return remain required.\n')
           assert os.environ['SELECT_RESULT'] == 'success'
           assert selected_result == 'success', 'Selected case failed, was cancelled, skipped, or remained unknown'
-          assert other_result == 'skipped', 'More than the selected heavy case ran'
+          assert len(others) == 2 and all(result == 'skipped' for result in others.values()), 'More than the selected heavy case ran'
+          if selected == 'cli-cache-producer-2015':
+              with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a') as stream:
+                  stream.write('CLI cache preparation only; zero test parents. Save-action success alone is not a saved-cache receipt or future restore guarantee. Original vendor exact-key confirmation and later separately granted installer restore/gate remain required.\n')
           PY
