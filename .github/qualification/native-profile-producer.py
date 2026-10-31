@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import hashlib
 import http.client
-import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -22,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 from urllib.parse import urlencode
 
 PINNED_ADMISSION_INPUTS = None  # No actual policy change/grant/facts/contract supplied.
@@ -678,6 +678,15 @@ def perform_readback(control, plan, context, documents, layout, phase):
         raise
 
 
+def preparation_module(control, expected):
+    path = control / '.github/qualification/final-main-prepare.py'
+    raw = path.read_bytes()
+    need(digest(raw) == expected,'preparation-source')
+    namespace = dict(__file__=str(path),__name__='reviewed_preparation',__package__=None,__cached__=None)
+    exec(compile(raw,str(path),'exec'),namespace)  # Execute the buffer authenticated by the existing plan pin.
+    return SimpleNamespace(**namespace)
+
+
 def main():
     context = user_context(dict(os.environ))
     need(len(sys.argv) == 3 and sys.argv[1] in ('--admission-only','--produce','--pre-save-readback','--post-save-readback'),'producer-mode')
@@ -694,10 +703,7 @@ def main():
         return perform_readback(control,plan,context,documents,layout,
             'before' if sys.argv[1] == '--pre-save-readback' else 'after')
     need('PRODUCER_READBACK_TOKEN' not in os.environ,'Readback token must never enter compiler environments')
-    prep_path = control/'.github/qualification/final-main-prepare.py'
-    need(digest(prep_path.read_bytes()) == plan['preparation_module_sha256'],'preparation-source')
-    spec = importlib.util.spec_from_file_location('reviewed_preparation',prep_path)
-    prep = importlib.util.module_from_spec(spec); spec.loader.exec_module(prep)
+    prep = preparation_module(control,plan['preparation_module_sha256'])
     cancel = prep.PreparationCancellation(); cancel.install()
     owner = owner_type(prep)(cancel,subprocess.Popen,prep.original_identity,os.killpg)
     began = time.monotonic(); proof = None; manifest = None; records = []; graphs = {}

@@ -4,12 +4,14 @@ The original22/100 stay at b3/3e. This file never merges historical logs or
 claims native Runtime internals that only the four owning Rust parents inspect.
 """
 import hashlib
-import importlib.util
 import json
 from pathlib import Path
 import re
 import stat
 import sys
+from types import SimpleNamespace
+
+PREPARATION_SHA = '289d578f7465b00b182a0f18f89b6861b6aaffce34d41d78ad1ff9c73b1236a6'
 
 A = '00000000-0000-4000-8000-000000002018'
 B = '00000000-0000-4000-8000-000000002019'
@@ -280,17 +282,24 @@ def check_flow(label, receipt, source, fixture_events, native_events, payload, f
     need(receipt['inspector_before']['present'] is True and receipt['inspector_after']['present'] is False, 'ordinary-inspector-setup')
 
 
-def check_preparation(root, control, plan, source, native_source):
+def preparation_module(control):
     path = control / '.github/qualification/final-main-prepare.py'
-    spec = importlib.util.spec_from_file_location('checked_preparation',path)
-    preparation = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(preparation)  # Stdlib definitions only, no native import.
+    raw = path.read_bytes()
+    module_sha = digest(raw)
+    need(module_sha == PREPARATION_SHA,'preparation-source')
+    namespace = dict(__file__=str(path),__name__='checked_preparation',__package__=None,__cached__=None)
+    exec(compile(raw,str(path),'exec'),namespace)  # No path reread or bytecode cache after verification.
+    return SimpleNamespace(**namespace),module_sha
+
+
+def check_preparation(root, control, plan, source, native_source):
+    preparation,module_sha = preparation_module(control)
     raw = (root / 'preparation/prepared.json').read_bytes()
     record = json.loads(raw)
     need(native_source['preparation_sha256'] == digest(raw)
-         and native_source['preparation_module_sha256'] == digest(path.read_bytes()),'preparation-native-binding')
+         and native_source['preparation_module_sha256'] == module_sha,'preparation-native-binding')
     preparation.verify_data(record,plan,dict(sha=source['control_sha'],tree=source['control_tree']),
-                            digest(path.read_bytes()),digest((control / '.github/qualification/final-main-fixture.rs').read_bytes()))
+                            module_sha,digest((control / '.github/qualification/final-main-fixture.rs').read_bytes()))
     retained_raw = {label:member(root,record['inventory_members'][label]) for label in ('before','after')}
     inventories = preparation.verify_inventory_bytes(record,retained_raw)
     need(json.loads(member(root,record['original_children_member'])) == record['original_children'],'prepared-original-child-log')

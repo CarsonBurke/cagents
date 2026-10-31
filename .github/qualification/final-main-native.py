@@ -7,7 +7,6 @@ import ast
 import ctypes
 from contextlib import contextmanager
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -21,10 +20,13 @@ import tempfile
 import threading
 import time
 import traceback
+from types import SimpleNamespace
 
 import pyatspi
 from gi.repository import Gio, GLib
 from PIL import Image
+
+PREPARATION_SHA = '289d578f7465b00b182a0f18f89b6861b6aaffce34d41d78ad1ff9c73b1236a6'
 
 A = '00000000-0000-4000-8000-000000002018'
 B = '00000000-0000-4000-8000-000000002019'
@@ -1044,10 +1046,12 @@ def open_monitor(resources, output):
 
 def preparation_module(control):
     path = control / '.github/qualification/final-main-prepare.py'
-    spec = importlib.util.spec_from_file_location('final_main_preparation',path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # Stdlib-only; no native or GI import/init.
-    return module
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != PREPARATION_SHA:
+        raise ValueError('Frozen preparation module changed')
+    namespace = dict(__file__=str(path),__name__='final_main_preparation',__package__=None,__cached__=None)
+    exec(compile(raw,str(path),'exec'),namespace)  # Execute only the verified retained bytes, never cached code.
+    return SimpleNamespace(**namespace)
 
 
 def exercise(control, checkout, label, helper, base, target, plan, resources):
