@@ -135,6 +135,47 @@ type FilePending =
 type TextCopyPending =
     Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::TextCopyPage, String>>>>>;
 const TEXT_COPY_TIMEOUT: Duration = Duration::from_secs(40);
+// Local cache replies can outlive cancellation/timeouts. Their request class
+// must never fall through into a provider/connection error publication.
+const LOCAL_QUERY_REQUEST_FLAG: u64 = 1 << 63;
+
+fn next_request_id(next: &AtomicU64) -> Result<u64, String> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        (value < LOCAL_QUERY_REQUEST_FLAG).then(|| value + 1)
+    })
+    .map_err(|_| "Chat request identifiers are exhausted; reconnect this conversation".to_owned())
+}
+
+fn check_copy_cancellation(cancelled: Option<&AtomicBool>) -> Result<(), String> {
+    if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+        Err("Saved output loading was cancelled".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn receive_text_copy(
+    response: &crossbeam_channel::Receiver<Result<super::TextCopyPage, String>>,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<super::TextCopyPage, String> {
+    if cancelled.is_none() {
+        return response
+            .recv_timeout(text_copy_remaining(deadline)?)
+            .map_err(|_| "Text copy request timed out or disconnected".to_string())?;
+    }
+    loop {
+        check_copy_cancellation(cancelled)?;
+        let remaining = text_copy_remaining(deadline)?;
+        match response.recv_timeout(remaining.min(Duration::from_millis(20))) {
+            Ok(result) => return result,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Err("Text copy request timed out or disconnected".into());
+            }
+        }
+    }
+}
 
 /// A daemon timestamp paired with local receipt time. It survives delayed UI
 /// hydration and advances while the provider is quiet without relying on the
@@ -2083,13 +2124,11 @@ impl ClientHandle {
                         chat_id: id,
                         visible: visibility_value.load(Ordering::Acquire),
                     };
-                    if transmit(
-                        &visibility_wire,
-                        &visibility_proof,
-                        visibility_next.fetch_add(1, Ordering::Relaxed),
-                        request,
-                    )
-                    .is_err()
+                    if next_request_id(&visibility_next)
+                        .and_then(|request_id| {
+                            transmit(&visibility_wire, &visibility_proof, request_id, request)
+                        })
+                        .is_err()
                     {
                         let _ = visibility_wire
                             .lock()
@@ -2137,7 +2176,7 @@ impl ClientHandle {
                         if resident != Some(true) && body_requested.load(Ordering::Acquire) {
                             resync = true;
                             if visible.load(Ordering::Acquire) && !read_pending {
-                                if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: None }) { break error; }
+                                if let Err(error) = next_request_id(&next).and_then(|request_id| transmit(&wire, &proof, request_id, ClientRequest::ChatRead { chat_id: id, after_generation: None })) { break error; }
                                 read_pending = true;
                             } else { read_again = true; }
                         }
@@ -2187,6 +2226,14 @@ impl ClientHandle {
                     let _ = reply.try_send(result);
                     // Request-specific command failures are delivered to the
                     // caller; they do not make presentation unavailable.
+                    continue;
+                }
+                // An authenticated local-query reply may arrive after its
+                // request was cancelled or timed out. It grants no authority
+                // to replace the current provider failure or read state.
+                if envelope.request_id.is_some_and(|request| request & LOCAL_QUERY_REQUEST_FLAG != 0)
+                    && matches!(&envelope.message, ServerMessage::Error(_) | ServerMessage::Response { .. })
+                {
                     continue;
                 }
                 match envelope.message {
@@ -2304,7 +2351,7 @@ impl ClientHandle {
                         let state = publication.current.load();
                         (!resync && (state.resident || !body_requested.load(Ordering::Acquire))).then_some(state.snapshot.generation)
                     };
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation }) { break error; }
+                    if let Err(error) = next_request_id(&next).and_then(|request_id| transmit(&wire, &proof, request_id, ClientRequest::ChatRead { chat_id: id, after_generation })) { break error; }
                     read_pending = true;
                 }
             };
@@ -2456,7 +2503,7 @@ impl ClientHandle {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; exact reattachment is required".into());
         }
-        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let id = next_request_id(&self.inner.next)?;
         let (reply, response) = crossbeam_channel::bounded(1);
         {
             let mut pending = self.inner.pending.lock().unwrap_or_else(|p| p.into_inner());
@@ -2499,6 +2546,14 @@ impl ClientHandle {
     /// Read immutable cached edit data on this connection's own reply channel.
     /// Call off the UI thread; no watch publication or provider state is mutated.
     pub fn file_changes(&self, command: Command) -> Result<super::FileChangeReply, String> {
+        self.file_changes_with_timeout(command, Duration::from_secs(40))
+    }
+
+    fn file_changes_with_timeout(
+        &self,
+        command: Command,
+        timeout: Duration,
+    ) -> Result<super::FileChangeReply, String> {
         if !matches!(
             &command,
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
@@ -2508,7 +2563,7 @@ impl ClientHandle {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; retained file pages remain readable".into());
         }
-        let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+        let id = next_request_id(&self.inner.next)? | LOCAL_QUERY_REQUEST_FLAG;
         let (reply, response) = crossbeam_channel::bounded(1);
         {
             let mut pending = self
@@ -2532,7 +2587,7 @@ impl ClientHandle {
         )
         .and_then(|()| {
             response
-                .recv_timeout(Duration::from_secs(40))
+                .recv_timeout(timeout)
                 .map_err(|_| "File changes request timed out".to_string())?
         });
         self.inner
@@ -2546,7 +2601,32 @@ impl ClientHandle {
     /// Call off the UI thread: all pages share one total deadline and never
     /// publish snapshots or dispatch commands to the provider.
     pub fn copy_text(&self, source: super::TextCopySource) -> Result<String, String> {
-        let deadline = Instant::now() + TEXT_COPY_TIMEOUT;
+        self.read_text_copy(source, None)
+    }
+
+    pub(crate) fn copy_text_cancellable(
+        &self,
+        source: super::TextCopySource,
+        cancelled: &AtomicBool,
+    ) -> Result<String, String> {
+        self.read_text_copy(source, Some(cancelled))
+    }
+
+    fn read_text_copy(
+        &self,
+        source: super::TextCopySource,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<String, String> {
+        self.read_text_copy_until(source, cancelled, Instant::now() + TEXT_COPY_TIMEOUT)
+    }
+
+    fn read_text_copy_until(
+        &self,
+        source: super::TextCopySource,
+        cancelled: Option<&AtomicBool>,
+        deadline: Instant,
+    ) -> Result<String, String> {
+        check_copy_cancellation(cancelled)?;
         if source.bytes > super::TEXT_COPY_LIMIT_BYTES as u64 {
             return Err("Text copy exceeds the supported byte limit".into());
         }
@@ -2567,12 +2647,13 @@ impl ClientHandle {
         text.try_reserve_exact(source.bytes as usize)
             .map_err(|_| "Could not allocate text copy buffer".to_string())?;
         loop {
+            check_copy_cancellation(cancelled)?;
             if !self.inner.alive.load(Ordering::Acquire) {
                 return Err("Chat is disconnected; text copy is unavailable".into());
             }
             text_copy_remaining(deadline)?;
             let offset = text.len() as u64;
-            let id = self.inner.next.fetch_add(1, Ordering::Relaxed);
+            let id = next_request_id(&self.inner.next)? | LOCAL_QUERY_REQUEST_FLAG;
             let (reply, response) = crossbeam_channel::bounded(1);
             {
                 let mut pending = self
@@ -2600,17 +2681,14 @@ impl ClientHandle {
                 },
                 deadline,
             )
-            .and_then(|()| {
-                response
-                    .recv_timeout(text_copy_remaining(deadline)?)
-                    .map_err(|_| "Text copy request timed out or disconnected".to_string())?
-            });
+            .and_then(|()| receive_text_copy(&response, deadline, cancelled));
             self.inner
                 .text_copy_pending
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&id);
             let page = result?;
+            check_copy_cancellation(cancelled)?;
             text_copy_remaining(deadline)?;
             append_text_copy_page(&source, &mut text, page)?;
             if text.len() as u64 == source.bytes {
@@ -5931,6 +6009,624 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn local_query_identifiers_never_wrap_or_collide_across_handle_clones() {
+        let next = Arc::new(AtomicU64::new(LOCAL_QUERY_REQUEST_FLAG - 1));
+        assert_eq!(
+            next_request_id(&next).unwrap(),
+            LOCAL_QUERY_REQUEST_FLAG - 1
+        );
+        for seed in [LOCAL_QUERY_REQUEST_FLAG, u64::MAX] {
+            next.store(seed, Ordering::Relaxed);
+            assert!(next_request_id(&next).is_err());
+            assert_eq!(next.load(Ordering::Relaxed), seed);
+        }
+
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let clone = handle.clone();
+            workers.push(thread::spawn(move || {
+                (0..128)
+                    .map(|_| {
+                        let id = next_request_id(&clone.inner.next).unwrap();
+                        if index % 2 == 0 {
+                            id | LOCAL_QUERY_REQUEST_FLAG
+                        } else {
+                            id
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let ids = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            ids.len()
+        );
+        assert_eq!(handle.inner.next.load(Ordering::Relaxed), 1025);
+        handle
+            .inner
+            .next
+            .store(LOCAL_QUERY_REQUEST_FLAG, Ordering::Relaxed);
+        assert!(
+            handle
+                .send(Command::Refresh)
+                .unwrap_err()
+                .contains("identifiers are exhausted")
+        );
+        assert!(
+            handle
+                .file_changes(Command::LoadFileChanges {
+                    request_id: 1,
+                    after: None
+                })
+                .unwrap_err()
+                .contains("identifiers are exhausted")
+        );
+        assert!(
+            handle
+                .copy_text(text_copy_source(1, 0))
+                .unwrap_err()
+                .contains("identifiers are exhausted")
+        );
+        assert!(
+            handle
+                .copy_text_cancellable(text_copy_source(1, 0), &AtomicBool::new(false))
+                .unwrap_err()
+                .contains("identifiers are exhausted")
+        );
+        assert!(handle.inner.pending.lock().unwrap().is_empty());
+        assert!(handle.inner.file_pending.lock().unwrap().is_empty());
+        assert!(handle.inner.text_copy_pending.lock().unwrap().is_empty());
+        assert_eq!(handle.inner.text_copies.load(Ordering::Acquire), 0);
+        assert_eq!(
+            handle.inner.next.load(Ordering::Relaxed),
+            LOCAL_QUERY_REQUEST_FLAG
+        );
+    }
+
+    fn query_test_handshake(
+        server: &mut UnixStream,
+        codec: &mut FrameCodec,
+        proof: &HostSessionProof,
+    ) -> TerminalId {
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let connect: ClientEnvelope = codec.read(server).unwrap().unwrap();
+        query_test_reply(
+            server,
+            codec,
+            proof,
+            Some(connect.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: proof.clone(),
+                    resumed: vec![],
+                },
+            },
+        );
+        let start: ClientEnvelope = codec.read(server).unwrap().unwrap();
+        let ClientRequest::ChatStart { session, .. } = start.request else {
+            panic!("start expected");
+        };
+        let chat_id = session.id;
+        query_test_reply(
+            server,
+            codec,
+            proof,
+            Some(start.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::ChatAttached {
+                    session,
+                    snapshot: Snapshot {
+                        generation: 41,
+                        ready: true,
+                        error: Some("Newer provider diagnostic".into()),
+                        ..Default::default()
+                    },
+                },
+            },
+        );
+        chat_id
+    }
+
+    fn query_test_reply(
+        server: &mut UnixStream,
+        codec: &mut FrameCodec,
+        proof: &HostSessionProof,
+        request_id: Option<u64>,
+        message: ServerMessage,
+    ) {
+        codec
+            .write(
+                server,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id,
+                    proof: proof.clone(),
+                    message,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn exhausted_request_identifiers_emit_no_wire_requests() {
+        for visibility in [false, true] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let (attempted, attempts) = crossbeam_channel::bounded(1);
+            let (checked, check) = crossbeam_channel::bounded(1);
+            let worker = thread::spawn(move || {
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let proof = host_proof("exhausted-request-identifiers");
+                query_test_handshake(&mut peer, &mut codec, &proof);
+                attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+                peer.set_read_timeout(Some(if visibility {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(100)
+                }))
+                .unwrap();
+                match codec.read::<ClientEnvelope>(&mut peer) {
+                    Ok(None) if visibility => {}
+                    Err(ipc::FrameError::Io(error))
+                        if !visibility
+                            && matches!(
+                                error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) => {}
+                    other => {
+                        panic!("exhaustion emitted a frame or disconnected unexpectedly: {other:?}")
+                    }
+                }
+                checked.send(()).unwrap();
+                // Keep this connection alive until its owner finishes checking
+                // side effects; otherwise EOF could clear pending maps for it.
+                attempts.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let handle = ClientHandle::connect_on(
+                stream,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                None,
+                |_| {},
+            )
+            .unwrap();
+            let before = handle.snapshot();
+            handle
+                .inner
+                .next
+                .store(LOCAL_QUERY_REQUEST_FLAG, Ordering::Relaxed);
+            if visibility {
+                handle.set_visible(true).unwrap();
+            } else {
+                assert!(handle.send(Command::Refresh).is_err());
+                assert!(
+                    handle
+                        .file_changes(Command::LoadFileChanges {
+                            request_id: 1,
+                            after: None
+                        })
+                        .is_err()
+                );
+                assert!(handle.copy_text(text_copy_source(1, 0)).is_err());
+                assert!(
+                    handle
+                        .copy_text_cancellable(text_copy_source(1, 0), &AtomicBool::new(false))
+                        .is_err()
+                );
+            }
+            attempted.send(()).unwrap();
+            check.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(handle.inner.pending.lock().unwrap().is_empty());
+            assert!(handle.inner.file_pending.lock().unwrap().is_empty());
+            assert!(handle.inner.text_copy_pending.lock().unwrap().is_empty());
+            assert_eq!(handle.inner.text_copies.load(Ordering::Acquire), 0);
+            assert_eq!(
+                handle.inner.next.load(Ordering::Relaxed),
+                LOCAL_QUERY_REQUEST_FLAG
+            );
+            assert!(Arc::ptr_eq(&before, &handle.snapshot()));
+            if !visibility {
+                assert!(handle.is_connected());
+            }
+            attempted.send(()).unwrap();
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn retired_local_query_replies_preserve_live_reader_state_and_fresh_queries() {
+        // These are real collector removals and the real socket reader. No
+        // stale frame is sent until the owning collector has returned.
+        for mode in ["cancelled text", "timed out text", "timed out files"] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let (query_seen, seen) = crossbeam_channel::bounded(1);
+            let (retired, retirement) = crossbeam_channel::bounded(1);
+            let (wake, wakes) = crossbeam_channel::unbounded();
+            let worker = thread::spawn(move || {
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let proof = host_proof("retired-local-query");
+                let chat_id = query_test_handshake(&mut peer, &mut codec, &proof);
+                let shown: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                assert!(matches!(
+                    shown.request,
+                    ClientRequest::ChatVisibility { visible: true, .. }
+                ));
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    None,
+                    ServerMessage::ChatChanged { chat_id },
+                );
+                let held: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                assert!(matches!(held.request, ClientRequest::ChatRead { .. }));
+                assert_eq!(held.request_id & LOCAL_QUERY_REQUEST_FLAG, 0);
+                query_seen.send(()).unwrap();
+                let old: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                assert!(
+                    matches!(&old.request, ClientRequest::ChatCommand { command, .. }
+                    if matches!(command, Command::ReadTextCopy { .. } | Command::LoadFileChanges { .. }))
+                );
+                assert_ne!(old.request_id & LOCAL_QUERY_REQUEST_FLAG, 0);
+                query_seen.send(()).unwrap();
+                retirement.recv_timeout(Duration::from_secs(5)).unwrap();
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(old.request_id),
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        "Obsolete local query failure",
+                        false,
+                    )),
+                );
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(old.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                );
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    None,
+                    ServerMessage::ChatChanged { chat_id },
+                );
+                // The original ChatRead is still pending. A stale local Error
+                // must not clear it and trigger a second read here.
+                let active: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                assert!(
+                    matches!(
+                        active.request,
+                        ClientRequest::ChatCommand {
+                            command: Command::ReadTextCopy { .. },
+                            ..
+                        }
+                    ),
+                    "stale query reset read_pending: {active:?}"
+                );
+                assert_ne!(active.request_id & LOCAL_QUERY_REQUEST_FLAG, 0);
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(active.request_id),
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        "Active query refused",
+                        false,
+                    )),
+                );
+                // This ordered reply is the barrier after the stale frames.
+                let fresh: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                let ClientRequest::ChatCommand {
+                    command: Command::ReadTextCopy { source, offset },
+                    ..
+                } = fresh.request
+                else {
+                    panic!("fresh copy expected");
+                };
+                assert_eq!(offset, 0);
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(fresh.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatTextCopy {
+                            chat_id,
+                            page: super::super::TextCopyPage {
+                                source,
+                                offset,
+                                text: "fresh".into(),
+                                done: true,
+                            },
+                        },
+                    },
+                );
+                let ordinary: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                assert!(matches!(
+                    ordinary.request,
+                    ClientRequest::ChatCommand {
+                        command: Command::Refresh,
+                        ..
+                    }
+                ));
+                assert_eq!(ordinary.request_id & LOCAL_QUERY_REQUEST_FLAG, 0);
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(ordinary.request_id),
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        "Ordinary command refused",
+                        false,
+                    )),
+                );
+                let hidden: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                assert!(matches!(
+                    hidden.request,
+                    ClientRequest::ChatVisibility { visible: false, .. }
+                ));
+                query_seen.send(()).unwrap();
+                let barrier: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    None,
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::QueueFull,
+                        "Unbound queue error",
+                        true,
+                    )),
+                );
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(barrier.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                );
+                let barrier: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(123456),
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        "Current reader unavailable",
+                        false,
+                    )),
+                );
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(barrier.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                );
+                let finish: ClientEnvelope = codec.read(&mut peer).unwrap().unwrap();
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(finish.request_id),
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                );
+                // Only replies are retired: an asynchronous shutdown notice
+                // remains effective even if the sender includes a tagged ID.
+                query_test_reply(
+                    &mut peer,
+                    &mut codec,
+                    &proof,
+                    Some(old.request_id),
+                    ServerMessage::HostShuttingDown,
+                );
+            });
+            let handle = ClientHandle::connect_on(
+                stream,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                None,
+                move |event| {
+                    let _ = wake.send(event);
+                },
+            )
+            .unwrap();
+            handle.set_visible(true).unwrap();
+            assert!(matches!(
+                wakes.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Wake::Changed
+            ));
+            let before = handle.snapshot();
+            seen.recv_timeout(Duration::from_secs(5)).unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancellation = cancelled.clone();
+            let query = handle.clone();
+            let collector = thread::spawn(move || {
+                if mode == "timed out files" {
+                    query
+                        .file_changes_with_timeout(
+                            Command::LoadFileChanges {
+                                request_id: 1,
+                                after: None,
+                            },
+                            Duration::from_secs(1),
+                        )
+                        .map(|_| String::new())
+                } else if mode == "timed out text" {
+                    query.read_text_copy_until(
+                        text_copy_source(1, 5),
+                        None,
+                        Instant::now() + Duration::from_secs(1),
+                    )
+                } else {
+                    query.copy_text_cancellable(text_copy_source(1, 5), &cancellation)
+                }
+            });
+            seen.recv_timeout(Duration::from_secs(5)).unwrap();
+            if mode == "cancelled text" {
+                cancelled.store(true, Ordering::Release);
+            }
+            let error = collector.join().unwrap().unwrap_err();
+            assert!(
+                error.contains(if mode == "cancelled text" {
+                    "cancelled"
+                } else {
+                    "timed out"
+                }),
+                "{mode}: {error}"
+            );
+            assert!(handle.inner.text_copy_pending.lock().unwrap().is_empty());
+            assert!(handle.inner.file_pending.lock().unwrap().is_empty());
+            assert_eq!(handle.inner.text_copies.load(Ordering::Acquire), 0);
+            retired.send(()).unwrap();
+            assert_eq!(
+                handle.copy_text(text_copy_source(2, 5)).unwrap_err(),
+                "Active query refused"
+            );
+            assert!(
+                Arc::ptr_eq(&before, &handle.snapshot()),
+                "{mode}: retired Error changed publication"
+            );
+            assert!(
+                wakes.try_recv().is_err(),
+                "retired/active query replies must not wake presentation"
+            );
+            assert_eq!(handle.copy_text(text_copy_source(3, 5)).unwrap(), "fresh");
+            assert_eq!(
+                handle.send(Command::Refresh).unwrap_err(),
+                "Ordinary command refused"
+            );
+            assert!(Arc::ptr_eq(&before, &handle.snapshot()));
+            handle.set_visible(false).unwrap();
+            seen.recv_timeout(Duration::from_secs(5)).unwrap();
+            handle.send(Command::Refresh).unwrap();
+            assert_eq!(
+                handle.snapshot().error.as_deref(),
+                Some("Unbound queue error")
+            );
+            assert!(handle.snapshot().ready);
+            assert!(matches!(
+                wakes.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Wake::Changed
+            ));
+            handle.send(Command::Refresh).unwrap();
+            assert_eq!(
+                handle.snapshot().error.as_deref(),
+                Some("Current reader unavailable")
+            );
+            assert!(!handle.snapshot().ready);
+            assert!(matches!(
+                wakes.recv_timeout(Duration::from_secs(5)).unwrap(),
+                Wake::Changed
+            ));
+            handle.send(Command::Refresh).unwrap();
+            assert!(
+                matches!(wakes.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(error) if error.contains("shutting down"))
+            );
+            assert!(!handle.is_connected());
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn tagged_retired_replies_still_require_current_proof_and_version() {
+        for wrong_version in [false, true] {
+            let (stream, mut peer) = UnixStream::pair().unwrap();
+            let (release, ready) = crossbeam_channel::bounded(1);
+            let (wake, wakes) = crossbeam_channel::unbounded();
+            let worker = thread::spawn(move || {
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let proof = host_proof("tagged-query-identity");
+                query_test_handshake(&mut peer, &mut codec, &proof);
+                ready.recv_timeout(Duration::from_secs(5)).unwrap();
+                codec
+                    .write(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: if wrong_version {
+                                PROTOCOL_VERSION + 1
+                            } else {
+                                PROTOCOL_VERSION
+                            },
+                            request_id: Some(LOCAL_QUERY_REQUEST_FLAG | 123),
+                            proof: if wrong_version {
+                                proof
+                            } else {
+                                host_proof("replacement")
+                            },
+                            message: ServerMessage::Error(ipc::ProtocolError::new(
+                                ipc::ProtocolErrorCode::TerminalUnavailable,
+                                "Obsolete query error",
+                                false,
+                            )),
+                        },
+                    )
+                    .unwrap();
+            });
+            let handle = ClientHandle::connect_on(
+                stream,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                None,
+                move |event| {
+                    let _ = wake.send(event);
+                },
+            )
+            .unwrap();
+            release.send(()).unwrap();
+            assert!(
+                matches!(wakes.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(error) if error.contains("identity/version changed"))
+            );
+            assert!(!handle.is_connected());
+            assert_eq!(
+                handle.snapshot().error.as_deref(),
+                Some("Newer provider diagnostic")
+            );
+            worker.join().unwrap();
+        }
     }
 
     #[test]

@@ -64,9 +64,16 @@ pub struct Request {
     handle: Arc<ClientHandle>,
     source: chat::TextCopySource,
     conversation_revision: u64,
+    report: Option<provider_exit::CopyTicket>,
 }
 
 impl Request {
+    fn report_is_current(&self) -> bool {
+        self.report
+            .as_ref()
+            .is_none_or(|ticket| ticket.is_current())
+    }
+
     fn snapshot_is_current(&self, snapshot: &Snapshot) -> bool {
         match &self.source.scope {
             // Paging and verified appends do not revoke the captured prefix.
@@ -100,6 +107,7 @@ impl Request {
             handle,
             source,
             conversation_revision,
+            report: None,
         }
     }
 }
@@ -158,33 +166,54 @@ impl Cagents {
         id: String,
         source: Option<chat::TextCopySource>,
     ) -> Task<Message> {
-        let context = current_context();
-        let intent = context.advance();
-        let Some(runtime) = self.chat_runtime_mut(target) else {
+        let Some(request) = self.message_copy_request(target, &id, source) else {
             return Task::none();
         };
-        let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
-            runtime.error = Some("This message is unavailable in the local copy cache. Open the provider transcript to recover its text.".into());
-            return Task::none();
-        };
-        let Some(handle) = runtime.handle().cloned() else {
-            runtime.error =
-                Some("Reconnect this conversation before copying its full message.".into());
-            return Task::none();
-        };
-        let request = Request {
-            context,
-            intent,
-            handle: handle.clone(),
-            source: source.clone(),
-            conversation_revision: runtime.snapshot.text_copy_sources.conversation_revision,
-        };
+        let handle = request.handle.clone();
+        let source = request.source.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || handle.copy_text(source))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
             Message::ChatUi(Action::MessageCopied(target, id, request, result))
+        })
+    }
+
+    /// The production admission shared by the async read and completion/effect
+    /// fixtures. A report cannot proceed as an unguarded generic message copy.
+    pub(super) fn message_copy_request(
+        &mut self,
+        target: Target,
+        id: &str,
+        source: Option<chat::TextCopySource>,
+    ) -> Option<Request> {
+        let context = current_context();
+        let intent = context.advance();
+        let runtime = self.chat_runtime_mut(target)?;
+        let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
+            runtime.error = Some("This message is unavailable in the local copy cache. Open the provider transcript to recover its text.".into());
+            return None;
+        };
+        let Some(handle) = runtime.handle().cloned() else {
+            runtime.error =
+                Some("Reconnect this conversation before copying its full message.".into());
+            return None;
+        };
+        let report = match runtime.report_copy_ticket(id, &source) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                runtime.error = Some(error.into());
+                return None;
+            }
+        };
+        Some(Request {
+            context,
+            intent,
+            handle: handle.clone(),
+            source: source.clone(),
+            conversation_revision: runtime.snapshot.text_copy_sources.conversation_revision,
+            report,
         })
     }
 
@@ -196,6 +225,7 @@ impl Cagents {
         result: Result<String, String>,
     ) -> Task<Message> {
         if !request.context.is_current(request.intent)
+            || !request.report_is_current()
             || self.workspace.focused() != Some(target.card)
         {
             return Task::none();
@@ -203,6 +233,9 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        if request.report.is_none() && runtime.requires_report_copy_ticket(&id, &request.source) {
+            return Task::none();
+        }
         let Some(handle) = runtime
             .handle()
             .filter(|handle| Arc::ptr_eq(handle, &request.handle))
@@ -226,7 +259,8 @@ impl Cagents {
                 let intent = request.intent;
                 Task::batch([
                     clipboard_write(context, intent, text, move || {
-                        request.snapshot_is_current(&request.handle.snapshot())
+                        request.report_is_current()
+                            && request.snapshot_is_current(&request.handle.snapshot())
                     }),
                     cosmic::task::future(async move {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
