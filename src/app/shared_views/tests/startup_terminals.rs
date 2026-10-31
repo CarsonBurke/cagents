@@ -383,8 +383,26 @@ fn a_replaced_shared_session_is_qualified_again() {
     assert!(window.app.startup_pane_check().is_err());
     let mut replacement = session(&window.cached);
     replacement.id = TerminalId::new();
-    window.app.card_state_mut(window.cached.id).unwrap().kind =
-        CardKind::Terminal(replacement.clone());
+    // A replacement is authoritative only when the model actually publishes
+    // it; changing just the local descriptor would leave an unadmitted owner.
+    let mut model = window.app.workspace_model.clone();
+    model.sequence += 1;
+    let view = model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == Scope::Channel(window.hidden))
+        .unwrap();
+    view.revision += 1;
+    view.panes
+        .iter_mut()
+        .find(|pane| pane.id == window.cached.id)
+        .unwrap()
+        .kind = CardKind::Terminal(replacement.clone());
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Read(model)),
+    );
     assert_eq!(window.app.startup_pane_check(), Ok(false));
     drop(window.app.update(Message::VerifyStartupPanes));
     assert!(window.app.terminal_start_in_flight(window.cached.id));
@@ -481,4 +499,284 @@ fn a_detached_offscreen_attach_is_reported_rather_than_awaited() {
     assert!(window.app.restored_agent_attaches.is_empty());
     let report = window.app.startup_pane_check().unwrap_err();
     assert!(report.contains(REFUSAL), "{report}");
+}
+
+/// Restore an actual observed-agent row so initialize_runtimes, rather than
+/// a fixture queue insertion, owns the pre-admission attach intent.
+fn reopened_observed_window(with_projected: bool) -> Window {
+    let (mut app, active, hidden, _) = fixture();
+    let identity = app.workspace_model.identity;
+    let mut cached = offscreen(&live_terminal());
+    let CardKind::Terminal(source) = &mut cached.kind else {
+        unreachable!()
+    };
+    source.launch.program = "/usr/bin/claude".into();
+    let projected = with_projected.then(|| offscreen(&live_terminal()));
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.workspace_model_identity = Some(identity);
+    durable.active_channel = Some(active);
+    durable
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == hidden)
+        .unwrap()
+        .cards = vec![cached.id];
+    durable.cards = vec![cached.clone()];
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    app.shared_views = State::for_workspace(&app.durable);
+    app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+    app.startup_gate = crate::app::startup_gate::State::fixture_opened();
+    drop(app.initialize_runtimes());
+    assert_eq!(app.restored_agent_attaches, [cached.id]);
+    assert_eq!(app.terminal_starts_in_flight(), 0);
+    Window {
+        app,
+        active,
+        hidden,
+        cached,
+        projected,
+    }
+}
+
+fn observed_window_model(window: &Window) -> crate::workspace_model::WorkspaceModel {
+    let mut hidden = View::empty(window.hidden);
+    hidden.panes = window
+        .terminals()
+        .iter()
+        .map(|card| Pane::from_card(card, None).unwrap())
+        .collect();
+    crate::workspace_model::WorkspaceModel {
+        identity: window.app.durable.workspace_model_identity.unwrap(),
+        sequence: 1,
+        channels: [window.active, window.hidden]
+            .into_iter()
+            .map(|id| crate::workspace_model::ModelChannel {
+                id,
+                repository: "/fixture-project".into(),
+                title: "view".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            })
+            .collect(),
+        views: vec![View::empty(window.active), hidden],
+        ..Default::default()
+    }
+}
+
+fn emitted_seed_scopes(requests: &async_channel::Receiver<ModelEdit>) -> HashSet<Scope> {
+    let mut scopes = HashSet::new();
+    while let Ok(edit) = requests.try_recv() {
+        if let ModelEdit::SeedView { scope, .. } = edit {
+            scopes.insert(scope);
+        }
+    }
+    scopes
+}
+
+#[test]
+fn restored_observed_row_waits_for_its_own_seed_ack_after_connected() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut window = reopened_observed_window(false);
+    let (publisher, requests) = async_channel::unbounded();
+    window.app.workspace_model_tx = publisher;
+    let model = observed_window_model(&window);
+    let focused = window.app.workspace.focused();
+    let order = window.app.workspace.order().collect::<Vec<_>>();
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Connected(model.clone())),
+    );
+    let seeds = emitted_seed_scopes(&requests);
+    assert!(seeds.contains(&Scope::Channel(window.active)));
+    assert!(seeds.contains(&Scope::Channel(window.hidden)));
+    assert_eq!(window.app.terminal_starts_in_flight(), 0);
+    assert_eq!(window.app.restored_agent_attaches, [window.cached.id]);
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(window.active),
+                operation: None,
+                model: model.clone(),
+            }),
+    );
+    assert_eq!(
+        window.app.terminal_starts_in_flight(),
+        0,
+        "another scope's ACK cannot admit this row"
+    );
+    assert_eq!(window.app.restored_agent_attaches, [window.cached.id]);
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(window.hidden),
+                operation: None,
+                model,
+            }),
+    );
+    assert!(window.app.terminal_start_in_flight(window.cached.id));
+    let saved = session(&window.cached);
+    drop(window.app.update(Message::RestoredAgentAttached {
+        card: window.cached.id,
+        terminal: saved.id,
+        result: Ok(Some(attached(directory.path(), &saved))),
+    }));
+    assert_hibernated_attachment(&window.app, window.cached.id);
+    assert_eq!(
+        session(window.app.card_state(window.cached.id).unwrap()),
+        rehosted(&saved)
+    );
+    assert_eq!(window.app.terminal_starts_in_flight(), 0);
+    assert!(window.app.restored_agent_attaches.is_empty());
+    assert_eq!(window.app.workspace.focused(), focused);
+    assert_eq!(window.app.workspace.order().collect::<Vec<_>>(), order);
+}
+
+#[test]
+fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
+    for ack_before_release in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut window = reopened_observed_window(true);
+        let (publisher, requests) = async_channel::unbounded();
+        window.app.workspace_model_tx = publisher;
+        let mut model = observed_window_model(&window);
+        drop(
+            window
+                .app
+                .apply_workspace_model_update(ModelUpdate::Connected(model.clone())),
+        );
+        let seeds = emitted_seed_scopes(&requests);
+        for channel in [window.active, window.hidden] {
+            assert!(seeds.contains(&Scope::Channel(channel)));
+            drop(
+                window
+                    .app
+                    .apply_workspace_model_update(ModelUpdate::ViewApplied {
+                        scope: Scope::Channel(channel),
+                        operation: None,
+                        model: model.clone(),
+                    }),
+            );
+        }
+        assert!(window.app.terminal_start_in_flight(window.cached.id));
+        let other = offscreen(&live_terminal());
+        model.sequence += 1;
+        model.views[1].revision += 1;
+        model.views[1]
+            .panes
+            .push(Pane::from_card(&other, None).unwrap());
+        drop(
+            window
+                .app
+                .apply_workspace_model_update(ModelUpdate::Read(model.clone())),
+        );
+        drop(window.app.update(Message::VerifyStartupPanes));
+        let target = window.projected();
+        assert_eq!(window.app.restored_agent_attaches, [target, other.id]);
+        // Both new scopes are introduced by a real model Read. Only the
+        // moved target's scope is acknowledged below; the other stays unready.
+        let project = window.app.durable.channels[0].project_id;
+        window
+            .app
+            .sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "fixture".into(),
+                "/fixture-project".into(),
+                vec![],
+                vec![],
+            ));
+        let destination = ChannelId::new();
+        for channel in [destination, ChannelId::new()] {
+            model.channels.push(crate::workspace_model::ModelChannel {
+                id: channel,
+                repository: "/fixture-project".into(),
+                title: "new scope".into(),
+                title_source: Default::default(),
+                ordinal: model.channels.len() as u32,
+            });
+            model.views.push(View::empty(channel));
+        }
+        let at = model.views[1]
+            .panes
+            .iter()
+            .position(|pane| pane.id == target)
+            .unwrap();
+        let moved = model.views[1].panes.remove(at);
+        model.views[1].revision += 1;
+        model.views[2].panes.push(moved);
+        model.views[2].revision += 1;
+        model.sequence += 1;
+        drop(
+            window
+                .app
+                .apply_workspace_model_update(ModelUpdate::Read(model.clone())),
+        );
+        assert!(emitted_seed_scopes(&requests).contains(&Scope::Channel(destination)));
+        assert!(!window.app.shared_views_ready_for_startup());
+        assert_eq!(window.app.restored_agent_attaches, [target, other.id]);
+        let target_ack = |app: &mut Cagents| {
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(destination),
+                operation: None,
+                model: model.clone(),
+            }));
+        };
+        if ack_before_release {
+            target_ack(&mut window.app);
+            assert!(!window.app.terminal_start_in_flight(target));
+        }
+        let cached = session(&window.cached);
+        drop(window.app.update(Message::RestoredAgentAttached {
+            card: window.cached.id,
+            terminal: cached.id,
+            result: Ok(Some(attached(directory.path(), &cached))),
+        }));
+        if !ack_before_release {
+            assert!(!window.app.terminal_start_in_flight(target));
+            assert!(
+                window.app.terminal_start_in_flight(other.id),
+                "an admitted row passes the held target"
+            );
+            assert_eq!(window.app.restored_agent_attaches, [target]);
+            let source = session(&other);
+            drop(window.app.update(Message::RestoredAgentAttached {
+                card: other.id,
+                terminal: source.id,
+                result: Ok(Some(attached(directory.path(), &source))),
+            }));
+            assert_eq!(window.app.terminal_starts_in_flight(), 0);
+            assert_eq!(window.app.restored_agent_attaches, [target]);
+            target_ack(&mut window.app);
+        }
+        assert!(
+            !window.app.shared_views_ready_for_startup(),
+            "an unrelated scope is still unready"
+        );
+        assert!(window.app.terminal_start_in_flight(target));
+        let source = session(window.projected.as_ref().unwrap());
+        drop(window.app.update(Message::RestoredAgentAttached {
+            card: target,
+            terminal: source.id,
+            result: Ok(Some(attached(directory.path(), &source))),
+        }));
+        if ack_before_release {
+            assert!(window.app.terminal_start_in_flight(other.id));
+            let source = session(&other);
+            drop(window.app.update(Message::RestoredAgentAttached {
+                card: other.id,
+                terminal: source.id,
+                result: Ok(Some(attached(directory.path(), &source))),
+            }));
+        }
+        assert_eq!(window.app.terminal_starts_in_flight(), 0);
+        assert!(window.app.restored_agent_attaches.is_empty());
+        for card in [window.cached.id, target, other.id] {
+            assert_hibernated_attachment(&window.app, card);
+        }
+    }
 }
