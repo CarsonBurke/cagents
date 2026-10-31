@@ -4434,7 +4434,7 @@ pub enum Message {
     StartupWindowOpened(window::Id),
     StartupReported(Result<(), String>),
     VerifyStartupPanes,
-    StartupStateInspected(Result<crate::terminal::ipc::StartupState, String>),
+    StartupStateInspected(startup_gate::Inspection),
     StartupPanesSaved(Result<SettingsSaved, String>, Result<(), String>),
     UiUpdate(instance::UiUpdateRequest),
     UiUpdateWatchdog(u64),
