@@ -168,7 +168,18 @@ pub enum HostedTerminalStartError {
 #[derive(Default)]
 struct AttachmentState {
     confirmed: bool,
+    /// The exact terminal was accepted on the current observed connection.
+    /// Unlike remembered identity, this is retired when that connection ends.
+    current_proof: Option<HostSessionProof>,
     failure: Option<String>,
+}
+
+struct CurrentAttachment<'a>(&'a HostedPublishedState);
+
+impl Drop for CurrentAttachment<'_> {
+    fn drop(&mut self) {
+        self.0.clear_current_attachment();
+    }
 }
 
 #[derive(Default)]
@@ -693,12 +704,37 @@ impl HostedPublishedState {
         }
     }
 
-    fn confirm_attachment(&self) {
-        self.attachment
+    fn confirm_attachment(&self, proof: &HostSessionProof) {
+        {
+            let mut attachment = self
+                .attachment
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attachment.confirmed = true;
+            if attachment.failure.is_none() {
+                attachment.current_proof = Some(proof.clone());
+            }
+        }
+        self.attachment_changed.notify_all();
+        self.request_semantic_wake();
+    }
+
+    fn clear_current_attachment(&self) {
+        let changed = self
+            .attachment
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .confirmed = true;
-        self.attachment_changed.notify_all();
+            .current_proof
+            .take()
+            .is_some();
+        if changed {
+            self.attachment_changed.notify_all();
+            // Connection cleanup also runs during worker unwinding. Retire
+            // its state without invoking a callback during another panic.
+            if !thread::panicking() {
+                self.request_semantic_wake();
+            }
+        }
     }
 
     fn fail_attachment(&self, message: String) {
@@ -706,9 +742,11 @@ impl HostedPublishedState {
             .attachment
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attachment.current_proof = None;
         if attachment.failure.is_none() {
             attachment.failure = Some(message);
         }
+        drop(attachment);
         self.attachment_changed.notify_all();
     }
 
@@ -1073,6 +1111,24 @@ impl HostedTerminalHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .failure
             .clone()
+    }
+
+    /// The exact terminal accepted on the current observed connection.
+    /// Remembered recovery identity alone does not establish this state.
+    pub fn current_attachment(&self) -> Result<Option<HostSessionProof>, String> {
+        let attachment = self
+            .inner
+            .published
+            .attachment
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(reason) = &attachment.failure {
+            return Err(reason.clone());
+        }
+        if self.inner.stop.is_requested() {
+            return Err("hosted terminal connection stopped".to_owned());
+        }
+        Ok(attachment.current_proof.clone())
     }
 
     /// Waits for a successful terminal attach, spawn, or reconnect resume.
@@ -1890,6 +1946,10 @@ fn serve_connection(
         stop,
     } = context;
     let terminal_id = *terminal_id;
+    published.clear_current_attachment();
+    // Retire currentness on every EOF, retry, stop, or unwind before the next
+    // connection can authenticate. The remembered proof remains unchanged.
+    let _attachment = CurrentAttachment(published);
     if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) {
         published
             .attachment
@@ -2048,7 +2108,7 @@ fn serve_connection(
                     {
                         return ConnectionEnd::Retry;
                     }
-                    published.confirm_attachment();
+                    published.confirm_attachment(&proof);
                     did_attach();
                 }
                 #[cfg(feature = "ui")]
@@ -2198,12 +2258,16 @@ fn serve_connection(
         Ok(connection) => connection,
         Err(_) => return ConnectionEnd::Retry,
     };
+    // This inner guard is dropped before ConnectionIo, whose destructor joins
+    // its reader. EOF/retry must retire currentness before that join can wait.
+    let _connected_attachment = CurrentAttachment(published);
 
     let mut pending = BTreeMap::new();
     let mut snapshot_pending = false;
     let mut last_acknowledgement = 0;
 
     if stop.is_requested() {
+        published.clear_current_attachment();
         connection.close();
         return ConnectionEnd::Stop;
     }
@@ -2253,6 +2317,7 @@ fn serve_connection(
     }
 
     if stop.is_requested() {
+        published.clear_current_attachment();
         connection.close();
         return ConnectionEnd::Stop;
     }
@@ -2270,6 +2335,7 @@ fn serve_connection(
             && matches!(intent, ConnectionIntent::AuthorizedSpawn { .. })
             && stop.is_requested()
         {
+            published.clear_current_attachment();
             connection.close();
             return ConnectionEnd::Stop;
         }
@@ -2314,6 +2380,7 @@ fn serve_connection(
         }
         published.expire_retained(Instant::now());
         if stop.is_requested() {
+            published.clear_current_attachment();
             connection.close();
             return ConnectionEnd::Stop;
         }
@@ -2324,6 +2391,7 @@ fn serve_connection(
                 break;
             }
             if stop.is_requested() {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2339,10 +2407,12 @@ fn serve_connection(
             };
             command = coalesce_client_scroll_command(command, commands, carried);
             if stop.is_requested() {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
             if matches!(command, ClientCommand::Stop) {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2406,6 +2476,7 @@ fn serve_connection(
         let envelope = match work {
             ClientWork::Acknowledge | ClientWork::RetainedExpired => continue,
             ClientWork::Stop => {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2415,6 +2486,7 @@ fn serve_connection(
             }
             ClientWork::Server(envelope) => envelope,
             ClientWork::CommandsClosed => {
+                published.clear_current_attachment();
                 connection.close();
                 return ConnectionEnd::Stop;
             }
@@ -2515,7 +2587,7 @@ fn serve_connection(
                             return ConnectionEnd::Retry;
                         }
                         published.request_semantic_wake();
-                        published.confirm_attachment();
+                        published.confirm_attachment(&proof);
                         did_attach();
                     }
                     (PendingRequest::Spawn, ServerResponse::Spawned { terminal })
@@ -2552,7 +2624,7 @@ fn serve_connection(
                             return ConnectionEnd::Retry;
                         }
                         published.request_semantic_wake();
-                        published.confirm_attachment();
+                        published.confirm_attachment(&proof);
                         did_attach();
                     }
                     (
