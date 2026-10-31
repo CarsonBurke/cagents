@@ -8,20 +8,22 @@
     "qualification-packets/pr1310-native-history-pair/history_driver.py",
     "qualification-packets/pr1310-native-history-pair/observations.py",
     "qualification-packets/pr1310-native-history-pair/root-interface.md",
-    "qualification-packets/pr1310-native-history-pair/plan.json"
+    "qualification-packets/pr1310-native-history-pair/plan.json",
+    "qualification-packets/pr1310-native-history-pair/native_owner.py",
+    "qualification-packets/pr1310-native-history-pair/owner-contract.json"
   ],
   "sources": {
     "before": {
-      "head": "a174dc7e7aa651745c95714971054fc4c270c5a3",
-      "tree": "2d557d0cd3757a01ee9ca2da32d15f211ce464b6",
+      "head": "146ad67b926672367817d06897e4cb9f55176bbd",
+      "tree": "c61e06cd488a6801863cc48d2de429c8f993ba9d",
       "paths": {
         "src/app/native_history_fixture.rs": {
-          "sha256": "9b9a88548098c15333e323aab0fd14d5b0e231ef4f68ff403ed924349eadcbb1",
-          "bytes": 19805
+          "sha256": "0ff94685448c72a2c8ea17c2f2bec1e2df48d25fd283c7f343d85bd42313c8b2",
+          "bytes": 30416
         },
         "src/app.rs": {
-          "sha256": "1ff20d4487526da1a4773bb36e4bb85a91ec8d03a6f804fb5493744153cf04ed",
-          "bytes": 1379070
+          "sha256": "4f9dd1ec708bd22240f9a7524bfb81e7dcff620e669d0e8e2eae9877c2a39303",
+          "bytes": 1379227
         },
         "src/bin/cagents-ui.rs": {
           "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
@@ -58,22 +60,30 @@
         "qualification-packets/pr1310-native-fixture/build.py": {
           "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01",
           "bytes": 18468
+        },
+        "Cargo.lock": {
+          "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+          "bytes": 341188
+        },
+        "src/instance.rs": {
+          "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+          "bytes": 119199
         }
       },
       "native": "UNRUN",
       "matched_executables": null
     },
     "after": {
-      "head": "9dc2a70caebbfc972e537712b9f9326843f232d0",
-      "tree": "fcb1b582d894dc46590cc8fc8f20e9cb17920a0a",
+      "head": "3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce",
+      "tree": "124bd8583a75133bb4ed564ef829a154d123c4ed",
       "paths": {
         "src/app/native_history_fixture.rs": {
-          "sha256": "2ccd222776616f0189684a81105dafa0486b3751f2f8640c1c5e66881f336ea0",
-          "bytes": 19371
+          "sha256": "198181e520a79307caf7e996c9436759c1acdd07c8b1fb2612708ceda17a869d",
+          "bytes": 29982
         },
         "src/app.rs": {
-          "sha256": "e551b3e627726c6f5ac77410e94ce03a586397018341f084bcae8132e4130321",
-          "bytes": 1436088
+          "sha256": "0ae1279e13f26a40bc8e62c33ac316328b139c927f7c09006f50a79e640c5ff8",
+          "bytes": 1436245
         },
         "src/bin/cagents-ui.rs": {
           "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
@@ -110,6 +120,14 @@
         "qualification-packets/pr1310-native-fixture/build.py": {
           "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01",
           "bytes": 18468
+        },
+        "Cargo.lock": {
+          "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+          "bytes": 341188
+        },
+        "src/instance.rs": {
+          "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+          "bytes": 119199
         }
       },
       "native": "UNRUN",
@@ -197,7 +215,7 @@
   },
   "runtime": {
     "actual_User_resource_admission": null,
-    "original_root_interface_implementation": null,
+    "original_root_interface_implementation": "native_owner.py SOURCE candidate; standalone entry/admission/AX/status/build remain HOLD",
     "matched_native_binaries": null,
     "private_desktop_and_bus": null,
     "ledger_and_writer_custody": null,
@@ -305,5 +323,85 @@
     "Before has no query/refine/fullSHAsearch/Limited controls; ordinary baseline only.",
     "Current source methods and AST parsing are neither execution admission nor native/UX qualification.",
     "Existing1775 Custody signal policy must be reconciled explicitly for planned owned-service shutdown; no transfer of safe handback."
-  ]
+  ],
+  "appearance_renderer_consumer": {
+    "schema": "pr1310-appearance-renderer-consumer-source-v1",
+    "owner_base": "0ffb14657a90fb56d62130f8c29492c691844c06",
+    "driver_source": "f86fbeaf50b38260e575e59e122d1f77932038fd",
+    "normal_composition": "8ba8d6424cd769b3285ba166c198ae470a04bb5e",
+    "paired_producer_receipt": {
+      "path": "/tmp/coord-b9-1310-native-history-appearance-evidence/source-receipt.json",
+      "sha256": "85e712a5533d49b888bf8ebdf4444dedfa90a6ffd4d4274e7ccc086724a0d28e"
+    },
+    "paired_independent_source_review": {
+      "path": "/tmp/coord-b9-1310-paired-appearance-independent-source-review.json",
+      "sha256": "9a7d59979dde5d16b4ae243cea058574ac369742db7204f74347b907092e20db"
+    },
+    "resolved_sources": {
+      "Cargo.lock": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1310-native-history-after-appearance/Cargo.lock",
+        "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "bytes": 341188
+      },
+      "compositor.rs": {
+        "path": "/home/marvin/.cargo/git/checkouts/libcosmic-41009aea1d72760b/caec74c/iced/wgpu/src/window/compositor.rs",
+        "sha256": "38aeed4090189e026cafdded1a51490c41adf3ffb795a5e8b2eaa2d27609b934",
+        "bytes": 17452
+      },
+      "adapter.rs": {
+        "path": "/home/marvin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-types-28.0.0/src/adapter.rs",
+        "sha256": "a4090392d78c62a12e4f070385190ca95781ff4c5ef91a694a372d07e639d5fd",
+        "bytes": 9660
+      },
+      "backend.rs": {
+        "path": "/home/marvin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-types-28.0.0/src/backend.rs",
+        "sha256": "cca0b725680cdc601a2735f64da0371b77b4ff741d76c56401866816a07f47e9",
+        "bytes": 23566
+      },
+      "format.rs": {
+        "path": "/home/marvin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/fmt/format/mod.rs",
+        "sha256": "8933844e059b8f56788fdeb289074da0d4051de1b3b125a7d11c8d5a36cbf986",
+        "bytes": 82583
+      },
+      "macros.rs": {
+        "path": "/home/marvin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-0.1.44/src/macros.rs",
+        "sha256": "4c367e39d560ae169afcf1b15c618011f5a8c198cab1504a86b4576d5c3fdb30",
+        "bytes": 115718
+      },
+      "instance.rs": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1310-native-history-after-appearance/src/instance.rs",
+        "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+        "bytes": 119199
+      }
+    },
+    "exact_resolved_graph": {
+      "iced_wgpu": "0.14.0 from libcosmic caec74c2559924443f12fc6faf97a5bcefe6271d / iced87c0358985cae50fefdcb15eabb0271e19ecf4a2",
+      "wgpu": "28.0.0",
+      "wgpu-types": "28.0.0",
+      "tracing": "0.1.44",
+      "tracing-subscriber": "0.3.23"
+    },
+    "selected_adapter_fields": [
+      "name",
+      "vendor",
+      "device",
+      "device_type",
+      "device_pci_bus_id",
+      "driver",
+      "driver_info",
+      "backend",
+      "subgroup_min_size",
+      "subgroup_max_size",
+      "transient_saves_memory"
+    ],
+    "registry_source_provenance_limit": "Observed cached source bytes/hash + actual Cargo.lock versions. .cargo-checksum.json absent for wgpu-types28; package archive and matched-build input provenance NOT independently established here, mandatory original build evidence remains NULL.",
+    "log_bound_bytes": 8388608,
+    "appearance_record_cap": 256,
+    "driver_cap_assessment": "Per root, unborn has two captures; populated baseline has seven common captures plus small401 pagination captures and up to seven After query captures. Hover/scroll/captures do not themselves enter AppearanceKey. Loading/completion/query/selection/workspace/source-generation transitions can emit dedup records; source supplies no scheduling upper bound below256. Original cap unchanged; any stop warning or 257th record is HOLD, not a silent freshness promise.",
+    "comparison": "Actual geometry + full adapter fingerprint + observer/main identity + applied Core scale bits + actual native factor/provenance. Growing raw log offsets/read timestamps and ordinary state generations excluded from equality but preserved as raw evidence.",
+    "freshness_limit": "Deduplicated view state and adapter selection are NOT per-capture/present acknowledgements. Native factor remains null without actual matching Rescaled.",
+    "original_build_provenance": null,
+    "actual_log_records": null,
+    "runtime": "UNRUN"
+  }
 }

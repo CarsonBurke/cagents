@@ -6,7 +6,7 @@ are expectations to check against real resources, never authority receipts.
 No native module is imported by this file. Nothing launches on import.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import hashlib
 import inspect
@@ -18,6 +18,7 @@ import re
 import select
 import signal
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -27,8 +28,8 @@ import uuid
 CUSTODY_SHA = "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
 BUILDER_SHA = "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01"
 ARMS = {
-    "before": ("a174dc7e7aa651745c95714971054fc4c270c5a3", "2d557d0cd3757a01ee9ca2da32d15f211ce464b6"),
-    "after": ("9dc2a70caebbfc972e537712b9f9326843f232d0", "fcb1b582d894dc46590cc8fc8f20e9cb17920a0a"),
+    "before": ("146ad67b926672367817d06897e4cb9f55176bbd", "c61e06cd488a6801863cc48d2de429c8f993ba9d"),
+    "after": ("3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce", "124bd8583a75133bb4ed564ef829a154d123c4ed"),
 }
 PRIVATE_KEYS = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
                 "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "TMPDIR")
@@ -36,6 +37,30 @@ ENDPOINT_KEYS = ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "AT_SPI_BU
 UNSUPPORTED_ENDPOINT_KEYS = ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "DBUS_STARTER_ADDRESS",
                              "DBUS_STARTER_BUS_TYPE", "SESSION_MANAGER", "LISTEN_PID", "LISTEN_FDS")
 MAX_OUTPUT = 262144
+
+# Exact resolved producers, not a requested backend or whole-binary certificate.
+RENDERER_SOURCES = {
+    "compositor.rs": "38aeed4090189e026cafdded1a51490c41adf3ffb795a5e8b2eaa2d27609b934",
+    "adapter.rs": "a4090392d78c62a12e4f070385190ca95781ff4c5ef91a694a372d07e639d5fd",
+    "backend.rs": "cca0b725680cdc601a2735f64da0371b77b4ff741d76c56401866816a07f47e9",
+    "format.rs": "8933844e059b8f56788fdeb289074da0d4051de1b3b125a7d11c8d5a36cbf986",
+    "macros.rs": "4c367e39d560ae169afcf1b15c618011f5a8c198cab1504a86b4576d5c3fdb30"
+}
+CARGO_LOCK_SHA = "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+INSTANCE_SHA = "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d"
+APPEARANCE_SOURCES = {
+    "before": {
+        "src/app/native_history_fixture.rs": "0ff94685448c72a2c8ea17c2f2bec1e2df48d25fd283c7f343d85bd42313c8b2",
+        "src/app.rs": "4f9dd1ec708bd22240f9a7524bfb81e7dcff620e669d0e8e2eae9877c2a39303",
+        "src/bin/cagents-ui.rs": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
+    },
+    "after": {
+        "src/app/native_history_fixture.rs": "198181e520a79307caf7e996c9436759c1acdd07c8b1fb2612708ceda17a869d",
+        "src/app.rs": "0ae1279e13f26a40bc8e62c33ac316328b139c927f7c09006f50a79e640c5ff8",
+        "src/bin/cagents-ui.rs": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
+    },
+}
+MAX_UI_LOG = 8 * 1024 * 1024
 
 
 class Hold(RuntimeError):
@@ -85,7 +110,9 @@ class FrameObservation:
     renderer_observed: str | None
     theme_observed: str | None
     app_scale_configured: float | None
-    evidence_json: str
+    evidence_json: str = field(compare=False)
+    appearance_identity: tuple = ()
+    native_scale_provenance: tuple = ()
 
     def to_evidence(self):
         return json.loads(self.evidence_json)
@@ -749,6 +776,7 @@ class NativeHistoryOwner:
         require((head, tree) == ARMS.get(arm), "unknown adapter tuple")
         spec, manifest, index = self._source_inputs(arm, fixture)
         ui = spec["matched"]["ui"]
+        self._bind_history_producers(arm, spec)
         # Root supplies actual separately built dev-runtime matched artifacts.
         # The NORMAL runner still performs its three serial build commands and
         # execs Cargo. Any subsequent replacement is a refusal, not a shortcut.
@@ -758,6 +786,11 @@ class NativeHistoryOwner:
         environment = {**self._environment, **self._profile(root),
                        "CAGENTS_DEVELOPMENT_HISTORY_FIXTURE": str(spec["manifest"]),
                        "CAGENTS_DEVELOPMENT_HISTORY_DATASET": fixture.dataset}
+        # Child-only observer logging request. Caller environment is untouched.
+        # The normal debug default is retained when no directive was inherited.
+        inherited_log = environment.get("RUST_LOG", "cagents=debug,cagentsd=debug,warn")
+        environment["RUST_LOG"] = (inherited_log + "," if inherited_log else "") + (
+            "iced_wgpu::window::compositor=info,cagents::native_history=info")
         require(self._base_environment.get("CARGO_BUILD_JOBS") == "2"
                 and self._base_environment.get("CARGO_TARGET_DIR") == spec["cargo_target_dir"],
                 "original admitted jobs/target context absent; never repair it")
@@ -932,23 +965,275 @@ class NativeHistoryOwner:
         self._write(self.ledger, payload)
         self.check_history_root(binding, "observation-after")
 
+    def _bind_history_producers(self, arm, spec):
+        """Mandatory consistency with ORIGINAL build evidence; not admission.
+
+        The actual entry owes genuine build/writer/source/argv/wait provenance.
+        This library never creates a successful build record or trusts a flag.
+        """
+        build = spec.get("renderer_build")
+        require(isinstance(build, dict), "ORIGINAL_RENDERER_BUILD_BINDING_UNSUPPLIED")
+        expected = {"schema", "head", "tree", "profile", "ui_sha256", "product_version",
+                    "cargo_lock_sha256", "resolved_source_sha256", "original_evidence"}
+        require(set(build) == expected and build["schema"] == "pr1310-renderer-build-binding-v1",
+                "renderer build binding schema changed")
+        require((build["head"], build["tree"]) == ARMS[arm]
+                and build["profile"] == "dev-runtime"
+                and build["ui_sha256"] == spec["matched"]["ui"]["sha256"]
+                and build["cargo_lock_sha256"] == CARGO_LOCK_SHA
+                and build["resolved_source_sha256"] == RENDERER_SOURCES,
+                "renderer source/build/artifact binding mismatch")
+        require(isinstance(build["product_version"], str)
+                and 0 < len(build["product_version"]) <= 256, "missing actual build version")
+        for path, expected_sha in APPEARANCE_SOURCES[arm].items():
+            require(spec["source_files"].get(path) == expected_sha, "compiled observer source pin absent")
+        require(spec["source_files"].get("src/instance.rs") == INSTANCE_SHA
+                and spec["source_files"].get("Cargo.lock") == CARGO_LOCK_SHA,
+                "logger/lock source pin absent")
+        require(set(spec.get("resolved_renderer_sources", {})) == set(RENDERER_SOURCES),
+                "actual resolved producer paths absent")
+        for name, expected_sha in RENDERER_SOURCES.items():
+            self._pin_input(Path(spec["resolved_renderer_sources"][name]), expected_sha, 1024 * 1024)
+        evidence = build["original_evidence"]
+        require(isinstance(evidence, dict) and set(evidence) == {"path", "sha256"}
+                and re.fullmatch(r"[0-9a-f]{64}", evidence["sha256"]) is not None,
+                "original build evidence reference missing")
+        # Pin actual immutable bytes, never treat their mere presence/hash as
+        # proof of a build, User authority, or a successful original wait.
+        item = self._pin_input(Path(evidence["path"]), evidence["sha256"], 16 * 1024 * 1024)
+        require(item["immutable"][5] > 0, "original build evidence is empty")
+
+    def _read_history_log(self, binding):
+        self.check_history_root(binding, "appearance-log-before")
+        log = self._ui_log
+        require(log.get("writer_pid") == binding.ui_pid, "UI log generation/PID mismatch")
+        info = self._same_file(log)
+        require(0 <= info.st_size <= MAX_UI_LOG, "UI log exceeds finite source bound")
+        previous = getattr(binding, "appearance_log_prefix", b"")
+        require(info.st_size >= len(previous), "original UI log truncated")
+        blocks, offset = [], 0
+        while offset < info.st_size:
+            self._remaining()
+            block = os.pread(log["fd"], min(65536, info.st_size - offset), offset)
+            self._remaining()
+            require(block, "original UI log shortened while reading")
+            blocks.append(block)
+            offset += len(block)
+        raw = b"".join(blocks)
+        self._same_file(log)
+        self.check_history_root(binding, "appearance-log-after")
+        require(raw.startswith(previous), "original UI log verified prefix rewritten")
+        # Preserve ORIGINAL appended bytes and each actual read's provenance
+        # separately from frame equality. Never reopen the path or repair it.
+        for offset in range(len(previous), len(raw), 65536):
+            block = raw[offset:offset + 65536]
+            self.append_history_observation(binding, {"record": "ui-log-original-bytes",
+                "fd": log["fd"], "identity": list(log["identity"]), "offset": offset,
+                "bytes": len(block), "sha256": digest(block), "hex": block.hex()})
+        self.append_history_observation(binding, {"record": "ui-log-read",
+            "fd": log["fd"], "identity": list(log["identity"]), "observed_size": info.st_size,
+            "verified_prefix_bytes": len(raw), "verified_prefix_sha256": digest(raw),
+            "monotonic": time.monotonic(), "writer_scope": "original runner/Cargo/UI shared log; no per-line kernel writer proof"})
+        binding.appearance_log_prefix = raw
+        return raw
+
+    @staticmethod
+    def _history_json(raw):
+        def pairs(items):
+            result = {}
+            for key, value in items:
+                require(key not in result, "duplicate appearance JSON key")
+                result[key] = value
+            return result
+        def constant(value):
+            raise Hold("nonfinite appearance JSON constant: " + value)
+        return json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+
+    @staticmethod
+    def _history_float(value, bits):
+        require(type(bits) is int and 0 <= bits <= 0xffffffff, "invalid observed f32 bits")
+        actual = struct.unpack("!f", struct.pack("!I", bits))[0]
+        require(type(value) in (float, int) and math.isfinite(value) and value > 0
+                and math.isfinite(actual) and actual > 0 and value == actual,
+                "observed scale/bits mismatch")
+        return actual
+
+    def _history_appearance(self, binding, record, expected_generation):
+        names = {"record_version", "record", "observer_instance", "observation_generation", "pid",
+                 "window_id_kind", "window_id", "window_open_source", "product_version",
+                 "compiled_source_sha256", "data", "theme_kind", "theme_is_dark",
+                 "theme_is_high_contrast", "theme_is_exact_dark_class", "applied_ui_scale",
+                 "applied_ui_scale_bits", "applied_ui_scale_source", "native_scale",
+                 "native_scale_bits", "native_scale_source", "native_scale_generation",
+                 "state", "observation_boundary"}
+        require(isinstance(record, dict) and set(record) == names
+                and type(record.get("record_version")) is int and record["record_version"] == 1
+                and record.get("record") == "history-native-appearance"
+                and type(record.get("pid")) is int and record["pid"] == binding.ui_pid
+                and type(record.get("observation_generation")) is int
+                and record["observation_generation"] == expected_generation <= 256,
+                "appearance identity/generation/record bound mismatch")
+        instance = record["observer_instance"]
+        require(str(uuid.UUID(instance)) == instance and uuid.UUID(instance).int != 0,
+                "appearance observer UUID invalid")
+        require(record["window_id_kind"] == "iced_main_window_debug"
+                and record["window_open_source"] == "original_window_opened_event"
+                and isinstance(record["window_id"], str) and 0 < len(record["window_id"]) <= 64
+                and record["observation_boundary"] == "view_state_readback_not_compositor_present",
+                "appearance main/opened/boundary mismatch")
+        require(record["compiled_source_sha256"] == APPEARANCE_SOURCES[binding.arm]
+                and record["product_version"] == self.sources[binding.arm]["renderer_build"]["product_version"]
+                and record["data"] == {"manifest_sha256": binding.fixture.manifest_sha256,
+                                       "dataset": binding.fixture.dataset}, "appearance source/data/build mismatch")
+        require(record["theme_kind"] in ("dark", "light", "high_contrast_dark", "high_contrast_light", "custom", "system")
+                and all(type(record[name]) is bool for name in
+                        ("theme_is_dark", "theme_is_high_contrast", "theme_is_exact_dark_class")),
+                "invalid applied theme record")
+        require(record["theme_is_exact_dark_class"] == (record["theme_kind"] == "dark"),
+                "applied theme class contradiction")
+        require(record["applied_ui_scale_source"] == "Core::scale_factor_as_returned_by_Shell",
+                "applied scale source changed")
+        self._history_float(record["applied_ui_scale"], record["applied_ui_scale_bits"])
+        require(type(record["native_scale_generation"]) is int and record["native_scale_generation"] >= 0,
+                "invalid native scale generation")
+        if record["native_scale"] is None:
+            require(record["native_scale_bits"] is None and record["native_scale_source"] == "unknown"
+                    and record["native_scale_generation"] == 0, "unknown native scale promoted")
+        else:
+            self._history_float(record["native_scale"], record["native_scale_bits"])
+            require(record["native_scale_source"] == "rescaled_event"
+                    and record["native_scale_generation"] > 0, "native factor lacks real Rescaled provenance")
+        state = record["state"]
+        require(isinstance(state, dict) and set(state) ==
+                {"workspace_generation", "source_generation", "inspector_open", "history"}
+                and all(type(state[name]) is int and 0 <= state[name] <= 0xffffffffffffffff
+                        for name in ("workspace_generation", "source_generation"))
+                and type(state["inspector_open"]) is bool, "invalid bounded appearance state")
+        history = state["history"]
+        if history is not None:
+            require(isinstance(history, dict) and set(history) ==
+                    {"source_state", "head_oid", "rows", "next_page", "loading", "selected_commit"}
+                    and history["source_state"] in ("loading", "ready", "error")
+                    and all(value is None or isinstance(value, str) and len(value) <= 64
+                            for value in (history["head_oid"], history["selected_commit"]))
+                    and all(type(history[name]) is int and 0 <= history[name] <= 0xffffffffffffffff
+                            for name in ("rows", "next_page")) and type(history["loading"]) is bool,
+                    "invalid bounded appearance history")
+        return record
+
+    @staticmethod
+    def _history_adapter(block):
+        # Exact wgpu-types28 derived pretty Debug field order/types. String
+        # tokens stay RAW Rust Debug, including Rust-specific escapes; never
+        # mis-decode them as JSON or infer hardware from a requested env value.
+        string = r'"(?:[^"\\\x00-\x1f]|\\(?:[\\"nrt0]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}))*"'
+        fields = (("name", string), ("vendor", r"[0-9]+"), ("device", r"[0-9]+"),
+                  ("device_type", r"Other|IntegratedGpu|DiscreteGpu|VirtualGpu|Cpu"),
+                  ("device_pci_bus_id", string), ("driver", string), ("driver_info", string),
+                  ("backend", r"Noop|Vulkan|Metal|Dx12|Gl|BrowserWebGpu"),
+                  ("subgroup_min_size", r"[0-9]+"), ("subgroup_max_size", r"[0-9]+"),
+                  ("transient_saves_memory", r"true|false"))
+        pattern = "AdapterInfo {\n" + "".join(
+            "    " + name + ": (?P<" + name + ">" + value + "),\n" for name, value in fields) + "}"
+        match = re.fullmatch(pattern, block)
+        require(match is not None, "selected adapter does not match exact resolved wgpu-types28 producer")
+        result = match.groupdict()
+        for name in ("vendor", "device", "subgroup_min_size", "subgroup_max_size"):
+            require(int(result[name]) <= 0xffffffff, "selected adapter u32 overflow")
+        return result
+
+    def _history_log_observers(self, binding, raw):
+        # Default pinned Full formatter: uncoloured timestamp, INFO/WARN,
+        # target and message-first event fields. Unexpected formatting refuses.
+        complete, separator, tail = raw.rpartition(b"\n")
+        lines = (complete + separator).decode("utf-8").splitlines() if separator else []
+        # Never hide a complete stopped-producer warning behind a partially
+        # appended adapter block or accept a later convenient appearance record.
+        require(not any("cagents::native_history: appearance observer stopped:" in line
+                        for line in lines), "appearance producer stopped; HOLD")
+        appearances, adapters = [], []
+        pending, index = bool(tail), 0
+        prefix = r"[0-9]{4}-[0-9T:.+Z-]+ +(?:INFO|WARN) +"
+        while index < len(lines):
+            line = lines[index]
+            if "cagents::native_history:" in line:
+                match = re.fullmatch(prefix + r"cagents::native_history: (.*)", line)
+                require(match is not None, "appearance log formatter/provenance mismatch")
+                message = match[1]
+                require("appearance observer stopped:" not in message, "appearance producer stopped; HOLD")
+                marker = "history native appearance state appearance_json="
+                require(message.startswith(marker), "unknown appearance producer record")
+                payload = message[len(marker):]
+                require(len(payload.encode()) <= 4096, "appearance record byte cap exceeded")
+                record = self._history_appearance(binding, self._history_json(payload), len(appearances) + 1)
+                if appearances:
+                    prior = appearances[-1]
+                    require((record["observer_instance"], record["window_id"]) ==
+                            (prior["observer_instance"], prior["window_id"]), "multiple observer/main generations")
+                    require(record["native_scale_generation"] >= prior["native_scale_generation"],
+                            "native scale generation regressed")
+                    if record["native_scale_generation"] == prior["native_scale_generation"]:
+                        require(record["native_scale_bits"] == prior["native_scale_bits"],
+                                "same native generation has conflicting factors")
+                appearances.append(record)
+            elif "iced_wgpu::window::compositor: Selected:" in line:
+                match = re.fullmatch(prefix + r"iced_wgpu::window::compositor: Selected: AdapterInfo \{", line)
+                require(match is not None, "selected-adapter log formatter/provenance mismatch")
+                end = index + 1
+                while end < len(lines) and lines[end] != "}":
+                    end += 1
+                if end == len(lines):
+                    pending = True
+                    break
+                require(end - index == 13, "selected-adapter resolved field count changed")
+                block = "AdapterInfo {\n" + "\n".join(lines[index + 1:end + 1])
+                adapters.append(self._history_adapter(block))
+                require(len(adapters) == 1, "multiple selected-adapter records are ambiguous")
+                index = end
+            index += 1
+        return appearances, adapters, pending
+
     @sticky
     def history_frame_observation(self, binding):
         self.check_history_root(binding, "frame-observation")
+        while True:
+            raw = self._read_history_log(binding)
+            appearances, adapters, pending = self._history_log_observers(binding, raw)
+            if appearances and adapters and not pending:
+                break
+            # No new input/replay/repair. An incomplete concurrent append and
+            # missing records can only become ready inside the SAME deadline.
+            self.pause_history_poll(binding, .05)
+        appearance, adapter = appearances[-1], adapters[0]
+        require(adapter["backend"] == "Gl", "actual selected backend differs from requested GL lane")
         result = self.run_history_tool(binding, ("xdotool", "getwindowgeometry", "--shell", str(binding.xid)), MAX_OUTPUT)
         require(result.exit_code == 0, "window geometry failed")
         fields = dict(line.split("=", 1) for line in result.stdout.decode().splitlines())
         require(int(fields["WINDOW"], 0) == binding.xid, "geometry XID changed")
         geometry = tuple(int(fields[name]) for name in ("X", "Y", "WIDTH", "HEIGHT"))
-        # Real geometry/identity is observed. Fixture source configures dark/1.0,
-        # but no actual renderer/theme observer is supplied by this component.
-        # UNKNOWN must stop the driver's capture gate, never copy requested env.
+        renderer = "wgpu-gl:" + digest(json.dumps(adapter, sort_keys=True).encode())
+        theme = appearance["theme_kind"]
+        require(theme == "dark" and appearance["theme_is_dark"]
+                and not appearance["theme_is_high_contrast"] and appearance["theme_is_exact_dark_class"],
+                "actual applied theme differs from exact Dark lane")
+        stable_appearance = (binding.generation, binding.ui_pid, binding.xid,
+                            appearance["observer_instance"], appearance["window_id"],
+                            appearance["applied_ui_scale_bits"], theme)
+        native = (appearance["native_scale"], appearance["native_scale_bits"],
+                  appearance["native_scale_source"], appearance["native_scale_generation"])
         evidence = {"generation": binding.generation, "pid": binding.ui_pid, "xid": binding.xid,
                     "geometry": geometry, "requested_theme": "dark", "configured_fixture_scale": 1.0,
-                    "renderer_observed": None, "theme_observed": None, "native_factor": None,
-                    "reason": "actual renderer/theme observation producer remains UNSUPPLIED",
-                    "ui_log_identity": list(self._ui_log["identity"])}
-        return FrameObservation(geometry, None, None, 1.0, json.dumps(evidence, sort_keys=True))
+                    "requested_backend": "wgpu/gl/software", "renderer_observed": adapter,
+                    "theme_observed": theme, "applied_ui_scale": appearance["applied_ui_scale"],
+                    "native_factor": appearance["native_scale"], "appearance": appearance,
+                    "ui_log_identity": list(self._ui_log["identity"]), "ui_log_prefix_bytes": len(raw),
+                    "ui_log_prefix_sha256": digest(raw), "readback_monotonic": time.monotonic(),
+                    "boundary": "deduplicated view-state plus selected adapter; NOT per-capture/present ACK",
+                    "writer_limit": "original runner/Cargo/UI log; no per-line kernel writer attribution"}
+        self.append_history_observation(binding, {"record": "frame-readback", "evidence": evidence})
+        self.check_history_root(binding, "frame-readback-after")
+        return FrameObservation(geometry, renderer, theme, appearance["applied_ui_scale"],
+                                json.dumps(evidence, sort_keys=True), stable_appearance, native)
 
     @sticky
     def reserve_history_artifact(self, binding, basename):

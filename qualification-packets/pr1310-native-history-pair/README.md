@@ -1,7 +1,7 @@
 # PR1310 finite native History interaction source
 
 **SOURCE PREPARATION ONLY. Not a usable native controller.** There is no supplied
-original-root implementation, execution grant, generated data, binary, native
+original reviewed entry/admission, execution grant, generated data, binary, native
 frame, performance measurement or UX approval. Running `history_driver.py`
 refuses with `ROOT_INTERFACE_UNSUPPLIED` before any native import or operation.
 No command in this packet launches the application or requests a resource lane.
@@ -18,8 +18,8 @@ The exact future native sources are:
 
 | Role | Head | Tree |
 | --- | --- | --- |
-| Before | a174dc7e7aa651745c95714971054fc4c270c5a3 | 2d557d0cd3757a01ee9ca2da32d15f211ce464b6 |
-| After | 9dc2a70caebbfc972e537712b9f9326843f232d0 | fcb1b582d894dc46590cc8fc8f20e9cb17920a0a |
+| Before | 146ad67b926672367817d06897e4cb9f55176bbd | c61e06cd488a6801863cc48d2de429c8f993ba9d |
+| After | 3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce | 124bd8583a75133bb4ed564ef829a154d123c4ed |
 
 Both include the reviewed fixture adapter and the same source builder. The
 builder's historical a322→efa source-pair fields remain unchanged provenance;
@@ -34,7 +34,7 @@ generated. The Root16 DATA delivery is an immutable specification, not a complet
 fixture or runtime admission.
 
 `history_driver.py` implements real pyatspi traversal/discovery and xdotool native
-input methods against an explicitly missing original-owner interface. It never
+input methods against the finite native_owner.py source candidate. The original entry and runtime admission remain absent. It never
 calls EditableText.setText, synthesizes an App message, creates Git outcomes,
 uses a provider, reads a clipboard or controls processes. The owner must supply
 actual pyatspi/PIL modules only after private endpoint admission. AX `grabFocus`
@@ -50,8 +50,7 @@ observes 200 initial rows, hover, keyboard and real scroll, opens a commit and
 200→400→401. After then enters message/author/late/no-match/full-SHA/refine/clear
 queries and presses real Enter. Unborn has its own real notice. Each new root
 must use the same independently bound dataset and checkpoint as its paired arm.
-The original owner must settle one root before starting the next; this method
-does not attempt that missing responsibility.
+The original owner must settle one root before starting the next; this driver does not own that responsibility. The owner retains its existing UNKNOWN status/service policy gates.
 
 Captures require an owned PID/XID and exact observed client geometry before and
 after. Both `import -screen -window <XID>` and direct `import -window <XID>` must
@@ -105,3 +104,46 @@ process_custody.py is a potential maintained building block, not a supplied nati
 launcher or admission. Its signal policy requires explicit reconciliation before
 planned service shutdown can be accepted. No old helper synthetic case result,
 compiler grant, cleanup claim or native proof transfers into this packet.
+
+## Source-only appearance consumer
+
+`native_owner.py` is the normal0ffb+f86 composition with a finite readback seam.
+It reads only the original retained UI log FD, preserving append bytes/offsets
+and identities separately from frame equality. It validates every completed
+version1 appearance record from the paired producers and exactly one selected
+wgpu-types28 adapter (twelve fields). Actual Dark/Core scale are readback;
+requested GL/software and configured scale1 are not observations. Native scale
+stays unknown without a real matching Rescaled. The observation is deduplicated
+view state, not a compositor-present or per-capture acknowledgement.
+
+A zero-record or current incomplete append can read-only poll inside the same
+original deadline. Complete malformed records, conflicting observers/data,
+producer-stop/cap warnings, rewrite/truncation or multiple selections refuse.
+Capture equality compares actual geometry, adapter, main/observer identity, Core
+scale and native factor/provenance; ordinary source/workspace generations, log
+offsets and read timestamps stay in raw evidence without creating false changes.
+
+The mandatory `renderer_build` schema in owner-contract.json binds actual source,
+lock, resolved parser-producer files, matched UI digest and original immutable
+build evidence bytes. Those are consistency expectations, never a build/User
+certificate. Genuine original build/source/argv/profile/context/wait/artifact
+and writer provenance must be supplied and audited by the future original entry.
+No fabricated sample build result is supplied; current input is NULL/HOLD. The
+iced compositor producer was matched to its actual Git blob. Cached registry
+files have explicit hashes and lock versions, but their .cargo-checksum.json is
+absent; this preparation does not claim registry-package checksum verification.
+
+Only the application child requests extra log targets, preserving inherited
+RUST_LOG directives and the normal debug default when absent. No worker env is
+mutated. The logger is the exact pinned uncoloured Full/message-first formatter;
+unexpected formatting is HOLD. The log is shared runner/Cargo/UI output and
+provides no per-line kernel writer authentication. The driver and all owner
+launch/wait/status/cleanup policy remain unchanged. Source cap256 remains; no
+scheduling proof promises this workload stays below it. Stops are explicit HOLD.
+
+No owner function, parser case, module import, build, native/tool command or
+fixture workload ran during preparation. Final entry/import/AX bounds, genuine
+matched builds/data, unknown child statuses, service TERM policy, physical
+release, native factors/frames/UX/performance all remain separate HOLD gates.
+`root-interface.md` is retained byte-exact as the historical driver ABI and
+requirements document; it does not supply the still-missing actual entry.

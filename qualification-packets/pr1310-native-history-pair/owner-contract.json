@@ -1,13 +1,76 @@
 {
   "allowed_preparation_checks": "Only source/metadata-Git/hash/AST/JSON/conservation; no owner import/call, fixture workload, native modules, tool versions, probes, builds or tests executed.",
+  "appearance_consumer": {
+    "appearance": "Exact version1 JSON keys, duplicate/nonfinite refusal; actual PID/source/build/version/manifest/dataset, one nonnil observer/main identity, contiguous1..256 records, positive actual Core scale/f32 bits and native Rescaled provenance when present. All complete records validated, not just last.",
+    "authored_negative_cases_UNRUN": [
+      "missing genuine build binding/evidence",
+      "empty/partial append readiness until original deadline",
+      "complete malformed/duplicate-key/nonfinite JSON",
+      "wrong actual PID/main/UUID/source/data/version",
+      "counter gap/257/stop warning",
+      "native None cannot become configured1",
+      "multiple/conflicting selected adapters or wrong12-field grammar",
+      "prefix rewrite/truncation or inode replacement",
+      "state generation/log offset/time only change does not falsify capture equality",
+      "real geometry/theme/Core/native/backend change does falsify equality"
+    ],
+    "composition": "8ba8d6424cd769b3285ba166c198ae470a04bb5e",
+    "equality": "Actual geometry + full adapter fingerprint + observer/main identity + applied Core scale bits + actual native factor/provenance. Growing raw log offsets/read timestamps and ordinary state generations excluded from equality but preserved as raw evidence.",
+    "formatter": "Pinned no-ANSI tracing-subscriber Full timestamp/level/target and message-first tracing fields. No generalized logger fallback; unexpected spans/format are HOLD.",
+    "freshness": "Deduplicated view state and adapter selection are NOT per-capture/present acknowledgements. Native factor remains null without actual matching Rescaled.",
+    "log_reader": "Retained original ui.log FD/inode, actual matched UI generation. Fresh original cancel/deadline/source fences before/after bounded pread chunks. Append-only verified prefix; original appended bytes/offset/hash/read metadata go to original evidence ledger. No path reopening or repair.",
+    "package_provenance_limit": "Observed cached source bytes/hash + actual Cargo.lock versions. .cargo-checksum.json absent for wgpu-types28; package archive and matched-build input provenance NOT independently established here, mandatory original build evidence remains NULL.",
+    "readiness": "Zero records or incomplete trailing concurrent append read-only polls inside SAME original absolute deadline. Complete malformed records, rewrite/truncation, conflicting identities/sources/data, stopped/capped producer or ambiguous selection are sticky HOLD. Incomplete at deadline is HOLD.",
+    "record_cap": "Per root, unborn has two captures; populated baseline has seven common captures plus small401 pagination captures and up to seven After query captures. Hover/scroll/captures do not themselves enter AppearanceKey. Loading/completion/query/selection/workspace/source-generation transitions can emit dedup records; source supplies no scheduling upper bound below256. Original cap unchanged; any stop warning or 257th record is HOLD, not a silent freshness promise.",
+    "renderer": "Exact resolved12-field wgpu-types28 pretty Debug Selected adapter from iced_wgpu::window::compositor; all raw Rust string tokens retained. Exactly one completed selection, actual backend Gl required; request is not observation.",
+    "resolved_producers": {
+      "Cargo.lock": {
+        "bytes": 341188,
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1310-native-history-after-appearance/Cargo.lock",
+        "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+      },
+      "adapter.rs": {
+        "bytes": 9660,
+        "path": "/home/marvin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-types-28.0.0/src/adapter.rs",
+        "sha256": "a4090392d78c62a12e4f070385190ca95781ff4c5ef91a694a372d07e639d5fd"
+      },
+      "backend.rs": {
+        "bytes": 23566,
+        "path": "/home/marvin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-types-28.0.0/src/backend.rs",
+        "sha256": "cca0b725680cdc601a2735f64da0371b77b4ff741d76c56401866816a07f47e9"
+      },
+      "compositor.rs": {
+        "bytes": 17452,
+        "path": "/home/marvin/.cargo/git/checkouts/libcosmic-41009aea1d72760b/caec74c/iced/wgpu/src/window/compositor.rs",
+        "sha256": "38aeed4090189e026cafdded1a51490c41adf3ffb795a5e8b2eaa2d27609b934"
+      },
+      "format.rs": {
+        "bytes": 82583,
+        "path": "/home/marvin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-subscriber-0.3.23/src/fmt/format/mod.rs",
+        "sha256": "8933844e059b8f56788fdeb289074da0d4051de1b3b125a7d11c8d5a36cbf986"
+      },
+      "instance.rs": {
+        "bytes": 119199,
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1310-native-history-after-appearance/src/instance.rs",
+        "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d"
+      },
+      "macros.rs": {
+        "bytes": 115718,
+        "path": "/home/marvin/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tracing-0.1.44/src/macros.rs",
+        "sha256": "4c367e39d560ae169afcf1b15c618011f5a8c198cab1504a86b4576d5c3fdb30"
+      }
+    },
+    "scope": "Only actual log/source/binding readback. All original0ffb effects/status/cleanup methods unchanged except source binding and child-only logging directives in require_history_root; f86 driver unchanged.",
+    "source_review_scope": "New callable source seam only; actual builds/native/imports/renderer/theme/User/resource/closure remain UNRUN/HOLD."
+  },
   "arms": {
     "after": {
-      "head": "9dc2a70caebbfc972e537712b9f9326843f232d0",
-      "tree": "fcb1b582d894dc46590cc8fc8f20e9cb17920a0a"
+      "head": "3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce",
+      "tree": "124bd8583a75133bb4ed564ef829a154d123c4ed"
     },
     "before": {
-      "head": "a174dc7e7aa651745c95714971054fc4c270c5a3",
-      "tree": "2d557d0cd3757a01ee9ca2da32d15f211ce464b6"
+      "head": "146ad67b926672367817d06897e4cb9f55176bbd",
+      "tree": "c61e06cd488a6801863cc48d2de429c8f993ba9d"
     }
   },
   "base": {
@@ -20,6 +83,7 @@
     "effects": "Constructor reads source metadata/bytes and inherited environment; acquires no FD/child. Returned owner exists before effectful preparation, retaining partial acquisitions on any later failure.",
     "entry_function": "Actual original entry callable on current stack; source file path/hash in entry_source. None refuses before effects. This is source provenance only, not User/resource authority.",
     "input_discovery": "No guessed executables/profile/OIDs, tool versions, package probes, auth or fallback discovery. Missing input means refusal.",
+    "original_build_evidence_scope": "Binding schema is finite consistency EXPECTATIONS, not authority or proof of a successful build. Actual entry/reviewer must supply/audit genuine original producer/source/argv/profile/context/wait/artifact/writer evidence; immutable raw bytes are pinned but not converted into a build certificate. No sample result is generated. Current original evidence NULL => refusal.",
     "root": "Separately admitted already fresh UID-owned0700 /tmp/cagents-history-<canonical UUID>; owner opens original O_DIRECTORY|O_NOFOLLOW FD and checks empty before helpers.",
     "signature": "NativeHistoryOwner(custody, cancelled, *, phase_deadline, whole_deadline, root, sources, tools, entry_function=None, entry_source=None)",
     "sources_shape": {
@@ -42,10 +106,41 @@
           }
         },
         "profile": "dev-runtime",
+        "renderer_build": {
+          "cargo_lock_sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+          "head": "exact paired source head",
+          "original_evidence": {
+            "path": "actual canonical immutable original build evidence file, bounded16MiB/nonempty",
+            "sha256": "actual raw bytes digest; NOT self-authored reviewed/success flags as proof"
+          },
+          "product_version": "actual build crate::VERSION, bounded nonempty<=256",
+          "profile": "dev-runtime",
+          "resolved_source_sha256": {
+            "adapter.rs": "a4090392d78c62a12e4f070385190ca95781ff4c5ef91a694a372d07e639d5fd",
+            "backend.rs": "cca0b725680cdc601a2735f64da0371b77b4ff741d76c56401866816a07f47e9",
+            "compositor.rs": "38aeed4090189e026cafdded1a51490c41adf3ffb795a5e8b2eaa2d27609b934",
+            "format.rs": "8933844e059b8f56788fdeb289074da0d4051de1b3b125a7d11c8d5a36cbf986",
+            "macros.rs": "4c367e39d560ae169afcf1b15c618011f5a8c198cab1504a86b4576d5c3fdb30"
+          },
+          "schema": "pr1310-renderer-build-binding-v1",
+          "tree": "exact paired source tree",
+          "ui_sha256": "actual matched UI artifact digest, equals matched.ui.sha256"
+        },
+        "resolved_renderer_sources": {
+          "adapter.rs": "actual canonical absolute source file path matching fixed SHA from RENDERER_SOURCES",
+          "backend.rs": "actual canonical absolute source file path matching fixed SHA from RENDERER_SOURCES",
+          "compositor.rs": "actual canonical absolute source file path matching fixed SHA from RENDERER_SOURCES",
+          "format.rs": "actual canonical absolute source file path matching fixed SHA from RENDERER_SOURCES",
+          "macros.rs": "actual canonical absolute source file path matching fixed SHA from RENDERER_SOURCES"
+        },
         "source_files": {
+          "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
           "other source/context/config pins": "actual source hashes from final entry",
           "scripts/run-development": "actual reviewed SHA256",
-          "src/app/native_history_fixture.rs": "actual reviewed SHA256"
+          "src/app.rs": "exact paired compiled source SHA",
+          "src/app/native_history_fixture.rs": "actual reviewed SHA256",
+          "src/bin/cagents-ui.rs": "exact paired compiled source SHA",
+          "src/instance.rs": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d"
         },
         "worktree": "exact canonical adapter path"
       }
@@ -75,7 +170,7 @@
   "driver_api": {
     "append_history_observation(binding,value)": "Single original owner JSONL FD, strict finite JSON, 2MiB record/64MiB total, original root/arm/source/data/UI/generation/monotonic/writer identity. No App callback or provider claim.",
     "check_history_root(binding,operation)": "Original source/data FD metadata, root/dirs, live UI ELF, private original service owners, cancellation/deadline/exclusive generation fences; strictly positive recomputed remaining. Whole-source Git root proof is bounded initial source HEAD/tree/clean observation plus explicitly pinned immutable files, not a global hostile filesystem guarantee.",
-    "history_frame_observation(binding)": "Actually measured geometry and current UI/XID/log identity; configured Dark/scale1 source recorded separately; renderer/theme None and native factor None until actual observer implementation. Immutable FrameObservation makes absence a driver refusal.",
+    "history_frame_observation(binding)": "Actual geometry + source-bound original UI log readback of exact paired applied Core/theme/native records and single actual selected adapter. ABI app_scale_configured now contains ACTUAL Core readback, never requested1. evidence_json excluded from equality; raw evidence separately preserved. No focus/geometry repair or compositor-present ACK.",
     "pause_history_poll(binding,maximum_seconds)": "<=.05 seconds clamped original absolute remaining with pre/post fences.",
     "require_history_root(arm,head,tree,fixture)": "Returns opaque identity-bound generation with actual ui_pid/xid, original UI node and fixture. Normal runner Popen is not assumed to be the UI; exact matched live ELF original descendant + XID/_NET_WM_PID corroboration required.",
     "reserve_history_artifact(binding,basename)": "Exclusive0600 regular nofollow PNG/WebP original FD in nonaliased per-generation0700 directory; never overwrite/replay/repair.",
@@ -88,6 +183,7 @@
       "CAGENTS_DEVELOPMENT_HISTORY_FIXTURE": "actual manifest",
       "ICED_BACKEND": "wgpu",
       "LIBGL_ALWAYS_SOFTWARE": "1",
+      "RUST_LOG": "Child-only append iced_wgpu::window::compositor=info,cagents::native_history=info after original directives (or normal debug default when absent). Original worker environment unchanged. Request/delivery unqualified until actual logs.",
       "WGPU_BACKEND": "gl"
     },
     "authority_limit": "No requested GL/backend, private UUID, env absence, source hash or syntax flag is User/resource proof. Unsupported ambient endpoint/activation-FD contexts refuse without stripping or copying descriptors.",
@@ -166,7 +262,7 @@
       "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01"
     }
   },
-  "native_owner_sha256": "2da057b7be169d4d82828a62861a2e2a0cb77b104b95e2d7e21ce3ba465d5e2d",
+  "native_owner_sha256": "917028e79fcffb21146c3f4a84bf8863daddd306df876605af5f712c0b8fa587",
   "public_entry_sequence": [
     "Actual outer authenticated EC/User/resource instruction and finite independently reviewed entry must precede effects. UUID/grant syntax is correlation, not authentication. Library cannot establish actual admission.",
     "Install original cancellation before Custody construction; separately generate/verify owned public Git fixture and build matched dev-runtime CLI/HOST/UI under actual future C grant. No result/target warmth transfer from unit/dev tests.",
@@ -184,12 +280,14 @@
     "actual_native_import_and_AX_call_bounds": null,
     "actual_original_entry_and_admission": null,
     "actual_renderer_observer": {
-      "concrete_seam": "Pinned libcosmic caec74c iced/wgpu/src/window/compositor.rs202 logs Selected: adapter.get_info() at iced_wgpu info. Normal runner debug default suppresses it. Future reviewed entry needs explicit iced_wgpu=info request and source-bound parser of actual original UI log FD offset/time/PID/start/XID with ambiguous/missing records refusing; requested WGPU env cannot substitute.",
-      "status": "UNIMPLEMENTED_HOLD"
+      "actual_original_build_provenance": null,
+      "actual_selected_adapter_log": null,
+      "status": "IMPLEMENTED_SOURCE_UNRUN"
     },
     "actual_theme_scale_observer": {
-      "concrete_seam": "Context::install source configures Dark and scale1, then app.synchronize_appearance(1.0) schedules real task. Config is not completion/readback; finite entry/observer must obtain actual attributable native appearance/effective scale or retain UNKNOWN.",
-      "status": "UNIMPLEMENTED_HOLD"
+      "actual_paired_log_records": null,
+      "native_factor": "None until actual matching Rescaled; UNKNOWN remains a qualification gate",
+      "status": "IMPLEMENTED_SOURCE_UNRUN"
     },
     "all_runtime_native_UX_images_performance_results": "UNRUN; no qualification transferred from source or prior unit packet",
     "normal_service_TERM_acceptance": null,
@@ -208,10 +306,14 @@
     "The pinned Custody primitive scans/polls and may already cache original child status before wrapper.wait. Recorded original wait remains actual, no independent kernel wait syscall claim.",
     "Source-data file metadata fences and actual initial Git HEAD/tree/count observations are scoped checks, not an immutable filesystem snapshot or global namespace proof. Exact final whole-source/tool/context checks remain final entry responsibilities.",
     "Synchronous metadata IO/PIL/AX imports are not independently supervised by this source. Root must bound/admit actual native imports and AX calls; this library does not make kernel filesystem calls preemptible.",
-    "Frame observation deliberately returns actual geometry plus UNKNOWN renderer/theme/native factor until separately implemented real observers. Capture stays blocked.",
     "Incomplete private desktop preparation or unknown parent-reaped descendant status can prevent local settlement; original object/custody/FD records stay retained under HOLD, not detached or silently retried.",
     "No delegated normal service TERM acceptance or automatic lane release; proposed finite role policy needs independent source review and actual execution evidence.",
-    "Deadline fences are cooperative: original d9ee metadata/pin/scan internals and blocking kernel/stdlib calls cannot be preempted and have no internal clock callback. Caller checks immediately before/after those operations and before subsequent external effects; Python scheduling can intervene. No hard real-time/kernel timeout guarantee or post-expiry repair is claimed."
+    "Deadline fences are cooperative: original d9ee metadata/pin/scan internals and blocking kernel/stdlib calls cannot be preempted and have no internal clock callback. Caller checks immediately before/after those operations and before subsequent external effects; Python scheduling can intervene. No hard real-time/kernel timeout guarantee or post-expiry repair is claimed.",
+    "Deduplicated view state and adapter selection are NOT per-capture/present acknowledgements. Native factor remains null without actual matching Rescaled.",
+    "Observed cached source bytes/hash + actual Cargo.lock versions. .cargo-checksum.json absent for wgpu-types28; package archive and matched-build input provenance NOT independently established here, mandatory original build evidence remains NULL.",
+    "Original ui.log is shared runner/Cargo/UI stdout+stderr. Source/matched artifact/appearance PID provide scoped attribution, not per-line kernel writer authentication. Exact original writer/build provenance remains external.",
+    "The256-record cap remains unchanged; no source scheduling proof guarantees workload stays below it. Any stopped/capped producer holds.",
+    "Frame equality excludes irrelevant raw-read metadata and dedup ordinary state generation; it still checks actual capture-critical state. Missing native factor is never replaced by configured1."
   ],
   "status": "IMPLEMENTED_SOURCE_CANDIDATE_WITH_EXPLICIT_HOLD_GATES"
 }
