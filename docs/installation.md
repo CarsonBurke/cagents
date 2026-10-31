@@ -310,6 +310,11 @@ ownership checks as `--stage-only`, and it refuses when:
 
 With no window or daemon running, any complete installed version can be selected.
 
+Run it from your own terminal; an agent session cannot select. A window
+rechecks the installation when it is focused, so an unfocused window can keep
+showing a withdrawn offer until then. Clicking it is refused with "the installed
+candidate changed" and changes nothing.
+
 For an explicitly authorized direct daemon replacement, append
 `--restart-daemon` to the installer invocation. The coordinator saves and closes
 application windows before checkpointing. Supported holders retain live
