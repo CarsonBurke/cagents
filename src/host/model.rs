@@ -45,6 +45,7 @@ pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetire
 mod navigation;
 mod schema;
 mod terminal_owners;
+mod tray_labels;
 mod views;
 
 const SCHEMA_VERSION: u32 = 19;
@@ -95,6 +96,19 @@ impl Registry {
     /// the global host lock while SQLite commits or waits for another writer.
     pub(crate) fn execution_connection(&self) -> Result<Self, String> {
         Self::at(&self.path)
+    }
+
+    /// The immutable store identity without loading the full agent inventory.
+    pub(crate) fn identity(&self) -> Result<Uuid, String> {
+        let identity: String = self
+            .db
+            .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
+        identity
+            .parse()
+            .map_err(|error| format!("Invalid registry identity: {error}"))
     }
 
     /// The whole model, ordered by the ranks the registry assigned.
