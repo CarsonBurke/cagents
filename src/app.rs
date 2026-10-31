@@ -31842,6 +31842,37 @@ mod tests {
     }
 
     #[test]
+    fn a_visible_pull_request_browser_refreshes_beside_the_focused_chat() {
+        let (mut app, _) = pull_request_test_app(&[]);
+        app.active_workspace = Some("/repo".into());
+        let (browser, _) = app.add_pull_requests_card("/repo".into());
+        if let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&browser) {
+            crate::pull_request_review::tests::ready_due_browser(&mut pane.review);
+        }
+        drop(app.new_native_chat(crate::agent::Provider::Codex, Some("/repo".into())));
+        assert_ne!(app.workspace.focused(), Some(browser));
+        app.workspace.resize_viewport(2400.0);
+        app.workspace.native_scroll(0.0, 2400.0);
+        assert_eq!(
+            app.workspace.visibility(browser),
+            Some(VisibilityClass::Visible)
+        );
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        drop(app.update_refresh(refresh_ui::Action::Tick));
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&browser) else {
+            panic!("PR browser")
+        };
+        // A started refresh cancels the prior generation's request: the new
+        // page response must not be accepted by the prior browser surface.
+        assert!(matches!(
+            pane.review.list(),
+            crate::pull_request_review::ListState::Ready(_)
+        ));
+        assert!(pane.review.browser_is_refreshing());
+    }
+
+    #[test]
     fn a_sidebar_pull_request_opens_one_review_pane_per_repository() {
         let (mut app, project) = pull_request_test_app(&[7, 8]);
 
