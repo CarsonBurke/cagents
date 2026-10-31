@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -ISB
 """Fixed offline Claude stream-json scenarios; no provider or filesystem access.
 
 Select exactly one --fixture-scenario at process startup. This executable does

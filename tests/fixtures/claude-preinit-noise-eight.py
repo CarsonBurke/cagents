@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -ISB
 """Fixed offline preinit entrypoint; no child process or recipe flag change."""
 from pathlib import Path
 import runpy
