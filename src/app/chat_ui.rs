@@ -5227,6 +5227,20 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
     }
 }
 
+fn set_launch_model(recipe: &mut LaunchRecipe, model: &str) {
+    let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
+    let mut original = recipe.arguments.iter();
+    while let Some(argument) = original.next() {
+        if argument == "--model" {
+            original.next();
+        } else if !argument.starts_with("--model=") {
+            arguments.push(argument.clone());
+        }
+    }
+    arguments.extend(["--model".to_owned(), model.to_owned()]);
+    recipe.arguments = arguments;
+}
+
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
     if provider == Provider::Antigravity {
         let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
@@ -7765,6 +7779,15 @@ impl Cagents {
             .map(|model| (model, runtime.snapshot.reasoning.clone()));
         let mut session = runtime.session.clone();
         session.id = TerminalId::new();
+        // Antigravity has no later step that could change the model.
+        let model = if session.launch.provider == Provider::Antigravity {
+            if let Some((model, _)) = &model {
+                set_launch_model(&mut session.launch.recipe, model);
+            }
+            None
+        } else {
+            model
+        };
         let text = runtime.composer.text();
         let resolved_text = completion::invocations(
             completion::from_leading_skill(&text, &runtime.snapshot.skills),
@@ -9541,6 +9564,19 @@ impl Cagents {
                     return Task::none();
                 }
                 let session = runtime.session.clone();
+                // Nothing holds an exited provider's conversation, so attaching
+                // would only show the same ended actor again. Start admits
+                // replacing it under this exact identity.
+                if runtime.connected()
+                    && runtime.snapshot.exited
+                    && !session.native_continuity.retains_provider()
+                    && !session.owns_codex_listener()
+                    && session.launch.session_id.is_some()
+                    && runtime.snapshot.session_id == session.launch.session_id
+                    && !session.is_saved_claude_history()
+                {
+                    return self.start_chat(target.card, session, chat::Intent::Start, None, false);
+                }
                 let intent = self.chat_retry_intent(target.card, &session);
                 return self.start_chat(target.card, session, intent, None, false);
             }
@@ -20362,6 +20398,40 @@ mod tests {
             assert_eq!(attempt.session, source);
             assert!(!app.chat_ui.explicit_starts.contains_key(&card));
         }
+    }
+
+    #[test]
+    fn retrying_an_exited_antigravity_chat_starts_its_conversation_again() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Antigravity, Some(KNOWN_THREAD));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            unreachable!()
+        };
+        let target = runtime.target;
+        runtime.session.launch.session_id = Some(KNOWN_THREAD.into());
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.exited = true;
+        snapshot.session_id = Some(KNOWN_THREAD.into());
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let attempt = app.chat_ui.attempt(card).unwrap();
+        assert_eq!(attempt.intent, chat::Intent::Start);
+        assert_eq!(
+            attempt.session.launch.session_id.as_deref(),
+            Some(KNOWN_THREAD)
+        );
+    }
+
+    #[test]
+    fn an_antigravity_model_is_chosen_in_its_launch_arguments() {
+        let mut recipe = LaunchRecipe {
+            program: "agy".into(),
+            arguments: vec!["--model=old".into(), "--mode".into(), "plan".into()],
+            working_directory: "/project".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        set_launch_model(&mut recipe, "new");
+        assert_eq!(recipe.arguments, ["--mode", "plan", "--model", "new"]);
     }
 
     #[test]

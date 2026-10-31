@@ -3484,32 +3484,33 @@ impl Runtime {
                 .position(|mode| Some(mode) == snapshot.permission_mode.as_ref());
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
                 controls.push(
-                    design::caption(
-                        selected
-                            .map_or("Permissions", |index| permission_mode_label(&modes[index])),
-                    )
+                    design::caption(selected.map_or("Permissions", |index| {
+                        provider_permission_mode_label(self.session.launch.provider, &modes[index])
+                    }))
                     .into(),
                 );
             } else {
                 let open = self.permission_picker;
-                let anchor =
-                    widget::button::custom(
-                        widget::row::with_children(vec![
-                            design::caption(selected.map_or("Permissions", |index| {
-                                permission_mode_label(&modes[index])
-                            }))
+                let anchor = widget::button::custom(
+                    widget::row::with_children(vec![
+                        design::caption(selected.map_or("Permissions", |index| {
+                            provider_permission_mode_label(
+                                self.session.launch.provider,
+                                &modes[index],
+                            )
+                        }))
+                        .into(),
+                        widget::icon(Icon::PanDown.handle())
+                            .size(design::COMPACT_ICON_SIZE)
                             .into(),
-                            widget::icon(Icon::PanDown.handle())
-                                .size(design::COMPACT_ICON_SIZE)
-                                .into(),
-                        ])
-                        .spacing(step::GAP_XS)
-                        .align_y(Alignment::Center),
-                    )
-                    .name("Choose permission mode")
-                    .class(crate::ui_controls::control_style(open, None))
-                    .padding(CONTROL_PADDING)
-                    .on_press(action(Action::PermissionPicker(target, !open)));
+                    ])
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
+                )
+                .name("Choose permission mode")
+                .class(crate::ui_controls::control_style(open, None))
+                .padding(CONTROL_PADDING)
+                .on_press(action(Action::PermissionPicker(target, !open)));
                 controls.push(crate::interaction::tooltip(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
@@ -5018,6 +5019,13 @@ impl Runtime {
         .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)
         .into()
+    }
+}
+
+pub(super) fn provider_permission_mode_label(provider: Provider, mode: &str) -> &str {
+    match (provider, mode) {
+        (Provider::Antigravity, "default") => "Default",
+        _ => permission_mode_label(mode),
     }
 }
 

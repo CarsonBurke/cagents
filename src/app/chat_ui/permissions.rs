@@ -47,7 +47,16 @@ pub(super) fn retry_draft(denial: &chat::PermissionDenial) -> Option<String> {
     ))
 }
 
-fn mode_description(mode: &str) -> &str {
+fn mode_description(provider: Provider, mode: &str) -> &str {
+    // Its chats cannot ask, so "review" would promise a prompt that never comes.
+    if provider == Provider::Antigravity {
+        match mode {
+            "default" => return "Refuse actions that need approval; this chat cannot ask",
+            "accept-edits" => return "Allow file edits; refuse other actions that need approval",
+            "auto" => return "Antigravity decides which actions to allow",
+            _ => {}
+        }
+    }
     match mode {
         "manual" | "default" => "Review tool requests before allowing them",
         "acceptEdits" | "accept-edits" => "Allow file edits; review other tool requests",
@@ -267,12 +276,14 @@ impl Runtime {
         }
         if !snapshot.capabilities.permission_modes.is_empty() {
             content.push(design::caption("Permission mode").into());
+            let provider = self.session.launch.provider;
             for mode in &snapshot.capabilities.permission_modes {
                 content.push(
                     widget::button::custom(
                         widget::column::with_children(vec![
-                            design::body(view::permission_mode_label(mode)).into(),
-                            design::caption(mode_description(mode))
+                            design::body(view::provider_permission_mode_label(provider, mode))
+                                .into(),
+                            design::caption(mode_description(provider, mode))
                                 .class(cosmic::theme::Text::Custom(design::muted_text))
                                 .into(),
                         ])

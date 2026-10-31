@@ -31,7 +31,7 @@ const STREAMING: [&str; 4] = [
     "stream-json",
 ];
 
-pub const CONSUMER_SIGN_IN: &str = "Google does not support using Antigravity CLI inside other applications on a personal Google sign-in. Use it in a terminal tab, or sign it in with a Gemini API key or Google Cloud to chat here.";
+pub const CONSUMER_SIGN_IN: &str = "Use a terminal tab, or sign in with a Gemini API key or Google Cloud: Google does not support Antigravity CLI inside other apps on a personal sign-in.";
 
 /// Whether the CLI signs in some way other than a personal Google account:
 /// the API key provider, a Google Cloud project, or Application Default
@@ -65,6 +65,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     }
     let mut kept = STREAMING.map(str::to_owned).to_vec();
     let mut mode = "default".to_owned();
+    let mut model = None;
     let mut arguments = launch.recipe.arguments.iter();
     while let Some(argument) = arguments.next() {
         let (name, inline) = argument
@@ -103,10 +104,14 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
                 .ok_or_else(|| format!("Missing value for {name}"))?;
             if name == "--mode" {
                 mode.clone_from(next);
+            } else if name == "--model" {
+                model = Some(next.clone());
             }
             kept.push(next.clone());
         } else if name == "--mode" {
             mode = inline.unwrap_or_default().to_owned();
+        } else if name == "--model" {
+            model = inline.map(str::to_owned);
         }
     }
     let arguments = kept.clone();
@@ -131,6 +136,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
                 .into_owned(),
             resume: launch.session_id.clone(),
             mode,
+            model,
             arguments,
             run_nonce: uuid::Uuid::new_v4().simple().to_string(),
             ..Antigravity::default()
@@ -144,6 +150,7 @@ struct Antigravity {
     cwd: String,
     resume: Option<String>,
     mode: String,
+    model: Option<String>,
     /// The launch's arguments, without a conversation to continue.
     arguments: Vec<String>,
     run_nonce: String,
@@ -299,6 +306,13 @@ impl Antigravity {
         // The event's own `permission_mode` reads the same whatever was chosen.
         step.events
             .push(Event::PermissionMode(Some(self.mode.clone())));
+        if self.model.is_some() {
+            step.events.push(Event::Models {
+                models: Vec::new(),
+                selected: self.model.clone(),
+                reasoning: None,
+            });
+        }
         step.events.push(Event::Ready(true));
         step.events.push(Event::Status {
             busy: false,

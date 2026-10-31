@@ -1433,7 +1433,12 @@ fn login_launch(
     home: PathBuf,
     device: bool,
 ) -> Option<LaunchRecipe> {
-    let command = login_arguments(account.provider, device)?;
+    // Antigravity has no sign-in command: it signs in when it is run.
+    let command: &[&str] = if account.provider == Provider::Antigravity {
+        &[]
+    } else {
+        login_arguments(account.provider, device)?
+    };
     let mut environment = BTreeMap::new();
     if let (Some(variable), Some(account_home)) = (
         account::home_variable(account.provider),
