@@ -1337,6 +1337,14 @@ impl ControlClient {
         }
     }
 
+    /// Answered during startup recovery, when other requests are refused.
+    pub fn startup_state(&mut self) -> Result<terminal::ipc::StartupState, ControlError> {
+        match self.request_strict(ClientRequest::StartupState)? {
+            ServerResponse::StartupState(state) => Ok(state),
+            response => Err(unexpected_response("daemon startup state", &response)),
+        }
+    }
+
     pub fn shutdown_with_policy(
         &mut self,
         require_empty: bool,
@@ -2102,6 +2110,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
         ServerResponse::Work(_) => "work",
         ServerResponse::ChannelWork(_) => "channel_work",
+        ServerResponse::StartupState(_) => "startup_state",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }

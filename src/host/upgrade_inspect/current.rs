@@ -385,7 +385,8 @@ impl Client {
 // appended Work board request) preserve this subset, including the existing
 // continuity enum discriminants.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
-    [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].contains(&protocol)
+    // 128 is the install candidate line's protocol (see `ipc::PROTOCOL_VERSION`).
+    [99, 100, 101, 102, 103, 119, 128, ipc::PROTOCOL_VERSION].contains(&protocol)
 }
 
 fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
