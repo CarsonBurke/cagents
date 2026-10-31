@@ -103,6 +103,8 @@ class _Binding:
     ui_environment: dict
     root: Path
     closed: bool = False
+    runner_exit_code: int | None = None
+    normal_close_succeeded: bool | None = None
 
 
 class NativeHistoryOwner:
@@ -126,6 +128,7 @@ class NativeHistoryOwner:
         self.thread = threading.get_ident()
         self.events, self.files, self.direct_waits, self.services = [], [], {}, {}
         self.raw_fds, self._directories, self.launches = [], [], {}
+        self.launch_attempts, self.signal_attempts, self.pidfd_closes = [], [], []
         self.inputs = {}
         self.bindings, self.artifacts, self.producers, self.writer_fences = [], {}, {}, {}
         self.first_failure = None
@@ -182,11 +185,14 @@ class NativeHistoryOwner:
     def _remaining(self, cleanup=False):
         self._entry_guard()
         require(threading.get_ident() == self.thread, "different original owner thread")
-        remaining = min(self.phase_deadline, self.whole_deadline) - time.monotonic()
-        require(remaining > 0, "original absolute budget exhausted; retain custody")
         if not cleanup:
             require(not self.cancelled() and self.first_failure is None and not self.settlement_attempted,
                     "cancelled/failed owner refuses new work")
+        # Source/metadata and the actual cancellation callback may take time.
+        # Sample the unchanged absolute clock LAST, directly before the caller's
+        # effect. This is cooperative admission, not kernel preemption.
+        remaining = min(self.phase_deadline, self.whole_deadline) - time.monotonic()
+        require(remaining > 0, "original absolute budget exhausted; retain custody")
         return remaining
 
     def _failure(self, error):
@@ -229,14 +235,17 @@ class NativeHistoryOwner:
             count = os.write(item["fd"], view)
             require(count > 0, "short evidence write")
             view = view[count:]
+        self._remaining()
         os.fsync(item["fd"])
         self._same_file(item)
         self._remaining()
 
-    def _close_file(self, item):
+    def _close_file(self, item, cleanup=False):
+        self._remaining(cleanup=cleanup)
         require(not item["close_attempted"], "original close cannot be retried")
         if "identity" in item:
             item["before_close"] = unchanged(self._same_file(item))
+        self._remaining(cleanup=cleanup)
         item["close_attempted"] = True
         try:
             os.close(item["fd"])
@@ -245,12 +254,15 @@ class NativeHistoryOwner:
             item["close_returned"] = False
             self._failure(error)
             raise
+        self._remaining(cleanup=cleanup)
 
     def _directory(self, parent, name):
         self._remaining()
         path = parent / name
+        self._remaining()
         os.mkdir(path, 0o700)
         self.events.append({"event": "mkdir-return", "path": str(path)})
+        self._remaining()
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         record = self._retain_raw(fd, "directory:" + str(path))
         self.events.append({"event": "directory-open-return", "fd": fd, "path": str(path)})
@@ -270,9 +282,11 @@ class NativeHistoryOwner:
         return item
 
     def _pipe(self, role):
+        self._remaining()
         read, write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
         # Both actual return values are retained before another syscall.
         pair = [self._retain_raw(read, role + "-read"), self._retain_raw(write, role + "-write")]
+        self._remaining()
         return pair
 
     def _pin_input(self, path, expected, maximum):
@@ -284,6 +298,7 @@ class NativeHistoryOwner:
             self._same_file(item)
             require(item["sha256"] == expected, "conflicting immutable input expectation")
             return item
+        self._remaining()
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         item = {"path": path, "fd": fd, "secret": False, "close_attempted": False}
         self.files.append(item)
@@ -316,33 +331,59 @@ class NativeHistoryOwner:
 
     def _launch(self, name, argv, environment, *, pass_fds=(), cleanup=False):
         self._remaining(cleanup=cleanup)
+        require(not self.cancelled() and not self.custody.closed,
+                "Cancellation/closure refuses new workload")
         number = len(self.custody.direct)
         stdout = self._new_file(self.root / f"process-{number}-{name}.stdout", cleanup=cleanup)
         stderr = self._new_file(self.root / f"process-{number}-{name}.stderr", cleanup=cleanup)
-        try:
-            child = self.custody.launch(argv, str(self.root), name, env=environment,
-                                        stdout=stdout["fd"], stderr=stderr["fd"], pass_fds=pass_fds)
-        except BaseException as error:
-            # Custody.launch retained any successful Popen before fallible pin.
-            # Preserve that original map; never replace a failed descriptor.
-            self._failure(error)
-            raise
-        self.events.append({"event": "launch-return", "pid": child.pid, "role": name,
-                            "argv": list(argv), "original_handle": id(child)})
-        self.launches[child.pid] = {"child": child, "stdout": stdout, "stderr": stderr,
-                                   "role": name, "argv": list(argv), "wait": None}
+        command = list(argv)
+        arguments = {"cwd": str(self.root), "close_fds": True, "stdin": subprocess.DEVNULL,
+                     "env": environment, "stdout": stdout["fd"], "stderr": stderr["fd"], "pass_fds": pass_fds}
+        attempt = {"role": name, "argv": command, "Popen_called": False, "Popen_returned": False}
+        self.launch_attempts.append(attempt)
+        # d9ee.launch scans before Popen but cannot accept a clock callback.
+        # Preserve that exact scan/pin/fast-exit protocol locally, placing the
+        # final original-budget fence AFTER the scan and all preparation.
+        self.custody.scan()
+        require(not self.cancelled() and not self.custody.closed,
+                "cancellation/closure refuses workload before Popen")
+        self._remaining(cleanup=cleanup)
+        attempt["Popen_called"] = True
+        child = subprocess.Popen(command, **arguments)
+        self.custody.direct[child.pid] = child  # First retention, BEFORE clock/pin/evidence.
+        self.custody.launches += 1
+        original = {"child": child, "stdout": stdout, "stderr": stderr,
+                    "role": name, "argv": command, "wait": None,
+                    "expected_exit": 0 if name == "history-development-runner" else None}
+        self.launches[child.pid] = original
+        attempt.update(Popen_returned=True, pid=child.pid)
         stdout["writer_pid"] = stderr["writer_pid"] = child.pid
+        self.events.append({"event": "launch-return", "pid": child.pid, "role": name,
+                            "argv": command, "original_handle": id(child)})
+        try:
+            self._remaining(cleanup=cleanup)
+            self.custody.pin(child.pid, self.custody.pid, direct=True, role=name)
+        except (FileNotFoundError, ProcessLookupError):
+            # Exact d9ee fast-exit fallback. Never infer a status from absence.
+            self._remaining(cleanup=cleanup)
+            code = child.poll()
+            require(code is not None, "New child vanished before custody without original wait status")
+            self.custody.nodes[child.pid] = {"pid": child.pid, "role": name, "settled": True,
+                "exit_code": code, "exit_status_source": "direct Popen reaped before live pin",
+                "provenance": "direct Popen child", "signals": []}
+        self._remaining(cleanup=cleanup)
+        self.custody.scan()
         self._remaining(cleanup=cleanup)
         return child, stdout, stderr
 
     def _wait(self, child, output, errors, limit, cleanup=False):
         cached_before = child.returncode
         while True:
-            remaining = self._remaining(cleanup=cleanup)
+            self._remaining(cleanup=cleanup)
             require(os.fstat(output["fd"]).st_size <= limit
                     and os.fstat(errors["fd"]).st_size <= limit, "tool output exceeded original bound")
             try:
-                code = child.wait(timeout=min(remaining, .05))
+                code = child.wait(timeout=min(self._remaining(cleanup=cleanup), .05))
                 record = {"pid": child.pid, "original_Popen_wait_return": code,
                           "cached_status_before_wait": cached_before,
                           "kernel_wait_syscall_independently_observed": False,
@@ -350,17 +391,22 @@ class NativeHistoryOwner:
                 self.direct_waits[child.pid] = record
                 self.launches[child.pid]["wait"] = record
                 self.events.append({"event": "original-wait-return", **record})
+                if self.launches[child.pid]["expected_exit"] == 0 and code != 0:
+                    self._failure(Hold("normal development runner exited " + str(code)))
                 self._remaining(cleanup=cleanup)
                 break
             except subprocess.TimeoutExpired:
                 continue
+        self._remaining(cleanup=cleanup)
         self.custody.scan()
+        self._remaining(cleanup=cleanup)
         require(os.fstat(output["fd"]).st_size <= limit
                 and os.fstat(errors["fd"]).st_size <= limit, "late output exceeded original bound")
-        os.lseek(output["fd"], 0, os.SEEK_SET)
-        os.lseek(errors["fd"], 0, os.SEEK_SET)
-        result = RawResult(os.read(output["fd"], limit + 1), os.read(errors["fd"], limit + 1),
-                           code, json.dumps(record, sort_keys=True))
+        self._remaining(cleanup=cleanup)
+        out = os.pread(output["fd"], limit + 1, 0)
+        self._remaining(cleanup=cleanup)
+        err = os.pread(errors["fd"], limit + 1, 0)
+        result = RawResult(out, err, code, json.dumps(record, sort_keys=True))
         require(len(result.stdout) <= limit and len(result.stderr) <= limit, "output overflow")
         self._remaining(cleanup=cleanup)
         return result
@@ -379,11 +425,14 @@ class NativeHistoryOwner:
         poller = select.poll()
         poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
         while True:
-            remaining = self._remaining()
+            self._remaining()
             require(child.returncode is None and not self.custody.exited(self.custody.nodes[child.pid]),
                     "owned server exited before readiness")
-            if not poller.poll(max(1, int(min(remaining, .05) * 1000))):
+            # A sub-millisecond budget permits only nonblocking poll(0); never
+            # round a small positive remainder UP beyond the original budget.
+            if not poller.poll(int(min(self._remaining(), .05) * 1000)):
                 continue
+            self._remaining()
             block = os.read(fd, cap + 1 - len(data))
             if not block:
                 break
@@ -399,8 +448,11 @@ class NativeHistoryOwner:
         A numeric PID from a bus/property never creates or adopts a node.
         This is bounded original-family evidence, not global kernel closure.
         """
+        self._remaining()
         self.custody.scan()
+        self._remaining()
         rows = Path("/proc/net/unix").read_text().splitlines()[1:]
+        self._remaining()
         matches = [row.split() for row in rows if len(row.split()) == 8 and row.split()[7] == str(path)]
         require(len(matches) == 1, "private listener pathname absent/ambiguous")
         require(matches[0][3] == "00010000" and matches[0][4] == "0001",
@@ -437,6 +489,7 @@ class NativeHistoryOwner:
         self._remaining()
         require(not self.desktop_attempted, "private desktop cannot be replayed")
         self.desktop_attempted = True
+        self._remaining()
         self.root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         self.root_record = self._retain_raw(self.root_fd, "original-root-directory")
         self.root_identity = identity(os.fstat(self.root_fd))
@@ -545,8 +598,9 @@ class NativeHistoryOwner:
         node["pinned_executable_identity"] = current["executable_identity"]
         self.services[role] = node
 
-    def _close_raw(self, item):
+    def _close_raw(self, item, cleanup=False):
         require(not item["close_attempted"], "original FD acquisition close cannot be retried")
+        self._remaining(cleanup=cleanup)
         item["close_attempted"] = True
         try:
             os.close(item["fd"])
@@ -556,6 +610,82 @@ class NativeHistoryOwner:
             item["close_returned"] = False
             self._failure(error)
             raise
+        self._remaining(cleanup=cleanup)
+
+    def _signal_owned(self, node, signum):
+        """d9ee's exact identity/refusal checks with a final dispatch fence.
+
+        A recorded intent is not a delivered signal. Keep both the per-attempt
+        outcome and the unchanged signal/identity fields of successful or
+        original-exit-confirmed d9ee history. No PID/group fallback exists.
+        """
+        attempt = {"pid": node["pid"], "signal": signum, "called": False,
+                   "returned": None, "dispatch_result": "not_called", "delivery_observed": False}
+        self.signal_attempts.append(attempt)
+        self._remaining(cleanup=True)
+        if self.custody.reap(node):
+            attempt["dispatch_result"] = "not_called_already_reaped"
+            self._remaining(cleanup=True)
+            return
+        current = self.custody.current(node, executable=True)
+        require(current["state"] not in ("Z", "X"), "Do not signal an exited child")
+        if node.get("pinned_executable"):
+            require(current.get("executable") == node["pinned_executable"]
+                    and current.get("executable_identity") == node["pinned_executable_identity"],
+                    "Pinned UI/daemon executable incarnation changed; no retargeting")
+        if current.get("executable") == self.custody.expected_daemon:
+            require(self.custody.daemon is node, "Matched daemon lacks private held-lock corroboration")
+        descriptor = node["pidfd"]
+        self._remaining(cleanup=True)
+        attempt["called"] = True
+        try:
+            signal.pidfd_send_signal(descriptor, signum, None, 0)
+        except ProcessLookupError as error:
+            attempt.update(returned=False, dispatch_result="process_lookup_error", error_type=type(error).__name__)
+            self._remaining(cleanup=True)
+            require(self.custody.exited(node), "Owned signal lost its process without pidfd exit")
+            attempt["dispatch_result"] = "not_delivered_original_exit_confirmed"
+        except BaseException as error:
+            attempt.update(returned=False, dispatch_result="dispatch_raised_unknown", error_type=type(error).__name__)
+            self._failure(error)
+            raise
+        else:
+            attempt.update(returned=True, dispatch_result="syscall_returned_not_delivery_observation")
+        node["signals"].append({"signal": signum, "monotonic": time.monotonic(),
+                                "current_executable": current.get("executable"),
+                                "current_executable_identity": current.get("executable_identity"),
+                                "dispatch_result": attempt["dispatch_result"], "delivery_observed": False})
+        self._remaining(cleanup=True)
+
+    def _close_pidfds(self):
+        """Preserve d9ee close predicates and one-shot pop, fence EACH close."""
+        require(not self.pidfd_close_attempted, "pidfd closure cannot be retried")
+        self.pidfd_close_attempted = True
+        # Actual pinned primitive globals, not an injected census/callback.
+        child_ids = type(self.custody).close_pidfds.__globals__["child_ids"]
+        require(child_ids is type(self.custody).scan.__globals__["child_ids"], "different original child census")
+        self._remaining(cleanup=True)
+        require(not child_ids(self.custody.pid) and all(node.get("settled") for node in self.custody.nodes.values()),
+                "Cannot close custody before positive child settlement")
+        self._remaining(cleanup=True)
+        for node in self.custody.nodes.values():
+            descriptor = node.get("pidfd")
+            if descriptor is None:
+                continue
+            record = {"pid": node["pid"], "fd": descriptor, "close_attempted": False, "close_returned": None}
+            self.pidfd_closes.append(record)  # Retain original numeric FD even after d9ee-style pop.
+            node.pop("pidfd")
+            self._remaining(cleanup=True)
+            record["close_attempted"] = True
+            try:
+                os.close(descriptor)
+                record["close_returned"] = True
+            except BaseException as error:
+                record.update(close_returned=False, error_type=type(error).__name__)
+                self._failure(error)
+                raise  # Ambiguous close is never retried, regardless of a later census.
+            self._remaining(cleanup=True)
+        self._remaining(cleanup=True)
 
     def _source_inputs(self, arm, fixture):
         spec = self.sources[arm]
@@ -604,7 +734,9 @@ class NativeHistoryOwner:
     def _open_input(self, path, expected):
         item = self._pin_input(path, expected, 64 * 1024 * 1024)
         size = self._same_file(item).st_size
+        self._remaining()
         data = os.pread(item["fd"], size + 1, 0)
+        self._remaining()
         require(len(data) == size and digest(data) == expected, "owned input changed during read")
         self._same_file(item)
         return data
@@ -641,7 +773,9 @@ class NativeHistoryOwner:
             matches = self.custody.exact_matches(ui["path"])
             if len(matches) == 1:
                 node, current = matches[0]
+                self._remaining()
                 require(digest(Path(f"/proc/{node['pid']}/exe").read_bytes()) == ui["sha256"], "live UI bytes differ")
+                self._remaining()
                 result = self._capture("window-discovery", [self._tool("xdotool"), "search", "--onlyvisible", "--pid", str(node["pid"])], environment)
                 if result.exit_code == 0:
                     ids = result.stdout.decode().splitlines()
@@ -703,7 +837,9 @@ class NativeHistoryOwner:
     def _driver_fence(self, binding, operation):
         spec = self.sources[binding.arm]["driver"]
         path = Path(spec["path"])
+        self._remaining()
         require(digest(path.read_bytes()) == spec["sha256"], "driver source changed")
+        self._remaining()
         frames = inspect.getouterframes(inspect.currentframe())
         try:
             matches = [item for item in frames if item.function == "capture"
@@ -777,9 +913,9 @@ class NativeHistoryOwner:
 
     @sticky
     def pause_history_poll(self, binding, maximum_seconds):
-        remaining = self.check_history_root(binding, "poll-before")
+        self.check_history_root(binding, "poll-before")
         require(0 <= maximum_seconds <= .05, "unplanned poll delay")
-        time.sleep(min(maximum_seconds, remaining))
+        time.sleep(min(maximum_seconds, self._remaining()))
         self.check_history_root(binding, "poll-after")
 
     @sticky
@@ -843,18 +979,20 @@ class NativeHistoryOwner:
             item = record["item"]
             info = self._same_file(item)
             require(0 < info.st_size <= 32 * 1024 * 1024, "artifact empty/oversized")
-            os.lseek(item["fd"], 0, os.SEEK_SET)
-            payload = os.read(item["fd"], 32 * 1024 * 1024 + 1)
+            self._remaining()
+            payload = os.pread(item["fd"], 32 * 1024 * 1024 + 1, 0)
             require(len(payload) == info.st_size, "artifact changed during read")
             require(payload.startswith(b"\x89PNG\r\n\x1a\n") if path == png else
                     payload[:4] == b"RIFF" and payload[8:12] == b"WEBP", "unexpected original image format")
             self._same_file(item)
+            self._remaining()
             record["retained"] = True
             retained.append({"path": str(path), "sha256": digest(payload), "bytes": len(payload),
                              "identity": list(item["identity"])})
         # Real synchronous image.save return is not a child wait or syscall
         # recording. Decoder/losslessness checks remain the actual driver/PIL
         # and independent review's obligation; this owner does not repair bytes.
+        self._remaining()
         return {"originals": retained, "png_producer": self.producers[str(png)],
                 "webp_writer": {"kind": "same-process-PIL-return", "source_fences": fences[-2:],
                                 "invented_child_wait": False}, "metrics": metrics,
@@ -872,7 +1010,7 @@ class NativeHistoryOwner:
             # to start a closing client. Only this positively held UI receives
             # TERM. This is forced failure cleanup, never a normal-close pass.
             self._failure(Hold("cancelled UI requires owned forced cleanup"))
-            self.custody.signal_owned(binding.node, signal.SIGTERM)
+            self._signal_owned(binding.node, signal.SIGTERM)
         else:
             tool = self.inputs[str(Path(self.tools["xdotool"]["path"]))]
             self._same_file(tool)
@@ -880,13 +1018,23 @@ class NativeHistoryOwner:
                                    binding.ui_environment, cleanup=True)
             require(result.exit_code == 0, "normal owned window close failed")
         result = self._wait(self._runner, *self._runner_streams, 16 * 1024 * 1024, cleanup=True)
+        binding.runner_exit_code = result.exit_code
+        if result.exit_code != 0:
+            self._failure(Hold("normal development runner exited " + str(result.exit_code)))
+        self._remaining(cleanup=True)
         self.custody.scan()
         require(self.custody.exited(binding.node), "UI closure lacks original pidfd exit")
+        # Physical exit is distinct from normal success, including exit101.
         binding.closed = True
+        binding.normal_close_succeeded = result.exit_code == 0 and not self.cancelled()
+        if not binding.normal_close_succeeded:
+            self._failure(Hold("normal UI close did not establish a successful uncancelled runner"))
         self.events.append({"event": "UI-root-exited", "generation": binding.generation,
+                            "normal_close_succeeded": binding.normal_close_succeeded,
                             "runner_wait": json.loads(result.evidence_json),
                             "ui_node": {key: value for key, value in binding.node.items() if key != "pidfd"},
                             "runner_is_UI": self._runner.pid == binding.ui_pid})
+        self._remaining(cleanup=True)
         # Cargo's original wait and the UI's original pidfd are distinct. A UI
         # status reaped by Cargo can remain unknown in Custody; do not invent it.
 
@@ -905,6 +1053,7 @@ class NativeHistoryOwner:
                       "frame_pass": False, "snapshot_only": True}
             records.append(record)  # Keep a partial record before fallible hash.
             if info.st_size <= 32 * 1024 * 1024:
+                self._remaining(cleanup=True)
                 payload = os.pread(item["fd"], info.st_size + 1, 0)
                 after = self._same_file(item)
                 require(unchanged(info) == unchanged(after) and len(payload) == info.st_size,
@@ -934,7 +1083,7 @@ class NativeHistoryOwner:
             self.events.append({"event": "raw-file-before-close", "path": str(item["path"]),
                                 "bytes": info.st_size, "sha256": hasher.hexdigest(),
                                 "identity": list(item["identity"])})
-        self._close_file(item)
+        self._close_file(item, cleanup=True)
 
     @sticky
     def settle_history_services(self):
@@ -974,7 +1123,7 @@ class NativeHistoryOwner:
             self._remaining(cleanup=True)
             self.custody.scan()
             if not self.custody.exited(node):
-                self.custody.signal_owned(node, signal.SIGTERM)
+                self._signal_owned(node, signal.SIGTERM)
             original = self.launches.get(node["pid"])
             if original is not None:
                 self._wait(original["child"], original["stdout"], original["stderr"],
@@ -990,6 +1139,11 @@ class NativeHistoryOwner:
         raw_signals = [{"pid": node["pid"], **item} for node in snapshot["nodes"] for item in node.get("signals", [])]
         self.final_settlement = {"custody": snapshot, "direct_waits": dict(self.direct_waits),
             "raw_signals_unchanged": raw_signals, "unknown": unknown,
+            "signal_attempts": self.signal_attempts, "pidfd_closes": self.pidfd_closes,
+            "failed_normal_runners": [{"pid": pid, "wait": original["wait"]}
+                for pid, original in self.launches.items()
+                if original["expected_exit"] == 0 and original["wait"] is not None
+                and original["wait"]["original_Popen_wait_return"] != 0],
             "first_failure": self.first_failure, "failure_artifacts": self.failure_artifacts,
             "planned_service_TERM_policy": "PROPOSED_ONLY_REQUIRES_FRESH_ACCEPTANCE",
             "logical_C_return": "NOT_AUTHORIZED_BY_THIS_LIBRARY", "disposition": "HOLD"}
@@ -1001,14 +1155,12 @@ class NativeHistoryOwner:
         for item in self.files:
             if not item["close_attempted"]:
                 self._retain_and_close(item)
-        require(not self.pidfd_close_attempted, "pidfd closure cannot be retried")
-        self.pidfd_close_attempted = True
-        self.custody.close_pidfds()  # Primitive pops before close: ambiguity => no retry/HOLD.
+        self._close_pidfds()
         self.final_settlement["pidfd_close_returned"] = True
         for item in reversed(self.raw_fds):
             if not item["close_attempted"]:
                 self._remaining(cleanup=True)
-                self._close_raw(item)
+                self._close_raw(item, cleanup=True)
         self.final_settlement["raw_fd_closes_returned"] = True
         self.final_settlement["disposition"] = "SOURCE_PREDICATES_ONLY_NOT_RESOURCE_RELEASE"
         # first_failure stays sticky even after all physical closes succeed.
