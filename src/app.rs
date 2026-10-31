@@ -5868,6 +5868,35 @@ impl Cagents {
         })
     }
 
+    /// Whether a queued restored row attaches from a cold residency, or why
+    /// its card is not attached from the queue at all.
+    fn restored_attach_residency(&self, card: CardId) -> Result<bool, &'static str> {
+        match self.lifecycle.state(card) {
+            Some((_, Residency::Hibernated)) => Ok(false),
+            Some((Exposure::Offscreen, Residency::Cold)) => Ok(true),
+            Some(_) => Err("it is waiting for its own pane to start it"),
+            None => Err("this window has not registered its pane"),
+        }
+    }
+
+    /// Why the attach queue would hold `card`'s restored `session` back.
+    pub(super) fn restored_attach_hold(
+        &self,
+        card: CardId,
+        session: &TerminalSession,
+    ) -> Option<&'static str> {
+        if let Err(hold) = self.restored_attach_residency(card) {
+            return Some(hold);
+        }
+        if self
+            .card_state(card)
+            .is_some_and(|state| self.project_ui.deleting_card(state))
+        {
+            return Some("its worktree is being deleted");
+        }
+        self.shared_terminal_attach_hold(card, session)
+    }
+
     /// Starts the next queued restored agent attach that still applies, once
     /// no other terminal start is outstanding. Each attach holds the daemon's
     /// recovery lease, so they run one at a time and never ahead of a card
@@ -5887,10 +5916,8 @@ impl Cagents {
             // A card being opened has a start of its own. One that is cold
             // has none coming while it is off screen, which is how a shared
             // view projects a pane it has not shown yet.
-            let cold = match self.lifecycle.state(card) {
-                Some((_, Residency::Hibernated)) => false,
-                Some((Exposure::Offscreen, Residency::Cold)) => true,
-                _ => continue,
+            let Ok(cold) = self.restored_attach_residency(card) else {
+                continue;
             };
             if self
                 .card_state(card)

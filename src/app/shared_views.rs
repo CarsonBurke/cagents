@@ -116,6 +116,24 @@ pub(super) fn quarantined_managed_panes(
         .collect()
 }
 
+/// Why one of `scopes` is not admitted by the registry yet.
+fn view_scope_hold<'a>(
+    state: &State,
+    mut scopes: impl Iterator<Item = &'a Scope>,
+) -> Option<&'static str> {
+    scopes.find_map(|scope| {
+        if !state.initialized.contains(scope) {
+            Some("the shared workspace has not admitted its view")
+        } else if state.seeding.contains(scope) {
+            Some("its view is still being restored into the shared workspace")
+        } else if state.blocked.contains(scope) {
+            Some("its view holds a managed agent this window may not show yet")
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Default)]
 pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
@@ -852,17 +870,20 @@ impl Cagents {
     /// Whether every view this window shows has been admitted by the
     /// registry, so its panes' records are the shared ones.
     pub(super) fn shared_views_ready_for_startup(&self) -> bool {
+        self.shared_views_startup_hold().is_none()
+    }
+
+    /// Why a view this window shows is not admitted by the registry yet.
+    pub(super) fn shared_views_startup_hold(&self) -> Option<&'static str> {
         if self.durable.workspace_model_identity.is_none() && self.shared_views.attached.is_empty()
         {
-            return true;
+            return None;
+        }
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Some("the shared workspace has not answered this window");
         }
         let scopes = self.local_view_scopes();
-        self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
-            && scopes.iter().all(|scope| {
-                self.shared_views.initialized.contains(scope)
-                    && !self.shared_views.seeding.contains(scope)
-                    && !self.shared_views.blocked.contains(scope)
-            })
+        view_scope_hold(&self.shared_views, scopes.iter())
     }
 
     /// A queued row may attach only after its own canonical view is admitted.
@@ -873,18 +894,28 @@ impl Cagents {
         card: CardId,
         source: &TerminalSession,
     ) -> bool {
+        self.shared_terminal_attach_hold(card, source).is_none()
+    }
+
+    /// Why a queued row may not attach `source` yet.
+    pub(super) fn shared_terminal_attach_hold(
+        &self,
+        card: CardId,
+        source: &TerminalSession,
+    ) -> Option<&'static str> {
         if self.shared_views.defaults.contains_key(&card)
             || self.durable.pending_terminal_creations.contains(&card)
         {
-            return false;
+            return Some("its pane is still being created");
         }
         if !self.shared_views.attached.contains(&card) {
-            return true;
+            return None;
         }
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             // A daemon whose registry store is unavailable never admits the
             // view, so its rows attach from their own descriptors as before.
-            return self.shared_views.registry_unavailable;
+            return (!self.shared_views.registry_unavailable)
+                .then_some("the shared workspace has not answered this window");
         }
         let mut owners = self.workspace_model.views.iter().flat_map(|view| {
             view.panes
@@ -893,15 +924,24 @@ impl Cagents {
                 .map(move |pane| (view, pane))
         });
         let Some((view, pane)) = owners.next() else {
-            return false;
+            return Some("the shared workspace does not list its pane");
         };
-        owners.next().is_none()
-            && !view.retired.contains(&card)
-            && self.shared_views.initialized.contains(&view.scope)
-            && !self.shared_views.seeding.contains(&view.scope)
-            && !self.shared_views.blocked.contains(&view.scope)
-            && !pane.pending_terminal_start
-            && matches!(&pane.kind, CardKind::Terminal(current) if current == source)
+        if owners.next().is_some() {
+            return Some("the shared workspace lists its pane in more than one view");
+        }
+        if view.retired.contains(&card) {
+            return Some("the shared workspace closed its pane");
+        }
+        if let Some(hold) = view_scope_hold(&self.shared_views, std::iter::once(&view.scope)) {
+            return Some(hold);
+        }
+        if pane.pending_terminal_start {
+            return Some("the shared workspace is still starting its terminal");
+        }
+        if !matches!(&pane.kind, CardKind::Terminal(current) if current == source) {
+            return Some("the shared workspace names a different terminal for its pane");
+        }
+        None
     }
 
     fn local_view_scopes(&self) -> Vec<Scope> {
