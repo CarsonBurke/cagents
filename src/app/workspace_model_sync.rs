@@ -31,6 +31,9 @@ pub enum ModelUpdate {
     /// compares the registry's identity against the one it recorded and decides
     /// whether anything it holds has ever been shared with this registry.
     Connected(WorkspaceModel),
+    /// The daemon answered but has no shared model to give, so this window's
+    /// shared panes have no registry to wait for.
+    Unavailable(String),
     /// A fresh read, taken because an edge does not carry the ranks it changed.
     Read(WorkspaceModel),
     Reopened {
@@ -126,9 +129,18 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
     // One request subscribes and reads, so an edit applied between the two
     // cannot fall into a gap - the hazard `watch_terminals` then `list` has to
     // order around with two requests.
-    let model = client
-        .watch_workspace_model()
-        .map_err(|error| error.to_string())?;
+    let model = match client.watch_workspace_model() {
+        Ok(model) => model,
+        Err(ControlError::Remote { message, .. })
+            if message == crate::workspace_model::REGISTRY_UNAVAILABLE =>
+        {
+            sender
+                .send_blocking(ModelUpdate::Unavailable(message.clone()))
+                .map_err(|error| error.to_string())?;
+            return Err(message);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     sender
         .send_blocking(ModelUpdate::Connected(model))
         .map_err(|error| error.to_string())?;
@@ -612,6 +624,10 @@ impl Cagents {
         {
             return (Task::none(), false);
         }
+        // The observer repeats this on every reconnection attempt.
+        if matches!(update, ModelUpdate::Unavailable(_)) && self.shared_views.registry_unavailable {
+            return (Task::none(), false);
+        }
         (self.apply_workspace_model_update_inner(update), true)
     }
 
@@ -696,6 +712,11 @@ impl Cagents {
                 self.retire_settled_empty_channels();
                 self.retarget_transferred_pane_updates(transferred);
                 self.reconcile_workspace_model()
+            }
+            ModelUpdate::Unavailable(error) => {
+                tracing::debug!(%error, "this daemon has no shared workspace model");
+                self.shared_views.registry_unavailable = true;
+                self.attach_next_restored_agent()
             }
             ModelUpdate::Connected(model) => {
                 if model.identity == self.workspace_model.identity

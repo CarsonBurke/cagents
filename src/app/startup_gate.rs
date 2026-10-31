@@ -1,81 +1,21 @@
 //! A launched window is ready only after its saved conversations and workspace
 //! have actually recovered. Opening a native surface alone cannot finish an update.
 use super::*;
-use crate::terminal_ipc::TerminalVisibility;
+
+mod retries;
 
 #[derive(Default)]
 pub(super) struct State {
     opened: Option<Instant>,
     saving: bool,
     reported: bool,
-    /// Terminals whose attach-only startup attempts ended without a surface.
-    /// Nothing else retries them until the card is opened, so qualification
-    /// tries again a few times and the gate then reports them.
-    detached: HashMap<CardId, Detached>,
+    /// Terminals whose attach-only startup attempts ended without settling.
+    pub(super) retries: retries::Retries,
 }
-
-/// The attach-only attempts made for one exact session.
-struct Detached {
-    terminal: TerminalId,
-    reason: String,
-    attempts: u32,
-    at: Instant,
-}
-
-/// A terminal the daemon has just restored can still be settling when the
-/// first attempt reaches it; more than this is a refusal to report.
-const ATTACH_ATTEMPTS: u32 = 3;
-const ATTACH_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 impl State {
     pub(super) fn window_opened(&self) -> bool {
         self.opened.is_some()
-    }
-
-    pub(super) fn terminal_detached(&mut self, card: CardId, terminal: TerminalId, reason: String) {
-        let attempts = self
-            .detached
-            .get(&card)
-            .filter(|detached| detached.terminal == terminal)
-            .map_or(1, |detached| detached.attempts + 1);
-        self.detached.insert(
-            card,
-            Detached {
-                terminal,
-                reason,
-                attempts,
-                at: Instant::now(),
-            },
-        );
-    }
-
-    /// `session`'s attempts so far. A different session on the same card is
-    /// a new owner to qualify, not these outcomes.
-    fn detached(&self, card: CardId, session: &TerminalSession) -> Option<&Detached> {
-        self.detached
-            .get(&card)
-            .filter(|detached| detached.terminal == session.id)
-    }
-
-    /// Why `session` stays detached once its attempts are spent.
-    fn detached_reason(&self, card: CardId, session: &TerminalSession) -> Option<&str> {
-        self.detached(card, session)
-            .filter(|detached| detached.attempts >= ATTACH_ATTEMPTS)
-            .map(|detached| detached.reason.as_str())
-    }
-
-    /// Whether qualification may attempt `session` now.
-    fn may_attach(&self, card: CardId, session: &TerminalSession) -> bool {
-        self.detached(card, session).is_none_or(|detached| {
-            detached.attempts < ATTACH_ATTEMPTS && detached.at.elapsed() >= ATTACH_RETRY_DELAY
-        })
-    }
-    /// Lets every recorded attempt be retried at once.
-    #[cfg(test)]
-    pub(super) fn expire_attach_retries(&mut self) {
-        for detached in self.detached.values_mut() {
-            detached.at -= ATTACH_RETRY_DELAY;
-        }
     }
 
     #[cfg(test)]
@@ -133,7 +73,12 @@ impl Cagents {
         // A native window opens independently of the observer/SeedView task.
         // Wait for that actual admission boundary before judging saved chats
         // or declaring a formerly shared workspace recovered.
-        let mut pending = !self.shared_views_ready_for_startup();
+        // A daemon whose registry cannot open never admits them; the panes
+        // are still qualified from their own records, and the shared
+        // workspace is then reported as not restored.
+        let registry_unavailable =
+            self.shared_views.registry_unavailable && !self.shared_views_ready_for_startup();
+        let mut pending = !self.shared_views_ready_for_startup() && !registry_unavailable;
         let mut failures = Vec::new();
         let mut reasons = Vec::new();
         for card in self
@@ -146,14 +91,20 @@ impl Cagents {
                 if terminal_ended(session) || self.saved_terminal_ready(card.id) {
                     continue;
                 }
-                if let Some(reason) = self.saved_terminal_unavailable(card.id) {
-                    failures.push(card.id);
-                    reasons.push(reason);
+                if self.saved_terminal_unavailable(card.id) {
+                    match self.startup_attach_exhausted(card.id) {
+                        Some(reason) => {
+                            failures.push(card.id);
+                            reasons.push(reason.to_owned());
+                        }
+                        None => pending = true,
+                    }
                     continue;
                 }
                 match self.cards.get(&card.id) {
                     Some(CardRuntime::Terminal(surface)) => {
-                        match terminal_surface_ready(session, surface) {
+                        let settling = self.shared_views.has_pending_update(card.id);
+                        match terminal_surface_ready(session, surface, settling) {
                             Ok(true) => {}
                             Ok(false) => pending = true,
                             Err(reason) => {
@@ -163,7 +114,7 @@ impl Cagents {
                         }
                     }
                     Some(CardRuntime::Loading) if !self.terminal_start_in_flight(card.id) => {
-                        if let Some(reason) = self.startup_gate.detached_reason(card.id, session) {
+                        if let Some(reason) = self.startup_attach_exhausted(card.id) {
                             failures.push(card.id);
                             reasons.push(reason.to_owned());
                         } else {
@@ -175,7 +126,14 @@ impl Cagents {
                         failures.push(card.id);
                         reasons.push(failure.message().to_owned());
                     }
-                    _ => failures.push(card.id),
+                    Some(CardRuntime::Completed) => {
+                        failures.push(card.id);
+                        reasons.push("it ended while it was reconnecting".into());
+                    }
+                    Some(_) => {
+                        failures.push(card.id);
+                        reasons.push("its pane no longer holds a terminal".into());
+                    }
                 }
                 continue;
             }
@@ -221,6 +179,12 @@ impl Cagents {
                     .join(", ")
             ));
         }
+        if registry_unavailable {
+            return Err(format!(
+                "recovery-incomplete: saved panes reconnected, but the shared workspace could not be restored because {}. This window remains available with its own saved layout; the update has not been verified.",
+                crate::workspace_model::REGISTRY_UNAVAILABLE
+            ));
+        }
         Ok(true)
     }
 
@@ -229,28 +193,40 @@ impl Cagents {
     ///
     /// It runs on every check until the gate settles: a shared view projects
     /// its panes only once the registry admits it, and can replace a pane's
-    /// session afterwards. An attempt that ends detached is tried again a
-    /// few times, then reported by the check.
+    /// session afterwards. An attempt that ends detached, or a saved pane
+    /// whose inspection could not verify its owner, is tried again until its
+    /// refusal stops changing; the check then reports it.
     pub(super) fn qualify_startup_terminals(&mut self) -> Task<Message> {
         // Until then a shared pane's descriptor is a cache that opening the
         // card would not attach either.
-        if !self.shared_views_ready_for_startup() {
+        if !self.shared_views_ready_for_startup() && !self.shared_views.registry_unavailable {
             return Task::none();
         }
+        let mut inspections = Vec::new();
         for card in &self.durable.cards {
-            if card.existence.is_open()
-                && matches!(&card.kind, CardKind::Terminal(session)
-                    if !terminal_ended(session)
-                        && self.startup_gate.may_attach(card.id, session))
-                && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
+            if !card.existence.is_open()
+                || !matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
+                || self.terminal_start_in_flight(card.id)
+                || !self.startup_attach_may_retry(card.id)
+            {
+                continue;
+            }
+            // A saved pane is checked again the way Reconnect checks it.
+            if self.saved_terminal_unavailable(card.id) {
+                inspections.push(card.id);
+            } else if matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
                 && self.saved_terminal_current(card.id).is_none()
-                && !self.terminal_start_in_flight(card.id)
                 && !self.restored_agent_attaches.contains(&card.id)
             {
                 self.restored_agent_attaches.push_back(card.id);
             }
         }
-        self.attach_next_restored_agent()
+        let mut tasks = inspections
+            .into_iter()
+            .map(|card| self.inspect_saved_terminal(card))
+            .collect::<Vec<_>>();
+        tasks.push(self.attach_next_restored_agent());
+        Task::batch(tasks)
     }
 
     pub(super) fn begin_startup_gate(&mut self) -> Task<Message> {
@@ -336,22 +312,35 @@ impl Cagents {
     }
 }
 
-/// A hibernated screen marker is independent of its actual attachment. Only
-/// the current connection's accepted exact terminal can qualify this row.
+/// Whether `surface` is attached to the exact terminal `session` names, on
+/// its current connection and under the terminal service that hosts it now:
+/// `Ok(false)` while that is still settling, or why it cannot.
+///
+/// A detached snapshot is not evidence either way: a hibernated view holds
+/// one, and so does a view just woken until its first frame. While `settling`
+/// the saved record is about to follow the registry, which catches up once
+/// this window's edit carrying the attachment is applied, so a record that
+/// names a different service is not yet a refusal.
 fn terminal_surface_ready(
     session: &TerminalSession,
     surface: &TerminalSurface,
+    settling: bool,
 ) -> Result<bool, String> {
     if surface.terminal_id() != session.id {
         return Err("The terminal surface no longer matches this saved pane".to_owned());
     }
+    // The view's own connection is still attaching or reconnecting, and
+    // reports a refusal if it gives up.
     let Some(proof) = surface.current_attachment()? else {
         return Ok(false);
     };
-    if !proof.is_complete() || session.continuity.live_proof().as_ref() != Some(&proof) {
-        return Err("The terminal attachment no longer matches this saved pane's owner".to_owned());
+    if proof.is_complete() && session.continuity.live_proof().as_ref() == Some(&proof) {
+        return Ok(true);
     }
-    Ok(surface.visibility() == TerminalVisibility::Hibernated || !surface.snapshot().detached)
+    if settling {
+        return Ok(false);
+    }
+    Err("The terminal attachment no longer matches this saved pane's owner".to_owned())
 }
 
 /// Leave room for the launcher's fixed prefix and pane IDs in its 4 KiB line.

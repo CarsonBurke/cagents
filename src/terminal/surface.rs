@@ -58,6 +58,7 @@ impl TerminalSurface {
         self.handle.agent_activity()
     }
 
+    #[cfg(test)]
     pub(crate) fn visibility(&self) -> crate::terminal_ipc::TerminalVisibility {
         self.handle.visibility()
     }

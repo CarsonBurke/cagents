@@ -1305,6 +1305,7 @@ impl HostedTerminalHandle {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn visibility(&self) -> TerminalVisibility {
         self.inner.published.desired_visibility()
     }
@@ -4727,7 +4728,12 @@ mod tests {
                     },
                 },
             );
-            let wake = wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Confirming the resumed attachment also wakes the view once,
+            // before any frame, so its owner sees the attachment is current.
+            let wake =
+                std::iter::repeat_with(|| wake_rx.recv_timeout(Duration::from_secs(2)).unwrap())
+                    .find(|wake| wake.generation != 0)
+                    .unwrap();
             assert_eq!(wake.generation, generation);
             let observed = handle.snapshot();
             assert_eq!(observed.lines[0].cells[0].text, text);

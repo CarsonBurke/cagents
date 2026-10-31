@@ -136,7 +136,7 @@ fn acknowledge(stream: &mut UnixStream, request: &ClientEnvelope, session: &Term
 fn wait_ready(surface: &TerminalSurface, session: &TerminalSession) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        match terminal_surface_ready(session, surface) {
+        match terminal_surface_ready(session, surface, false) {
             Ok(true) => return,
             Ok(false) => {
                 assert!(
@@ -171,7 +171,7 @@ fn hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof() {
     assert_eq!(surface.current_attachment(), Ok(None));
     connect(&mut first, Vec::new());
     let request = attach(&mut first, &session);
-    assert_eq!(terminal_surface_ready(&session, &surface), Ok(false));
+    assert_eq!(terminal_surface_ready(&session, &surface, false), Ok(false));
     assert_eq!(surface.host_proof(), None);
     acknowledge(&mut first, &request, &session);
     wait_ready(&surface, &session);
@@ -195,7 +195,7 @@ fn hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof() {
     );
     handle.wait_until_attached(Duration::ZERO).unwrap();
     assert_eq!(surface.current_attachment(), Ok(None));
-    assert_eq!(terminal_surface_ready(&session, &surface), Ok(false));
+    assert_eq!(terminal_surface_ready(&session, &surface, false), Ok(false));
     connect(&mut second, Vec::new());
     let request = attach(&mut second, &session);
     assert_eq!(
@@ -203,24 +203,29 @@ fn hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof() {
         Ok(None),
         "Connected is not an exact Attach ACK"
     );
-    assert_eq!(terminal_surface_ready(&session, &surface), Ok(false));
+    assert_eq!(terminal_surface_ready(&session, &surface, false), Ok(false));
     acknowledge(&mut second, &request, &session);
     wait_ready(&surface, &session);
 
     let mut other = session.clone();
     other.id = TerminalId::new();
-    assert!(terminal_surface_ready(&other, &surface).is_err());
+    assert!(terminal_surface_ready(&other, &surface, false).is_err());
     let mut replaced = session.clone();
     replaced.continuity = TerminalContinuity::Live {
         host_session_id: HostSessionId::new("replacement"),
         boot_id: BootId::new("boot"),
         host_incarnation: HostIncarnation::new("different"),
     };
-    assert!(terminal_surface_ready(&replaced, &surface).is_err());
+    assert!(terminal_surface_ready(&replaced, &surface, false).is_err());
+    assert_eq!(
+        terminal_surface_ready(&replaced, &surface, true),
+        Ok(false),
+        "a record still following the registry is not yet a refusal"
+    );
 
     drop(second);
     let mut third = accept(&listener);
-    assert_eq!(terminal_surface_ready(&session, &surface), Ok(false));
+    assert_eq!(terminal_surface_ready(&session, &surface, false), Ok(false));
     connect(&mut third, vec![descriptor(&session)]);
     wait_ready(&surface, &session); // Real exact-ID resumed acceptance is sufficient.
     surface.stop_for_test();
@@ -248,7 +253,7 @@ fn another_resumed_terminal_cannot_hide_the_actual_attach_refusal() {
     connect(&mut stream, vec![descriptor(&other)]);
     let request = attach(&mut stream, &session);
     assert_eq!(surface.current_attachment(), Ok(None));
-    assert_eq!(terminal_surface_ready(&session, &surface), Ok(false));
+    assert_eq!(terminal_surface_ready(&session, &surface, false), Ok(false));
     send(
         &mut stream,
         request.request_id,
@@ -270,7 +275,7 @@ fn another_resumed_terminal_cannot_hide_the_actual_attach_refusal() {
     assert!(reason.contains("exact terminal refused"));
     assert_eq!(surface.current_attachment(), Err(reason.clone()));
     assert_eq!(
-        terminal_surface_ready(&session, &surface),
+        terminal_surface_ready(&session, &surface, false),
         Err(reason.clone())
     );
     surface.stop_for_test();
@@ -290,9 +295,10 @@ fn oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery
     app.cards.insert(card.id, CardRuntime::Loading);
     Arc::make_mut(&mut app.durable).cards = vec![card.clone()];
     let raw = format!("exact terminal refused\n\t{}", "多字\r\n  ".repeat(3000));
-    for _ in 0..ATTACH_ATTEMPTS {
-        app.startup_gate
-            .terminal_detached(card.id, session.id, raw.clone());
+    app.startup_gate.opened = Some(Instant::now());
+    for _ in 0..2 {
+        app.startup_attach_failed(card.id, session.id, raw.clone());
+        app.startup_gate.retries.expire_window();
     }
     let reason = app
         .startup_pane_check()
@@ -307,7 +313,7 @@ fn oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery
     );
     assert!(!reason.contains(['\r', '\n', '\t']));
     assert_eq!(
-        app.startup_gate.detached_reason(card.id, &session),
+        app.startup_attach_exhausted(card.id),
         Some(raw.as_str()),
         "only the transport summary is bounded; original recovery detail remains"
     );
