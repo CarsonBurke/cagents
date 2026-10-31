@@ -1953,7 +1953,13 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
     }
 }
 
-fn mark_lease_capable_process() -> io::Result<()> {
+/// Names this process so a starting window does not mistake it for a UI that
+/// predates the session-store lease.
+///
+/// Every mode of the current UI executable needs it, not only a window: the
+/// legacy scan matches any process still named `cagents-ui`, so a dialog or
+/// helper left with that name refuses every window for as long as it runs.
+pub fn mark_lease_capable_process() -> io::Result<()> {
     fs::write("/proc/self/comm", LEASE_CAPABLE_PROCESS_NAME)
 }
 fn peer_ui_predates_lease(peer_directory: &Path) -> bool {

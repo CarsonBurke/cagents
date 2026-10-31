@@ -191,6 +191,10 @@ required-features = ["ui"]
 name = "session_restore_contract"
 required-features = ["ui"]
 
+[[test]]
+name = "ui_process_identity_contract"
+required-features = ["ui"]
+
 [dependencies]
 cagents-browser-import = { path = "crates/browser-import", features = ["desktop-keyring"], optional = true }
 cookie = { version = "0.18", optional = true }
