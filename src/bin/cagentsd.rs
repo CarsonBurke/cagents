@@ -11,6 +11,16 @@ fn command() -> clap::Command {
 }
 
 fn main() -> std::process::ExitCode {
+    if let Some(result) = cagents::host::run_build_scope_helper() {
+        return match result {
+            Ok(never) => match never {},
+            Err(error) => {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr().lock(), "cagents build scope: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(result) = cagents::host::run_retained_actor_helper() {
         return match result {
             // The startup owner treats this private status as proved teardown.

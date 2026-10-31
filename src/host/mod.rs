@@ -3,6 +3,7 @@ pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
 mod automations;
+mod build_scope;
 mod channel_work;
 mod chat;
 mod client;
@@ -184,6 +185,11 @@ impl From<PlatformError> for HostError {
 /// its captured account context and cleanup status belong to the launch owner.
 pub fn run_retained_actor_helper() -> Option<Result<(), String>> {
     crate::chat::runtime::run_retained_helper_if_requested()
+}
+
+/// Internal build-only mode must run before account or daemon initialization.
+pub fn run_build_scope_helper() -> Option<std::io::Result<std::convert::Infallible>> {
+    build_scope::entry()
 }
 
 /// Dedicated precheck owners must enter before tracing or runtime threads are

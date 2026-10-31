@@ -279,6 +279,28 @@ fn with_verified_manager(
     result
 }
 
+/// Required enrollment evidence for an owned build before it replaces itself.
+/// Keeping this value alive retains the original manager connection and pidfd;
+/// dropping it only closes those descriptors, never stops the enrolled scope.
+pub(crate) struct ConfirmedScope {
+    _manager: ManagerNamespace,
+}
+
+/// Unlike optional provider enrollment, an unavailable or unproved manager is
+/// an error. Reuse the exact unique-unit membership confirmation while keeping
+/// the original namespace proof live, without changing the caller's launch.
+pub(crate) fn require_scope_for_current_process() -> io::Result<ConfirmedScope> {
+    let proof = ManagerNamespace::connect()?;
+    if !peer_alive(&proof.peer) {
+        return Err(io::Error::other("user manager peer is no longer live"));
+    }
+    enroll_proven_process(std::process::id())?;
+    if !peer_alive(&proof.peer) {
+        return Err(io::Error::other("user manager peer is no longer live"));
+    }
+    Ok(ConfirmedScope { _manager: proof })
+}
+
 /// Failure keeps the existing launch path. No actor has started yet and no
 /// provider command, identity, environment or inherited descriptor is changed.
 pub(crate) fn enroll_holder() -> io::Result<()> {
