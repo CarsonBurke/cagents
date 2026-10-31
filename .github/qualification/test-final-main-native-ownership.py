@@ -21,7 +21,7 @@ SOURCE = Path(__file__).with_name('final-main-native.py').read_text()
 NAMES = {'NativeCancelled','Cancellation','family','register','start_owned','stop','cleanup_arm',
          'spawn','command','open_monitor','complete_arm_cleanup','finish_cleanup','IncompleteTree','wait',
          'DriverLedger','open_parent','close_parent','write_payload','original_wait','drain_adopted',
-         'publish_ledger','PortalObserver','save_image','backup_database','wait_record','admit_work'}
+         'publish_ledger','PortalObserver','save_image','backup_database','wait_record','admit_work','send_owned_signal'}
 
 
 class InertPath:
@@ -756,6 +756,39 @@ class AtomicOwnershipTests(unittest.TestCase):
                 else:binding['numeric_job_id']=123
                 self.assertTrue(any('instance binding UNKNOWN' in error for error in h.ns['ledger'].errors()))
                 self.assertTrue(h.ns['finish_cleanup']([])['errors']);self.assertNotIn('cleanup-complete',h.output.files)
+
+    def test_controlled_TERM_requires_returned_group_send_not_ESRCH_attempt(self):
+        for outcome in ('returned-TERM','ESRCH-TERM','ESRCH-KILL','returned-KILL'):
+            with self.subTest(outcome=outcome):
+                h=Harness();child=h.spawn();row=h.ns['ledger'].creations[0]
+                self.assertEqual(child.state,'S');self.assertEqual(row['identity']['group'],child.pid)
+                def send(target, signum):
+                    self.assertEqual(target,child.pid)
+                    attempt=row['signals'][-1]
+                    self.assertEqual((attempt['returned'],attempt['outcome']),(False,'attempted'))
+                    h.events.append(('signal',target,signum))
+                    if outcome.endswith('KILL') and signum==15:return  # Retained live original until the KILL observation.
+                    child.returncode,child.state=(-15 if outcome.endswith('TERM') else (0 if outcome=='ESRCH-KILL' else -9)),'Z'
+                    if outcome.startswith('ESRCH'):raise ProcessLookupError(3,'algorithm-only ESRCH')
+                h.ns['os'].kill=h.ns['os'].killpg=send
+                result=h.ns['finish_cleanup']([])
+                selected=next(item for item in row['signals'] if item['signal']==(15 if outcome.endswith('TERM') else 9))
+                self.assertEqual(selected['scope'],'original group')
+                self.assertEqual(selected['returned'],outcome.startswith('returned'))
+                self.assertEqual(selected['outcome'],'returned' if outcome.startswith('returned') else 'ESRCH')
+                self.assertEqual(selected['error'] is None,outcome.startswith('returned'))
+                self.assertEqual(row['forced'],outcome=='returned-KILL')
+                self.assertEqual(row['terminal']['exit_code'],-15 if outcome.endswith('TERM') else (0 if outcome=='ESRCH-KILL' else -9))
+                negative=outcome in ('ESRCH-TERM','returned-KILL')
+                self.assertEqual(bool(result['errors']),negative)
+                self.assertEqual('cleanup-complete' in h.output.files,not negative)
+                report=json.loads(h.output.files['driver-role-writer-ledger.json'])
+                self.assertEqual(bool(report['errors']),negative)
+        h=Harness();roles={};mount=Mount()
+        h.spawn(roles,'permissions');documents=h.spawn(roles,'documents',mount)
+        self.assertEqual(h.ns['cleanup_arm'](roles)['errors'],[])
+        receipt=h.ns['ledger'].handles[id(documents)]['signals'][0]
+        self.assertEqual((receipt['scope'],receipt['signal'],receipt['returned'],receipt['outcome']),('original Documents',15,True,'returned'))
 
     def test_callback_gate_drains_actual_admission_before_stream_close_and_rejects_late_work(self):
         h=Harness();portal=PortalHarness(h);observer=portal.open()

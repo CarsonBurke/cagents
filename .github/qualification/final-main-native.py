@@ -158,11 +158,12 @@ class DriverLedger:
         for row in self.creations:
             if not row['returned'] or row['identity'] is None or not row['published'] or row['error'] or row['terminal'] is None:
                 errors.append(row['id']+' original creation/role/wait UNKNOWN')
-            if row['forced']: errors.append(row['id']+' required forced termination')
+            if row['forced']: errors.append(row['id']+' returned a forced KILL send')
             terminal = row['terminal']
             if terminal is not None:
                 code = terminal['exit_code']
-                issued_term = any(item['signal']==signal.SIGTERM and item['scope']=='original group' for item in row['signals'])
+                issued_term = any(item['signal']==signal.SIGTERM and item['scope']=='original group'
+                    and item['returned'] is True and item['outcome']=='returned' for item in row['signals'])
                 controlled_term = row['exit_policy']['kind']=='ordinary-native-zero-or-issued-TERM' and issued_term and code==-signal.SIGTERM
                 if code==-signal.SIGKILL or not (code in row['exit_policy']['allowed_exit_codes'] or controlled_term):
                     errors.append(row['id']+' unexpected original terminal outcome: '+str(code))
@@ -475,6 +476,22 @@ def start_owned(argv, *, resources=None, role=None, expected_mount=None, allowed
         return register(process,creation,options,resources=resources,role=role,expected_mount=expected_mount)
 
 
+def send_owned_signal(row, signum, scope, sender, target, **identity):
+    attempt = dict(signal=signum,unix_ns=time.time_ns(),scope=scope,target=target,
+                   returned=False,outcome='attempted',error=None,**identity)
+    row['signals'].append(attempt)  # Retain before the actual syscall.
+    try:
+        sender(target,signum)
+    except BaseException as error:
+        attempt['outcome'] = 'ESRCH' if isinstance(error,ProcessLookupError) else 'error'
+        attempt['error'] = repr(error)
+        raise
+    attempt['returned'] = True
+    attempt['outcome'] = 'returned'
+    # This records a returned send, not individual signal causation/delivery.
+    if signum==signal.SIGKILL: row['forced'] = True
+
+
 def stop(process):
     identity = process.owned_identity
     key = (process.pid, identity['stamp'] if identity else None)
@@ -513,9 +530,7 @@ def stop(process):
         if current and current['stamp'] == identity['stamp'] and current['group'] == identity['group']:
             try:
                 row = ledger.handles[id(process)]
-                row['signals'].append(dict(signal=signum,unix_ns=time.time_ns(),scope='original group'))
-                if signum == signal.SIGKILL: row['forced'] = True
-                os.killpg(identity['group'], signum)
+                send_owned_signal(row,signum,'original group',os.killpg,identity['group'])
             except ProcessLookupError:
                 pass
         for pid, stamp in live_owned().items():
@@ -523,9 +538,7 @@ def stop(process):
             if value and value['stamp'] == stamp and value['state'] not in ('Z', 'X'):
                 try:
                     row = ledger.handles[id(process)]
-                    row['signals'].append(dict(signal=signum,unix_ns=time.time_ns(),scope='original stamped descendant',pid=pid,stamp=stamp))
-                    if signum == signal.SIGKILL: row['forced'] = True
-                    os.kill(pid, signum)
+                    send_owned_signal(row,signum,'original stamped descendant',os.kill,pid,pid=pid,stamp=stamp)
                 except ProcessLookupError:
                     pass
         deadline = time.monotonic() + 10
@@ -604,8 +617,7 @@ def cleanup_arm(resources):
             identity = documents.owned_identity
             actual = processes().get(documents.pid)
             assert identity and actual and actual['stamp'] == identity['stamp'], 'Documents owner disappeared before normal shutdown'
-            ledger.handles[id(documents)]['signals'].append(dict(signal=signal.SIGTERM,unix_ns=time.time_ns(),scope='original Documents'))
-            os.kill(documents.pid, signal.SIGTERM)
+            send_owned_signal(ledger.handles[id(documents)],signal.SIGTERM,'original Documents',os.kill,documents.pid)
             code = original_wait(documents,15,'Documents-normal-TERM')
             assert code == 0, ('Documents did not complete normal signal/unmount cleanup', code)
             assert not resources['mount'].is_mount(), 'Documents mount survived graceful process exit'
