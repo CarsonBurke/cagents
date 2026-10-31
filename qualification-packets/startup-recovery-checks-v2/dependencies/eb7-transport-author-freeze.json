@@ -1,0 +1,14 @@
+{
+  "base": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+  "file": "src/control.rs",
+  "sha256": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+  "delta_sha256": "0935bb7a26e9f39cac94056b09148f3dbc42a268b9daa58e3ae19aea28d4dc76",
+  "new_parent": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+  "cases": "3variants+correlatedRemoteRefusal+foreignincarnationReady rejection; oneparentnonadditive",
+  "production_changes": false,
+  "format_rust193_exit": 0,
+  "diff_check_exit": 0,
+  "rust_tests_native": "UNRUN",
+  "publication": "NONE"
+}

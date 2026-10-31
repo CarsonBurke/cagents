@@ -1,0 +1,93 @@
+{
+  "schema": "fw16-startup-recovery-composition-source-v1",
+  "utc": "2026-10-31T08:12:43.608509+00:00",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+  "head_before_commit": "ac54c12bb54dc433366fe2eeb992faa348428acb",
+  "target_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "inputs": [
+    "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+    "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd"
+  ],
+  "files": {
+    "src/app.rs": {
+      "sha256": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
+      "bytes": 1380000
+    },
+    "src/app/chat_ui.rs": {
+      "sha256": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+      "bytes": 1214271
+    },
+    "src/app/saved_terminal.rs": {
+      "sha256": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+      "bytes": 37956
+    },
+    "src/app/shared_views.rs": {
+      "sha256": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
+      "bytes": 233376
+    },
+    "src/app/shared_views/tests/startup_terminals.rs": {
+      "sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "bytes": 29571
+    },
+    "src/app/startup_gate.rs": {
+      "sha256": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+      "bytes": 28521
+    },
+    "src/app/startup_gate/attachment_tests.rs": {
+      "sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "bytes": 18278
+    },
+    "src/app/startup_gate/tests.rs": {
+      "sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "bytes": 30317
+    },
+    "src/control.rs": {
+      "sha256": "37c489822925d1e5a62fe6a87aee2e226379979ae399f34957065277f948a3e9",
+      "bytes": 299253
+    },
+    "src/host/agent_execution/terminals.rs": {
+      "sha256": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+      "bytes": 9314
+    },
+    "src/host/client.rs": {
+      "sha256": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+      "bytes": 155313
+    },
+    "src/host/state.rs": {
+      "sha256": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "bytes": 336801
+    },
+    "src/terminal/hosted.rs": {
+      "sha256": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+      "bytes": 186517
+    },
+    "src/terminal/ipc.rs": {
+      "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+      "bytes": 113283
+    },
+    "src/terminal/surface.rs": {
+      "sha256": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21",
+      "bytes": 6261
+    }
+  },
+  "source_assembly": "V3 inspection spine; R1 current attachment + R2 target admission + detached ledger/retry; current owner collector; common bounded startup detail; original26parents conserved plus2newcrossparents",
+  "parent_test_count": 28,
+  "format_rust193_exit": 0,
+  "format_original_chunk": "49dd5a; check-format completed before subsequent manifest assertion exit1",
+  "diff_check_exit": 0,
+  "all_rust_tests_native_ux": "UNRUN_MISSING",
+  "publication": "NONE",
+  "C_grant": null,
+  "prior_manifest_attempts": [
+    {
+      "chunk": "65c0d1",
+      "exit": 1,
+      "observed": "expected13paths assertion received15; no freeze written"
+    },
+    {
+      "chunk": "49dd5a",
+      "exit": 1,
+      "observed": "expected-set assertion failed; no freeze written; subsequent explicit pathset check7bff8a exit0 observed15/15 symmetricdifference empty; cause not inferred"
+    }
+  ]
+}

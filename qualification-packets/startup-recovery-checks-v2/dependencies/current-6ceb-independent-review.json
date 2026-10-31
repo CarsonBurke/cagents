@@ -1,0 +1,82 @@
+{
+  "verdict": "SOURCE_CLEAR_CURRENT_HEAD_STABLE_GUARD_DELTA_ONLY",
+  "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+  "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+  "parents": [
+    "eb7ff16beb8864349573231521c5d4eab5270cc6"
+  ],
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard",
+  "actual_worktree_HEAD_matches": true,
+  "source_file": {
+    "path": "src/app/startup_gate.rs",
+    "original_entry": "100644 blob baf52662bed8bd088b067aae7ab291d39eff6d7b",
+    "current_entry": "100644 blob 01bb3356994e9d6f76cd7be4623aa17cfb5982a7",
+    "original_sha256": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+    "current_sha256": "6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339",
+    "reviewed_preformat_proposal_sha256": "5a87bbe8ee8ff72d7aff7aec323266b21a15cc7ab6a09ae6333a59a71c08bf45"
+  },
+  "proposal_review_reused": {
+    "path": "/tmp/coord-b9-startup-stable-match-guard-independent-proposal-review.json",
+    "sha256": "354acbfe2af986eeee310bab1908c2fb7dd256be80a78c57a44990667f0419cb",
+    "scope": "Single guard rewrite equivalence only, bound now to exact actual committed bytes."
+  },
+  "author_receipt": {
+    "path": "/tmp/coord-b9-startup-stable-guard-evidence/source-receipt.json",
+    "sha256": "07f2f51ab299616525ee75b369068d5068a3b88b5c5b1fbfb9a894c050063243"
+  },
+  "binding_checks": {
+    "committed_file_equals_reviewed_proposal_plus_only_guard_line_collapse": true,
+    "guard_line_collapse": "3 lines -> 1; identical Some(Loading) pattern, !terminal_start_in_flight(card.id) bool and branch body",
+    "changed_paths": [
+      "src/app/startup_gate.rs"
+    ],
+    "all_other_mode_type_blob_entries_exact": 2221,
+    "tracked_entries": 2222,
+    "old_test_and_direct_helper_blobs_unchanged": true,
+    "all_bytes_outside_reviewed_hunk_exact": true
+  },
+  "findings": [],
+  "retained_semantics": [
+    "Loading/non-in-flight + Some(reason) appends same card failure and same reason.to_owned().",
+    "Loading/non-in-flight + None appends same pending pane as original match fallthrough.",
+    "In-flight Loading retains once-only bool check and short-circuits detached_reason, then appends pending pane.",
+    "Absent runtime, terminal surfaces, Failed, admission aggregation, inspection/ACK/retry/startup behavior outside this exact guard are unchanged."
+  ],
+  "artifacts_hash_verified": {
+    "inverse.patch": {
+      "path": "/tmp/coord-b9-startup-stable-guard-evidence/inverse.patch",
+      "sha256": "2e9d29f820a75f6af94834761a0eb5c3e72aedd000a7d0d6bde75033d7fed665",
+      "bytes": 1352
+    },
+    "source.bundle": {
+      "path": "/tmp/coord-b9-startup-stable-guard-evidence/source.bundle",
+      "sha256": "abd49f90bc981b6a3cd3721c7c4609a936bde6db67d3ff5de6d26ccb00ee3220",
+      "bytes": 721
+    },
+    "source.patch": {
+      "path": "/tmp/coord-b9-startup-stable-guard-evidence/source.patch",
+      "sha256": "dcff8a7c85f9bb40e70152d9d12473d3562f08c9d7d2c9270aa1f298e6918e8c",
+      "bytes": 1352
+    }
+  },
+  "formatting": "Author receipt truthfully retains first official format exit1 for line-collapse request and final physical Rust1.93 scripts/check-format exit0; no formatter rerun or compiler qualification by this reviewer.",
+  "original_A3_negative_retained": {
+    "product": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+    "cause": "actual Rust1.93 E0658 experimental if-let match guard",
+    "evidence_reference": "/tmp/coord-b9-startup-recovery-checks-validation-20261031T095222830496Z-2/ui-binary-check/stderr.log",
+    "not_reaudited": true,
+    "not_replaced_by_current_head_pass": true
+  },
+  "activity": "Read-only Git/source/hash/JSON and in-memory textual comparison; one additive review receipt only. No source edits or authored function/case/module/helper execution.",
+  "actual_newhead_results": {
+    "compiler": null,
+    "Rust_tests": null,
+    "native": null,
+    "whole_flow": null,
+    "UX": null,
+    "publication": null,
+    "merge": null,
+    "execution_grant": null
+  },
+  "limit": "This current-head source binding supplies no compile/native PASS, execution permission, lane return, publication or merge authorization; separate A2 source rebinding/qualification remains Root-owned."
+}

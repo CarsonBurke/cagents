@@ -1,0 +1,258 @@
+{
+  "schema": "pr2030-2029-on-4429-backend-startup-semantics-join-review-v1",
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/startup-recovery-2030-2029-on-4429-source-v1/freeze.json",
+    "sha256": "de41158a936a4086958ca95b126c621cf16b119c50870e25131bbe49df5727bc",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+    "head_before_commit": "ac54c12bb54dc433366fe2eeb992faa348428acb",
+    "target_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "inputs": [
+      "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+      "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd"
+    ]
+  },
+  "scope": "Exclusive source semantics of original #2029 daemon startup status after main #2026; host startup/custody/retained state, status request admission/response, shared getter and IPC feature consistency. Fourteen pinned files including nine narrow ownership/module/cfg dependencies. No gate/predicate/queue/test/whole-PR review.",
+  "disposition": "bounded_source_clear",
+  "introduced_or_combined_findings": [],
+  "required_source_correction": null,
+  "semantic_contract": [
+    {
+      "claim": "Status and ordinary recovery admission use the same two HostState signals. Explicit retained failure outranks outstanding custody; otherwise nonempty custody is Restoring and only empty custody with no retained failure is Ready.",
+      "pins": [
+        "src/host/state.rs:1993",
+        "src/host/state.rs:2000",
+        "src/host/client.rs:483"
+      ],
+      "limit": "Ready reports this daemon startup-recovery admission state, not all conversations recovered and not an atomic promise that later shutdown/request state cannot change."
+    },
+    {
+      "claim": "Retained recovery is sticky. Only construction initializes None; retain_startup_recovery sets the first error and preserves it. Exact-worker completed Close removes custody without clearing the retained error. Ordinary-exit ownership is preserved when the late failure arrives.",
+      "pins": [
+        "src/host/state.rs:422",
+        "src/host/state.rs:2014",
+        "src/host/state.rs:2025",
+        "src/host/state.rs:2051"
+      ],
+      "limit": "No runtime Close/reaper claim; underlying cleanup proof remains inherited."
+    },
+    {
+      "claim": "Initial empty flags are not externally served while synchronous boot restore runs. Binding precedes restore, but listener acceptance/handlers follow restore. A failed restore with live terminal/chat owners retains recovery; a failure without owners aborts instead of serving empty Ready. Recovery-only boot omits autonomous producers.",
+      "pins": [
+        "src/host/mod.rs:225",
+        "src/host/mod.rs:287",
+        "src/host/mod.rs:318",
+        "src/host/mod.rs:349",
+        "src/host/mod.rs:379",
+        "src/host/mod.rs:469"
+      ],
+      "limit": "Restoring is not established as a streamed progress response during the synchronous boot body. An already queued socket connect is not a completed status handshake."
+    },
+    {
+      "claim": "Existing terminal adoption publishes exact parent ownership and inserts startup custody under one HostState lock before the worker may CommitAdoption. Success retains custody through descriptor publication; retained errors set sticky recovery, and changed parent/pane/publication fails preserve recovery rather than returning Ready.",
+      "pins": [
+        "src/host/state.rs:4375",
+        "src/host/state.rs:4397",
+        "src/host/state.rs:4421",
+        "src/host/state.rs:4471",
+        "src/host/state.rs:4511",
+        "src/host/state.rs:4561",
+        "src/host/state.rs:4581"
+      ],
+      "limit": "TerminalStartError alternative outcome proof and worker native behavior were not re-audited."
+    },
+    {
+      "claim": "Main #2026 supplies exclusive ChatRestore classification. Retained wins over Codex-listener classification, then nonretained managed Codex listeners, then relaunch. Each loop takes only its category; the final relaunch loop excludes retained actors, so the new status API does not restore an already reattached actor again.",
+      "pins": [
+        "src/host/state.rs:3091",
+        "src/host/state.rs:3105",
+        "src/host/state.rs:3213",
+        "src/host/state.rs:3264",
+        "src/host/state.rs:3368"
+      ],
+      "limit": "The category fix is already main #2026, not a new #2029 finding."
+    },
+    {
+      "claim": "A retained-native refusal is intentionally per-conversation. It records exact adoption failure and unattached evidence, blocks paired replay for that refused source, writes recovered/unattached evidence before checkpoint consumption, and passes the refused IDs to the subsequent orphan pass so they are not immediately retried. Such a refusal can coexist with daemon Ready; it is not global Retained startup custody.",
+      "pins": [
+        "src/host/state.rs:3271",
+        "src/host/state.rs:3295",
+        "src/host/state.rs:3401",
+        "src/host/state.rs:3447",
+        "src/host/mod.rs:291",
+        "src/host/mod.rs:300",
+        "src/host/chat/native_recovery.rs:544",
+        "src/host/chat/native_recovery.rs:558"
+      ],
+      "limit": "Whether a particular saved presentation must fail window readiness is the separate gate/recovery-collector review, not this API status."
+    },
+    {
+      "claim": "Native reattachment remains the inherited no-launch path. It authenticates the holder and exact issued descriptor/pair, enrolls pending authority before installation, commits helper installation before publishing the new source, records authenticated registry ownership, revalidates daemon/pair/transition identity, then exposes the exact record. The new getter neither mutates nor clears these durable pending/committed owners.",
+      "pins": [
+        "src/host/chat.rs:3628",
+        "src/host/chat/native_recovery.rs:244",
+        "src/host/chat/retained_actor.rs:685",
+        "src/host/chat/retained_actor.rs:718",
+        "src/host/chat/retained_actor.rs:826",
+        "src/host/chat/retained_actor.rs:939",
+        "src/host/chat/retained_actor.rs:988",
+        "src/host/chat/retained_actor.rs:1040"
+      ],
+      "limit": "These helpers are byte-equal to main4429 and were traced only for this status join. No full provider/rollback/launch ownership certification."
+    },
+    {
+      "claim": "StartupState inspection passes both recovery admission checks and is classified read-only for authenticated agents. It returns a snapshot under HostState with no events/effects. The normal wire requires matched protocol128 and current complete daemon proof before this handler.",
+      "pins": [
+        "src/host/client.rs:190",
+        "src/host/client.rs:278",
+        "src/host/client.rs:417",
+        "src/host/client.rs:491",
+        "src/host/client.rs:607",
+        "src/host/client.rs:902",
+        "src/host/agent_execution/terminals.rs:27"
+      ],
+      "limit": "Committed ordinary shutdown/upgrade can still refuse the request through existing admission; that is an error, not a fabricated Ready."
+    },
+    {
+      "claim": "ControlClient::startup_state uses the existing connected client's strict request path. It neither discovers a socket nor autostarts a daemon nor selects/falls back between local and remote. The request carries the pinned proof and the reply validates version, full proof and request ID.",
+      "pins": [
+        "src/control.rs:1306",
+        "src/control.rs:1641",
+        "src/control.rs:1690",
+        "src/control.rs:1732",
+        "src/control.rs:1823"
+      ],
+      "limit": "Full caller endpoint selection and UI gate behavior are separate ownership. Real selected-remote/native evidence remains missing."
+    },
+    {
+      "claim": "Shared IPC request/response/status type and ControlClient are available in CLI/HOST/UI source graphs; host-only state references remain host gated. The request and response append to their enums and both sides reference the one common protocol128 constant.",
+      "pins": [
+        "src/modules.rs:33",
+        "src/modules.rs:73",
+        "src/modules.rs:130",
+        "src/modules.rs:149",
+        "src/terminal/mod.rs:3",
+        "src/terminal/mod.rs:4",
+        "src/terminal/ipc.rs:198",
+        "src/terminal/ipc.rs:556",
+        "src/terminal/ipc.rs:894",
+        "Cargo.toml:15",
+        "Cargo.toml:101"
+      ],
+      "limit": "Source/API consistency only; no compiler or protocol-runtime claim and no protocol allocation decision made."
+    }
+  ],
+  "comparisons": {
+    "actual_main_merge": "4429728a1f179ea7f7eaca9667156553209a46ac merges a3221af83d56663f0dcbef90f67b30ad6d9fe53d and b2ba9acc3 for #2026.",
+    "main_2026_owning_diff": "Among scoped ownership/API sources, a322->4429 changes only state.rs ChatRestore classification/loop conditions (31 insertions,7 deletions); retained_actor/native_recovery/chat/mod helpers unchanged.",
+    "combined_vs_main": "Five owning API files add status read, two admission classifications, shared strict getter, appended wire enums/type and protocol constant; no production ownership transition rewrite in this backend join."
+  },
+  "missing_evidence": [
+    "All Rust builds/tests, native daemon/client/UI execution, provider execution and process probes UNRUN.",
+    "No real framed StartupState observation while actual original custody commits, refuses, completes Close or retains finalization failure.",
+    "No executed #2026 retained actor commit/rollback/captured-authority integration at this combined source.",
+    "No executed selected-remote/protocol-skew/autostart integration at this combined source.",
+    "No transfer of public d2 Script contracts, prior original #2029 test/native claims or other reviewers' gate/test clearance into backend runtime validation.",
+    "Not whole-PR merge, UX, provider lifecycle, replay authority or deployed behavior approval."
+  ],
+  "restrictions_observed": [
+    "Read-only Git/source inspection; no edits/repository mutations/builds/tests/probes/providers/process/account/DB/endpoint inspection/remote writes/new workers; only this /tmp artifact written.",
+    "No gate/predicate/test implementation review, wire allocation or provider lifecycle redesign."
+  ],
+  "primary_read_start_hashes": {
+    "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+    "src/host/agent_execution/terminals.rs": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+    "src/host/client.rs": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+    "src/control.rs": "37c489822925d1e5a62fe6a87aee2e226379979ae399f34957065277f948a3e9",
+    "src/terminal/ipc.rs": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885"
+  },
+  "seal_source_hashes": {
+    "src/host/state.rs": {
+      "sha256": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "bytes": 336801,
+      "equals_target_main": false,
+      "target_main_blob": "51c2651272c99c9a85dbd8e44c0a3267367e8c83"
+    },
+    "src/host/agent_execution/terminals.rs": {
+      "sha256": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+      "bytes": 9314,
+      "equals_target_main": false,
+      "target_main_blob": "761de117f5aef2ff0e79e6c2f4469e291c9dbe4f"
+    },
+    "src/host/client.rs": {
+      "sha256": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+      "bytes": 155313,
+      "equals_target_main": false,
+      "target_main_blob": "c0c095db53ee07e95482f9384962fe9bf80176e6"
+    },
+    "src/control.rs": {
+      "sha256": "37c489822925d1e5a62fe6a87aee2e226379979ae399f34957065277f948a3e9",
+      "bytes": 299253,
+      "equals_target_main": false,
+      "target_main_blob": "d249a2f78aa0df6cef4e302f6b64444e1b2504b3"
+    },
+    "src/terminal/ipc.rs": {
+      "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+      "bytes": 113283,
+      "equals_target_main": false,
+      "target_main_blob": "10953637ae526fa6ef19826d7a6fe5a741812f0d"
+    },
+    "src/host/mod.rs": {
+      "sha256": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+      "bytes": 30974,
+      "equals_target_main": true,
+      "target_main_blob": "1fcf101724e3a9984bb038d208998a19a4a1d3e6"
+    },
+    "src/host/chat.rs": {
+      "sha256": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838",
+      "bytes": 271017,
+      "equals_target_main": true,
+      "target_main_blob": "e2fdeae4cf08c21a52e8bba396b5a0206cc64269"
+    },
+    "src/host/chat/native_recovery.rs": {
+      "sha256": "21514b0cdb22f5a782607eb29b96eb7ba6559865be3e3f7a3db283f76181b751",
+      "bytes": 27141,
+      "equals_target_main": true,
+      "target_main_blob": "572994b5128e16f13eef4e604963187f067102f5"
+    },
+    "src/host/chat/retained_actor.rs": {
+      "sha256": "7f09fb0556d97d1a1ff5e5b98874bf601462f7cfc3a9ce2af6450f19f16fe119",
+      "bytes": 88526,
+      "equals_target_main": true,
+      "target_main_blob": "62c7ebd6f8f44436445bd28e207940790919f89f"
+    },
+    "src/lib.rs": {
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "bytes": 350,
+      "equals_target_main": true,
+      "target_main_blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e"
+    },
+    "src/modules.rs": {
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "bytes": 4143,
+      "equals_target_main": true,
+      "target_main_blob": "9e04bd958166835de80fc06502dd6cbe547111d6"
+    },
+    "src/terminal/mod.rs": {
+      "sha256": "cb89ea3c9acd9ea48f3d7894bd05996bcb14549b30e7658c331190f14b1f4614",
+      "bytes": 1858,
+      "equals_target_main": true,
+      "target_main_blob": "ce041f25e5c2822f1bb006ae949ddec35ad76441"
+    },
+    "Cargo.toml": {
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "bytes": 13087,
+      "equals_target_main": true,
+      "target_main_blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5"
+    },
+    "src/main.rs": {
+      "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+      "bytes": 656,
+      "equals_target_main": true,
+      "target_main_blob": "429db35e164a3306f4e91c2576f4fc352606ebce"
+    }
+  },
+  "primary_read_start_end_matches_freeze": true,
+  "dependency_pinning": "Nine dependencies are target-main byte-equal at seal; narrow read spans are identified above. Only the five changed owning files were hashed at review start as well.",
+  "head_at_seal": "ac54c12bb54dc433366fe2eeb992faa348428acb",
+  "sealed_at_utc": "2026-10-31T08:25:08.868480+00:00"
+}

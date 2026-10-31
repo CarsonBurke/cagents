@@ -1,0 +1,28 @@
+{
+  "schema": "fw16-startup-recovery-shared-transport-test-publication-v1",
+  "branch": "qualification/fw16-startup-recovery-composition",
+  "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+  "parent": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+  "correction": "ONE114line test-only insertion in src/control.rs; inverseproduction andotherfilesexact",
+  "parent_name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+  "parent_cases": 5,
+  "nonadditive": true,
+  "counts": {
+    "UI_focused": 28,
+    "HOST_focused": 1,
+    "shared_CLI_new": 1,
+    "total_focused_across_graphs": 30
+  },
+  "source_review": "/tmp/b914-shared-startup-transport-test-independent-review-v1.json",
+  "source_review_sha256": "fcfa4aa9cb29c643668a0887c9d77e4d2d60d4a024783a4466c5282bf1a47015",
+  "format_rust193_exit": 0,
+  "diff_check_exit": 0,
+  "original_push_chunk": "5666c1",
+  "original_push_exit": 0,
+  "supported_ref_readback": "exact",
+  "all_rust_tests_native_ux": "UNRUN_MISSING",
+  "new_product_PR": "NONE",
+  "C_grant": null,
+  "earlier_composition_source_reviews": "unchangedproduction and alloldtests conserved; b914publication52915b retained"
+}

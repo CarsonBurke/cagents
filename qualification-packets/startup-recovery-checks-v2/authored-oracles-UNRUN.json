@@ -1,0 +1,89 @@
+{
+  "kind": "AUTHORED_SOURCE_DATA_ONLY_NO_PARSER_FUNCTION_EXECUTION",
+  "check_output_cases": [
+    {
+      "name": "one_valid_dev_completion",
+      "stdout": "",
+      "stderr": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 30.96s\n",
+      "expected_output_parser": "ACCEPT",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "missing_finished",
+      "stdout": "",
+      "stderr": "Checking cagents v0.1.3\n",
+      "expected_output_parser": "REFUSE",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "duplicate_finished",
+      "stdout": "",
+      "stderr": "Finished `dev` profile\nFinished `dev` profile\n",
+      "expected_output_parser": "REFUSE",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "wrong_profile",
+      "stdout": "",
+      "stderr": "Finished `test` profile\n",
+      "expected_output_parser": "REFUSE",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "test_result_even_with_dev_marker",
+      "stdout": "test result: UNKNOWN. 9 failed;\n",
+      "stderr": "Finished `dev` profile\n",
+      "expected_output_parser": "REFUSE",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "compiler_error_even_with_dev_marker",
+      "stdout": "",
+      "stderr": "error: failure\nFinished `dev` profile\n",
+      "expected_output_parser": "REFUSE",
+      "execution": "UNRUN"
+    }
+  ],
+  "supervision_accounting_cases": [
+    {
+      "name": "original_nonzero_with_valid_marker",
+      "required": "No qualified check candidate; original exit preserved; no subsequent phase",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "unknown_wait_with_clean_later_census",
+      "required": "No qualified check and no safe handoff; sticky unknown HOLD",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "spawn_then_pidfd_or_evidence_failure",
+      "required": "Immediate append-only ledger retained; originalexit stays null unless real wait; sticky failure HOLD",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "prep_crosses_absolute_deadline",
+      "required": "No following Popen; original remaining budget check unchanged",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "earlier_unclean_then_both_final_clean",
+      "required": "History remains negative; safe handoff refuses",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "ambiguous_Cfd_close",
+      "required": "No close retry or safe return; passive HOLD",
+      "execution": "UNRUN"
+    },
+    {
+      "name": "all_three_check_records",
+      "required": "Only3check candidates; never test/artifact/native credit",
+      "execution": "UNRUN"
+    }
+  ],
+  "A2_compact_stdout_source_contract": {
+    "full_summary_processledger_SHA256SUMS": "Complete and write-order byteexact withA1",
+    "stdout": "Compact truthful projection after persistence; no fake UI0/testcredits; exact evidence path",
+    "execution": "UNRUN"
+  }
+}

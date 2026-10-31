@@ -1,0 +1,698 @@
+{
+  "prepared_only": true,
+  "status": "SOURCE_PREPARED_HOST9_REQUIRES_FRESH_REVIEW_EXTERNAL_GRANT_EXECUTION_HOLD",
+  "product_pr": 1239,
+  "product_head": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+  "product_tree": "0ac51f1aa553ddd30fd0e993d25397b08e58172f",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1239-inventory-varint-fixture",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/run-packet.py",
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/source-binding.json",
+  "source_review_sha256": "1ac98654c62492f04483c3b3ef8dc4ffd646fd7e6a4f4cf37935a11ca50bc258",
+  "source_paths_sha256": {
+    "src/chat/runtime.rs": "e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca",
+    "src/chat.rs": "b1d71c4dbc20c05fd7f1304518ccc5e1cd6fcbabf21cecf9566fff8aa15e4418",
+    "src/chat/protocol.rs": "94abf5661761f9f21aaeebc3bf1445d31a998d621c570d94aca0b54a6b00798e",
+    "src/chat/stderr_log.rs": "2e8988082c2b50e5949aed9b5220788bda26d454ee930050ad4e27267c3ea1f2",
+    "src/chat/runtime/worker_join.rs": "6fbe406ec6bf4ee75bb8e8006817aaca5594ca056f2a95e1d6a18dfa2fd14ec1",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "src/chat/client.rs": "a625d2b0d3773f234a8d8b7d66bb1ed0f001c365c833ed5debb6e98c41a6e156",
+    "src/chat/native_holder/transport.rs": "27788e187001a61d794404208d3cd4653d8e7ceccf4ee3a4ed6504867c293283",
+    "src/host/upgrade_inspect/current.rs": "c118617f5666ab3de65f5f755d670a4595c1432bf9374e0586189fcc8d2a4765"
+  },
+  "binary_checks": [
+    {
+      "label": "host-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "seconds": 600
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "host-lib",
+      "features": [
+        "host"
+      ],
+      "selectors": [
+        {
+          "name": "chat::runtime::tests::stdio_eof_drains_complete_frame_backlog_before_terminal_diagnostics",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "chat::runtime::tests::real_json_lines_pipe_keeps_hidden_state_without_presentation",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "chat::runtime::tests::managed_terminal_outcomes_survive_idle_diagnosis_and_nonzero_process_exit",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "chat::runtime::tests::a_new_actor_turn_clears_terminal_proof_before_classifying_its_own_exit",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "chat::runtime::tests::pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "chat::client::tests::handled_command_refusals_do_not_become_shared_snapshot_errors",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "chat::native_holder::transport::tests::legacy_named_json_inspection_messages_remain_decodable",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "chat::runtime::tests::stdio_eof_drains_complete_frame_backlog_before_terminal_diagnostics",
+        "chat::runtime::tests::real_json_lines_pipe_keeps_hidden_state_without_presentation",
+        "chat::runtime::tests::managed_terminal_outcomes_survive_idle_diagnosis_and_nonzero_process_exit",
+        "chat::runtime::tests::a_new_actor_turn_clears_terminal_proof_before_classifying_its_own_exit",
+        "chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure",
+        "chat::runtime::tests::pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers",
+        "chat::client::tests::handled_command_refusals_do_not_become_shared_snapshot_errors",
+        "chat::native_holder::transport::tests::legacy_named_json_inspection_messages_remain_decodable",
+        "host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only"
+      ],
+      "source_predicted_absent_names": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ]
+    }
+  ],
+  "planned_phase_order": [
+    "host-binary-check",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-1",
+    "parent-host-lib-2",
+    "parent-host-lib-3",
+    "parent-host-lib-4",
+    "parent-host-lib-5",
+    "parent-host-lib-6",
+    "parent-host-lib-7",
+    "parent-host-lib-8",
+    "parent-host-lib-9"
+  ],
+  "planned_phase_count": 12,
+  "counts": {
+    "checks": 1,
+    "lib_compilations": 1,
+    "ELF_inventories": 1,
+    "qualifying_outer_parents": 9,
+    "unique_source_parents": 9,
+    "host_assigned_outer_parents": 9,
+    "ui_assigned_outer_parents": 0,
+    "cli_assigned_outer_parents": 0,
+    "source_predicted_compiled_selected_host": 9,
+    "expected_nonadditive_staged_child_results": 0,
+    "total_phases": 12
+  },
+  "packet_deadline_seconds": 2400,
+  "lane": {
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "jobs": 2,
+    "rust": "1.93.0",
+    "new_cache": false
+  },
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "actual_allocation": null,
+  "actual_runtime_readiness": null,
+  "actual_independent_controller_review": null,
+  "readiness": false,
+  "grant": "NONE. Fresh actual EC allocation for this exact source/argv is separately required. UUID syntax is only correlation, never authority or once-only admission.",
+  "environment": "Inherited opaque authority/config/context preserved except exact reviewed compiler-only overrides. No provider/User/native authority substitution or environment stripping.",
+  "boundary_selection": {
+    "required": [
+      "HOST check",
+      "HOST libcompile/actualinventory",
+      "9exactHOSTparents"
+    ],
+    "CLI": {
+      "required": false
+    },
+    "UI": {
+      "required": false
+    }
+  },
+  "fixture_contract": {
+    "selected": [
+      {
+        "anchor_line": 9967,
+        "execution": "UNRUN",
+        "fixture_source_screen": "Finite foreground /bin/sh -> waited cat; OwnedActor releases gate and retains same LocalHandle/TempDir through successful close or intentional HOLD. Reuse sealed fixture/type review.",
+        "future_argv": [
+          "chat::runtime::tests::stdio_eof_drains_complete_frame_backlog_before_terminal_diagnostics",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "ignored": false,
+        "nested_cases": 4,
+        "nested_cases_are_nonadditive": true,
+        "role": "new EOF owner",
+        "selector": "chat::runtime::tests::stdio_eof_drains_complete_frame_backlog_before_terminal_diagnostics",
+        "source": "src/chat/runtime.rs",
+        "source_sha256": "e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca",
+        "static_parent_count": 1,
+        "why_required": "Real gated stdout burst exceeds two parsing budgets. Requires600 decoded noop frames, exact final-answer proof, real0/7 exit diagnostics, partial suffix refusal and complete private stderr. Four table entries are one parent."
+      },
+      {
+        "anchor_line": 8916,
+        "execution": "UNRUN",
+        "fixture_source_screen": "One directly owned /bin/cat through existing LocalHandle; explicit close. No test-authored numeric signal, pidfd reopening, descendant or group selection.",
+        "future_argv": [
+          "chat::runtime::tests::real_json_lines_pipe_keeps_hidden_state_without_presentation",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "ignored": false,
+        "nested_cases": 1,
+        "nested_cases_are_nonadditive": true,
+        "role": "adjacent command/wake responsiveness",
+        "selector": "chat::runtime::tests::real_json_lines_pipe_keeps_hidden_state_without_presentation",
+        "source": "src/chat/runtime.rs",
+        "source_sha256": "e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca",
+        "static_parent_count": 1,
+        "why_required": "Real cat pipe verifies commands/stdin replies, hidden coalescing, observation rearm, presentation and successful close. It is the minimal neighboring poll/wake smoke, not a measured flood-fairness test."
+      },
+      {
+        "anchor_line": 6027,
+        "execution": "UNRUN",
+        "fixture_source_screen": "Finite direct /bin/sh reads two lines and exits3; actual helper source6042-6290 inspected. No background descendants, marker PID, raw/group fixture signaling; explicit close Result required after saved completion flag.",
+        "future_argv": [
+          "chat::runtime::tests::managed_terminal_outcomes_survive_idle_diagnosis_and_nonzero_process_exit",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "ignored": false,
+        "nested_cases": 3,
+        "nested_cases_are_nonadditive": true,
+        "role": "typed final outcome precedence",
+        "selector": "chat::runtime::tests::managed_terminal_outcomes_survive_idle_diagnosis_and_nonzero_process_exit",
+        "source": "src/chat/runtime.rs",
+        "source_sha256": "e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca",
+        "static_parent_count": 1,
+        "why_required": "Existing helper runs Succeeded/Failed/Cancelled proof, a later idle diagnostic and actual nonzero shell exit. Requires the original exact run result once and retained typed outcome despite process diagnosis."
+      },
+      {
+        "anchor_line": 6038,
+        "execution": "UNRUN",
+        "fixture_source_screen": "Same direct finite shell helper6042-6290; no extra provider or invented execution identity.",
+        "future_argv": [
+          "chat::runtime::tests::a_new_actor_turn_clears_terminal_proof_before_classifying_its_own_exit",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "ignored": false,
+        "nested_cases": 1,
+        "nested_cases_are_nonadditive": true,
+        "role": "new-turn negative control",
+        "selector": "chat::runtime::tests::a_new_actor_turn_clears_terminal_proof_before_classifying_its_own_exit",
+        "source": "src/chat/runtime.rs",
+        "source_sha256": "e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca",
+        "static_parent_count": 1,
+        "why_required": "Uses same finite helper but starts a new turn after prior success. The old terminal proof must be cleared before classifying the new turn exit; prevents preserving unrelated previous success as the EOF fix drains final events."
+      },
+      {
+        "anchor_line": 4735,
+        "execution": "UNRUN",
+        "fixture_source_screen": "Self-reexecutes this exact libtest selector to install private tracing; outer Command.output waits that original child. Inner finite /bin/sh waits foreground cat, then exits3. Existing cfg(test) stderr Capture is private /var/tmp. Nested child test output is nonadditive.",
+        "future_argv": [
+          "chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "ignored": false,
+        "nested_cases": 1,
+        "nested_cases_are_nonadditive": true,
+        "role": "stderr and retained log",
+        "selector": "chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure",
+        "source": "src/chat/runtime.rs",
+        "source_sha256": "e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca",
+        "static_parent_count": 1,
+        "why_required": "Existing actual stderr/cat parent validates bounded readable tail, full retained bytes, wrong log ID and out-of-range refusal, and absence of synthetic private sentinel from general logs."
+      },
+      {
+        "anchor_line": 10167,
+        "execution": "UNRUN",
+        "fixture_source_screen": "Finite direct /bin/sh with foreground sleep; no background, setsid or marker process. Explicit LocalHandle close before assertions of saved completion/failure. Existing owned ChildGuard is the only process cleanup API.",
+        "future_argv": [
+          "chat::runtime::tests::pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "ignored": false,
+        "nested_cases": 3,
+        "nested_cases_are_nonadditive": true,
+        "role": "exact EOF exit deadline",
+        "selector": "chat::runtime::tests::pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers",
+        "source": "src/chat/runtime.rs",
+        "source_sha256": "e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca",
+        "static_parent_count": 1,
+        "why_required": "Closes original stdout then checks delayed0, delayed7 and a still-live5s writer. Saved completion/failure precede explicit close; late cleanup cannot convert a missed classification deadline into success."
+      },
+      {
+        "selector": "chat::client::tests::handled_command_refusals_do_not_become_shared_snapshot_errors",
+        "source": "src/chat/client.rs",
+        "source_sha256": "a625d2b0d3773f234a8d8b7d66bb1ed0f001c365c833ed5debb6e98c41a6e156",
+        "body_sha256": "ffa1df795e30ed683e558ddcceee7722a7c8bfe7155d1a58145e6c85266f9478",
+        "anchor_line": 2948,
+        "ignored": false,
+        "static_parent_count": 1,
+        "nested_cases": 2,
+        "nested_cases_are_nonadditive": true,
+        "execution": "UNRUN",
+        "future_argv": [
+          "chat::client::tests::handled_command_refusals_do_not_become_shared_snapshot_errors",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "fixture_source_screen": "Existing bounded UnixStream peer thread, original framing/correlated refusal and unsolicited error gates, original worker.join. No provider/helper/selfexec; two initialerror cases nonadditive."
+      },
+      {
+        "selector": "chat::native_holder::transport::tests::legacy_named_json_inspection_messages_remain_decodable",
+        "source": "src/chat/native_holder/transport.rs",
+        "source_sha256": "27788e187001a61d794404208d3cd4653d8e7ceccf4ee3a4ed6504867c293283",
+        "body_sha256": "03afe820312dbed8bf6bf84e1d2fb6b353c8155895e45ac15d768fa97e5e0a2c",
+        "anchor_line": 2011,
+        "ignored": false,
+        "static_parent_count": 1,
+        "nested_cases": 1,
+        "nested_cases_are_nonadditive": true,
+        "execution": "UNRUN",
+        "future_argv": [
+          "chat::native_holder::transport::tests::legacy_named_json_inspection_messages_remain_decodable",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "fixture_source_screen": "Existing serde/proof data-only legacyJSON roundtrip, explicit conservative directory_pin=false. No child/helper/provider; no historicalbinary/matchedwire qualification."
+      },
+      {
+        "selector": "host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only",
+        "source": "src/host/upgrade_inspect/current.rs",
+        "source_sha256": "c118617f5666ab3de65f5f755d670a4595c1432bf9374e0586189fcc8d2a4765",
+        "body_sha256": "b054e40bc3127245cd71855c25f2a7519675df86eef00e2d74bef189e3273c48",
+        "anchor_line": 762,
+        "cfg_test_module_line": 554,
+        "execution": "UNRUN",
+        "ignored": false,
+        "static_parent_count": 1,
+        "nested_cases": 7,
+        "nested_cases_are_nonadditive": true,
+        "future_argv": [
+          "host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only",
+          "--exact",
+          "--nocapture",
+          "--test-threads=1",
+          "--color=never"
+        ],
+        "fixture_source_screen": "Ordinary data-only postcard encode/decode/frozen frame fixture; no helper/selfexec/provider/process. Seven source_protocols iterations plus existing response roundtrips are internal to one parent. Name doesnot certify104 support or wire127 migration.",
+        "module_ancestry": [
+          {
+            "source": "src/lib.rs",
+            "line": 5,
+            "gate": "include modules.rs"
+          },
+          {
+            "source": "src/modules.rs",
+            "line": 73,
+            "gate": "cfg(feature=host) pubmodhost"
+          },
+          {
+            "source": "src/host/mod.rs",
+            "line": 196,
+            "gate": "mod upgrade_inspect"
+          },
+          {
+            "source": "src/host/upgrade_inspect.rs",
+            "line": 4,
+            "gate": "mod current"
+          },
+          {
+            "source": "src/host/upgrade_inspect/current.rs",
+            "line": 554,
+            "gate": "cfg(test) mod tests"
+          }
+        ]
+      }
+    ],
+    "explicitly_excluded": [
+      {
+        "line": 9825,
+        "selector": "chat::runtime::tests::direct_provider_group_cleanup_retains_descendants_and_refuses_lost_ownership",
+        "why": "Excluded: forked descendant reports numeric PID on stdout, late numeric pidfd capture, adoption/wait and raw group-cleanup experiment; outside this qualification and no broad fixture clearance."
+      },
+      {
+        "line": 9680,
+        "selector": "chat::runtime::tests::direct_provider_teardown_never_signals_a_reused_process_group",
+        "why": "Excluded: ignored namespace/PID reuse and raw group-signal test. Do not use --ignored or unshare for this fix."
+      },
+      {
+        "line": 10219,
+        "selector": "chat::runtime::tests::direct_provider_non_reaping_observation_preserves_exit_status",
+        "why": "Conservatively excluded: direct original-process status/self-SIGTERM fixture is unrelated to buffered-frame draining; no raw/self-PID or process-group contract expansion."
+      },
+      {
+        "line": 10245,
+        "selector": "chat::runtime::tests::direct_provider_scope_preserves_pipes_and_process_group",
+        "why": "Excluded: process-scope/group inspection contract; unnecessary for this source change and outside the no-process-probe preparation scope."
+      }
+    ],
+    "limits": {
+      "fairness_limit": "real_json_lines_pipe is adjacent command/wake/stdin responsiveness coverage; it is not a latched sustained frame-flood fairness oracle. New600-line EOF case checks multi-budget completion. Fairness retention is the sealed production source conclusion, not measured native/performance evidence.",
+      "no_new_test_authored_unknown_signals": true,
+      "original_executor_custody": "A future separately authorized existing owner/controller must retain its original executable Child/pidfd/family and original wait/close evidence. A failed assertion, timeout, nonzero, uncertainty or surviving owned work remains negative/HOLD; this data does not grant release or authorize an unowned fallback.",
+      "private_state": "New EOF TempDir survives OwnedActor HOLD. Existing stderr Capture::new cfg(test) uses a private UUID /var/tmp root. The stderr parent self-reexec overrides only its fixture trace/cache selectors; no caller/delegation/authority clearing, copying or printing is proposed by this data.",
+      "screen": "Only selected parent/helper source topology screened; no broad test execution clearance. New EOF ownership/type review reused.",
+      "underlying_API_boundary": "Selected process parents use existing LocalHandle/ChildGuard teardown. This is distinct from test-authored raw PID/group cleanup; it does not prove every kernel failure settles. Existing adjacent parents generally call explicit close, but lack the new OwnedActor repeated-close wrapper on every assertion unwind; final Inner::Drop at1837-1866 can detach with unconfirmed diagnostic. Do not claim all selected existing fixtures have universal RAII join proof.",
+      "appended_parent_scopes": [
+        "Existing bounded UnixStream peer thread, original framing/correlated refusal and unsolicited error gates, original worker.join. No provider/helper/selfexec; two initialerror cases nonadditive.",
+        "Existing serde/proof data-only legacyJSON roundtrip, explicit conservative directory_pin=false. No child/helper/provider; no historicalbinary/matchedwire qualification."
+      ]
+    },
+    "self_reexec": "One captured unrelayedstderr selfchild remainsnonadditive; newvarintparent hasnone.",
+    "inventory_exclusions": "No compiledabsence claim for excluded execution."
+  },
+  "result_oracles": {
+    "ordinary": "Same untouched donor strict stdout parser, one running1/exact selected ok/1P0F0I0M result with fresh actual ELF inventory N-1 filtered count; all original waits/exit0/custody required.",
+    "self_child": "Captured successfulstderr selfchild remainsnonadditive, not independentlycounted; no tenthouter/no nestedstdout exception. Varintprotocolcases internalonly.",
+    "dormant_donor_scope": "SCOPE_PARENT=None. The retained donor scope parser/diagnostic fields are unreachable for every selected string name. They confer no scope/adoption qualification and are out of scope.",
+    "qualification": "Twelveoriginalphases/nineordinaryouterparents only; actualuniqueELF/inventoryN/exactnames/originalexit0 and1P0F0I0M withcleanunchangedcustody required. Sourcepredictions notruntime/compatibility qualification."
+  },
+  "controller_review_contract": {
+    "required_fields": {
+      "verdict": "CONTROLLER_SOURCE_CLEAR",
+      "head": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+      "tree": "0ac51f1aa553ddd30fd0e993d25397b08e58172f",
+      "runner_sha256": "<actual frozen runner SHA256>",
+      "plan_sha256": "<actual frozen plan SHA256>"
+    },
+    "runtime_arguments": [
+      "--controller-review",
+      "<actual independent controller receipt path>",
+      "--controller-review-sha256",
+      "<actual receipt SHA256>"
+    ],
+    "note": "Fresh exact independent review of this adaptation required. Actual coordinator/cagents grant is separately required; no old review/grant transfer. Receipt bytes archived before lock. UUID is receipt correlation only; no freshness or once-only authorization is implemented."
+  },
+  "bounded_failure_cleanup": {
+    "direct_child_TERM_wait_seconds": 3,
+    "direct_child_KILL_wait_seconds": 3,
+    "adopted_natural_seconds": 3,
+    "adopted_forced_window_seconds": 10,
+    "qualification": "Any timeout, nonzero exit, unresolved wait, forced custody or inspection uncertainty stops dependencies and prevents qualification; cleanup grace is not extra test budget.",
+    "read_only_source_check_seconds": 10,
+    "source_check_TERM_wait_seconds": 3,
+    "source_check_KILL_wait_seconds": 3,
+    "final_custody_passes": 2,
+    "final_custody_order": "before final source/context and again afterward, before lock release; all earlier uncertainty/forced state prevents qualification",
+    "maximum_two_final_custody_windows_seconds": 26
+  },
+  "budget": "Same2400cap, jobs2/existingC. HOST600+compile900+inventory30+9parents90=2340 nominalceilings; everyphase clamped tooriginalremainingcap, no extension/newcache/target/coldfallback. Originalsource/cleanup/custodybounds unchanged.",
+  "limits": "Exact7348/HOST9 sourceprepared only. Allcurrent Rust/artifact/inventory/parents/waits/pidfd/family/Cfdclose/context/tool/resource/native/provider/readinessUNRUN/NULL. No wire127migration/wholehead/currentmain/installed/allowlist claim. Retained fixtureRAII/fairness/failedinvokeELFposthash and discrete-source-observation limits unchanged. Nineordinary1P0F0I0M/12phases planned, old8sameorder, oneappendeddatafixture. Oldaa352negative remainsnegative metadataonly; no RAWreaudit/rewrite. No oldhandoff/grant/authority/publication/queue/availability transfer; unknown/forcedcustody retainsHOLD/no safehandback. Fresh exactnonauthorcontroller review plus distinct extrinsic ECgrant required.",
+  "lineage": {
+    "donor_control_head": "0b845a2c6f1bc2e503f87a19f832379b2ea3302f",
+    "donor_control_tree": "52cddbab7769cb0813c156e60af8f85cd48da12f",
+    "runner": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/donor-host8-run-packet.py",
+      "sha256": "244901cd7d3e0986c51e7df2ad6c7134b424de54fe9de1c9fa5852c1dfb7ceb0",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-8bcd-host8-control/qualification-packets/pr1239-8bcd/run-packet.py",
+      "encoding": "Python source only"
+    },
+    "plan": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/donor-host8-plan.json",
+      "sha256": "f9273a0b8daf00985737a61d3d475b6b4e47df2836e9d77ae1f4c420e69296bd",
+      "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-8bcd-host8-control/qualification-packets/pr1239-8bcd/plan.json",
+      "encoding": "JSON"
+    },
+    "scope": "SOURCE only, oldHOST8 unexecuted/handoff unchanged, aa352negative historical, no grant/result transfer."
+  },
+  "negative_path_ELF_hash_limit": "Conserved donor limitation: ELF digest is checked before inventory/each owning parent and after invoke returns successfully. If invoke raises on nonzero/timeout/custody/source/evidence error, control never reaches that phase's post-use digest. No post-failed-use ELF hash or full ELF bytes are guaranteed archived; do not claim unchanged ELF after a failed phase. All raw negative outcomes stay nonqualifying; strict original wait/custody still governs any release.",
+  "grant_binding_limit": "A supplied --grant UUID is recorded against exact runner/plan/review/source receipts. Syntax acceptance neither verifies a fresh external cagents grant nor enforces once-only authorization. Root must obtain new actual grant for this exact packet/argv/cwd and coordinate fair admission before any execution; no current grant is present.",
+  "merge": "No readiness/merge claim. Main Root/EC retain product and actual validation ownership.",
+  "request": "Fresh nonauthor task-binding/count/inventory/source-admission source review, then separately explicit external EC admission; no current execution authorized.",
+  "archive_bindings": [
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/original-command-data-v1.json",
+      "sha256": "589e6e7179d4f4cef2cc912f5a5f971b0a23a0e2af505ad611a3808c0d30aa9a",
+      "name": "source-archive-original-command-data-v1.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/production-source-review.md",
+      "sha256": "5001ebbc7a3c04d4a9bf543231ada7b439645c010efc8efcb69af82be529991f",
+      "name": "source-archive-production-source-review.md",
+      "encoding": "UTF-8 Markdown"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/oracle-source-review.json",
+      "sha256": "0f89938f74f1be76c9fd6c13c9d41de52d4f828392d5dc33fe6dda4af8c43cd2",
+      "name": "source-archive-oracle-source-review.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/fixture-source-review.json",
+      "sha256": "63958262fb458d06156fd063dd7e2f1c6ea41afc2106f562446ee8e8f6ea3f39",
+      "name": "source-archive-fixture-source-review.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/source-freeze-v2.json",
+      "sha256": "153736a6be31a8f9299ef82ad57e5d9331d43d228c458d751b85ec21fba0e5c9",
+      "name": "source-archive-source-freeze-v2.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/script-ci-original-review.json",
+      "sha256": "db5a2b5f4f4ab0068bcc3d2739c2471eed76505d3c13064ef5c402274ef76be5",
+      "name": "source-archive-script-ci-original-review.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/publication-receipt.json",
+      "sha256": "4c3584c73fcb538045dfd2cb4d281b343602ded6b924f17c6a40c8e85f9b85a2",
+      "name": "source-archive-publication-receipt.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/product-source-conservation.json",
+      "sha256": "c4a9f0022401c0879ffefddcfa0ce3077e6b774211e3f12742dfbd8c45616bc1",
+      "name": "source-archive-product-source-conservation.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/ancestor-command-data-v2.json",
+      "sha256": "52fb82e130ab4e49a8191c1f8f88b96b8a9ec6afb33c6ea29bfd7654605f1b63",
+      "name": "source-archive-ancestor-command-data-v2.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/test-api-source-review.md",
+      "sha256": "80918d5623bc7aebff64e123b873845822d418c60ddfac32975e24ce4e55978a",
+      "name": "source-archive-test-api-source-review.md",
+      "encoding": "UTF-8 Markdown"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/test-conservation-review.json",
+      "sha256": "b9cd13113ef28caf52475e71dea5c3ff41b04154fc0eeb0a62a3875c623183de",
+      "name": "source-archive-test-conservation-review.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/current-publication.json",
+      "sha256": "a0f41411668654c87dcb8a3630ee6f0a8f023438c90a0f603a6fbd00edadacc1",
+      "name": "source-archive-current-publication.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/test-source-freeze.json",
+      "sha256": "9c9c3800c7cb8bfde71518e76ea2b6a36311f27af2fb83dcae8ba46751ae29ec",
+      "name": "source-archive-test-source-freeze.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/test-source-delta.json",
+      "sha256": "d0e1fd780ea8ea028802bbd499462a2e8e2a8291425da244beea5ca365be5a67",
+      "name": "source-archive-test-source-delta.json",
+      "encoding": "JSON wrapper of exact original raw UTF-8 patch"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/original-aa352-executor-return.json",
+      "sha256": "ea2cb28910823bb174dac4508d9c4c6033e22e750e79905fcd88f9a95c8ac6b1",
+      "name": "source-archive-original-aa352-executor-return.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/command-data-v3.json",
+      "sha256": "25cc0330a49c9def7210a540c0338b6dfcdd3030b5824dbb66263dd8551864df",
+      "name": "source-archive-command-data-v3.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/command-data-v2-to-v3-delta.json",
+      "sha256": "ecfe962a37b1158753cf1848b0e26d7951a5c89c98aaf146ff6bd5f727a4313b",
+      "name": "source-archive-command-data-v2-to-v3-delta.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/donor-host8-run-packet.py",
+      "sha256": "244901cd7d3e0986c51e7df2ad6c7134b424de54fe9de1c9fa5852c1dfb7ceb0",
+      "name": "source-archive-donor-host8-run-packet.py",
+      "encoding": "Python source only"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/donor-host8-plan.json",
+      "sha256": "f9273a0b8daf00985737a61d3d475b6b4e47df2836e9d77ae1f4c420e69296bd",
+      "name": "source-archive-donor-host8-plan.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/varint-semantic-review.md",
+      "sha256": "cc47bd563582accf9d09aad17a86c2097cacb3d9f01122c87f34021151f126e1",
+      "name": "source-archive-varint-semantic-review.md",
+      "encoding": "UTF-8 Markdown"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/varint-conservation-review.json",
+      "sha256": "e8aefe80ba69c0d8938e5b0b3f870fd184fabefd35c1e500d93397188509a93e",
+      "name": "source-archive-varint-conservation-review.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/varint-publication.json",
+      "sha256": "f81781b19c6d4282a319d143e691de94e4b0ebd9811f009c5f47452b0931ab03",
+      "name": "source-archive-varint-publication.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/varint-source-freeze.json",
+      "sha256": "8b9063f5607310c41d191f2c7e3e2f5f4825b0a27f946012a147783e664d6b51",
+      "name": "source-archive-varint-source-freeze.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/varint-source-delta.json",
+      "sha256": "582679ff656aff75f1ee6aa3230d3617d0ab01d5173708fc3d5bab1ea347b9c1",
+      "name": "source-archive-varint-source-delta.json",
+      "encoding": "JSON wrapper of original raw UTF-8 patch"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/command-data-v4.json",
+      "sha256": "a9816af90b53e587cea0cd96270cabc00c9e590731be15fa4b7731f614aa6e7e",
+      "name": "source-archive-command-data-v4.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/command-data-v3-to-v4-delta.json",
+      "sha256": "71be2f38e1515d10bf51879627afe54622537b845d870fb6b060b18c69b68275",
+      "name": "source-archive-command-data-v3-to-v4-delta.json",
+      "encoding": "JSON"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/source-binding.json",
+      "sha256": "1ac98654c62492f04483c3b3ef8dc4ffd646fd7e6a4f4cf37935a11ca50bc258",
+      "name": "source-binding.json",
+      "encoding": "JSON"
+    }
+  ],
+  "historical_negative": {
+    "product": "195052bf1d7ce2d5b6580e3335c6ef0628cae981",
+    "allocation": "aa35221a-9192-4d38-b8f3-5e426578bfba",
+    "return_receipt": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-8bcd-host8-control/qualification-packets/pr1239-8bcd/dependencies/original-aa352-executor-return.json",
+      "sha256": "ea2cb28910823bb174dac4508d9c4c6033e22e750e79905fcd88f9a95c8ac6b1",
+      "original_path": "/tmp/coord-b9-pr1239-aa35221a-actual-executor-return.json",
+      "encoding": "JSON"
+    },
+    "HOST_check_exit": 0,
+    "HOST_lib_compile_exit": 101,
+    "parents_attempted": 0,
+    "parents_unrun": 6,
+    "later_state_source": {
+      "publication": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-8bcd-host8-control/qualification-packets/pr1239-8bcd/dependencies/current-publication.json",
+        "sha256": "a0f41411668654c87dcb8a3630ee6f0a8f023438c90a0f603a6fbd00edadacc1",
+        "original_path": "/tmp/fw16-backend-ec204421/pr1239-8bcd52-reviewed-source-publication-v1.json",
+        "encoding": "JSON"
+      },
+      "field": "old_C",
+      "value": "aa352CLOSED_ACCEPTED2492b6bc; no consumedgranttransfer"
+    },
+    "limits": "Existing executor return at its original pending-acceptance timestamp plus later supplied publication CLOSED_ACCEPTED2492b6bc metadata only; no original RAW read/re-audit, no result rewrite or grant transfer."
+  },
+  "historical_host8_Script_metadata": {
+    "id": 124444752433,
+    "status": "completed",
+    "conclusion": "success",
+    "head": "8bcd52d1d99f9193cc3d4f5a8b121e0211d19a6e",
+    "scope": "RootapprovedGitHubcheckrunmetadata ONLY; rawlogs/methodcountnotreviewed"
+  }
+}

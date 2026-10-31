@@ -1,0 +1,120 @@
+--- A2/run-packet.py
++++ 4d77/run-packet.py
+@@ -1,4 +1,4 @@
+-"""Prepared6ceb startup packet A2:3isolated binary checks and compact stdout; fresh review/grant required, no tests/native qualification."""
++"""Prepared eb7 startup packet A: exactly3 isolated binary checks; independent review and fresh grant required. No tests/native qualification."""
+ import argparse
+ import ctypes
+ import errno
+@@ -16,16 +16,16 @@
+ import time
+ from datetime import datetime, timezone
+ 
+-WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard')
++WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition')
+ TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
+ LOCK = TARGET.parent / 'lane-c.lock'
+ TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
+-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks-v2/qualification-packets/startup-recovery-checks-v2/plan.json')
++PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/plan.json')
+ PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
+ PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
+ SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
+ CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
+-PLAN_SHA = '2a8536f75fe1e4ea20d693aa2286480307a80d64f32bb86b8a0e354f66f822f0'
++PLAN_SHA = 'f53a1415715da6e109a905cf309be7fb2e387818b92f4120767ecb0c4fb9fc0e'
+ SCOPE_PARENT = None  # No selected PR1239 contract enables the dormant donor staged-scope path.
+ 
+ 
+@@ -579,7 +579,7 @@
+     review_bytes = Path(plan['source_review']).read_bytes()
+     review = json.loads(review_bytes)
+     assert review['head'] == plan['product_head'] and review['tree'] == plan['product_tree']
+-    assert review['kind'] == 'AUTHOR_6CEB_PACKET_A2_SOURCE_BINDING_NOT_INDEPENDENT_APPROVAL'
++    assert review['kind'] == 'AUTHOR_EB7_PACKET_A_SOURCE_BINDING_NOT_INDEPENDENT_APPROVAL'
+     assert review['verdict'] == 'BOUND_EXACT_STARTUP_SOURCE_CHAIN_ONLY_NO_WHOLE_HEAD_OR_RUNTIME_APPROVAL'
+     assert review['job_kind'] == plan['job_kind'] == 'A_CHECKS_ONLY'
+     def read_bound(key, as_json=True):
+@@ -587,14 +587,6 @@
+         payload = Path(ref['path']).read_bytes()
+         assert hashlib.sha256(payload).hexdigest() == ref['sha256'], 'Changed source/report input: ' + key
+         return json.loads(payload) if as_json else payload.decode('utf-8')
+-    current_guard = read_bound('current_guard_source')
+-    current_guard_review = read_bound('current_guard_review')
+-    read_bound('original_A3_negative')
+-    read_bound('original_A3_return')
+-    read_bound('original_A3_controller_review')
+-    read_bound('original_A3_runner', False)
+-    read_bound('original_A3_plan')
+-    read_bound('original_A3_manifest')
+     data = read_bound('command_data')
+     preflight = read_bound('source_preflight')
+     transport = read_bound('transport_review')
+@@ -613,11 +605,11 @@
+     for ref in review['composition_reviews']:
+         payload = Path(ref['path']).read_bytes()
+         assert hashlib.sha256(payload).hexdigest() == ref['sha256']
+-    assert data['schema'] == '6ceb-startup-recovery-packet-A2-three-isolated-binary-checks-v1'
++    assert data['schema'] == 'eb7-startup-recovery-packet-A-three-isolated-binary-checks-v1'
+     assert data['kind'] == 'FIXED_SOURCE_DATA_ONLY_NO_EXECUTION_OR_GRANT'
+-    assert data['head'] == review['head'] == plan['product_head'] == '6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194'
+-    assert data['tree'] == review['tree'] == plan['product_tree'] == '726b28c2d8d10abc2a2e8340b98e9e6015a089c4'
+-    assert data['parent'] == review['parent'] == plan['product_parent'] == 'eb7ff16beb8864349573231521c5d4eab5270cc6'
++    assert data['head'] == review['head'] == plan['product_head'] == 'eb7ff16beb8864349573231521c5d4eab5270cc6'
++    assert data['tree'] == review['tree'] == plan['product_tree'] == '8d60fb0154109a82861f9b595f2b7296e4f55c26'
++    assert data['parent'] == review['parent'] == plan['product_parent'] == 'b914f9d9b55527aa1bb22d591968c58958d717ee'
+     assert data['product_cwd'] == str(WT)
+     assert data['job_kind'] == 'A_CHECKS_ONLY' and data['artifact_groups'] == plan['artifact_groups'] == []
+     assert data['binary_checks'] == plan['binary_checks'] == [
+@@ -630,21 +622,15 @@
+     assert data['caps_override']['authority_reference'] == 'EC53a57eea as relayed by Root task'
+     assert data['packet_deadline_seconds'] == plan['packet_deadline_seconds'] == 2400
+     assert plan['planned_phase_count'] == 3 and plan['planned_phase_order'] == ['cli-binary-check', 'host-binary-check', 'ui-binary-check']
+-    assert preflight['product_head'] == current_guard['head'] == current_guard_review['head'] == plan['product_head']
+-    assert preflight['product_tree'] == current_guard['tree'] == current_guard_review['tree'] == plan['product_tree']
+-    assert current_guard_review['verdict'] == 'SOURCE_CLEAR_CURRENT_HEAD_STABLE_GUARD_DELTA_ONLY' and current_guard_review['findings'] == []
+-    assert current_guard_review['parents'] == [data['parent']] and current_guard['sole_parent'] == data['parent']
+-    assert current_guard_review['author_receipt']['sha256'] == review['current_guard_source']['sha256']
+-    assert current_guard_review['source_file']['path'] == 'src/app/startup_gate.rs'
+-    assert current_guard_review['source_file']['current_sha256'] == current_guard['product_source_sha256'] == plan['source_paths_sha256']['src/app/startup_gate.rs'] == '6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339'
++    assert preflight['product_head'] == publication['head'] == plan['product_head']
++    assert preflight['product_tree'] == publication['tree'] == plan['product_tree']
+     assert preflight['source_paths_sha256'] == review['source_paths_sha256'] == plan['source_paths_sha256']
+     assert plan['source_paths_sha256']['src/control.rs'] == '5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1'
+     assert transport['result'] == 'SOURCE_CLEAR_BOUNDED_SHARED_TRANSPORT_TEST' and transport['blocking_findings'] == []
+     assert publication['source_review_sha256'] == review['transport_review']['sha256']
+-    assert publication['head'] == data['parent']
+-    assert publication['parent'] == b914_publication['head']
++    assert publication['parent'] == b914_publication['head'] == data['parent']
+     assert composition['schema'] == 'fw16-startup-recovery-composition-source-v1'
+-    assert all(name in ('src/control.rs', 'src/app/startup_gate.rs') or plan['source_paths_sha256'][name] == spec['sha256'] for name, spec in composition['files'].items())
++    assert all(name == 'src/control.rs' or plan['source_paths_sha256'][name] == spec['sha256'] for name, spec in composition['files'].items())
+     assert 'Job A: three isolated binary checks' in design
+     assert donor_acceptance['decision'] == 'CLOSED_ACCEPTED_BOUNDED_EXACT_73487_HOST9_PASS'
+     assert donor_acceptance['source_controller']['runner_sha256'] == donor_review['runner_sha256'] == review['donor_runner']['sha256'] == '71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829'
+@@ -919,24 +905,7 @@
+         files = sorted(path for path in out.rglob('*') if path.is_file())
+         (out / 'SHA256SUMS').write_text(''.join(digest(path) + '  ' + str(path.relative_to(out)) + '\n' for path in files))
+         # Root owns coordination; this runner never sends a message or starts another agent.
+-        # Stdout is a projection only. Complete summary/ledger and checksums above remain unchanged.
+-        compact = {key: summary[key] for key in ('head', 'tree', 'grant', 'error',
+-            'owning_commands_qualified', 'qualification_scope', 'historical_handoff_clean')}
+-        compact['check_results'] = [{key: row[key] for key in ('label', 'exit', 'original_wait_complete',
+-            'qualified_check_candidate', 'output_read_error', 'output_parse_error')} for row in summary['raw_check_results']]
+-        compact['counts'] = {key: summary[key] for key in ('requested_binary_check_count',
+-            'qualified_binary_check_candidate_count', 'attempted_binary_check_count', 'unrun_binary_check_count',
+-            'attempted_process_count', 'original_wait_settled_process_count', 'unknown_process_count',
+-            'attempted_phase_count', 'original_wait_settled_phase_count', 'unknown_phase_count',
+-            'declared_test_invocations', 'declared_test_parents', 'declared_ELF_inventories')}
+-        compact['custody'] = {'clean': custody['clean'], 'forced': custody['forced'],
+-            'passes': [{'clean': value.get('clean'), 'forced': value.get('forced'),
+-                'inspection_error': value.get('inspection_error'),
+-                'observed_count': len(value.get('observed', [])),
+-                'remaining_count': len(value.get('remaining', []))} for value in custody['passes']]}
+-        compact['close'] = {key: summary[key] for key in ('lock_closed', 'lock_close_error', 'actual_release')}
+-        compact['evidence'] = str(out)
+-        print(json.dumps(compact), flush=True)
++        print(json.dumps(summary), flush=True)
+         print('EVIDENCE ' + str(out), flush=True)
+         print('RELEASE_STATUS ' + ('ACTUAL_CLEAN_C_RELEASE' if summary['actual_release'] else 'NO_SAFE_RELEASE_CLAIM'), flush=True)
+     return 0 if summary['owning_commands_qualified'] else 1

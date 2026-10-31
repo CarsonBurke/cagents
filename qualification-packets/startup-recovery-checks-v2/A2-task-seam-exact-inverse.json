@@ -1,0 +1,78 @@
+{
+  "source_basis_4d77_runner_sha256": "cf22192079dde3c5786069a1133d595b5f55d6c2d2567b534cde52890b35755c",
+  "new_runner_sha256": "3a253b705e749fbb8e816c04beb659293ce98b3d3adf6ff7698ff7195df6f3b5",
+  "edits": [
+    {
+      "rationale": "Exact reviewed6ceb product cwd only",
+      "before": "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition')",
+      "after": "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard')"
+    },
+    {
+      "rationale": "A2 task plan path only",
+      "before": "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/plan.json')",
+      "after": "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks-v2/qualification-packets/startup-recovery-checks-v2/plan.json')"
+    },
+    {
+      "rationale": "A2 plan hash only",
+      "before": "PLAN_SHA = 'f53a1415715da6e109a905cf309be7fb2e387818b92f4120767ecb0c4fb9fc0e'",
+      "after": "PLAN_SHA = '2a8536f75fe1e4ea20d693aa2286480307a80d64f32bb86b8a0e354f66f822f0'"
+    },
+    {
+      "rationale": "Current author binding schema label",
+      "before": "review['kind'] == 'AUTHOR_EB7_PACKET_A_SOURCE_BINDING_NOT_INDEPENDENT_APPROVAL'",
+      "after": "review['kind'] == 'AUTHOR_6CEB_PACKET_A2_SOURCE_BINDING_NOT_INDEPENDENT_APPROVAL'"
+    },
+    {
+      "rationale": "Read and hash real currentguard review/source and immutable original negative, no re-audit/result transfer",
+      "before": "    data = read_bound('command_data')",
+      "after": "    current_guard = read_bound('current_guard_source')\n    current_guard_review = read_bound('current_guard_review')\n    read_bound('original_A3_negative')\n    read_bound('original_A3_return')\n    read_bound('original_A3_controller_review')\n    read_bound('original_A3_runner', False)\n    read_bound('original_A3_plan')\n    read_bound('original_A3_manifest')\n    data = read_bound('command_data')"
+    },
+    {
+      "rationale": "A2 DATA schema binding",
+      "before": "data['schema'] == 'eb7-startup-recovery-packet-A-three-isolated-binary-checks-v1'",
+      "after": "data['schema'] == '6ceb-startup-recovery-packet-A2-three-isolated-binary-checks-v1'"
+    },
+    {
+      "rationale": "Current product head literal",
+      "before": "data['head'] == review['head'] == plan['product_head'] == 'eb7ff16beb8864349573231521c5d4eab5270cc6'",
+      "after": "data['head'] == review['head'] == plan['product_head'] == '6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194'"
+    },
+    {
+      "rationale": "Current product tree literal",
+      "before": "data['tree'] == review['tree'] == plan['product_tree'] == '8d60fb0154109a82861f9b595f2b7296e4f55c26'",
+      "after": "data['tree'] == review['tree'] == plan['product_tree'] == '726b28c2d8d10abc2a2e8340b98e9e6015a089c4'"
+    },
+    {
+      "rationale": "Current product parent literal",
+      "before": "data['parent'] == review['parent'] == plan['product_parent'] == 'b914f9d9b55527aa1bb22d591968c58958d717ee'",
+      "after": "data['parent'] == review['parent'] == plan['product_parent'] == 'eb7ff16beb8864349573231521c5d4eab5270cc6'"
+    },
+    {
+      "rationale": "Real current-head source and genuine independent review, not old eb7 publication as6ceb approval",
+      "before": "    assert preflight['product_head'] == publication['head'] == plan['product_head']\n    assert preflight['product_tree'] == publication['tree'] == plan['product_tree']",
+      "after": "    assert preflight['product_head'] == current_guard['head'] == current_guard_review['head'] == plan['product_head']\n    assert preflight['product_tree'] == current_guard['tree'] == current_guard_review['tree'] == plan['product_tree']\n    assert current_guard_review['verdict'] == 'SOURCE_CLEAR_CURRENT_HEAD_STABLE_GUARD_DELTA_ONLY' and current_guard_review['findings'] == []\n    assert current_guard_review['parents'] == [data['parent']] and current_guard['sole_parent'] == data['parent']\n    assert current_guard_review['author_receipt']['sha256'] == review['current_guard_source']['sha256']\n    assert current_guard_review['source_file']['path'] == 'src/app/startup_gate.rs'\n    assert current_guard_review['source_file']['current_sha256'] == current_guard['product_source_sha256'] == plan['source_paths_sha256']['src/app/startup_gate.rs'] == '6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339'"
+    },
+    {
+      "rationale": "Preserve actual eb7\u2192b914 ancestor provenance",
+      "before": "    assert publication['parent'] == b914_publication['head'] == data['parent']",
+      "after": "    assert publication['head'] == data['parent']\n    assert publication['parent'] == b914_publication['head']"
+    },
+    {
+      "rationale": "Only reviewed stableguard source differs from old b914 source besides retained sharedtest; exact currentguard hash checked above",
+      "before": "all(name == 'src/control.rs' or plan['source_paths_sha256'][name] == spec['sha256'] for name, spec in composition['files'].items())",
+      "after": "all(name in ('src/control.rs', 'src/app/startup_gate.rs') or plan['source_paths_sha256'][name] == spec['sha256'] for name, spec in composition['files'].items())"
+    },
+    {
+      "rationale": "EC3e5b-authorized terminal stdout compaction only after full summary and complete checksum manifest writes",
+      "before": "        print(json.dumps(summary), flush=True)",
+      "after": "        # Stdout is a projection only. Complete summary/ledger and checksums above remain unchanged.\n        compact = {key: summary[key] for key in ('head', 'tree', 'grant', 'error',\n            'owning_commands_qualified', 'qualification_scope', 'historical_handoff_clean')}\n        compact['check_results'] = [{key: row[key] for key in ('label', 'exit', 'original_wait_complete',\n            'qualified_check_candidate', 'output_read_error', 'output_parse_error')} for row in summary['raw_check_results']]\n        compact['counts'] = {key: summary[key] for key in ('requested_binary_check_count',\n            'qualified_binary_check_candidate_count', 'attempted_binary_check_count', 'unrun_binary_check_count',\n            'attempted_process_count', 'original_wait_settled_process_count', 'unknown_process_count',\n            'attempted_phase_count', 'original_wait_settled_phase_count', 'unknown_phase_count',\n            'declared_test_invocations', 'declared_test_parents', 'declared_ELF_inventories')}\n        compact['custody'] = {'clean': custody['clean'], 'forced': custody['forced'],\n            'passes': [{'clean': value.get('clean'), 'forced': value.get('forced'),\n                'inspection_error': value.get('inspection_error'),\n                'observed_count': len(value.get('observed', [])),\n                'remaining_count': len(value.get('remaining', []))} for value in custody['passes']]}\n        compact['close'] = {key: summary[key] for key in ('lock_closed', 'lock_close_error', 'actual_release')}\n        compact['evidence'] = str(out)\n        print(json.dumps(compact), flush=True)"
+    },
+    {
+      "rationale": "Current task docstring only",
+      "before": "\"\"\"Prepared eb7 startup packet A: exactly3 isolated binary checks; independent review and fresh grant required. No tests/native qualification.\"\"\"",
+      "after": "\"\"\"Prepared6ceb startup packet A2:3isolated binary checks and compact stdout; fresh review/grant required, no tests/native qualification.\"\"\""
+    }
+  ],
+  "full_reverse_reconstruction_byteexact": true,
+  "execution": "AST/source only; no function evaluation"
+}

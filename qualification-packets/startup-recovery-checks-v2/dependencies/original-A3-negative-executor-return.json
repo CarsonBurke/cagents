@@ -1,0 +1,104 @@
+{
+  "actual_phases": [
+    {
+      "exit": 0,
+      "label": "cli-binary-check",
+      "seconds": 12.813751211971976
+    },
+    {
+      "exit": 0,
+      "label": "host-binary-check",
+      "seconds": 30.30054881295655
+    },
+    {
+      "exit": 101,
+      "label": "ui-binary-check",
+      "seconds": 37.61646099295467
+    }
+  ],
+  "actual_recorded_scope": {
+    "archives": 20,
+    "checksum_members": 48,
+    "evidence_files": 49,
+    "final_local_censuses": 2,
+    "original_outer_tool_terminal": "EXIT1_OBSERVED",
+    "phase_censuses": 3,
+    "physical_original_Cfd_close": "RECORDED_ONCE_AND_SOLE_RAW_VERIFIED",
+    "product_pins": 25,
+    "recorded_forced_cancel_supervision": 0,
+    "settled_original_direct_waits": 123,
+    "source_context_pins": "UNCHANGED_AS_VERIFIED_BY_SOLE_RAW",
+    "source_payloads": 53,
+    "unknown_original_direct_waits": 0
+  },
+  "actual_retries_or_new_heavy_work": 0,
+  "allocation": "a4c5357c-9cb1-40b6-a4a0-d7651db29dd7",
+  "authenticated_grant_message": "1f83b0a6-6d7c-426d-a6f7-0fdc1e76a4a9",
+  "controller": {
+    "head": "4d77bb0a9fb9d9cd998a22471a8730d7932a18d9",
+    "plan_sha256": "f53a1415715da6e109a905cf309be7fb2e387818b92f4120767ecb0c4fb9fc0e",
+    "runner_sha256": "cf22192079dde3c5786069a1133d595b5f55d6c2d2567b534cde52890b35755c",
+    "tree": "8ff445a198ac73308676fadd130e50f0729aedca"
+  },
+  "evidence": "/tmp/coord-b9-startup-recovery-checks-validation-20261031T095222830496Z-2",
+  "exact_failure": {
+    "compiler_code": "E0658",
+    "count": 1,
+    "line": 222,
+    "path": "src/app/startup_gate.rs",
+    "reason": "if let match guards are experimental on physical Rust1.93",
+    "source_diagnostic_and_sole_RAW_confirmed": true
+  },
+  "executor_native_agent": "f7cfa858-f77d-4e7e-830b-589345fe63b9",
+  "executor_session": "b9aa3f1d-524e-49e2-a43c-e5d9acf6bbc6",
+  "explicit_executor_return_requested": true,
+  "future_execution_requires_fresh_exact_grant": true,
+  "grant_readback": {
+    "path": "/tmp/coord-b9-startup-recovery-checks-1f83-authenticated-readback-and-argv.json",
+    "sha256": "970a6f6bea2ad38c0ecc7b33f0b52acca66a984728984b6659e48d9c16116c21"
+  },
+  "kind": "ACTUAL_BOUNDED_NEGATIVE_EXECUTOR_RETURN_PENDING_ROOT_ACCEPTANCE",
+  "limits": "Original recorded direct waits/local phase+final census and original source custody only; no global namespace/manager/kernel-history/fullELF/installed/native/UX proof. Full artifact bytes audited, tool stdout truncation retained. Existing prior negatives/WHOLE/359/SeedView/1749/native holds unchanged. Physical close does not imply logical return or future capacity.",
+  "logical_allocation_state": "HELD_PENDING_EC_ACCEPTANCE",
+  "next_source_only": "Stable match-guard source proposal prepared; exact file ownership pending EC. No frozen product/controller/evidence modified, no nightly/tool/authority/account change.",
+  "original_exec_session": 80915,
+  "original_tools": {
+    "000-start.json": {
+      "chunk_id": "c5c688",
+      "exit_code": null,
+      "original_token_count": 63,
+      "path": "/tmp/coord-b9-startup-recovery-checks-a4c5357c-original-tools/000-start.json",
+      "session_id": 80915,
+      "sha256": "68a6b06f898161e28ce0816f1e857a768d5d1f0fbbe07f4e120f121ab9be4740"
+    },
+    "001-wait.json": {
+      "chunk_id": "db615b",
+      "exit_code": 1,
+      "original_token_count": 484700,
+      "path": "/tmp/coord-b9-startup-recovery-checks-a4c5357c-original-tools/001-wait.json",
+      "session_id": null,
+      "sha256": "778c8ff947841948abba658bca77b08191917d56588556a7def3afbf133cf517"
+    }
+  },
+  "product": {
+    "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+    "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26"
+  },
+  "qualification": "NEGATIVE_FAIL_STOP_2_BINARY_CHECK_CANDIDATES_ONLY_NO_WHOLE_PACKET_PASS",
+  "sole_nonauthor_RAW": {
+    "additional_evidence_blocker": false,
+    "path": "/tmp/coord-b9-startup-recovery-checks-a4c5357c-sole-raw-review.json",
+    "reviewer": "/root/ci_delivery",
+    "sha256": "d7b577b71c8f84570f75dabfb14ab5a1e210f060a714c01f186c5a7284249519"
+  },
+  "steward": "ec204421-6a6d-4edc-a23d-c8f8fc1b5ab1",
+  "tests_or_helpers_or_ELF_inventories": 0,
+  "whole_original_terminal": {
+    "chunk": "db615b",
+    "exit_code": 1,
+    "finished": "2026-10-31T09:53:44.168686+00:00",
+    "original_token_count": 484700,
+    "repair_or_reconstruction": false,
+    "tool_stdout_truncated": true
+  }
+}

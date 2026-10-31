@@ -1,0 +1,48 @@
+{
+  "C_runtime_grant": null,
+  "all_compilation_tests_native": "UNRUN",
+  "all_other_entries_exact": 2221,
+  "artifacts": {
+    "inverse.patch": {
+      "bytes": 1352,
+      "sha256": "2e9d29f820a75f6af94834761a0eb5c3e72aedd000a7d0d6bde75033d7fed665"
+    },
+    "source.bundle": {
+      "bytes": 721,
+      "sha256": "abd49f90bc981b6a3cd3721c7c4609a936bde6db67d3ff5de6d26ccb00ee3220"
+    },
+    "source.patch": {
+      "bytes": 1352,
+      "sha256": "dcff8a7c85f9bb40e70152d9d12473d3562f08c9d7d2c9270aa1f298e6918e8c"
+    }
+  },
+  "branch": "fix/b9-startup-stable-match-guard",
+  "changed_paths": [
+    "src/app/startup_gate.rs"
+  ],
+  "current_head_nonauthor_review": "PENDING_SAME_PROPOSAL_REVIEWER_BINDING",
+  "diff_check_original_exit": 0,
+  "diff_chunk": "39740d",
+  "exact_conservation": "Only the Loading/not-in-flight detached_reason match is lowered; same short-circuit, failure/reason and pending fallback. All other source entries exact.",
+  "formatter": {
+    "command": "scripts/check-format",
+    "final_chunk": "b229e2",
+    "final_original_check_exit": 0,
+    "first_chunk": "5d366e",
+    "first_original_check_exit": 1,
+    "physical_Rust": "1.93.0",
+    "required_change": "Only combines the boolean guard onto one line; no behavior change"
+  },
+  "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+  "kind": "AUTHOR_CURRENT_HEAD_STABLE_MATCH_GUARD_SOURCE_FIX",
+  "new_tests": "NONE_SYNTAX_ONLY_EQUIVALENT_REWRITE",
+  "original_compile_negative": "A3 original CLI0/HOST0/UI101; E0658 at old src/app/startup_gate.rs222:25 retained, no rerun",
+  "private_git": "/tmp/coord-b9-startup-stable-guard-git",
+  "product_source_sha256": "6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339",
+  "proposal_review_sha256": "354acbfe2af986eeee310bab1908c2fb7dd256be80a78c57a44990667f0419cb",
+  "semantic_patch_proposal_sha256": "7bb7e5b7949268260ab83155e5e8569132b82f8512d9b305aa0d389a83b32e03",
+  "sole_parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "source_ownership_message": "3e5b1d3f-7aa0-42fc-9bb3-634a293fbec1",
+  "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard"
+}

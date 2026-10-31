@@ -1,0 +1,167 @@
+{
+  "actual": {
+    "CLI_check": "UNRUN",
+    "ELF_inventory": "NOT_REQUESTED",
+    "HOST_check": "UNRUN",
+    "UI_check": "UNRUN",
+    "admission": null,
+    "capacity": null,
+    "grant": null,
+    "libtest_compilation": "NOT_REQUESTED",
+    "native_UI_provider_UX": "UNRUN",
+    "publication": null,
+    "queue": null,
+    "resource_return": null,
+    "runtime": null,
+    "test_invocations": "NOT_REQUESTED_ZERO"
+  },
+  "author_source_receipt": {
+    "path": "/tmp/coord-b9-startup-recovery-checks-evidence/source-receipt.json",
+    "sha256": "0d56c18f79fc672d324183c9447200202d892b7ab76b163a3fb69f6bcad5ad3d"
+  },
+  "checks_only_contract": {
+    "ELF_artifacts_or_inventories": 0,
+    "authored_oracle_DATA_UNRUN": {
+      "check_output_declarations": 6,
+      "supervision_accounting_declarations": 7
+    },
+    "budget": "Every phase remains min(original deadline, own cap). The300 seconds are within2400, not an extension. Current warmth/fit and runtime elapsed time remain unmeasured.",
+    "check_proof": "Exact invoke must return original exit0 and complete evidence/unforced custody before output parsing. Parser requires exactly one Finished dev profile line and rejects compiler-error/test-result/running-test lines. Check candidates additionally require actual matching spawn/state/phase/argv and successfully parsed execute-loop record. Marker alone cannot qualify.",
+    "effective_cargo_path_DATA": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+    "fixed_Cargo_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+    "isolated_graphs": [
+      "CLI no-default",
+      "HOST no-default+host",
+      "browserless UI no-default+ui"
+    ],
+    "libtest_compilations": 0,
+    "negative_accounting": "Nonzero/timeout/unknown/evidence error stops sequential dependencies. Output parse/read failure prevents candidate credit. All3 candidates, exact phase order, no overall error/cancel and original safe physical return required for packet qualification. Zero requested tests is scope, never an empty-inventory pass.",
+    "no_UI_HOST_union": true,
+    "ordered_checks_DATA": [
+      {
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--bin",
+          "cagents"
+        ],
+        "label": "cli-binary-check",
+        "seconds": 600
+      },
+      {
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "host",
+          "--bin",
+          "cagentsd"
+        ],
+        "label": "host-binary-check",
+        "seconds": 600
+      },
+      {
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--bin",
+          "cagents-ui"
+        ],
+        "label": "ui-binary-check",
+        "seconds": 900
+      }
+    ],
+    "original_packet_workload_deadline_seconds": 2400,
+    "phase_caps_seconds": [
+      600,
+      600,
+      900
+    ],
+    "phase_count": 3,
+    "qualification_helper_build_or_execution": 0,
+    "sum_phase_caps_seconds": 2100,
+    "test_invocations_or_parents_or_groups": 0,
+    "within_original_cap_overhead_seconds": 300
+  },
+  "conserved_lifecycle": {
+    "HOLD": "Original uncertainty/force/cancel/error history persists. Workload deadline is not a promised custody-release deadline; incomplete custody/evidence retains HOLD without replacement owner/budget reset.",
+    "finalization": "Same two clean unforced final custody passes around final source/context, complete original spawn/wait/evidence matching and positive handoff before original one-shot Cfd close. No LOCK_UN, ambiguous-close retry or unknown-state release. Task changes only check-accounting calls/evidence labels and check-only qualification summary.",
+    "source_context": "Same nested source() fixes head/tree/clean status and25source pins, rehashing runner/plan/review/archives/tools. Same opaque inherited environment copy, compiler-only overrides and config/build-context equality guards. No authority/config stripping, provider/account substitution.",
+    "spawn_wait_pidfd": "Original append-only successful Popen tuples and separate original-wait/evidence state, retained original pidfd, sticky supervision/cancel and main.run body byte-exact donor. No fallback poll/census exit inference.",
+    "tools_lane": "Same physical Rust1.93 source pins/jobs2/existing lane-C target+nonblocking lock. Actual target/tool/context/lock admission remains future runtime evidence; no availability probe/new cache."
+  },
+  "controller_head": "4d77bb0a9fb9d9cd998a22471a8730d7932a18d9",
+  "controller_parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "controller_tree": "8ff445a198ac73308676fadd130e50f0729aedca",
+  "execution_authorized_by_this_review": false,
+  "findings": [],
+  "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "independent_static_verification": {
+    "all54_actual_packet_files_match_frozen_Git_blobs": true,
+    "all_product_mode_type_blob_entries_preserved": 2222,
+    "archive_bindings_read_and_hash_checked": 20,
+    "declared_task_edits_independently_verified": 18,
+    "donor_controller_head": "d610e0ff6834c8023010645d9c65d9fbdf515061",
+    "donor_controller_tree": "3dec0e58099374e3f7f57c01c70da76cfcd2ff54",
+    "donor_runner_sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+    "exact_controller_parent_and_tree_metadata_verified": true,
+    "forward_source_text_transform_exact": true,
+    "generic_nested_main_functions_byteexact": 4,
+    "generic_top_level_functions_byteexact": 24,
+    "inverse_DATA_sha256": "ae315b6682096bd91460570b122fe21d1d4692f8c123b4d686f2c688b66e6055",
+    "inverse_method": "Independent string-position reconstruction of18 declared source-text edits including deletion, without importing/evaluating any reviewed function.",
+    "manifest_indexed_file_hashes_and_sizes_checked": 53,
+    "manifest_plus_exact_packet_file_set": 54,
+    "method_conservation_map_sha256": "f4e5157f89e799a0967a6be8039d0df1eb34d5997ffd1faf9d93b82d1bb02749",
+    "nested_functions": [
+      "read_bound",
+      "source",
+      "context",
+      "run"
+    ],
+    "new_packet_files": 54,
+    "only_changed_new_or_removed_functions": [
+      "binary_check_pass",
+      "check_accounting",
+      "execute_contracts",
+      "main",
+      "parent_accounting"
+    ],
+    "only_new_paths_prefix": "qualification-packets/startup-recovery-checks/",
+    "reverse_source_text_reconstruction_exact_donor_sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+    "source_AST_and_JSON_parse_only": true,
+    "source_chain": "Actual eb7 transport review/publication binds exact src/control.rs; b914 publication/composition freeze and scoped gate/API/conservation/backend reviews remain distinct. Other composition pin hashes preserved. Archived d610 acceptance is donor lineage only, no startup result/grant transfer.",
+    "source_snapshot_pins_matching_exact_product_Git_blobs": 25
+  },
+  "kind": "INDEPENDENT_STARTUP_RECOVERY_PACKET_A_CHECKS_ONLY_CONTROLLER_SOURCE_REVIEW",
+  "limits": [
+    "Finite packet-A source only. No reviewed controller/helper import, authored/extracted function/case/script execution, tests/build/Cargo/compiler/toolversion/ELF/native/AX/provider/process/proc/env/account/DB/target/cache/lock/resource/availability probe, GitHub/source mutation or worker. Only source/Git/hash/AST/JSON reads and this independent receipt write.",
+    "Packet B remains DATA-only UNASSIGNED and was not implemented or reviewed. Conserved dormant test parsers are unreachable through checks-only execute loop; no B/test/native result transfer.",
+    "Runtime source/context/tool observations are discrete, not atomic external-mutation exclusion. Donor subreaper census/original direct waits are not maintained359/full kernel descendant admission/status/pidfd/FD-close ledgers or global absence proof.",
+    "Source/workload stdout/stderr are file-backed without a streaming disk-output ceiling. Existing cooperative syscall/deadline and external SIGKILL cleanup limitations remain; no added closure/runtime guarantee.",
+    "This seals required nonauthor source review only. No actual fresh grant/queue/capacity/runtime admission/return exists. UUID syntax does not authenticate freshness/once-use. Root must obtain genuine new exact grant and later soleRAW/executor-return/coordinator-acceptance; review grants no resource handoff.",
+    "All old negatives/unknowns/custody/359/WHOLE/native holds remain. Three future compile checks would still establish zero Rust-test/native/full-startup/current-main/whole-PR/installed/provider/UX/merge readiness."
+  ],
+  "manifest_sha256": "cb9fb075fab86b888642792bd9707e624375628763034a831953be610ef11066",
+  "plan_sha256": "f53a1415715da6e109a905cf309be7fb2e387818b92f4120767ecb0c4fb9fc0e",
+  "queue_or_grant_claim": false,
+  "reviewer": "/root/pidfd_delta_review",
+  "runner_sha256": "cf22192079dde3c5786069a1133d595b5f55d6c2d2567b534cde52890b35755c",
+  "runtime_readiness": false,
+  "source_authorization": "Parent relayed EC53a57eea for B9 packet-A source only; not an execution grant or capacity/queue acceptance.",
+  "source_binding_sha256": "6a071093f91a4cabc011773e9ed5ae3b91a6ab3b4a12b11fceae3ace68b7d827",
+  "source_handoff": {
+    "path": "/tmp/coord-b9-startup-recovery-checks-evidence/ready-source-handoff.json",
+    "sha256": "dbdeaba5d0d24b801677dbacc9ffc8cd1cde952d947cddf50858d71b139f0c3a"
+  },
+  "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+  "verdict": "CONTROLLER_SOURCE_CLEAR"
+}

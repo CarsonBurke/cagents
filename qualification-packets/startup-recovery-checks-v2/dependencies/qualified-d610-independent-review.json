@@ -1,0 +1,97 @@
+{
+  "kind": "INDEPENDENT_PR1239_FIXED_7348_HOST9_CONTROLLER_DELTA_SOURCE_REVIEW",
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "reviewer": "/root/ci_delivery",
+  "head": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+  "tree": "0ac51f1aa553ddd30fd0e993d25397b08e58172f",
+  "controller_head": "d610e0ff6834c8023010645d9c65d9fbdf515061",
+  "controller_tree": "3dec0e58099374e3f7f57c01c70da76cfcd2ff54",
+  "controller_parent": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+  "runner_sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+  "plan_sha256": "88b0b79fb975089b08d85d2b30a4a6bad1df5d7d5f2f3d9c28db188618695c6d",
+  "source_binding_sha256": "1ac98654c62492f04483c3b3ef8dc4ffd646fd7e6a4f4cf37935a11ca50bc258",
+  "frozen_packet": {
+    "path": "/tmp/coord-b9-1239-7348-host9-control-evidence/frozen-packet.json",
+    "sha256": "3c71049adadf0fad1bc9392a5853be198dc39ab6d7dd33a89c9b8dd8665435ef"
+  },
+  "author_source_receipt": {
+    "path": "/tmp/coord-b9-1239-7348-host9-control-evidence/source-receipt.json",
+    "sha256": "a50888e9193246f3756ad4d661039bad196a6eee171a1c957fd30ad535c6a068"
+  },
+  "independent_static_comparison": {
+    "path": "/tmp/coord-b9-pr1239-d610e0ff-static-source-comparison.json",
+    "sha256": "649dbdacc3f03c36892af518b7f53b0d607108d8b56c822df642d1378ccabb70",
+    "performed": "AST parsing and source/hash/JSON comparisons only; no runner/helper import or authored/extracted function execution"
+  },
+  "conservation": {
+    "controller_and_actual_fixed_product_heads_trees_clean": true,
+    "all2223_original_product_mode_type_blob_entries_exact": true,
+    "only32_new_paths_under_qualification_packets_pr1239_7348": true,
+    "all32_frozen_file_hashes_exact": true,
+    "all27_archive_hashes_exact": true,
+    "all12_actual_product_source_hashes_exact": true,
+    "old11_source_pins_and_first8_parent_contracts_order_exact": true,
+    "nine_nonignored_source_bodies_verified_new_body_hash_matches_DATA": true,
+    "donor_controller": "0b845a2c6f1bc2e503f87a19f832379b2ea3302f",
+    "donor_runner_sha256": "244901cd7d3e0986c51e7df2ad6c7134b424de54fe9de1c9fa5852c1dfb7ceb0",
+    "donor_plan_sha256": "f9273a0b8daf00985737a61d3d475b6b4e47df2836e9d77ae1f4c420e69296bd",
+    "generic_top_level_functions_byte_exact": 25,
+    "only_changed_functions": ["parent_accounting", "main"],
+    "accounting_inverse": "Only four cardinality constants change: upper bound/requested/unrun parents8->9 and unrun phases11->12. Actual attempt/wait/evidence/unknown/error formulas are otherwise byte-exact.",
+    "nested_read_bound_source_context_run_byte_exact": true,
+    "complete_C_acquire_originalwait_finalsource_custody_handoff_Cfdclose_block_byte_exact_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "main_tail_after_preflight_exact_except_task_output_prefix_and_final9": true,
+    "whole_module_inverse_after_reviewed_functions_and_task_globals_exact": true
+  },
+  "new_varint_binding": {
+    "semantic_review_sha256": "cc47bd563582accf9d09aad17a86c2097cacb3d9f01122c87f34021151f126e1",
+    "conservation_review_sha256": "e8aefe80ba69c0d8938e5b0b3f870fd184fabefd35c1e500d93397188509a93e",
+    "publication_sha256": "f81781b19c6d4282a319d143e691de94e4b0ebd9811f009c5f47452b0931ab03",
+    "source_path": "src/host/upgrade_inspect/current.rs",
+    "source_sha256": "c118617f5666ab3de65f5f755d670a4595c1432bf9374e0586189fcc8d2a4765",
+    "scope": "Genuine semantic rawMarkdown and independent conservationJSON bind the same frozen one-test-block bytes against8bcd. Public author commit binding ties those bytes to7348/tree0ac5 and source/publication hashes; it is not promoted to independent whole-head approval.",
+    "conservation_scope": "Only cfg(test) payload setup changes: postcard serializes the exact u16 protocol prefix; original11byte frozen suffix, all assertions, production prefix, supports_protocol and source_protocols remain byte-equal. Exact inverse restores the whole parent file;2222other entries unchanged. No codec/allowlist/schema/authority change is inferred.",
+    "retained_scope_chain": "Original195052 EOF production/oracle/fixture/Script-only source chain remains tied to its actual head/source;8bcd three-line API/conservation chain remains tied to its actual blobs and parent. Neither is rewritten as a whole7348 review or current Rust result.",
+    "historical_negative": "Originalaa352 HOST0/libcompile101/0tests/6UNRUN stays negative metadata. Its return and later acceptance report grant no retry/result transfer. No original RAW was reopened or re-audited."
+  },
+  "planned_contract": {
+    "serial_phases": 12,
+    "unique_outer_parents": 9,
+    "appended_selector": "host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only",
+    "module_verified": "lib.rs includes modules.rs; cfg(feature=host) pub mod host -> host/mod.rs mod upgrade_inspect -> upgrade_inspect.rs mod current -> current.rs cfg(test) mod tests. Actual existing nonignored test at762-763 matches the pinned body hash.",
+    "nonadditive_cases": "Seven source_protocols iterations plus response roundtrips remain one ordinary parent; old EOF four-case table remains one parent. Test name is unchanged and establishes neither104 nor127 support. Captured private-stderr child remains nonadditive and does not relay successful output into the outer stream.",
+    "original8": "Same source bodies, selected contract order, inventory/color/exact/nocapture/thread1 flags and expected zero stdout-child results. Only the ninth ordinary contract and new fixed cwd/source proof are appended.",
+    "actual_result_requirements": "Same one isolated HOST cagentsd check, one HOST root lib CargoJSON compilation, unique actual reported ELF/full inventory and nine strict original exit0/run1/exact-name/1P0F0I results. Actual inventoryN binds filteredN-1; malformed/unknown/duplicate/ignored/failing results refuse. No guessed/borrowed ELF, count, pass or new parser/child exception.",
+    "budgets": "Same jobs2/physicalRust1.93 source tool hashes/existingCtarget+lock/2400s cap. Nominal600+900+30+9x90=2340s; actual phases and source checks remain constrained by the unchanged cap, without extension, new graph, cache or availability observation.",
+    "fixed_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1239-inventory-varint-fixture",
+    "resource_and_custody": "Original source/context/tool/nonblocking-lock/wait/pidfd/family/cancel/error/evidence/HOLD/Cfd-close semantics are byte-exact. No maintained359/full kernel ledger or native/source-consumer authority is added. UUID grant syntax remains correlation only."
+  },
+  "whitespace": {
+    "whole_git_diff_check_exit": 2,
+    "whole_check_findings": [
+      "qualification-packets/pr1239-7348/dependencies/test-api-source-review.md:39: new blank line at EOF.",
+      "qualification-packets/pr1239-7348/dependencies/varint-semantic-review.md:38: new blank line at EOF."
+    ],
+    "excluding_only_these_two_exact_raw_archives_exit": 0,
+    "raw_review_bytes_and_hashes_preserved": true,
+    "full_whitespace_PASS_claimed": false,
+    "gate_waiver_issued": false,
+    "assessment": "Two trailing blanks in immutable hashed review artifacts do not change controller logic. Whole-check2 remains an explicit nonpass; the code/subset check0 is not a full-gate pass. No artifact was edited or required gate waived by this source review."
+  },
+  "findings": [],
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_ELF": null,
+  "actual_inventory": null,
+  "actual_parent_results": null,
+  "actual_context_tool_resource_observations": null,
+  "actual_kernel_family_or_Cfd_close": null,
+  "qualification_readiness": false,
+  "limits": [
+    "Exact fixed7348 HOST9 source-delta review only. ECfde8a4f3 authorizes source preparation, not runtime. Main-only EOF97228b6c was not adopted: all11old pins, including runtimee270, remain exact. No main retarget/composition/promotion is authorized.",
+    "Whole147 migration/refusal-of127 HOLD remains. No allowlist widening, actual prior varint failure, serializer/decoder execution, wire127 support, installed-fullSHA/live failure or native/whole-feature/merge readiness is inferred.",
+    "All current compilation/ELF/discovery/inventory/nine parents/physical tool-context-target-lock-profile-resource/original waits/family/Cfdclose/native/provider evidence remains UNRUN/NULL. Capacity return is not a new grant or queue place; no B9C claimed.",
+    "Retained fixture RAII/fairness and failed-invoke post-use ELF hash limitations remain; no universal kernel settlement or full retained ELF bytes is claimed. Source checkpoints are discrete, not atomic exclusion of external mutation. Unknown/forced custody cannot become qualified safe handoff.",
+    "Only source Git/file/archive/hash/JSON/AST/whitespace reads and task-owned /tmp DATA writes. No source/Git edit, controller/helper import, authored/extracted-function/pure-case execution, tests/Cargo/build/tool-version/context/ELF/inventory/target/cache/lock/process/native/provider/account/DB/GitHub/inbox/new-worker operation."
+  ]
+}

@@ -1,0 +1,146 @@
+{
+  "recorded_utc": "2026-10-31T06:08:34.105467+00:00",
+  "decision": "CLOSED_ACCEPTED_BOUNDED_EXACT_73487_HOST9_PASS",
+  "allocation": "cc424f5e-ad00-4f4c-97ce-025c8d0b1dc5",
+  "grant": "8c592318-d34a-4c52-92fd-2000e09a0724",
+  "executor": "b9aa3f1d-524e-49e2-a43c-e5d9acf6bbc6",
+  "source_product": {
+    "head": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+    "tree": "0ac51f1aa553ddd30fd0e993d25397b08e58172f"
+  },
+  "source_controller": {
+    "head": "d610e0ff6834c8023010645d9c65d9fbdf515061",
+    "tree": "3dec0e58099374e3f7f57c01c70da76cfcd2ff54",
+    "runner_sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+    "plan_sha256": "88b0b79fb975089b08d85d2b30a4a6bad1df5d7d5f2f3d9c28db188618695c6d"
+  },
+  "original_execution": {
+    "attempts": 1,
+    "exec_session": 87161,
+    "start_chunk": "4597f0",
+    "poll_chunks": [
+      "b1e219",
+      "6fda16"
+    ],
+    "terminal_chunk": "51d667",
+    "terminal_exit": 0,
+    "terminal_EOF_observed": true,
+    "closed_exec_not_repolled": true,
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control",
+    "argv_only_grant_placeholder_replaced": true,
+    "evidence_dir": "/tmp/coord-b9-pr1239-73487c8d-host9-validation-20261031T054729615910Z-2",
+    "large_original_tool_output_forwarded_filtered_only": true
+  },
+  "actual_executor_return": {
+    "path": "/tmp/coord-b9-pr1239-cc424f5e-actual-executor-return.json",
+    "sha256": "6b77fb6c30434df81004cb3a4468ef8351517d246172eca3ee30dfb135b49dd9"
+  },
+  "sole_independent_RAW": {
+    "path": "/tmp/coord-b9-pr1239-73487c8d-host9-original-RAW-review.json",
+    "sha256": "45798cd6b734b07cb66167e0a6f13cbae8bb0d88463c99166f9cb7bef119b554",
+    "reviewer": "/root/ci_delivery"
+  },
+  "root_acceptance_checks": {
+    "return_review_grant_summary_manifest_bindings_verified": true,
+    "all101_manifest_members_verified": true,
+    "complete_regular_nonsymlink102_file_inventory": true,
+    "source_context_pins_exact_in_return_and_sole_RAW": true,
+    "original_terminal0_and_explicit_return": true,
+    "nine_parents_and12_phases_verified_against_original_summary_and_sole_RAW": true,
+    "recorded_wait_custody_close_basis": true,
+    "no_duplicate_RAW_or_live_probe": true
+  },
+  "actual_bounded_results": {
+    "HOST_cagentsd_check_exit": 0,
+    "HOST_root_lib_JSON_compile_exit": 0,
+    "actual_unique_inventory": 3182,
+    "all_phase_exits_zero": 12,
+    "ordinary_selected_parents": 9,
+    "passed": 9,
+    "failed": 0,
+    "ignored": 0,
+    "measured": 0,
+    "filtered_out_per_parent": 3181,
+    "unrun_planned_parents": 0,
+    "unrun_planned_phases": 0,
+    "EOF4_and_codec7_inner_cases": "NONADDITIVE",
+    "additional_counted_children": 0
+  },
+  "recorded_waits": {
+    "attempts": 402,
+    "settled": 402,
+    "source": 390,
+    "owning_phases": 12,
+    "unknown": 0,
+    "nonzero": 0,
+    "direct_cleanup_attempts": 0,
+    "supervision_errors": 0,
+    "cancellation_signals": [],
+    "all_original_attempt_stage_label_pid_argv_and_phase_records_correlate": true,
+    "original_wait_implementation": "executed-runner.py:44-48 records the original child.wait return; no poll/reaper result substituted for these direct waits",
+    "not_all_OS_descendant_wait_statuses": true
+  },
+  "recorded_custody_close": {
+    "all_12_phase_observations": {
+      "clean": true,
+      "forced": false,
+      "observed": []
+    },
+    "final": {
+      "clean": true,
+      "forced": false,
+      "passes": [
+        {
+          "clean": true,
+          "forced": false,
+          "observed": []
+        },
+        {
+          "clean": true,
+          "forced": false,
+          "observed": []
+        }
+      ]
+    },
+    "historical_handoff_clean": true,
+    "lock_closed": true,
+    "LOCK_UN_issued": false,
+    "lock_close_error": null,
+    "recorded_actual_release": true,
+    "unknown_or_forced_recorded_custody": 0,
+    "safe_handoff_predicates_independently_recomputed_from_retained_records": true,
+    "source_order": [
+      "All original source/owning Popen wait and evidence predicates are assessed.",
+      "Final observation1, final source/context comparison+retention, final observation2 (source Git after first census is covered by second).",
+      "Raw parent accounting and safe_lane_handoff evaluate the complete original attempt/state lists and both final passes.",
+      "Only then original Cfd os.close, once, no earlier LOCK_UN; ambiguous close enters passive unconfirmed HOLD rather than retry.",
+      "Local summary and complete checksum manifest are written; original stdout publication and terminal return follow."
+    ],
+    "source_references": [
+      "executed-runner.py:457-473",
+      "executed-runner.py:535-559",
+      "executed-runner.py:1103-1145",
+      "executed-runner.py:1146-1170"
+    ],
+    "last_writer_assessment": "All retained manifested bytes stable during independent read; finalization order plus parent-reported original terminal51d667/exit0 supports completed original writer within this bounded audit. No independent live writer/global-process absence assertion.",
+    "per_close_syscall_timestamp_or_kernel_trace_archived": false
+  },
+  "preserved_limits": [
+    "This qualifies only one isolated HOST cagentsd check, one HOST lib compile, one actual ELF inventory and nine exact ordinary parents at product73487c8d. It is not a full test suite or whole-PR acceptance.",
+    "Recorded original Popen waits402 and clean phase/final censuses are not a maintained359 descendant-admission ledger, comprehensive original-pidfd kernel closure certificate, or global absence proof. Census-only reaped descendants have no invented direct wait statuses.",
+    "No live target, lock, profile, namespace, process, ELF, tool, environment, registry, account, provider, device or installed state was queried by this audit. Original physical tool identities remain recorded pins, not a fresh tool probe.",
+    "Cargo reported one current-root test artifact with features host and fresh=false; its original recorded SHA is bound to phase argv and recorded direct PIDs. Full ELF bytes and /proc/PID/exe process-image binding are not archived. Successful-source assertions hash ELF before/after each use; this audit cannot independently rehash those historical ELF bytes or exclude every temporal substitution. Existing failed-use posthash limitation remains.",
+    "Source/context checks are discrete original observations. Only before/after output checkpoints and recorded source-child statuses are archived, not a separate raw stdout/stderr log for every intermediate source Git check.",
+    "Fixture-created children and their synchronous assertions remain bounded by the owning outer test; neither the EOF4 table nor codec7 protocol iterations are additive parents. No general fixture RAII, live provider, native UI, user UX, performance or installed/release qualification follows.",
+    "Prior aa352 HOST0/lib101/zero-tests/six-UNRUN negative and unexecuted old HOST8 controller remain immutable, nonadditive history; no old failure is waived or old result transferred.",
+    "Wire147 actual-main127 inspector refusal and whole migration HOLD remain. No composition/promotion/merge or current installed fullSHA is established; main127 EOF pair remains unqualified.",
+    "dcd359/WHOLE/SeedView/managed-proof/native and existing automatic-approval rejection holds are unchanged.",
+    "The source controller full whitespace exit2 is still exactly the two immutable raw Markdown EOF blank-line findings; other source paths were reviewed separately. This audit supplies no full-whitespace pass or waiver.",
+    "Original static source-prepared/UNRUN policy text in summary.limits remains byte-preserved. Dynamic original records now establish only the exact bounded result above, not new whole-head independent review or native acceptance.",
+    "Physical Cfd close alone is not logical resource return or EC acceptance. This reviewer does not allocate a new lane, retry, change original deadlines, repair evidence or perform cleanup."
+  ],
+  "root_preparation_correction": "Initial Root acceptance assertion incorrectly compared original summary product head/tree to controller head/tree; assertion failed before acceptance or messages. Corrected to source_product, checked original runner/plan/controller-review pins separately; no original evidence/result changed.",
+  "C_after_acceptance": "UNALLOCATED; next workload needs separately reviewed exact controller and new authenticated Root grant",
+  "other_lanes": "A/B conservatively occupied2; no fourth lane or parallel cold build",
+  "native_whole_PR_installed_or_merge_qualification": false
+}

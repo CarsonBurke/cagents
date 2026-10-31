@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "kind": "EXACT_FIXED_PR1239_HOST9_REVIEWED_SOURCE_HANDOFF_NO_EXECUTION_GRANT",
+  "source_authorization": "fde8a4f3-14f1-4e27-b468-18ed77e80e93",
+  "executor_session": "b9aa3f1d-524e-49e2-a43c-e5d9acf6bbc6",
+  "product_head": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+  "product_tree": "0ac51f1aa553ddd30fd0e993d25397b08e58172f",
+  "control_head": "d610e0ff6834c8023010645d9c65d9fbdf515061",
+  "control_tree": "3dec0e58099374e3f7f57c01c70da76cfcd2ff54",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control",
+  "argv_DATA_ONLY": [
+    "python3",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/run-packet.py",
+    "--runner-sha256",
+    "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+    "--controller-review",
+    "/tmp/coord-b9-pr1239-d610e0ff-independent-controller-delta-review.json",
+    "--controller-review-sha256",
+    "30254a713641b4fa383d3ccd29c22723a150c23cd198a298bcbd613432ed1c00",
+    "--grant",
+    "ACTUAL_NEW_EC_GRANT_UUID_REQUIRED"
+  ],
+  "runner_sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+  "plan_sha256": "88b0b79fb975089b08d85d2b30a4a6bad1df5d7d5f2f3d9c28db188618695c6d",
+  "source_receipt": {
+    "path": "/tmp/coord-b9-1239-7348-host9-control-evidence/source-receipt.json",
+    "sha256": "a50888e9193246f3756ad4d661039bad196a6eee171a1c957fd30ad535c6a068"
+  },
+  "independent_controller_review": {
+    "path": "/tmp/coord-b9-pr1239-d610e0ff-independent-controller-delta-review.json",
+    "sha256": "30254a713641b4fa383d3ccd29c22723a150c23cd198a298bcbd613432ed1c00",
+    "verdict": "CONTROLLER_SOURCE_CLEAR"
+  },
+  "frozen_packet": {
+    "path": "/tmp/coord-b9-1239-7348-host9-control-evidence/frozen-packet.json",
+    "sha256": "3c71049adadf0fad1bc9392a5853be198dc39ab6d7dd33a89c9b8dd8665435ef"
+  },
+  "source_ready_for_scheduler_review": true,
+  "execution_ready": false,
+  "actual_grant": null,
+  "attempts": 0,
+  "queue_place": null,
+  "planned_counts": {
+    "HOST_checks": 1,
+    "HOST_lib_compiles": 1,
+    "actual_unique_ELF_inventories": 1,
+    "outer_parents": 9,
+    "phases": 12,
+    "retained_first_parents": 8,
+    "appended_parents": 1,
+    "additional_counted_children": 0,
+    "new_EOF_table_cases_nonadditive": 4,
+    "varint_protocol_cases_nonadditive": 7
+  },
+  "bounds": {
+    "packet_cap_seconds": 2400,
+    "HOST_check_seconds": 600,
+    "HOST_compile_seconds": 900,
+    "inventory_seconds": 30,
+    "each_parent_seconds": 90,
+    "nominal_ceiling_sum_seconds": 2340,
+    "clamped_original_remaining": true,
+    "jobs": 2,
+    "newcache_target_coldfallback_extension": false,
+    "source_cleanup_custody_bounds_unchanged": true,
+    "physical_Rust1_93_hashes": "Donor literal pins only, not current tool reads/version probes.",
+    "existing_warm_Ctarget_lock": "Literal paths retained only; no access/readiness/availability probe."
+  },
+  "source_checks": {
+    "AST_JSON_hash_source_inverse_only": true,
+    "controller_import_helper_function_purecase_execution": false,
+    "full_committed_whitespace_exit": 2,
+    "full_committed_whitespace_findings": [
+      "qualification-packets/pr1239-7348/dependencies/test-api-source-review.md:39: new blank line at EOF.",
+      "qualification-packets/pr1239-7348/dependencies/varint-semantic-review.md:38: new blank line at EOF."
+    ],
+    "all_other_files_whitespace_exit": 0,
+    "raw_review_hashes_untrimmed": true,
+    "Rust_source_edits_or_format_required": false,
+    "clean_new_dedicated_WT": true
+  },
+  "prior_source_DATA_assembly_error": {
+    "chunk": "21c59f",
+    "exit": 1,
+    "error": "KeyError: 'launch_argv_DATA_ONLY'",
+    "file_created": false,
+    "runtime_attempt": false,
+    "correction": "Read actual external_launch_DATA_ONLY field; no controller/helper execution or runtime retry."
+  },
+  "holds": [
+    "A/B remain unknown counted two. No C grant, acquisition, availability probe, tool/target/context check or execution authorized by this handoff.",
+    "Old aa352 original HOST check0/libcompile101/zero parents remains CLOSED_ACCEPTED NEGATIVE. Old HOST8 controller0b845a2c remains immutable and unexecuted. No passes transferred.",
+    "Product wire147 preconnection inspector excludes actual-main127. Owner compatibility decision and actual127-specific qualified source/frames remain required; no installed fullSHA, current-main promotion, wholePR migration, native UX or merge readiness.",
+    "Full committed whitespace exit2 solely immutable raw Markdown reviews with extra EOF blank lines; every other path0. No full whitespace PASS or waiver.",
+    "Source preparation only; all twelve phases, nine actual parent outcomes, original process custody/final waits/evidence/Cfdclose/sole RAW/actual return remain UNRUN. Unknown or forced custody remains HOLD.",
+    "No alternate metadata write route, no retry of prior automatic approval rejection; no source publication or heavy trigger authorized."
+  ],
+  "active_disjoint_work": "PR1310 After-only cfgdevelopment native History fixture46241 is separately under independent SOURCE review; no execution or result transfer."
+}
