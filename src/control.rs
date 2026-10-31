@@ -1303,6 +1303,14 @@ impl ControlClient {
         }
     }
 
+    /// Answered during startup recovery, when other requests are refused.
+    pub fn startup_state(&mut self) -> Result<terminal::ipc::StartupState, ControlError> {
+        match self.request_strict(ClientRequest::StartupState)? {
+            ServerResponse::StartupState(state) => Ok(state),
+            response => Err(unexpected_response("daemon startup state", &response)),
+        }
+    }
+
     pub fn shutdown_with_policy(
         &mut self,
         require_empty: bool,
@@ -2080,6 +2088,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
         ServerResponse::Work(_) => "work",
         ServerResponse::ChannelWork(_) => "channel_work",
+        ServerResponse::StartupState(_) => "startup_state",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -5926,6 +5935,120 @@ mod tests {
         assert_eq!(client.proof(), &expected);
         assert!(client.list().unwrap().is_empty());
         server.join().unwrap();
+    }
+
+    /// Exercise the appended startup protocol through the actual shared client,
+    /// rather than injecting a typed UI observation or calling the HOST reducer.
+    #[test]
+    fn startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals() {
+        use crate::terminal::ipc::StartupState;
+
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server_stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let expected = proof("startup-session", "boot", "incarnation");
+        let pinned = expected.clone();
+        let foreign = proof("startup-session", "boot", "replacement-incarnation");
+        let detail = "fixture α: original owner retained";
+        thread::scope(|scope| {
+            let peer = scope.spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(connect.version, PROTOCOL_VERSION);
+                assert_eq!(connect.request_id, 1);
+                assert_eq!(connect.proof, None);
+                assert!(matches!(connect.request, ClientRequest::Connect {
+                    expected_host: None, ref resume
+                } if resume.is_empty()));
+                write_frame(
+                    &mut server_stream,
+                    &connected_envelope(1, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let status = |state| ServerMessage::Response {
+                    response: ServerResponse::StartupState(state),
+                };
+                let replies = [
+                    (pinned.clone(), status(StartupState::Ready)),
+                    (
+                        pinned.clone(),
+                        status(StartupState::Restoring { awaiting: 37 }),
+                    ),
+                    (
+                        pinned.clone(),
+                        status(StartupState::Retained {
+                            detail: detail.into(),
+                        }),
+                    ),
+                    (
+                        pinned.clone(),
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::TerminalUnavailable,
+                            "fixture status unavailable",
+                            false,
+                        )),
+                    ),
+                    (foreign, status(StartupState::Ready)),
+                ];
+                for (index, (proof, message)) in replies.into_iter().enumerate() {
+                    let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    assert_eq!(request.version, PROTOCOL_VERSION);
+                    assert_eq!(request.request_id, index as u64 + 2);
+                    assert_eq!(request.proof, Some(pinned.clone()));
+                    assert!(matches!(request.request, ClientRequest::StartupState));
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof,
+                            message,
+                        },
+                    )
+                    .unwrap();
+                }
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut server_stream)
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            // Drop the original client before joining even when construction
+            // fails. Main-thread assertions run only after the original peer
+            // has returned; scoped unwinding also joins it on an unexpected panic.
+            let observed = (|| -> Result<_, ControlError> {
+                let mut client = ControlClient::from_stream(client_stream)?;
+                let pinned = client.proof().clone();
+                let replies = (0..5).map(|_| client.startup_state()).collect::<Vec<_>>();
+                Ok((pinned, replies))
+            })();
+            peer.join().unwrap();
+            let (pinned, replies) = observed.unwrap();
+            assert_eq!(pinned, expected);
+            assert_eq!(replies.len(), 5);
+            let mut replies = replies.into_iter();
+            assert_eq!(replies.next().unwrap().unwrap(), StartupState::Ready);
+            assert_eq!(
+                replies.next().unwrap().unwrap(),
+                StartupState::Restoring { awaiting: 37 }
+            );
+            assert_eq!(
+                replies.next().unwrap().unwrap(),
+                StartupState::Retained {
+                    detail: detail.into()
+                }
+            );
+            assert!(matches!(replies.next().unwrap(), Err(ControlError::Remote {
+                code: ProtocolErrorCode::TerminalUnavailable, message, retryable: false,
+            }) if message == "fixture status unavailable"));
+            assert!(matches!(
+                replies.next().unwrap(),
+                Err(ControlError::ProofMismatch)
+            ));
+        });
     }
 
     #[test]

@@ -195,7 +195,11 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 128 appends the startup-state inspection request and its response.
+/// A reopened window sends it to the daemon an update just started, so a
+/// same-numbered older daemon that would drop the undecodable frame must be
+/// refused at connection instead.
+pub const PROTOCOL_VERSION: u16 = 128;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -549,6 +553,10 @@ pub enum ClientRequest {
         authority: crate::agent_execution::Authority,
         request: crate::channel_work_api::Request,
     },
+    /// Whether startup recovery finished, is still awaiting original owners,
+    /// or kept them after a failure. Answered during recovery, unlike every
+    /// request that recovery refuses with the same `TerminalUnavailable`.
+    StartupState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -883,6 +891,20 @@ pub enum ServerResponse {
     },
     Work(crate::work::Response),
     ChannelWork(crate::channel_work_api::Response),
+    StartupState(StartupState),
+}
+
+/// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupState {
+    /// Startup finished; ordinary requests are admitted.
+    Ready,
+    /// Adopted original owners whose startup outcome is still pending.
+    Restoring { awaiting: u64 },
+    /// Startup failed and kept original ownership. This does not resolve by
+    /// waiting: only inspection and explicit Close are admitted.
+    Retained { detail: String },
 }
 
 /// Maximum compact inventory rows in one capacity response.

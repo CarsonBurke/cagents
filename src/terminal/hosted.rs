@@ -3244,6 +3244,24 @@ mod tests {
         if !systemd_user_manager_available() {
             return;
         }
+        let capability = Command::new("systemd-run")
+            .args(["--expand-environment=no", "--help"])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("inspect the actual systemd-run client capability");
+        if !capability.status.success() {
+            let error = String::from_utf8_lossy(&capability.stderr);
+            assert!(
+                capability.status.code() == Some(1)
+                    && capability.stdout.is_empty()
+                    && error.trim() == "systemd-run: unrecognized option '--expand-environment=no'",
+                "unexpected systemd-run capability failure: {error}"
+            );
+            eprintln!(
+                "optional scoped-launch assertions not exercised: systemd-run lacks --expand-environment=no"
+            );
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("scope-evidence");
         // Regular files avoid waiting for the background holder to close a pipe.

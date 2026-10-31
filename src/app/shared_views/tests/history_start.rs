@@ -387,6 +387,7 @@ fn begin_history() -> (tempfile::TempDir, Cagents, Scope, Task<Message>) {
         card: CardId::new(),
         title: "Saved History thread".into(),
         open: false,
+        quarantined: false,
         updated_at_unix_ms: 1,
         session: Session {
             id: TerminalId::new(),

@@ -23,7 +23,7 @@ use crate::{
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
-        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight, StartupState,
         TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
         WireTerminalEvent,
     },
@@ -1997,6 +1997,20 @@ impl HostState {
         })
     }
 
+    /// A retained failure outranks custody still awaiting its outcome: it is
+    /// never cleared, so waiting on the remaining custody cannot finish startup.
+    pub(super) fn startup_state(&self) -> StartupState {
+        match &self.startup_recovery {
+            Some(detail) => StartupState::Retained {
+                detail: detail.clone(),
+            },
+            None if self.startup_custody.is_empty() => StartupState::Ready,
+            None => StartupState::Restoring {
+                awaiting: self.startup_custody.len() as u64,
+            },
+        }
+    }
+
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
         if self.startup_recovery.is_none() {
             self.startup_recovery = Some(message);
@@ -3074,6 +3088,32 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
 /// [`restore_upgrade_from`].
 const RESTORE_TERMINATED: &str = "daemon termination was requested during upgrade restore";
 
+/// The one path that restores a checkpointed chat. Each chat takes exactly
+/// one: a second attempt on a retained conversation finds the actor the first
+/// attempt reattached and refuses it, failing the whole restore.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatRestore {
+    /// A managed Codex CLI, whose thread server must exist before its TUI.
+    CodexListener,
+    /// A provider that outlived the previous daemon. It is reattached, and a
+    /// refusal is that conversation's problem alone; it is never relaunched.
+    Retained,
+    /// Relaunched from its checkpointed launch once carried terminals return.
+    Relaunch,
+}
+
+impl ChatRestore {
+    fn of(chat: &crate::upgrade::handoff::Chat) -> Self {
+        if chat.source.native_continuity.retains_provider() {
+            Self::Retained
+        } else if super::chat::owns_codex_listener(&chat.source) {
+            Self::CodexListener
+        } else {
+            Self::Relaunch
+        }
+    }
+}
+
 /// Replays a checkpoint, abandoning the replay as soon as termination is
 /// requested.
 ///
@@ -3116,7 +3156,7 @@ fn restore_upgrade_from(
     if checkpoint
         .chats
         .iter()
-        .any(|chat| !chat.source.native_continuity.retains_provider())
+        .any(|chat| ChatRestore::of(chat) != ChatRestore::Retained)
     {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
@@ -3129,7 +3169,7 @@ fn restore_upgrade_from(
     for chat in &checkpoint.chats {
         // A private holder authenticates the exact still-running server. Its
         // presence is the purpose of adoption, not permission to relaunch it.
-        if chat.source.native_continuity.retains_provider() {
+        if ChatRestore::of(chat) == ChatRestore::Retained {
             continue;
         }
         let terminal = TerminalSession {
@@ -3171,9 +3211,7 @@ fn restore_upgrade_from(
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source)
-                && !chat.source.native_continuity.retains_provider()
-            {
+            if ChatRestore::of(chat) == ChatRestore::CodexListener {
                 super::chat::restore_upgrade(host, chat)?;
             }
         }
@@ -3224,7 +3262,7 @@ fn restore_upgrade_from(
         // thread's rollout, is that conversation's problem to report, not a
         // reason to keep every other session and the daemon itself down.
         for chat in &checkpoint.chats {
-            if !chat.source.native_continuity.retains_provider() {
+            if ChatRestore::of(chat) != ChatRestore::Retained {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -3328,7 +3366,7 @@ fn restore_upgrade_from(
                 .map_err(|error| error.message)?;
         }
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source) {
+            if ChatRestore::of(chat) != ChatRestore::Relaunch {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -4993,6 +5031,46 @@ mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
+        use crate::terminal_ipc::{ClientRequest, ServerResponse};
+        let host = Arc::new(HostLock::new(test_host()));
+        let inspect =
+            || match crate::host::client::process_request(&host, 0, ClientRequest::StartupState)
+                .unwrap()
+                .0
+            {
+                ServerResponse::StartupState(state) => state,
+                response => panic!("unexpected startup state response: {response:?}"),
+            };
+        let refused = || {
+            crate::host::client::process_request(&host, 0, ClientRequest::BuildInfo)
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(inspect(), StartupState::Ready);
+
+        let custody = TerminalId::new();
+        host.lock().unwrap().startup_custody.insert(custody);
+        assert_eq!(inspect(), StartupState::Restoring { awaiting: 1 });
+        assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
+
+        let detail = "Upgrade restore retained original ownership: fixture restore failed";
+        host.lock().unwrap().retain_startup_recovery(detail.into());
+        let retained = StartupState::Retained {
+            detail: detail.into(),
+        };
+        assert_eq!(inspect(), retained);
+        // Custody settling afterwards does not end a retained recovery, and a
+        // later failure does not replace the original reason.
+        host.lock().unwrap().startup_custody.remove(&custody);
+        host.lock()
+            .unwrap()
+            .retain_startup_recovery("a later failure".into());
+        assert_eq!(inspect(), retained);
+        assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
     }
 
     #[test]
@@ -6661,6 +6739,12 @@ for line in sys.stdin:
                     let state = failed.lock().unwrap();
                     assert_eq!(state.terminals.len(), 1);
                     assert_eq!(state.startup_recovery(), Some(failure.as_str()));
+                    assert_eq!(
+                        state.startup_state(),
+                        StartupState::Retained {
+                            detail: failure.clone()
+                        }
+                    );
                     let descriptor = state.descriptor(0, source.id).unwrap();
                     assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
                     assert_eq!(descriptor.session.launch, source.launch);

@@ -31,6 +31,10 @@ use cagents::repository::{
     ValidatedRefName,
 };
 
+#[cfg(unix)]
+#[path = "support/owned_hook_pipe_holder.rs"]
+mod owned_hook_pipe_holder;
+
 /// Applies configuration isolation and a fixed identity to every command,
 /// including the ones the service builds itself.
 struct IsolatedExecutor(SystemProcessExecutor);
@@ -833,45 +837,23 @@ fn a_complete_rename_can_be_staged_unstaged_and_discarded() {
     assert!(!fixture.work().join("new-name.txt").exists());
 }
 
-/// A `pre-commit` hook can leave a process outside Git's process group holding
-/// the stdout and stderr the executor reads. The process group signalled at the
-/// deadline cannot reach it, so nothing will ever close those pipes — and the
-/// caller is holding this repository's mutation lock while it waits.
-///
-/// The failure mode being ruled out is a permanent hang, so this test's own
-/// patience is what fails: it never asserts that the command was fast, only
-/// that it produced a result at all and gave the lock back.
+/// A real pre-commit hook transfers its actual stdout/stderr writers to a
+/// directly owned child outside Git's process group. The child keeps the pipe
+/// EOF hazard alive through both product oracles; no timer releases it early.
+/// This covers pipe draining and mutation-lock release, not hook genealogy.
 #[cfg(unix)]
-#[test]
-fn a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Some(fixture) = Fixture::new() else {
-        return;
-    };
+fn exercise_owned_hook_pipes(injection: Option<HookFailurePoint>) -> HookFixtureOutcome {
+    let fixture = Fixture::new().expect("the owning hook regression requires actual Git");
     fixture.write("a.txt", b"one\n");
     fixture.git_in_work(&["add", "-A"]);
     fixture.commit("initial");
-
-    let holder = fixture.root.path().join("holder.pid");
     let hooks = fixture.work().join(".git/hooks");
     fs::create_dir_all(&hooks).expect("hooks directory");
-    let hook = hooks.join("pre-commit");
-    fs::write(
-        &hook,
-        format!(
-            "#!/bin/sh\n\
-             setsid sh -c 'printf %s \"$$\" > \"{}\"; exec sleep 300' &\n\
-             exit 0\n",
-            holder.display()
-        ),
-    )
-    .expect("write hook");
-    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("hook is executable");
-
+    let mut holder =
+        owned_hook_pipe_holder::Holder::start(fixture.root.path(), &hooks.join("pre-commit"))
+            .expect("start original owned hook pipe holder");
     fixture.write("a.txt", b"two\n");
     fixture.git_in_work(&["add", "-A"]);
-
     let command = fixture
         .service()
         .commit_command(&CommitRequest {
@@ -879,53 +861,177 @@ fn a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock() {
             message: "hooked".into(),
         })
         .expect("commit command")
-        // Long enough that the hook certainly ran and detached, short enough
-        // that the test does not sit through the production timeout.
         .timeout(Duration::from_secs(2));
-
     let locks = Arc::new(MutationLocks::new());
     let common = fixture.work().join(".git");
+    let cancellation = CancellationToken::new();
     let (report, results) = mpsc::channel();
-    {
+    let (finished, completions) = mpsc::channel();
+    let command_thread = {
         let locks = Arc::clone(&locks);
         let common = common.clone();
+        let cancellation = cancellation.clone();
         thread::spawn(move || {
             let guard = locks.lock(&common);
-            let outcome = IsolatedExecutor(SystemProcessExecutor)
-                .execute(&command, &CancellationToken::new());
+            let outcome = IsolatedExecutor(SystemProcessExecutor).execute(&command, &cancellation);
             drop(guard);
             let _ = report.send(outcome.err().map(|failure| failure.kind));
-        });
+            let _ = finished.send(());
+        })
+    };
+    let mut lock_thread = None;
+    let (lock_finished, lock_completions) = mpsc::channel();
+    let oracle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        holder
+            .holding()
+            .expect("actual hook transferred both capture writers");
+        if injection == Some(HookFailurePoint::AfterHandoff) {
+            panic!("injected failure after actual hook handoff");
+        }
+        let kind = results
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the commit never returned while its capture writers remained open");
+        assert_eq!(kind, Some(ProcessFailureKind::TimedOut));
+        holder
+            .snapshot()
+            .expect("original writers still held after actual timeout");
+        if injection == Some(HookFailurePoint::AfterTimeout) {
+            panic!("injected failure after original command timeout");
+        }
+        let (acquired, acquisitions) = mpsc::channel();
+        lock_thread = Some(thread::spawn(move || {
+            let guard = locks.lock(&common);
+            let _ = acquired.send(());
+            drop(guard);
+            let _ = lock_finished.send(());
+        }));
+        acquisitions
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the mutation lock was still held after the command returned");
+        holder
+            .snapshot()
+            .expect("original writers still held after lock reacquisition");
+    }));
+    // Preserve the original oracle failure before cancellation/real pipe EOF
+    // can unblock a regressed reader. Cleanup cannot turn that failure into a pass.
+    if oracle.is_err() {
+        cancellation.cancel();
     }
-    let kind = results
-        .recv_timeout(Duration::from_secs(60))
-        .expect("the commit never returned while a hook's child held its pipes");
-    assert_eq!(kind, Some(ProcessFailureKind::TimedOut));
-    assert!(
-        holder.is_file(),
-        "the hook never launched its detached child, so the hazard was not exercised"
-    );
-
-    let (acquired, acquisitions) = mpsc::channel();
-    thread::spawn(move || {
-        let _guard = locks.lock(&common);
-        let _ = acquired.send(());
-    });
-    acquisitions
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the mutation lock was still held after the command returned");
-
-    // The sleeper is in its own session precisely so that nothing this service
-    // signals can reach it, which leaves the cleanup to the test.
-    if let Ok(text) = fs::read_to_string(&holder)
-        && let Ok(group) = text.trim().parse::<u32>()
-    {
-        let _ = Command::new("kill")
-            .arg("-9")
-            .arg("--")
-            .arg(format!("-{group}"))
-            .output();
+    let holder_cleanup = holder.finish();
+    let command_cleanup = match completions.recv_timeout(Duration::from_secs(10)) {
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => command_thread
+            .join()
+            .map_err(|_| "original command worker panicked"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Retain the entire private fixture through the original join,
+            // even if it must HOLD. Late settlement cannot erase this failure.
+            let _ = command_thread.join();
+            Err("original command worker cleanup exceeded its deadline")
+        }
+    };
+    let lock_cleanup = if let Some(worker) = lock_thread {
+        match lock_completions.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                worker.join().map_err(|_| "original lock worker panicked")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Keep original lock ownership and fixture context until the
+                // worker settles; there is no thread cancellation fallback.
+                let _ = worker.join();
+                Err("original lock worker cleanup exceeded its deadline")
+            }
+        }
+    } else {
+        Ok(())
+    };
+    HookFixtureOutcome {
+        oracle,
+        holder_cleanup,
+        command_cleanup,
+        lock_cleanup,
     }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookFailurePoint {
+    AfterHandoff,
+    AfterTimeout,
+}
+
+#[cfg(unix)]
+struct HookFixtureOutcome {
+    oracle: std::thread::Result<()>,
+    holder_cleanup: Result<(), String>,
+    command_cleanup: Result<(), &'static str>,
+    lock_cleanup: Result<(), &'static str>,
+}
+
+#[cfg(unix)]
+impl HookFixtureOutcome {
+    fn require_cleanup(&self) {
+        assert!(
+            self.holder_cleanup.is_ok(),
+            "holder: {:?}",
+            self.holder_cleanup
+        );
+        assert!(
+            self.command_cleanup.is_ok(),
+            "command: {:?}",
+            self.command_cleanup
+        );
+        assert!(self.lock_cleanup.is_ok(), "lock: {:?}", self.lock_cleanup);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock() {
+    let outcome = exercise_owned_hook_pipes(None);
+    if let Err(payload) = outcome.oracle {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "failure cleanup: holder={:?}, command={:?}, lock={:?}",
+            outcome.holder_cleanup,
+            outcome.command_cleanup,
+            outcome.lock_cleanup
+        );
+        std::panic::resume_unwind(payload);
+    }
+    outcome.require_cleanup();
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff() {
+    for (injection, expected) in [
+        (
+            HookFailurePoint::AfterHandoff,
+            "injected failure after actual hook handoff",
+        ),
+        (
+            HookFailurePoint::AfterTimeout,
+            "injected failure after original command timeout",
+        ),
+    ] {
+        let outcome = exercise_owned_hook_pipes(Some(injection));
+        outcome.require_cleanup();
+        let payload = outcome
+            .oracle
+            .expect_err("the deliberate oracle failure must survive cleanup");
+        assert_eq!(payload.downcast_ref::<&str>().copied(), Some(expected));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_hook_pipe_holder_settles_when_no_hook_handoff_starts() {
+    let root = tempfile::tempdir().expect("private holder fixture");
+    let mut holder = owned_hook_pipe_holder::Holder::start(root.path(), &root.path().join("hook"))
+        .expect("original holder ready before any Git command");
+    holder
+        .finish()
+        .expect("control EOF settles and reaps the original child");
 }
 
 /// A discard request is built from a snapshot and then sits in front of the
