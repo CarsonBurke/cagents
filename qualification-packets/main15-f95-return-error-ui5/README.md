@@ -1,0 +1,17 @@
+# Main15 f95 UI5 bounded source qualification
+
+This packet binds the published assembled product `f95df2da80a23b2a50c8c2304e19805423ca7da3` and its real parent b8. It supplies source for independent controller review, not an execution grant. Current tools, source context, emitted ELF, inventory N, runtime results and resource grant are unknown.
+
+UI5 has nine serial command phases: isolated CLI check300, isolated browserless UI check450, UI library compile900, inventory30, and five exact singleton parents90 each. The sum2130 stays within the original2400-second workload ceiling. HOST check belongs only to the separate HOST16 packet.
+
+Both packets use separate implementation graphs, fresh actual inventory, captured pretty output and the default outer Rust scheduler. Each selected ordinary invocation must prove1P0F0I0M and actual N-1 filtered. Helpers, nested controls, supplied sockets, private processes and Widget focus operations add no parent credit. The original emitted library ELF is the only test executable; no helper/reexec neighbor is adopted.
+
+The five UI parents are inherited-Agent-compatible component tests. The owning two now consume only test-local Tab/Shift-Tab Widget focus operations; production provider/cleanup/save/recheck futures remain dropped. The three adapted tests use synthetic callbacks. In particular typed Closed without a session writer retains FlushFailed and unresolved custody; the Codex test name does not establish physical CLI teardown. HOST fixtures may actually create private PTYs, /bin/cat, files, threads or scripted provider processes during a later admitted run. They are not inert arithmetic, genuine User authorization, or commercial provider evidence.
+
+The product contains55 changed paths and76 ahead commits versus main442; only three consumer leaves differ from API615e and the direct f95 correction changes two leaves versus b8. This packet does not qualify that inherited stack, native Before/After WebPs, realistic responsiveness, genuine User5, FULL52, WHOLE or1933. The retained-terminal reexec neighbor remains explicitly unqualified.
+
+The additive reconciliation preserves original HOST DATA and replaces no history: canonical inventory is `ELF --list --color=never`; each exact selected invocation is `ELF NAME --exact --format=pretty --color=never`. No runtime-equivalence or old count/result transfer is claimed. Natural HOME/XDG and opaque inherited authority remain unchanged and unread during authoring. Required absent fixture/capture/scheduler/helper names are checked prospectively by name, never scrubbed or synthesized.
+
+Canonical9004 retains unproven adopted survivors without signalling. Original direct-child waits/pidfds, sticky failures, source/context checks, safe relative archive parents and the full3790-byte C-close block are conserved. Unknown custody retains indefinite HOLD; the workload ceiling is not a promised finite release. Full summary, original output, ledgers and SHA256SUMS remain complete; terminal output alone is compact. Full ELF bytes/every-child/kernel/embedded-version proof is not claimed; a failed invoke can bypass its subsequent ELF hash.
+
+The manifest excludes its own hash. Controller head/tree and future genuine frozen review are bound externally to avoid a self-hash cycle. The prereview invocation is explicitly NOT SUBMITTABLE; after actual code and conservation reviews, Root constructs a separate review-bearing handoff with only grant slot5 NULL. All Rust tests and native evidence remain unrun on f95.

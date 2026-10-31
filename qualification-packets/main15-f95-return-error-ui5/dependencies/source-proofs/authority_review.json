@@ -1,0 +1,173 @@
+{
+  "affected_invariant_checks": [
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:13317",
+        "src/app/chat_ui.rs:13826"
+      ],
+      "assessment": "No delta edits the proof-gated close helper or async worker: captured C1/D connect_control, complete equal expected/connected/returned proof and nonnil nonce, only close_returned_terminal(id,nonce). ContinueClose funnels into this path; no Arc preclose, inventory, attach, retained fallback or id-only sweep added.",
+      "invariant": "Some-issued-only cleanup"
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:13860"
+      ],
+      "assessment": "The delta leaves exact full binding/stage match and typed Closed-only success unchanged. Active/Unknown/Err retain custody. Old attempts cannot replace fresh attempts; the new actual refusal control directly covers this current reducer.",
+      "invariant": "Typed Closed and callback identity"
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:13934",
+        "src/app/chat_ui.rs:13993",
+        "src/app/chat_ui.rs:14050"
+      ],
+      "assessment": "These functions are not changed by this delta. Closed remains irreversible; persistence retry does not redispatch cleanup. Actual writer barrier precedes original-R authenticated supplied-client nonce ACK. Exact result retires only its own record, retaining other issued records; no direct legacy retirement path added. Source-only conservation, not execution or physical proof.",
+      "invariant": "Closed -> conversion snapshot -> flush -> original R nonce ACK"
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:13347",
+        "src/app/chat_ui.rs:13487",
+        "src/app/chat_ui.rs:13720",
+        "src/app/chat_ui.rs:13826",
+        "src/app/chrome_ui.rs:1789",
+        "src/app/chrome_ui.rs:2606"
+      ],
+      "assessment": "All unretired issued/conflict records remain in existing unresolved/window guards. The new keyboard ring consumes the same filtered action IDs as mounted rows; pending/blocked rows have none. Existing orphan Close still requires Held plus no linked queued Close and no owner, captures D once, and keeps D for retry. ContinueClose requires an existing queued owner and does not relax current-q refusal. app.rs is byte-identical to b8, retaining generic None ACK issued-id exclusions and window guard. Full UX behavior and broader conservation are separately reviewed.",
+      "invariant": "Visible held custody / q / orphan / legacy exclusions"
+    }
+  ],
+  "first_valid_C1_after_B": {
+    "anchors": [
+      "src/app/chat_ui.rs:13638",
+      "src/app/chat_ui.rs:13648",
+      "src/app/chat_ui.rs:13651",
+      "src/app/chat_ui.rs:13672",
+      "src/app/chat_ui.rs:13734",
+      "src/app/chat_ui.rs:7495",
+      "src/app/chat_ui.rs:31759"
+    ],
+    "continuation": "Held plus existing queued owner exposes a separate ContinueClose purpose through the existing owner-keyed RetryCleanup route. The reducer revalidates stage/queued owner and invokes the existing begin_issued_close with that retained caller. It neither captures D nor substitutes C2/R. begin_issued_close still refuses queued current q and permits only the exact issued id+nonce RPC.",
+    "custody_predicate": "first_bound requires valid complete original/returned proof, nonnil nonce, exact captured Target, first still-pending result with no prior Err/first issuance, no nonce conflict, and the exact active operation UUID. Only then is the already captured queued C1 cloned into the issued record, independently of whether the current presentation has changed.",
+    "meaningful_controls": "issued_first_some_after_replacement_controls runs both captured shared origin and captured origin=None paths, live !exited Arc and actual Switch, C1 then C2, real model View.apply/Read recipe-B replacement, then a first valid Some with no prior Err. It asserts full tuple/source/R/C1/Arc retention, no generic pending handoff or conversion, and mounted ContinueClose reuses C1. Typed Closed injection leaves full B open, order/focus, editor and readable original runtime intact. For the origin=None case A is admitted through the actual model reducer before B without rewriting captured origin/context. All are unrun component controls.",
+    "no_transfer": "Late-after-firstErr, duplicate, conflicting nonce, wrong proof/Target, missing context or a replaced active operation cannot satisfy first_bound and cannot acquire C1. R and orphan D are not stored in native_returns.close. linked_queued_close remains true when an old Close exists even for an ineligible late result, preventing an orphan-D bypass.",
+    "separate_presentation_predicate": "current additionally requires native_return_presentation_matches. A first valid result after accepted B is Held and does not return an automatic publication/cleanup-eligible id from retain_issued_return. The native/source/Arc/full A presentation and R remain the captured context; B is not read as cleanup authority or replaced to manufacture eligibility.",
+    "status": "SOURCE_CLEAR_WITH_EXISTING_Q_AND_FULL_OUTCOME_HOLDS"
+  },
+  "fresh_two_parent_caller_classification": {
+    "actual_N": null,
+    "actual_artifact": null,
+    "actual_caller_environment": "UNKNOWN_UNREAD",
+    "actual_grant": null,
+    "actual_results": null,
+    "actual_run": null,
+    "anchors": [
+      "src/app/chat_ui.rs:32332",
+      "src/app/chat_ui.rs:32603",
+      "src/app/chat_ui.rs:30763",
+      "src/app/chat_ui.rs:31652"
+    ],
+    "classification": "ORDINARY_INHERITED_AGENT_SOURCE_TEST_COMPATIBLE; NO_GENUINE_USER_WRAPPER_REQUIRED_FOR_THESE_COMPONENT_PARENTS",
+    "fresh_assessment": "The changed helpers still use explicit for_test session authorities, local supplied sockets and synthetic frames; no actual environment assertion, token removal, User fabrication, authority proxy or normal-daemon lookup is introduced. Production capture reads whatever caller is inherited in a later admitted execution; we did not read that environment. The only newly consumed Task stream is the test-local Tab/Shift-Tab Widget focus operation, with a non-Widget panic guard. Cleanup/provider/save/recheck Tasks remain dropped and completions/barriers synthetic. Thus the older blanket all-Tasks-dropped wording must not be copied to f95; the narrower focus-only exception is explicit.",
+    "scheduler": "Default outer Rust scheduler; no --test-threads=1, wrapper or context substitution. Two exact UI-lib owning selectors, nested controls nonadditive.",
+    "selectors": [
+      "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+      "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody"
+    ]
+  },
+  "inputs": [
+    {
+      "bytes": 14616,
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-b8-bounded-source-correction-freeze-v1.json",
+      "sha256": "24ab6dc0d43d9ce328cf4e9cf445a9f1ea6405038a93201b175bf88d1fc84a54"
+    },
+    {
+      "bytes": 14391,
+      "path": "/tmp/held-saved-scope-fw16-evidence/b8ebb9ca-issued-return-independent-authority-caller-source-review-v1.json",
+      "sha256": "5cd3b4a89a2f7cdd97c70e6009fc15ad6f47ce0413af8d78db5afc8a972e1e01"
+    },
+    {
+      "bytes": 9506,
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-615e-consumer-plan-v4-independent-authority-correction-review-v1.json",
+      "sha256": "8fa66c0fb4595394e545f1526675f3e330caf272e44f000b3e5035f54ea8565a"
+    }
+  ],
+  "limits": {
+    "PR1933": "NEVER_MERGE",
+    "actions": "Static immutable Git/JSON/hash reads only. No source edits, imports/eval/reviewed Task execution, Cargo/tests/formatter/build/native/provider/authority/env/account/process/cache/target/resource/API probes, public writes or new worker. Sole mutation is this exclusive0444 receipt.",
+    "actual_context_inventory_grant_artifact_N_run_results": null,
+    "kind": "Bounded exact correction source review; not a repeat of API14 physical-effect review or whole-product UX/conservation review.",
+    "merge_ready": false,
+    "old_history": "b8 remains the immutable blocked/unrun source reviewed in5cd3b4a8. The new source resolution does not relabel it or transfer aeb/d26/API/mock/native/test results.",
+    "qualified": false,
+    "queued": false,
+    "remaining_holds": "Original User5/native/WHOLE/qclosed/general/conflict full-outcome holds remain. No source-clear statement grants execution, adoption, queue, publication, merge or resources.",
+    "tests_compilation_native": "UNRUN; source/formatter claims do not establish Rust type correctness or runtime behavior."
+  },
+  "remaining_source_findings_in_scope": [],
+  "resolved_findings": [
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:13604",
+        "src/app/chat_ui.rs:31820",
+        "src/app/chat_ui.rs:31838",
+        "src/app/chat_ui.rs:32603"
+      ],
+      "causal_negatives": "The new shared/nonshared helper creates the actual live Switch operation and immutable C1, then sends nil and unknown nonnil IDs with the matching live Target, plus the real operation with a wrong Target. Assertions retain native pending/first_error/first_issued/none attempt, exact C1, Returning close_requested, empty issued/conflict/cleanup ledgers and original shared error/owner state. These are source-authored controls, not executed results.",
+      "correction": "native_result_error now returns false for every missing operation, including nil, before any pending state mutation. A present context also requires exact Target and still-pending result. The HandoffFinished reducer exits when this returns false, so matching a live Target alone no longer selects and refuses a different retained operation.",
+      "id": "B8-AUTH-01",
+      "matching_positive": "The same two parents retain the real-operation current-A Err/None continuation and actual framed-refusal reducer controls. The guard only rejects absent/mismatched/nonpending operation; the existing matching pending operation still writes its first Err and follows its captured lawful owner path. No missing-owner or User fallback was added.",
+      "status": "RESOLVED_AT_SOURCE_LEVEL_UNRUN"
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:30763",
+        "src/app/chat_ui.rs:30880",
+        "src/app/chat_ui.rs:31259",
+        "src/app/chat_ui.rs:31299",
+        "src/app/chat_ui.rs:31305",
+        "src/app/chat_ui.rs:31319"
+      ],
+      "causal_assertions": "The owning reducer then retains returned nonce/session, captured full source and exact C1 id/authentication, records the actual refusal string separately as cleanup_error, and enters CloseFailed. Mounted Notices Tab/Enter produces RetryCleanup(C1); after the reducer processes that action a fresh attempt is asserted. A stale previous Closed callback is ignored, and only the matching later typed Closed advances. ACK, wrong-host zero-request and supplied Authenticate framing controls remain.",
+      "correction": "The supplied-client component now returns the exact ReturnedTerminal and actual Result<TerminalCloseResult,String> for Close. The parent asserts its tuple equals the first current binding, selects the actual refused result, and passes that result into IssuedCloseFinished(first.clone(), refusal).",
+      "id": "B8-ORACLE-02",
+      "limit": "The peer is a scripted UnixStream component, with synthetic caller data and Accepted/Closed frames. It is not actual Host permission, actual user authority, a provider/worker teardown or durable writer evidence.",
+      "status": "RESOLVED_IN_AUTHORED_COMPONENT_ORACLE_UNRUN"
+    }
+  ],
+  "reviewer": "/root/authority_regressions",
+  "schema": "main15-f95df2da-issued-return-independent-authority-caller-correction-source-review-v1",
+  "source": {
+    "API_composition_parent": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+    "changed_paths": [
+      "src/app/chat_ui.rs",
+      "src/app/chrome_ui.rs"
+    ],
+    "files": {
+      "src/app.rs": {
+        "blob": "be8e325257d237b5bd13ae14890591fea3b0ab0e",
+        "bytes": 1390648,
+        "sha256": "de2b68f872f4195e87a3cbdee1fa846ab2655726cf9e8540141ec0701f5aec4c",
+        "unchanged_from_parent": true
+      },
+      "src/app/chat_ui.rs": {
+        "blob": "77681ebe5c3050ab212be626ed487e0d63618ba9",
+        "bytes": 1418988,
+        "sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+        "unchanged_from_parent": false
+      },
+      "src/app/chrome_ui.rs": {
+        "blob": "e94db20b119745f12f5e3d4069ff8fe25154be03",
+        "bytes": 160413,
+        "sha256": "651091245803497ff0705a287d952b839137c4cf842675617d4752e26eb0272c",
+        "unchanged_from_parent": false
+      }
+    },
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "method": "Immutable Git object/source diffs plus sealed JSON and hash reads. No reviewed code or Task evaluated.",
+    "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6"
+  },
+  "utc": "2026-10-31T16:26:03.428300+00:00",
+  "verdict": "CLEAR_FOR_THE_BOUNDED_AUTHORITY_CORRECTNESS_AND_CALLER_SOURCE_DELTA; B8_AUTH_01_AND_ORACLE_02_RESOLVED_AT_SOURCE_LEVEL; EXECUTION_UNRUN"
+}

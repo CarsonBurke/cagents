@@ -1,0 +1,66 @@
+{
+  "caller_limits": "UI owning2 consume only test-local Widget Tab/ShiftTab focus operations; production cleanup/provider/save/recheck futures remain dropped. Adapted3 use synthetic completions; typed Closed without writer leaves FlushFailed/unresolved custody. HOST fixtures may create private PTY /bin/cat/process/thread/file/scripted providers. No genuine User authority, commercial provider, physical cleanup or native proof.",
+  "graph": [
+    "ui"
+  ],
+  "kind": "SOURCE_PINNED_ORDINARY_CALLER_MAP_NOT_EXECUTED_PARENT_INVENTORY",
+  "owning_passes_max": 5,
+  "parents": [
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+      "definition_line": 32332,
+      "expected_stdout_child_results": 0,
+      "name": "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+      "ordinary_source_declaration": true,
+      "source": "src/app/chat_ui.rs",
+      "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+      "definition_line": 32603,
+      "expected_stdout_child_results": 0,
+      "name": "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+      "ordinary_source_declaration": true,
+      "source": "src/app/chat_ui.rs",
+      "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+      "definition_line": 24100,
+      "expected_stdout_child_results": 0,
+      "name": "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+      "ordinary_source_declaration": true,
+      "source": "src/app/chat_ui.rs",
+      "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+      "definition_line": 24587,
+      "expected_stdout_child_results": 0,
+      "name": "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+      "ordinary_source_declaration": true,
+      "source": "src/app/chat_ui.rs",
+      "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+      "definition_line": 24692,
+      "expected_stdout_child_results": 0,
+      "name": "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
+      "ordinary_source_declaration": true,
+      "source": "src/app/chat_ui.rs",
+      "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+    }
+  ],
+  "product": {
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15"
+  }
+}

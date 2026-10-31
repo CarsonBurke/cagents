@@ -1,0 +1,25 @@
+{
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source/qualification-packets/main15-f95-return-error-ui5/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "337258965c34ab95759552e27b63682751468e622cd9781ddc553c6336ec7474",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source",
+  "execution_authorized": false,
+  "kind": "NOT_SUBMITTABLE_PRE_REVIEW_SOURCE_TEMPLATE",
+  "review_ABI": {
+    "controller_identity": "EXTERNAL_POSTCOMMIT",
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "review": "PENDING_GENUINE_FROZEN_CODE_REVIEW",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6"
+  }
+}

@@ -1,0 +1,164 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "deferred_unqualified": {
+    "boundary": "Needs separate same-head helper, caller-preservation and custody qualification. No helper path override, invocation, authority clearing/downgrade or role change is proposed here. It remains an explicitly unqualified affected neighbor.",
+    "facts": "retained_turn_final_action462 requires CAGENTS_TEST_RETAINED_ACTOR_HELPER463 and reexecs current test binary487 with --exact/--nocapture and env_clear488. It is not an ordinary no-child-results parent.",
+    "selected": false,
+    "selector": "host::chat::retained_actor_tests::retained_terminal_handoff_proves_original_console_cleanup",
+    "source": "src/host/chat/retained_actor_tests.rs:448"
+  },
+  "delivery_scope": "Full inherited55-path/76-commit stack vs main442; consumer layer3paths vs615e; directf95 correction2paths vsb8. Only this bounded task is proposed; no whole-stack/User5/FULL52/native/WHOLE qualification.",
+  "instruction_source": {
+    "bytes_flags_changed_by_author": false,
+    "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+    "index_flag": "H AGENTS.md",
+    "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+    "latest_user_AGENTS_instructions_followed": true,
+    "variance": true
+  },
+  "kind": "CURRENT_F95_UI5_SOURCE_MAP_NOT_APPROVAL",
+  "product": {
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15"
+  },
+  "runtime_admission": {
+    "execution_authorized": false,
+    "helper_binding": null,
+    "state": "MAIN15_F95_UI5_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT"
+  },
+  "selected_caller_source_contract": {
+    "caller_limits": "UI owning2 consume only test-local Widget Tab/ShiftTab focus operations; production cleanup/provider/save/recheck futures remain dropped. Adapted3 use synthetic completions; typed Closed without writer leaves FlushFailed/unresolved custody. HOST fixtures may create private PTY /bin/cat/process/thread/file/scripted providers. No genuine User authority, commercial provider, physical cleanup or native proof.",
+    "graph": [
+      "ui"
+    ],
+    "kind": "SOURCE_PINNED_ORDINARY_CALLER_MAP_NOT_EXECUTED_PARENT_INVENTORY",
+    "owning_passes_max": 5,
+    "parents": [
+      {
+        "actual_caller_runtime": null,
+        "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+        "definition_line": 32332,
+        "expected_stdout_child_results": 0,
+        "name": "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+        "ordinary_source_declaration": true,
+        "source": "src/app/chat_ui.rs",
+        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+      },
+      {
+        "actual_caller_runtime": null,
+        "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+        "definition_line": 32603,
+        "expected_stdout_child_results": 0,
+        "name": "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+        "ordinary_source_declaration": true,
+        "source": "src/app/chat_ui.rs",
+        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+      },
+      {
+        "actual_caller_runtime": null,
+        "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+        "definition_line": 24100,
+        "expected_stdout_child_results": 0,
+        "name": "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+        "ordinary_source_declaration": true,
+        "source": "src/app/chat_ui.rs",
+        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+      },
+      {
+        "actual_caller_runtime": null,
+        "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+        "definition_line": 24587,
+        "expected_stdout_child_results": 0,
+        "name": "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+        "ordinary_source_declaration": true,
+        "source": "src/app/chat_ui.rs",
+        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+      },
+      {
+        "actual_caller_runtime": null,
+        "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT",
+        "definition_line": 24692,
+        "expected_stdout_child_results": 0,
+        "name": "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
+        "ordinary_source_declaration": true,
+        "source": "src/app/chat_ui.rs",
+        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+      }
+    ],
+    "product": {
+      "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+      "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+      "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15"
+    }
+  },
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "crates/browser-import/Cargo.toml": "f5b6050089d17dbbb3f939c2dfd064c9e5b79a2c4e72d621c6d9c8083ddb0158",
+    "crates/ceditor/Cargo.toml": "ec03c70fe7f2151744e68208837dbe84e589b4940e0772c03427146be1237b76",
+    "crates/iced-contracts/Cargo.toml": "2b52fa79d91cb859f66855d5ea3ff8b01cb7ff9b0da1d12dd56daea0942c4d94",
+    "scripts/qualification/process_custody.py": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+    "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+    "src/app.rs": "de2b68f872f4195e87a3cbdee1fa846ab2655726cf9e8540141ec0701f5aec4c",
+    "src/app/chat_ui.rs": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+    "src/app/chrome_ui.rs": "651091245803497ff0705a287d952b839137c4cf842675617d4752e26eb0272c",
+    "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+    "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+    "src/chat.rs": "bcba67f4e68578ebb07fb41d304725151a0829488151485c5a7e349377698967",
+    "src/chat/client.rs": "2cbef29622dc3c6ee4f2af8e4d08705bed44948df90eb1a4bc6b285151ce4096",
+    "src/chat/protocol.rs": "26e6653206834540155a97b0a7fcb5be0b76285563e9baaa2bbd7e4d094d0b30",
+    "src/chat/protocol/claude.rs": "ffa169629039fe3e5182add62d2c0e96ed997d4cee0f367ccd9d22492452c181",
+    "src/chat/runtime.rs": "47ac6594942d47d925b278511d5d9ffeafd064b240d3d6fbd8e0fe47edbb6138",
+    "src/control.rs": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02",
+    "src/host/agent_execution/ownership.rs": "13c718709fa9c0aaef11fa8f24921c8812fb0a80761cc65c1f95330731e81edd",
+    "src/host/agent_execution/terminals.rs": "6ec8ed383db97bb9def9713ba1f863419ec63f29139785df1c88806b21ae7e3b",
+    "src/host/chat.rs": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d",
+    "src/host/chat/retained_actor_tests.rs": "ebafa0a8c9973a26f1fd8e74bfa3757c99be8dbfbada1cb9f1b343de934fa2c6",
+    "src/host/chat/terminal_return_cleanup.rs": "e6a6fc53f75abcdec789a34df1b3d3d4e27ce2b2ad0b4e120b38524237ad91b0",
+    "src/host/chat/terminal_return_cleanup/tests.rs": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6",
+    "src/host/client.rs": "e755119e5d87e02b0f09782e8c4cd887546498702bfbbea2cf58c2a7173db9ad",
+    "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+    "src/host/state.rs": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6",
+    "src/host/state/update.rs": "5fedaab89811f4ac69e683b356e1ab5380b575831f848e372ead54b20d1d8b2d",
+    "src/host/worktree_removal.rs": "80262d25b1284cc5598216a8066bcb2a1579eca4eddc69591124878daab6d6b1",
+    "src/interaction.rs": "7881579c46f30348f5b48c30319a38a89551e2bdbc9e47eda21cf2398a11f01e",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/model.rs": "d49a2423a6a39df38c2bf83e6186954f40fa88d8f8d0e09ba72cb793a5451dde",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/process.rs": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47",
+    "src/settings.rs": "36630b1b6d811d38cc25e7d055785bd0ff324b9ddd78e9538e81c053604ee1ba",
+    "src/terminal/ipc.rs": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d",
+    "src/terminal/mod.rs": "cb89ea3c9acd9ea48f3d7894bd05996bcb14549b30e7658c331190f14b1f4614",
+    "src/ui_controls.rs": "2ffe8c62c9ff35fc498cdf6bcc070db665cdcea0794b713b6da12d275ba323dc",
+    "src/ui_controls/button.rs": "a03038b946f946a2afdec251bb4b8b99f1e8604e05ad3cc3413c8545293fce04",
+    "src/ui_controls/owned.rs": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690"
+  }
+}

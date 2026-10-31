@@ -1,0 +1,1075 @@
+{
+  "actions": {
+    "build_test_runtime_helper_env_account_process_resource_probes": "NONE",
+    "controller_framework_candidate_import_or_evaluation": "NONE",
+    "new_workers_execution_grant": "NONE",
+    "source_Git_GitHub_edits": "NONE",
+    "writes": "Exclusive own JSON DATA and SHA256 sidecar only."
+  },
+  "artifact_inventory_and_parent_contract": {
+    "compiled_ELF": "Select from the just-completed final-tuple Cargo JSON compiler-artifact for package cagents, target.kind lib, target.name cagents, profile.test true and final-root/src/lib.rs. No target-directory searches, stale executable paths or cached inventory substitution.",
+    "execution": "Each ordinary exact parent uses default outer harness, default captured stdout/stderr and --format pretty. Require running1 and exactly one named result,1 passed,0 failed,0 ignored,0 measured,N-1 filtered; expected extra stdout child libtest result count0. No --nocapture/custom child mode/ignored override/substrings/zero-selected substitute.",
+    "inventory": "Fresh --list --format terse on that executable. Record full unique ordinary-test names/ignored flags and actual artifact/source/hash identity. Each16 selected name must occur exactly once and be nonignored. Actual N stays null until this inventory; do not fabricate total N from source.",
+    "receipts": "Keep original command,start/terminal status,stdout/stderr and source/ELF/inventory hashes per phase. Test/job exit is not kernel process-family settlement or permission to release custody."
+  },
+  "caller_fixtures": {
+    "ack": "Private UnixStream pair and synthetic authority. Two captured receipt acknowledgements, scoped denial, wrong proof and nil receipt controls. Private unscoped case is not actual production User authority.",
+    "actual_scope": "UNKNOWN/UNREAD. Caller compatibility below is source classification, not runtime/admission authority.",
+    "existing3": "Private upgrade/paired fixtures and authored Python provider/credential sentinels. These create processes/threads/files; not inert data tests or commercial provider/account evidence.",
+    "new10": "Reuse exact physical review class: private HostState/synthetic clients and owned TerminalHandle/native targets, actual private /bin/cat/PTY workers. No real User endpoint or commercial provider auth oracle.",
+    "runtime_limit": "Some selected tests create PTYs/processes/threads/files. Source caller compatibility supplies no resource/cleanup grant; existing Root16 custody/return rules remain separate.",
+    "selected16": "No selected source requires inherited authority absence or genuine User producer. Preserve opaque inherited authority; no unset/clear/replace, new context/role, remote User proxy or credential probe.",
+    "wire_controls": "In-memory framing and private stream handshake, not actual installed-peer/provider endpoint."
+  },
+  "deferred_affected_neighbor": {
+    "boundary": "Needs separate same-head helper, caller-preservation and custody qualification. No helper path override, invocation, authority clearing/downgrade or role change is proposed here. It remains an explicitly unqualified affected neighbor.",
+    "facts": "retained_turn_final_action462 requires CAGENTS_TEST_RETAINED_ACTOR_HELPER463 and reexecs current test binary487 with --exact/--nocapture and env_clear488. It is not an ordinary no-child-results parent.",
+    "selected": false,
+    "selector": "host::chat::retained_actor_tests::retained_terminal_handoff_proves_original_console_cleanup",
+    "source": "src/host/chat/retained_actor_tests.rs:448"
+  },
+  "final_binding_PENDING": {
+    "Main15_consumer_head": null,
+    "actual_caller_authority": null,
+    "actual_host_lib_executable": null,
+    "actual_inventory_N": null,
+    "actual_inventory_receipt": null,
+    "combined_head": null,
+    "combined_tree": null,
+    "controller_review": null,
+    "controller_source": null,
+    "execution_grant": null,
+    "resource_allocation": null,
+    "rule": "Bind/refreeze/review the actual matched combined tuple before executable packet materialization. This DATA cannot be evaluated or treated as runtime admission."
+  },
+  "meaningful_limits": [
+    "No runtime on615e UI-incomplete staging source; final Main15 typed consumer/nonce/caller/presentation union must be frozen and reviewed before packet binding.",
+    "Existing IPC List roundtrip and synthetic unsupported current+1 gate do not establish genuine128/127 producers, every new enum carrier, installed old-peer compatibility or public129 admission. Peer wire review stays separate.",
+    "ACK peer checks source/nonce/frame sequencing, not full inherited capture\u2192real host capability acceptance\u2192provider\u2192consumer durable acknowledgement.",
+    "Ten new physical meanings retain original review bounds; no UI error/presentation flow,native runner/screenshots/latency,complete HOST suite or unknown-descendant closure is established.",
+    "All command phases and selected bodies UNRUN here; no historical donor/B9/API staging pass transfers."
+  ],
+  "phase_DATA": {
+    "outer_cap_seconds": 2400,
+    "outer_slack_seconds": 60,
+    "rules": "Prospective finite failure deadlines, not measured durations/pass promises. No auto-retry/extension, cold fallback, alternative cache/source, profile/target probing or helper execution. Command cwd/ELF/resource binding belongs to existing controller after final tuple and admission.",
+    "serial_phases": [
+      {
+        "argv": null,
+        "id": "source-prebinding",
+        "kind": "FROZEN_SOURCE_TUPLE_VALIDATION",
+        "seconds": 30
+      },
+      {
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "host",
+          "--bin",
+          "cagentsd"
+        ],
+        "id": "host-bin-check",
+        "kind": "CHECK_ONLY",
+        "seconds": 480
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "host",
+          "--lib",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "id": "host-lib-json-compile",
+        "kind": "COMPILE_NO_RUN",
+        "seconds": 900
+      },
+      {
+        "argv_template": [
+          null,
+          "--list",
+          "--format",
+          "terse"
+        ],
+        "id": "fresh-host-lib-inventory",
+        "kind": "ACTUAL_FRESH_ARTIFACT_INVENTORY",
+        "seconds": 30
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-01",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-02",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-03",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-04",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-05",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-06",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-07",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-08",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-09",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-10",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 60,
+        "selector": "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-11",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 45,
+        "selector": "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-12",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 15,
+        "selector": "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-13",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 45,
+        "selector": "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-14",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 45,
+        "selector": "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-15",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 45,
+        "selector": "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement",
+          "--format",
+          "pretty"
+        ],
+        "id": "parent-16",
+        "kind": "ONE_ORDINARY_EXACT_PARENT",
+        "seconds": 45,
+        "selector": "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement"
+      },
+      {
+        "argv": null,
+        "id": "source-postbinding-and-original-receipt-collection",
+        "kind": "SOURCE_AND_RECEIPT_VALIDATION",
+        "seconds": 60
+      }
+    ],
+    "sum_phase_caps_seconds": 2340
+  },
+  "purpose": "API-owning HOST DATA for existing Root16 source author. Main15 final consumer/combined source tuple remains pending. No runtime authorized on615e staging tree; UI consumers incomplete.",
+  "review_reuse": {
+    "new10_parent_leaves_exact": true,
+    "path": "/tmp/issued-return-cleanup-9c19-host-physical-custody-port-review-v1.json",
+    "per_path_conservation": {
+      "src/chat.rs": {
+        "current_sha256": "bcba67f4e68578ebb07fb41d304725151a0829488151485c5a7e349377698967",
+        "exact": true,
+        "prior_review_sha256": "bcba67f4e68578ebb07fb41d304725151a0829488151485c5a7e349377698967"
+      },
+      "src/chat/client.rs": {
+        "current_sha256": "2cbef29622dc3c6ee4f2af8e4d08705bed44948df90eb1a4bc6b285151ce4096",
+        "exact": false,
+        "prior_review_sha256": "3182b704f28db57c99366bb239fbb55882469ea15ee9961bbdeeb252277498dd"
+      },
+      "src/control.rs": {
+        "current_sha256": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02",
+        "exact": true,
+        "prior_review_sha256": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02"
+      },
+      "src/host/agent_execution/ownership.rs": {
+        "current_sha256": "13c718709fa9c0aaef11fa8f24921c8812fb0a80761cc65c1f95330731e81edd",
+        "exact": true,
+        "prior_review_sha256": "13c718709fa9c0aaef11fa8f24921c8812fb0a80761cc65c1f95330731e81edd"
+      },
+      "src/host/agent_execution/terminals.rs": {
+        "current_sha256": "6ec8ed383db97bb9def9713ba1f863419ec63f29139785df1c88806b21ae7e3b",
+        "exact": true,
+        "prior_review_sha256": "6ec8ed383db97bb9def9713ba1f863419ec63f29139785df1c88806b21ae7e3b"
+      },
+      "src/host/chat.rs": {
+        "current_sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d",
+        "exact": true,
+        "prior_review_sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d"
+      },
+      "src/host/chat/retained_actor_tests.rs": {
+        "current_sha256": "ebafa0a8c9973a26f1fd8e74bfa3757c99be8dbfbada1cb9f1b343de934fa2c6",
+        "exact": true,
+        "prior_review_sha256": "ebafa0a8c9973a26f1fd8e74bfa3757c99be8dbfbada1cb9f1b343de934fa2c6"
+      },
+      "src/host/chat/terminal_return_cleanup.rs": {
+        "current_sha256": "e6a6fc53f75abcdec789a34df1b3d3d4e27ce2b2ad0b4e120b38524237ad91b0",
+        "exact": true,
+        "prior_review_sha256": "e6a6fc53f75abcdec789a34df1b3d3d4e27ce2b2ad0b4e120b38524237ad91b0"
+      },
+      "src/host/chat/terminal_return_cleanup/tests.rs": {
+        "current_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6",
+        "exact": true,
+        "prior_review_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+      },
+      "src/host/client.rs": {
+        "current_sha256": "e755119e5d87e02b0f09782e8c4cd887546498702bfbbea2cf58c2a7173db9ad",
+        "exact": true,
+        "prior_review_sha256": "e755119e5d87e02b0f09782e8c4cd887546498702bfbbea2cf58c2a7173db9ad"
+      },
+      "src/host/state.rs": {
+        "current_sha256": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6",
+        "exact": true,
+        "prior_review_sha256": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6"
+      },
+      "src/host/state/update.rs": {
+        "current_sha256": "5fedaab89811f4ac69e683b356e1ab5380b575831f848e372ead54b20d1d8b2d",
+        "exact": true,
+        "prior_review_sha256": "5fedaab89811f4ac69e683b356e1ab5380b575831f848e372ead54b20d1d8b2d"
+      },
+      "src/host/worktree_removal.rs": {
+        "current_sha256": "80262d25b1284cc5598216a8066bcb2a1579eca4eddc69591124878daab6d6b1",
+        "exact": true,
+        "prior_review_sha256": "80262d25b1284cc5598216a8066bcb2a1579eca4eddc69591124878daab6d6b1"
+      },
+      "src/terminal/ipc.rs": {
+        "current_sha256": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d",
+        "exact": true,
+        "prior_review_sha256": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d"
+      }
+    },
+    "scope": "No renewed physical custody/wire/correctness review. Only actual test identity/cfg/import/caller fixture and qualification DATA mapping.",
+    "sha256": "7ffd6b69f603c73edf13350926d6d87932bae550369d6383a6926591be759ee0"
+  },
+  "schema": "issued-return-cleanup-host-qualification-DATA-v1",
+  "selection": {
+    "affected_ordinary_existing_HOST_neighbors": 3,
+    "corrected_ack": 1,
+    "count_rule": "Nested cases, two receipts, helpers, private process roles and repeats are nonadditive; these are16 distinct ordinary nonignored source declarations, not discovered inventory or passes.",
+    "distinct_total": 16,
+    "existing_IPC_version_controls": 2,
+    "new_HOST_api": 10,
+    "parents": [
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 107,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-01",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 126,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-02",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 170,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-03",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 184,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-04",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 240,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-05",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 309,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-06",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 346,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-07",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 369,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-08",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 419,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-09",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 6138,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-10",
+        "kind": "NEW_HOST_API_OWNING_PARENT",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 60,
+        "selector": "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+        "source": "src/host/chat.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_PRIVATE_FRAMED_PEER",
+        "definition_line": 3078,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-11",
+        "kind": "CORRECTED_ACK_FRAMING_PARENT",
+        "meaning_and_limit": "Four nested cases: unscoped success, synthetic scoped denial, wrong expected host and missing receipt, with two terminals/receipts. One ordinary parent; not real host authorization.",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 45,
+        "selector": "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+        "source": "src/chat/client.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_IN_MEMORY_CODEC",
+        "definition_line": 2866,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-12",
+        "kind": "EXISTING_IPC_FRAMING_CONTROL",
+        "meaning_and_limit": "Current-version ClientEnvelope/List binary roundtrip plus oversized-prefix refusal. Not every issued-cleanup carrier.",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 15,
+        "selector": "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+        "source": "src/terminal/ipc.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_PRIVATE_FRAMED_PEER",
+        "definition_line": 6084,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-13",
+        "kind": "EXISTING_VERSION_AND_PROOF_GATE",
+        "meaning_and_limit": "Synthetic PROTOCOL_VERSION+1, incomplete/mismatched proof and unexpected streaming reply. Not a genuine legacy-peer producer.",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 45,
+        "selector": "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+        "source": "src/control.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 6133,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-14",
+        "kind": "AFFECTED_EXISTING_FALSE_BRANCH",
+        "meaning_and_limit": "Existing managed_cli_close_fixture(false), beside new issued true-branch parent; private /bin/cat workers.",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 45,
+        "selector": "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+        "source": "src/host/chat.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_PRIVATE_SCRIPTED_PROVIDER_FIXTURE",
+        "definition_line": 4981,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-15",
+        "kind": "AFFECTED_EXISTING_REPLAY_AND_ACK",
+        "meaning_and_limit": "Private Python provider/terminal fixture and authored credential sentinels; nonce replay and ACK, not commercial provider/account credentials.",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 45,
+        "selector": "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+        "source": "src/host/chat.rs"
+      },
+      {
+        "argv_template": [
+          null,
+          "--exact",
+          "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement",
+          "--format",
+          "pretty"
+        ],
+        "caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "definition_line": 4924,
+        "executable_slot": "Fresh HOST library-test executable from just-completed final-tuple Cargo JSON compile; null until admitted binding.",
+        "harness_contract": {
+          "capture": "DEFAULT_CAPTURED_STDOUT_STDERR",
+          "expected_stdout_child_results": 0,
+          "failed": 0,
+          "filtered_out": "N-1; fresh current executable ordinary-test inventory N is not known yet",
+          "format": "pretty",
+          "ignored": 0,
+          "measured": 0,
+          "no_nocapture_ignored_substring_or_child_override": true,
+          "ordinary_parent": true,
+          "outer": "DEFAULT_OUTER",
+          "passed": 1,
+          "selected_results": 1
+        },
+        "id": "parent-16",
+        "kind": "AFFECTED_EXISTING_NONE_ACK",
+        "meaning_and_limit": "Private upgrade_fixture and legacy None ACK after retirement; not whole UI writer/receipt composition.",
+        "requires_genuine_User_process_environment": false,
+        "seconds": 45,
+        "selector": "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement",
+        "source": "src/host/chat.rs"
+      }
+    ]
+  },
+  "source": {
+    "api_head": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+    "api_parent": "9c19e1291c83c4a2f7d91fe2e6f59f4aa1d88478",
+    "api_tree": "834d2844924ea655ecf84952d682e8c645089425",
+    "pins": {
+      ".cargo/config.toml": {
+        "blob": "0e2d20b442d9256e22ecbe4852d77e2a07c45409",
+        "bytes": 412,
+        "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+      },
+      "Cargo.lock": {
+        "blob": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+        "bytes": 341188,
+        "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+      },
+      "Cargo.toml": {
+        "blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+        "bytes": 13087,
+        "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+      },
+      "build.rs": {
+        "blob": "cc0447aee8720c7e850030ca36b5385665e6a275",
+        "bytes": 4593,
+        "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+      },
+      "src/agent_execution.rs": {
+        "blob": "209c36db63faa878e3e3dcd33e0c49d3e01db5e8",
+        "bytes": 25326,
+        "sha256": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452"
+      },
+      "src/bin/cagentsd.rs": {
+        "blob": "1aa318c635fa46910bcd95b7d1dc1bbe7e178aae",
+        "bytes": 4892,
+        "sha256": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830"
+      },
+      "src/chat.rs": {
+        "blob": "b2095760cce488a12f58d264d459fdd1769a13b0",
+        "bytes": 126421,
+        "sha256": "bcba67f4e68578ebb07fb41d304725151a0829488151485c5a7e349377698967"
+      },
+      "src/chat/client.rs": {
+        "blob": "3229661266eaa89ad3b71b6910075114b135fa29",
+        "bytes": 303999,
+        "sha256": "2cbef29622dc3c6ee4f2af8e4d08705bed44948df90eb1a4bc6b285151ce4096"
+      },
+      "src/control.rs": {
+        "blob": "118561077e7fb5d87b761b589f28d5a25c630a19",
+        "bytes": 305556,
+        "sha256": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02"
+      },
+      "src/host/agent_execution/ownership.rs": {
+        "blob": "e825c268994d655fa983bbdd71156da336e04333",
+        "bytes": 9351,
+        "sha256": "13c718709fa9c0aaef11fa8f24921c8812fb0a80761cc65c1f95330731e81edd"
+      },
+      "src/host/agent_execution/terminals.rs": {
+        "blob": "c1cce1c1eb4ec6cb93abd474172f620e0c5d89a0",
+        "bytes": 9360,
+        "sha256": "6ec8ed383db97bb9def9713ba1f863419ec63f29139785df1c88806b21ae7e3b"
+      },
+      "src/host/chat.rs": {
+        "blob": "b48e14a3b61e2cbd26d683d87a0e58fc04854dfd",
+        "bytes": 275437,
+        "sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d"
+      },
+      "src/host/chat/retained_actor_tests.rs": {
+        "blob": "25fc7b2059533bc3ee611611ad5205693d708277",
+        "bytes": 144102,
+        "sha256": "ebafa0a8c9973a26f1fd8e74bfa3757c99be8dbfbada1cb9f1b343de934fa2c6"
+      },
+      "src/host/chat/terminal_return_cleanup.rs": {
+        "blob": "3e591ce063c961a6ec441029768eb7535ca9b646",
+        "bytes": 16256,
+        "sha256": "e6a6fc53f75abcdec789a34df1b3d3d4e27ce2b2ad0b4e120b38524237ad91b0"
+      },
+      "src/host/chat/terminal_return_cleanup/tests.rs": {
+        "blob": "120c762b87eaf56e57b934a4539b216aceae65bd",
+        "bytes": 15386,
+        "sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+      },
+      "src/host/client.rs": {
+        "blob": "8f6177d570aa459d43561a0541705648993c951a",
+        "bytes": 156038,
+        "sha256": "e755119e5d87e02b0f09782e8c4cd887546498702bfbbea2cf58c2a7173db9ad"
+      },
+      "src/host/mod.rs": {
+        "blob": "1fcf101724e3a9984bb038d208998a19a4a1d3e6",
+        "bytes": 30974,
+        "sha256": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864"
+      },
+      "src/host/state.rs": {
+        "blob": "2aa44f480c9d64f89b395f387775c53944789f90",
+        "bytes": 337894,
+        "sha256": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6"
+      },
+      "src/host/state/update.rs": {
+        "blob": "9af1374d6060115e270239976f98a251f34184db",
+        "bytes": 16285,
+        "sha256": "5fedaab89811f4ac69e683b356e1ab5380b575831f848e372ead54b20d1d8b2d"
+      },
+      "src/host/worktree_removal.rs": {
+        "blob": "96c4d376fbd4d685cc13fd82543568b82f087a87",
+        "bytes": 18103,
+        "sha256": "80262d25b1284cc5598216a8066bcb2a1579eca4eddc69591124878daab6d6b1"
+      },
+      "src/lib.rs": {
+        "blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e",
+        "bytes": 350,
+        "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+      },
+      "src/main.rs": {
+        "blob": "429db35e164a3306f4e91c2576f4fc352606ebce",
+        "bytes": 656,
+        "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d"
+      },
+      "src/modules.rs": {
+        "blob": "9e04bd958166835de80fc06502dd6cbe547111d6",
+        "bytes": 4143,
+        "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+      },
+      "src/terminal/ipc.rs": {
+        "blob": "9e162c974ec742fa1761b8d0115c882bdaa5b04f",
+        "bytes": 113948,
+        "sha256": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d"
+      },
+      "src/terminal/mod.rs": {
+        "blob": "ce041f25e5c2822f1bb006ae949ddec35ad76441",
+        "bytes": 1858,
+        "sha256": "cb89ea3c9acd9ea48f3d7894bd05996bcb14549b30e7658c331190f14b1f4614"
+      }
+    },
+    "protocol_version": 129,
+    "worktree_locator_only": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issued-return-cleanup-api"
+  },
+  "source_eligibility": {
+    "graph_limits": "CLI/default-full omits host/client ownership; zero selected is failure. CLI/UI checks remain separate Main15 packet work. Never combine HOST+UI in one Cargo invocation.",
+    "module_chain": [
+      "src/lib.rs5 include modules.rs; modules.rs73-74 host feature module; host/mod.rs7 chat; chat terminal_return_cleanup cfg(test) tests.rs and chat.rs cfg(test) tests own10 physical parents.",
+      "chat.rs19-20 client uses ui OR (test AND host); client.rs2903-2904 cfg(test) mod tests owns corrected ack3078. Local ProtocolError/ProtocolErrorCode import3079 resolves through modules.rs149 terminal::ipc alias. HOSTbincheck alone excludes client production; HOSTlib JSON compile owns it.",
+      "modules.rs130 terminal; terminal/mod.rs4 ipc; ipc.rs2120-2121 cfg(test) tests. Actual test namespace is terminal::ipc::tests; terminal_ipc reexport is not a second module namespace.",
+      "control cfg(test) tests owns handshake gate. Cargo.toml121-126 cagentsd bin requires host and test=false; narrow bin check is separate from library-test compilation."
+    ],
+    "owning_target": "Package cagents conventional src/lib.rs library; --no-default-features --features host --lib. No --test caller_scope_tests integration target or cagents:: test-name prefix."
+  },
+  "status": "DATA_ONLY_NOT_EXECUTABLE_PACKET_CONTROLLER_OR_GRANT"
+}
