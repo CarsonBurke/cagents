@@ -10,6 +10,7 @@ import copy
 from contextlib import contextmanager
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -18,7 +19,16 @@ import unittest
 
 SOURCE = Path(__file__).with_name('final-main-native.py').read_text()
 NAMES = {'NativeCancelled','Cancellation','family','register','start_owned','stop','cleanup_arm',
-         'spawn','command','open_monitor','complete_arm_cleanup','finish_cleanup'}
+         'spawn','command','open_monitor','complete_arm_cleanup','finish_cleanup','IncompleteTree','wait'}
+
+
+class InertPath:
+    def __new__(cls, *args, **kwargs):
+        raise AssertionError('Extracted logic attempted ambient path access')
+
+    @staticmethod
+    def cwd():
+        return '/algorithm-only-cwd'
 
 
 class Output:
@@ -51,6 +61,7 @@ class Handle:
         self.state = 'S'
         self.communicate_code = 0
         self.wait_error = None
+        self.wait_code = None
         self.on_wait = lambda: None
         self.on_communicate = lambda: None
         self.auto_unmount = True
@@ -60,10 +71,12 @@ class Handle:
 
     def wait(self, timeout):
         self.harness.events.append(('wait',self.pid,timeout))
+        if getattr(self,'owned_role',None) == 'documents' and timeout == 15:
+            assert ('signal',self.pid,15) in self.harness.events, 'Documents must receive original TERM before wait'
         self.on_wait()
         if self.wait_error is not None:
             raise self.wait_error
-        self.returncode = 0 if self.returncode is None else self.returncode
+        self.returncode = self.wait_code if self.wait_code is not None else (0 if self.returncode is None else self.returncode)
         self.state = 'Z'
         if getattr(self,'expected_mount',None) is not None and self.auto_unmount:
             self.expected_mount.mounted = False
@@ -103,7 +116,7 @@ class Harness:
         tick = iter(range(10000))
         class NoOwner(Exception):
             pass
-        namespace = dict(__builtins__=__builtins__,contextmanager=contextmanager,sys=sys,Path=Path,json=json,
+        namespace = dict(__builtins__=__builtins__,contextmanager=contextmanager,sys=sys,Path=InertPath,json=json,re=re,
             children=[],stopped=set(),ownership_errors=[],out=self.output,
             user=lambda:None,processes=table,bus_owner=lambda name:(_ for _ in ()).throw(NoOwner()),
             GLib=SimpleNamespace(Error=NoOwner),
@@ -162,7 +175,10 @@ class AtomicOwnershipTests(unittest.TestCase):
                 self.assertEqual(h.ns['cancellation'].signum,2)
                 result = h.ns['complete_arm_cleanup'](roles,'before',[])
                 self.assertEqual(result['errors'],[])
+                doc_term = ('signal',original.pid,15)
+                self.assertEqual(h.events.count(doc_term),1)
                 doc_wait = h.events.index(('wait',original.pid,15))
+                self.assertLess(h.events.index(doc_term),doc_wait)
                 permission_signal = next(i for i,event in enumerate(h.events) if event[:2] == ('signal',permissions.pid))
                 self.assertLess(doc_wait,permission_signal)
 
@@ -235,13 +251,18 @@ class AtomicOwnershipTests(unittest.TestCase):
         self.assertEqual(result['errors'],[])
         self.assertEqual(result['documents_graceful']['exit_code'],0)
         self.assertFalse(mount.mounted)
+        doc_term = ('signal',documents.pid,15)
+        self.assertEqual(h.events.count(doc_term),1)
         doc_wait = h.events.index(('wait',documents.pid,15))
+        self.assertLess(h.events.index(doc_term),doc_wait)
         permission_signal = next(i for i,event in enumerate(h.events) if event[:2] == ('signal',permissions.pid))
         self.assertLess(doc_wait,permission_signal)
-        first = h.ns['cancellation'].failure
+        first = h.ns['cancellation'].cancel_error
+        self.assertIsInstance(first,h.ns['NativeCancelled'])
         result = h.ns['finish_cleanup']([])
         self.assertEqual(result,dict(errors=[],owned_descendants_remaining=[]))
-        self.assertIs(h.ns['cancellation'].failure,first)
+        self.assertIs(h.ns['cancellation'].cancel_error,first)
+        self.assertIsNone(h.ns['cancellation'].failure)
         self.assertIn('cleanup-complete',h.output.files)  # Local settlement, never a native work success.
 
     def test_original_work_and_drain_failure_survive_repeated_cancel(self):
@@ -265,12 +286,26 @@ class AtomicOwnershipTests(unittest.TestCase):
             raise RuntimeError('secondary arm cleanup failure')
         h.ns['cleanup_arm'] = fail_arm
         try:
-            raise original
+            with h.ns['cancellation'].work():
+                raise original
         except RuntimeError:
             result = h.ns['complete_arm_cleanup']({},'before',arm_errors)
             self.assertIs(h.ns['cancellation'].failure,original)
             self.assertTrue(result['errors']); self.assertTrue(arm_errors)
             self.assertFalse(h.ns['cancellation'].finalizing)
+
+    def test_nonzero_documents_wait_cannot_become_graceful(self):
+        h = Harness(); roles = {}; mount = Mount()
+        h.spawn(roles,'permissions')
+        documents = h.spawn(roles,'documents',mount)
+        documents.wait_code = 7
+        result = h.ns['cleanup_arm'](roles)
+        self.assertIsNone(result['documents_graceful'])
+        self.assertTrue(any('did not complete normal signal/unmount cleanup' in error for error in result['errors']))
+        self.assertEqual(h.events.count(('signal',documents.pid,15)),1)
+        self.assertIn(('wait',documents.pid,15),h.events)
+        final = h.ns['finish_cleanup'](result['errors'])
+        self.assertTrue(final['errors']); self.assertNotIn('cleanup-complete',h.output.files)
 
     def test_unresolved_wait_or_mount_never_publishes_complete(self):
         for point in ('wait','mount'):
@@ -305,6 +340,8 @@ class AtomicOwnershipTests(unittest.TestCase):
             self.assertEqual(len(h.ns['children']),1)
         h = Harness(); h.creation = lambda handle:setattr(handle,'communicate_code',1)
         with self.assertRaises(subprocess.CalledProcessError): h.ns['command'](['another-command'])
+        h = Harness()
+        self.assertEqual(h.ns['command'](['ordinary-algorithm-command']),b'observed bytes')
 
     def test_observer_is_retained_before_constructor_cancellation_or_failure(self):
         for fail in (False,True):
@@ -323,6 +360,56 @@ class AtomicOwnershipTests(unittest.TestCase):
                 with self.assertRaises(expected): h.ns['open_monitor'](roles,'algorithm-only-output')
                 self.assertIsInstance(roles['monitor'],Observer)
                 if not fail: self.assertTrue(roles['monitor'].initialized)
+
+    def test_recoverable_observation_cannot_swallow_cancellation(self):
+        for variant in ('incomplete','stale','positive-after-handled-stale'):
+            with self.subTest(variant=variant):
+                # Positive control: the same transient exception remains retryable
+                # without cancellation. No real GLib object or AX tree is used.
+                h = Harness(); calls = []
+                def transient():
+                    calls.append('query')
+                    if len(calls) == 1:
+                        raise h.ns['IncompleteTree']('changed')
+                    return True
+                self.assertTrue(h.ns['wait'](transient))
+                self.assertEqual(calls,['query','query'])
+                self.assertIsNone(h.ns['cancellation'].failure)
+                h = Harness(); calls = []; inputs = []
+                error_type = h.ns['IncompleteTree'] if variant == 'incomplete' else h.ns['GLib'].Error
+                def query():
+                    calls.append('query')
+                    try:
+                        raise error_type('Unknown object algorithm-only stale tree')
+                    except error_type:
+                        h.repeat()  # Actual request() observes an active recoverable exception.
+                        if variant == 'positive-after-handled-stale':
+                            return True
+                        raise
+                with self.assertRaises(h.ns['NativeCancelled']) as caught:
+                    with h.ns['cancellation'].work():
+                        h.ns['wait'](query)
+                        inputs.append('would issue the next native input')
+                self.assertIs(caught.exception,h.ns['cancellation'].cancel_error)
+                self.assertIsNone(h.ns['cancellation'].failure)
+                self.assertEqual(calls,['query']); self.assertEqual(inputs,[])
+
+    def test_terminal_unwind_keeps_explicit_diagnostic_separate(self):
+        h = Harness(); original = RuntimeError('genuine terminal work error')
+        with self.assertRaisesRegex(RuntimeError,'genuine terminal work error') as caught:
+            with h.ns['cancellation'].work():
+                try:
+                    raise original
+                except RuntimeError:
+                    h.repeat()  # Defer control; work() explicitly latches the terminal unwind.
+                    raise
+        self.assertIs(caught.exception,original)
+        self.assertIs(h.ns['cancellation'].failure,original)
+        self.assertIsInstance(h.ns['cancellation'].cancel_error,h.ns['NativeCancelled'])
+        self.assertIsNot(original,h.ns['cancellation'].cancel_error)
+        result = h.ns['finish_cleanup']([])
+        self.assertEqual(result['errors'],[])
+        self.assertIs(h.ns['cancellation'].failure,original)
 
     def test_metadata_children_have_install_subreaper_and_outer_cleanup(self):
         main = next(node for node in ast.parse(SOURCE).body if isinstance(node,ast.FunctionDef) and node.name == 'main')

@@ -52,26 +52,26 @@ class Cancellation:
         self.finalizing = False
         self.interruptible = False
         self.failure = None
+        self.cancel_error = None
 
     def latch(self, error):
-        if self.failure is None:
+        if not isinstance(error, NativeCancelled) and self.failure is None:
             self.failure = error
 
     def request(self, signum, frame):
-        # Preserve an exception already unwinding into protected cleanup.
-        active = sys.exc_info()[1]
-        if active is not None:
-            self.latch(active)
         if self.signum is None:
+            self.cancel_error = NativeCancelled('Native integration cancelled by signal ' + str(signum))
             self.signum = signum
-            self.latch(NativeCancelled('Native integration cancelled by signal ' + str(signum)))
-        if active is None and self.interruptible:
+        # An active exception may be recoverable observation churn, not a
+        # terminal diagnostic. Defer delivery without classifying that error.
+        # Actual work/unwind owners explicitly latch terminal failures.
+        if sys.exc_info()[1] is None and self.interruptible:
             self.checkpoint()
 
     def checkpoint(self):
         if self.signum is not None and not self.delivered and not self.depth and not self.finalizing:
             self.delivered = True
-            raise self.failure
+            raise self.cancel_error
 
     @contextmanager
     def defer(self):
@@ -97,6 +97,9 @@ class Cancellation:
         self.interruptible = True
         try:
             yield
+        except BaseException as error:
+            self.latch(error)
+            raise
         finally:
             self.interruptible = previous
 
@@ -398,13 +401,14 @@ class IncompleteTree(RuntimeError):
 
 
 def wait(query, timeout=30):
+    cancellation.checkpoint()
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
+        cancellation.checkpoint()
+        result = None
         try:
             result = query()
-            if result:
-                return result
         except GLib.Error as error:
             if 'Unknown object' not in str(error) and not (error.domain == 'atspi_error' and error.code == 1
                     and re.fullmatch(r'/org/a11y/atspi/accessible/[0-9]+/[0-9]+', error.message)):
@@ -412,7 +416,13 @@ def wait(query, timeout=30):
             last = error
         except IncompleteTree as error:
             last = error
+        # Cancellation is distinct control, checked outside recoverable catches
+        # and before even a positive observation can permit the next input.
+        cancellation.checkpoint()
+        if result:
+            return result
         time.sleep(.15)
+    cancellation.checkpoint()
     raise RuntimeError('Observation did not settle; no input was repeated') from last
 
 
@@ -1066,6 +1076,8 @@ def main():
         cleanup = finish_cleanup(errors)
     if cancellation.failure is not None:
         raise cancellation.failure
+    if cancellation.cancel_error is not None:
+        raise cancellation.cancel_error
     if cleanup['errors'] or cleanup['owned_descendants_remaining']:
         raise RuntimeError('Native cleanup incomplete: ' + repr(cleanup))
 
