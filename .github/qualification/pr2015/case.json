@@ -4,7 +4,7 @@
   "never_merge": true,
   "product_head": "375c37ff01aab0b226c58f547012af74e93a8643",
   "product_tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
-  "runner_sha256": "c72a22e0a52e139ec8ebed20909e5b4605bbfaaa9da098c5b5d84f2c4e4afb1b",
+  "runner_sha256": "b2fda78cb29cf3a712d52f9cfbaa83c317ace3a0aa74a1da9f678b9af7f23dd6",
   "plan_sha256": "c39055932062af3961999942c15df40239a761d2373472cd173a743d6c190e85",
   "selector_path": ".github/qualification/pr2015/case-select.py",
   "selector_sha256": "bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d",
@@ -12,7 +12,7 @@
   "independent_review_input": "No author clear/stub: missing genuine exact frozen runner/plan/product review refuses before output/setup/Cargo. Must copy actual independent receipt after freeze and perform final source-binding review before publication.",
   "source_sha256": {
     ".github/qualification/pr2015/case-select.py": "bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d",
-    ".github/qualification/pr2015/cli-cache-producer.py": "c72a22e0a52e139ec8ebed20909e5b4605bbfaaa9da098c5b5d84f2c4e4afb1b",
+    ".github/qualification/pr2015/cli-cache-producer.py": "b2fda78cb29cf3a712d52f9cfbaa83c317ace3a0aa74a1da9f678b9af7f23dd6",
     ".github/qualification/pr2015/cli-cache-producer-plan.json": "c39055932062af3961999942c15df40239a761d2373472cd173a743d6c190e85",
     ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4"
   },
@@ -45,6 +45,11 @@
   "prior_source_negative": {
     "head": "05f2f9ea33a45fdaed9b6b77e72eacc73117f877",
     "scope": "Original source-only findings, no execution: payload enumeration missed nonmatching entries; partial tool evidence and initialization failure-write exits needed strengthening. Original05f2 and reviews remain immutable.",
+    "runtime_result": null
+  },
+  "prior_cbce_source_negative": {
+    "head": "cbce2c8af82b09008c566dd32e7a2ab545f28dcf",
+    "scope": "Source-only lock-acquisition refusal could return while handoff stayed unconfirmed because HOLD was conditioned on acquired. This successor removes that condition; no runtime result.",
     "runtime_result": null
   }
 }

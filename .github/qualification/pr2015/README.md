@@ -82,3 +82,5 @@ The three existing ordered cache paths and `held1922-Linux-X64-rust193-<exact lo
 The pre-existing root assembly/checksum files retain their historical ac4/installer scope. They are not rewritten or offered as current producer bindings; the new producer plan/case and source freeze identify the new source.
 
 The successor to unexecuted source05f2 checks every `os.scandir` entry before filtering, persists each original tool channel/status before completing materialization, and guards all post-child initialization exits. A failed receipt write or handoff assessment cannot let unknown custody exit. Original source-only findings remain unchanged; this correction is still unrun and independently unreviewed. Per-capture direct waits do not independently prove every descendant writer closed.
+
+The source successor to unexecuted cbce retains unconfirmed custody independently of whether the local lock was acquired. A known-clean acquisition refusal may return failure; an unknown handoff remains held. This is a source correction awaiting independent delta review, not an execution result.

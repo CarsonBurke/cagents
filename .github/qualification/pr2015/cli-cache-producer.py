@@ -1126,7 +1126,7 @@ def producer_main():
                     'attempts': PROCESS_ATTEMPTS, 'states': PROCESS_STATES,
                     'phases': phases, 'supervision_failures': SUPERVISION_FAILURES})
             raise
-        if acquired and not historical_handoff_clean:
+        if not historical_handoff_clean:
             retain_uncertain_lane(save, {
                 'stage': 'positive-handoff-unconfirmed', 'original_error': error,
                 'lock_fd': lock_fd, 'close_attempted': False,

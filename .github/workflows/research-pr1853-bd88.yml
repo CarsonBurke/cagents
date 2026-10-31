@@ -777,7 +777,7 @@ jobs:
         run: |
           python3 "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/cli-cache-producer.py" \
             --run-binding "$PR2015_RUN_BINDING" \
-            --runner-sha256 c72a22e0a52e139ec8ebed20909e5b4605bbfaaa9da098c5b5d84f2c4e4afb1b \
+            --runner-sha256 b2fda78cb29cf3a712d52f9cfbaa83c317ace3a0aa74a1da9f678b9af7f23dd6 \
             --controller-review "$GITHUB_WORKSPACE/research/.github/qualification/pr2015/cli-cache-producer-review.json" \
             --controller-review-sha256 "$PR2015_CONTROLLER_REVIEW_SHA256"
       - name: Save only positively prepared CLI payload to the existing namespace
