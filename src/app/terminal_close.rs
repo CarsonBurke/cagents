@@ -472,7 +472,10 @@ impl Cagents {
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
-            iced::widget::operation::focus(
+            // The pre-commit handoff already chose a temporary home. Its
+            // fallback must also respect any control chosen since then.
+            workspace_widget::focus_after_loading(
+                widget::Id::new(TOOLBAR_FOCUS_ID),
                 self.workspace
                     .focused()
                     .map(|card| self.card_keyboard_focus(card))
