@@ -1,0 +1,3607 @@
+{
+  "policy": {
+    "F8": "Fixed nonpointer fixture staging/release only. Exact original held-work log and fresh root/client review; full-frame pixel differences recorded, not masked. Pointer/hover/Tab retain equality.",
+    "initial_resize": "One fixed initial nonpointer layout. Exact original scene phase/work and owned source/UI/window/geometry; fresh full root/client hashes and differences retained. Conserved resize_focus acquires and verifies native focus. No pointer equality exemption.",
+    "scroll": "No wheel/new primitive. Narrow scrollbar work is review-only backlog unless a genuine rail is visible; never guess a target.",
+    "terminal": "Source oracle, missing control and screenshots are separate observations; no automatic UX PASS."
+  },
+  "scenes": {
+    "claude-delayed": {
+      "after": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Delayed",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "publish-newer-live-limit",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Delayed",
+                  "serial": 1
+                }
+              ],
+              "phase": "newer-live-limited-held",
+              "returned": []
+            },
+            "index": 6,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-delayed",
+            "predecessor": "publish-newer-live-limit",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "newer-live-limited-held"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-delayed",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 8,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "Delayed"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      },
+      "before": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Delayed",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "publish-newer-live-limit",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Delayed",
+                  "serial": 1
+                }
+              ],
+              "phase": "newer-live-limited-held",
+              "returned": []
+            },
+            "index": 6,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-delayed",
+            "predecessor": "publish-newer-live-limit",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "newer-live-limited-held"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-delayed",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "before-delayed-answer-replaced-live-rejection"
+          },
+          {
+            "index": 8,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-delayed SYSTEM row"
+            },
+            "visible_state": "before-delayed-answer-replaced-live-rejection"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "Delayed"
+        ],
+        "terminal_states": [
+          "before-delayed-answer-replaced-live-rejection"
+        ],
+        "unavailable_control_expected": false
+      }
+    },
+    "claude-malformed": {
+      "after": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 1,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-sparse",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [],
+              "phase": "failed-retained",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 2,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "enable-recovery",
+            "predecessor": "release-sparse",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "failed-retained"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-recovery",
+            "predecessor": "enable-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-recovery",
+            "predecessor": "inspect-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Recovery",
+                  "serial": 1
+                }
+              ],
+              "phase": "recovery-held",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-recovery",
+            "predecessor": "start-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Sparse",
+          "Recovery"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      },
+      "before": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 1,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-sparse",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [],
+              "phase": "before-empty-answer-published-without-usable-quota",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 2,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "enable-recovery",
+            "predecessor": "release-sparse",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "before-empty-answer-published-without-usable-quota"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-recovery",
+            "predecessor": "enable-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-recovery",
+            "predecessor": "inspect-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Recovery",
+                  "serial": 1
+                }
+              ],
+              "phase": "recovery-held",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-recovery",
+            "predecessor": "start-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-malformed SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Sparse",
+          "Recovery"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      }
+    },
+    "claude-sparse": {
+      "after": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-sparse",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [],
+              "phase": "failed-retained",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 6,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "enable-recovery",
+            "predecessor": "release-sparse",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "failed-retained"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-recovery",
+            "predecessor": "enable-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "index": 8,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-recovery",
+            "predecessor": "inspect-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Recovery",
+                  "serial": 2
+                }
+              ],
+              "phase": "recovery-held",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 9,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-recovery",
+            "predecessor": "start-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-held"
+          },
+          {
+            "index": 10,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 11,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "Sparse",
+          "Recovery"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      },
+      "before": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-sparse",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-sparse",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "before-sparse-reading-replaced"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-sparse SYSTEM row"
+            },
+            "visible_state": "before-sparse-reading-replaced"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "Sparse"
+        ],
+        "terminal_states": [
+          "before-sparse-reading-replaced"
+        ],
+        "unavailable_control_expected": true
+      }
+    },
+    "claude-ticket": {
+      "after": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "stage-logical-expiry",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-successor",
+            "predecessor": "stage-logical-expiry",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "logical-expiry-successor-ready"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-successor",
+            "predecessor": "inspect-successor",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "logical-expiry-successor-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                },
+                {
+                  "kind": "NewB",
+                  "serial": 2
+                }
+              ],
+              "phase": "successor-held",
+              "returned": []
+            },
+            "index": 8,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-obsolete-a",
+            "predecessor": "start-successor",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "successor-held"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "NewB",
+                  "serial": 2
+                }
+              ],
+              "phase": "obsolete-a-refused-b-still-held",
+              "returned": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 9,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-current-b",
+            "predecessor": "release-obsolete-a",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "obsolete-a-refused-b-still-held"
+          },
+          {
+            "index": 10,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-current-b",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 11,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "OldA",
+          "NewB"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      },
+      "before": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "stage-logical-expiry",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-successor",
+            "predecessor": "stage-logical-expiry",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "logical-expiry-successor-ready"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-successor",
+            "predecessor": "inspect-successor",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "logical-expiry-successor-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                },
+                {
+                  "kind": "NewB",
+                  "serial": 2
+                }
+              ],
+              "phase": "successor-held",
+              "returned": []
+            },
+            "index": 8,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-obsolete-a",
+            "predecessor": "start-successor",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "successor-held"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "NewB",
+                  "serial": 2
+                }
+              ],
+              "phase": "before-obsolete-a-settled-successor",
+              "returned": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 9,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-current-b",
+            "predecessor": "release-obsolete-a",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "before-obsolete-a-settled-successor"
+          },
+          {
+            "index": 10,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-current-b",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 11,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "claude-ticket SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "OldA",
+          "NewB"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      }
+    },
+    "codex-delayed": {
+      "after": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Delayed",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "publish-newer-live-limit",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Delayed",
+                  "serial": 1
+                }
+              ],
+              "phase": "newer-live-limited-held",
+              "returned": []
+            },
+            "index": 6,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-delayed",
+            "predecessor": "publish-newer-live-limit",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "newer-live-limited-held"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-delayed",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 8,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "Delayed"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      },
+      "before": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Delayed",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "publish-newer-live-limit",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Delayed",
+                  "serial": 1
+                }
+              ],
+              "phase": "newer-live-limited-held",
+              "returned": []
+            },
+            "index": 6,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-delayed",
+            "predecessor": "publish-newer-live-limit",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "newer-live-limited-held"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-delayed",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "before-delayed-answer-replaced-live-rejection"
+          },
+          {
+            "index": 8,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-delayed SYSTEM row"
+            },
+            "visible_state": "before-delayed-answer-replaced-live-rejection"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "Delayed"
+        ],
+        "terminal_states": [
+          "before-delayed-answer-replaced-live-rejection"
+        ],
+        "unavailable_control_expected": false
+      }
+    },
+    "codex-malformed": {
+      "after": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 1,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-sparse",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [],
+              "phase": "failed-retained",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 2,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "enable-recovery",
+            "predecessor": "release-sparse",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "failed-retained"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-recovery",
+            "predecessor": "enable-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-recovery",
+            "predecessor": "inspect-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Recovery",
+                  "serial": 1
+                }
+              ],
+              "phase": "recovery-held",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-recovery",
+            "predecessor": "start-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Sparse",
+          "Recovery"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      },
+      "before": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 1,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-sparse",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [],
+              "phase": "before-empty-answer-published-without-usable-quota",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 2,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "enable-recovery",
+            "predecessor": "release-sparse",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "before-empty-answer-published-without-usable-quota"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-recovery",
+            "predecessor": "enable-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-recovery",
+            "predecessor": "inspect-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Recovery",
+                  "serial": 1
+                }
+              ],
+              "phase": "recovery-held",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-recovery",
+            "predecessor": "start-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "recovery-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-malformed SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Sparse",
+          "Recovery"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      }
+    },
+    "codex-sparse": {
+      "after": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-sparse",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [],
+              "phase": "failed-retained",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 6,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "enable-recovery",
+            "predecessor": "release-sparse",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "failed-retained"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-recovery",
+            "predecessor": "enable-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "index": 8,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-recovery",
+            "predecessor": "inspect-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Recovery",
+                  "serial": 2
+                }
+              ],
+              "phase": "recovery-held",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 9,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-recovery",
+            "predecessor": "start-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-held"
+          },
+          {
+            "index": 10,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 11,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "Sparse",
+          "Recovery"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      },
+      "before": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-sparse",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "fixture": {
+              "held": [],
+              "phase": "before-sparse-reading-replaced",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 6,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "enable-recovery",
+            "predecessor": "release-sparse",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "before-sparse-reading-replaced"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-recovery",
+            "predecessor": "enable-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "index": 8,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-recovery",
+            "predecessor": "inspect-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "Recovery",
+                  "serial": 2
+                }
+              ],
+              "phase": "recovery-held",
+              "returned": [
+                {
+                  "kind": "Sparse",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 9,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-recovery",
+            "predecessor": "start-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "recovery-held"
+          },
+          {
+            "index": 10,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-recovery",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 11,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-sparse SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "Sparse",
+          "Recovery"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      }
+    },
+    "codex-ticket": {
+      "after": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "stage-logical-expiry",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-successor",
+            "predecessor": "stage-logical-expiry",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "logical-expiry-successor-ready"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-successor",
+            "predecessor": "inspect-successor",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "logical-expiry-successor-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                },
+                {
+                  "kind": "NewB",
+                  "serial": 2
+                }
+              ],
+              "phase": "successor-held",
+              "returned": []
+            },
+            "index": 8,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-obsolete-a",
+            "predecessor": "start-successor",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "successor-held"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "NewB",
+                  "serial": 2
+                }
+              ],
+              "phase": "obsolete-a-refused-b-still-held",
+              "returned": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 9,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-current-b",
+            "predecessor": "release-obsolete-a",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "obsolete-a-refused-b-still-held"
+          },
+          {
+            "index": 10,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-current-b",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 11,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "OldA",
+          "NewB"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      },
+      "before": {
+        "phases": [
+          {
+            "fixture": {
+              "held": [],
+              "phase": "ready-refresh",
+              "returned": [
+                {
+                  "kind": "Seed",
+                  "serial": 0
+                }
+              ]
+            },
+            "index": 0,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "resize",
+            "phase": "layout",
+            "predecessor": null,
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "initial owned Accounts viewport"
+          },
+          {
+            "index": 1,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "keyboard-forward",
+            "predecessor": "layout",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 2,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "keyboard-back",
+            "predecessor": "keyboard-forward",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 3,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-refresh",
+            "predecessor": "keyboard-back",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "index": 4,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-current",
+            "predecessor": "inspect-refresh",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "ready-refresh"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                }
+              ],
+              "phase": "quota-held",
+              "returned": []
+            },
+            "index": 5,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "stage-logical-expiry",
+            "predecessor": "start-current",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "quota-held"
+          },
+          {
+            "index": 6,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "motion",
+            "phase": "inspect-successor",
+            "predecessor": "stage-logical-expiry",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "logical-expiry-successor-ready"
+          },
+          {
+            "index": 7,
+            "labels": {
+              "after": "Check now",
+              "before": "Check now"
+            },
+            "operation": "click",
+            "phase": "start-successor",
+            "predecessor": "inspect-successor",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "control",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "logical-expiry-successor-ready"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                },
+                {
+                  "kind": "NewB",
+                  "serial": 2
+                }
+              ],
+              "phase": "successor-held",
+              "returned": []
+            },
+            "index": 8,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-obsolete-a",
+            "predecessor": "start-successor",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "successor-held"
+          },
+          {
+            "fixture": {
+              "held": [
+                {
+                  "kind": "NewB",
+                  "serial": 2
+                }
+              ],
+              "phase": "before-obsolete-a-settled-successor",
+              "returned": [
+                {
+                  "kind": "OldA",
+                  "serial": 1
+                }
+              ]
+            },
+            "index": 9,
+            "labels": {
+              "after": "F8 fixture gate (not a widget)",
+              "before": "F8 fixture gate (not a widget)"
+            },
+            "operation": "F8",
+            "phase": "release-current-b",
+            "predecessor": "release-obsolete-a",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "fixture-step",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "before-obsolete-a-settled-successor"
+          },
+          {
+            "index": 10,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "Tab",
+            "phase": "finished-tab",
+            "predecessor": "release-current-b",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "complete"
+          },
+          {
+            "index": 11,
+            "labels": {
+              "after": "Accounts",
+              "before": "Accounts"
+            },
+            "operation": "shift-tab",
+            "phase": "finished-shift-tab",
+            "predecessor": "finished-tab",
+            "target": {
+              "occurrences": 1,
+              "ordinal": 0,
+              "role": "owned-window",
+              "subject": "codex-ticket SYSTEM row"
+            },
+            "visible_state": "complete"
+          }
+        ],
+        "required_completion_kinds": [
+          "Seed",
+          "OldA",
+          "NewB"
+        ],
+        "terminal_states": [
+          "complete"
+        ],
+        "unavailable_control_expected": false
+      }
+    }
+  },
+  "version": 1,
+  "viewport_sizes": {
+    "narrow": [
+      900,
+      900
+    ],
+    "wide": [
+      1440,
+      900
+    ]
+  }
+}

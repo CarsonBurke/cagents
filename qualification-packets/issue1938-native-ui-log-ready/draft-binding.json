@@ -1,0 +1,83 @@
+{
+  "adapter_sha256": "c5cdbf195b5b220f38c53e5ca0b4a6580adaecdb9c25489c481fe038575dff7f",
+  "all_current_physical_context_and_grant_facts": null,
+  "allocation_fields": {
+    "adapter_sha256": [
+      "adapter_sha256"
+    ],
+    "after": [
+      "after"
+    ],
+    "allocation_id": [
+      "allocation_id"
+    ],
+    "before": [
+      "before"
+    ],
+    "checkout": [
+      "checkout"
+    ],
+    "expires_utc": [
+      "expires_utc"
+    ],
+    "lock": [
+      "lock"
+    ],
+    "owner": [
+      "owner"
+    ],
+    "plan_sha256": [
+      "plan_sha256"
+    ],
+    "scene": [
+      "scene"
+    ],
+    "target": [
+      "target"
+    ],
+    "viewport": [
+      "viewport"
+    ]
+  },
+  "attempts": 0,
+  "capture_root_proposal": "/tmp/coord16-1938-native-ui-log-corrected-1f1e78ab/owned-native",
+  "execution_authorized": false,
+  "grant": null,
+  "historical_C942d_only": {
+    "EC_return_acceptance": {
+      "path": "/tmp/fw16-backend-ec204421/root16-942d-actual-return-acceptance-v1.json",
+      "sha256": "20c79e2d74b04551bb6bf482fea17959ff130ac822cc9669395dcfa6d0794495"
+    },
+    "accepted_original_delivery": {
+      "path": "/var/tmp/coord16-C942d-original-executor-5isazpa3/accepted-original-delivery.json",
+      "sha256": "b83eb310d91f317ce3170e6f8f7781b61fbc73a053a3da9624d8f971c9d6204c"
+    },
+    "original_executor_return": {
+      "path": "/var/tmp/coord16-C942d-original-executor-5isazpa3/actual-original-executor-return.json",
+      "sha256": "d02e6db1f0c6aa1b65c8ec1fbcf3962a0cf54882d4207f95d634c97d339cd884"
+    }
+  },
+  "namespace_names": "Unchanged exclusive constructor names, NOT observed fresh. Existing namespace causes refusal; no adoption/reset/delete.",
+  "pair": {
+    "after": {
+      "head": "bb9524d5caba771e817e1c54d0f03c6455d913ae",
+      "tree": "a6ba27f620b9f80dd59a3be46966e36a509340f6"
+    },
+    "before": {
+      "head": "e10c855c10f58b2019887e4e864c47b59c3f8d58",
+      "tree": "8c26393b40af3f89aa22dbaffb81c315d7cabaca"
+    }
+  },
+  "plan_sha256": "a41ff691d544ffc3437a923898c9862691733f4b8cd7e0ac336e794e856438d8",
+  "remaining_holds": [
+    "Pending independent exact new-root/source/hash DAG assembly review; corrected source179b alone is not this binding review.",
+    "Root/EC must supply actual current canonical checkout/control/registry/original-inode/target/lock facts and current accepted-return context; B9 later ownership may retarget.",
+    "Actual source-object presence in canonical execution common is unobserved and null; no common Git/helper call was made.",
+    "All current installed tool hashes, ancestor configuration/absence facts, natural inherited context and full global family/namespace closure facts are unobserved/null.",
+    "Fresh fixed capture root/display/clipboard/five-empty-XDG exclusivity and original source/window/frame/coordinate reviews remain runtime obligations; no observation/allocation here.",
+    "Fresh exact original scoped EC grant/current expiry/owner handoff/preflight are null; historical C942d return/acceptance cannot authorize this packet."
+  ],
+  "scene": "claude-malformed",
+  "status": "UNBOUND_HOLD_SOURCE_ASSEMBLY_ONLY",
+  "viewport": "narrow"
+}
