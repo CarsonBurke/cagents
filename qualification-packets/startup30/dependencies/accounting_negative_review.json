@@ -1,0 +1,238 @@
+{
+  "schema": "finite-startup30-independent-parent-accounting-source-review-v1",
+  "utc": "2026-10-31T09:35:15.454590+00:00",
+  "reviewer_role": "/root/1945_cache_io_oracles; independent scoped source reviewer, not packet author, execution authority or runtime observer",
+  "verdict": "SOURCE_HOLD_ONE_PARTIAL_DISCOVERY_ACCOUNTING_GAP",
+  "scope": "Only parent_accounting, final main summary task delta and cumulative group-contract evidence join. Admission/execute semantics and full conservation are independently owned; no whole-controller approval.",
+  "controller": {
+    "head": "359623881492576f122532ded4ac6c7ce36adf01",
+    "tree": "10dc77a01badf5dec7745da41cda21b2d244e762",
+    "parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source",
+    "pins": [
+      {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/run-packet.py",
+        "git_ref": "359623881492576f122532ded4ac6c7ce36adf01:qualification-packets/startup30/run-packet.py",
+        "sha256": "535836c4b6c922f4c37a7b297ac04463e00b50112bd192a0c02fcda2d6d4234c",
+        "live_equal_frozen_at_review_end": true
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/plan.json",
+        "git_ref": "359623881492576f122532ded4ac6c7ce36adf01:qualification-packets/startup30/plan.json",
+        "sha256": "5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c",
+        "live_equal_frozen_at_review_end": true
+      },
+      {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/manifest.json",
+        "git_ref": "359623881492576f122532ded4ac6c7ce36adf01:qualification-packets/startup30/manifest.json",
+        "sha256": "287b8cbae2a26d6466bb379921d18e338f3d224d9b7921bf03c35fbfd2348656",
+        "live_equal_frozen_at_review_end": true
+      }
+    ]
+  },
+  "product": {
+    "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+    "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+    "parent": "b914f9d9b55527aa1bb22d591968c58958d717ee"
+  },
+  "seam_map": {
+    "path": "/tmp/eb7ff16b-packet-B-d412-exact-task-seam-map-v1.md",
+    "sha256": "6c02bcd3ef8bb9f2935d17c5c9df8189bf359c906e58a8e961cc77cdcf8badf0"
+  },
+  "donor": {
+    "head": "d412d6fdb7f137df179b415aae18e4e5cabc3a1a",
+    "runner_sha256": "f820d314bda28a4e183a50ace3b05fb4ca0506d12ebb6b41bfdb868039a497ae",
+    "actual_grant5360_launch_and_RAW_qualification": "UNOBSERVED; no runtime qualification transfer"
+  },
+  "finding": {
+    "id": "ACCOUNTING-DISCOVERY-1",
+    "severity": "P2 accounting/evidence defect; no false pass or unsafe release demonstrated",
+    "path": "qualification-packets/startup30/run-packet.py",
+    "lines": [
+      713,
+      715,
+      761,
+      791
+    ],
+    "title": "A validated first-group inventory disappears from discovery accounting if its parent has not spawned",
+    "source_causal_schedule": [
+      "CLI compile and inventory return successfully; grouped_contracts631 creates a validated singleton contract from the actual inventory.",
+      "required_save637 successfully persists cumulative group-contracts.json with the CLI contract.",
+      "The first group before-observation648/649, or invoke pre-launch source/context work, refuses before recording a parent phase Popen. No parent attempt exists. No candidate execution was performed to realize this schedule.",
+      "parent_accounting713 skips reading the already valid cumulative contract because attempted is empty. contracts stays empty;761/791 return discovered_requested_unique_parent_names/count=None instead of the observed CLI singleton/count1."
+    ],
+    "introduced_vs_inherited": "The if attempted gate is inherited. This derivative newly exposes a declared-versus-discovered distinction and requires faithful partial discovery; retaining that gate fails the new metric contract before the first parent spawn. It is not a newly proved unsafe custody/close path.",
+    "expected_observation": "declared30; discovered CLI singleton/count1 from retained valid evidence; attempted0; qualified0; unrun invocations3. Actual inventory total N remains only the saved actual inventory/contract value, never guessed from source.",
+    "current_observation": "declared30; discovered names/count null; attempted0; qualified0; unrun3, although the original valid contract/inventory remain on disk.",
+    "smallest_correction": "Read and validate a produced cumulative contract even with zero test attempts. Distinguish genuine not-yet-produced FileNotFound before any attempt (discovery remains None) from malformed/unreadable/prefix-invalid produced evidence (sticky raw error/HOLD). Any actual test attempt must still require its original contract. No source-time N, invented parent waits, new execution seam or protected finalizer edit is needed.",
+    "qualification_effect": "Do not grant new pass credit or relax HOLD. The first-library-observation failure is already sticky; discovery repair reports evidence only. This review leaves admission/runtime blocked."
+  },
+  "accepted_bounded_checks": [
+    {
+      "fact": "Fixed groups and declarations",
+      "source": "Plan artifact_groups and planned_phase_order",
+      "observation": {
+        "groups": [
+          [
+            "cli-lib",
+            "parent-cli-lib-exact",
+            1
+          ],
+          [
+            "host-lib",
+            "parent-host-lib-exact",
+            1
+          ],
+          [
+            "ui-lib",
+            "parent-ui-lib-exact",
+            28
+          ]
+        ],
+        "declared_assigned_names": 30,
+        "distinct_assigned_names": 30,
+        "phases": [
+          "compile-cli-lib",
+          "inventory-cli-lib",
+          "parent-cli-lib-exact",
+          "compile-host-lib",
+          "inventory-host-lib",
+          "parent-host-lib-exact",
+          "compile-ui-lib",
+          "inventory-ui-lib",
+          "parent-ui-lib-exact"
+        ],
+        "helper_build": null
+      },
+      "limit": "Source declarations only, not compiled inventory, selected runtime rows or pass counts."
+    },
+    {
+      "fact": "Cumulative join preserves earlier groups on later artifact failure",
+      "anchors": [
+        "execute_contracts:631-637",
+        "parent_accounting:715-719"
+      ],
+      "observation": "Contracts append after each original inventory, require unique exact prefix labels, and save before invocation. Later compile/inventory failure leaves the earlier persisted prefix. Required save failure is sticky and prevents invocation."
+    },
+    {
+      "fact": "Actual raw stdout/wait reconciliation retained",
+      "anchors": [
+        "parent_accounting:722-753"
+      ],
+      "exact_donor_body": true,
+      "observation": "Original stage/label/PID state and phase record are joined; stdout bytes are reread and SHA256 matched to original phase hash. Credit requires strict parser result, original wait complete/exit0, evidence complete, no supervision error, and one historical result matching the exact parsed fields. Logical parent membership never supplies per-name wait receipts."
+    },
+    {
+      "fact": "Complete group credit cannot borrow from earlier prefixes",
+      "anchors": [
+        "parent_accounting:764-795",
+        "main:1271"
+      ],
+      "observation": "Final semantic qualification requires the three raw group labels, historical records and contract labels in exact CLI/HOST/UI order and all three qualified rows. Summary additionally requires no original error/cancellation, exact nine-phase order and actual_release. A missing/failed UI group cannot earn the other28 names from CLI/HOST or declaration30."
+    },
+    {
+      "fact": "Historical, discovered and qualified observations remain distinct except finding above",
+      "anchors": [
+        "parent_accounting:761-794"
+      ],
+      "observation": "Union counts are nonadditive; historical parents are separately labelled; source-time declaration30 never fills actual N or test results. A later contract may be discovered but not attempted without pass credit. Unknown original waits stay unknown."
+    },
+    {
+      "fact": "Failure versus HOLD/release classification not relaxed by the scoped task delta",
+      "anchors": [
+        "parent_accounting:750-752",
+        "main:1223-1228",
+        "main:1260-1271"
+      ],
+      "observation": "Read/decode/reconciliation exceptions become raw errors and sticky supervision failures, preventing clean handoff. A semantic/nonzero test refusal remains FAIL_STOP with no qualification; physically clean original waits/custody can support only the unchanged negative-return predicates. No positive C release observed here."
+    }
+  ],
+  "scope_interface_comparisons": {
+    "per_attempt_raw_join_byte_exact_d412": true,
+    "grouped_result_byte_exact_d412": true,
+    "safe_lane_handoff_byte_exact_d412": true,
+    "summary_delta": "Only owning_commands_qualified group count/labels2->3 changed inside summary; protected finalizer not re-reviewed."
+  },
+  "static_failure_matrix_not_executed": [
+    {
+      "schedule": "Before first valid contract",
+      "discovered": "None is appropriate",
+      "qualified": 0,
+      "whole_group_qualified": false
+    },
+    {
+      "schedule": "CLI contract saved; before first parent spawn refusal",
+      "discovered": "Should be CLI1; current None is finding",
+      "qualified": 0,
+      "whole_group_qualified": false
+    },
+    {
+      "schedule": "CLI passes then HOST compile/inventory fails before its contract",
+      "discovered": "CLI1 prefix retained",
+      "qualified": "At most CLI1 after final raw reconciliation",
+      "whole_group_qualified": false
+    },
+    {
+      "schedule": "HOST contract saved but HOST parent never spawns",
+      "discovered": "CLI1+HOST1 prefix retained",
+      "qualified": "At most earlier CLI1",
+      "whole_group_qualified": false
+    },
+    {
+      "schedule": "Actual UI parent exits nonzero/has malformed or missing selected results",
+      "discovered": "May be declared30 only after three actual contracts",
+      "qualified": "No UI28 credit; only separately reconciled prior groups",
+      "whole_group_qualified": false
+    },
+    {
+      "schedule": "All three groups return strict outputs and original receipts",
+      "discovered": "30 only from actual saved contracts",
+      "qualified": "30 only with all original raw joins; summary still requires original no-error/context/custody/release predicates",
+      "whole_group_qualified": "Conditional source path, never observed here"
+    }
+  ],
+  "actual": {
+    "B_grant": null,
+    "execution_authorized": false,
+    "current_context": null,
+    "compiled_inventory_N": null,
+    "original_phase_waits": null,
+    "actual_stdout_or_counts": null,
+    "actual_donor_qualification": "UNRUN/UNOBSERVED",
+    "runtime": "UNRUN",
+    "native": "UNRUN",
+    "resource_release": null
+  },
+  "limits": [
+    "Only inert source/Git/AST/JSON/hash reads and own /tmp evidence; no candidate/helper/parser import, extracted function invocation, compile/test/build/Cargo/native/process/environment/context/resource probe, source mutation or worker.",
+    "This is one bounded accounting negative. It neither reviews main admission/execute semantics nor asserts complete conservation/whole-controller approval.",
+    "Original donor grant5360 has not been observed launching here; actual accepted donor return, Packet A positive return, independent assembled review and distinct B admission remain required. Source preparation was separately authorized; it is not execution authority."
+  ],
+  "signature": "Signed in role by /root/1945_cache_io_oracles; finite independent source-only accounting review.",
+  "artifacts": [
+    {
+      "path": "/tmp/startup30-parent-accounting-source-review-texya0k0/manifest.json.frozen",
+      "sha256": "287b8cbae2a26d6466bb379921d18e338f3d224d9b7921bf03c35fbfd2348656"
+    },
+    {
+      "path": "/tmp/startup30-parent-accounting-source-review-texya0k0/parent_accounting.diff",
+      "sha256": "567a50612fce46398655da1badea0f8da0fa0e99b5ee837498c2ab9c7c6c947d"
+    },
+    {
+      "path": "/tmp/startup30-parent-accounting-source-review-texya0k0/plan.json.frozen",
+      "sha256": "5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c"
+    },
+    {
+      "path": "/tmp/startup30-parent-accounting-source-review-texya0k0/run-packet.py.frozen",
+      "sha256": "535836c4b6c922f4c37a7b297ac04463e00b50112bd192a0c02fcda2d6d4234c"
+    },
+    {
+      "path": "/tmp/startup30-parent-accounting-source-review-texya0k0/scoped-source-excerpts.txt",
+      "sha256": "fe3497aeb90d04fb9480462951f18c2925f0153e74b15b1b3febeb371a86f42b"
+    },
+    {
+      "path": "/tmp/startup30-parent-accounting-source-review-texya0k0/seam-map.frozen.md",
+      "sha256": "6c02bcd3ef8bb9f2935d17c5c9df8189bf359c906e58a8e961cc77cdcf8badf0"
+    }
+  ]
+}

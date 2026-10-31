@@ -710,9 +710,16 @@ def safe_lane_handoff(attempts, states, phases, final_custody, failures):
 def parent_accounting(attempts, states, phases, parents, out):
     attempted = [attempt for attempt in attempts if attempt[0] == 'phase' and attempt[1].startswith('parent-')]
     raw, errors, contracts = [], [], {}
-    if attempted:
+    try:
+        contract_bytes = (out / 'group-contracts.json').read_bytes()
+    except FileNotFoundError as exc:
+        if attempted:
+            errors.append('Group contract evidence: ' + type(exc).__name__ + ': ' + str(exc))
+    except Exception as exc:
+        errors.append('Group contract evidence: ' + type(exc).__name__ + ': ' + str(exc))
+    else:
         try:
-            values = json.loads((out / 'group-contracts.json').read_bytes())
+            values = json.loads(contract_bytes)
             expected = ['parent-cli-lib-exact', 'parent-host-lib-exact', 'parent-ui-lib-exact']
             assert 0 < len(values) <= len(expected)
             assert [value['label'] for value in values] == expected[:len(values)]
