@@ -28,6 +28,7 @@ UNKNOWN = ['No independent original-supervisor terminal or parent stdout/stderr 
            'Full native8 flow, preparation inventories, immutable staging, official artifacts and acceptance are outside this reader.',
            'Ready-line raw bytes are absent from the supervisor DTO; only its count/hash/EOF associations can be checked.',
            'Directory identities and kernel waits are recorded observations, not independently re-observed here.',
+           'Inter-service capture close timing is absent; prior X/bus numeric FDs may be reused after EOF, not proven live across later acquisitions.',
            'The source-verified data-only driver callback is supplied by the caller; a matching label does not authenticate callable code.']
 TOP = 'kind qualified retained_evidence_verified_here supervisor_instance roots source descriptors captures directories spawn_fenced subreaper kernel driver_ledger first_diagnostic cancel_signal errors outside_scope'
 SOURCE = 'control product before run attempt logical_job numeric_job_id supervisor_sha256 driver_sha256 preparation_module_sha256 prepared_sha256'
@@ -96,7 +97,7 @@ def source_data(value):
 
 def wait_data(value):
     keys(value,'start_ns finish_ns exit_code error','wait-shape')
-    need(integer(value['start_ns'],1) and integer(value['finish_ns'],value['start_ns'])
+    need(integer(value['start_ns'],1) and integer(value['finish_ns'],1)
          and (value['exit_code'] is None or type(value['exit_code']) is int)
          and (value['error'] is None or text(value['error'])),'wait-types')
     need((value['error'] is None and type(value['exit_code']) is int)
@@ -176,6 +177,16 @@ def validate_local(record, expected_source, paths, owner_uid, supervisor_instanc
             need(row['eof'] is True and 0 < row['bytes'] <= READY_BYTES,'ready-EOF-count')
         else:
             need(row['eof'] is False and row['bytes'] == 0,'nonreader-descriptor-count')
+    # Record IDs stay unique across history; numeric FDs may be reused after
+    # close. These acquisition sets coexist without an intervening pump close.
+    # Prior-service captures are excluded: ready()/pump() may have closed them
+    # on EOF before a later acquisition, and the DTO has no close-time facts.
+    co_live=[(index*2-1,index*2) for index in range(1,10)]
+    co_live += [(19,20),(19,20,21),(19,20,22,23,24,25),
+                (19,20,26),(19,20,27,28,29,30),(19,20,31,32)]
+    for phase in co_live:
+        numbers=[fds['supervisor-fd-'+str(index)]['fd'] for index in phase]
+        need(len(numbers) == len(set(numbers)),'co-live-descriptor-alias')
     captures_by_path={}
     for name,row in zip(names,capture_rows):
         keys(row,CAPTURE,'capture-shape')
@@ -204,7 +215,6 @@ def validate_local(record, expected_source, paths, owner_uid, supervisor_instanc
     need(directory_rows[0]['identity'] != directory_rows[1]['identity'],'directory-generation-alias')
     private=directory_rows[1]['path']
     stream_fds=[];generations=set();pids=[]
-    first_finishes=[]
     for index,row in enumerate(roots,1):
         role='metadata' if index <= 9 else ('Xvfb','bus','driver')[index-10]
         fields=ROOT+(' ready' if role in ('Xvfb','bus') else '')
@@ -216,16 +226,19 @@ def validate_local(record, expected_source, paths, owner_uid, supervisor_instanc
         need(type(row['pid']) is int and row['pid'] == row['identity']['pid'],'root-original-PID')
         generation=(row['pid'],row['identity']['stamp'])
         need(generation not in generations,'root-generation-reuse');generations.add(generation);pids.append(row['pid'])
-        need(type(row['waits']) is list and 0 < len(row['waits']) <= 4096,'root-wait-history')
-        successes=[];previous_finish=row['attempted_ns']
+        # The normal source awaits metadata/driver once for work and again
+        # during finish; X/bus are each awaited once during finish. A prior
+        # wait error would have latched a diagnostic and is never clean here.
+        expected_waits=2 if role in ('metadata','driver') else 1
+        need(type(row['waits']) is list and len(row['waits']) == expected_waits,'normal-root-wait-count')
         for waited in row['waits']:
             wait_data(waited)
-            need(waited['start_ns'] >= previous_finish,'root-wait-chronology')
-            previous_finish=waited['finish_ns']
-            if waited['error'] is None:successes.append(waited)
+            need(waited['error'] is None,'normal-root-wait-error: '+str(waited['error']))
         wait_data(row['terminal'])
-        need(successes and row['terminal'] == successes[-1] and row['terminal']['error'] is None,'root-terminal-last-wait')
-        first_finishes.append(successes[0]['finish_ns'])
+        need(row['terminal'] == row['waits'][-1] and row['terminal']['error'] is None,'root-terminal-last-wait')
+        need(all(waited['exit_code'] == row['terminal']['exit_code'] for waited in row['waits']),'original-wait-outcome-contradiction')
+        # System.stamp is time.time_ns: positive scalar observations and list
+        # position are retained; no within/across-record clock order is inferred.
         need(type(row['signals']) is list and len(row['signals']) <= 4096,'root-signals')
         returned_term=returned_kill=False
         for sent in row['signals']:
@@ -276,8 +289,6 @@ def validate_local(record, expected_source, paths, owner_uid, supervisor_instanc
             need(integer(ready['bytes'],1) and ready['bytes'] == fds[descriptor_id]['bytes'] and ready['eof'] is True
                  and hex_text(ready['sha256'],64) and ready['meaning'] == 'Original launch notification only; no authenticated client readiness claim.','ready-association')
     need(len(stream_fds) == len(set(stream_fds)) == 24,'root-stream-unique-IDs')
-    need(all(roots[index-1]['attempted_ns'] <= roots[index]['attempted_ns'] for index in range(1,12)),'root-creation-order')
-    need(all(first_finishes[index-1] <= roots[index]['attempted_ns'] for index in range(1,10)),'serial-metadata-order')
     kernel=record['kernel'];keys(kernel,'waits echild errors','kernel-shape')
     strings(kernel['errors'],'kernel-errors')
     need(type(kernel['echild']) is bool and type(kernel['waits']) is list and len(kernel['waits']) <= MAX_ADOPTED,'kernel-types')

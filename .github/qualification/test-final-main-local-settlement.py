@@ -69,11 +69,14 @@ class Fixture:
             pid=1001 if index<=2 else 1000+index
             identity=dict(pid=pid,group=pid,stamp=str(200+index))
             code=-15 if role in ('Xvfb','bus') else 0
-            waited=dict(start_ns=index*100+10,finish_ns=index*100+20,exit_code=code,error=None)
+            work_wait=dict(start_ns=index*100+10,finish_ns=index*100+20,exit_code=code,error=None)
+            finish_order=0 if role=='driver' else (1 if role=='bus' else (11 if role=='Xvfb' else index+1))
+            finish_wait=dict(start_ns=3000+finish_order*100,finish_ns=3020+finish_order*100,exit_code=code,error=None)
+            waits=[copy.deepcopy(work_wait),copy.deepcopy(finish_wait)] if role in ('metadata','driver') else [copy.deepcopy(finish_wait)]
             signals=[dict(signal=15,returned=True,outcome='returned',error=None)] if code==-15 else []
             row=dict(id='supervisor-root-'+str(index),role=role,argv=[],cwd=None,attempted_ns=index*100,
-                pid=pid,identity=identity,returned=True,published=True,error=None,waits=[copy.deepcopy(waited)],
-                terminal=copy.deepcopy(waited),signals=signals,forced=False,streams=[])
+                pid=pid,identity=identity,returned=True,published=True,error=None,waits=waits,
+                terminal=copy.deepcopy(finish_wait),signals=signals,forced=False,streams=[])
             if role=='metadata':
                 checkout=self.paths[('control','before','after')[(index-1)//3]]
                 row['argv']=['git','-C',checkout,*([['rev-parse','HEAD'],['rev-parse','HEAD^{tree}'],['status','--porcelain=v1']][(index-1)%3])]
@@ -130,13 +133,25 @@ class Fixture:
 
     def code(self,index,value):
         row=self.record['roots'][index-1]
-        row['waits'][-1]['exit_code']=value;row['terminal']['exit_code']=value
+        for waited in row['waits']:waited['exit_code']=value
+        row['terminal']['exit_code']=value
 
     def stream(self,index,stream,field,value):
         root=self.record['roots'][index-1];which=0 if stream=='stdout' else 1
         row=root['streams'][which];row[field]=value
         descriptor=next(item for item in self.record['descriptors'] if item['id']==row['id'])
         descriptor[field]=value
+
+
+    def fd(self,index,value):
+        row=self.record['descriptors'][index-1];row['fd']=value
+        for root in self.record['roots']:
+            for stream in root['streams']:
+                if stream['id']==row['id']:stream['fd']=value
+        # Keep source-owned inherited-ready argv consistent, so a co-live alias
+        # is refused for ownership rather than a stale copied argument.
+        if index==23:self.record['roots'][9]['argv'][2]=str(value)
+        if index==28:self.record['roots'][10]['argv'][-1]='--print-address='+str(value)
 
 
 class LocalSettlementTests(unittest.TestCase):
@@ -184,9 +199,6 @@ class LocalSettlementTests(unittest.TestCase):
                 mutate(fixture);self.assert_negative(fixture,reason);self.assertEqual(fixture.calls,[])
 
     def test_metadata_membership_argv_order_cleanliness_and_terminal_types(self):
-        def late_metadata_finish(fixture):
-            row=fixture.record['roots'][0]
-            row['waits'][0]['finish_ns']=201;row['terminal']['finish_ns']=201
         cases=[('argv',lambda f:f.record['roots'][3]['argv'].__setitem__(2,f.paths['after']),'root-exact-argv-cwd'),
             ('id',lambda f:f.record['roots'][1].__setitem__('id','supervisor-root-1'),'root-creation'),
             ('role',lambda f:f.record['roots'][9].__setitem__('role','driver'),'root-creation'),
@@ -194,7 +206,7 @@ class LocalSettlementTests(unittest.TestCase):
             ('unreturned',lambda f:f.record['roots'][0].__setitem__('returned',False),'root-creation'),
             ('bool-wait',lambda f:f.code(1,False),'wait-types'),
             ('float-pid',lambda f:f.record['roots'][0].__setitem__('pid',1001.0),'root-original-PID'),
-            ('order',late_metadata_finish,'serial-metadata-order')]
+            ('terminal-copy',lambda f:f.record['roots'][0]['terminal'].__setitem__('exit_code',1),'root-terminal-last-wait')]
         for name,mutate,reason in cases:
             with self.subTest(name=name):
                 fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
@@ -289,6 +301,80 @@ class LocalSettlementTests(unittest.TestCase):
                 fixture=Fixture();fixture.record[field]=value;self.assert_negative(fixture,reason)
         fixture=Fixture();fixture.record['extra_witness']='cannot release HOLD'
         self.assert_negative(fixture,'supervisor-shape')
+
+    def test_normal_original_wait_histories_require_both_work_and_finish(self):
+        fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+        self.assertEqual([len(row['waits']) for row in fixture.record['roots']],[2]*9+[1,1,2])
+        for index in [*range(1,10),12]:
+            for removed in (0,1):
+                with self.subTest(root=index,missing=removed):
+                    fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+                    row=fixture.record['roots'][index-1];row['waits'].pop(removed)
+                    row['terminal']=copy.deepcopy(row['waits'][-1])
+                    self.assert_negative(fixture,'normal-root-wait-count')
+        for index in (1,10,11,12):
+            with self.subTest(root=index,extra=True):
+                fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+                row=fixture.record['roots'][index-1];row['waits'].insert(0,copy.deepcopy(row['waits'][0]))
+                self.assert_negative(fixture,'normal-root-wait-count')
+        for index in (1,12):
+            with self.subTest(root=index,prior_error=True):
+                fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+                row=fixture.record['roots'][index-1]
+                row['waits'][0].update(exit_code=None,error='retained original wait failure')
+                result=self.assert_negative(fixture,'normal-root-wait-error')
+                self.assertEqual(result['recorded_errors'],[])
+                self.assertTrue(any('retained original wait failure' in value for value in result['diagnostics']))
+                self.assertIsNone(result['recorded_first_diagnostic'])  # The history contradicts this copied clean verdict.
+            with self.subTest(root=index,prior_outcome=True):
+                fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+                fixture.record['roots'][index-1]['waits'][0]['exit_code']=1
+                self.assert_negative(fixture,'original-wait-outcome-contradiction')
+
+    def test_co_live_original_FDs_are_distinct_without_global_lifetime_uniqueness(self):
+        # Guaranteed source acquisition phases, not an inference that prior
+        # service output remained open after ready()/pump() observed its EOF.
+        aliases=[('directories',20,19),('metadata-pair',2,1),('server-secret',21,19),
+            ('X-ready-pair',23,22),('X-ready-output',24,22),('X-directory-output',24,19),
+            ('client-secret',26,20),('bus-ready-pair',28,27),('bus-ready-output',29,27),
+            ('bus-directory-output',29,20),('driver-pair',32,31),('driver-directory-output',31,19)]
+        for name,target,original in aliases:
+            with self.subTest(name=name):
+                fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+                fixture.fd(target,fixture.record['descriptors'][original-1]['fd'])
+                self.assert_negative(fixture,'co-live-descriptor-alias')
+        # Every reuse has otherwise consistent stream copies/ready argv. This
+        # is a possible history, not evidence of the absent EOF-close timing.
+        for name,target,closed in [('closed-server-auth',22,21),
+                ('closed-X-ready',26,22),('prior-X-output',29,24),('prior-bus-output',31,29)]:
+            with self.subTest(reuse=name):
+                fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+                fixture.fd(target,fixture.record['descriptors'][closed-1]['fd'])
+                result=fixture.check();self.assertTrue(result['internal_consistency'],result);self.assert_hold(result)
+                self.assertTrue(any('Inter-service capture close timing' in value for value in result['unknown']))
+
+    def test_regressing_wall_stamps_are_scalar_observations_not_clock_order(self):
+        fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+        for index,row in enumerate(fixture.record['roots'],1):
+            row['attempted_ns']=20000-index*100
+            for position,waited in enumerate(row['waits']):
+                waited['start_ns']=10000-index-position*1000
+                waited['finish_ns']=100-index-position*50
+            row['terminal']=copy.deepcopy(row['waits'][-1])
+        # Covers within-wait reversal, later wait before earlier finish,
+        # waits before creation stamp and regressing cross-root wall stamps.
+        fixture.record['roots'][0]['waits'][1]['start_ns']=1
+        fixture.record['roots'][0]['terminal']=copy.deepcopy(fixture.record['roots'][0]['waits'][-1])
+        result=fixture.check();self.assertTrue(result['internal_consistency'],result);self.assert_hold(result)
+        for field,value,reason in [('attempted_ns',False,'root-creation'),('start_ns',1.5,'wait-types'),('finish_ns',0,'wait-types')]:
+            with self.subTest(field=field):
+                fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+                if field=='attempted_ns':fixture.record['roots'][0][field]=value
+                else:fixture.record['roots'][0]['waits'][0][field]=value
+                self.assert_negative(fixture,reason)
+        fixture=Fixture();self.assertTrue(fixture.check()['internal_consistency'])
+        fixture.record['roots'][0],fixture.record['roots'][1]=fixture.record['roots'][1],fixture.record['roots'][0]
+        self.assert_negative(fixture,'root-creation')  # Actual list/role order remains source-owned.
 
     def test_source_only_reader_has_no_resource_boundary_or_HOLD_override(self):
         namespace=extracted()
