@@ -3074,6 +3074,32 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
 /// [`restore_upgrade_from`].
 const RESTORE_TERMINATED: &str = "daemon termination was requested during upgrade restore";
 
+/// The one path that restores a checkpointed chat. Each chat takes exactly
+/// one: a second attempt on a retained conversation finds the actor the first
+/// attempt reattached and refuses it, failing the whole restore.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatRestore {
+    /// A managed Codex CLI, whose thread server must exist before its TUI.
+    CodexListener,
+    /// A provider that outlived the previous daemon. It is reattached, and a
+    /// refusal is that conversation's problem alone; it is never relaunched.
+    Retained,
+    /// Relaunched from its checkpointed launch once carried terminals return.
+    Relaunch,
+}
+
+impl ChatRestore {
+    fn of(chat: &crate::upgrade::handoff::Chat) -> Self {
+        if chat.source.native_continuity.retains_provider() {
+            Self::Retained
+        } else if super::chat::owns_codex_listener(&chat.source) {
+            Self::CodexListener
+        } else {
+            Self::Relaunch
+        }
+    }
+}
+
 /// Replays a checkpoint, abandoning the replay as soon as termination is
 /// requested.
 ///
@@ -3171,9 +3197,7 @@ fn restore_upgrade_from(
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source)
-                && !chat.source.native_continuity.retains_provider()
-            {
+            if ChatRestore::of(chat) == ChatRestore::CodexListener {
                 super::chat::restore_upgrade(host, chat)?;
             }
         }
@@ -3224,7 +3248,7 @@ fn restore_upgrade_from(
         // thread's rollout, is that conversation's problem to report, not a
         // reason to keep every other session and the daemon itself down.
         for chat in &checkpoint.chats {
-            if !chat.source.native_continuity.retains_provider() {
+            if ChatRestore::of(chat) != ChatRestore::Retained {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -3328,7 +3352,7 @@ fn restore_upgrade_from(
                 .map_err(|error| error.message)?;
         }
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source) {
+            if ChatRestore::of(chat) != ChatRestore::Relaunch {
                 continue;
             }
             if crate::daemon::termination_requested() {
