@@ -39,6 +39,228 @@ preparation = None
 stopped = set()
 out = None
 arm = None
+ledger = None
+
+
+class DriverLedger:
+    """Driver-created originals/writers only; never an outside-family census."""
+    def __init__(self, clock, lock):
+        self.clock,self.lock = clock,lock
+        self.scope = 'global-driver'
+        self.entered = []
+        self.creations,self.writers,self.callbacks = [],[],[]
+        self.streams,self.handles = {},{}
+        self.original_streams = []
+        self.monitors = []
+        self.fenced = self.sealed = False
+        self.binding = None
+        self.kernel = None
+        self.subreaper = False
+
+    def enter(self, label):
+        with self.lock:
+            assert not self.fenced and label in ('before','after') and label not in self.entered
+            self.entered.append(label)
+            self.scope = label
+
+    def attempt(self, argv, cwd, role, mount):
+        with self.lock:
+            assert not self.fenced and not self.sealed, 'Driver spawning phase is closed'
+            assert role is not None and len(self.creations) < 4096, 'Creation role/count unresolved'
+            row = dict(id='creation-'+str(len(self.creations)+1),scope=self.scope,role=role,
+                argv=list(map(str,argv)),cwd=None if cwd is None else str(cwd),attempted_ns=self.clock(),
+                pid=None,identity=None,pidfd=None,pidfd_note='Not acquired; authority is the original retained Popen.',
+                expected_mount=None if mount is None else str(mount),returned=False,published=False,
+                error=None,writers=[],waits=[],terminal=None,signals=[],forced=False)
+            self.creations.append(row)
+            return row
+
+    def returned(self, process, row, options):
+        with self.lock:
+            self.handles[id(process)] = row
+            row.update(returned=True,pid=process.pid)
+        for name in ('stdin','stdout','stderr'):
+            supplied = options.get(name)
+            if id(supplied) in self.streams:
+                self.inherit(supplied,row)
+            stream = getattr(process,name,None)
+            if stream is not None:
+                self.retain_stream(stream,'<'+row['id']+'.'+name+'>','child-PIPE',row=row)
+
+    def reserve_writer(self, path, kind):
+        with self.lock:
+            assert not self.sealed and len(self.writers) < 16384, 'Writer phase/count unresolved'
+            row = dict(id='writer-'+str(len(self.writers)+1),scope=self.scope,path=str(path),kind=kind,
+                       acquired=False,closed=False,error=None,inherited_by=[],callback=None)
+            self.writers.append(row)
+            return row
+
+    def retain_stream(self, stream, path=None, kind=None, row=None, writer=None):
+        self.original_streams.append((stream,writer))  # Before fallible ledger publication.
+        with self.lock:
+            if id(stream) not in self.streams:
+                writer = writer or self.reserve_writer(path,kind)
+                self.streams[id(stream)] = (stream,writer)
+                writer['acquired'] = True
+            if row is not None: self.inherit(stream,row)
+            return self.streams[id(stream)][1]
+
+    def inherit(self, stream, row):
+        with self.lock:
+            writer = self.streams[id(stream)][1]
+            if row['id'] not in writer['inherited_by']: writer['inherited_by'].append(row['id'])
+            if writer['id'] not in row['writers']: row['writers'].append(writer['id'])
+
+    def record_wait(self, process, method, began, code=None, error=None):
+        with self.lock:
+            row = self.handles[id(process)]
+            result = dict(method=method,start_ns=began,finish_ns=self.clock(),exit_code=code,
+                          error=None if error is None else repr(error))
+            row['waits'].append(result)
+            if error is None and type(code) is int: row['terminal'] = result
+
+    def callback(self, output):
+        with self.lock:
+            assert not self.fenced and not self.sealed
+            row = dict(id='callback-'+str(len(self.callbacks)+1),scope=self.scope,path=str(output),
+                accepting=False,inflight=0,closed=False,filter_id=None,filter_removed=False,
+                monitor='uncreated',query='uncreated',initialized=False,errors=[])
+            self.callbacks.append(row)
+            return row
+
+    def errors(self):
+        errors = []
+        if self.binding is None: errors.append('Driver source/instance binding UNKNOWN')
+        by_id = {row['id']:row for row in self.creations}
+        for row in self.creations:
+            if not row['returned'] or row['identity'] is None or not row['published'] or row['error'] or row['terminal'] is None:
+                errors.append(row['id']+' original creation/role/wait UNKNOWN')
+            if row['forced']: errors.append(row['id']+' required forced termination')
+        for row in self.writers:
+            if not row['acquired'] or not row['closed'] or row['error']:
+                errors.append(row['id']+' parent stream UNKNOWN')
+            if any(by_id[child]['terminal'] is None for child in row['inherited_by']):
+                errors.append(row['id']+' inherited writer terminal UNKNOWN')
+        for row in self.callbacks:
+            if not row['initialized'] or row['accepting'] or row['inflight'] or not row['closed'] or row['errors']:
+                errors.append(row['id']+' callback writer UNKNOWN')
+        return errors
+
+    def snapshot(self, errors, work_error, requested_cancel):
+        with self.lock:
+            assert self.fenced and not self.sealed
+            self.sealed = True
+            return dict(kind='driver-role-writer-ledger-v1',scope='This original driver only; pre-exit statement.',
+                binding=self.binding,entered_arms=list(self.entered),creations=self.creations,
+                writers=self.writers,callbacks=self.callbacks,kernel=self.kernel,
+                no_future_spawns=True,errors=list(errors),first_terminal_diagnostic=work_error,
+                requested_cancel=requested_cancel,
+                outside_scope=['Xvfb/private session-bus roots and activated families','Driver later exit and captured parent streams',
+                    'Native capsule/staging, whole-job/executor return and independent acceptance'],
+                final_publication=('PARTIAL UNKNOWN; unsettled writers may remain.' if errors else
+                    'This sidecar is the final driver native-payload write; its own bytes are not self-hashed.'))
+
+
+def open_parent(path, mode, kind='parent-log'):
+    with cancellation.defer():
+        row = ledger.reserve_writer(path,kind)
+        try:
+            stream = path.open(mode)
+            ledger.retain_stream(stream,writer=row)
+            return stream
+        except BaseException as error:
+            row['error'] = repr(error)
+            cancellation.latch(error)
+            raise
+
+
+def close_parent(stream):
+    if stream is None: return
+    with cancellation.defer():
+        if id(stream) not in ledger.streams:
+            # Close the retained original object even when metadata publication
+            # failed; do not convert that failure into a repaired ledger.
+            stream.close()
+            raise RuntimeError('Original stream publication UNKNOWN after actual close')
+        row = ledger.streams[id(stream)][1]
+        if row['closed']: return
+        if row['callback'] is not None:
+            callback = next(value for value in ledger.callbacks if value['id']==row['callback'])
+            assert not callback['accepting'] and callback['inflight']==0, 'Callback stream still admitted/inflight'
+        try:
+            stream.close()
+            row['closed'] = True
+        except BaseException as error:
+            row['error'] = repr(error)
+            cancellation.latch(error)
+            raise
+
+
+def write_payload(path, data, append=False):
+    with cancellation.defer():
+        stream = open_parent(path,'ab' if append else 'wb','synchronous-payload')
+        first = None
+        try:
+            stream.write(data.encode() if isinstance(data,str) else data)
+        except BaseException as error:
+            first = error; cancellation.latch(error)
+            ledger.streams[id(stream)][1]['error'] = repr(error)
+        finally:
+            try: close_parent(stream)
+            except BaseException as error:
+                if first is None: first = error
+        if first is not None: raise first
+
+
+def original_wait(process, timeout, method='wait'):
+    began = time.time_ns()
+    try:
+        code = process.wait(timeout=timeout)
+    except BaseException as error:
+        ledger.record_wait(process,method,began,error=error)
+        raise
+    ledger.record_wait(process,method,began,code=code)
+    return code
+
+
+def save_image(image, path):
+    with cancellation.defer():
+        stream = open_parent(path,'wb','synchronous-image')
+        first = None
+        try: image.save(stream,format='WEBP',lossless=True)
+        except BaseException as error:
+            first = error; cancellation.latch(error)
+            ledger.streams[id(stream)][1]['error'] = repr(error)
+        finally:
+            try: close_parent(stream)
+            except BaseException as error:
+                if first is None: first = error
+        if first is not None: raise first
+
+
+def backup_database(source, clone):
+    retained = []
+    first = None
+    with cancellation.defer():
+        try:
+            for path,options in [('file:'+str(source)+'?mode=ro',dict(uri=True)),(str(clone),{})]:
+                row = ledger.reserve_writer(path,'synchronous-sqlite')
+                try:
+                    connection = sqlite3.connect(path,**options)
+                    retained.append(connection)
+                    ledger.retain_stream(connection,writer=row)
+                except BaseException as error:
+                    row['error'] = repr(error)
+                    raise
+            retained[0].backup(retained[1])
+        except BaseException as error:
+            first = error; cancellation.latch(error)
+        finally:
+            for connection in reversed(retained):
+                try: close_parent(connection)
+                except BaseException as error:
+                    if first is None: first = error
+        if first is not None: raise first
 
 
 class NativeCancelled(RuntimeError):
@@ -121,8 +343,7 @@ def sha(path):
 
 
 def emit(event, **values):
-    with (out / 'events.jsonl').open('a') as stream:
-        stream.write(json.dumps(dict(event=event, arm=arm, unix_ns=time.time_ns(), **values)) + '\n')
+    write_payload(out / 'events.jsonl',json.dumps(dict(event=event, arm=arm, unix_ns=time.time_ns(), **values)) + '\n',append=True)
 
 
 def processes():
@@ -145,7 +366,7 @@ def family(table, roots):
         result = expanded
 
 
-def register(process, *, resources=None, role=None, expected_mount=None):
+def register(process, creation, options, *, resources=None, role=None, expected_mount=None):
     # Retain the actual Popen before any fallible identity lookup/publication.
     children.append(process)
     process.owned_identity = None
@@ -156,13 +377,16 @@ def register(process, *, resources=None, role=None, expected_mount=None):
     process.owned_graceful = None
     process.expected_mount = expected_mount
     try:
+        ledger.returned(process,creation,options)
         value = processes().get(process.pid)
         assert value is not None, 'Original child creation identity unavailable'
         assert value['group'] == process.pid, 'Owned Popen must have its own new session'
         process.owned_identity = dict(pid=process.pid, stamp=value['stamp'], group=value['group'])
+        creation['identity'] = process.owned_identity
         process.ownership_error = None
     except BaseException as error:
         process.ownership_error = repr(error)
+        creation['error'] = repr(error)
         cancellation.latch(error)
         raise
     finally:
@@ -173,8 +397,10 @@ def register(process, *, resources=None, role=None, expected_mount=None):
                 resources[role] = process
                 if expected_mount is not None:
                     resources['mount'] = expected_mount
+            creation['published'] = True
         except BaseException as error:
             process.publication_error = repr(error)
+            creation['error'] = creation['error'] or repr(error)
             cancellation.latch(error)
             raise
     return process
@@ -184,12 +410,17 @@ def start_owned(argv, *, resources=None, role=None, expected_mount=None, **optio
     assert resources is None or role is not None
     cancellation.checkpoint()
     with cancellation.defer():
+        creation = ledger.attempt(argv,options.get('cwd'),role,expected_mount)
         try:
+            for name in ('stdin','stdout','stderr'):
+                stream = options.get(name)
+                assert not hasattr(stream,'close') or id(stream) in ledger.streams, 'Unretained original parent descriptor'
             process = subprocess.Popen(argv, start_new_session=True, **options)
         except BaseException as error:
+            creation['error'] = repr(error)
             ownership_errors.append('Child creation unresolved for ' + str(role or argv) + ': ' + repr(error))
             raise
-        return register(process, resources=resources, role=role, expected_mount=expected_mount)
+        return register(process,creation,options,resources=resources,role=role,expected_mount=expected_mount)
 
 
 def stop(process):
@@ -197,9 +428,13 @@ def stop(process):
     key = (process.pid, identity['stamp'] if identity else None)
     if key in stopped:
         return
-    assert process.ownership_error is None, 'Original child identity unresolved: ' + str(process.ownership_error)
+    if process.ownership_error is not None or identity is None:
+        # The retained handle still supplies a genuine wait attempt, but no
+        # missing/replaced generation authorizes a PID/group signal.
+        original_wait(process,10,'identity-unresolved-wait')
+        raise RuntimeError('Original child identity unresolved: ' + str(process.ownership_error))
     def terminal():
-        process.wait(timeout=0)
+        original_wait(process,0)
         stopped.add(key)
     table = processes()
     current = table.get(process.pid)
@@ -225,6 +460,9 @@ def stop(process):
         current = processes().get(process.pid)
         if current and current['stamp'] == identity['stamp'] and current['group'] == identity['group']:
             try:
+                row = ledger.handles[id(process)]
+                row['signals'].append(dict(signal=signum,unix_ns=time.time_ns(),scope='original group'))
+                if signum == signal.SIGKILL: row['forced'] = True
                 os.killpg(identity['group'], signum)
             except ProcessLookupError:
                 pass
@@ -232,6 +470,9 @@ def stop(process):
             value = processes().get(pid)
             if value and value['stamp'] == stamp and value['state'] not in ('Z', 'X'):
                 try:
+                    row = ledger.handles[id(process)]
+                    row['signals'].append(dict(signal=signum,unix_ns=time.time_ns(),scope='original stamped descendant',pid=pid,stamp=stamp))
+                    if signum == signal.SIGKILL: row['forced'] = True
                     os.kill(pid, signum)
                 except ProcessLookupError:
                     pass
@@ -245,37 +486,29 @@ def stop(process):
 
 
 def drain_adopted():
-    # The subreaper owns only descendants of this driver. Snapshot their real
-    # start stamps; never borrow unrelated same-user processes or PID groups.
-    table = processes()
-    owned = {pid: table[pid]['stamp'] for pid in family(table, {os.getpid()}) if pid != os.getpid()}
-    for signum in (signal.SIGTERM, signal.SIGKILL):
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            table = processes()
-            for pid in family(table, {os.getpid()}) - {os.getpid()}:
-                owned.setdefault(pid, table[pid]['stamp'])
-            for pid, stamp in owned.items():
-                value = processes().get(pid)
-                if value and value['stamp'] == stamp and value['state'] not in ('Z','X'):
-                    try:
-                        os.kill(pid, signum)
-                    except ProcessLookupError:
-                        pass
-            for pid in owned:
-                try:
-                    os.waitpid(pid, os.WNOHANG)
-                except ChildProcessError:
-                    pass
-            table = processes()
-            # A shutdown handler can fork before its original process exits.
-            # A fresh whole-descendant scan, not just the initial snapshot,
-            # must be empty before a cleanup marker can be issued.
-            live = [pid for pid in family(table, {os.getpid()}) - {os.getpid()} if table[pid]['state'] not in ('Z','X')]
-            if not live:
-                return []
-            time.sleep(.05)
-    return live
+    assert ledger.fenced, 'Kernel drain requires a closed spawning phase'
+    assert ledger.subreaper, 'Driver subreaper establishment UNKNOWN'
+    assert all(row['returned'] and row['terminal'] is not None for row in ledger.creations), 'Original spawning roots remain unresolved'
+    result = dict(scope='Original driver subreaper kernel children only',waits=[],echild=False,errors=[])
+    deadline = time.monotonic()+10
+    while time.monotonic() < deadline:
+        try:
+            pid,status = os.waitpid(-1,os.WNOHANG)
+        except ChildProcessError:
+            result['echild'] = True
+            return result
+        if pid:
+            # The actual kernel parent relationship supplies this terminal
+            # result, never signal authority from a PID/name/UID census.
+            code = -(status & 0x7f) if status & 0x7f else (status >> 8) & 0xff
+            result['waits'].append(dict(pid=pid,raw_status=status,exit_code=code,unix_ns=time.time_ns()))
+            if any(row['pid']==pid for row in ledger.creations):
+                result['errors'].append('Kernel PID overlaps an original terminal root; status not remapped')
+            if code == -signal.SIGKILL: result['errors'].append('Adopted writer ended by SIGKILL')
+        else:
+            time.sleep(.05)  # 0 means a child still exists, never closure.
+    result['errors'].append('Scoped kernel ECHILD not observed; adopted writer custody UNKNOWN')
+    return result
 
 
 def cleanup_arm(resources):
@@ -319,8 +552,9 @@ def cleanup_arm(resources):
             identity = documents.owned_identity
             actual = processes().get(documents.pid)
             assert identity and actual and actual['stamp'] == identity['stamp'], 'Documents owner disappeared before normal shutdown'
+            ledger.handles[id(documents)]['signals'].append(dict(signal=signal.SIGTERM,unix_ns=time.time_ns(),scope='original Documents'))
             os.kill(documents.pid, signal.SIGTERM)
-            code = documents.wait(timeout=15)
+            code = original_wait(documents,15,'Documents-normal-TERM')
             assert code == 0, ('Documents did not complete normal signal/unmount cleanup', code)
             assert not resources['mount'].is_mount(), 'Documents mount survived graceful process exit'
             graceful = dict(exit_code=code, mount=str(resources['mount']), mounted_after=False, identity=identity)
@@ -369,9 +603,19 @@ def cleanup_arm(resources):
 def spawn(argv, *, env=None, cwd=None, log=None, stdin=None, resources=None, role=None, expected_mount=None):
     user()
     with cancellation.defer():
-        process = start_owned(argv, env=env, cwd=cwd, stdin=stdin, stdout=log, stderr=subprocess.STDOUT,
-                              resources=resources, role=role, expected_mount=expected_mount)
-        emit('process-started', argv=list(map(str, argv)), pid=process.pid, cwd=str(cwd or Path.cwd()))
+        output = open_parent(log,'wb') if log is not None else None
+        first = None
+        try:
+            process = start_owned(argv,env=env,cwd=cwd,stdin=stdin,stdout=output,stderr=subprocess.STDOUT,
+                                  resources=resources,role=role,expected_mount=expected_mount)
+            emit('process-started',argv=list(map(str,argv)),pid=process.pid,cwd=str(cwd or Path.cwd()))
+        except BaseException as error:
+            first = error; cancellation.latch(error)
+        finally:
+            try: close_parent(output)
+            except BaseException as error:
+                if first is None: first = error
+        if first is not None: raise first
         return process
 
 
@@ -380,10 +624,14 @@ def command(argv, *, env=None, cwd=None, timeout=20, stdout=None, allowed_exit_c
     started = time.time_ns()
     process = start_owned(argv, env=env, cwd=cwd, stdout=stdout or subprocess.PIPE,
                           stderr=subprocess.PIPE, role='command')
+    closure_failure = None
+    began = time.time_ns()
     try:
         with cancellation.work():
             output, errors = process.communicate(timeout=timeout)
+            ledger.record_wait(process,'communicate',began,code=process.returncode)
     except BaseException as error:
+        ledger.record_wait(process,'communicate',began,error=error)
         cancellation.latch(error)
         with cancellation.defer():
             try:
@@ -391,6 +639,14 @@ def command(argv, *, env=None, cwd=None, timeout=20, stdout=None, allowed_exit_c
             except BaseException as cleanup_error:
                 ownership_errors.append('Command cleanup: ' + repr(cleanup_error))
         raise
+    finally:
+        for stream in (getattr(process,'stdin',None),getattr(process,'stdout',None),getattr(process,'stderr',None)):
+            try: close_parent(stream)
+            except BaseException as error:
+                cancellation.latch(error)
+                ownership_errors.append('Command parent pipe closure: '+repr(error))
+                if closure_failure is None: closure_failure = error
+    if closure_failure is not None: raise closure_failure
     emit('command', argv=list(map(str, argv)), cwd=str(cwd or Path.cwd()), exit_code=process.returncode,
          started_unix_ns=started, stderr=(errors or b'').decode(errors='replace'))
     if process.returncode not in allowed_exit_codes:
@@ -479,9 +735,12 @@ def click(pid, name):
 
 
 def clipboard_image(root, resources):
-    with (root / 'offered.png').open('rb') as stream:
-        process = spawn(['xclip', '-selection', 'clipboard', '-target', 'image/png', '-in', '-quiet'], stdin=stream,
-                        log=(out / (arm + '-clipboard.log')).open('wb'), resources=resources, role='clipboard')
+    with cancellation.defer():
+        stream = open_parent(root / 'offered.png','rb','clipboard-input')
+        try:
+            process = spawn(['xclip', '-selection', 'clipboard', '-target', 'image/png', '-in', '-quiet'], stdin=stream,
+                            log=(out / (arm + '-clipboard.log')),resources=resources,role='clipboard')
+        finally: close_parent(stream)
     emit('clipboard-offer', bytes=(root / 'offered.png').stat().st_size, sha256=sha(root / 'offered.png'), pid=process.pid)
     command(['xdotool', 'key', 'ctrl+v'])
     return process
@@ -553,41 +812,82 @@ class PortalObserver:
     def __init__(self, output):
         self.output = output
         self.rows = []
-        self.lock = threading.Lock()
-        flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
-        address = os.environ['DBUS_SESSION_BUS_ADDRESS']
-        self.monitor = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
-        self.query = Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
-        self.frontend_owner = self.bus_call('GetNameOwner', 'org.freedesktop.portal.Desktop', '(s)')
-        self.monitor.add_filter(self.receive, None)
-        self.monitor.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus',
-            'org.freedesktop.DBus.Monitoring', 'BecomeMonitor',
-            GLib.Variant('(asu)', (["type='method_call',interface='org.freedesktop.portal.FileChooser',member='OpenFile'",
-                "type='signal',interface='org.freedesktop.portal.Request',member='Response'",
-                "type='method_return',sender='" + self.frontend_owner + "'"], 0)),
-            None, Gio.DBusCallFlags.NONE, 5000, None)
+        self.lock = threading.RLock()
+        self.condition = threading.Condition(self.lock)
+        self.monitor = self.query = self.stream = None
+        self.filter_id = None
+        self.accepting = False
+        self.inflight = 0
+        self.record['initialized'] = False
+        try:
+            self.stream = open_parent(output,'a','callback-log')
+            ledger.streams[id(self.stream)][1]['callback'] = self.record['id']
+            flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+            address = os.environ['DBUS_SESSION_BUS_ADDRESS']
+            self.record['monitor'] = 'acquisition-attempted'
+            self.monitor = Gio.DBusConnection.new_for_address_sync(address,flags,None,None)
+            self.record['monitor'] = 'acquired'
+            self.record['query'] = 'acquisition-attempted'
+            self.query = Gio.DBusConnection.new_for_address_sync(address,flags,None,None)
+            self.record['query'] = 'acquired'
+            self.frontend_owner = self.bus_call('GetNameOwner','org.freedesktop.portal.Desktop','(s)')
+            with self.condition:
+                self.accepting = self.record['accepting'] = True
+            self.filter_id = self.monitor.add_filter(self.receive,None)
+            self.record['filter_id'] = self.filter_id
+            self.monitor.call_sync('org.freedesktop.DBus','/org/freedesktop/DBus',
+                'org.freedesktop.DBus.Monitoring','BecomeMonitor',
+                GLib.Variant('(asu)', (["type='method_call',interface='org.freedesktop.portal.FileChooser',member='OpenFile'",
+                    "type='signal',interface='org.freedesktop.portal.Request',member='Response'",
+                    "type='method_return',sender='" + self.frontend_owner + "'"],0)),
+                None,Gio.DBusCallFlags.NONE,5000,None)
+            self.record['initialized'] = True
+        except BaseException as error:
+            self.record['errors'].append('Observer initialization: '+repr(error))
+            cancellation.latch(error)
+            raise
 
     def bus_call(self, method, name, signature):
         return self.query.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', method,
             GLib.Variant('(s)', (name,)), GLib.VariantType.new(signature), Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
 
+    def enter_callback(self):
+        with self.condition:
+            if not self.accepting: return False
+            self.inflight += 1
+            self.record['inflight'] = self.inflight
+            return True
+
+    def leave_callback(self):
+        with self.condition:
+            self.inflight -= 1
+            self.record['inflight'] = self.inflight
+            self.condition.notify_all()
+
     def receive(self, connection, message, incoming, unused):
-        if not incoming:
+        if not self.enter_callback(): return message
+        try:
+            if not incoming: return message
+            body = message.get_body()
+            value = dict(type=int(message.get_message_type()),sender=message.get_sender(),destination=message.get_destination(),
+                         interface=message.get_interface(),member=message.get_member(),path=message.get_path(),
+                         serial=message.get_serial(),reply_serial=message.get_reply_serial(),
+                         body=body.unpack() if body else None,unix_ns=time.time_ns())
+            with self.lock:
+                self.rows.append(value)
+                self.stream.write(json.dumps(value)+'\n')
             return message
-        body = message.get_body()
-        value = dict(type=int(message.get_message_type()), sender=message.get_sender(), destination=message.get_destination(),
-                     interface=message.get_interface(), member=message.get_member(), path=message.get_path(),
-                     serial=message.get_serial(), reply_serial=message.get_reply_serial(),
-                     body=body.unpack() if body else None, unix_ns=time.time_ns())
-        # GLib variants nested in a{sv} are recursively unpacked by PyGObject.
-        with self.lock:
-            self.rows.append(value)
-            with self.output.open('a') as stream:
-                stream.write(json.dumps(value) + '\n')
-        return message
+        except BaseException as error:
+            with self.condition:
+                self.record['errors'].append('Observer callback: '+repr(error))
+            cancellation.latch(error)
+            return message  # Gio must not silently erase the recorded failure.
+        finally:
+            self.leave_callback()
 
     def opened(self, ui_pid, frontend_pid):
         with self.lock:
+            assert not self.record['errors'], 'Portal callback failed: '+repr(self.record['errors'])
             rows = list(self.rows)
         calls = [row for row in rows if row['interface'] == 'org.freedesktop.portal.FileChooser' and row['member'] == 'OpenFile']
         assert len(calls) <= 1, 'No repeated or extra chooser input'
@@ -611,6 +911,7 @@ class PortalObserver:
 
     def cancelled(self, opened):
         with self.lock:
+            assert not self.record['errors'], 'Portal callback failed: '+repr(self.record['errors'])
             values = [row for row in self.rows if row['interface'] == 'org.freedesktop.portal.Request'
                       and row['member'] == 'Response' and row['path'] == opened['request_path']]
         assert len(values) <= 1
@@ -620,13 +921,55 @@ class PortalObserver:
         return values[0]
 
     def close(self):
-        self.monitor.close_sync(None)
-        self.query.close_sync(None)
+        if self.record['closed']: return
+        errors = []
+        condition = getattr(self,'condition',None)
+        if condition is not None:
+            with condition:
+                self.accepting = self.record['accepting'] = False
+        else:
+            self.record['accepting'] = False
+        # Never hold the callback lock across a synchronous connection close.
+        monitor = getattr(self,'monitor',None)
+        query = getattr(self,'query',None)
+        filter_id = getattr(self,'filter_id',None)
+        if monitor is not None and filter_id is not None:
+            try:
+                monitor.remove_filter(filter_id)
+                self.record['filter_removed'] = True
+            except BaseException as error: errors.append('Filter removal: '+repr(error))
+        elif not self.record['initialized']:
+            self.record['filter_removed'] = True
+        for name,connection in [('monitor',monitor),('query',query)]:
+            if connection is not None:
+                try:
+                    connection.close_sync(None)
+                    self.record[name] = 'closed'
+                except BaseException as error: errors.append(name+' close: '+repr(error))
+        if condition is not None:
+            deadline = time.monotonic()+5
+            try:
+                with condition:
+                    while self.inflight and time.monotonic() < deadline:
+                        self.condition.wait(max(0,deadline-time.monotonic()))
+                    if self.inflight: errors.append('Observer callbacks remain in flight')
+            except BaseException as error: errors.append('Observer callback drain: '+repr(error))
+        if not self.record['inflight']:
+            try: close_parent(getattr(self,'stream',None))
+            except BaseException as error: errors.append('Observer output close: '+repr(error))
+        self.record['errors'].extend(errors)
+        self.record['closed'] = (not errors and not self.record['inflight']
+            and self.record['filter_removed'] and self.record['monitor'] in ('closed','uncreated')
+            and self.record['query'] in ('closed','uncreated'))
+        if errors: raise RuntimeError('Observer writer settlement: '+repr(errors))
 
 
 def open_monitor(resources, output):
     with cancellation.defer():
+        record = ledger.callback(output)
         monitor = PortalObserver.__new__(PortalObserver)
+        monitor.record = record
+        ledger.monitors.append(monitor)  # Retain before resource publication or constructor.
         resources['monitor'] = monitor
         monitor.__init__(output)
         return monitor
@@ -653,20 +996,20 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     descriptors.mkdir(mode=0o700)
     official_descriptor = Path('/usr/share/xdg-desktop-portal/portals/gtk.portal')
     descriptor = descriptors / 'gtk.portal'
-    descriptor.write_bytes(official_descriptor.read_bytes())
+    write_payload(descriptor,official_descriptor.read_bytes())
     assert sha(descriptor) == sha(official_descriptor)
     env['XDG_DESKTOP_PORTAL_DIR'] = str(descriptors)
-    (out / (label + '-gtk.portal')).write_bytes(descriptor.read_bytes())
+    write_payload(out / (label + '-gtk.portal'),descriptor.read_bytes())
     icon = root / 'config/cosmic/com.system76.CosmicTk/v1/icon_theme'
     icon.parent.mkdir(parents=True)
-    icon.write_text('"Adwaita"\n')
+    write_payload(icon,'"Adwaita"\n')
     permissions = spawn(['/usr/libexec/xdg-permission-store', '--verbose'], env=env,
-                        log=(out / (label + '-permission-store.log')).open('wb'), resources=resources, role='permissions')
+                        log=(out / (label + '-permission-store.log')), resources=resources, role='permissions')
     command(['gdbus', 'wait', '--session', '--timeout', '30', 'org.freedesktop.impl.portal.PermissionStore'], env=env, timeout=35)
     permission_owner = bus_owner('org.freedesktop.impl.portal.PermissionStore')
     assert permission_owner['pid'] == permissions.pid
     documents = spawn(['/usr/libexec/xdg-document-portal', '--verbose'], env=env,
-                      log=(out / (label + '-documents.log')).open('wb'),
+                      log=(out / (label + '-documents.log')),
                       resources=resources, role='documents', expected_mount=root / 'runtime/doc')
     command(['gdbus', 'wait', '--session', '--timeout', '30', 'org.freedesktop.portal.Documents'], env=env, timeout=35)
     document_owner = bus_owner('org.freedesktop.portal.Documents')
@@ -676,18 +1019,18 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
         GLib.VariantType.new('(ay)'), Gio.DBusCallFlags.NONE, 30000, None).unpack()[0]
     mount = Path(bytes(mount_reply).rstrip(b'\0').decode())
     assert mount == root / 'runtime/doc' and mount.is_mount()
-    backend = spawn(['/usr/libexec/xdg-desktop-portal-gtk', '--verbose'], env=env, log=(out / (label + '-portal-gtk.log')).open('wb'), resources=resources, role='backend')
+    backend = spawn(['/usr/libexec/xdg-desktop-portal-gtk', '--verbose'], env=env, log=(out / (label + '-portal-gtk.log')), resources=resources, role='backend')
     command(['gdbus', 'wait', '--session', '--timeout', '30', 'org.freedesktop.impl.portal.desktop.gtk'], env=env, timeout=35)
-    frontend = spawn(['/usr/libexec/xdg-desktop-portal', '--verbose'], env=env, log=(out / (label + '-portal.log')).open('wb'), resources=resources, role='frontend')
+    frontend = spawn(['/usr/libexec/xdg-desktop-portal', '--verbose'], env=env, log=(out / (label + '-portal.log')), resources=resources, role='frontend')
     command(['gdbus', 'wait', '--session', '--timeout', '30', 'org.freedesktop.portal.Desktop'], env=env, timeout=35)
     monitor = open_monitor(resources, out / (label + '-portal.jsonl'))
     assert monitor.bus_call('GetConnectionUnixProcessID', monitor.bus_call('GetNameOwner', 'org.freedesktop.portal.Desktop', '(s)'), '(u)') == frontend.pid
     backend_owner = monitor.bus_call('GetNameOwner', 'org.freedesktop.impl.portal.desktop.gtk', '(s)')
     assert monitor.bus_call('GetConnectionUnixProcessID', backend_owner, '(u)') == backend.pid
-    fixture = spawn([str(helper), str(root)], env=env, log=(out / (label + '-fixture.log')).open('wb'), resources=resources, role='fixture')
+    fixture = spawn([str(helper), str(root)], env=env, log=(out / (label + '-fixture.log')), resources=resources, role='fixture')
     wait(lambda: (root / 'fixture.jsonl').exists() and any(json.loads(line)['event'] == 'ready' for line in (root / 'fixture.jsonl').read_text().splitlines()))
     ui = spawn(['scripts/run-development', '--browserless', '--debug', '--log-file', str(out / (label + '-ui.log'))],
-               env=env, cwd=checkout, log=(out / (label + '-runner.log')).open('wb'), resources=resources, role='ui')
+               env=env, cwd=checkout, log=(out / (label + '-runner.log')), resources=resources, role='ui')
     def owned_window():
         assert ui.poll() is None, 'Development runner exited'
         result = command(['xdotool', 'search', '--onlyvisible', '--class', 'cagents'], timeout=5, allowed_exit_codes=(0, 1))
@@ -752,8 +1095,8 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
         command(['import', '-window', window, str(png)])
         with Image.open(png) as image:
             assert image.size == tuple(size)
-            image.save(out / (label + '-' + name + '.webp'), lossless=True)
-        (out / (label + '-' + name + '-a11y.json')).write_text(json.dumps(data, indent=2) + '\n')
+            save_image(image,out / (label + '-' + name + '.webp'))
+        write_payload(out / (label + '-' + name + '-a11y.json'),json.dumps(data, indent=2) + '\n')
         emit('capture', name=name, viewport=size, webp=label + '-' + name + '.webp')
         emit('client-geometry', phase=name, xwininfo=command(['xwininfo','-id',window,'-stats','-tree']).decode())
     source, rows = source_witness(root)
@@ -789,7 +1132,7 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     asset = Path(image['path'])
     assert asset.resolve(strict=True) == asset and asset.is_relative_to(root / 'data') and sha(asset) == sha(root / 'offered.png')
     wait(lambda: check_storage(root, source['initial'], expected_text, image))
-    (out / (label + '-payload-storage.json')).write_text(json.dumps(
+    write_payload(out / (label + '-payload-storage.json'),json.dumps(
         wait(lambda: check_storage(root, source['initial'], expected_text, image)), indent=2) + '\n')
     snapshot('draft-image-wide', (1280, 800))
     click(pid, 'Attach files')
@@ -829,7 +1172,7 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     # Capture the actual owned dialog, after navigation and the peer update.
     command(['import', '-window', str(dialog_focus), str(out / (label + '-chooser-peer.png'))])
     with Image.open(out / (label + '-chooser-peer.png')) as image_file:
-        image_file.save(out / (label + '-chooser-peer.webp'), lossless=True)
+        save_image(image_file,out / (label + '-chooser-peer.webp'))
     emit('chooser-open-peer', portal=opened, gtk_pid=backend.pid, window=dialog_focus,
          chooser_directory=str(root / 'chooser-data'), canonical=peer_storage, image=image)
     click(backend.pid, 'Cancel')  # Genuine GTK Cancel once; no WM close or Request.Close.
@@ -872,19 +1215,18 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     inspections = root / 'inspection'
     inspections.mkdir(mode=0o700)
     clone = inspections / 'final.sqlite3'
-    with sqlite3.connect('file:' + str(database(root)) + '?mode=ro', uri=True) as original, sqlite3.connect(clone) as copied:
-        original.backup(copied)
+    backup_database(database(root),clone)
     os.chmod(clone, 0o600)
     typed = command([str(helper), str(root), '--inspect', str(clone)], env=env)
-    (out / (label + '-typed-inspection.json')).write_bytes(typed)
-    (out / (label + '-fixture.jsonl')).write_bytes((root / 'fixture.jsonl').read_bytes())
+    write_payload(out / (label + '-typed-inspection.json'),typed)
+    write_payload(out / (label + '-fixture.jsonl'),(root / 'fixture.jsonl').read_bytes())
     final = wait(lambda: check_storage(root, source['chosen'], final_text, image))
     assert asset.read_bytes() == (root / 'offered.png').read_bytes()
-    (out / (label + '-managed-image.png')).write_bytes(asset.read_bytes())
+    write_payload(out / (label + '-managed-image.png'),asset.read_bytes())
     asset_info = asset.lstat()
     assert stat.S_ISREG(asset_info.st_mode) and not asset.is_symlink() and asset_info.st_nlink == 1 and asset_info.st_uid == os.geteuid()
-    (out / (label + '-storage.json')).write_text(json.dumps(final, indent=2) + '\n')
-    (out / (label + '-source.json')).write_text(json.dumps(dict(revision=plan[label if label == 'before' else 'product'],
+    write_payload(out / (label + '-storage.json'),json.dumps(final, indent=2) + '\n')
+    write_payload(out / (label + '-source.json'),json.dumps(dict(revision=plan[label if label == 'before' else 'product'],
         ui_pid=pid, ui_start_stamp=ui_identity['stamp'], ui_sha256=ui_sha, window=int(window), matched_triplet=triplet,
         helper_sha256=sha(helper), fixture_sha256=sha(control / '.github/qualification/final-main-fixture.rs'),
         prepared_environment_sha256=plan['_prepared']['arms'][label]['environment_sha256'],
@@ -918,7 +1260,7 @@ def complete_arm_cleanup(resources, label, errors):
             result = dict(errors=['Arm cleanup: ' + repr(error)], documents_graceful=None,
                           private_bus_names={}, owned_descendants_remaining=['UNKNOWN: arm cleanup incomplete'])
         try:
-            (out / (label + '-cleanup.json')).write_text(json.dumps(result, indent=2) + '\n')
+            write_payload(out / (label + '-cleanup.json'),json.dumps(result, indent=2) + '\n')
         except BaseException as error:
             result['errors'].append('Cleanup receipt: ' + repr(error))
         errors.extend(label + ': ' + error for error in result['errors'])
@@ -929,65 +1271,107 @@ def complete_arm_cleanup(resources, label, errors):
     return result
 
 
-def finish_cleanup(errors):
-    """Protected local settlement only; not a complete native-writer ledger."""
-    cancellation.finalizing = True
-    errors.extend(ownership_errors)
-    for child in reversed(children):
+def publish_ledger(errors):
+    value = ledger.snapshot(errors,None if cancellation.failure is None else repr(cancellation.failure),
+                            cancellation.signum)
+    temporary = out / '.driver-role-writer-ledger.tmp'
+    destination = out / 'driver-role-writer-ledger.json'
+    assert not destination.exists(), 'A prior ledger cannot be replaced or restamped'
+    # Deliberate final self-publication: not a recursive writer/hash record.
+    # No driver native-payload write follows a successful atomic rename.
+    with cancellation.defer():
+        stream = temporary.open('xb')
+        first = None
         try:
-            stop(child)
+            stream.write((json.dumps(value,indent=2)+'\n').encode())
+            stream.flush(); os.fsync(stream.fileno())
+        except BaseException as error: first = error
+        finally:
+            try: stream.close()
+            except BaseException as error:
+                if first is None: first = error
+        if first is not None: raise first
+        os.replace(temporary,destination)
+
+
+def finish_cleanup(errors):
+    """Settle only this driver's originals/parent writers/kernel children."""
+    cancellation.finalizing = True
+    ledger.fenced = True  # No later Popen, including transient commands.
+    errors.extend(ownership_errors)
+    for monitor in ledger.monitors:
+        try: monitor.close()
+        except BaseException as error:
+            cancellation.latch(error); errors.append('Observer cleanup: '+repr(error))
+    for child in children:
+        if (getattr(child,'owned_role',None)=='documents' and getattr(child,'owned_graceful',None) is None
+            and ledger.handles.get(id(child),{}).get('terminal') is None):
+            try:
+                result = cleanup_arm(child.owned_resources)
+                errors.extend(result['errors'])
+            except BaseException as error:
+                cancellation.latch(error); errors.append('Original Documents role cleanup: '+repr(error))
+    for child in reversed(children):
+        try: stop(child)
         except BaseException as error:
             cancellation.latch(error)
-            errors.append(str(getattr(child, 'owned_role', 'unpublished-role')) + ' cleanup: ' + repr(error))
+            errors.append(str(getattr(child,'owned_role','unpublished-role'))+' cleanup: '+repr(error))
+        for stream in (getattr(child,'stdin',None),getattr(child,'stdout',None),getattr(child,'stderr',None)):
+            try: close_parent(stream)
+            except BaseException as error:
+                cancellation.latch(error); errors.append('Original child parent pipe: '+repr(error))
+    for stream,row in ledger.original_streams:
+        try: close_parent(stream)
+        except BaseException as error:
+            cancellation.latch(error); errors.append('Original parent stream closure: '+repr(error))
     try:
-        remaining = drain_adopted()
+        ledger.kernel = drain_adopted()
+        errors.extend(ledger.kernel['errors'])
+        remaining = [] if ledger.kernel['echild'] else ['UNKNOWN: driver kernel children remain']
     except BaseException as error:
         cancellation.latch(error)
-        errors.append('Owned descendant drain: ' + repr(error))
+        errors.append('Owned descendant drain: '+repr(error))
+        ledger.kernel = dict(echild=False,waits=[],errors=[repr(error)])
         remaining = ['UNKNOWN: descendant drain did not complete']
     for child in children:
-        identity = getattr(child, 'owned_identity', None)
-        role = getattr(child, 'owned_role', None)
-        if role is None:
-            errors.append('Original child role remains unpublished')
-        if getattr(child, 'ownership_error', 'unregistered') is not None or identity is None:
-            errors.append(str(role) + ' original identity remains unresolved')
-        elif (child.pid, identity['stamp']) not in stopped or child.returncode is None:
-            errors.append(str(child.owned_role) + ' original wait remains unresolved')
-        if getattr(child, 'publication_error', 'unpublished') is not None:
-            errors.append(str(role) + ' original role/mount publication remains unresolved')
-        if role == 'documents':
+        identity = getattr(child,'owned_identity',None)
+        role = getattr(child,'owned_role',None)
+        if getattr(child,'publication_error','unpublished') is not None:
+            errors.append(str(role)+' original role/mount publication remains unresolved')
+        if role=='documents':
             try:
                 assert child.owned_graceful is not None, 'Documents normal wait/unmount was not verified'
                 assert child.expected_mount is not None and not child.expected_mount.is_mount(), 'Documents mount unresolved'
             except BaseException as error:
-                cancellation.latch(error)
-                errors.append('Documents role settlement: ' + repr(error))
-    cleanup = dict(errors=errors, owned_descendants_remaining=remaining)
-    try:
-        (out / 'cleanup.json').write_text(json.dumps(cleanup, indent=2) + '\n')
+                cancellation.latch(error); errors.append('Documents role settlement: '+repr(error))
+    errors.extend(ledger.errors())
+    cleanup = dict(errors=errors,owned_descendants_remaining=remaining)
+    try: write_payload(out/'cleanup.json',json.dumps(cleanup,indent=2)+'\n')
     except BaseException as error:
-        cancellation.latch(error)
-        errors.append('Cleanup receipt publication: ' + repr(error))
-        return cleanup
+        cancellation.latch(error); errors.append('Cleanup receipt publication: '+repr(error))
     if not errors and not remaining:
         try:
-            (out / 'cleanup-complete').write_text('Owned application, fixture, portal, WM and accessibility descendants closed.\n')
+            write_payload(out/'cleanup-complete','Driver-owned role/writer streams and scoped kernel children settled. Outside Xvfb/private bus/entry/whole-job closure is NOT established.\n')
         except BaseException as error:
-            cancellation.latch(error)
-            errors.append('Cleanup marker publication: ' + repr(error))
+            cancellation.latch(error); errors.append('Cleanup marker publication: '+repr(error))
             try:
-                (out / 'cleanup-complete').unlink(missing_ok=True)
-                (out / 'cleanup.json').write_text(json.dumps(cleanup, indent=2) + '\n')
-            except BaseException as publication_error:
-                cancellation.latch(publication_error)
-                errors.append('Failed marker/error receipt removal/publication: ' + repr(publication_error))
+                (out/'cleanup-complete').unlink(missing_ok=True)
+                write_payload(out/'cleanup.json',json.dumps(cleanup,indent=2)+'\n')
+            except BaseException as secondary:
+                cancellation.latch(secondary); errors.append('Failed marker removal/receipt: '+repr(secondary))
+    # All receipt writers above have returned/closed. This is the last native
+    # payload publication only when the ledger has no UNKNOWN/error outcome.
+    try: publish_ledger(errors)
+    except BaseException as error:
+        cancellation.latch(error); errors.append('Final driver ledger publication: '+repr(error))
+        try: (out/'cleanup-complete').unlink(missing_ok=True)
+        except BaseException as secondary:
+            cancellation.latch(secondary); errors.append('Failed stale marker removal: '+repr(secondary))
     return cleanup
 
 
-
 def main():
-    global out, cancellation, preparation
+    global out, cancellation, preparation, ledger
     user()
     assert len(sys.argv) == 4
     control, before, after = [Path(value).resolve(strict=True) for value in sys.argv[1:]]
@@ -996,6 +1380,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     cancellation = Cancellation()
     cancellation.install()  # Before metadata command() creates the first child.
+    ledger = DriverLedger(time.time_ns,threading.RLock())
     errors = []
     arm_cleanups = {}
     try:
@@ -1003,34 +1388,41 @@ def main():
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.prctl(36, 1, 0, 0, 0) != 0:
             raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER failed')
+        flag = ctypes.c_int()
+        assert libc.prctl(37,ctypes.byref(flag),0,0,0)==0 and flag.value==1, 'Driver subreaper establishment UNKNOWN'
+        ledger.subreaper = True
         identity = dict(sha=command(['git','-C',str(control),'rev-parse','HEAD']).decode().strip(),
                         tree=command(['git','-C',str(control),'rev-parse','HEAD^{tree}']).decode().strip())
         preparation = preparation_module(control)
         prepared,prepared_sha = preparation.load_prepared(control,plan,{'before':before,'after':after},dict(os.environ),identity)
         plan['_prepared'] = prepared  # Runtime-only; source plan remains immutable.
-        (out / 'source.json').write_text(json.dumps(dict(product=plan['product'],before=plan['before'],
+        write_payload(out / 'source.json',json.dumps(dict(product=plan['product'],before=plan['before'],
             control_sha=identity['sha'],control_tree=identity['tree'],
             driver_sha256=sha(Path(__file__)),fixture_sha256=sha(control / '.github/qualification/final-main-fixture.rs'),
             preparation_sha256=prepared_sha,preparation_module_sha256=sha(control / '.github/qualification/final-main-prepare.py'),
             late_environment_sha256={key:preparation.digest(os.environ[key].encode()) for key in preparation.LATE if key in os.environ},
             workflow_sha256=sha(control / '.github/workflows/qualify-final-main-integration.yml'),
-            run=os.environ['GITHUB_RUN_ID'],attempt=os.environ['GITHUB_RUN_ATTEMPT']),indent=2) + '\n')
+            run=os.environ['GITHUB_RUN_ID'],attempt=os.environ['GITHUB_RUN_ATTEMPT'],logical_job=os.environ['GITHUB_JOB'],
+            numeric_job_id=None,numeric_job_note='No actual supported numeric job supplier is implemented.',
+            plan_sha256=sha(control/'.github/qualification/final-main-plan.json'),
+            driver_instance=dict(pid=os.getpid(),observation=processes().get(os.getpid()))),indent=2) + '\n')
+        ledger.binding = json.loads((out/'source.json').read_text())
         base = Path(prepared['base'])
         launcher = next(path for path in [Path('/usr/libexec/at-spi-bus-launcher'), Path('/usr/lib/at-spi2-core/at-spi-bus-launcher')] if path.exists())
-        spawn([str(launcher), '--launch-immediately'], log=(out / 'atspi.log').open('wb'), role='accessibility-launcher')
+        spawn([str(launcher), '--launch-immediately'], log=(out / 'atspi.log'), role='accessibility-launcher')
         for key in ('IsEnabled', 'ScreenReaderEnabled'):
             command(['gdbus', 'call', '--session', '--dest', 'org.a11y.Bus', '--object-path', '/org/a11y/bus',
                      '--method', 'org.freedesktop.DBus.Properties.Set', 'org.a11y.Status', key, '<true>'])
         bus = command(['gdbus', 'call', '--session', '--dest', 'org.a11y.Bus', '--object-path', '/org/a11y/bus', '--method', 'org.a11y.Bus.GetAddress'])
         os.environ['AT_SPI_BUS_ADDRESS'] = ast.literal_eval(bus.decode())[0]
         registry = next(path for path in [Path('/usr/libexec/at-spi2-registryd'), Path('/usr/lib/at-spi2-core/at-spi2-registryd')] if path.exists())
-        spawn([str(registry)], env=dict(os.environ, DBUS_SESSION_BUS_ADDRESS=os.environ['AT_SPI_BUS_ADDRESS']), log=(out / 'atspi-registry.log').open('wb'), role='accessibility-registry')
+        spawn([str(registry)], env=dict(os.environ, DBUS_SESSION_BUS_ADDRESS=os.environ['AT_SPI_BUS_ADDRESS']), log=(out / 'atspi-registry.log'), role='accessibility-registry')
         rc = base / 'rc.xml'
-        rc.write_text('<openbox_config xmlns="http://openbox.org/3.4/rc"><focus><focusNew>yes</focusNew><followMouse>no</followMouse></focus></openbox_config>')
-        (out / 'openbox-rc.xml').write_bytes(rc.read_bytes())
-        wm = spawn(['/usr/bin/openbox', '--config-file', str(rc)], log=(out / 'openbox.log').open('wb'), role='window-manager')
+        write_payload(rc,'<openbox_config xmlns="http://openbox.org/3.4/rc"><focus><focusNew>yes</focusNew><followMouse>no</followMouse></focus></openbox_config>')
+        write_payload(out / 'openbox-rc.xml',rc.read_bytes())
+        wm = spawn(['/usr/bin/openbox', '--config-file', str(rc)], log=(out / 'openbox.log'), role='window-manager')
         wait(lambda: b'_NET_SUPPORTING_WM_CHECK(WINDOW)' in command(['xprop', '-root', '_NET_SUPPORTING_WM_CHECK']))
-        (out / 'desktop.json').write_text(json.dumps(dict(openbox_pid=wm.pid, config_sha256=sha(rc),
+        write_payload(out / 'desktop.json',json.dumps(dict(openbox_pid=wm.pid, config_sha256=sha(rc),
             supporting_wm=command(['xprop', '-root', '_NET_SUPPORTING_WM_CHECK']).decode(),
             versions=command(['dpkg-query', '-W', '-f=${Package} ${Version}\n', 'openbox', 'xdg-desktop-portal', 'xdg-desktop-portal-gtk']).decode(),
             renderer=RENDERER, virtual_screen=[1600,1000], dpi=96,
@@ -1038,6 +1430,7 @@ def main():
             parent_identifier='omitted by the actual libcosmic portal implementation',
             directory='not supplied by libcosmic portal; normal GTK location entry is used'), indent=2) + '\n')
         for label, checkout in [('before', before), ('after', after)]:
+            ledger.enter(label)  # Explicit scope includes this arm's source checks/transient commands.
             pin = plan['before' if label == 'before' else 'product']
             assert command(['git', '-C', str(checkout), 'rev-parse', 'HEAD']).decode().strip() == pin['sha']
             assert command(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}']).decode().strip() == pin['tree']
@@ -1056,11 +1449,12 @@ def main():
                 raise
             finally:
                 arm_cleanups[label] = complete_arm_cleanup(resources, label, errors)
+            ledger.scope = 'global-driver'
     except BaseException as error:
         cancellation.finalizing = True
         cancellation.latch(error)
         try:
-            (out / 'failure-traceback.txt').write_text(traceback.format_exc())
+            write_payload(out / 'failure-traceback.txt',traceback.format_exc())
         except BaseException as publication_error:
             errors.append('Original failure publication: ' + repr(publication_error))
     finally:

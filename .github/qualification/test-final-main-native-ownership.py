@@ -19,7 +19,9 @@ import unittest
 
 SOURCE = Path(__file__).with_name('final-main-native.py').read_text()
 NAMES = {'NativeCancelled','Cancellation','family','register','start_owned','stop','cleanup_arm',
-         'spawn','command','open_monitor','complete_arm_cleanup','finish_cleanup','IncompleteTree','wait'}
+         'spawn','command','open_monitor','complete_arm_cleanup','finish_cleanup','IncompleteTree','wait',
+         'DriverLedger','open_parent','close_parent','write_payload','original_wait','drain_adopted',
+         'publish_ledger','PortalObserver','save_image','backup_database'}
 
 
 class InertPath:
@@ -35,12 +37,45 @@ class Output:
     def __init__(self):
         self.files = {}
         self.on_write = lambda name: None
+        self.on_open = lambda name: None
+        self.on_close = lambda name: None
+        self.events = []
 
     def __truediv__(self, name):
-        def write(text):
-            self.on_write(name)
-            self.files[name] = text
-        return SimpleNamespace(write_text=write,unlink=lambda missing_ok=False:self.files.pop(name,None))
+        outer = self
+        class File:
+            def __init__(self, mode):
+                self.closed = False
+                self.mode = mode
+                if 'x' in mode and name in outer.files:raise FileExistsError(name)
+                if 'a' not in mode:outer.files[name] = ''
+                outer.on_open(name)
+            def write(self, data):
+                assert not self.closed
+                outer.on_write(name)
+                outer.files[name] = outer.files.get(name,'')+(data.decode() if isinstance(data,bytes) else data)
+            def flush(self):pass
+            def fileno(self):return 17
+            def close(self):
+                outer.on_close(name);self.closed = True;outer.events.append(('stream-close',name))
+        class Named:
+            def __str__(self):return '/algorithm-only/'+name
+            def open(self, mode):return File(mode)
+            def exists(self):return name in outer.files
+            def unlink(self, missing_ok=False):outer.files.pop(name,None)
+            def __init__(self):self.name = name
+        return Named()
+
+
+class Lock:
+    def __init__(self):self.depth=0
+    def __enter__(self):self.depth+=1;return self
+    def __exit__(self, *args):self.depth-=1
+
+
+class Pipe:
+    def __init__(self, events, name):self.closed=False;self.events=events;self.name=name
+    def close(self):self.closed=True;self.events.append(('pipe-close',self.name))
 
 
 class Mount:
@@ -55,7 +90,7 @@ class Mount:
 
 
 class Handle:
-    def __init__(self, harness, pid):
+    def __init__(self, harness, pid, options):
         self.harness, self.pid = harness, pid
         self.returncode = None
         self.state = 'S'
@@ -65,6 +100,9 @@ class Handle:
         self.on_wait = lambda: None
         self.on_communicate = lambda: None
         self.auto_unmount = True
+        self.stdin = None
+        self.stdout = Pipe(harness.events,str(pid)+'.stdout') if options.get('stdout') == -1 else None
+        self.stderr = Pipe(harness.events,str(pid)+'.stderr') if options.get('stderr') == -1 else None
 
     def poll(self):
         return self.returncode
@@ -96,10 +134,13 @@ class Harness:
         self.lookup = lambda: None
         self.on_signal = lambda: None
         self.output = Output()
+        self.output.events = self.events
+        self.kernel_answers = []
         def create(argv, **options):
             assert options['start_new_session'] is True
             assert 'preexec_fn' not in options  # No inherited signal mask trick.
-            handle = Handle(self,10 + len(self.handles))
+            assert self.ns['cancellation'].depth > 0
+            handle = Handle(self,10 + len(self.handles),options)
             self.handles.append(handle)
             self.events.append(('created',handle.pid,list(argv)))
             self.creation(handle)
@@ -116,22 +157,36 @@ class Harness:
         tick = iter(range(10000))
         class NoOwner(Exception):
             pass
+        def waitpid(pid, flags):
+            assert (pid,flags)==(-1,1)
+            self.events.append(('kernel-wait',pid,flags))
+            if not self.kernel_answers:raise ChildProcessError()
+            answer=self.kernel_answers.pop(0)
+            if isinstance(answer,BaseException):raise answer
+            return answer
+        def replace(source,destination):
+            self.output.files[destination.name]=self.output.files.pop(source.name)
+            self.events.append(('ledger-rename',destination.name))
         namespace = dict(__builtins__=__builtins__,contextmanager=contextmanager,sys=sys,Path=InertPath,json=json,re=re,
             children=[],stopped=set(),ownership_errors=[],out=self.output,
             user=lambda:None,processes=table,bus_owner=lambda name:(_ for _ in ()).throw(NoOwner()),
             GLib=SimpleNamespace(Error=NoOwner),
             Gio=SimpleNamespace(DBusError=SimpleNamespace(get_remote_error=lambda error:'org.freedesktop.DBus.Error.NameHasNoOwner')),
-            os=SimpleNamespace(getpid=lambda:1000,kill=kill,killpg=kill),
+            os=SimpleNamespace(getpid=lambda:1000,kill=kill,killpg=kill,WNOHANG=1,waitpid=waitpid,
+                               fsync=lambda fd:self.events.append(('fsync',fd)),replace=replace),
             time=SimpleNamespace(time_ns=lambda:next(tick),monotonic=lambda:next(tick),sleep=lambda delay:None),
             signal=SimpleNamespace(SIGINT=2,SIGTERM=15,SIGKILL=9,signal=lambda signum,handler:self.handlers.__setitem__(signum,handler)),
             subprocess=SimpleNamespace(Popen=create,PIPE=-1,STDOUT=-2,CalledProcessError=subprocess.CalledProcessError),
-            emit=lambda event,**values:self.events.append(('emit',event,values)),drain_adopted=lambda:[])
+            emit=lambda event,**values:self.events.append(('emit',event,values)))
         parsed = ast.parse(SOURCE)
         selected = [copy.deepcopy(node) for node in parsed.body
                     if isinstance(node,(ast.FunctionDef,ast.ClassDef)) and node.name in NAMES]
         assert {node.name for node in selected} == NAMES
         exec(compile(ast.Module(body=selected,type_ignores=[]),'<actual-driver-definitions>','exec'),namespace)
         namespace['cancellation'] = namespace['Cancellation']()
+        namespace['ledger'] = namespace['DriverLedger'](namespace['time'].time_ns,Lock())
+        namespace['ledger'].binding = {'algorithm_only':'not a native/source/closure evidence packet'}
+        namespace['ledger'].subreaper = True
         self.ns = namespace
 
     def spawn(self, resources=None, role='ui', mount=None):
@@ -140,6 +195,70 @@ class Harness:
     def repeat(self):
         self.ns['cancellation'].request(2,None)
         self.ns['cancellation'].request(15,None)
+
+
+class PortalHarness:
+    """Actual observer methods with inert connections, locks and output files."""
+    def __init__(self, harness, failure=None):
+        self.h=harness;self.failure=failure;self.created=[];self.locks=[];self.resources={}
+        self.on_wait=lambda:None
+        outer=self
+        class Condition:
+            def __init__(self, lock):self.lock=lock
+            def __enter__(self):return self.lock.__enter__()
+            def __exit__(self, *args):return self.lock.__exit__(*args)
+            def notify_all(self):pass
+            def wait(self, timeout):
+                assert self.lock.depth==1
+                self.lock.depth=0
+                try:outer.on_wait()
+                finally:self.lock.depth=1
+        def new_lock():
+            lock=Lock();outer.locks.append(lock);return lock
+        class Connection:
+            def __init__(self, name):self.name=name
+            def call_sync(self, *args):
+                if args[3]=='BecomeMonitor' and failure=='become':raise RuntimeError('become failure')
+                return SimpleNamespace(unpack=lambda:(':1.algorithm-frontend',))
+            def add_filter(self, callback, unused):
+                if failure=='filter':raise RuntimeError('filter failure')
+                return 77
+            def remove_filter(self, identifier):
+                assert identifier==77 and not outer.resources['monitor'].record['accepting']
+                assert all(lock.depth==0 for lock in outer.locks)
+                harness.events.append(('remove-filter',))
+            def close_sync(self, unused):
+                assert all(lock.depth==0 for lock in outer.locks), 'No callback lock over sync close'
+                harness.events.append(('connection-close',self.name))
+                if failure=='close-monitor' and self.name=='monitor':raise RuntimeError('monitor close failure')
+        def connect(*args):
+            assert self.resources.get('monitor') in harness.ns['ledger'].monitors
+            name='monitor' if not self.created else 'query'
+            if failure==name:raise RuntimeError(name+' acquisition failure')
+            value=Connection(name);self.created.append(value)
+            if name=='query':assert self.resources['monitor'].monitor is self.created[0]
+            return value
+        old_gio=harness.ns['Gio'];old_glib=harness.ns['GLib']
+        harness.ns['Gio']=SimpleNamespace(DBusConnectionFlags=SimpleNamespace(AUTHENTICATION_CLIENT=1,MESSAGE_BUS_CONNECTION=2),
+            DBusConnection=SimpleNamespace(new_for_address_sync=connect),DBusCallFlags=SimpleNamespace(NONE=0),DBusError=old_gio.DBusError)
+        harness.ns['GLib']=SimpleNamespace(Variant=lambda signature,value:value,
+            VariantType=SimpleNamespace(new=lambda value:value),Error=old_glib.Error)
+        harness.ns['threading']=SimpleNamespace(RLock=new_lock,Condition=Condition)
+        harness.ns['os'].environ={'DBUS_SESSION_BUS_ADDRESS':'algorithm-only-private-bus'}
+    def open(self):
+        return self.h.ns['open_monitor'](self.resources,self.h.output/'portal.jsonl')
+
+
+class Message:
+    def get_body(self):return SimpleNamespace(unpack=lambda:[])
+    def get_message_type(self):return 4
+    def get_sender(self):return ':1.algorithm-only'
+    def get_destination(self):return None
+    def get_interface(self):return 'algorithm-only'
+    def get_member(self):return 'algorithm-only'
+    def get_path(self):return '/algorithm-only'
+    def get_serial(self):return 1
+    def get_reply_serial(self):return 0
 
 
 class AtomicOwnershipTests(unittest.TestCase):
@@ -205,6 +324,8 @@ class AtomicOwnershipTests(unittest.TestCase):
         result = h.ns['finish_cleanup']([])
         self.assertTrue(result['errors']); self.assertNotIn('cleanup-complete',h.output.files)
         self.assertIs(h.ns['cancellation'].failure,original)
+        self.assertIn(('wait',h.handles[0].pid,10),h.events)  # Retained original still waited despite unknown identity.
+        self.assertFalse(any(event[0]=='signal' for event in h.events))
 
     def test_registration_error_precedes_a_secondary_publication_error(self):
         h = Harness(); original = RuntimeError('original identity lookup failure')
@@ -410,6 +531,200 @@ class AtomicOwnershipTests(unittest.TestCase):
         result = h.ns['finish_cleanup']([])
         self.assertEqual(result['errors'],[])
         self.assertIs(h.ns['cancellation'].failure,original)
+
+    def test_unique_creation_ids_scopes_attempts_and_spawn_fence_are_not_role_names(self):
+        h=Harness();owner=h.ns['ledger']
+        h.ns['command'](['same-algorithm-command'])
+        owner.enter('before')
+        h.ns['command'](['same-algorithm-command']);h.ns['command'](['same-algorithm-command'])
+        self.assertEqual([row['scope'] for row in owner.creations],['global-driver','before','before'])
+        self.assertEqual(len({row['id'] for row in owner.creations}),3)
+        self.assertEqual(owner.entered,['before'])  # Unentered After is not inferred.
+        result=h.ns['finish_cleanup']([])
+        self.assertEqual(result['errors'],[])
+        count=len(h.handles)
+        with self.assertRaisesRegex(AssertionError,'spawning phase is closed'):h.ns['command'](['must-not-create'])
+        self.assertEqual(len(h.handles),count)
+        report=json.loads(h.output.files['driver-role-writer-ledger.json'])
+        self.assertEqual(report['entered_arms'],['before']);self.assertTrue(report['no_future_spawns'])
+        self.assertEqual(len(report['creations']),3)
+        self.assertTrue(all(row['terminal']['method']=='wait' or row['terminal']['method']=='communicate' for row in report['creations']))
+
+    def test_atomic_parent_log_and_child_pipes_close_on_cancel_or_creation_failure(self):
+        for stage in ('normal','cancel-open','popen-failure','close-failure'):
+            with self.subTest(stage=stage):
+                h=Harness();original=RuntimeError(stage)
+                def opened(name):
+                    self.assertGreater(h.ns['cancellation'].depth,0)
+                    if stage=='cancel-open':h.repeat()
+                h.output.on_open=opened
+                if stage=='popen-failure':
+                    def fail(handle):raise original
+                    h.creation=fail
+                if stage=='close-failure':
+                    def fail(name):
+                        if name=='owned.log':raise original
+                    h.output.on_close=fail
+                if stage=='normal':h.ns['spawn'](['algorithm-only'],log=h.output/'owned.log',role='ui')
+                else:
+                    expected=h.ns['NativeCancelled'] if stage=='cancel-open' else RuntimeError
+                    with self.assertRaises(expected):h.ns['spawn'](['algorithm-only'],log=h.output/'owned.log',role='ui')
+                row=h.ns['ledger'].writers[0]
+                self.assertTrue(row['acquired'])
+                if stage!='close-failure':self.assertTrue(row['closed'])
+                else:self.assertIsNotNone(row['error'])
+                result=h.ns['finish_cleanup']([])
+                if stage in ('popen-failure','close-failure'):self.assertTrue(result['errors'])
+                else:
+                    self.assertEqual(result['errors'],[])
+                    self.assertEqual(row['inherited_by'],[h.ns['ledger'].creations[0]['id']])
+                    self.assertIsNotNone(h.ns['ledger'].creations[0]['terminal'])
+        h=Harness();h.ns['command'](['ordinary-algorithm-command'])
+        pipes=[stream for stream,row in h.ns['ledger'].original_streams]
+        self.assertEqual(len(pipes),2);self.assertTrue(all(stream.closed for stream in pipes))
+
+    def test_kernel_wait_requires_original_roots_and_retains_status_zero_and_ECHILD(self):
+        h=Harness();h.spawn();h.kernel_answers=[(77,0),(78,15),(0,0),ChildProcessError()]
+        result=h.ns['finish_cleanup']([])
+        self.assertEqual(result['errors'],[])
+        kernel=h.ns['ledger'].kernel
+        self.assertTrue(kernel['echild'])
+        self.assertEqual([(row['pid'],row['raw_status'],row['exit_code']) for row in kernel['waits']],[(77,0,0),(78,15,-15)])
+        first_kernel=next(i for i,event in enumerate(h.events) if event[0]=='kernel-wait')
+        self.assertTrue(any(event[0]=='wait' for event in h.events[:first_kernel]))
+        for signum in (15,9):
+            h=Harness();child=h.spawn()
+            def controlled(pid, signal):
+                h.events.append(('signal',pid,signal))
+                if signal==signum:child.returncode,child.state=-signal,'Z'
+            h.ns['os'].kill=h.ns['os'].killpg=controlled
+            result=h.ns['finish_cleanup']([])
+            self.assertEqual(h.ns['ledger'].creations[0]['terminal']['exit_code'],-signum)
+            self.assertEqual(bool(result['errors']),signum==9)  # Settled TERM is distinct from forced KILL.
+            self.assertEqual('cleanup-complete' in h.output.files,signum==15)
+        for stage in ('zero-only','root-unwaited','root-pid-overlap','subreaper-unknown'):
+            with self.subTest(stage=stage):
+                h=Harness();child=h.spawn()
+                if stage=='zero-only':h.ns['os'].waitpid=lambda pid,flags:(0,0)
+                if stage=='root-unwaited':child.wait_error=RuntimeError('original wait unresolved')
+                if stage=='root-pid-overlap':h.kernel_answers=[(child.pid,0),ChildProcessError()]
+                if stage=='subreaper-unknown':h.ns['ledger'].subreaper=False
+                result=h.ns['finish_cleanup']([])
+                self.assertTrue(result['errors']);self.assertNotIn('cleanup-complete',h.output.files)
+                if stage=='root-unwaited':self.assertFalse(any(event[0]=='kernel-wait' for event in h.events))
+
+    def test_actual_observer_partial_acquisitions_and_close_errors_keep_originals(self):
+        for stage in ('monitor','query','filter','become','close-monitor'):
+            with self.subTest(stage=stage):
+                h=Harness();portal=PortalHarness(h,stage)
+                if stage=='close-monitor':observer=portal.open()
+                else:
+                    with self.assertRaises(RuntimeError):portal.open()
+                    observer=portal.resources['monitor']
+                self.assertIn(observer,h.ns['ledger'].monitors)
+                if stage=='close-monitor':
+                    with self.assertRaisesRegex(RuntimeError,'Observer writer settlement'):observer.close()
+                else:observer.close()
+                for connection in portal.created:
+                    self.assertIn(('connection-close',connection.name),h.events)
+                self.assertTrue(h.ns['ledger'].errors())
+                self.assertFalse(observer.record['accepting']);self.assertEqual(observer.record['inflight'],0)
+
+    def test_callback_gate_drains_actual_admission_before_stream_close_and_rejects_late_work(self):
+        h=Harness();portal=PortalHarness(h);observer=portal.open()
+        self.assertTrue(observer.enter_callback())  # Actual admission of a hypothetical already-running callback.
+        events=[]
+        def finish_admitted():
+            self.assertFalse(observer.record['accepting'])
+            self.assertFalse(observer.stream.closed)
+            observer.leave_callback()  # Actual finally operation; models the other callback thread returning.
+            events.append('admitted-finished')
+        portal.on_wait=finish_admitted
+        observer.close()
+        self.assertEqual(events,['admitted-finished']);self.assertTrue(observer.stream.closed)
+        self.assertEqual(observer.record['inflight'],0);self.assertTrue(observer.record['closed'])
+        before=dict(h.output.files)
+        class Late(Message):
+            def get_body(self):raise AssertionError('Late callback passed the closed admission gate')
+        late=Late();self.assertIs(observer.receive(None,late,True,None),late)
+        self.assertEqual(h.output.files,before)
+        self.assertIsNone(h.ns['cancellation'].failure)
+
+    def test_callback_parse_write_close_and_unfinished_work_refuse_positive_marker(self):
+        for stage in ('parse','write','close','inflight'):
+            with self.subTest(stage=stage):
+                h=Harness();portal=PortalHarness(h);observer=portal.open();original=RuntimeError('callback '+stage)
+                if stage=='parse':
+                    class Broken(Message):
+                        def get_body(self):raise original
+                    observer.receive(None,Broken(),True,None)
+                if stage=='write':
+                    def fail(name):
+                        if name=='portal.jsonl':raise original
+                    h.output.on_write=fail
+                    observer.receive(None,Message(),True,None)
+                if stage=='close':
+                    observer.receive(None,Message(),True,None)
+                    def fail(name):
+                        if name=='portal.jsonl':raise original
+                    h.output.on_close=fail
+                if stage=='inflight':self.assertTrue(observer.enter_callback())
+                if stage in ('parse','write'):
+                    self.assertEqual(observer.record['inflight'],0)
+                    self.assertIs(h.ns['cancellation'].failure,original)
+                result=h.ns['finish_cleanup']([])
+                self.assertTrue(result['errors']);self.assertNotIn('cleanup-complete',h.output.files)
+                if stage=='inflight':
+                    self.assertFalse(observer.stream.closed)  # Never close under an admitted writer.
+                    self.assertEqual(observer.record['inflight'],1)
+
+    def test_final_sidecar_is_last_payload_write_and_failed_publication_removes_marker(self):
+        h=Harness();h.spawn();result=h.ns['finish_cleanup']([])
+        self.assertEqual(result['errors'],[])
+        self.assertEqual(h.events[-1],('ledger-rename','driver-role-writer-ledger.json'))
+        report=json.loads(h.output.files['driver-role-writer-ledger.json'])
+        self.assertEqual(report['kind'],'driver-role-writer-ledger-v1')
+        self.assertTrue(report['kernel']['echild']);self.assertEqual(report['errors'],[])
+        self.assertTrue(any('Xvfb/private session-bus' in item for item in report['outside_scope']))
+        with self.assertRaisesRegex(AssertionError,'Writer phase/count'):h.ns['write_payload'](h.output/'late.txt','no late writer')
+        self.assertNotIn('late.txt',h.output.files)
+        for stage in ('write','rename'):
+            h=Harness();h.spawn();original=RuntimeError('original work failure');secondary=RuntimeError('ledger '+stage)
+            h.ns['cancellation'].latch(original)
+            if stage=='write':
+                def fail(name):
+                    if name=='.driver-role-writer-ledger.tmp':raise secondary
+                h.output.on_write=fail
+            else:
+                def fail(source,destination):raise secondary
+                h.ns['os'].replace=fail
+            result=h.ns['finish_cleanup']([])
+            self.assertTrue(result['errors']);self.assertIs(h.ns['cancellation'].failure,original)
+            self.assertNotIn('cleanup-complete',h.output.files)
+            self.assertNotIn('driver-role-writer-ledger.json',h.output.files)
+
+    def test_image_and_SQLite_original_writers_close_on_partial_failure(self):
+        h=Harness();seen=[]
+        class Image:
+            def save(self, stream, **options):
+                self_test.assertEqual(options,dict(format='WEBP',lossless=True))
+                seen.append(stream);stream.write(b'algorithm-only-image')
+        self_test=self
+        h.ns['save_image'](Image(),h.output/'image.webp')
+        self.assertTrue(seen[0].closed)
+        original=RuntimeError('second SQLite connection failed');connections=[]
+        class Connection:
+            closed=False
+            def close(self):self.closed=True
+            def backup(self, other):raise AssertionError('No backup after failed second acquisition')
+        def connect(path, **options):
+            if connections:raise original
+            value=Connection();connections.append(value);return value
+        h.ns['sqlite3']=SimpleNamespace(connect=connect)
+        with self.assertRaises(RuntimeError) as caught:h.ns['backup_database']('source','clone')
+        self.assertIs(caught.exception,original);self.assertTrue(connections[0].closed)
+        self.assertIs(h.ns['cancellation'].failure,original)
+        self.assertTrue(h.ns['ledger'].errors())
 
     def test_metadata_children_have_install_subreaper_and_outer_cleanup(self):
         main = next(node for node in ast.parse(SOURCE).body if isinstance(node,ast.FunctionDef) and node.name == 'main')
