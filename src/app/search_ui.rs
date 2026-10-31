@@ -56,6 +56,7 @@ impl Drop for State {
 #[derive(Debug, Clone)]
 pub enum Action {
     Open,
+    Retry(u64),
     Query(String),
     Include(String),
     Exclude(String),
@@ -146,6 +147,19 @@ impl Cagents {
                     search,
                     iced::widget::operation::focus(query_id()).map(cosmic::Action::App),
                 ]);
+            }
+            Action::Retry(generation) => {
+                if generation != self.search_ui.generation
+                    || self.search_ui.error.is_none()
+                    || self.search_ui.root.is_none()
+                    || self.search_ui.root.as_ref() != self.sidebar_state.active_worktree()
+                    || self.search_ui.options.query.is_empty()
+                    || self.context_tab != ContextTab::Search
+                    || self.modal_is_open()
+                {
+                    return Task::none();
+                }
+                return self.schedule_project_search();
             }
             Action::Query(value) => self.search_ui.options.query = value,
             Action::Include(value) => self.search_ui.options.include = value,
@@ -472,6 +486,14 @@ impl Cagents {
             )
         };
         controls = controls.push(design::caption(notice));
+        if state.error.is_some() {
+            controls = controls.push(
+                crate::ui_controls::button::quiet("Retry search").on_press_maybe(
+                    (enabled && state.root.is_some() && !state.options.query.is_empty())
+                        .then_some(Message::ProjectSearch(Action::Retry(generation))),
+                ),
+            );
+        }
         let page = state.selected / PAGE_SIZE;
         let start = page * PAGE_SIZE;
         let mut rows = widget::column::with_capacity(PAGE_SIZE + 20)
@@ -1225,6 +1247,96 @@ mod tests {
         ));
         assert!(!app.search_ui.running);
         assert_eq!(app.search_ui.skipped, 2);
+    }
+
+    #[test]
+    fn retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let root = app.sidebar_state.active_worktree().unwrap().clone();
+        app.search_ui.root = Some(root.clone());
+        app.search_ui.generation = 10;
+        app.search_ui.options.query = "needle".into();
+        app.search_ui.options.include = "src/**".into();
+        app.search_ui.options.exclude = "tests/**".into();
+        app.search_ui.options.case_sensitive = true;
+        app.context_tab = ContextTab::Search;
+        drop(app.apply_git_watch_change(
+            root.project_id,
+            crate::git_watch::Change {
+                retired_roots: [root.canonical_path.clone()].into(),
+                ..Default::default()
+            },
+        ));
+        let failed_generation = app.search_ui.generation;
+        drop(cosmic::Application::update(
+            &mut app,
+            Message::ProjectSearch(Action::Progress {
+                generation: failed_generation,
+                root: root.clone(),
+                progress: Progress::Error("Folder is temporarily absent".into()),
+            }),
+        ));
+        assert!(!app.search_ui.running);
+        assert!(app.search_ui.error.is_some());
+        drop(cosmic::Application::update(
+            &mut app,
+            Message::ProjectSearch(Action::Retry(10)),
+        ));
+        assert_eq!(app.search_ui.generation, failed_generation);
+        assert!(app.search_ui.error.is_some());
+        // The replacement keeps the same logical key. Its user retries the
+        // rendered error; no query edit or periodic automatic retry is needed.
+        drop(cosmic::Application::update(
+            &mut app,
+            Message::ProjectSearch(Action::Retry(failed_generation)),
+        ));
+        let retried = app.search_ui.generation;
+        assert_ne!(retried, failed_generation);
+        assert_eq!(app.search_ui.root.as_ref(), Some(&root));
+        assert_eq!(app.search_ui.options.query, "needle");
+        assert_eq!(app.search_ui.options.include, "src/**");
+        assert_eq!(app.search_ui.options.exclude, "tests/**");
+        assert!(app.search_ui.options.case_sensitive);
+        assert!(app.search_ui.running);
+        assert!(app.search_ui.error.is_none());
+        drop(cosmic::Application::update(
+            &mut app,
+            Message::ProjectSearch(Action::Progress {
+                generation: failed_generation,
+                root: root.clone(),
+                progress: Progress::Error("late original error".into()),
+            }),
+        ));
+        assert!(app.search_ui.error.is_none());
+        assert!(app.search_ui.running);
+        drop(cosmic::Application::update(
+            &mut app,
+            Message::ProjectSearch(Action::Progress {
+                generation: retried,
+                root,
+                progress: Progress::Batch(vec![project_search::Match {
+                    path: "src/replacement.rs".into(),
+                    line: 0,
+                    column: 0,
+                    length: 6,
+                    line_identity: project_search::LineIdentity::new("needle"),
+                    snippet: "needle".into(),
+                    highlight: 0..6,
+                }]),
+            }),
+        ));
+        assert_eq!(
+            app.search_ui.matches[0].path,
+            Path::new("src/replacement.rs")
+        );
+        drop(cosmic::Application::update(
+            &mut app,
+            Message::ProjectSearch(Action::Retry(failed_generation)),
+        ));
+        assert_eq!(app.search_ui.generation, retried);
+        assert_eq!(app.search_ui.matches.len(), 1);
     }
 
     #[test]
