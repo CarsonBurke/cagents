@@ -1,0 +1,422 @@
+{
+  "ABI": {
+    "candidate_not_called": true,
+    "external_binding": "Root binds this genuine receipt path/hash separately after source freeze; actual authenticated scope grant/current context/resource checks not supplied by source.",
+    "required_top_fields": {
+      "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+      "plan_sha256": "58256b3a2582d37326465feda15ec105626ae135241765334f99e295adaadba2",
+      "runner_sha256": "86dfd54444633796a4888d3e57e1168dedf2ea49ba25ab0c50e392fab23c0929",
+      "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+      "verdict": "CONTROLLER_SOURCE_CLEAR"
+    },
+    "source": "run-packet.py362-367/984-989"
+  },
+  "activity": "Static frozen source/hash/AST/JSON/text and immutable Git headers; existing AGENTS source read; own new private receipt only. No candidate/module/function/parser-example/algorithm execution/import, compiler/test/helper/ELF/toolversion/native/authority/account/env/process/resource/target/cache/context probe, source/public write or child.",
+  "actual_source_counterexample": {
+    "actual_type": "str",
+    "assertion_AST_line": 902,
+    "equal": false,
+    "expected_type": "str",
+    "predicates_before_reject": "genuine current proof hash/schema/head/parents/full assembly verdict are correct",
+    "type": "STATIC_JSON_AND_AST_ONLY_NO_CANDIDATE_CALL"
+  },
+  "blocking_findings": [
+    {
+      "assertion_source": "assert main_assembly['known_whole_head_blocker']['status'] == 'BLOCKED'",
+      "failure_path": "main reads/hash-checks actual product_main_assembly at868; schema/head/parents/verdict join898-901 accepts; exact status assertion902 rejects the actual string. No output archive mkdir, Cfd open/flock, compiler, ELF or test phase has started. This is a source-derived inevitable assertion refusal, not an executed failure.",
+      "genuine_pinned_JSON_value": "BLOCKED pending separately pinned fixture-only successor",
+      "genuine_receipt": {
+        "JSON_path": "/known_whole_head_blocker/status",
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json",
+        "schema": "pr1549_9e63_current_main_actual_merge_independent_assembly_conservation_review_v1",
+        "sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348",
+        "verdict": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED"
+      },
+      "id": "HOST3-PROOF-STATUS-EXACT-LITERAL",
+      "line": 902,
+      "minimum_correction": "Change only expected literal to exact actual \"BLOCKED pending separately pinned fixture-only successor\". Keep genuine273ab bytes and original blocked verdict; do not turn it into PASS, change proof or replace this with a weaker generic status admission. Freeze a separate affected successor for regate.",
+      "negative_preservation": "Original frozen86df source/author837d and this negative review remain immutable. Actual current compilation/native remains UNRUN; c28 source correction does not retroactively clear9e63 assembly.",
+      "path": "qualification-packets/pr1549-c28-host3/run-packet.py",
+      "severity": "blocking_source_integration",
+      "source_expected_literal": "BLOCKED"
+    }
+  ],
+  "checked_fact_count": 21,
+  "checked_facts": [
+    {
+      "name": "own frozen code and source identity",
+      "reason": "Exact current HOST3 own pins; source object proves controller soleparentc28 and c28soleparent9e63. No ee7 source review or result transferred.",
+      "source": "object-freeze; immutable commit headers26764a/f2b07f exit0",
+      "verified": true
+    },
+    {
+      "name": "product_freeze genuine role hash",
+      "reason": "Actual archived typed proof reference matched, no author placeholder substituted.",
+      "source": "source-binding product_freeze",
+      "verified": true
+    },
+    {
+      "name": "product_correctness genuine role hash",
+      "reason": "Actual archived typed proof reference matched, no author placeholder substituted.",
+      "source": "source-binding product_correctness",
+      "verified": true
+    },
+    {
+      "name": "product_conservation genuine role hash",
+      "reason": "Actual archived typed proof reference matched, no author placeholder substituted.",
+      "source": "source-binding product_conservation",
+      "verified": true
+    },
+    {
+      "name": "product_ux_source genuine role hash",
+      "reason": "Actual archived typed proof reference matched, no author placeholder substituted.",
+      "source": "source-binding product_ux_source",
+      "verified": true
+    },
+    {
+      "name": "product_main_assembly genuine role hash",
+      "reason": "Actual archived typed proof reference matched, no author placeholder substituted.",
+      "source": "source-binding product_main_assembly",
+      "verified": true
+    },
+    {
+      "name": "product_adoption genuine role hash",
+      "reason": "Actual archived typed proof reference matched, no author placeholder substituted.",
+      "source": "source-binding product_adoption",
+      "verified": true
+    },
+    {
+      "name": "product_publication genuine role hash",
+      "reason": "Actual archived typed proof reference matched, no author placeholder substituted.",
+      "source": "source-binding product_publication",
+      "verified": true
+    },
+    {
+      "name": "v3 source freeze/current-main/correction exact schema join",
+      "reason": "Cumulative18-path feature and immediate two-fixture source correction are distinct. Original freeze null reviews/publication retained. Current correction removes known source cause only; no current compile PASS.",
+      "source": "run-packet.py:854,861-890",
+      "verified": true
+    },
+    {
+      "name": "genuine assembly negative retained and conservation typed",
+      "reason": "Actual273ab assembly verdict stays BLOCKED at9e63, not relabeled clear/current runtime. Later c28 correction proof source-only and all current Rust/native UNRUN.",
+      "source": "run-packet.py:891-906",
+      "verified": false
+    },
+    {
+      "name": "source UX/adoption/publication bounded role linkage",
+      "reason": "No source/UX readiness fabrication. Genuine Root source adoption/publication is not a grant. Original ee7 UI negative and HOST2 acceptance remain original-head history only, not retargeted.",
+      "source": "run-packet.py:878-884,907-920",
+      "verified": true
+    },
+    {
+      "name": "34 source pins and68 archive hashes",
+      "reason": "Current source includes18feature paths plus current config/enrollment/script pins. Those scripts are source inputs, not executed helpers. Full77-file/tree/DAG/3790/inverse conservation belongs other reviewer.",
+      "source": "run-packet.py:875-876,906,965,990-994,1037-1051",
+      "verified": true
+    },
+    {
+      "name": "three current source selectors and cfg owning graph",
+      "reason": "Exact ordinary nonignored source declarations and Root adoption request match; compiled inventory is still unknown and must be discovered fresh.",
+      "source": "run-packet.py:963-977; git_watch.rs951/983/1572; modules.rs68-69",
+      "verified": true
+    },
+    {
+      "name": "native watcher private real fixture without silent success/helper",
+      "reason": "Actual Monitor start/notify threads, TempDir/filesystem writes/rename/recreated identity/rearm and Dropjoin source path. No missing-backend skip or early success; wait_for returns only on predicate and otherwise asserts5s. No emitted helper. Execution/backend/thread/drop responsiveness remains UNRUN; this is not native UI.",
+      "source": "git_watch.rs881-890,1546-1628",
+      "verified": true
+    },
+    {
+      "name": "isolated HOST graph and six serial phases",
+      "reason": "One binary check, one HOST-only lib compile, one same-artifact inventory and three singleton processes. No UI union, arbitrary workload, helper binding or old ELF transfer.",
+      "source": "run-packet.py:565-601,968-980",
+      "verified": true
+    },
+    {
+      "name": "actual CargoJSON artifact inventory andN-1 guards",
+      "reason": "Root-manifest test lib executable unique actual CargoJSON/build-finished, exact featureshost; canonical nonsymlink target ELF magic+hash and per-use observation. Full unique inventory ordinary+benchmark count derives freshN-1; no current ELF/N invented.",
+      "source": "run-packet.py:247-285,475-491,565-596",
+      "verified": true
+    },
+    {
+      "name": "strict default captured singleton and final raw failure semantics",
+      "reason": "Each original outer stdout must be running1/exactok/onecomplete1P0F0I0M/freshN-1, ordered. Raw reread matches original phase hash/wait0/evidence and earlier strict result. Failure/ignore/missing/duplicate/zero-test/unrecognized refuses. No stderr splice, nocapture/thread override, child/PID/per-branch additive credit, rerun or expected-negative PASS. Asset/control/read failures sticky/HOLD.",
+      "source": "run-packet.py:494-562,597-650,680-762,1170-1176,1304",
+      "verified": true
+    },
+    {
+      "name": "finite workload and authority/context predicates",
+      "reason": "600+900+30+3x90=1800 under original2400; source/phase remaining caps preserved. Name-only refusals and compiler-only overlays preserve opaque HOME/authority; no User/role proxy/env clear/newcache/target. Actual tool/context not read here. Uncertain family HOLD remains indefinite, not hard realtime OS guarantee.",
+      "source": "run-packet.py:845-847,978-983,1020-1075,1092-1103,1173",
+      "verified": true
+    },
+    {
+      "name": "safe fixed relative archive parents",
+      "reason": "Hash-bound fixed names, fresh private output; validated components including.cargo/.github, nonsymlink parents0700 and exclusivecopy+digest. No existing-tree adoption/reset/delete, generic path escape or local framework change; static source not filesystem race test.",
+      "source": "run-packet.py:990-1014; evidence_copy370-375",
+      "verified": true
+    },
+    {
+      "name": "exact executable proof ABI and NULL admission",
+      "reason": "Topproductc28 head/tree plus exact runner/plan, separate controller5278 identity. Fresh external review path/hash and authenticated grant/context admission required; this source proof gives no runtime authority or result.",
+      "source": "run-packet.py:362-367,842-844,984-989",
+      "verified": true
+    },
+    {
+      "name": "reviewed source stable",
+      "reason": "No frozen source edits or drift in reviewed files.",
+      "source": "review seal reads",
+      "verified": true
+    }
+  ],
+  "checked_function_pins": {
+    "execute_contracts": {
+      "end_line": 652,
+      "line": 565,
+      "sha256": "584d6c3b8076b29a92d12454bd3c3e04b1d14abe5f46323c62cbd451151c41bc"
+    },
+    "grouped_contracts": {
+      "end_line": 491,
+      "line": 475,
+      "sha256": "a0857a4f968cf7fa26356111b0b52a0bd5665aedea5cc89cd6ae6b17d4be21cd"
+    },
+    "main": {
+      "end_line": 1340,
+      "line": 825,
+      "sha256": "7df28c336a2b5e153ed9d3a2552b7dbf3c5e61cc2c4e8cba431a0fd67b894f8d"
+    },
+    "parent_accounting": {
+      "end_line": 762,
+      "line": 680,
+      "sha256": "63ae986431251629da4eedcd17cdaf19f3449eef7ba0e337f2a1021cf9e1f5c1"
+    },
+    "validate_controller_review": {
+      "end_line": 367,
+      "line": 362,
+      "sha256": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
+    }
+  },
+  "clear_portions": "All20 other recorded source checks remain clear; unique remaining blocker is exact assembly status literal. Full conservation separate. No product source semantics re-review, compile, runtime/context/tool/resource probes or code edits.",
+  "controller_head": "5278f4c5611e678bcfe7d3674cddabbe21bb7f62",
+  "controller_parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "controller_tree": "921a092b275998fa966eb015dea28507da16a97a",
+  "current_main_reference": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "findings": [
+    {
+      "assertion_source": "assert main_assembly['known_whole_head_blocker']['status'] == 'BLOCKED'",
+      "failure_path": "main reads/hash-checks actual product_main_assembly at868; schema/head/parents/verdict join898-901 accepts; exact status assertion902 rejects the actual string. No output archive mkdir, Cfd open/flock, compiler, ELF or test phase has started. This is a source-derived inevitable assertion refusal, not an executed failure.",
+      "genuine_pinned_JSON_value": "BLOCKED pending separately pinned fixture-only successor",
+      "genuine_receipt": {
+        "JSON_path": "/known_whole_head_blocker/status",
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json",
+        "schema": "pr1549_9e63_current_main_actual_merge_independent_assembly_conservation_review_v1",
+        "sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348",
+        "verdict": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED"
+      },
+      "id": "HOST3-PROOF-STATUS-EXACT-LITERAL",
+      "line": 902,
+      "minimum_correction": "Change only expected literal to exact actual \"BLOCKED pending separately pinned fixture-only successor\". Keep genuine273ab bytes and original blocked verdict; do not turn it into PASS, change proof or replace this with a weaker generic status admission. Freeze a separate affected successor for regate.",
+      "negative_preservation": "Original frozen86df source/author837d and this negative review remain immutable. Actual current compilation/native remains UNRUN; c28 source correction does not retroactively clear9e63 assembly.",
+      "path": "qualification-packets/pr1549-c28-host3/run-packet.py",
+      "severity": "blocking_source_integration",
+      "source_expected_literal": "BLOCKED"
+    }
+  ],
+  "frozen_inputs": {
+    "immutable_commit_headers": [
+      {
+        "chunk": "26764a",
+        "controller": {
+          "head": "5278f4c5611e678bcfe7d3674cddabbe21bb7f62",
+          "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+          "tree": "921a092b275998fa966eb015dea28507da16a97a"
+        },
+        "exit": 0
+      },
+      {
+        "chunk": "f2b07f",
+        "exit": 0,
+        "product": {
+          "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+          "parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+          "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751"
+        }
+      }
+    ],
+    "manifest": {
+      "declared_files": 77,
+      "declared_payloads": 76,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/manifest.json",
+      "sha256": "69f6d9f1944230559e8f75a1d0e40cac4d2fcab249f5fb6a0d632d63d8e88b99",
+      "source_index_not_runtime_SHA256SUMS": true
+    },
+    "object_freeze": {
+      "path": "/var/tmp/coord16-pr1549-c28-host3-author-freeze-hixfgymy/object-freeze.json",
+      "sha256": "837d56dd0c59faba8c921bc13419495f44d92965f9a9aba98e295713441ef0cc"
+    },
+    "plan": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/plan.json",
+      "sha256": "58256b3a2582d37326465feda15ec105626ae135241765334f99e295adaadba2"
+    },
+    "runner": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/run-packet.py",
+      "sha256": "86dfd54444633796a4888d3e57e1168dedf2ea49ba25ab0c50e392fab23c0929"
+    }
+  },
+  "future_contract": {
+    "actual_ELF_N_counts_results": null,
+    "all_case_and_child_observations_nonadditive": true,
+    "argv": [
+      "ACTUAL_SAME_CURRENT_HOST_LIBTEST_ELF",
+      "ONE_EXACT_NAME",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    "boundary": "HOST features[host] only",
+    "caps": {
+      "bin_check": 600,
+      "compile": 900,
+      "each_parent": 90,
+      "inventory": 30,
+      "sum_phase_caps": 1800,
+      "whole": 2400
+    },
+    "native_watcher_source": {
+      "executed": false,
+      "fixtures": "Private TempDir, real Monitor/notify threads/filesystem identity+atomic replacement/rearm/5s wait predicates/Dropjoin",
+      "line": 1572,
+      "native_UI_or_provider": false,
+      "path": "src/git_watch.rs",
+      "silent_skip": false
+    },
+    "outer_parent_count": 3,
+    "phase_order": [
+      "host-binary-check",
+      "compile-host-lib",
+      "inventory-host-lib",
+      "parent-host-lib-1",
+      "parent-host-lib-2",
+      "parent-host-lib-3"
+    ],
+    "result_oracle": "One original running1/nameok/footer1P0F0I0M/fullN-1 plus originalwait0, streams/evidence hashes, actual ELF/source/context proof and final raw reread match",
+    "selected_names": [
+      "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+      "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+      "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory"
+    ]
+  },
+  "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "instruction_source": {
+    "actual_filesystem_AGENTS_read_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+    "latest_user_AGENTS_take_precedence": true,
+    "no_blanket_filesystem_Git_agreement": true,
+    "record": {
+      "bytes_flags_changed_by_author": false,
+      "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+      "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+      "index_flag": "H AGENTS.md",
+      "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+      "latest_user_AGENTS_instructions_followed": true,
+      "variance": true
+    },
+    "unchanged_Git_pointer_source_variance_preserved_not_waived": true
+  },
+  "kind": "INDEPENDENT_CURRENT_MAIN_HOST3_CODE_REVIEW_CHANGES_REQUIRED_EXACT_PROOF_READER_LITERAL",
+  "new_workers": false,
+  "plan_sha256": "58256b3a2582d37326465feda15ec105626ae135241765334f99e295adaadba2",
+  "preserved_assembly_negative": {
+    "head": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+    "known_blocker_status": "BLOCKED pending separately pinned fixture-only successor",
+    "meaning": "Original9e63 assembly clear only for conservation and whole-head UI-test compile BLOCKED. New c28 review supports source-known E0509 cause removed; current compile/results remain UNRUN. No negative reclassification/old ee7 outcome transfer.",
+    "sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348",
+    "verdict": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED"
+  },
+  "prior_static_check_receipt": {
+    "path": "/var/tmp/coord16-pr1549-c28-host3-code-independent-nkxvjkl0/review.json",
+    "purpose": "Preserved initial sealed21-check output showing this real aggregate proof-check failure; precise source counterexample added in this successor report without rewriting it.",
+    "sha256": "b2fe3dd38ff8406ae577bb020f52e3e0eef4552df1312d9c3ede5b13d667ab4a"
+  },
+  "product_parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+  "product_pr": 1549,
+  "product_proof_roles": [
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-current-main-search-source-freeze-v3.json",
+      "role": "product_freeze",
+      "schema": "pr1549_current_main_search_source_freeze_v3",
+      "sha256": "9c4361dead8b82c4f07aa076265fadbb800880814a5ba10bb3b97d50c10044b7",
+      "verdict": null
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-c28e76c7-drop-state-fixture-correction-independent-source-review-v1.json",
+      "role": "product_correctness",
+      "schema": "pr1549_c28e76c7_drop_state_fixture_correction_independent_source_review_v1",
+      "sha256": "30a8b6cd3d357d5812f62b5f0a40e1200c423a85b9a3bd23609eafe4d3d73edf",
+      "verdict": "BOUNDED_SOURCE_CLEAR_KNOWN_E0509_CAUSE_REMOVED_NO_NEW_DELTA_BLOCKER"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-c28e76c7-two-fixture-correction-independent-conservation-review-v1.json",
+      "role": "product_conservation",
+      "schema": "pr1549_c28e76c7_two_fixture_correction_independent_conservation_review_v1",
+      "sha256": "283ea3f460f4ff0ec7c07692c2e63339f9c8e90ba66b6717950c8c8f1e8c0202",
+      "verdict": "BOUNDED_FIXTURE_CORRECTION_SOURCE_CLEAR_CURRENT_COMPILE_UNRUN"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-current-main-c28-independent-ux-source-evidence-refresh-1335-v1.json",
+      "role": "product_ux_source",
+      "schema": "pr1549_current_main_c28_fixture_correction_independent_ux_source_evidence_refresh_v1",
+      "sha256": "9ef393cd5fff6ae7824fbf84f3f283ec756d83e98a5c998f85f4edd4bfa45bd9",
+      "verdict": "BOUNDED_FIXTURE_SOURCE_CAUSE_FIXED; PRODUCTION_UX_SOURCE_ASSESSMENT_RETAINED; EXECUTION_AND_NATIVE_EVIDENCE_HOLD; NOT_READY"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json",
+      "role": "product_main_assembly",
+      "schema": "pr1549_9e63_current_main_actual_merge_independent_assembly_conservation_review_v1",
+      "sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348",
+      "verdict": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/product-adoption.json",
+      "role": "product_adoption",
+      "schema": "pr1549_c28_current_main_root_source_adoption_v1",
+      "sha256": "36686d074bef22212398582de92ed3aab456713d5f1584e4c90179e0ac547a2a",
+      "verdict": null
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/product-publication.json",
+      "role": "product_publication",
+      "schema": "pr1549_c28_current_main_reviewed_source_publication_v1",
+      "sha256": "cb42afaf0caf230f28286cd2adac98cb5fc8b57e530bc91f2a35b411e5b474e0",
+      "verdict": null
+    }
+  ],
+  "qualification_limits": {
+    "ELF": null,
+    "UI4": "SEPARATE_REVIEW_AND_FRESH_EXECUTION_REQUIRED",
+    "all_current_compile_tests_runtime": "UNRUN",
+    "current_caller_tools_context_resources": null,
+    "execution_authorized": false,
+    "full_ELF_archived": false,
+    "grant": null,
+    "inventory_N": null,
+    "native_current_main442_before_c28_after_WebP_UX_keyboard_scroll_performance": "UNRUN_UNQUALIFIED",
+    "other_limits": [
+      "Oldee7HOST2accepted/UI3failed/source histories are not current results, never imported as pass or review.",
+      "Canonical9004/no unproven-adopted signals/indefinite uncertainty HOLD remain; no namespace/kernel/manager/installed/everyinternalexec proof.",
+      "Source pins for runner/preparer/custody/scripts represent enrollment only; no helper execution/current resource qualification.",
+      "Separate full conservation and actual admitted current source/tool/context/ELF/inventory/original terminal+RAW required before any execution claim."
+    ],
+    "results": null,
+    "whole_PR_main_caller_adoption_WHOLE_merge": "UNKNOWN_UNQUALIFIED"
+  },
+  "reviewer": "/root/editor_recovery_review, nonauthor; no delegation",
+  "runner_sha256": "86dfd54444633796a4888d3e57e1168dedf2ea49ba25ab0c50e392fab23c0929",
+  "schema": "pr1549_c28_host3_independent_task_code_typed_proof_ABI_source_review_v1",
+  "scope": "Four changed task functions/main, typed current-main v3freeze/correction/conservation/UX/assembly/Rootadoption/publication proof reader, executable ABI, HOST graph/3selector source fixtures, current ELF/inventory/strict result/raw reread/accounting/error/archive-parent and inherited context predicates. Exact core/tree/DAG/3790/whole-file inverses belong separate reviewer, not duplicated.",
+  "source_binding_sha256": "a10a6644679ae1f571d60c213016a8e8ce4a0fe359ee72012bc15d5ed5b2bfea",
+  "source_edits_or_public_writes": false,
+  "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+  "verdict": "CHANGES_REQUIRED",
+  "writing_released": true
+}

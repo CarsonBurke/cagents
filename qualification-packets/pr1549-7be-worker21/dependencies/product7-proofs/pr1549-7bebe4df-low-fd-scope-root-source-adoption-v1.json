@@ -1,0 +1,33 @@
+{
+  "schema": "pr1549_7bebe4df_low_fd_scope_root_source_adoption_v1",
+  "utc": "2026-10-31T16:25:17.653244+00:00",
+  "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+  "tree": "532d48f268b00fa658fea22a8418d41432879046",
+  "sole_parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "source_freeze": {
+    "path": "/tmp/fw16-backend-ec204421/pr1549-low-fd-child-scope-source-freeze-v1.json",
+    "sha256": "f3e5626484baf74bfd80b67ca32f159145bebf4871766358e35ce0276439f0e9"
+  },
+  "independent_reviews": [
+    {
+      "path": "/tmp/pr1549-7bebe4df-low-fd-authority-custody-independent-source-review-v1.json",
+      "sha256": "85967cf2f75f0dd4b48a89308a242b919e5fc842add05084d839ee41cd61d65d",
+      "actual_verdict": "BOUNDED SOURCE CLEAR; no concrete new type/gate/caller-custody/conservation blocker in the exact test-only delta; not runtime admission"
+    },
+    {
+      "path": "/tmp/pr1549-7bebe4df-low-fd-child-scope-independent-conservation-review-v1.json",
+      "sha256": "1c76e11d9b425c041de746c1bb4a8568309c85f449167dbe715ef8e44d0b6c60",
+      "actual_verdict": "BOUNDED_TEST_SETUP_CONSERVATION_SOURCE_CLEAR_EXECUTION_UNRUN"
+    }
+  ],
+  "reviewed_source_code_clear": true,
+  "reviewed_conservation_clear": true,
+  "production_prefix_equal": true,
+  "all_2222_other_entries_conserved": true,
+  "source_only_adopted": true,
+  "runtime_grant": null,
+  "prior_results": "c28HOST3/Script67 exactoldsource only; HOSTgraph/sourceproduction conserved but no relabelednewheadexecution. c28UI4nevergranted/UNRUN.",
+  "current_compiles_tests_CI_native": "UNRUN",
+  "required_future_context": "Natural CAGENTS_SEARCH_FD_BUDGET_CHILD absence, originalopaqueauthorityinheritance, source-childargs unchanged/nonadditive and actualoutercaptured/defaultscheduler. Bounded inheritedglobalignoreconfigurationreads mayoccur in selected fullworker/scannerparents; not fixture-only and noHOME/XDG/authorityscrub.",
+  "source_next": "Ordinary sourcepublication+existingPRFF; exactremainingDATA needs newheadexplicitbinding. Root16current LinearLIB3 sourceindependent, noautomaticC/nativegrant."
+}

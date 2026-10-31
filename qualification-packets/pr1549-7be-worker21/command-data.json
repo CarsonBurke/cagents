@@ -1,0 +1,556 @@
+{
+  "schema": "pr1549-7be-worker21-controller-task-data-v1",
+  "product_PR_reference": 1549,
+  "boundary": "ui",
+  "source": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope"
+  },
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "selected_names": [
+    "project_search::tests::ignore_hidden_globs_and_options",
+    "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope",
+    "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries",
+    "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes",
+    "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry",
+    "project_search::tests::large_search_streams_first_results_before_completion",
+    "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership",
+    "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal",
+    "project_search::tests::deep_ignore_error_terminates_without_a_finished_event",
+    "project_search::tests::regex_errors_and_binary_files",
+    "project_search::tests::content_search_never_follows_links_outside_the_selected_root",
+    "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data",
+    "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending",
+    "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix",
+    "project_search::tests::caps_results_and_cancels_during_delivery",
+    "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress",
+    "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+    "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree",
+    "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings",
+    "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources",
+    "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers"
+  ],
+  "selected_parents": [
+    {
+      "name": "project_search::tests::ignore_hidden_globs_and_options",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 709,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "82a710f81d10c58b5c97c4f27d33dbd10a2a0a1b07e820cb17a610a44b462125",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 736,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "9b59e6c6ae106a7d170b85c3401da76f8421ecb0aa95568f90951246684130c6",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 838,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "518e0f0e9c90a05e68bcbcfff44e267e477e51b8bbfb397b7dcf9976cbdd0208",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 874,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "0bace255a067c8ebbf571bc243ae668ca63e6a21a76fb3217a59a84ad5f36b18",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 926,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "0d280c62c88cdc8331051944b01494e67d946254e7258c13d1fce245f71a4fb5",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::large_search_streams_first_results_before_completion",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 943,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "5e51894d0ec00bc975391fe1865b59e545d0b13b50254bdfa0b0ddff7e70f590",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 976,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "cdd13f3236b11fd27be39b53f7f75251194e53dff0f519c0c42fc6fa55d7f8da",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1056,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "54c4764aea7d3f041a1b74c9762ad8d6478a4e3e4c00d8fc75dc3176aa557996",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::deep_ignore_error_terminates_without_a_finished_event",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1104,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "955e51e3cf463b52accdf686defdfdaecc4c4e676a885dd8e93bb771071d946d",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::regex_errors_and_binary_files",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1120,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "3cefd79c80fb16a627fa053a1b8ccf4f8dfccce0f9b84b4d79e75fc6112e07a9",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::content_search_never_follows_links_outside_the_selected_root",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1132,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "4dca010534e81ad0c9de4e801ccee50c7da92df99fd74054448f9e232d502123",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1176,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "c997858cfe1fe9ebed26086a53452669d2d6a1b651385a1378f536c0fe2459d5",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1204,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "1fbca012c15638b206ecef53d886cf78af7e204b9ef1b265320c6cc5c1e3c466",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1234,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "1ae98f9bdf70ee496995b3854bed8df682b482b2ddb4afb1bb131b7b8e733a84",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::caps_results_and_cancels_during_delivery",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1269,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "8eebb6887b113ebe56c2356e172dc7ac3fcb96970b2bb186e1eb9f9d0fdfdc9c",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1301,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "d2d5152e56d84566026930b1fda9b958ec6f7ac8473098a956e629be8a3512c8",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1331,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "362a508b8dce258172eda117b3e1a0a168f226267d016bccff55b90a1dad57a0",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree",
+      "source": "src/project_search.rs",
+      "source_sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "line": 1451,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "daf978598d566ad95f74ba4c9ca40593e792a0d03c1e3a828357e4da8ef808d3",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings",
+      "source": "src/project_search/ignore_policy.rs",
+      "source_sha256": "7a78519d0450b2b701fc3ff44011b25a8d800a7df6e5377273d6757dd647aeb8",
+      "line": 419,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "93e948cb1407a3f4d7a5bba9cbd903b24672aab2e634b9c4e14a809a5ae28aff",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources",
+      "source": "src/project_search/ignore_policy.rs",
+      "source_sha256": "7a78519d0450b2b701fc3ff44011b25a8d800a7df6e5377273d6757dd647aeb8",
+      "line": 462,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "995394dd5670f71b097faae7a2cdb5d4f33ed4da7740aff4c6361ba3c831f474",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers",
+      "source": "src/project_search/traversal.rs",
+      "source_sha256": "efe6e92570f66931b12c658765f6d3291a58620238c5ffd066d0752f84a2fd75",
+      "line": 302,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "73655bd7b1b2080c526ebd1ebb35a466fd5c174c2f9beeeb6894c85b19fc7376",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "project_search::tests::ignore_hidden_globs_and_options",
+        "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope",
+        "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries",
+        "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes",
+        "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry",
+        "project_search::tests::large_search_streams_first_results_before_completion",
+        "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership",
+        "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal",
+        "project_search::tests::deep_ignore_error_terminates_without_a_finished_event",
+        "project_search::tests::regex_errors_and_binary_files",
+        "project_search::tests::content_search_never_follows_links_outside_the_selected_root",
+        "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data",
+        "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending",
+        "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix",
+        "project_search::tests::caps_results_and_cancels_during_delivery",
+        "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress",
+        "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+        "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree",
+        "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings",
+        "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources",
+        "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "project_search::tests::ignore_hidden_globs_and_options",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::large_search_streams_first_results_before_completion",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::deep_ignore_error_terminates_without_a_finished_event",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::regex_errors_and_binary_files",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::content_search_never_follows_links_outside_the_selected_root",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::caps_results_and_cancels_during_delivery",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [],
+  "planned_phase_order": [
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3",
+    "parent-ui-lib-4",
+    "parent-ui-lib-5",
+    "parent-ui-lib-6",
+    "parent-ui-lib-7",
+    "parent-ui-lib-8",
+    "parent-ui-lib-9",
+    "parent-ui-lib-10",
+    "parent-ui-lib-11",
+    "parent-ui-lib-12",
+    "parent-ui-lib-13",
+    "parent-ui-lib-14",
+    "parent-ui-lib-15",
+    "parent-ui-lib-16",
+    "parent-ui-lib-17",
+    "parent-ui-lib-18",
+    "parent-ui-lib-19",
+    "parent-ui-lib-20",
+    "parent-ui-lib-21"
+  ],
+  "runtime_admission": {
+    "state": "PR1549_7BE_WORKER21_SOURCE_REQUIRES_TWO_REVIEWS_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null,
+    "controller_source_adoption": null,
+    "controller_source_publication": null,
+    "queue": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "worker_source_contract": {
+    "kind": "SOURCE_ONLY_WORKER21_EXACT_SELECTION_NOT_COMPILED_INVENTORY",
+    "selectors": [
+      "project_search::tests::ignore_hidden_globs_and_options",
+      "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope",
+      "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries",
+      "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes",
+      "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry",
+      "project_search::tests::large_search_streams_first_results_before_completion",
+      "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership",
+      "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal",
+      "project_search::tests::deep_ignore_error_terminates_without_a_finished_event",
+      "project_search::tests::regex_errors_and_binary_files",
+      "project_search::tests::content_search_never_follows_links_outside_the_selected_root",
+      "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data",
+      "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending",
+      "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix",
+      "project_search::tests::caps_results_and_cancels_during_delivery",
+      "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress",
+      "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+      "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree",
+      "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings",
+      "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources",
+      "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers"
+    ],
+    "count": 21,
+    "UI5_selected": false,
+    "low_FD_selected": false,
+    "ignored_manual_benchmark_selected": false,
+    "expected_visible_outer_stdout_child_results": 0,
+    "scheduler_and_capture": "Captured default outer scheduler; no overrides, no manual childmode; inline subcases nonadditive.",
+    "global_configuration_scope_decision": "Selected production worker/scanner paths may perform bounded read-only inherited global Git ignore/configuration and ancestor ignore discovery. This normal task read behavior is allowed within the existing filesystem sandbox; it is not fixture-confined. Preserve inherited HOME/XDG/opaqueauthority and current no-write policy; do not inspect/print configuration contents in preparation, rewrite HOME, read account/provider databases or claim a broader User authority. If original execution refuses or fails context/config prerequisites, preserve it without scrub/fallback/retry.",
+    "actual_ELF_or_N_or_results": null
+  }
+}

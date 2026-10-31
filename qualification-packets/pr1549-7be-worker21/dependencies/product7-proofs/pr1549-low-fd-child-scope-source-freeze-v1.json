@@ -1,0 +1,32 @@
+{
+  "schema": "pr1549_low_fd_child_scope_source_freeze_v1",
+  "utc": "2026-10-31T16:20:41.767344+00:00",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope",
+  "branch": "fix/fw16-pr1549-search-child-scope",
+  "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+  "tree": "532d48f268b00fa658fea22a8418d41432879046",
+  "sole_parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "changed_paths": [
+    "src/project_search/traversal.rs"
+  ],
+  "pins": {
+    "src/project_search/traversal.rs": {
+      "sha256": "efe6e92570f66931b12c658765f6d3291a58620238c5ffd066d0752f84a2fd75",
+      "blob": "e192a308d1828483171501130a886114689b2a57"
+    }
+  },
+  "delta": "Only owning lowFD cfgtest child Command setup: enumerate environment names for removal except crate::agent_execution::AUTHORITY_ENV, leaving inherited opaque authority without explicitly selecting/copying/serializing/removing its value. All other names still removed; existing childflag/privateHOME/args/cwd/streams/originalChild/30sdeadline/limit/assertions/body preserved. No new test parent or production change.",
+  "neighbor_scan": "rg env_clear/env_remove/remove_var/AUTHORITY_ENV/Command::new/current_exe in project_search.rs,project_search/,app/search_ui.rs found only this child setup; no other owned-neighbor env_clear remains.",
+  "format": {
+    "start": "9c2725",
+    "session": 50828,
+    "final": "60b5ad",
+    "exit": 0,
+    "diff_check_commit": "2ef3f4 EXIT0"
+  },
+  "prior_source_results": "c28 originalScript67/HOST3 accepted remain exactoldhead only. No currenthead compile/test/native claim; UI4 c28 nevergranted remainsUNRUN.",
+  "C": "NO_CURRENT_LEASE after HOST3 acceptance ee44cb7d; no new grant",
+  "source_reviews": null,
+  "publication": null,
+  "runtime": "UNRUN; newhead currentselection/source/independentreview/admission required."
+}

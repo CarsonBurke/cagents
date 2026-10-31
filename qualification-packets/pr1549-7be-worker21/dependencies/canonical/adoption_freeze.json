@@ -1,0 +1,40 @@
+{
+  "kind": "CANONICAL_EXISTING_FUNCTION_SOURCE_CORRECTION_NOT_EXECUTION_PACKET",
+  "utc": "2026-10-31T11:17:29.400536+00:00",
+  "head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+  "tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+  "parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold",
+  "branch": "qualification/fw16-unproven-adoption-hold",
+  "source_finding": {
+    "path": "/tmp/startup30-adopted-signal-source-audit-hlrnp0hy/review.json",
+    "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
+  },
+  "changed_paths": [
+    "policy-corrections/adopted-child-settlement/README.md",
+    "policy-corrections/adopted-child-settlement/from-347-function.diff.json",
+    "policy-corrections/adopted-child-settlement/settle_children.py",
+    "policy-corrections/adopted-child-settlement/test_policy.py"
+  ],
+  "canonical_function_file": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold/policy-corrections/adopted-child-settlement/settle_children.py",
+  "canonical_function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+  "source_files": {
+    "settle_children.py": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "from-347-function.diff.json": "3cdf58ec3a730e81b67d9470a63334f229e36c1621d272fba915ea02f3c911dc",
+    "README.md": "5a5ab2c919f74a054e0876a6694a58effe0a940b4839e907f37074f53ac9b7dd",
+    "test_policy.py": "0a9e368a994d6c31c03b834b645055dd21ee432b8221e225bfc8c10f3fff0263"
+  },
+  "contract": "Original3s natural grace/reap/census prefix preserved; no freshpidfd/signal for unproven adopted survivors; return unclean/unforced remaining so existingcaller retains C/HOLD. Original direct-Popen timeout/waits/heldpidfd cleanup remain untouched.",
+  "actual_legacy_C_runner": "Unchanged frozen347 artifact remains historical, not the corrected runnablepacket. Port canonicalfunction into separately reviewed successors before helper-backed execution. This source leaf has no CLI/main/grant/supervisor.",
+  "pure_unit_source": {
+    "file": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold/policy-corrections/adopted-child-settlement/test_policy.py",
+    "count": 4,
+    "execution": "UNRUN",
+    "selected_definition_AST_only_with_inert_os_time_children_signal_doubles": true
+  },
+  "diff_and_commit_exit": 0,
+  "status": "",
+  "grant_runtime_test_native": "NONE",
+  "independent_reviews": "PENDING",
+  "published": false
+}

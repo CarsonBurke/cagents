@@ -1,0 +1,86 @@
+{
+  "conservation_interpretation": "The intermediate 24-function conservation evidence describes preserved historical code bytes; it is not safety approval of the newly identified canonical policy branch. No function was altered or executed during this finalization.",
+  "controller_head": "ca92176d598775acb7dd94d54df8d54dec21ea9e",
+  "controller_parent": "5a6a9b18769d70349dfd8a7151a1bb0d41580979",
+  "controller_tree": "43709cf57725d905d3e9b2ff7438a54ed449874e",
+  "effective_source_admission": "HOLD",
+  "head": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+  "inherited_blocking_finding": {
+    "classification": "Source-policy mismatch; no runtime observation",
+    "consequence": "Current ca/9ad source must not execute or receive a runnable external handoff. Fresh helper-backed or broad lanes may reach an unproven adopted helper/provider descendant.",
+    "description": "The copied canonical settle_children can open a fresh pidfd and send SIGKILL after a delay using current PID/start/parent checks without original descendant custody or the required managed permission guard. Post-signal forced/HOLD classification does not establish pre-signal authority.",
+    "future_review_requirement": "Require exact corrected-function source pin, bounded port and independent review before any later admission. The intended future accounting is 23 unchanged generic functions plus 1 corrected function, not a claim that all 24 remain exact.",
+    "historical_limit": "No historical signal, kill, policy violation, or result reinterpretation is asserted. No old RAW or runtime evidence was reopened.",
+    "repair_owner_and_boundary": "EC owns the smallest canonical fail-closed correction and will supply genuine source proof. Do not signal unproven adoptions; record uncertainty/unclean state and retain C/HOLD. Preserve original direct-Popen timeout cleanup and waits. No new authority framework or data-flag bypass."
+  },
+  "intermediate_review_status": "Immutable task-scope evidence only. Its earlier ABI-shaped CONTROLLER_SOURCE_CLEAR is not a final runnable delivery or aggregate admission; this additive final HOLD governs current ca/9ad reuse.",
+  "kind": "FINAL_TASK_REVIEW_WITH_ADDITIVE_INHERITED_CANONICAL_POLICY_HOLD",
+  "late_policy_evidence": {
+    "audit_disposition": "SOURCE_BLOCKER_FOR_REUSE_WITH_UNPROVEN_ADOPTED_HELPER_OR_PROVIDER_DESCENDANTS",
+    "authenticated_inbox": {
+      "bytes": 8982,
+      "path": "/var/tmp/coord16-2025-b68-source-intake-sdqc3hvg/frozen-review-steering-original-inbox.json",
+      "sha256": "62a776745a345d10287f4602cb7b44b448e5dea817233ce42a5edf8eb46f7db6"
+    },
+    "independent_source_audit": {
+      "bytes": 13311,
+      "path": "/tmp/startup30-adopted-signal-source-audit-hlrnp0hy/review.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
+    },
+    "message_id": "ad6426eb-3ef7-4c7e-9d61-3813be3934ac",
+    "parent_reported_applicability": {
+      "bytes": 1593,
+      "comparison": "Exact audit reference according to Root",
+      "function": "settle_children",
+      "lines": "223-267",
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+      "source": "Parent Root immutable-source comparison; not independently repeated in this task"
+    },
+    "source_owner": "ec204421-6a6d-4edc-a23d-c8f8fc1b5ab1"
+  },
+  "manifest_sha256": "434beb67f4ae0bd7987d7e6bdcf67b6b69f4693e42a1d15a34e56826d566d3a6",
+  "operations": {
+    "candidate_import_or_calls": false,
+    "children_spawned": false,
+    "future_correction_reviewed": false,
+    "public_writes": false,
+    "runtime_probes": false,
+    "source_edits": false,
+    "tests_or_examples": false
+  },
+  "plan_sha256": "91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78",
+  "product_parent": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386",
+  "runner_sha256": "6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01",
+  "runtime_and_delivery": {
+    "Rust_tests_builds_native": "UNRUN",
+    "abi_reason": "Top-level verdict intentionally is not CONTROLLER_SOURCE_CLEAR; the task-scope intermediate receipt must not substitute for this final inherited policy HOLD.",
+    "aggregate_controller_approval": false,
+    "algorithm_tests": "UNRUN",
+    "candidate_execution": "UNRUN",
+    "current_runtime_or_resource_facts": "UNOBSERVED",
+    "execution_grant": null,
+    "queue_request": null,
+    "runnable_handoff": false,
+    "runtime_admission": false,
+    "validate_controller_review_admission_compatible": false
+  },
+  "schema": "issue2025_b68_final_scoped_source_review_with_late_policy_hold_v1",
+  "scope": "Finalizes the independently reviewed changed b68 task-main source-admission reader, genuine current-product proof joins, and source-derived qualified self-child caller metadata. Adds the late authenticated canonical adopted-child signal-policy HOLD without duplicating its source audit. No aggregate controller, product, runtime, or resource admission.",
+  "sealed_intermediate_readable": {
+    "bytes": 5738,
+    "path": "/var/tmp/coord16-2025-b68-code-independent-ic8n57sn/readable.md",
+    "sha256": "fa3a0bc61072e43ce27feda8c341bf8201880b49e3d704795f8bea50d1004705"
+  },
+  "sealed_intermediate_scoped_review": {
+    "bytes": 7980,
+    "path": "/var/tmp/coord16-2025-b68-code-independent-ic8n57sn/review.json",
+    "sha256": "cdc343443cb7fc736d424fee595fd663e7951aff3c8b65003a331b33f0cc8efa"
+  },
+  "source_binding_sha256": "4e40e5d09bd8a739dee208e4aa78244dbcdae0b340bf7a6177b490094f70f5d4",
+  "task_scope_blocking_findings": [],
+  "task_scope_findings": [],
+  "task_scope_verdict": "SOURCE_CLEAR_WITHIN_CHANGED_ADMISSION_READER_AND_SOURCE_CALLER_MEMBERSHIP_ONLY",
+  "tree": "c004d7b3eab00e166f4393eb93ec99c91484d03b",
+  "verdict": "TASK_SCOPE_CLEAR_WITH_INHERITED_ADOPTED_SIGNAL_SOURCE_HOLD",
+  "writing_released": true
+}
