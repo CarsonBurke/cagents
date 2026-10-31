@@ -1789,6 +1789,11 @@ impl Cagents {
                         }
                     },
                 ));
+                ring.extend(
+                    self.issued_return_notices()
+                        .into_iter()
+                        .filter_map(|issued| issued.action_id().map(Cow::Owned)),
+                );
                 ring
             }
         }
@@ -2321,7 +2326,13 @@ impl Cagents {
         let cleanup_severity = self
             .chat_ui
             .return_cleanup_needs_retry()
-            .then_some(NoticeSeverity::Error);
+            .then_some(NoticeSeverity::Error)
+            .filter(|_| {
+                self.shared_return_cleanup_notices()
+                    .iter()
+                    .any(|row| row.retry || row.blocked)
+                    || self.issued_return_notices().iter().any(|row| row.error)
+            });
         let recorded_severity = self
             .notices
             .severity()
@@ -2592,6 +2603,7 @@ impl Cagents {
                     notices.push(super::notice_surface(severity, body, retry, false));
                 }
                 for issued in self.issued_return_notices() {
+                    let control_id = issued.action_id();
                     let severity = if issued.error {
                         NoticeSeverity::Error
                     } else {
@@ -2611,7 +2623,8 @@ impl Cagents {
                                 chat_ui::IssuedNoticeAction::Close => {
                                     Action::CloseIssuedReturn(issued.id)
                                 }
-                                chat_ui::IssuedNoticeAction::RetryClose => {
+                                chat_ui::IssuedNoticeAction::ContinueClose
+                                | chat_ui::IssuedNoticeAction::RetryClose => {
                                     Action::RetryIssuedClose(issued.id)
                                 }
                                 chat_ui::IssuedNoticeAction::RetryFlush => {
@@ -2633,11 +2646,9 @@ impl Cagents {
                                 severity,
                                 purpose.label(),
                                 purpose.label(),
-                                widget::Id::new(format!(
-                                    "chrome.issued.{}.{}",
-                                    issued.id,
-                                    purpose.purpose()
-                                )),
+                                widget::Id::new(
+                                    control_id.expect("offered issued action has an ID"),
+                                ),
                                 Message::ChromeUi(message),
                             ),
                         )

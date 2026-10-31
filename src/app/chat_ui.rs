@@ -754,6 +754,7 @@ struct IssuedConflict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IssuedNoticeAction {
     Close,
+    ContinueClose,
     RetryClose,
     RetryFlush,
     RetryAck,
@@ -763,6 +764,7 @@ impl IssuedNoticeAction {
     pub(super) fn purpose(self) -> &'static str {
         match self {
             Self::Close => "close-issued-first",
+            Self::ContinueClose => "continue-issued-close",
             Self::RetryClose => "retry-issued-close",
             Self::RetryFlush => "retry-issued-flush",
             Self::RetryAck => "retry-issued-ack",
@@ -770,7 +772,7 @@ impl IssuedNoticeAction {
     }
     pub(super) fn label(self) -> &'static str {
         match self {
-            Self::Close => "Close returned terminal",
+            Self::Close | Self::ContinueClose => "Close returned terminal",
             Self::RetryClose => "Retry close returned terminal",
             Self::RetryFlush => "Retry saving",
             Self::RetryAck => "Retry confirmation",
@@ -7497,8 +7499,13 @@ impl Cagents {
                 .as_ref()
                 .is_some_and(|owner| owner.queued && owner.id == id)
         }) {
+            let action = if record.stage == IssuedStage::Held {
+                IssuedNoticeAction::ContinueClose
+            } else {
+                IssuedNoticeAction::RetryClose
+            };
             let record = record.id;
-            return self.issued_action(record, IssuedNoticeAction::RetryClose);
+            return self.issued_action(record, action);
         }
         if let Some(operation) =
             self.chat_ui
@@ -13329,6 +13336,13 @@ fn close_issued_return_on(
         .map_err(|error| error.to_string())
 }
 
+impl IssuedNotice {
+    pub(super) fn action_id(&self) -> Option<String> {
+        self.action
+            .map(|purpose| format!("chrome.issued.{}.{}", self.id, purpose.purpose()))
+    }
+}
+
 impl State {
     pub(super) fn issued_unresolved(&self) -> bool {
         !self.issued_returns.is_empty()
@@ -13370,6 +13384,11 @@ impl State {
         }
         for record in self.issued_returns.values() {
             let (message, action, error) = match record.stage {
+                IssuedStage::Held if record.close.as_ref().is_some_and(|owner| owner.queued) => (
+                    "Your earlier Close still applies to the original returned terminal. Close that terminal to finish this return.",
+                    Some(IssuedNoticeAction::ContinueClose),
+                    false,
+                ),
                 IssuedStage::Held if !record.linked_queued_close && record.close.is_none() => (
                     "A returned terminal is not open in this window. Close the returned terminal to finish this return.",
                     Some(IssuedNoticeAction::Close),
@@ -13440,7 +13459,10 @@ impl State {
                 queued_retry: record
                     .close
                     .as_ref()
-                    .filter(|owner| owner.queued && record.stage == IssuedStage::CloseFailed)
+                    .filter(|owner| {
+                        owner.queued
+                            && matches!(record.stage, IssuedStage::Held | IssuedStage::CloseFailed)
+                    })
                     .map(|owner| owner.id),
             });
         }
@@ -13581,7 +13603,7 @@ impl Cagents {
 
     fn native_result_error(&mut self, target: Target, operation: uuid::Uuid, error: &str) -> bool {
         let Some(pending) = self.chat_ui.native_returns.get_mut(&operation) else {
-            return operation.is_nil();
+            return false;
         };
         if pending.context.target != target || !pending.pending {
             return false;
@@ -13625,10 +13647,12 @@ impl Cagents {
             .any(|record| record.returned.cleanup_receipt == returned.cleanup_receipt);
         let first =
             pending.pending && pending.first_error.is_none() && pending.first_issued.is_none();
-        let current = valid
+        // Exact cleanup custody is independent of presentation replacement.
+        let first_bound = valid
             && first
-            && self.chat_ui.active_native_returns.get(&target) == Some(&operation)
-            && self.native_return_presentation_matches(&context);
+            && !nonce_conflict
+            && self.chat_ui.active_native_returns.get(&target) == Some(&operation);
+        let current = first_bound && self.native_return_presentation_matches(&context);
         let queued = pending.close.clone();
         let id = uuid::Uuid::new_v4();
         self.chat_ui.issued_returns.insert(
@@ -13645,7 +13669,7 @@ impl Cagents {
                     IssuedStage::Held
                 },
                 attempt: uuid::Uuid::new_v4(),
-                close: if current { queued.clone() } else { None },
+                close: if first_bound { queued.clone() } else { None },
                 linked_queued_close: queued.is_some(),
                 represented: false,
                 closed: false,
@@ -13705,6 +13729,12 @@ impl Cagents {
                     queued: false,
                 };
                 self.chat_ui.issued_returns.get_mut(&id).unwrap().close = Some(owner);
+                self.begin_issued_close(id)
+            }
+            IssuedNoticeAction::ContinueClose
+                if record.stage == IssuedStage::Held
+                    && record.close.as_ref().is_some_and(|owner| owner.queued) =>
+            {
                 self.begin_issued_close(id)
             }
             IssuedNoticeAction::RetryClose if record.stage == IssuedStage::CloseFailed => {
@@ -30497,6 +30527,10 @@ mod tests {
     }
 
     fn shared_return_fixture() -> SharedReturnFixture {
+        shared_return_fixture_with_registry(true)
+    }
+
+    fn shared_return_fixture_with_registry(registered: bool) -> SharedReturnFixture {
         use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId, ProjectKind};
         use crate::workspace_model::{
             ModelChannel, ModelProject, WorkspaceModel,
@@ -30556,7 +30590,7 @@ mod tests {
                 title: "Keep this channel name".into(),
                 title_source: ChannelTitleSource::Manual,
                 ordinal: 1,
-                shared: true,
+                shared: registered,
                 cards: vec![card],
                 focused: Some(card),
             });
@@ -30590,13 +30624,16 @@ mod tests {
         };
         let (sender, edits) = async_channel::unbounded();
         app.workspace_model_tx = sender;
-        drop(app.update(Message::WorkspaceModelObserved(
-            super::super::workspace_model_sync::ModelUpdate::ViewApplied {
-                scope: Scope::Channel(channel),
-                operation: None,
-                model: model.clone(),
-            },
-        )));
+        if registered {
+            drop(app.update(Message::WorkspaceModelObserved(
+                super::super::workspace_model_sync::ModelUpdate::ViewApplied {
+                    scope: Scope::Channel(channel),
+                    operation: None,
+                    model: model.clone(),
+                },
+            )));
+        }
+
         drop(app.update(Message::Viewport {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::Resized(1_600.0),
@@ -30730,7 +30767,10 @@ mod tests {
         ack: bool,
         refuse: bool,
         wrong_host: bool,
-    ) {
+    ) -> Option<(
+        chat::ReturnedTerminal,
+        Result<crate::terminal::ipc::TerminalCloseResult, String>,
+    )> {
         use crate::terminal::ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
             ServerEnvelope, ServerMessage, ServerResponse, TerminalCloseResult, read_frame,
@@ -30840,7 +30880,7 @@ mod tests {
         });
         let mut client = crate::control::ControlClient::from_stream(stream).unwrap();
         client.authenticate(authority).unwrap();
-        if ack {
+        let observed = if ack {
             let results = crate::chat::client::acknowledge_terminal_handoffs_with_receipts_on(
                 &mut client,
                 &expected,
@@ -30852,12 +30892,15 @@ mod tests {
                     .iter()
                     .all(|result| result.is_ok() == (!refuse && !wrong_host))
             );
+            None
         } else {
             let result = close_issued_return_on(&mut client, Some(&expected), returned);
             assert_eq!(result.is_ok(), !refuse && !wrong_host);
-        }
+            Some((returned.clone(), result))
+        };
         drop(client);
         server.join().unwrap();
+        observed
     }
 
     fn issued_orphan_and_persistence_controls() {
@@ -30962,14 +31005,21 @@ mod tests {
                 .iter()
                 .any(|row| row.id == id && row.action == Some(IssuedNoticeAction::Close))
         );
-        let messages = enter_mounted_return_control(
-            f.app.shared_return_notice_view_for_test(),
-            format!("chrome.issued.{id}.close-issued-first"),
+        let messages = tab_mounted_return_control(
+            &mut f.app,
+            &format!("chrome.issued.{id}.close-issued-first"),
+            false,
         );
         assert!(messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::CloseIssuedReturn(found)) if *found == id)));
         for message in messages {
             drop(f.app.update(message));
         }
+        assert!(
+            !f.app
+                .shared_return_notice_ring_for_test()
+                .iter()
+                .any(|control| control.starts_with(&format!("chrome.issued.{id}.")))
+        );
         let record = &f.app.chat_ui.issued_returns[&id];
         let disposition = record.close.as_ref().unwrap().id;
         let d = record.close.as_ref().unwrap().caller.authentication();
@@ -30981,10 +31031,15 @@ mod tests {
             Ok(crate::terminal::ipc::TerminalCloseResult::Active),
         ))));
         assert!(f.app.chat_ui.issued_returns[&id].stage == IssuedStage::CloseFailed);
-        drop(
-            f.app
-                .update(Message::ChromeUi(Chrome::RetryIssuedClose(id))),
+        let messages = tab_mounted_return_control(
+            &mut f.app,
+            &format!("chrome.issued.{id}.retry-issued-close"),
+            true,
         );
+        assert!(messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryIssuedClose(found)) if *found == id)));
+        for message in messages {
+            drop(f.app.update(message));
+        }
         assert_eq!(
             f.app.chat_ui.issued_returns[&id].close.as_ref().unwrap().id,
             disposition
@@ -31017,6 +31072,14 @@ mod tests {
                 .action,
             Some(IssuedNoticeAction::RetryFlush)
         );
+        let save_messages = tab_mounted_return_control(
+            &mut f.app,
+            &format!("chrome.issued.{id}.retry-issued-flush"),
+            false,
+        );
+        assert!(save_messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryIssuedFlush(found)) if *found == id)));
+        // Observe navigation without dispatching this save: the following
+        // retained-pointer control owns the stage transition.
         let renderer = crate::app::tests::headless_renderer();
         let mut tree = iced::advanced::widget::Tree::new(
             f.app.shared_return_notice_view_for_test().as_widget(),
@@ -31054,6 +31117,12 @@ mod tests {
             result: Err("synthetic original R refused".into()),
         }));
         assert!(f.app.chat_ui.issued_returns[&id].stage == IssuedStage::AckFailed);
+        let ack_messages = tab_mounted_return_control(
+            &mut f.app,
+            &format!("chrome.issued.{id}.retry-issued-ack"),
+            true,
+        );
+        assert!(ack_messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryIssuedAck(found)) if *found == id)));
         let released = send_return_control_pointer(
             f.app.shared_return_notice_view_for_test(),
             &mut tree,
@@ -31187,51 +31256,70 @@ mod tests {
                 .authentication(),
             c1.caller.authentication()
         );
+        let mut actual_refusal = None;
         for refuse in [false, true] {
-            issued_request_component(
+            let observed = issued_request_component(
                 &context.source,
                 &returned,
                 c1.caller.authentication().unwrap(),
                 false,
                 refuse,
                 false,
-            );
-            issued_request_component(
+            )
+            .unwrap();
+            assert_eq!(observed.0, first.returned);
+            if refuse {
+                actual_refusal = Some(observed.1);
+            }
+            drop(issued_request_component(
                 &context.source,
                 &returned,
                 context.save_caller.authentication().unwrap(),
                 true,
                 refuse,
                 false,
-            );
+            ));
         }
-        issued_request_component(
+        drop(issued_request_component(
             &context.source,
             &returned,
             c1.caller.authentication().unwrap(),
             false,
             false,
             true,
-        );
-        issued_request_component(
+        ));
+        drop(issued_request_component(
             &context.source,
             &returned,
             context.save_caller.authentication().unwrap(),
             true,
             false,
             true,
-        );
+        ));
+        let refusal = actual_refusal.expect("the supplied-client Close was refused");
+        let refusal_error = refusal.as_ref().unwrap_err().clone();
         drop(app.update(Message::ChatUi(Action::IssuedCloseFinished(
             first.clone(),
-            Ok(crate::terminal::ipc::TerminalCloseResult::Unknown(
-                "synthetic uncertain owner".into(),
-            )),
+            refusal,
         ))));
+        let failed = &app.chat_ui.issued_returns[&id];
+        assert_eq!(failed.returned, returned);
+        assert_eq!(failed.context.source, context.source);
+        assert_eq!(
+            failed.cleanup_error.as_deref(),
+            Some(refusal_error.as_str())
+        );
+        assert_eq!(failed.close.as_ref().unwrap().id, c1.id);
+        assert_eq!(
+            failed.close.as_ref().unwrap().caller.authentication(),
+            c1.caller.authentication()
+        );
         assert!(app.chat_ui.issued_returns[&id].stage == IssuedStage::CloseFailed);
         drop(app.update(Message::ChromeUi(Chrome::ToggleNotices)));
-        let messages = enter_mounted_return_control(
-            app.shared_return_notice_view_for_test(),
-            format!("chrome.issued.{id}.retry-issued-close"),
+        let messages = tab_mounted_return_control(
+            &mut app,
+            &format!("chrome.issued.{id}.retry-issued-close"),
+            true,
         );
         assert!(messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryCleanup(owner)) if *owner == c1.id)));
         for message in messages {
@@ -31356,6 +31444,12 @@ mod tests {
                 None
             );
             drop(q.app.update(Message::ChromeUi(Chrome::ToggleNotices)));
+            assert!(
+                !q.app
+                    .shared_return_notice_ring_for_test()
+                    .iter()
+                    .any(|control| control.starts_with(&format!("chrome.issued.{id}.")))
+            );
             drop(
                 q.app
                     .update(Message::ChromeUi(Chrome::CloseIssuedReturn(id))),
@@ -31550,6 +31644,320 @@ mod tests {
             "original actor success is not proof about a new returned terminal"
         );
         actual_refusal.expect("the controlled wrong-B request returns a real refusal")
+    }
+
+    /// Navigate the actual Notices Tab ring, apply only its focus operations
+    /// to mounted widgets, then press Enter on the reached control. Cleanup,
+    /// save and provider Tasks returned by messages are never evaluated here.
+    fn tab_mounted_return_control(
+        app: &mut Cagents,
+        wanted: &str,
+        backwards: bool,
+    ) -> Vec<Message> {
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Tree, operation},
+        };
+        use iced::futures::StreamExt;
+        let ring = app.shared_return_notice_ring_for_test();
+        assert!(
+            ring.iter().any(|id| id == wanted),
+            "the offered action belongs to the real Tab ring"
+        );
+        for _ in 0..ring.len() {
+            let task = app
+                .chrome_key_event(&keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Tab),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Tab),
+                    location: keyboard::Location::Standard,
+                    modifiers: if backwards {
+                        keyboard::Modifiers::SHIFT
+                    } else {
+                        keyboard::Modifiers::empty()
+                    },
+                    text: None,
+                    repeat: false,
+                })
+                .expect("the open Notices popup owns Tab and Shift-Tab");
+            let mut element = app.shared_return_notice_view_for_test();
+            let renderer = crate::app::tests::headless_renderer();
+            let viewport = iced::Rectangle::with_size(iced::Size::new(900.0, 1500.0));
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap();
+                while let Some(action) = executor.block_on(stream.next()) {
+                    let iced::runtime::Action::Widget(mut operation) = action else {
+                        panic!("Notices keyboard navigation must only focus widgets");
+                    };
+                    loop {
+                        element.as_widget_mut().operate(
+                            &mut tree,
+                            Layout::new(&node),
+                            &renderer,
+                            &mut operation,
+                        );
+                        match operation.finish() {
+                            operation::Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            let found: Arc<Mutex<Option<widget::Id>>> = Default::default();
+            let sink = Arc::clone(&found);
+            let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
+                *sink.lock().unwrap() = Some(id);
+            });
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            let _ = probe.finish();
+            let reached = found
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|id| id.to_string() == wanted);
+            if !reached {
+                continue;
+            }
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }),
+                Layout::new(&node),
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            return messages;
+        }
+        panic!("the mounted action was not reached by the actual Tab ring");
+    }
+
+    /// First successful Some after a normal accepted B Read, with no earlier
+    /// Err. Both registry-backed and local returns retain C1 without granting
+    /// A's presentation replacement rights over B. All effects are components.
+    fn issued_first_some_after_replacement_controls() {
+        use super::super::chrome_ui::Action as Chrome;
+        use crate::workspace_model::views::Scope;
+        for shared in [true, false] {
+            let mut f = shared_return_fixture_with_registry(shared);
+            let original = f.app.card_state(f.card).unwrap().kind.clone();
+            let handle = chat_runtime(&f.app, f.card).handle().unwrap().clone();
+            assert!(!handle.snapshot().exited);
+            drop(f.app.update(Message::ChatUi(Action::Switch(f.card))));
+            let operation = native_return_operation(&f.app, f.target);
+            assert!(!operation.is_nil());
+            assert_eq!(
+                f.app.chat_ui.native_returns[&operation]
+                    .context
+                    .origin
+                    .is_some(),
+                shared
+            );
+            f.app
+                .chat_ui
+                .native_returns
+                .get_mut(&operation)
+                .unwrap()
+                .context
+                .save_caller = return_close_caller("synthetic-first-Some-save-R");
+            drop(
+                f.app
+                    .begin_chat_close_as(return_close_caller("synthetic-first-Some-C1"), f.card),
+            );
+            drop(
+                f.app
+                    .begin_chat_close_as(return_close_caller("synthetic-first-Some-C2"), f.card),
+            );
+            let owner = f.app.chat_ui.native_returns[&operation]
+                .close
+                .as_ref()
+                .unwrap()
+                .clone();
+            let context = f.app.chat_ui.native_returns[&operation].context.clone();
+            assert_eq!(
+                owner.caller.authentication(),
+                return_close_caller("synthetic-first-Some-C1").authentication()
+            );
+            assert!(Arc::ptr_eq(&context.handle, &handle));
+            assert_eq!(context.presentation, original);
+            assert_ne!(
+                owner.caller.authentication(),
+                context.save_caller.authentication()
+            );
+            assert_ne!(
+                owner.caller.authentication(),
+                return_close_caller("synthetic-first-Some-C2").authentication()
+            );
+            assert!(matches!(f.app.chat_ui.phases.get(&f.card),
+                Some(Phase::Returning { target, local: None, close_requested: true }) if *target == f.target));
+            let old_shared_close = f
+                .app
+                .chat_ui
+                .terminal_returns
+                .get(&f.target)
+                .and_then(|pending| pending.close_owner.as_ref().map(|owner| owner.id));
+            // Missing/nil IDs with a matching live Target, and a real ID with
+            // the wrong Target, cannot consume the genuine pending return.
+            for (target, id) in [
+                (f.target, uuid::Uuid::nil()),
+                (f.target, uuid::Uuid::new_v4()),
+                (
+                    Target {
+                        generation: f.target.generation.wrapping_add(1),
+                        ..f.target
+                    },
+                    operation,
+                ),
+            ] {
+                drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+                    target,
+                    id,
+                    Err("unowned callback".into()),
+                ))));
+                let pending = &f.app.chat_ui.native_returns[&operation];
+                assert!(
+                    pending.pending
+                        && pending.first_error.is_none()
+                        && pending.first_issued.is_none()
+                );
+                assert!(pending.none_attempt.is_none() && !pending.none_pending);
+                assert_eq!(pending.close.as_ref().unwrap().id, owner.id);
+                assert_eq!(
+                    pending.close.as_ref().unwrap().caller.authentication(),
+                    owner.caller.authentication()
+                );
+                assert!(matches!(f.app.chat_ui.phases.get(&f.card),
+                    Some(Phase::Returning { target, local: None, close_requested: true }) if *target == f.target));
+                assert!(
+                    f.app.chat_ui.issued_returns.is_empty()
+                        && f.app.chat_ui.issued_conflicts.is_empty()
+                );
+                assert!(f.app.chat_ui.return_cleanup.is_empty());
+                assert_eq!(
+                    f.app
+                        .chat_ui
+                        .terminal_returns
+                        .get(&f.target)
+                        .and_then(|pending| pending.close_owner.as_ref().map(|owner| owner.id)),
+                    old_shared_close
+                );
+                if let Some(pending) = f.app.chat_ui.terminal_returns.get(&f.target) {
+                    assert!(pending.return_error.is_none() && pending.cleanup_error.is_none());
+                }
+            }
+            if !shared {
+                // The return was genuinely captured without registry origin.
+                // Admit A through the actual model reducer before the later
+                // recipe-B Read, without rewriting the captured return tuple.
+                drop(f.app.update(Message::WorkspaceModelObserved(
+                    super::super::workspace_model_sync::ModelUpdate::ViewApplied {
+                        scope: Scope::Channel(f.model.channels[0].id),
+                        operation: None,
+                        model: f.model.clone(),
+                    },
+                )));
+            }
+            let order = f.app.workspace.order().collect::<Vec<_>>();
+            let focus = f.app.workspace.focused();
+            let replacement = project_same_id_return_recipe(&mut f);
+            assert_eq!(f.app.card_state(f.card).unwrap().kind, replacement);
+            assert!(!f.app.pane_is_quarantined(f.card));
+            let returned = issued_terminal_fixture(f.terminal.clone());
+            drop(f.app.update(Message::ChatUi(Action::HandoffFinished(
+                f.target,
+                operation,
+                Ok(returned.clone()),
+            ))));
+            let id = f.app.chat_ui.native_returns[&operation]
+                .first_issued
+                .unwrap();
+            let record = &f.app.chat_ui.issued_returns[&id];
+            assert!(
+                record.stage == IssuedStage::Held
+                    && record.linked_queued_close
+                    && !record.represented
+                    && !record.closed
+            );
+            assert!(record.return_error.is_none());
+            assert_eq!(record.returned, returned);
+            assert_eq!(record.context.source, context.source);
+            assert_eq!(record.context.presentation, original);
+            assert!(Arc::ptr_eq(&record.context.handle, &handle));
+            assert_eq!(
+                record.context.save_caller.authentication(),
+                context.save_caller.authentication()
+            );
+            assert_eq!(record.close.as_ref().unwrap().id, owner.id);
+            assert_eq!(
+                record.close.as_ref().unwrap().caller.authentication(),
+                owner.caller.authentication()
+            );
+            assert!(record.close.as_ref().unwrap().queued);
+            assert!(
+                !f.app
+                    .pending_terminal_handoffs
+                    .contains_key(&returned.session.id)
+            );
+            assert_eq!(f.app.card_state(f.card).unwrap().kind, replacement);
+            assert_shared_return_readable(&f);
+            drop(f.app.update(Message::ChromeUi(Chrome::ToggleNotices)));
+            let messages = tab_mounted_return_control(
+                &mut f.app,
+                &format!("chrome.issued.{id}.continue-issued-close"),
+                !shared,
+            );
+            assert!(messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryCleanup(found)) if *found == owner.id)));
+            for message in messages {
+                drop(f.app.update(message));
+            }
+            let record = &f.app.chat_ui.issued_returns[&id];
+            assert!(record.stage == IssuedStage::Closing);
+            assert_eq!(record.close.as_ref().unwrap().id, owner.id);
+            assert_eq!(
+                record.close.as_ref().unwrap().caller.authentication(),
+                owner.caller.authentication()
+            );
+            let binding = record.binding();
+            assert!(
+                !f.app
+                    .shared_return_notice_ring_for_test()
+                    .iter()
+                    .any(|control| control.starts_with(&format!("chrome.issued.{id}.")))
+            );
+            // Typed response injection is not a real native ownership proof.
+            drop(f.app.update(Message::ChatUi(Action::IssuedCloseFinished(
+                binding,
+                Ok(crate::terminal::ipc::TerminalCloseResult::Closed),
+            ))));
+            assert!(f.app.chat_ui.issued_returns[&id].closed);
+            assert!(f.app.chat_ui.issued_returns[&id].stage == IssuedStage::FlushFailed);
+            assert_eq!(f.app.card_state(f.card).unwrap().kind, replacement);
+            assert!(f.app.card_state(f.card).unwrap().existence.is_open());
+            assert_eq!(f.app.workspace.order().collect::<Vec<_>>(), order);
+            assert_eq!(f.app.workspace.focused(), focus);
+            assert_shared_return_readable(&f);
+        }
     }
 
     /// Mounts production widgets and sends Enter to their actual keyed control.
@@ -31917,11 +32325,13 @@ mod tests {
         assert_eq!(pending.draft, "Unsent draft stays here");
     }
 
-    /// These parents exercise reducers and exact synthetic receipts only. Every
-    /// returned Task is dropped: they do not claim a provider/daemon was stopped.
+    /// These parents exercise reducers and exact synthetic receipts only.
+    /// Cleanup/provider Tasks are dropped; only mounted keyboard focus operations
+    /// are evaluated. They do not claim a provider/daemon was stopped.
     #[test]
     fn stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement() {
         issued_orphan_and_persistence_controls();
+        issued_first_some_after_replacement_controls();
         for close_timing in [
             "before-replacement",
             "first-close-after-replacement",
