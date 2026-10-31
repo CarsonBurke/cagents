@@ -1607,13 +1607,22 @@ impl RemoteActor {
     }
 
     fn apply_acknowledged_receipts(&self, receipts: &[InputReceipt]) -> Result<(), String> {
-        if receipts.len() > 64
-            || receipts.iter().any(|receipt| {
-                !matches!(&receipt.state, InputState::Acknowledged(_))
-                    || (receipt.not_idle
-                        && !matches!(&receipt.state, InputState::Acknowledged(Err(_))))
-            })
-        {
+        if receipts.len() > 64 {
+            return Err("Helper returned an invalid terminal receipt page".into());
+        }
+        if receipts.iter().any(|receipt| {
+            !matches!(&receipt.state, InputState::Acknowledged(_))
+                || (receipt.not_idle && !matches!(&receipt.state, InputState::Acknowledged(Err(_))))
+        }) {
+            // An invalid page cannot settle or retire any terminal outcome.
+            // Preserve a live owner's admission fence when the page itself
+            // carries contradictory typed evidence, just as a direct reply
+            // does. Earlier Accepted evidence may have cleared uncertainty.
+            for receipt in receipts.iter().filter(|receipt| {
+                receipt.not_idle && !matches!(&receipt.state, InputState::Acknowledged(Err(_)))
+            }) {
+                self.apply_receipts(std::slice::from_ref(receipt));
+            }
             return Err("Helper returned an invalid terminal receipt page".into());
         }
         // Deliver any still-live local waiter before retirement. Older daemon
@@ -5758,38 +5767,63 @@ done"#;
 
     #[test]
     fn recovery_does_not_retire_a_completion_rejected_by_its_pending_owner() {
-        let actor = RemoteActor::fixture();
-        let response = actor.enqueue(None, Command::Refresh).unwrap();
-        let identity = actor.pending_inputs().pop().unwrap();
-        actor.apply_receipts(&[InputReceipt {
-            identity: identity.clone(),
-            state: InputState::Accepted,
-            not_idle: false,
-        }]);
-        let invalid = InputReceipt {
-            identity: identity.clone(),
-            state: InputState::Acknowledged(Err("claimed contention for a non-prompt".into())),
-            not_idle: true,
-        };
-        actor.apply_acknowledged_receipts(&[invalid]).unwrap();
-        assert!(matches!(
-            response.try_recv().unwrap(),
-            Err(Rejection::Unacknowledged(_))
-        ));
-        assert_eq!(actor.pending_inputs(), vec![identity.clone()]);
-        assert!(actor.0.retiring_inputs.lock().unwrap().is_empty());
-        assert!(actor.enqueue(None, Command::Refresh).is_err());
-        // An authentic ordinary terminal outcome can still settle this exact
-        // identity. It does not reconstruct or resend the provider command.
-        actor
-            .apply_acknowledged_receipts(&[InputReceipt {
+        for (managed, state, page_invalid) in [
+            (
+                false,
+                InputState::Acknowledged(Err("claimed contention for a non-prompt".into())),
+                false,
+            ),
+            (true, InputState::Acknowledged(Ok(())), true),
+            (true, InputState::Unknown("outcome unknown".into()), true),
+            (true, InputState::Accepted, true),
+        ] {
+            let actor = RemoteActor::fixture();
+            let command = if managed {
+                Command::Prompt {
+                    text: "managed".into(),
+                    attachments: Vec::new(),
+                    mode: chat::PromptMode::Send,
+                }
+            } else {
+                Command::Refresh
+            };
+            let response = actor
+                .enqueue(managed.then(crate::model::RunId::new), command)
+                .unwrap();
+            let identity = actor.pending_inputs().pop().unwrap();
+            actor.apply_receipts(&[InputReceipt {
                 identity: identity.clone(),
-                state: InputState::Acknowledged(Err("definitive refusal".into())),
+                state: InputState::Accepted,
                 not_idle: false,
-            }])
-            .unwrap();
-        assert!(actor.pending_inputs().is_empty());
-        assert_eq!(*actor.0.retiring_inputs.lock().unwrap(), vec![identity]);
+            }]);
+            let invalid = InputReceipt {
+                identity: identity.clone(),
+                state,
+                not_idle: true,
+            };
+            assert_eq!(
+                actor.apply_acknowledged_receipts(&[invalid]).is_err(),
+                page_invalid
+            );
+            assert!(matches!(
+                response.try_recv().unwrap(),
+                Err(Rejection::Unacknowledged(_))
+            ));
+            assert_eq!(actor.pending_inputs(), vec![identity.clone()]);
+            assert!(actor.0.retiring_inputs.lock().unwrap().is_empty());
+            assert!(actor.enqueue(None, Command::Refresh).is_err());
+            // An authentic ordinary terminal outcome can still settle this exact
+            // identity. It does not reconstruct or resend the provider command.
+            actor
+                .apply_acknowledged_receipts(&[InputReceipt {
+                    identity: identity.clone(),
+                    state: InputState::Acknowledged(Err("definitive refusal".into())),
+                    not_idle: false,
+                }])
+                .unwrap();
+            assert!(actor.pending_inputs().is_empty());
+            assert_eq!(*actor.0.retiring_inputs.lock().unwrap(), vec![identity]);
+        }
     }
 
     #[test]
