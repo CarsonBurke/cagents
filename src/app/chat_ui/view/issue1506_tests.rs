@@ -758,6 +758,314 @@ fn waiting_child_quota_detail_without_items_is_projected_and_does_not_hide_other
 }
 
 #[test]
+fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
+    use iced::advanced::clipboard;
+    use iced::runtime::user_interface::{Cache, UserInterface};
+
+    fn runtime(app: &Cagents, target: Target) -> &Runtime {
+        match app.cards.get(&target.card) {
+            Some(CardRuntime::Chat(runtime)) => runtime,
+            _ => panic!("the diagnostic fixture remains mounted"),
+        }
+    }
+    fn view(app: &Cagents, target: Target) -> Element<'_, Message> {
+        runtime(app, target).view(
+            None,
+            false,
+            true,
+            &app.settings.keyboard_shortcuts,
+            640.0,
+            Place {
+                name: "diagnostic-owner-fixture".into(),
+                branch: None,
+                channel: None,
+            },
+            true,
+            None,
+            Vec::new(),
+        )
+    }
+    fn control_bounds(tree: &iced_accessibility::A11yTree, name: &str) -> iced::Rectangle {
+        let matches: Vec<_> = tree
+            .root()
+            .iter()
+            .chain(tree.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some(name)
+                    && !node.node().is_hidden()
+            })
+            .filter_map(|node| node.node().bounds())
+            .collect();
+        assert_eq!(matches.len(), 1, "one actual visible control: {name}");
+        let bounds = matches[0];
+        iced::Rectangle {
+            x: bounds.x0 as f32,
+            y: bounds.y0 as f32,
+            width: (bounds.x1 - bounds.x0) as f32,
+            height: (bounds.y1 - bounds.y0) as f32,
+        }
+    }
+
+    for copy in [false, true] {
+        for scenario in 0..4 {
+            let replace_incident = scenario == 1;
+            let replace_runtime = scenario == 3;
+            let change_details = matches!(scenario, 1 | 2);
+            let (original, replacement) = if scenario == 2 {
+                // The reported reset defines this semantic incident. Its raw
+                // request details can refresh without changing that identity.
+                (quota("1:30pm", "first"), quota("1:30pm", "second"))
+            } else {
+                (
+                    r#"{"request":"A"}"#.to_owned(),
+                    r#"{"request":"B"}"#.to_owned(),
+                )
+            };
+            let (mut live, handle) = frame_cost::live_runtime(&[]);
+            let mut snapshot = live.snapshot.as_ref().clone();
+            snapshot.generation += 1;
+            let mut failed = child("same-child", ToolStatus::Failed, false);
+            failed.description = "One failed child".into();
+            failed.detail = original.clone();
+            snapshot.subagents = vec![failed];
+            handle.publish_snapshot_for_test(snapshot);
+            live.refresh();
+
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            app.context_inspector_open = false;
+            let mut target = live.target;
+            target.card = app.workspace.focused().unwrap();
+            live.target = target;
+            app.card_state_mut(target.card).unwrap().kind = CardKind::Chat(live.session.clone());
+            app.cards
+                .insert(target.card, CardRuntime::Chat(Box::new(live)));
+            drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("same-child".into()))));
+            let live = runtime(&app, target);
+            assert_eq!(live.selected_subagent.as_deref(), Some("same-child"));
+            assert!(live.snapshot.subagents[0].items.is_empty());
+            assert_eq!(live.failure_ui.incidents.len(), 1);
+            let summary = live.failure_ui.incidents[0].summary.clone();
+            if scenario != 2 {
+                assert_eq!(summary, "Request failed");
+            }
+            let original_target = target;
+            let original_key = live.failure_ui.incidents[0].key.clone();
+            assert_eq!(
+                live.failure_details(&original_key).as_deref(),
+                Some(original.as_str())
+            );
+
+            let mut renderer = crate::app::tests::headless_renderer();
+            let size = iced::Size::new(640.0, 800.0);
+            let name = if copy {
+                format!("Copy original diagnostics for {summary}")
+            } else {
+                format!("Show technical details for {summary}")
+            };
+            let mut ui =
+                UserInterface::build(view(&app, target), size, Cache::new(), &mut renderer);
+            let bounds = control_bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), &name);
+            let pointer = bounds.center();
+            let mut messages = Vec::new();
+            for event in [
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            ] {
+                ui.update(
+                    &[event],
+                    iced::mouse::Cursor::Available(pointer),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
+            }
+            assert!(!messages.iter().any(|message| matches!(
+                message,
+                Message::ChatUi(Action::ToggleFailure(..) | Action::CopyFailure(..))
+            )));
+            let cache = ui.into_cache();
+
+            // Publish with the same heading/geometry and no transcript item
+            // whose named anchor could otherwise discard the held press.
+            // Only the chosen detail or runtime owner changes below.
+            let mut snapshot = runtime(&app, target).snapshot.as_ref().clone();
+            snapshot.generation += 1;
+            if change_details {
+                snapshot.subagents[0].detail = replacement.clone();
+            }
+            handle.publish_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target).unwrap().refresh();
+            if replace_runtime {
+                // A reopened/replaced runtime can expose identical diagnostics
+                // in the same card. Its Target generation, rather than the
+                // snapshot publication generation, owns the new interaction.
+                let live = app.chat_runtime_mut(target).unwrap();
+                live.target.generation += 1;
+                target = live.target;
+            }
+            let live = runtime(&app, target);
+            assert_eq!(live.failure_ui.incidents.len(), 1);
+            let current_key = live.failure_ui.incidents[0].key.clone();
+            assert_eq!(original_key == current_key, !replace_incident);
+            assert!(!live.failure_ui.expanded.contains(&current_key));
+            assert_eq!(
+                live.failure_details(&current_key).as_deref(),
+                Some(if change_details {
+                    replacement.as_str()
+                } else {
+                    original.as_str()
+                })
+            );
+
+            let mut ui = UserInterface::build(view(&app, target), size, cache, &mut renderer);
+            assert_eq!(
+                control_bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), &name),
+                bounds,
+                "the release remains over the same-shaped replacement control"
+            );
+            messages.clear();
+            ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))],
+                iced::mouse::Cursor::Available(pointer),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            let released_cache = ui.into_cache();
+            let mut actions: Vec<_> = messages
+                .into_iter()
+                .filter_map(|message| match message {
+                    Message::ChatUi(
+                        action @ (Action::ToggleFailure(..) | Action::CopyFailure(..)),
+                    ) => Some(action),
+                    _ => None,
+                })
+                .collect();
+            if replace_incident || replace_runtime {
+                assert!(
+                    actions.is_empty(),
+                    "a held press must not invoke a replacement owner, copy={copy}, scenario={scenario}"
+                );
+                assert!(
+                    !runtime(&app, target)
+                        .failure_ui
+                        .expanded
+                        .contains(&current_key)
+                );
+                if replace_runtime {
+                    // Also reject an already-queued action from the old
+                    // runtime, even while its incident key remains current.
+                    for stale in [
+                        Action::ToggleFailure(original_target, original_key.clone()),
+                        Action::CopyFailure(original_target, original_key.clone()),
+                    ] {
+                        assert!(
+                            iced::runtime::task::into_stream(app.handle_chat_ui(stale)).is_none(),
+                            "an old runtime must not publish a clipboard effect"
+                        );
+                        assert!(
+                            !runtime(&app, target)
+                                .failure_ui
+                                .expanded
+                                .contains(&current_key)
+                        );
+                    }
+                }
+                // Cancelling an old press must leave the replacement usable.
+                // Retain the real widget cache after release so this checks
+                // recovery of the same mounted controls, not a fresh tree.
+                let mut ui =
+                    UserInterface::build(view(&app, target), size, released_cache, &mut renderer);
+                let pointer =
+                    control_bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), &name)
+                        .center();
+                let mut fresh_messages = Vec::new();
+                for event in [
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: pointer }),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    )),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )),
+                ] {
+                    ui.update(
+                        &[event],
+                        iced::mouse::Cursor::Available(pointer),
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut fresh_messages,
+                    );
+                }
+                drop(ui);
+                actions = fresh_messages
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        Message::ChatUi(
+                            action @ (Action::ToggleFailure(..) | Action::CopyFailure(..)),
+                        ) => Some(action),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(actions.len(), 1, "replacement accepts a fresh click");
+            } else {
+                assert_eq!(actions.len(), 1, "same incident keeps its held press");
+            }
+            let action = actions.pop().unwrap();
+            assert!(match &action {
+                Action::CopyFailure(owner, key) if copy => *owner == target && key == &current_key,
+                Action::ToggleFailure(owner, key) if !copy =>
+                    *owner == target && key == &current_key,
+                _ => false,
+            });
+            if copy {
+                let task = app.handle_chat_ui(action);
+                let contents = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let mut effects = iced::runtime::task::into_stream(task)
+                            .expect("current-incident Copy emits the actual clipboard effect");
+                        tokio::time::timeout(Duration::from_secs(1), async {
+                            while let Some(effect) = effects.next().await {
+                                if let iced::runtime::Action::Clipboard(
+                                    iced::runtime::clipboard::Action::Write { contents, .. },
+                                ) = effect
+                                {
+                                    return contents;
+                                }
+                            }
+                            panic!("diagnostic Copy must publish complete current originals");
+                        })
+                        .await
+                        .expect("bounded clipboard effect")
+                    });
+                assert_eq!(
+                    contents,
+                    if change_details {
+                        replacement.as_str()
+                    } else {
+                        original.as_str()
+                    }
+                );
+            } else {
+                drop(app.handle_chat_ui(action));
+                assert!(
+                    runtime(&app, target)
+                        .failure_ui
+                        .expanded
+                        .contains(&current_key)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn child_picker_filters_full_names_and_keeps_order_during_status_changes() {
     let mut children = vec![
         child("finished", ToolStatus::Succeeded, false),
