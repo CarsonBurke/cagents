@@ -125,7 +125,7 @@ if [ -n "$SELECT_VERSION" ]; then
         v*) SELECT_VERSION=${SELECT_VERSION#v} ;;
     esac
     case $SELECT_VERSION in
-        [!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) fail "unsafe selected version: $SELECT_VERSION" ;;
+        ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) fail "unsafe selected version: $SELECT_VERSION" ;;
     esac
 fi
 [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || [ "$RESTART_DAEMON" -eq 1 ] \

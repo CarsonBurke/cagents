@@ -2204,6 +2204,16 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--select requires a version"));
     assert_eq!(current(), Path::new("versions/9.9.7"));
+    // A stripped version prefix must remain a selection error, rather than
+    // falling through to ordinary installation of the coordinator release.
+    let output = install(&["--select", "v", "--stage-only"], None);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsafe selected version: "),
+        "{output:?}"
+    );
+    assert_eq!(current(), Path::new("versions/9.9.7"));
+    assert_eq!(fs::read(&marker).unwrap(), recorded);
     assert!(!launches.exists(), "no staged executable may run");
 }
 

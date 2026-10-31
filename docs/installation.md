@@ -303,7 +303,8 @@ ownership checks as `--stage-only`, and it refuses when:
 - windows or a daemon are running, and the version is neither the one they run
   nor a build staged over it;
 - the staged build was recorded as sharing the running daemon, and that daemon
-  has since stopped. Stage it again instead;
+  has since stopped. Start the original version's daemon before re-selecting
+  the staged build;
 - an application update is in progress;
 - `current` changed while the selection was being prepared.
 
