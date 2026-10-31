@@ -454,8 +454,12 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
             .changed,
         "replay after an already committed registry cursor must still have committed the independent annotation Store before ACK"
     );
-    super::super::agent_execution::process(&successor, Authority::default(), crate::agent_execution::Operation::Close(accepted.agent.id))
-        .unwrap();
+    super::super::agent_execution::process(
+        &successor,
+        Authority::default(),
+        crate::agent_execution::Operation::Close(accepted.agent.id),
+    )
+    .unwrap();
     wait_until(
         || {
             !identity.record.holder.is_current()
@@ -839,7 +843,12 @@ fn slow_turn_survives_sigkill_of_the_host_owner_process() {
             .count(),
         1
     );
-    super::super::agent_execution::process(&host, Authority::default(), crate::agent_execution::Operation::Close(receipt.agent)).unwrap();
+    super::super::agent_execution::process(
+        &host,
+        Authority::default(),
+        crate::agent_execution::Operation::Close(receipt.agent),
+    )
+    .unwrap();
     wait_until(
         || {
             !receipt.identity.record.holder.is_current()

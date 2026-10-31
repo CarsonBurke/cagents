@@ -326,9 +326,13 @@ impl LinearCommand {
                 ("Updated ticket", ticket(&save.id))
             }
             Operation::Create(save) => ("Created ticket", save.title.clone().unwrap_or_default()),
-            Operation::Set { target, .. } | Operation::Label { command: LabelCommand::Add { target, .. } | LabelCommand::Remove { target, .. } | LabelCommand::Set { target, .. } } => {
-                ("Updated ticket", issue(target))
-            }
+            Operation::Set { target, .. }
+            | Operation::Label {
+                command:
+                    LabelCommand::Add { target, .. }
+                    | LabelCommand::Remove { target, .. }
+                    | LabelCommand::Set { target, .. },
+            } => ("Updated ticket", issue(target)),
             Operation::Status {
                 command: StatusCommand::Set { target, state },
             } => ("Moved ticket", format!("{} to {state}", issue(target))),
@@ -337,7 +341,10 @@ impl LinearCommand {
             } => ("Commented on", issue(target)),
             Operation::Attach { target, .. } => ("Attached a link to", issue(target)),
             Operation::Relation {
-                command: RelationCommand::Add { target, related, .. },
+                command:
+                    RelationCommand::Add {
+                        target, related, ..
+                    },
             } => ("Related", format!("{} to {related}", issue(target))),
             Operation::Relation {
                 command: RelationCommand::Remove { .. },

@@ -9,14 +9,16 @@ pub(super) struct Recovery {
 }
 impl Runtime {
     pub(super) fn auth_error(&self) -> Option<&str> {
-        self.snapshot.error
+        self.snapshot
+            .error
             .as_deref()
             .into_iter()
             .chain(self.error.as_deref())
             .find(|error| chat::requires_sign_in(self.session.launch.provider, error))
     }
     pub(super) fn auth_verification_detail(&self) -> Option<&str> {
-        self.auth_error().and_then(chat::sign_in_verification_detail)
+        self.auth_error()
+            .and_then(chat::sign_in_verification_detail)
     }
     pub(super) fn active_auth_notice(&self, anchor: &Option<String>, message: &str) -> bool {
         self.auth_error().is_some()
