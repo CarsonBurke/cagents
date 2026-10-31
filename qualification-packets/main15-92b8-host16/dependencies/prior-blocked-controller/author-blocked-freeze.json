@@ -1,0 +1,186 @@
+{
+  "kind": "fresh-current-92b8-host16-controller-author-source-freeze-v1",
+  "status": "SOURCE_BLOCKED_UNRUN_KNOWN_HISTORICAL_RECEIPT_KEY_MAPPING_DEFECT",
+  "created_utc": "2026-10-31T19:51:27.322637+00:00",
+  "controller": {
+    "head": "f2fbe92f6af07e81ca96c236d1af243893221364",
+    "tree": "fa6cebcb1f7f9faf6cedd9d60b4f3349a0b1b8ad",
+    "parent": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "branch": "qual/fw16-return-host16-92b8-source-main15",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-host16-92b8-source-main15",
+    "packet": "qualification-packets/main15-92b8-host16",
+    "tracked_clean": true,
+    "ancestry": "Direct product92b8 child, not an old-controller descendant or retarget."
+  },
+  "product": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+  },
+  "original_controller": {
+    "head": "855a41f9dbb35bc3f33aafc1d4a84c235177faa0",
+    "tree": "8b06732ed3f8042aeb6fd42620d92ec906c7f65c",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-host16-abi-source",
+    "packet": "qualification-packets/main15-bb8-host16",
+    "unchanged": true
+  },
+  "pins": {
+    "run-packet.py": {
+      "sha256": "eeaf1600ef331443abc90f402d43793c173fb8193961efc9a7b85fb0389d320f",
+      "bytes": 106438
+    },
+    "plan.json": {
+      "sha256": "b4cb540061a248388e715b1ea7129a6a0220e7c22b23c6b594541dab71aff36a",
+      "bytes": 61148
+    },
+    "manifest.json": {
+      "sha256": "1c55a0dcb15a5a45c62e206eb69bf1c7367ea4a61fe1240db7df3be66cc7f99b",
+      "bytes": 26460
+    },
+    "source-binding.json": {
+      "sha256": "e0eb02aebb9878e029999b95453d74a9fe417c72ec047462f15bc368c71e2254",
+      "bytes": 26974
+    },
+    "source-conservation.json": {
+      "sha256": "264d4f9d375fa80323063228c9d024a4f9b96452b17e623918232e3cc25e4d1b",
+      "bytes": 5647
+    },
+    "current-source-map.json": {
+      "sha256": "0474baeb8ac9655acca0341fb836800080f5f3f53f459465b0e9d1c2db40db0d",
+      "bytes": 16998
+    },
+    "selected-source-contract.json": {
+      "sha256": "5dea22ebe9942f9bc2938d624e9014859427db984f2b665a47f1be756fe03952",
+      "bytes": 9155
+    },
+    "invocation-template.json": {
+      "sha256": "4976053eae7c54140a6beaefe12fc621ce2291e247fe8828b593cdfe7646473c",
+      "bytes": 849
+    }
+  },
+  "product_tree_conservation": {
+    "all_original_product_entries_exact_mode_type_blob": 2231,
+    "only_added_controller_packet_paths": 145,
+    "no_product_entry_removed_or_modified": true
+  },
+  "source_conservation": {
+    "other_top_level_functions_exact": 31,
+    "nested_definitions_exact": 7,
+    "canonical9004_exact": true,
+    "FULL3790_exact": true,
+    "FULL3790_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "only_main_task_source_binding_segment_and_allowed_literals_changed": true,
+    "main_generic_execution_tail_exact_except_allowed_output_prefix_and_qualified_scope": true,
+    "original_prologue_hard_refusal_read_bound_canonical_island_command_contract_island_preserved": true,
+    "TARGET_LOCK_TOOL_and_caps_unchanged": true,
+    "runner_exact_diff": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f2fbe92f-host16-92b8-task-binding-exact-runner-diff-v1.patch",
+      "sha256": "463defba7833dd8e97a146b70541d70ab7c3a0b84b5d73f627c35d46660b76dd",
+      "bytes": 26388,
+      "mode": "0444"
+    },
+    "complete_inverse_and_hash_ledger": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f2fbe92f-host16-92b8-payload-inverse-and-conservation-v1.json",
+      "sha256": "7a38ce14386da977741c5ab7a2fc5425dd9cd2ef18ae0655cf5b5d0a44387ed3",
+      "bytes": 57084,
+      "mode": "0444"
+    }
+  },
+  "metadata": {
+    "current_invocation_review_ABI_product_equals_plan": true,
+    "nested_selected_caller_contract_equals_standalone": true,
+    "fail_closed_equality_guard_present": true,
+    "current_source_map_total": 44,
+    "other_unchanged_source_pins": 43,
+    "old_manifest_files": 121,
+    "old_payloads": 120,
+    "old_runtime_archive_refs": 104,
+    "new_manifest_files": 145,
+    "new_payloads": 144,
+    "new_runtime_archive_refs": 127,
+    "runtime_archive_is_not_entire_manifest": true,
+    "current_receipt_shapes": "Genuine92b8 freeze/semantic/conservation/assembly/formatter/adoption/publication validated, flat current receipt tuples used; no fake product.worktree/branch fields. Current freeze.before binds immediate BB8cab7, afterd4e; f95base35c remains historical.",
+    "history": "Old BB8/f95 receipt bytes/NULLs/outcomes/source proofs remain exact archived history; acceptedBB8negative9475 included. Original formattergap69fe separate from fresh explicit physical193 formatter4dab."
+  },
+  "commands": {
+    "serial_count": 19,
+    "caps_sum_seconds": 2250,
+    "workload_seconds": 2400,
+    "jobs": 2,
+    "default_outer_scheduler_and_capture": true,
+    "selected_names": [
+      "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+      "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+      "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+      "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+      "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+      "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+      "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+      "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+      "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+      "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+      "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+      "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+      "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+      "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+      "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+      "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement"
+    ],
+    "singleton_result_contract": "Original1P0F0I0M,N-1; actual CargoJSON/same-root ELF/hash and inventoryN remain FUTURE only.",
+    "separate_source_DATA_reservations": "Preserved original source-only reconciliation, not added invocation/deadline/wait claims."
+  },
+  "source_only_checks": [
+    {
+      "operation": "Author AST/JSON parse, actual source/header/mode/hash and manifest/runtime archive checks",
+      "exit": 0,
+      "execution": "No candidate/module/runner/helper/test imported or evaluated."
+    },
+    {
+      "operation": "Exact old payload/runner forward inverse and all protected function/island/block comparisons",
+      "exit": 0
+    },
+    {
+      "operation": "git staged diff --check",
+      "exit": 0,
+      "tool_chunk": "c51044"
+    },
+    {
+      "operation": "Private source commit",
+      "exit": 0,
+      "note": "Hooks/signing disabled; no identity changes, old source refs/WTs untouched."
+    }
+  ],
+  "limits": [
+    "No runner/helper/module/app/Task evaluation, Cargo/check/build/test/native/provider or environment/account/authority/process/resource/cache/target probe; no network/publication/queue/new worker.",
+    "Data source path/tool/hash declarations are immutable source facts only, not current availability/warmth/context observations or grants.",
+    "No old grant/pass/N/ELF/result transfer. Fresh current grant/controller-review/ELF/N/results remainNULL.",
+    "Physical retained helper remains deferred/unselected. Native/genuineUser5/FULL52/whole-product/full inherited-stack outcomes remainUNQUALIFIED.",
+    "31 other functions and7 nested are conserved; main current source-schema assertion segment necessarily changes and is not mislabeled32-exact. Source integrity added one nested==standalone equality guard.",
+    "Root/EC own independent source review/adoption/publication and later exact controller binding/grants. This author receipt is not independent approval.",
+    "Independent source finding blocks this candidate: historical identity key lookup is wrong. Static syntax/hash/conservation success is not semantic or runnable clearance."
+  ],
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "grant": null,
+  "controller_review": null,
+  "execution_authorized": false,
+  "queueable": false,
+  "known_source_blockers": [
+    {
+      "id": "HISTORICAL_BB8_IDENTITY_KEY_RENAMED_INCORRECTLY",
+      "actual_expression": "current_conservation['bb8_identity']",
+      "required_receipt_key": "identity",
+      "required_local_comparison_variable": "bb8_identity",
+      "source": "Archived genuine dependencies/bb8/product_conservation.json retains literal top-level identity; no bb8_identity field.",
+      "origin": "Author regex replaced a JSON key literal while renaming the local identity variable. Independent UI5 reviewers reported same-source defect after HOST16 commit had already frozen.",
+      "disposition": "Preserve frozen commit/archive; pending separately authorized successor correction. No runner execution or archive rewrite."
+    }
+  ]
+}

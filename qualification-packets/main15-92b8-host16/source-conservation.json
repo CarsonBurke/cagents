@@ -44,18 +44,27 @@
     "task_group_assets": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4",
     "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
   },
+  "ancestry": "Descendant of blocked controller; original product92b8 remains an ancestor and distinct product source tuple.",
   "archive_not_equal_full_payload_manifest": true,
   "canonical9004_exact": true,
   "canonical_adoption_island_and_command_contract_island_exact": true,
   "checks": "AST/JSON parse and inert source/Git/hash/diff only; no runner/helper/module/test/eval/compiler/runtime/probe.",
   "controller_identity": "EXTERNAL_POSTCOMMIT_DISTINCT_FROM_PRODUCT",
-  "controller_parent": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "controller_parent": "f2fbe92f6af07e81ca96c236d1af243893221364",
   "controller_review": null,
+  "current_correction": "Exactly three historical receipt key literals bb8_identity -> identity; local variable bb8_identity retained. Only current controller path/plan hash/output prefix metadata also rebound.",
+  "current_manifest_file_count": 146,
+  "current_manifest_payload_count": 145,
   "execution_authorized": false,
   "generic_execution_tail_exact_except_output_prefix_and_qualified_scope": true,
   "grant": null,
-  "immediate_old_controller": "855a41f9dbb35bc3f33aafc1d4a84c235177faa0",
-  "kind": "AUTHOR_CURRENT_92B8_HOST16_TASK_BINDING_SOURCE_CONSERVATION_NOT_APPROVAL",
+  "historical_bb8_controller_reference": "855a41f9dbb35bc3f33aafc1d4a84c235177faa0",
+  "historical_bb8_packet_reference": "qualification-packets/main15-bb8-host16",
+  "immediate_baseline_file_count": 145,
+  "immediate_baseline_packet": "qualification-packets/main15-92b8-host16",
+  "immediate_old_controller": "f2fbe92f6af07e81ca96c236d1af243893221364",
+  "kind": "AUTHOR_92B8_HOST16_IDENTITY_KEY_AND_CURRENT_PATH_SOURCE_CORRECTION_NOT_APPROVAL",
+  "literal_key_fix_inverse_exact": true,
   "nested_sha256": {
     "collect": "a2d1e38e7398b37be359ac4f6ed598633710b961fa38f3c0f984c0d619dc5a0c",
     "context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
@@ -65,20 +74,29 @@
     "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06",
     "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711"
   },
-  "old_packet": "qualification-packets/main15-bb8-host16",
   "only_changed_function": "main existing task source/receipt assertion segment and permitted current labels",
   "original_manifest_file_count": 121,
   "original_manifest_payload_count": 120,
   "other_source_pins_unchanged": 43,
   "other_top_level_full_functions_exact": 31,
+  "prior_blocked_history": [
+    {
+      "bytes": 9996,
+      "original_path": "/tmp/held-saved-scope-fw16-evidence/f2fbe92f-host16-92b8-controller-source-freeze-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-host16-92b8-identity-main15/qualification-packets/main15-92b8-host16/dependencies/prior-blocked-controller/author-blocked-freeze.json",
+      "scope": "Immutable blocked-source history only; not current review or execution evidence.",
+      "sha256": "7602a66e884cc3edfaf8d36c30ff07c32842b36830502afb826e18221075180c"
+    }
+  ],
   "product": {
     "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
     "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
     "tree": "c0c42d3153033da826b05736673b38e57449bee4",
     "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
   },
-  "runner_sha256": "eeaf1600ef331443abc90f402d43793c173fb8193961efc9a7b85fb0389d320f",
-  "runtime_archive_binding_count": 127,
+  "runner_sha256": "ca5a0710128b810e62d623392de1af2104d8e3ad24c6c6148edc302c0a369dd2",
+  "runtime_archive_binding_count": 128,
+  "separate_path_rebind_inverse_exact": true,
   "source_pin_total": 44,
   "top_level_count": 32
 }
