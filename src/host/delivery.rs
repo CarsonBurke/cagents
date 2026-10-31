@@ -119,6 +119,7 @@ fn bulk_page(message: &ServerMessage) -> bool {
                 | ServerResponse::Work(
                     crate::work::Response::Board(_) | crate::work::Response::Watching { .. }
                 )
+                | ServerResponse::ChatProviderExitOutput { .. }
         }
     )
 }
@@ -664,6 +665,7 @@ mod tests {
                 chat_id,
                 state,
                 generation,
+                outcome: None,
             };
             queue.push(envelope.clone()).unwrap();
         }

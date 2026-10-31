@@ -1,5 +1,36 @@
 //! One handle for a daemon-local actor or its authenticated retained owner.
 use super::retained_actor::journal::{InputIdentity, InputReceipt, OutboxEntry};
+
+/// The completion broker observes both owners without forwarding threads or
+/// discarding the retained actor's refusal/uncertain receipt classification.
+pub(crate) enum CommandReply {
+    Local(crossbeam_channel::Receiver<Result<(), String>>),
+    Retained(crossbeam_channel::Receiver<Result<(), Rejection>>),
+}
+impl CommandReply {
+    pub(crate) fn select<'a>(&'a self, select: &mut crossbeam_channel::Select<'a>) -> usize {
+        match self {
+            Self::Local(reply) => select.recv(reply),
+            Self::Retained(reply) => select.recv(reply),
+        }
+    }
+    pub(crate) fn receive(
+        &self,
+        operation: crossbeam_channel::SelectedOperation<'_>,
+    ) -> Result<Result<(), String>, crossbeam_channel::RecvError> {
+        match self {
+            Self::Local(reply) => operation.recv(reply),
+            Self::Retained(reply) => operation
+                .recv(reply)
+                .map(|result| result.map_err(String::from)),
+        }
+    }
+}
+impl From<crossbeam_channel::Receiver<Result<(), String>>> for CommandReply {
+    fn from(reply: crossbeam_channel::Receiver<Result<(), String>>) -> Self {
+        Self::Local(reply)
+    }
+}
 use super::retained_actor::transport::{ActorIdentity, RemoteActor};
 use super::{LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness};
 use crate::chat::{
@@ -324,6 +355,24 @@ impl Handle {
     }
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.try_command(command).map_err(String::from)
+    }
+    pub(crate) fn enqueue_command(&self, command: Command) -> Result<CommandReply, String> {
+        match &self.0 {
+            Owner::Local(local) => local.enqueue_command(command).map(CommandReply::Local),
+            Owner::Remote(remote) => remote.enqueue_deferred(command).map(CommandReply::Retained),
+        }
+    }
+    pub(crate) fn provider_exit_output(
+        &self,
+        log_id: &str,
+        offset: u64,
+    ) -> Result<(Vec<u8>, Option<u64>, u64), String> {
+        match &self.0 {
+            Owner::Local(local) => local.provider_exit_output(log_id, offset),
+            Owner::Remote(remote) => {
+                remote.call("provider_exit_output", serde_json::json!([log_id, offset]))
+            }
+        }
     }
     pub(crate) fn try_command(&self, command: Command) -> Result<(), Rejection> {
         match &self.0 {
@@ -677,6 +726,12 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.close(),
             Owner::Remote(remote) => remote.close(),
+        }
+    }
+    pub(crate) fn close_until(&self, deadline: std::time::Instant) -> Result<(), String> {
+        match &self.0 {
+            Owner::Local(local) => local.close_until(deadline),
+            Owner::Remote(remote) => remote.close_until(deadline),
         }
     }
     pub(crate) fn decline_answer(&self, command: Command) -> Result<(), String> {

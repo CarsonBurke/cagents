@@ -6,6 +6,7 @@ mod automations;
 mod channel_work;
 mod chat;
 mod client;
+mod deferred;
 mod delivery;
 pub(crate) mod descriptor_limit;
 #[cfg(all(test, target_os = "linux"))]

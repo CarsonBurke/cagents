@@ -59,7 +59,11 @@ impl BuildIdentity {
                 .and_then(|metadata| metadata.split('.').next())
                 .map(str::to_owned),
             capabilities: match kind {
-                Kind::Native => vec!["event-driven-orphan-reaping".into()],
+                Kind::Native => vec![
+                    "event-driven-orphan-reaping".into(),
+                    "provider-exit-diagnostics".into(),
+                    "provider-retained-output".into(),
+                ],
                 Kind::Terminal => Vec::new(),
             },
         }
@@ -271,6 +275,16 @@ impl Record {
                         .capabilities
                         .iter()
                         .any(|capability| capability == "event-driven-orphan-reaping"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-exit-diagnostics"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-retained-output"))
         })
     }
 
@@ -320,7 +334,7 @@ impl Record {
     fn supported_version(&self) -> bool {
         match self.kind {
             Kind::Terminal => matches!(self.version, 3 | 4 | 5),
-            Kind::Native => matches!(self.version, 2 | 3 | 4),
+            Kind::Native => matches!(self.version, 2 | 3 | 4 | 5 | 6),
         }
     }
 
@@ -914,18 +928,20 @@ mod tests {
         );
         let mut native = record();
         native.kind = Kind::Native;
-        native.version = 4;
-        native.create(directory.path()).unwrap();
-        assert_eq!(
-            evidence(&socket(directory.path(), native.terminal), Kind::Native).unwrap(),
-            Some(native.clone())
-        );
-        assert_eq!(
-            discover(directory.path(), &native.boot, Kind::Native).unwrap(),
-            vec![native.clone()]
-        );
-        native.remove(directory.path());
-        native.version = 5;
+        for version in [2, 3, 4, 5, 6] {
+            native.version = version;
+            native.create(directory.path()).unwrap();
+            assert_eq!(
+                evidence(&socket(directory.path(), native.terminal), Kind::Native).unwrap(),
+                Some(native.clone())
+            );
+            assert_eq!(
+                discover(directory.path(), &native.boot, Kind::Native).unwrap(),
+                vec![native.clone()]
+            );
+            native.remove(directory.path());
+        }
+        native.version = 7;
         native.create(directory.path()).unwrap();
         assert!(evidence(&socket(directory.path(), native.terminal), Kind::Native).is_err());
         assert!(

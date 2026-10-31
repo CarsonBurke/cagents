@@ -25,6 +25,7 @@ mod child_text_copy;
 pub(crate) mod courier_tests;
 mod execution;
 mod handle;
+pub(crate) use handle::CommandReply;
 pub use handle::Handle;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
@@ -35,6 +36,8 @@ mod retained_actor;
 mod store;
 mod websocket;
 pub(crate) use store::Store;
+mod native_reconcile;
+mod worker_join;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -156,6 +159,8 @@ pub(crate) enum Update {
     Activity {
         state: ActivityState,
         generation: u64,
+        #[serde(default)]
+        outcome: Option<crate::agent::ActivityOutcome>,
     },
     /// The provider began taking prompts, which leaves activity unchanged.
     Ready,
@@ -169,6 +174,10 @@ pub(crate) enum Update {
         /// Unix milliseconds at which the runtime read the report.
         observed_at: u64,
     },
+    /// Evidence for an older provider turn. It must never sample or replace
+    /// attention belonging to the current turn. Managed run lifecycle has
+    /// its own exact RunId-bearing Execution update.
+    PastAttention(crate::notifications::Evidence),
 }
 
 #[derive(Clone)]
@@ -197,6 +206,7 @@ pub(crate) enum TitleUnavailable {
 
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
+    urgent_commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
@@ -207,6 +217,8 @@ struct Inner {
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    worker_joining: AtomicBool,
+    worker_join_failed: AtomicBool,
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
@@ -216,8 +228,11 @@ struct Inner {
     retain_cleanup_receipt: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
+    native_reconciling: AtomicBool,
+    native_reconcile_error: Mutex<Option<String>>,
     native_installed: Arc<AtomicBool>,
     history_only: bool,
+    stderr_lease: Arc<Mutex<Option<super::stderr_log::Lease>>>,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
 }
@@ -416,6 +431,7 @@ impl LocalHandle {
         nonblocking(&wake)?;
         nonblocking(&reader)?;
         let (commands, incoming) = crossbeam_channel::bounded(64);
+        let (urgent_commands, urgent_incoming) = crossbeam_channel::bounded(1);
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
             ..Snapshot::default()
@@ -427,6 +443,7 @@ impl LocalHandle {
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let store = Arc::new(Mutex::new(store));
+        let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
@@ -436,6 +453,7 @@ impl LocalHandle {
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let inner = Arc::new(Inner {
             commands,
+            urgent_commands,
             wake: Mutex::new(wake),
             state: state.clone(),
             confirmed_session: confirmed_session.clone(),
@@ -446,6 +464,8 @@ impl LocalHandle {
             draining: draining.clone(),
             failure: failure.clone(),
             worker: Mutex::new(None),
+            worker_joining: AtomicBool::new(false),
+            worker_join_failed: AtomicBool::new(false),
             store: store.clone(),
             notify: notify.clone(),
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
@@ -457,14 +477,21 @@ impl LocalHandle {
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
+            native_reconciling: AtomicBool::new(false),
+            native_reconcile_error: Mutex::new(None),
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
+            stderr_lease: stderr_lease.clone(),
             provider_process: provider_process.clone(),
             launch_account_scope: launch_account_scope
                 .clone()
                 .ok_or_else(|| "This local actor has no retained account scope".to_owned()),
         });
         let launch_context = spec.execution.clone();
+        let native_transport = matches!(
+            &spec.transport,
+            TransportSpec::UnixWebSocket { .. } | TransportSpec::OwnedUnixWebSocket { .. }
+        );
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
         let (started, startup) = crossbeam_channel::bounded(1);
         let worker = thread::Builder::new()
@@ -490,20 +517,25 @@ impl LocalHandle {
                     observe_next,
                     stop,
                     incoming,
+                    urgent_incoming,
                     wake: reader,
                     notify,
                     output: Vec::new(),
                     scanned: 0,
                     pending: VecDeque::new(),
+                    control_replies: BTreeMap::new(),
                     offset: 0,
                     queued: 0,
                     stderr: VecDeque::new(),
+                    stderr_reader: None,
+                    stderr_log: if matches!(spec.transport,TransportSpec::JsonLines) { super::stderr_log::Capture::new().map_err(|error| { tracing::warn!(%error,"Provider diagnostic log is unavailable"); error }).ok() } else { None },
                     indices: BTreeMap::new(),
                     retained: 0,
                     history_error: None,
                     login_recovery: None,
                     dirty: false,
                     activity: ActivityState::Idle,
+                    activity_outcome: None,
                     ready: false,
                     prompt_available: false,
                     attention: TurnAttention::default(),
@@ -515,7 +547,7 @@ impl LocalHandle {
                     started: Instant::now(),
                     write_started: None,
                 };
-                let result = {
+                let mut result = {
                     let _recovered = crate::instance::recovered_panic_scope();
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         ready_to_begin
@@ -559,13 +591,43 @@ impl LocalHandle {
                 }
                 .unwrap_or_else(|_| {
                     Err("Native chat worker panicked; exact provider state is unconfirmed".into())
-                });
+                })
+                .map_err(|error|super::protocol::preview(error.as_bytes(),1024));
                 // The actor has stopped answering commands, yet teardown below can
                 // take seconds. Reject commands now so a caller is told the provider
                 // exited instead of waiting out an acknowledgement nobody will send.
                 draining.store(true, Ordering::Release);
+                for (_, reply) in std::mem::take(&mut actor.control_replies) {
+                    let _ = reply.send(Err(
+                        "Provider exited before acknowledging the control request".into(),
+                    ));
+                }
+                let had_unfinished_turn = {
+                    let state = actor.state.lock().unwrap_or_else(|p| p.into_inner());
+                    // Scalar activity can remain stale after a Store failure.
+                    // Terminal provider proof wins until TurnStarted clears it.
+                    state.outcome.is_none()
+                        && (actor.execution.has_pending() || actor.attention.started
+                            || state.busy || state.waiting || !state.requests.is_empty())
+                };
+                let native_diagnostic = if result.is_err() || !actor.stop.load(Ordering::Acquire) {
+                    actor.native_exit_diagnostic_until(Instant::now() + Duration::from_millis(500))
+                } else { None };
+                if result.is_ok() && !actor.stop.load(Ordering::Acquire) {
+                    if actor.native_holder.is_some() {
+                        result = Err("Provider connection closed unexpectedly; restart the session to continue".into());
+                    } else if actor.child.is_some() && had_unfinished_turn {
+                        result = Err("Provider exited before reporting the turn's final result".into());
+                    }
+                }
+                let native_status = native_diagnostic.as_ref().and_then(|diagnostic| diagnostic.provider_status);
+                let retained_log = if let Some(descriptor) = native_diagnostic.as_ref().and_then(|diagnostic|diagnostic.log.clone()) {
+                    super::stderr_log::Lease::open(descriptor).map_err(|error| {tracing::warn!(%error,"Retained provider output is unavailable");error}).ok()
+                } else { None };
+                *stderr_lease.lock().unwrap_or_else(|p|p.into_inner()) = retained_log;
+                let native_exited = native_status.is_some();
                 let unexpected_loss = result.is_err() && !actor.stop.load(Ordering::Acquire);
-                let preserve_holder = actor
+                let preserve_holder = !native_exited && actor
                     .native_holder
                     .as_ref()
                     .is_some_and(|holder| holder.is_durable())
@@ -573,47 +635,64 @@ impl LocalHandle {
                         || (unexpected_loss && native_installed.load(Ordering::Acquire)))
                         && !release_native.load(Ordering::Acquire)
                         || (adopted_native && !native_installed.load(Ordering::Acquire)));
+                let mut exit_error = result.as_ref().err().cloned();
+                let mut direct_closed = true;
+                let direct_status = actor.child.as_mut().and_then(|child| {
+                    let status = child.observed_exit_status().ok().flatten();
+                    if let Err(error) = child.terminate() {
+                        direct_closed = false;
+                        *failure.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(format!("Provider cleanup is unconfirmed: {error}"));
+                    }
+                    status
+                });
+                let direct_subject = provider_process.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let status = actor.provider_exit_status(direct_status, direct_subject.as_ref(), native_transport, native_status);
+                if let Some(mut reader)=actor.stderr_reader.take() {
+                    let mut bytes=[0u8;8192];
+                    for _ in 0..128 {
+                        match reader.read(&mut bytes) {
+                            Ok(0)=>break,
+                            Ok(count)=>actor.capture_stderr(&bytes[..count]),
+                            Err(error) if error.kind()==std::io::ErrorKind::Interrupted=>continue,
+                            Err(_)=>break,
+                        }
+                    }
+                }
+                if let Some(capture)=actor.stderr_log.as_ref() {
+                    *stderr_lease.lock().unwrap_or_else(|p|p.into_inner())=Some(capture.lease());
+                }
+                let log_metadata=stderr_lease.lock().unwrap_or_else(|p|p.into_inner()).as_ref().map(|lease|lease.descriptor.log.clone());
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
                     let attention = (!actor.attention.settled && !preserve_holder).then(|| {
                         crate::notifications::Evidence {
                             key: actor.attention.key.clone(),
-                            kind: crate::notifications::Kind::Interrupted,
+                            kind: if status.is_some_and(|status| !status.success()) {
+                                crate::notifications::Kind::Failed
+                            } else { crate::notifications::Kind::Interrupted },
                         }
                     });
-                    *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
-                    let stderr =
-                        String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned();
-                    let message = if stderr.is_empty() {
-                        error
-                    } else {
-                        format!("{error}\nProvider stderr (last 16 KiB): {stderr}")
-                    };
+                    if direct_closed { *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone()); }
+                    let stderr = native_diagnostic.as_ref().map(|diagnostic| diagnostic.stderr.clone())
+                        .unwrap_or_else(|| String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned());
+                    let mut diagnostic = provider_exit_diagnostic(status, &error, &stderr);
+                    diagnostic.log = log_metadata;
+                    tracing::error!(error = %error, "Provider process failed; stderr retained privately");
+                    exit_error = Some(diagnostic.summary.clone());
                     actor.apply(Event::Error {
-                        message,
+                        message: diagnostic.summary.clone(),
                         fatal: true,
                     });
+                    actor.apply(Event::ProviderExit(diagnostic));
                     // Publish the bounded diagnosis before attention samples
                     // it, while keeping retained native outcomes unconfirmed.
                     if let Some(evidence) = attention {
                         actor.publish_current_attention(evidence);
                     }
                 }
-                let mut direct_closed = true;
-                let code = actor.child.as_mut().and_then(|child| {
-                    let code = child
-                        .observed_exit_status()
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.code());
-                    if let Err(error) = child.terminate() {
-                        direct_closed = false;
-                        *failure.lock().unwrap_or_else(|p| p.into_inner()) =
-                            Some(format!("Provider cleanup is unconfirmed: {error}"));
-                    }
-                    code
-                });
+                let code = status.and_then(|status| status.code());
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
                     if preserve_holder {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -631,6 +710,29 @@ impl LocalHandle {
                 } else {
                     true
                 };
+                if !preserve_holder {
+                    let mut state = actor.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if had_unfinished_turn && state.outcome.is_none() {
+                        state.outcome = Some(if actor.stop.load(Ordering::Acquire) {
+                            crate::agent::ActivityOutcome::Cancelled
+                        } else if status.is_some_and(|status| !status.success()) {
+                            crate::agent::ActivityOutcome::Failed {
+                                reason: execution::exit_reason(status, exit_error.as_deref()),
+                            }
+                        } else {
+                            crate::agent::ActivityOutcome::Interrupted {
+                                reason: execution::exit_reason(status, exit_error.as_deref()),
+                            }
+                        });
+                    }
+                    if state.outcome.is_some() && state.finished_at.is_none() { state.finished_at = observed_at(); }
+                    let terminal=match &state.outcome {Some(crate::agent::ActivityOutcome::Failed{..})=>Some(ToolStatus::Failed),Some(crate::agent::ActivityOutcome::Cancelled|crate::agent::ActivityOutcome::Interrupted{..})=>Some(ToolStatus::Stopped),_=>None};
+                    if let Some(status)=terminal {
+                        finish_snapshot_work(&mut state,status,direct_closed&&native_closed);
+                        drop(state);
+                        if let Err(error)=actor.store.lock().unwrap_or_else(|p|p.into_inner()).finish_running(status) {tracing::warn!(%error,"Cannot settle ended provider tool metadata");}
+                    }
+                }
                 actor.apply(Event::Exited { code });
                 let usage = actor
                     .state
@@ -638,10 +740,16 @@ impl LocalHandle {
                     .unwrap_or_else(|p| p.into_inner())
                     .usage
                     .clone();
-                for (run, update) in actor
-                    .execution
-                    .ended(actor.stop.load(Ordering::Acquire), usage)
-                {
+                for (run, update) in actor.execution.ended(
+                    actor.stop.load(Ordering::Acquire),
+                    status,
+                    if preserve_holder {
+                        None
+                    } else {
+                        exit_error.as_deref()
+                    },
+                    usage,
+                ) {
                     (actor.notify)(Update::Execution { run, update });
                 }
                 actor.publish_activity();
@@ -679,6 +787,17 @@ impl LocalHandle {
             Err(_) => {} // The host publishes the still-owned interactive actor.
         }
         Ok(handle)
+    }
+    /// Queue a provider control while its exact actor owns acknowledgement.
+    pub(crate) fn enqueue_command(
+        &self,
+        command: Command,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+        self.enqueue_actor(ActorCommand::Provider {
+            run: None,
+            command,
+            decline_only: false,
+        })
     }
     pub(super) fn pinned_launch_directory(
         &self,
@@ -719,8 +838,23 @@ impl LocalHandle {
             return Err("Provider actor is no longer accepting commands".into());
         }
         let (reply, response) = crossbeam_channel::bounded(1);
-        self.0
-            .commands
+        let sender = if matches!(
+            &command,
+            ActorCommand::Interrupt { .. }
+                | ActorCommand::Provider {
+                    command: Command::Interrupt,
+                    ..
+                }
+                | ActorCommand::RetainedProvider {
+                    command: Command::Interrupt,
+                    ..
+                }
+        ) {
+            &self.0.urgent_commands
+        } else {
+            &self.0.commands
+        };
+        sender
             .try_send((command, reply))
             .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
         self.wake();
@@ -813,8 +947,23 @@ impl LocalHandle {
             return Err(Rejection::Refused("Chat is closing".into()));
         }
         let (reply, response) = crossbeam_channel::bounded(1);
-        self.0
-            .commands
+        let sender = if matches!(
+            &command,
+            ActorCommand::Interrupt { .. }
+                | ActorCommand::Provider {
+                    command: Command::Interrupt,
+                    ..
+                }
+                | ActorCommand::RetainedProvider {
+                    command: Command::Interrupt,
+                    ..
+                }
+        ) {
+            &self.0.urgent_commands
+        } else {
+            &self.0.commands
+        };
+        sender
             .try_send((command, reply))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
@@ -835,8 +984,12 @@ impl LocalHandle {
             return Err("The provider actor is no longer accepting ownership commands".into());
         }
         let (reply, response) = crossbeam_channel::bounded(1);
-        self.0
-            .commands
+        let sender = if matches!(&command, ActorCommand::Interrupt { .. }) {
+            &self.0.urgent_commands
+        } else {
+            &self.0.commands
+        };
+        sender
             .try_send((command, reply))
             .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
         self.wake();
@@ -963,6 +1116,34 @@ impl LocalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .file_query(command)
+    }
+    pub(crate) fn provider_exit_output(
+        &self,
+        log_id: &str,
+        offset: u64,
+    ) -> Result<(Vec<u8>, Option<u64>, u64), String> {
+        let current = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .provider_exit
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.log.as_ref())
+            .map(|log| log.id.clone());
+        if current.as_deref() != Some(log_id) {
+            return Err("This provider diagnostic is no longer current".into());
+        }
+        let lease = self
+            .0
+            .stderr_lease
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|lease| lease.descriptor.log.id == log_id)
+            .cloned()
+            .ok_or("Retained provider output expired or is unavailable")?;
+        lease.read(offset)
     }
     pub(crate) fn text_copy(
         &self,
@@ -1345,7 +1526,7 @@ impl LocalHandle {
             return Err("Native provider has already been explicitly closed".into());
         }
         self.0.preserve_native.store(true, Ordering::Release);
-        self.close_inner(true)
+        self.close_inner(true, None)
     }
 
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {
@@ -1362,27 +1543,87 @@ impl LocalHandle {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
         }
-        self.close_inner(false)
+        self.close_inner(false, None)
     }
 
-    fn close_inner(&self, preserving: bool) -> Result<(), String> {
+    /// A caller-owned teardown budget. An unfinished worker or retained native
+    /// reconciliation remains owned and retryable; timeout is never cleanup.
+    pub(crate) fn close_until(&self, deadline: Instant) -> Result<(), String> {
+        if self.0.native_installed.load(Ordering::Acquire) {
+            self.0.release_native.store(true, Ordering::Release);
+        }
+        self.close_inner(false, Some(deadline))
+    }
+
+    fn join_worker_until(&self, deadline: Instant) -> Result<(), String> {
+        loop {
+            if !self.0.worker_joining.load(Ordering::Acquire) {
+                let ready = match self.0.worker.try_lock() {
+                    Ok(mut worker) => {
+                        if self.0.worker_joining.load(Ordering::Acquire) {
+                            false
+                        } else if worker
+                            .as_ref()
+                            .is_some_and(std::thread::JoinHandle::is_finished)
+                        {
+                            worker_join::request(self, &mut worker)?;
+                            false
+                        } else {
+                            worker.is_none()
+                        }
+                    }
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        let mut worker = poisoned.into_inner();
+                        if self.0.worker_joining.load(Ordering::Acquire) {
+                            false
+                        } else if worker
+                            .as_ref()
+                            .is_some_and(std::thread::JoinHandle::is_finished)
+                        {
+                            worker_join::request(self, &mut worker)?;
+                            false
+                        } else {
+                            worker.is_none()
+                        }
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => false,
+                };
+                if ready {
+                    return if self.0.worker_join_failed.load(Ordering::Acquire) {
+                        Err("Native chat worker did not shut down cleanly; provider state is unconfirmed".into())
+                    } else {
+                        Ok(())
+                    };
+                }
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err("Native chat close is still pending; its exact provider cleanup owner is retained".into());
+            };
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    }
+
+    fn close_inner(&self, preserving: bool, deadline: Option<Instant>) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
-        self.wake();
-        // Serialize explicit closes through the join. A protocol failure is
-        // still useful diagnostic history, but it must not prevent retiring an
-        // actor whose process teardown has subsequently completed.
-        let mut worker = self.0.worker.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(worker) = worker.take()
-            && worker.join().is_err()
-        {
-            let error =
-                "Native chat worker did not shut down cleanly; provider state is unconfirmed"
-                    .to_owned();
-            // Even if the panic happened after the completion publication,
-            // repeated closes must preserve the uncertain teardown outcome.
-            self.0.completed.store(false, Ordering::Release);
-            *self.0.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
-            return Err(error);
+        // Close intent is atomic even when another caller owns wake metadata.
+        // A full/nonavailable wake stream already has a pending notification;
+        // periodic actor polls also observe stop without extending this budget.
+        match self.0.wake.try_lock() {
+            Ok(mut wake) => {
+                let _ = wake.write(&[1]);
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let _ = poisoned.into_inner().write(&[1]);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        // is_finished may precede blocking TLS destruction. Actual joins run
+        // in a bounded owner service, never on this deadline-bearing caller.
+        self.join_worker_until(
+            deadline.unwrap_or_else(|| Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE),
+        )?;
+        if let Some(deadline) = deadline {
+            return self.reconcile_native_until(deadline);
         }
         {
             let mut retained = self
@@ -1411,21 +1652,78 @@ impl LocalHandle {
                 detached.take();
             }
         }
+        self.close_result()
+    }
+
+    fn reconcile_native_until(&self, deadline: Instant) -> Result<(), String> {
+        let mut attempted = false;
+        loop {
+            let retained = match self.0.retained_native.try_lock() {
+                Ok(owner) => Some(owner.is_some()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().is_some())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            let detached = if self.0.native_installed.load(Ordering::Acquire) {
+                match self.0.detached_native.try_lock() {
+                    Ok(owner) => Some(owner.is_some()),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        Some(poisoned.into_inner().is_some())
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                }
+            } else {
+                Some(false)
+            };
+            if retained == Some(false)
+                && detached == Some(false)
+                && !self.0.native_reconciling.load(Ordering::Acquire)
+            {
+                return self.close_result();
+            }
+            if retained == Some(true) || detached == Some(true) {
+                if !attempted {
+                    native_reconcile::request(self)?;
+                    attempted = true;
+                } else if !self.0.native_reconciling.load(Ordering::Acquire) {
+                    let reason = self
+                        .0
+                        .native_reconcile_error
+                        .try_lock()
+                        .ok()
+                        .and_then(|error| error.clone());
+                    return Err(format!(
+                        "Retained native cleanup is unconfirmed; its exact owner is retained for retry{}",
+                        reason
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default()
+                    ));
+                }
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err("Native cleanup is still pending; its exact owner and bounded reconciliation task are retained for retry".into());
+            };
+            thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+    }
+
+    fn close_result(&self) -> Result<(), String> {
         if self.is_completed() {
             return Ok(());
         }
-        match self
-            .0
-            .failure
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-        {
-            Some(error) => Err(error),
-            None => {
-                Err("Native chat teardown did not complete; provider state is unconfirmed".into())
+        let failure = match self.0.failure.try_lock() {
+            Ok(failure) => failure.clone(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(
+                    "Native teardown diagnostic is updating; cleanup remains unconfirmed".into(),
+                );
             }
-        }
+        };
+        Err(failure.unwrap_or_else(|| {
+            "Native chat teardown did not complete; provider state is unconfirmed".into()
+        }))
     }
 }
 
@@ -1523,11 +1821,15 @@ fn preflight_inner(
     }
     let mut count = ByteCounter(0);
     serde_json::to_writer(&mut count, &metadata).map_err(|error| error.to_string())?;
-    // Child transcripts are bounded presentation items, not long-lived
-    // request/model metadata. The actor checks that metadata alone stays
-    // under STATE_LIMIT after applying this initial batch.
+    // Initial advisory events take the same bounded reduction path as live
+    // metadata. In particular, 64 valid denial previews can exceed 4 MiB
+    // before the actor replaces their oldest inputs with omission markers.
+    // Rejecting the batch here would bypass that non-fatal byte budgeting.
     if count.0 > 4 * STATE_LIMIT {
-        return Err("Provider initial presentation exceeds IPC capacity".into());
+        tracing::warn!(
+            bytes = count.0,
+            "Reducing large initial provider presentation metadata"
+        );
     }
     initial.events = metadata;
     Ok(store)
@@ -1535,6 +1837,16 @@ fn preflight_inner(
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let retained = match self.retained_native.try_lock() {
+            Ok(mut owner) => owner.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+            // The actor still owns this Arc/guard. Its existing owner remains
+            // responsible; final frontend destruction cannot wait for it.
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(holder) = retained {
+            native_reconcile::retire_final(holder);
+        }
         let _ = self
             .wake
             .get_mut()
@@ -1546,7 +1858,12 @@ impl Drop for Inner {
             .unwrap_or_else(|p| p.into_inner())
             .take()
         {
-            let _ = worker.join();
+            // Dropping a JoinHandle detaches it. No last-handle destruction
+            // may join a TLS destructor, even if is_finished already says true.
+            drop(worker);
+            tracing::warn!(
+                "Final chat handle dropped without an OS-thread cleanup receipt; cleanup is unconfirmed"
+            );
         }
     }
 }
@@ -1879,15 +2196,19 @@ struct Actor {
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     incoming: crossbeam_channel::Receiver<CommandRequest>,
+    urgent_incoming: crossbeam_channel::Receiver<CommandRequest>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     output: Vec<u8>,
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
     pending: VecDeque<Vec<u8>>,
+    control_replies: BTreeMap<String, crossbeam_channel::Sender<Result<(), String>>>,
     offset: usize,
     queued: usize,
     stderr: VecDeque<u8>,
+    stderr_reader: Option<std::process::ChildStderr>,
+    stderr_log: Option<super::stderr_log::Capture>,
     indices: BTreeMap<String, usize>,
     retained: usize,
     /// Only the active error published by the most recent history failure.
@@ -1896,6 +2217,7 @@ struct Actor {
     login_recovery: Option<String>,
     dirty: bool,
     activity: ActivityState,
+    activity_outcome: Option<crate::agent::ActivityOutcome>,
     /// Whether the provider was taking prompts when activity was last published.
     ready: bool,
     prompt_available: bool,
@@ -1907,6 +2229,12 @@ struct Actor {
     first_frame: bool,
     started: Instant,
     write_started: Option<Instant>,
+}
+
+struct NativeExitObservation {
+    provider_status: Option<std::process::ExitStatus>,
+    stderr: String,
+    log: Option<super::stderr_log::Descriptor>,
 }
 
 struct TurnAttention {
@@ -1940,6 +2268,20 @@ impl TurnAttention {
                     kind: *outcome,
                 });
             }
+            Event::PastTurnFinished {
+                key: Some(key),
+                outcome,
+            } => {
+                return Some(crate::notifications::Evidence {
+                    key: key.clone(),
+                    kind: *outcome,
+                });
+            }
+            Event::PastTurnFinished { key: None, .. } => {
+                // Never borrow the current attention key for an uncorrelated
+                // historical result with no old-turn identity.
+                return None;
+            }
             _ => {}
         }
         None
@@ -1972,6 +2314,76 @@ fn accepts_prompt(state: &Snapshot) -> bool {
 }
 
 impl Actor {
+    fn native_exit_diagnostic_until(&mut self, deadline: Instant) -> Option<NativeExitObservation> {
+        let holder = self.native_holder.as_mut()?;
+        loop {
+            let diagnostic = holder.diagnostic().ok()?;
+            let provider_status = diagnostic.provider_status(
+                self.native_peer.as_ref(),
+                self.expected_native_peer.as_ref(),
+            );
+            if provider_status.is_some() || Instant::now() >= deadline {
+                tracing::debug!(launcher = ?diagnostic.launcher,
+                    launcher_code = ?diagnostic.launcher_code,
+                    launcher_signal = ?diagnostic.launcher_signal,
+                    ?provider_status, "Observed native diagnostic subjects");
+                return Some(NativeExitObservation {
+                    provider_status,
+                    stderr: diagnostic.stderr,
+                    log: diagnostic.log,
+                });
+            }
+            // A distinct launcher's status cannot end observation of the
+            // provider, and identity disappearance is not a wait result.
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn provider_exit_status(
+        &self,
+        direct_status: Option<std::process::ExitStatus>,
+        direct_subject: Option<&crate::daemon::holder_registry::Process>,
+        native_transport: bool,
+        native_status: Option<std::process::ExitStatus>,
+    ) -> Option<std::process::ExitStatus> {
+        if !native_transport
+            && self.native_holder.is_none()
+            && self.native_peer.is_none()
+            && self.expected_native_peer.is_none()
+        {
+            return direct_status.or(native_status);
+        }
+        let provider = match (
+            self.native_peer.as_ref(),
+            self.expected_native_peer.as_ref(),
+        ) {
+            (Some(actual), Some(expected)) if actual != expected => return None,
+            (Some(actual), _) => Some(actual),
+            (_, Some(expected)) => Some(expected),
+            _ => None,
+        }
+        .filter(|process| process.pid > 0 && process.start > 0)?;
+        if self.native_holder.is_some() {
+            // Native custody excludes a direct Child. Keep that separation
+            // fail-closed even if a future caller retains both capabilities.
+            return native_status;
+        }
+        direct_status
+            .filter(|_| direct_subject == Some(provider))
+            .or(native_status)
+    }
+
+    fn capture_stderr(&mut self, bytes: &[u8]) {
+        if let Some(log) = &mut self.stderr_log {
+            log.push(bytes);
+        }
+        for byte in bytes {
+            if self.stderr.len() == 64 * 1024 {
+                self.stderr.pop_front();
+            }
+            self.stderr.push_back(*byte);
+        }
+    }
     /// A history reader owns no process, network connection, or execution
     /// authority. It keeps the ordinary bounded store and paging contract.
     fn run_history(&mut self, initial: Step) -> Result<(), String> {
@@ -2037,228 +2449,280 @@ impl Actor {
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
-        self.step(initial)?;
-        let mut stdout_eof = false;
-        let mut stderr_eof = false;
-        let mut closing = None;
-        let mut partial_started = None;
-        let mut interrupt_sent = false;
-        let mut interrupt_error = String::new();
-        loop {
-            if self.stop.load(Ordering::Acquire) {
-                if closing.is_none() {
-                    closing = Some(Instant::now());
-                }
-                let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
-                if busy && !interrupt_sent && self.pending.is_empty() {
-                    match self.adapter.command(Command::Interrupt) {
-                        Ok(step) => {
-                            self.step(step)?;
-                            interrupt_sent = true;
-                        }
-                        // A just-submitted turn may not have its provider ID yet.
-                        // Continue draining until it can be interrupted or the deadline expires.
-                        Err(error) => interrupt_error = error,
-                    }
-                }
-                if self.pending.is_empty()
-                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
-                {
-                    return Ok(());
-                }
-                if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
-                    return Err(format!(
-                        "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
-                    ));
-                }
-            }
-            self.drain_commands(closing.is_some())?;
-            // Parse every frame that already arrived. Gating this on an empty stdin
-            // queue froze streaming for a whole turn against any provider that reads
-            // stdin only between turns, then killed the session by blaming its
-            // framing; a stalled write has its own `write_started` deadline below.
-            let mut frames_ready = false;
-            let mut parsed = 0usize;
+        let result = (|| {
+            self.step(initial)?;
+            let mut stdout_eof = false;
+            let mut stderr_eof = false;
+            let mut closing = None;
+            let mut partial_started = None;
+            let mut interrupt_sent = false;
+            let mut interrupt_error = String::new();
+            let mut garbage_lines = 0usize;
+            let mut garbage_total = 0u64;
             loop {
-                let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
-                    break;
-                };
-                if newline == 0 {
-                    self.output.drain(..1);
-                    self.scanned = 0;
-                    continue;
-                }
-                if parsed == FRAMES_PER_POLL {
-                    frames_ready = true;
-                    break;
-                }
-                let frame = serde_json::from_slice(&self.output[..newline]).map_err(|error| {
-                    format!("Unsupported provider stdout (expected JSON-lines): {error}")
-                })?;
-                self.output.drain(..=newline);
-                self.scanned = 0;
-                partial_started = None;
-                parsed += 1;
-                self.first_frame = true;
-                let step = self.adapter.receive(frame)?;
-                self.provider_step(step)?;
-            }
-            if self.output.len() > FRAME_LIMIT {
-                return Err("Provider stdout frame exceeds 32 MiB".into());
-            }
-            // Only a genuinely incomplete line is on the framing deadline.
-            if frames_ready || self.output.is_empty() {
-                partial_started = None;
-            } else {
-                let since = partial_started.get_or_insert_with(Instant::now);
-                if since.elapsed() > IO_TIMEOUT {
-                    return Err(
-                        "Provider JSON frame remained incomplete or blocked for 30 seconds".into(),
-                    );
-                }
-            }
-            if stdout_eof && self.pending.is_empty() {
-                if !self.output.is_empty() {
-                    return Err("Provider ended with an incomplete JSON line".into());
-                }
-                if let Some(status) = self
-                    .child
-                    .as_mut()
-                    .ok_or("Provider process unavailable")?
-                    .observe_exit_within(PROTOCOL_EXIT_GRACE)
-                    .map_err(|error| error.to_string())?
-                {
-                    if status.success() {
+                let housekeeping = self.adapter.tick();
+                self.step(housekeeping)?;
+                if self.stop.load(Ordering::Acquire) {
+                    if closing.is_none() {
+                        closing = Some(Instant::now());
+                    }
+                    let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+                    if busy && !interrupt_sent && self.pending.is_empty() {
+                        match self.adapter.command(Command::Interrupt) {
+                            Ok(step) => {
+                                self.step(step)?;
+                                interrupt_sent = true;
+                            }
+                            // A just-submitted turn may not have its provider ID yet.
+                            // Continue draining until it can be interrupted or the deadline expires.
+                            Err(error) => interrupt_error = error,
+                        }
+                    }
+                    if self.pending.is_empty()
+                        && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
+                    {
                         return Ok(());
                     }
-                    return Err(format!("Provider exited with {status}"));
+                    if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
+                        return Err(format!(
+                            "Provider did not confirm interruption within 30 seconds ({interrupt_error}). Backend work may still be active; check it before restarting the session"
+                        ));
+                    }
                 }
-                return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
-            }
-            if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
-                return Err(
-                    "Provider initialization timed out without a JSON protocol frame".into(),
-                );
-            }
-            if self
-                .write_started
-                .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
-            {
-                return Err("Provider stdin stalled for 30 seconds".into());
-            }
-            if self.dirty
-                && self.visible.load(Ordering::Acquire)
-                && self.last_present.elapsed() >= PRESENT_INTERVAL
-            {
-                self.dirty = false;
-                self.last_present = Instant::now();
-                (self.notify)(Update::Presentation);
-            }
-            let mut fds = [
-                libc::pollfd {
-                    fd: self.wake.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if stdout_eof || self.output.len() > FRAME_LIMIT {
-                        -1
-                    } else {
-                        stdout.as_raw_fd()
-                    },
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if self.pending.is_empty() {
-                        -1
-                    } else {
-                        stdin.as_raw_fd()
-                    },
-                    events: libc::POLLOUT,
-                    revents: 0,
-                },
-            ];
-            let timeout = if frames_ready
-                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
-            {
-                0
-            } else if self.dirty && self.visible.load(Ordering::Acquire) {
-                50
-            } else if !self.first_frame
-                || !self.output.is_empty()
-                || self.write_started.is_some()
-                || closing.is_some()
-            {
-                250
-            } else {
-                -1
-            };
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error.to_string());
-                }
-            }
-            let mut buffer = [0u8; 8192];
-            if fds[0].revents != 0 {
-                while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
-            }
-            if fds[3].revents != 0 {
-                if let Some(line) = self.pending.front() {
-                    match stdin.write(&line[self.offset..]) {
-                        Ok(0) => return Err("Provider closed stdin".into()),
-                        Ok(n) => {
-                            self.offset += n;
-                            self.queued -= n;
-                            if self.offset == line.len() {
-                                self.pending.pop_front();
-                                self.offset = 0;
-                                self.write_started = if self.pending.is_empty() {
-                                    None
-                                } else {
-                                    Some(Instant::now())
-                                };
+                self.drain_commands(closing.is_some())?;
+                // Parse every frame that already arrived. Gating this on an empty stdin
+                // queue froze streaming for a whole turn against any provider that reads
+                // stdin only between turns, then killed the session by blaming its
+                // framing; a stalled write has its own `write_started` deadline below.
+                let mut frames_ready = false;
+                let mut parsed = 0usize;
+                loop {
+                    let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
+                        break;
+                    };
+                    if newline == 0 {
+                        self.output.drain(..1);
+                        self.scanned = 0;
+                        continue;
+                    }
+                    if parsed == FRAMES_PER_POLL {
+                        frames_ready = true;
+                        break;
+                    }
+                    let frame = match self.adapter.decode(&self.output[..newline]) {
+                        Ok(frame) => {
+                            garbage_lines = 0;
+                            Some(frame)
+                        }
+                        Err(error) => {
+                            garbage_lines += 1;
+                            garbage_total = garbage_total.saturating_add(1);
+                            let preview = super::protocol::preview(&self.output[..newline], 200);
+                            if garbage_total <= 3 || garbage_total.is_power_of_two() {
+                                tracing::warn!(%preview, %error, consecutive = garbage_lines, ignored_total=garbage_total, "Skipping non-JSON provider stdout line");
                             }
+                            if garbage_lines >= 8 {
+                                return Err(format!(
+                                    "Provider printed 8 consecutive invalid protocol lines. Last output: {preview}"
+                                ));
+                            }
+                            None
+                        }
+                    };
+                    self.output.drain(..=newline);
+                    self.scanned = 0;
+                    partial_started = None;
+                    parsed += 1;
+                    let Some(frame) = frame else {
+                        continue;
+                    };
+                    self.first_frame = true;
+                    let step = self.adapter.receive(frame)?;
+                    self.provider_step(step)?;
+                }
+                if self.output.len() > FRAME_LIMIT {
+                    return Err("Provider stdout frame exceeds 32 MiB".into());
+                }
+                // Only a genuinely incomplete line is on the framing deadline.
+                if frames_ready || self.output.is_empty() {
+                    partial_started = None;
+                } else {
+                    let since = partial_started.get_or_insert_with(Instant::now);
+                    if since.elapsed() > IO_TIMEOUT {
+                        return Err(
+                            "Provider JSON frame remained incomplete or blocked for 30 seconds"
+                                .into(),
+                        );
+                    }
+                }
+                // A parsing budget can leave complete lines queued even after
+                // the pipe closes. Keep fair poll passes until those drain.
+                if stdout_eof && self.pending.is_empty() && !frames_ready {
+                    if !self.output.is_empty() {
+                        return Err("Provider ended with an incomplete JSON line".into());
+                    }
+                    if let Some(status) = self
+                        .child
+                        .as_mut()
+                        .ok_or("Provider process unavailable")?
+                        .observe_exit_within(PROTOCOL_EXIT_GRACE)
+                        .map_err(|error| error.to_string())?
+                    {
+                        // Exit notification and stdout EOF can win the poll before
+                        // the last stderr write. Drain the exact child's pipe before
+                        // constructing its diagnostic, with a bounded work budget.
+                        let mut tail_buffer = [0u8; 8192];
+                        for _ in 0..64 {
+                            match stderr.read(&mut tail_buffer) {
+                                Ok(0) => break,
+                                Ok(count) => self.capture_stderr(&tail_buffer[..count]),
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                    continue;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if status.success() {
+                            return Ok(());
+                        }
+                        return Err(format!("Provider exited with {status}"));
+                    }
+                    return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
+                }
+                if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
+                    return Err(
+                        "Provider initialization timed out without a JSON protocol frame".into(),
+                    );
+                }
+                if self
+                    .write_started
+                    .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
+                {
+                    return Err("Provider stdin stalled for 30 seconds".into());
+                }
+                if self.dirty
+                    && self.visible.load(Ordering::Acquire)
+                    && self.last_present.elapsed() >= PRESENT_INTERVAL
+                {
+                    self.dirty = false;
+                    self.last_present = Instant::now();
+                    (self.notify)(Update::Presentation);
+                }
+                let mut fds = [
+                    libc::pollfd {
+                        fd: self.wake.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if stdout_eof || self.output.len() > FRAME_LIMIT {
+                            -1
+                        } else {
+                            stdout.as_raw_fd()
+                        },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if self.pending.is_empty() {
+                            -1
+                        } else {
+                            stdin.as_raw_fd()
+                        },
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    },
+                ];
+                let timeout = if frames_ready
+                    || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
+                {
+                    0
+                } else if self.dirty && self.visible.load(Ordering::Acquire) {
+                    50
+                } else if !self.first_frame
+                    || stdout_eof
+                    || !self.output.is_empty()
+                    || self.write_started.is_some()
+                    || closing.is_some()
+                {
+                    250
+                } else {
+                    -1
+                };
+                let timeout = self.adapter.deadline().map_or(timeout, |deadline| {
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(i32::MAX as u128) as i32;
+                    if timeout < 0 {
+                        remaining
+                    } else {
+                        timeout.min(remaining)
+                    }
+                });
+                if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error.to_string());
+                    }
+                }
+                let mut buffer = [0u8; 8192];
+                if fds[0].revents != 0 {
+                    while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
+                }
+                if fds[3].revents != 0 {
+                    if let Some(line) = self.pending.front() {
+                        match stdin.write(&line[self.offset..]) {
+                            Ok(0) => return Err("Provider closed stdin".into()),
+                            Ok(n) => {
+                                self.offset += n;
+                                self.queued -= n;
+                                if self.offset == line.len() {
+                                    self.pending.pop_front();
+                                    self.offset = 0;
+                                    self.write_started = if self.pending.is_empty() {
+                                        None
+                                    } else {
+                                        Some(Instant::now())
+                                    };
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => return Err(format!("Provider stdin: {e}")),
+                        }
+                    }
+                }
+                if fds[1].revents != 0 {
+                    let available = buffer.len().min(FRAME_LIMIT + 1 - self.output.len());
+                    match stdout.read(&mut buffer[..available]) {
+                        Ok(0) => {
+                            stdout_eof = true;
+                        }
+                        Ok(n) => {
+                            reserve_frame(&mut self.output, n)?;
+                            self.output.extend_from_slice(&buffer[..n]);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => return Err(format!("Provider stdin: {e}")),
+                        Err(e) => return Err(format!("Provider stdout: {e}")),
+                    }
+                }
+                if fds[2].revents != 0 {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) => stderr_eof = true,
+                        Ok(n) => self.capture_stderr(&buffer[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(format!("Provider stderr: {e}")),
                     }
                 }
             }
-            if fds[1].revents != 0 {
-                let available = buffer.len().min(FRAME_LIMIT + 1 - self.output.len());
-                match stdout.read(&mut buffer[..available]) {
-                    Ok(0) => stdout_eof = true,
-                    Ok(n) => {
-                        reserve_frame(&mut self.output, n)?;
-                        self.output.extend_from_slice(&buffer[..n]);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(format!("Provider stdout: {e}")),
-                }
-            }
-            if fds[2].revents != 0 {
-                match stderr.read(&mut buffer) {
-                    Ok(0) => stderr_eof = true,
-                    Ok(n) => {
-                        for byte in &buffer[..n] {
-                            if self.stderr.len() == 16384 {
-                                self.stderr.pop_front();
-                            }
-                            self.stderr.push_back(*byte);
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(format!("Provider stderr: {e}")),
-                }
-            }
-        }
+        })();
+        self.stderr_reader = Some(stderr);
+        result
     }
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
         for _ in 0..64 {
@@ -2266,10 +2730,12 @@ impl Actor {
             // queued write: a provider that reads stdin only between turns keeps
             // `pending` non-empty for the whole turn, and refusing to drain there left
             // UI commands unacknowledged until the caller's 10 second timeout.
-            if self.queued > QUEUE_BACKPRESSURE {
-                break;
-            }
-            let Ok((command, reply)) = self.incoming.try_recv() else {
+            let request = self.urgent_incoming.try_recv().ok().or_else(|| {
+                (self.queued <= QUEUE_BACKPRESSURE)
+                    .then(|| self.incoming.try_recv().ok())
+                    .flatten()
+            });
+            let Some((command, reply)) = request else {
                 break;
             };
             let (command, effects) = match command {
@@ -2525,13 +2991,18 @@ impl Actor {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            // Discard a previous internally-issued control's marker. Only
+            // this command owns the acknowledgement sender below.
+            self.adapter.command_ack();
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
-            };
+            }
+            .map_err(|error| super::protocol::preview(error.as_bytes(), 1024));
             match prepared {
                 Ok(step) => {
                     effects.possible();
+                    let acknowledgement = self.adapter.command_ack();
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;
                     }
@@ -2545,17 +3016,21 @@ impl Actor {
                             detail: "Waiting for provider turn".into(),
                         });
                     }
-                    let _ = reply.send(result.clone());
+                    if result.is_ok()
+                        && let Some(id) = acknowledgement
+                    {
+                        self.control_replies.insert(id, reply);
+                    } else {
+                        let _ = reply.send(result.clone());
+                    }
                     result?;
                     if started {
                         self.publish_activity();
                     }
                 }
                 Err(message) => {
-                    self.apply(Event::Error {
-                        message: message.clone(),
-                        fatal: false,
-                    });
+                    // The caller owns refusals. A handled request must not
+                    // leave a standing error on the shared conversation.
                     let _ = reply.send(Err(message));
                 }
             }
@@ -2563,7 +3038,12 @@ impl Actor {
         Ok(())
     }
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
-        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
+        if !state.ready
+            || state.exited
+            || !self.pending.is_empty()
+            || !self.output.is_empty()
+            || !self.control_replies.is_empty()
+        {
             UpdateReadiness::Unready
         } else if state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
@@ -2710,7 +3190,10 @@ impl Actor {
         // Stop further Store writes, then report the original error after
         // this bounded frame's semantic proof has been published.
         let mut frame_error = None;
-        for event in step.events {
+        for mut event in step.events {
+            if let Event::Error { message, .. } | Event::HistoryError(message) = &mut event {
+                *message = super::protocol::preview(message.as_bytes(), 1024);
+            }
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
                     let update = self.execution.start(run, key)?;
@@ -2851,8 +3334,22 @@ impl Actor {
                     let update = self.execution.finish(run, outcome)?;
                     (self.notify)(Update::Execution { run, update });
                 }
+                crate::agent_execution::ProviderEvent::Diagnostic { message } => {
+                    self.execution.observe(
+                        run,
+                        &Event::Error {
+                            message: super::protocol::preview(message.as_bytes(), 1024),
+                            fatal: false,
+                        },
+                    );
+                }
                 crate::agent_execution::ProviderEvent::Started { .. } => unreachable!(),
                 crate::agent_execution::ProviderEvent::Scope => {}
+            }
+        }
+        for (id, result) in self.adapter.control_replies() {
+            if let Some(reply) = self.control_replies.remove(&id) {
+                let _ = reply.send(result);
             }
         }
         self.publish_activity();
@@ -2881,6 +3378,12 @@ impl Actor {
         content: Option<crate::notifications::Content>,
         preview_observed: bool,
     ) {
+        if matches!(&event, Event::PastTurnFinished { .. }) {
+            if let Some(evidence) = self.attention.apply(&event) {
+                (self.notify)(Update::PastAttention(evidence));
+            }
+            return;
+        }
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
@@ -2888,7 +3391,7 @@ impl Actor {
             if let Some(evidence) = self.attention.apply(&event) {
                 (self.notify)(Update::AttentionContext { evidence, content });
             }
-            if !matches!(event, Event::TurnStarted) {
+            if matches!(event, Event::TurnSettled) {
                 return;
             }
         }
@@ -2913,14 +3416,13 @@ impl Actor {
         // Owned edit summaries have their own item/byte budgets; they do not
         // count toward the provider's request/model identity budget.
         let file_changes = std::mem::take(&mut state.file_changes);
-        let mut counter = ByteCounter(0);
-        let _ = serde_json::to_writer(&mut counter, &*state);
+        let retained = trim_metadata(&mut state);
         state.file_changes = file_changes;
         state.items = items;
         for (agent, items) in state.subagents.iter_mut().zip(child_items) {
             agent.items = items;
         }
-        self.retained = counter.0;
+        self.retained = retained;
         state.generation = state.generation.saturating_add(1);
         self.dirty = true;
     }
@@ -2933,6 +3435,7 @@ impl Actor {
             self.dirty = true;
         }
         let activity = state.activity();
+        let outcome = state.outcome.clone();
         let generation = state.generation;
         let waiting_fingerprint = if activity == ActivityState::Waiting {
             state.waiting_fingerprint()
@@ -2949,6 +3452,7 @@ impl Actor {
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         let activity_changed = activity != self.activity;
+        let outcome_changed = outcome != self.activity_outcome;
         if activity_changed {
             self.activity = activity;
             if let Some((run, update)) = self.execution.activity(activity) {
@@ -2962,10 +3466,13 @@ impl Actor {
                 kind: crate::notifications::Kind::Waiting,
             });
         }
-        if activity_changed {
+        // Outcomes can change while activity stays idle.
+        if activity_changed || outcome_changed {
+            self.activity_outcome = outcome.clone();
             (self.notify)(Update::Activity {
                 state: activity,
                 generation,
+                outcome,
             });
         }
         if became_ready {
@@ -3028,6 +3535,133 @@ impl Write for BoundedFrame {
         Ok(())
     }
 }
+fn provider_exit_diagnostic(
+    status: Option<std::process::ExitStatus>,
+    error: &str,
+    stderr: &str,
+) -> super::ProviderExitDiagnostic {
+    let output = super::protocol::terminal_output::display(stderr.to_owned());
+    let output = output
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .collect::<String>();
+    let output =
+        output[output.ceil_char_boundary(output.len().saturating_sub(64 * 1024))..].to_owned();
+    let lower = format!(
+        "{output} {}",
+        super::protocol::preview(error.as_bytes(), 1024)
+    )
+    .to_lowercase();
+    let hint = if lower.contains("unauthorized")
+        || lower.contains("authentication")
+        || lower.contains("api key")
+    {
+        " Sign in again, then restart the session."
+    } else if lower.contains("rate limit") || lower.contains("too many requests") {
+        " Wait briefly, then restart the session."
+    } else if lower.contains("not found") || lower.contains("no such file or directory") {
+        " Install or configure the provider executable, then restart the session."
+    } else if lower.contains("out of memory") || lower.contains("cannot allocate memory") || {
+        use std::os::unix::process::ExitStatusExt;
+        status.is_some_and(|status| status.signal() == Some(9))
+    } {
+        " Free memory, then restart the session."
+    } else {
+        " Restart session to continue."
+    };
+    let detail = if error.to_lowercase().contains("tungstenite")
+        || error.to_lowercase().contains("inspect")
+    {
+        "Provider connection closed".into()
+    } else {
+        super::protocol::preview(error.as_bytes(), 240)
+    };
+    let reason = if status.is_some() {
+        execution::exit_reason(status, Some(&detail))
+    } else {
+        detail
+    };
+    let lines: Vec<_> = output
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            let lower = line.to_lowercase();
+            !line.is_empty() && !lower.contains("tungstenite") && !lower.contains("inspect")
+        })
+        .rev()
+        .take(3)
+        .collect();
+    let tail = lines
+        .into_iter()
+        .rev()
+        .map(|line| super::protocol::preview(line.as_bytes(), 200))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let summary = if tail.is_empty() {
+        format!("{reason}.{hint}")
+    } else {
+        format!("{reason}.\n{tail}\n{}", hint.trim())
+    };
+    super::ProviderExitDiagnostic {
+        summary,
+        output,
+        log: None,
+    }
+}
+
+// Presentation history must never turn a healthy provider into a failed actor.
+// Old denial payloads are the first expendable data; retain their advisory
+// identity and keep the newest useful inputs intact.
+fn trim_metadata(state: &mut Snapshot) -> usize {
+    fn bytes(state: &Snapshot) -> usize {
+        let mut count = ByteCounter(0);
+        let _ = serde_json::to_writer(&mut count, state);
+        count.0
+    }
+    let mut retained = bytes(state);
+    if retained <= STATE_LIMIT {
+        return retained;
+    }
+    tracing::warn!(
+        bytes = retained,
+        "Trimming provider presentation metadata to budget"
+    );
+    for index in 0..state.permission_denials.len() {
+        const OMITTED: &str =
+            "{\"_cagents_preview\":\"Older tool input omitted to fit the presentation budget\"}";
+        if state.permission_denials[index]
+            .tool_input
+            .as_ref()
+            .is_some_and(|input| input.len() > OMITTED.len())
+        {
+            state.permission_denials[index].tool_input = Some(OMITTED.into());
+            retained = bytes(state);
+            if retained <= STATE_LIMIT {
+                return retained;
+            }
+        }
+    }
+    // Discovery lists are presentation metadata, never outstanding approvals.
+    // Drop oldest entries before considering live controls.
+    while retained > STATE_LIMIT {
+        if !state.commands.is_empty() {
+            state.commands.remove(0);
+        } else if !state.skills.is_empty() {
+            state.skills.remove(0);
+        } else if !state.models.is_empty() {
+            state.models.remove(0);
+        } else if !state.queue_removals.is_empty() {
+            state.queue_removals.remove(0);
+        } else if !state.permission_denials.is_empty() {
+            state.permission_denials.remove(0);
+        } else {
+            break;
+        }
+        retained = bytes(state);
+    }
+    retained
+}
+
 struct ByteCounter(usize);
 impl Write for ByteCounter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -3119,14 +3753,22 @@ fn apply_projected_event(
             | Event::SubagentItem { .. }
             | Event::SubagentTextDelta { .. }
             | Event::SubagentOutputDelta { .. }
+            | Event::SubagentInputDelta { .. }
             | Event::SubagentItemsRemoved { .. }
     );
+    let input_delta = matches!(
+        &event,
+        Event::InputDelta { .. } | Event::SubagentInputDelta { .. }
+    );
     match event {
-        Event::OutputDelta { id, offset, delta } => {
+        Event::InputDelta { id, offset, delta } | Event::OutputDelta { id, offset, delta } => {
             if let Some(&index) = indices.get(&id) {
                 let item = Arc::make_mut(&mut state.items[index]);
                 let body = match &mut item.content {
-                    ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } => {
+                    ItemContent::Tool { input, .. } if input_delta => Some(input),
+                    ItemContent::Command { output, .. } | ItemContent::Tool { output, .. }
+                        if !input_delta =>
+                    {
                         Some(output)
                     }
                     _ => None,
@@ -3139,12 +3781,46 @@ fn apply_projected_event(
                 }
             }
         }
+        Event::ProviderExit(diagnostic) => state.provider_exit = Some(diagnostic),
         Event::TurnStarted => {
+            state.provider_exit = None;
             state.prompt_suggestion = None;
             state.turn_generation = state.turn_generation.wrapping_add(1);
             state.finished_at = None;
+            state.outcome = None;
         }
-        Event::TurnSettled | Event::TurnFinished { .. } | Event::Execution { .. } => {}
+        Event::TurnFinished { outcome, .. } => {
+            use crate::{agent::ActivityOutcome, notifications::Kind};
+            // The adapter owns request lifetimes. A parent's terminal outcome
+            // does not expire a surviving child's decision or optional question.
+            // Only its scoped RequestResolved events remove those controls.
+            match outcome {
+                Kind::Cancelled => {
+                    state.waiting = false;
+                    state.busy = false;
+                    let all = state.capabilities.interrupt_stops_background;
+                    finish_snapshot_work(state, ToolStatus::Stopped, all);
+                }
+                Kind::Failed => {
+                    state.waiting = false;
+                    state.busy = false;
+                    finish_snapshot_work(state, ToolStatus::Failed, false);
+                }
+                _ => {}
+            }
+            state.outcome = match outcome {
+                Kind::Succeeded => Some(ActivityOutcome::Succeeded),
+                Kind::Cancelled => Some(ActivityOutcome::Cancelled),
+                Kind::Failed => Some(ActivityOutcome::Failed {
+                    reason: state
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "The provider reported a failed turn".into()),
+                }),
+                _ => state.outcome.take(),
+            };
+        }
+        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished { .. } => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -3383,7 +4059,13 @@ fn apply_projected_event(
             }
             trim_subagent(agent);
         }
-        Event::SubagentOutputDelta {
+        Event::SubagentInputDelta {
+            id,
+            item_id,
+            offset,
+            delta,
+        }
+        | Event::SubagentOutputDelta {
             id,
             item_id,
             offset,
@@ -3392,10 +4074,16 @@ fn apply_projected_event(
             let agent = subagent(state, &id);
             if let Some(item) = agent.items.iter_mut().find(|item| item.id == item_id) {
                 let item = Arc::make_mut(item);
-                if let ItemContent::Command { output, .. } | ItemContent::Tool { output, .. } =
-                    &mut item.content
-                    && output.len() == offset
-                {
+                let output = match &mut item.content {
+                    ItemContent::Tool { input, .. } if input_delta => Some(input),
+                    ItemContent::Command { output, .. } | ItemContent::Tool { output, .. }
+                        if !input_delta =>
+                    {
+                        Some(output)
+                    }
+                    _ => None,
+                };
+                if let Some(output) = output.filter(|output| output.len() == offset) {
                     output.push_str(&delta);
                     let at = observed_at();
                     item.started_at = item.started_at.or(item.at).or(at);
@@ -3543,16 +4231,20 @@ fn apply_projected_event(
         Event::Composer { text } => state.composer = Some(text),
         Event::OpenUrl { url, instructions } => state.open_url = Some((url, instructions)),
         Event::Error { message, fatal } => {
+            // A later diagnosis does not revise a provider-confirmed result.
             state.error = Some(message);
             if fatal {
                 state.prompt_suggestion = None;
                 state.busy = false;
+                state.waiting = false;
+                state.requests.clear();
                 state.history_loading = false;
             }
         }
         Event::Exited { .. } => {
             state.prompt_suggestion = None;
             state.exited = true;
+            state.requests.clear();
             state.waiting = false;
             state.busy = false;
             state.ready = false;
@@ -3570,6 +4262,37 @@ fn apply_projected_event(
         trim_subagents(state);
     }
     child_text_copy::finish(state, child_copy_update);
+}
+
+fn finish_snapshot_work(state: &mut Snapshot, status: ToolStatus, include_background: bool) {
+    fn finish_items(items: &mut [Arc<Item>], status: ToolStatus) {
+        for item in items {
+            if item.content.status() != Some(ToolStatus::Running) {
+                continue;
+            }
+            match &mut Arc::make_mut(item).content {
+                ItemContent::Tool {
+                    status: current, ..
+                }
+                | ItemContent::Command {
+                    status: current, ..
+                }
+                | ItemContent::Changes {
+                    status: current, ..
+                } => *current = status,
+                _ => {}
+            }
+        }
+    }
+    finish_items(&mut state.items, status);
+    for child in &mut state.subagents {
+        if child.status == ToolStatus::Running && (!child.background || include_background) {
+            child.status = status;
+            child.waiting = false;
+            child.detail.clear();
+            finish_items(&mut child.items, status);
+        }
+    }
 }
 
 /// Running task identities authorize interruption and idle waits. Retiring
@@ -3761,6 +4484,758 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unchanged_idle_activity_publishes_new_outcomes_once_with_their_reason() {
+        struct ActivityFixture;
+        impl Adapter for ActivityFixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(ActivityFixture);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = send.send(update);
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        receive.try_iter().for_each(drop);
+        for outcome in [
+            crate::agent::ActivityOutcome::Failed {
+                reason: "Provider exited with status 3".into(),
+            },
+            crate::agent::ActivityOutcome::Succeeded,
+        ] {
+            {
+                let mut state = handle.0.state.lock().unwrap();
+                state.outcome = Some(outcome.clone());
+                state.generation += 1;
+            }
+            handle.command(Command::Compact).unwrap();
+            let updates = receive
+                .try_iter()
+                .filter_map(|update| match update {
+                    Update::Activity { state, outcome, .. } => Some((state, outcome)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(updates, vec![(ActivityState::Idle, Some(outcome))]);
+            handle.command(Command::Compact).unwrap();
+            assert!(
+                !receive
+                    .try_iter()
+                    .any(|update| matches!(update, Update::Activity { .. }))
+            );
+        }
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn isolated_stdout_noise_is_tolerated_and_consecutive_noise_is_bounded() {
+        const LOG: &str = "CAGENTS_STDOUT_NOISE_TEST_LOG";
+        let Some(log) = std::env::var_os(LOG) else {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let log = directory.path().join("warnings.log");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::runtime::tests::isolated_stdout_noise_is_tolerated_and_consecutive_noise_is_bounded", "--nocapture"])
+                .env(LOG,&log).output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let warnings = std::fs::read_to_string(log).unwrap();
+            assert!(warnings.contains("Skipping non-JSON provider stdout line"));
+            assert!(warnings.contains("stray plain output"));
+            assert!(
+                !warnings.contains(&"x".repeat(201)),
+                "provider preview must remain bounded"
+            );
+            assert!(
+                !warnings.contains('\x1b'),
+                "provider controls must be escaped in logs"
+            );
+            return;
+        };
+        let collector = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(log).unwrap()))
+            .finish();
+        tracing::subscriber::set_global_default(collector).unwrap();
+        for (lines, fails) in [
+            (
+                "{\"text\":\"before\"}\nstray plain output\n{\"text\":\"after\"}\n".to_owned(),
+                false,
+            ),
+            (
+                (format!("garbage\x1b{}\n", "x".repeat(1000))).repeat(8),
+                true,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let stream = directory.path().join("stream");
+            std::fs::write(&stream, lines).unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    "cat -- \"$1\"; sleep 0.1".into(),
+                    "provider".into(),
+                    stream.to_string_lossy().into_owned(),
+                ],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let state = until(&handle, |snapshot| snapshot.exited);
+            if fails {
+                let error = state.error.as_deref().unwrap();
+                assert!(error.contains("8 consecutive"));
+                assert!(error.len() <= 1024);
+                assert!(!error.contains('\x1b'));
+                assert!(error.contains("garbage"));
+            } else {
+                assert!(state.error.is_none(), "{:?}", state.error);
+                assert!(state.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "beforeafter")));
+            }
+        }
+    }
+
+    #[test]
+    fn actor_remains_responsive_after_sixty_four_large_denials() {
+        struct Denials;
+        impl Adapter for Denials {
+            fn initialize(&mut self) -> Result<Step, String> {
+                let mut events = (0..64)
+                    .map(|index| {
+                        Event::PermissionDenied(super::super::PermissionDenial {
+                            tool_use_id: index.to_string(),
+                            tool_name: "Write".into(),
+                            tool_input: Some("x".repeat(64 * 1024)),
+                            reason: "denied".into(),
+                            reason_type: None,
+                            agent_id: None,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                events.push(Event::Ready(true));
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Denials);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |state| state.ready);
+        assert!(!snapshot.exited);
+        assert!(snapshot.error.is_none());
+        assert_eq!(snapshot.permission_denials.len(), 64);
+        assert_eq!(
+            snapshot
+                .permission_denials
+                .last()
+                .unwrap()
+                .tool_input
+                .as_ref()
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= STATE_LIMIT);
+        handle.command(Command::Compact).unwrap();
+        assert!(!handle.snapshot(None).unwrap().exited);
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn metadata_denials_keep_newest_inputs_under_budget() {
+        let mut state = Snapshot::default();
+        for index in 0..64 {
+            state
+                .permission_denials
+                .push(super::super::PermissionDenial {
+                    tool_use_id: index.to_string(),
+                    tool_name: "Write".into(),
+                    tool_input: Some("x".repeat(64 * 1024)),
+                    reason: "denied".into(),
+                    reason_type: None,
+                    agent_id: None,
+                });
+        }
+        assert!(trim_metadata(&mut state) <= STATE_LIMIT);
+        assert_eq!(state.permission_denials.len(), 64);
+        assert!(
+            state.permission_denials[0]
+                .tool_input
+                .as_deref()
+                .unwrap()
+                .contains("omitted")
+        );
+        assert_eq!(
+            state.permission_denials[63]
+                .tool_input
+                .as_ref()
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+    }
+
+    #[test]
+    fn default_provider_exit_retains_complete_private_stderr_without_general_log_exposure() {
+        const STAGE: &str = "CAGENTS_PRIVATE_STDERR_RUNTIME_TEST";
+        let Some(directory) = std::env::var_os(STAGE) else {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure","--nocapture"])
+                .env(STAGE,directory.path()).env("XDG_CACHE_HOME",directory.path().join("cache"))
+                .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let general = std::fs::read_to_string(directory.path().join("general.log")).unwrap();
+            assert!(
+                !general.contains("private-api-token"),
+                "raw stderr must stay in the private diagnostic log"
+            );
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let collector = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::sync::Mutex::new(
+                std::fs::File::create(directory.join("general.log")).unwrap(),
+            ))
+            .finish();
+        tracing::subscriber::set_global_default(collector).unwrap();
+        let payload = format!(
+            "<<private-api-token>>\n{}\x1b[31mAuthentication failed: last diagnostic\x1b[0m\n",
+            "trace detail\n".repeat(10000)
+        );
+        let source = directory.join("provider-stderr");
+        std::fs::write(&source, &payload).unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "cat -- \"$1\" >&2; exit 3".into(),
+                "provider".into(),
+                source.to_string_lossy().into_owned(),
+            ],
+            working_directory: directory.clone(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let state = until(&handle, |state| state.exited);
+        let diagnostic = state.provider_exit.as_ref().unwrap();
+        assert!(diagnostic.summary.len() <= 1024 && diagnostic.summary.lines().count() <= 5);
+        assert!(diagnostic.summary.contains("status 3"));
+        assert!(!diagnostic.summary.contains('\x1b'));
+        assert!(diagnostic.output.len() <= 64 * 1024);
+        let log = diagnostic.log.as_ref().unwrap();
+        assert_eq!(log.bytes, payload.len() as u64);
+        assert_eq!(log.omitted, 0);
+        let mut bytes = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let (page, next, omitted) = handle.provider_exit_output(&log.id, cursor).unwrap();
+            assert!(page.len() <= 256 * 1024);
+            assert_eq!(omitted, 0);
+            bytes.extend(page);
+            if let Some(next) = next {
+                cursor = next;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(bytes, payload.as_bytes());
+        assert!(handle.provider_exit_output("another-run", 0).is_err());
+        assert!(handle.provider_exit_output(&log.id, log.bytes + 1).is_err());
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn provider_notice_is_readable_bounded_and_preserves_details() {
+        use std::os::unix::process::ExitStatusExt;
+        let stderr = format!(
+            "{}\n\x1b[31mAuthentication failed\x1b[0m\n",
+            "debug noise\n".repeat(4000)
+        );
+        let diagnostic = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(3 << 8)),
+            "tungstenite: inspect exact thread",
+            &stderr,
+        );
+        assert!(diagnostic.summary.len() <= 1024);
+        assert!(diagnostic.summary.lines().count() <= 5);
+        assert!(diagnostic.summary.contains("status 3"));
+        assert!(diagnostic.summary.contains("Authentication failed"));
+        assert!(!diagnostic.summary.contains("tungstenite"));
+        assert!(!diagnostic.summary.contains('\x1b'));
+        assert!(!diagnostic.output.contains('\x1b'));
+        assert!(diagnostic.output.len() > diagnostic.summary.len());
+        let missing = provider_exit_diagnostic(None, "Provider executable not found", "");
+        assert!(missing.summary.contains("Install or configure"));
+        let killed = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(9)),
+            "socket closed",
+            "",
+        );
+        assert!(killed.summary.contains("signal 9") && killed.summary.contains("Free memory"));
+        let invalid = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(0)),
+            "Provider printed 8 consecutive invalid protocol lines. Last output: garbage",
+            "",
+        );
+        assert!(invalid.summary.contains("status 0"));
+        assert!(
+            invalid
+                .summary
+                .contains("8 consecutive invalid protocol lines. Last output: garbage"),
+            "a status must not erase the bounded framing diagnosis"
+        );
+    }
+
+    #[test]
+    fn compact_provider_notice_omits_transport_jargon_from_stderr_but_preserves_saved_details() {
+        use std::os::unix::process::ExitStatusExt;
+        let stderr = "Authentication failed\ntungstenite: connection closed\ninspect the exact thread for raw output\n";
+        let diagnostic = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(3 << 8)),
+            "socket closed",
+            stderr,
+        );
+        assert!(diagnostic.summary.contains("Authentication failed"));
+        assert!(!diagnostic.summary.to_lowercase().contains("tungstenite"));
+        assert!(!diagnostic.summary.to_lowercase().contains("inspect"));
+        assert_eq!(
+            diagnostic.output, stderr,
+            "saved readable output must remain faithful to provider diagnostics"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_and_cancel_do_not_retain_live_approval_waiting() {
+        let waiting = || Snapshot {
+            ready: true,
+            busy: true,
+            waiting: true,
+            requests: vec![super::super::Request {
+                kind: super::super::RequestKind::Approval,
+                id: "pending".into(),
+                title: "Approve tool".into(),
+                description: String::new(),
+                fields: Vec::new(),
+                actions: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        for outcome in [
+            crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed,
+        ] {
+            let mut state = waiting();
+            let mut indices = BTreeMap::new();
+            assert_eq!(state.activity(), ActivityState::Waiting);
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::TurnFinished { key: None, outcome },
+            );
+            assert_eq!(state.requests.len(), 1, "the adapter owns decision expiry");
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::RequestResolved {
+                    id: "pending".into(),
+                },
+            );
+            assert!(state.requests.is_empty());
+            assert!(!state.waiting);
+            assert_eq!(state.activity(), ActivityState::Idle);
+            assert!(state.outcome.is_some());
+            apply_event(&mut state, &mut indices, Event::TurnStarted);
+            assert_eq!(
+                state.activity(),
+                ActivityState::Idle,
+                "an old approval must not revive when a later prompt clears its terminal outcome"
+            );
+        }
+        let mut state = waiting();
+        apply_event(
+            &mut state,
+            &mut BTreeMap::new(),
+            Event::Error {
+                message: "Provider failed".into(),
+                fatal: true,
+            },
+        );
+        assert!(state.requests.is_empty());
+        assert!(!state.waiting);
+        let mut state = waiting();
+        apply_event(
+            &mut state,
+            &mut BTreeMap::new(),
+            Event::Exited { code: Some(3) },
+        );
+        assert!(state.requests.is_empty());
+        assert!(!state.waiting);
+        assert_eq!(state.activity(), ActivityState::Unknown);
+    }
+
+    #[test]
+    fn uncorrelated_past_outcome_never_borrows_current_attention_identity() {
+        let mut attention = TurnAttention::default();
+        attention.apply(&Event::TurnStarted);
+        let current = attention.key.clone();
+        assert!(
+            attention
+                .apply(&Event::PastTurnFinished {
+                    key: None,
+                    outcome: crate::notifications::Kind::Cancelled,
+                })
+                .is_none()
+        );
+        assert_eq!(attention.key, current);
+        assert_eq!(
+            attention
+                .apply(&Event::TurnFinished {
+                    key: None,
+                    outcome: crate::notifications::Kind::Succeeded,
+                })
+                .unwrap()
+                .key,
+            current
+        );
+    }
+
+    #[test]
+    fn delayed_old_turn_outcome_notifies_without_mutating_current_turn_metadata() {
+        struct LateResult;
+        impl Adapter for LateResult {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let events = match command {
+                    Command::SetFastMode { .. } => vec![
+                        Event::TurnStarted,
+                        Event::Status {
+                            busy: true,
+                            detail: "Working".into(),
+                        },
+                        Event::Request(super::super::Request {
+                            kind: super::super::RequestKind::Approval,
+                            id: "new-approval".into(),
+                            title: "New tool".into(),
+                            description: String::new(),
+                            fields: Vec::new(),
+                            actions: Vec::new(),
+                        }),
+                    ],
+                    Command::Interrupt => vec![
+                        Event::TurnFinished {
+                            key: None,
+                            outcome: crate::notifications::Kind::Cancelled,
+                        },
+                        Event::Status {
+                            busy: false,
+                            detail: "Stopped".into(),
+                        },
+                    ],
+                    Command::Compact => vec![Event::PastTurnFinished {
+                        key: Some("old-result".into()),
+                        outcome: crate::notifications::Kind::Cancelled,
+                    }],
+                    _ => return Err("Unexpected late-result fixture command".into()),
+                };
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(
+            spec,
+            Box::new(LateResult),
+            initial,
+            store,
+            None,
+            move |update| {
+                let _ = send.send(update);
+            },
+        )
+        .unwrap();
+        until(&handle, |state| state.ready);
+        handle
+            .command(Command::SetFastMode { enabled: true })
+            .unwrap();
+        let before = handle.snapshot(None).unwrap();
+        handle.command(Command::Compact).unwrap();
+        let after = handle.snapshot(None).unwrap();
+        assert_eq!(after.turn_generation, before.turn_generation);
+        assert_eq!(after.requests, before.requests);
+        assert_eq!(after.outcome, before.outcome);
+        assert_eq!(after.finished_at, before.finished_at);
+        assert_eq!(after.activity(), ActivityState::Waiting);
+        let updates = receive.try_iter().collect::<Vec<_>>();
+        assert!(updates.iter().any(|update|matches!(update,Update::PastAttention(evidence) if evidence.key=="old-result" && evidence.kind==crate::notifications::Kind::Cancelled)));
+        assert!(
+            !updates.iter().any(
+                |update| matches!(update,Update::Attention(evidence) if evidence.key=="old-result")
+            ),
+            "old evidence must not enter current-session attention coalescing or sample current rich context"
+        );
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn adapter_refusals_and_fatal_provider_errors_are_bounded_at_the_runtime_boundary() {
+        struct Verbose;
+        impl Adapter for Verbose {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                if matches!(command, Command::Compact) {
+                    Ok(Step {
+                        writes: vec![serde_json::json!({"fail":true})],
+                        ..Default::default()
+                    })
+                } else {
+                    Err(format!("Provider refusal: {}\x1b", "x".repeat(1024 * 1024)))
+                }
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Err(format!("Provider failure: {}\x1b", "x".repeat(1024 * 1024)))
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Verbose), initial, store, None, |_| {}).unwrap();
+        until(&handle, |state| state.ready);
+        let refusal = handle
+            .command(Command::SetModel {
+                model: "fixture".into(),
+                reasoning: None,
+            })
+            .unwrap_err();
+        assert!(refusal.len() <= 1024 && refusal.starts_with("Provider refusal:"));
+        assert!(!refusal.contains('\x1b'));
+        assert!(handle.snapshot(None).unwrap().error.is_none());
+        handle.command(Command::Compact).unwrap();
+        let snapshot = until(&handle, |state| state.exited);
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(error.len() <= 1024 && error.contains("Provider failure:"));
+        assert!(!error.contains('\x1b'));
+        let failure = handle.failure().unwrap();
+        assert!(failure.len() <= 1024 && failure.starts_with("Provider failure:"));
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn unacknowledged_controls_keep_upgrade_readiness_fenced_without_blocking_input() {
+        struct Controls(Option<String>);
+        impl Adapter for Controls {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                if matches!(command, Command::SetPermissionMode { .. }) {
+                    self.0 = Some("mode".into());
+                }
+                Ok(Step::default())
+            }
+            fn command_ack(&mut self) -> Option<String> {
+                self.0.take()
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Controls(None));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |state| state.ready);
+        let pending = handle
+            .enqueue_command(Command::SetPermissionMode {
+                mode: "manual".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            handle.check_update_readiness().unwrap(),
+            UpdateReadiness::Unready
+        );
+        assert!(pending.try_recv().is_err());
+        assert!(handle.snapshot(None).unwrap().error.is_none());
+        handle.close().unwrap();
+        assert!(
+            pending
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cancelled_work_does_not_become_running_again_when_the_next_turn_starts() {
+        let tool = Arc::new(Item {
+            id: "old-tool".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "Bash".into(),
+                input: "work".into(),
+                output: String::new(),
+                status: ToolStatus::Running,
+            },
+        });
+        let mut state = Snapshot {
+            items: vec![tool],
+            ..Default::default()
+        };
+        subagent(&mut state, "foreground");
+        subagent(&mut state, "background").background = true;
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::TurnFinished {
+                key: None,
+                outcome: crate::notifications::Kind::Cancelled,
+            },
+        );
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
+        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        assert_eq!(
+            state.subagents[1].status,
+            ToolStatus::Running,
+            "a background child outside interruption ownership remains live"
+        );
+        apply_event(&mut state, &mut indices, Event::TurnStarted);
+        assert!(state.outcome.is_none());
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
+        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        finish_snapshot_work(&mut state, ToolStatus::Failed, true);
+        assert_eq!(
+            state.subagents[1].status,
+            ToolStatus::Failed,
+            "confirmed provider teardown settles all owned children"
+        );
+    }
+
     #[test]
     fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
         let mut store = Store::new().unwrap();
@@ -4287,6 +5762,534 @@ mod tests {
     }
 
     #[test]
+    fn native_diagnostic_caller_keeps_launcher_exit_separate_from_provider_status() {
+        use crate::daemon::holder_registry::Process as Identity;
+        use std::os::unix::process::ExitStatusExt;
+        let launcher = Identity {
+            pid: 5101,
+            start: 101,
+        };
+        let provider = Identity {
+            pid: 5102,
+            start: 102,
+        };
+        let old4 = |present| {
+            json!({"Diagnostic":{"code":0,"signal":null,"stderr":"launcher completed",
+            "launcher":launcher,"confirmed_server":{"process":provider,"identity_current":present},
+            "log_path":"/must-not-open"}})
+        };
+        let exact = |code, signal| {
+            json!({"Diagnostic":{"code":code,"signal":signal,"stderr":"same subject",
+            "launcher":launcher,"confirmed_server":{"process":launcher,"identity_current":false}}})
+        };
+        let mut stale = launcher.clone();
+        stale.start += 1;
+        let zero = Identity { pid: 0, start: 101 };
+        let cases = vec![
+            (
+                old4(true),
+                Some(provider.clone()),
+                Some(provider.clone()),
+                None,
+            ),
+            (
+                old4(false),
+                Some(provider.clone()),
+                Some(provider.clone()),
+                None,
+            ),
+            (
+                json!({"Diagnostic":{"code":0,"signal":null,"stderr":"legacy unlabeled"}}),
+                Some(launcher.clone()),
+                Some(launcher.clone()),
+                None,
+            ),
+            (
+                exact(Some(3), None::<i32>),
+                Some(launcher.clone()),
+                Some(launcher.clone()),
+                Some(3 << 8),
+            ),
+            (
+                exact(None::<i32>, Some(9)),
+                Some(launcher.clone()),
+                None,
+                Some(9),
+            ),
+            (
+                exact(Some(0), None::<i32>),
+                None,
+                Some(launcher.clone()),
+                Some(0),
+            ),
+            (exact(Some(0), None::<i32>), None, None, None),
+            (
+                exact(Some(0), None::<i32>),
+                Some(launcher.clone()),
+                Some(stale.clone()),
+                None,
+            ),
+            (exact(Some(0), None::<i32>), Some(stale), None, None),
+            (exact(Some(0), None::<i32>), Some(zero), None, None),
+            // Even an exact launcher peer cannot erase contradictory server metadata.
+            (
+                old4(false),
+                Some(launcher.clone()),
+                Some(launcher.clone()),
+                None,
+            ),
+        ];
+        for (frame, actual, expected, wanted) in cases {
+            let (control, peer) = UnixStream::pair().unwrap();
+            let holder =
+                super::super::native_holder::Holder::diagnostic_fixture(control, launcher.clone());
+            let responder = thread::spawn(move || {
+                let length = read_holder_fixture_json(&peer);
+                assert_eq!(length, json!("Diagnostic"));
+                write_holder_fixture_json(&peer, &frame);
+                peer
+            });
+            let mut actor = native_diagnostic_actor_fixture(holder, actual, expected);
+            actor.state.lock().unwrap().outcome = Some(crate::agent::ActivityOutcome::Succeeded);
+            let observed = actor.native_exit_diagnostic_until(Instant::now()).unwrap();
+            assert_eq!(
+                observed.provider_status.map(|status| status.into_raw()),
+                wanted
+            );
+            assert!(
+                observed.log.is_none(),
+                "log_path must not mint retained-output authority"
+            );
+            let final_status =
+                actor.provider_exit_status(None, None, true, observed.provider_status);
+            assert_eq!(final_status.map(|status| status.into_raw()), wanted);
+            if wanted.is_none() {
+                // The direct-child alternative cannot smuggle launcher0 into a
+                // distinct or unproved native provider's lifecycle either.
+                let direct = actor.provider_exit_status(
+                    Some(std::process::ExitStatus::from_raw(0)),
+                    Some(&launcher),
+                    true,
+                    None,
+                );
+                assert!(
+                    direct.is_none(),
+                    "native holder custody cannot fall back to an unrelated direct-child status"
+                );
+                assert!(
+                    actor
+                        .provider_exit_status(
+                            Some(std::process::ExitStatus::from_raw(0)),
+                            Some(&launcher),
+                            false,
+                            None
+                        )
+                        .is_none(),
+                    "native custody also fences a mismatched transport label"
+                );
+            }
+            assert!(actor.native_holder.is_some());
+            assert!(!actor.stop.load(Ordering::Acquire));
+            let state = actor.state.lock().unwrap();
+            assert!(!state.exited);
+            assert_eq!(
+                state.outcome,
+                Some(crate::agent::ActivityOutcome::Succeeded)
+            );
+            drop(state);
+            let mut peer = responder.join().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let mut byte = [0];
+            assert!(
+                matches!(peer.read(&mut byte), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "diagnostic classification must not send a Release/Confirm or recreate a provider"
+            );
+        }
+    }
+
+    #[test]
+    fn native_diagnostic_poll_does_not_stop_at_an_unrelated_launcher_exit() {
+        use crate::daemon::holder_registry::Process as Identity;
+        let launcher = Identity {
+            pid: 5201,
+            start: 201,
+        };
+        let provider = Identity {
+            pid: 5202,
+            start: 202,
+        };
+        let (control, peer) = UnixStream::pair().unwrap();
+        let holder =
+            super::super::native_holder::Holder::diagnostic_fixture(control, launcher.clone());
+        let mut actor =
+            native_diagnostic_actor_fixture(holder, Some(provider.clone()), Some(provider.clone()));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let responder = thread::spawn(move || {
+            assert_eq!(read_holder_fixture_json(&peer), json!("Diagnostic"));
+            write_holder_fixture_json(
+                &peer,
+                &json!({"Diagnostic":{"code":0,"signal":null,"stderr":"first",
+                "launcher":launcher,"confirmed_server":{"process":provider,"identity_current":true}}}),
+            );
+            assert_eq!(read_holder_fixture_json(&peer), json!("Diagnostic"));
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            write_holder_fixture_json(
+                &peer,
+                &json!({"Diagnostic":{"code":0,"signal":null,"stderr":"later",
+                "launcher":launcher,"confirmed_server":{"process":provider,"identity_current":false}}}),
+            );
+        });
+        let observed = actor.native_exit_diagnostic_until(deadline).unwrap();
+        assert!(observed.provider_status.is_none());
+        assert_eq!(observed.stderr, "later");
+        assert!(actor.native_holder.is_some());
+        responder.join().unwrap();
+    }
+
+    fn read_holder_fixture_json(peer: &UnixStream) -> Value {
+        let mut peer = peer;
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut length = [0; 4];
+        peer.read_exact(&mut length).unwrap();
+        let mut payload = vec![0; u32::from_be_bytes(length) as usize];
+        peer.read_exact(&mut payload).unwrap();
+        serde_json::from_slice(&payload).unwrap()
+    }
+    fn write_holder_fixture_json(peer: &UnixStream, frame: &Value) {
+        let mut peer = peer;
+        let payload = serde_json::to_vec(frame).unwrap();
+        peer.write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
+        peer.write_all(&payload).unwrap();
+    }
+    fn native_diagnostic_actor_fixture(
+        holder: super::super::native_holder::Holder,
+        native_peer: Option<crate::daemon::holder_registry::Process>,
+        expected_native_peer: Option<crate::daemon::holder_registry::Process>,
+    ) -> Actor {
+        let (_, incoming) = crossbeam_channel::bounded(1);
+        let (_, urgent_incoming) = crossbeam_channel::bounded(1);
+        let (wake, _) = UnixStream::pair().unwrap();
+        Actor {
+            launch_context: None,
+            launch_account_scope: None,
+            working_directory: "/var/tmp".into(),
+            child: None,
+            native_holder: Some(holder),
+            reconnect_only_reported: false,
+            native_peer,
+            expected_native_peer,
+            preserve_native: Arc::new(AtomicBool::new(false)),
+            native_installed: Arc::new(AtomicBool::new(true)),
+            adapter: Box::new(Echo),
+            state: Arc::new(Mutex::new(Snapshot::default())),
+            confirmed_session: Arc::new(Mutex::new(None)),
+            store: Arc::new(Mutex::new(Store::new().unwrap())),
+            visible: Arc::new(AtomicBool::new(false)),
+            observe_next: Arc::new(AtomicBool::new(false)),
+            stop: Arc::new(AtomicBool::new(false)),
+            incoming,
+            urgent_incoming,
+            wake,
+            notify: Arc::new(|_| {}),
+            output: Vec::new(),
+            scanned: 0,
+            pending: VecDeque::new(),
+            control_replies: BTreeMap::new(),
+            offset: 0,
+            queued: 0,
+            stderr: VecDeque::new(),
+            stderr_reader: None,
+            stderr_log: None,
+            indices: BTreeMap::new(),
+            retained: 0,
+            history_error: None,
+            login_recovery: None,
+            dirty: false,
+            activity: ActivityState::Idle,
+            activity_outcome: None,
+            ready: false,
+            prompt_available: false,
+            attention: TurnAttention::default(),
+            execution: execution::Tracker::default(),
+            attention_baselined: false,
+            waiting_fingerprint: None,
+            last_present: Instant::now(),
+            first_frame: false,
+            started: Instant::now(),
+            write_started: None,
+        }
+    }
+
+    #[test]
+    fn managed_terminal_outcomes_survive_idle_diagnosis_and_nonzero_process_exit() {
+        for outcome in [
+            crate::notifications::Kind::Succeeded,
+            crate::notifications::Kind::Failed,
+            crate::notifications::Kind::Cancelled,
+        ] {
+            actual_managed_result_then_idle_exit(outcome, false);
+        }
+    }
+
+    #[test]
+    fn a_new_actor_turn_clears_terminal_proof_before_classifying_its_own_exit() {
+        actual_managed_result_then_idle_exit(crate::notifications::Kind::Succeeded, true);
+    }
+
+    fn actual_managed_result_then_idle_exit(outcome: crate::notifications::Kind, new_turn: bool) {
+        use crate::agent_execution::{ProviderEvent, State};
+        struct CompletedThenIdle {
+            run: Option<crate::model::RunId>,
+            outcome: crate::notifications::Kind,
+        }
+        impl Adapter for CompletedThenIdle {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                Ok(match command {
+                    Command::Refresh => Step {
+                        events: vec![Event::Error {
+                            message: "Later idle diagnosis".into(),
+                            fatal: false,
+                        }],
+                        ..Default::default()
+                    },
+                    Command::SetFastMode { .. } => Step {
+                        events: vec![
+                            Event::TurnStarted,
+                            Event::Status {
+                                busy: true,
+                                detail: "New turn".into(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    Command::Compact => Step {
+                        writes: vec![json!({"exit": true})],
+                        ..Default::default()
+                    },
+                    _ => return Err("Unexpected completed-turn fixture command".into()),
+                })
+            }
+            fn command_for_run(
+                &mut self,
+                run: crate::model::RunId,
+                _: Command,
+            ) -> Result<Step, String> {
+                self.run = Some(run);
+                Ok(Step {
+                    writes: vec![json!({"finish": true})],
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: ProviderEvent::Started {
+                                key: "managed-terminal".into(),
+                            },
+                        },
+                        Event::TurnStarted,
+                        Event::Status {
+                            busy: true,
+                            detail: "Working".into(),
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                assert_eq!(frame, json!({"finish": true}));
+                let run = self.run.take().unwrap();
+                let mut events = vec![
+                    Event::Execution {
+                        run,
+                        event: ProviderEvent::Scope,
+                    },
+                    Event::Item(text("answer", "Exact managed result")),
+                ];
+                if self.outcome == crate::notifications::Kind::Failed {
+                    events.push(Event::Error {
+                        message: "Original terminal rejection".into(),
+                        fatal: false,
+                    });
+                }
+                events.extend([
+                    Event::TurnSettled,
+                    Event::TurnFinished {
+                        key: Some("managed-terminal".into()),
+                        outcome: self.outcome,
+                    },
+                    Event::Status {
+                        busy: false,
+                        detail: String::new(),
+                    },
+                    Event::Execution {
+                        run,
+                        event: ProviderEvent::Settled,
+                    },
+                    Event::Execution {
+                        run,
+                        event: ProviderEvent::Finished {
+                            outcome: self.outcome,
+                        },
+                    },
+                ]);
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+        }
+        let expected = match outcome {
+            crate::notifications::Kind::Succeeded => crate::agent::ActivityOutcome::Succeeded,
+            crate::notifications::Kind::Failed => crate::agent::ActivityOutcome::Failed {
+                reason: "Original terminal rejection".into(),
+            },
+            crate::notifications::Kind::Cancelled => crate::agent::ActivityOutcome::Cancelled,
+            _ => unreachable!(),
+        };
+        let expected_run_state = match outcome {
+            crate::notifications::Kind::Succeeded => State::Succeeded,
+            crate::notifications::Kind::Failed => State::Failed,
+            crate::notifications::Kind::Cancelled => State::Cancelled,
+            _ => unreachable!(),
+        };
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None, messages: None, unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines, program: "/bin/sh".into(),
+            arguments: vec!["-c".into(),
+                "IFS= read -r frame || exit 2; printf '%s\\n' \"$frame\"; IFS= read -r frame || exit 2; printf 'late idle exit diagnosis\\n' >&2; exit 3".into()],
+            working_directory: directory.path().into(), environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(CompletedThenIdle { run: None, outcome });
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = send.send(update);
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        let run = crate::model::RunId::new();
+        handle
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "One managed prompt".into(),
+                    attachments: Vec::new(),
+                    mode: crate::chat::PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let idle = until(&handle, |snapshot| {
+            snapshot.outcome.as_ref() == Some(&expected) && !snapshot.busy
+        });
+        assert_eq!(idle.activity(), ActivityState::Idle);
+        handle.command(Command::Refresh).unwrap();
+        let diagnosed = handle.snapshot(None).unwrap();
+        assert_eq!(diagnosed.error.as_deref(), Some("Later idle diagnosis"));
+        assert_eq!(
+            diagnosed.outcome.as_ref(),
+            Some(&expected),
+            "later Error must not rewrite terminal failure reason"
+        );
+        if new_turn {
+            handle
+                .command(Command::SetFastMode { enabled: true })
+                .unwrap();
+            let next = handle.snapshot(None).unwrap();
+            assert!(
+                next.outcome.is_none(),
+                "TurnStarted must clear terminal proof"
+            );
+            assert!(next.busy);
+        }
+        handle.command(Command::Compact).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_completed() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let completed = handle.is_completed();
+        let closed = handle.close();
+        assert!(
+            completed,
+            "actual nonzero fixture exit must complete before cleanup"
+        );
+        closed.unwrap();
+        let snapshot = handle.snapshot(None).unwrap();
+        let diagnostic = snapshot
+            .provider_exit
+            .as_ref()
+            .expect("late exit diagnosis must remain available");
+        assert!(diagnostic.output.contains("late idle exit diagnosis"));
+        assert_eq!(snapshot.error.as_deref(), Some(diagnostic.summary.as_str()));
+        let updates = receive.try_iter().collect::<Vec<_>>();
+        let finished = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::Execution {
+                    run: actual,
+                    update: crate::agent_execution::Update::Finished { state, result },
+                } if *actual == run => Some((state, result)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finished.len(),
+            1,
+            "later process failure cannot publish a second accepted-run result: {updates:?}"
+        );
+        assert_eq!(*finished[0].0, expected_run_state);
+        assert_eq!(finished[0].1.text, "Exact managed result");
+        if outcome == crate::notifications::Kind::Failed {
+            assert_eq!(
+                finished[0].1.diagnostic.as_deref(),
+                Some("Original terminal rejection")
+            );
+        }
+        let activity_outcomes = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::Activity {
+                    outcome: Some(outcome),
+                    ..
+                } => Some(outcome),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if new_turn {
+            assert!(
+                matches!(&snapshot.outcome, Some(crate::agent::ActivityOutcome::Failed { reason })
+                if reason.contains("late idle exit diagnosis"))
+            );
+            assert!(updates.iter().any(|update| matches!(
+                update,
+                Update::Activity {
+                    state: ActivityState::Working,
+                    outcome: None,
+                    ..
+                }
+            )));
+            assert_eq!(activity_outcomes.last().copied(), snapshot.outcome.as_ref());
+        } else {
+            assert_eq!(snapshot.outcome.as_ref(), Some(&expected));
+            assert!(!activity_outcomes.is_empty());
+            assert!(
+                activity_outcomes
+                    .iter()
+                    .all(|outcome| **outcome == expected),
+                "snapshot and activity must retain exact terminal proof: {updates:?}"
+            );
+        }
+    }
+
+    #[test]
     fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure() {
         struct FinalFrame {
             run: Option<crate::model::RunId>,
@@ -4319,6 +6322,10 @@ mod tests {
                             },
                         },
                         Event::TurnStarted,
+                        Event::Status {
+                            busy: true,
+                            detail: "Working".into(),
+                        },
                     ],
                 })
             }
@@ -4369,6 +6376,12 @@ mod tests {
                                 outcome: crate::notifications::Kind::Succeeded,
                             },
                         },
+                        // This scalar event is intentionally dropped after
+                        // the Store error, leaving busy stale despite proof.
+                        Event::Status {
+                            busy: false,
+                            detail: String::new(),
+                        },
                     ],
                 })
             }
@@ -4388,10 +6401,31 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (updates, receiver) = crossbeam_channel::unbounded();
+        let actor_state = Arc::new(Mutex::new(None::<std::sync::Weak<Inner>>));
+        let observed_actor = actor_state.clone();
+        let (terminal_state, terminal_states) = crossbeam_channel::bounded(1);
         let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            if matches!(
+                &update,
+                Update::Execution {
+                    update: crate::agent_execution::Update::Finished { .. },
+                    ..
+                }
+            ) {
+                let actor = observed_actor
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap();
+                let state = actor.state.lock().unwrap();
+                let _ = terminal_state.send((state.busy, state.outcome.clone()));
+            }
             let _ = updates.send(update);
         })
         .unwrap();
+        *actor_state.lock().unwrap() = Some(Arc::downgrade(&handle.0));
         let ready_deadline = Instant::now() + Duration::from_secs(2);
         while !handle.0.state.lock().unwrap().ready && Instant::now() < ready_deadline {
             std::thread::sleep(Duration::from_millis(5));
@@ -4427,7 +6461,38 @@ mod tests {
             "the real actor must settle after reporting its cache failure"
         );
         closed.unwrap();
+        assert_eq!(
+            terminal_states
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            (true, Some(crate::agent::ActivityOutcome::Succeeded)),
+            "final proof must be accepted while the dropped Status(false) leaves activity stale"
+        );
+        let final_snapshot = handle.snapshot(None).unwrap();
+        assert_eq!(
+            final_snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Succeeded)
+        );
+        assert!(final_snapshot.error.is_some());
+        assert!(final_snapshot.provider_exit.is_some());
         let updates = receiver.try_iter().collect::<Vec<_>>();
+        let activity_outcomes = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::Activity {
+                    outcome: Some(outcome),
+                    ..
+                } => Some(outcome),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!activity_outcomes.is_empty());
+        assert!(
+            activity_outcomes
+                .iter()
+                .all(|outcome| **outcome == crate::agent::ActivityOutcome::Succeeded),
+            "cache teardown must preserve the success on the small activity stream: {updates:?}"
+        );
         let finished = updates
             .iter()
             .filter_map(|update| match update {
@@ -7086,6 +9151,7 @@ mod tests {
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
                 | Update::Attention(_)
+                | Update::PastAttention(_)
                 | Update::AttentionContext { .. }
                 | Update::Ready
                 | Update::PromptAvailable
@@ -7166,14 +9232,14 @@ mod tests {
     }
 
     #[test]
-    fn non_json_stdout_fails_visibly_instead_of_scraping_ansi() {
+    fn consecutive_non_json_stdout_fails_with_a_bounded_preview() {
         let spec = ProcessSpec {
             execution: None,
             messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
             program: "/usr/bin/printf".into(),
-            arguments: vec!["not-json\\n".into()],
+            arguments: vec!["not-json\\n".repeat(8)],
             working_directory: std::env::temp_dir(),
             environment: BTreeMap::new(),
         };
@@ -7187,7 +9253,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap()
-                .contains("Unsupported provider stdout")
+                .contains("8 consecutive invalid protocol lines. Last output: not-json")
         );
         handle
             .close()
@@ -7197,6 +9263,387 @@ mod tests {
             handle.failure().is_some(),
             "closing retains the failure diagnosis"
         );
+    }
+
+    #[test]
+    fn bounded_close_preserves_a_stuck_worker_and_does_not_hold_the_join_mutex() {
+        struct Blocked {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+        }
+        impl Adapter for Blocked {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (entered, entered_command) = crossbeam_channel::bounded(1);
+        let (release, released) = crossbeam_channel::bounded(1);
+        let handle = LocalHandle::start(
+            spec,
+            Box::new(Blocked {
+                entered,
+                release: released,
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let command_handle = handle.clone();
+        let command =
+            thread::spawn(move || command_handle.command(Command::SetFastMode { enabled: true }));
+        entered_command
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let started = Instant::now();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(40))
+                .unwrap_err()
+                .contains("retained")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!handle.is_completed());
+        assert!(handle.owns_work());
+        assert!(
+            handle
+                .0
+                .worker
+                .try_lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished()),
+            "the exact join handle is retained without a held mutex"
+        );
+        let held = handle.0.worker.lock().unwrap();
+        let wake_held = handle.0.wake.lock().unwrap();
+        let failure_held = handle.0.failure.lock().unwrap();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(20))
+                .is_err(),
+            "even another caller holding worker/wake/diagnostic metadata cannot block this deadline"
+        );
+        drop(failure_held);
+        drop(wake_held);
+        assert!(held.is_some());
+        drop(held);
+        release.send(()).unwrap();
+        let _ = command.join().unwrap();
+        handle
+            .close_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(handle.is_completed());
+        assert!(handle.0.worker.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure() {
+        use std::os::unix::fs::OpenOptionsExt;
+        const CHILD: &str = "CAGENTS_RETAINED_CLOSE_RETRY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output=Process::new(std::env::current_exe().unwrap()).args(["--exact","chat::runtime::tests::bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure","--nocapture"])
+                .env(CHILD,"1").env("XDG_RUNTIME_DIR",directory.path()).env("XDG_DATA_HOME",directory.path().join("data"))
+                .env("XDG_CONFIG_HOME",directory.path().join("config")).env("XDG_CACHE_HOME",directory.path().join("cache"))
+                .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for scenario in 0..3 {
+            let broken_control = scenario == 1;
+            let mut source = super::super::native_holder::fixture_source();
+            let boot = crate::daemon::read_boot_id().unwrap();
+            source.proof.as_mut().unwrap().boot_id = boot.clone();
+            source
+                .owned_codex_listener
+                .as_mut()
+                .unwrap()
+                .allocator
+                .boot_id = boot;
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            let _lease =
+                crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::OwnedUnixWebSocket {
+                    socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+                },
+                program: "/bin/sleep".into(),
+                arguments: vec!["60".into()],
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut holder = super::super::native_holder::spawn(spec, source.clone()).unwrap();
+            let root = crate::daemon::holder_registry::directory(
+                crate::daemon::holder_registry::Kind::Native,
+            )
+            .unwrap();
+            let record = crate::daemon::holder_registry::evidence(
+                &crate::daemon::holder_registry::socket(&root, source.id),
+                crate::daemon::holder_registry::Kind::Native,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(record.root.is_current());
+            let receipt = root.join(format!(
+                "{}-{}-{}.closed",
+                source.id, record.holder.pid, record.holder.start
+            ));
+            if scenario != 0 {
+                holder
+                    .confirm(
+                        uuid::Uuid::new_v4().to_string(),
+                        super::super::native_holder::fixture_identity(),
+                        record.root.clone(),
+                    )
+                    .unwrap();
+                if broken_control {
+                    holder.disconnect_control_for_test();
+                }
+            } else {
+                let mut invalid = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&receipt)
+                    .unwrap();
+                invalid
+                    .write_all(b"transient invalid cleanup receipt")
+                    .unwrap();
+                drop(invalid);
+            }
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut initial = Step::default();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle =
+                LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+            handle.close().unwrap();
+            if scenario == 2 {
+                let (stalled, peer) = UnixStream::pair().unwrap();
+                let identity = holder.replace_control_for_test(stalled);
+                *handle.0.retained_native.lock().unwrap() = Some(holder);
+                let started = Instant::now();
+                drop(handle);
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "final Inner field destruction must not perform retained Holder RPC"
+                );
+                assert!(
+                    record.root.is_current(),
+                    "returning from Drop is not a cleanup receipt"
+                );
+                drop(peer);
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if identity.close().is_ok() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the exact preserved registry owner must remain cleanable"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(!record.root.is_current());
+                continue;
+            }
+            *handle.0.retained_native.lock().unwrap() = Some(holder);
+            handle.0.completed.store(false, Ordering::Release);
+            *handle.0.failure.lock().unwrap() = Some("Native teardown remains unconfirmed".into());
+            assert!(
+                handle
+                    .close_until(Instant::now() + Duration::from_secs(2))
+                    .is_err()
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while handle.0.native_reconciling.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(handle.0.retained_native.lock().unwrap().is_some());
+            assert!(
+                record.root.is_current(),
+                "the failed attempt must retain the same actual provider owner"
+            );
+            assert!(!handle.is_completed());
+            assert!(handle.owns_work());
+            if !broken_control {
+                std::fs::remove_file(&receipt).unwrap();
+            }
+            handle
+                .close_until(Instant::now() + Duration::from_secs(5))
+                .unwrap();
+            assert!(handle.0.retained_native.lock().unwrap().is_none());
+            assert!(handle.is_completed());
+            assert!(
+                !record.root.is_current(),
+                "the later same close API must progress through exact native cleanup"
+            );
+        }
+    }
+
+    fn worker_blocked_in_tls_destruction() -> (
+        JoinHandle<()>,
+        crossbeam_channel::Sender<()>,
+        crossbeam_channel::Receiver<()>,
+    ) {
+        struct TlsCleanup {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+            finished: crossbeam_channel::Sender<()>,
+        }
+        impl Drop for TlsCleanup {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+                let _ = self.finished.send(());
+            }
+        }
+        thread_local! {static CLEANUP:std::cell::RefCell<Option<TlsCleanup>>=const {std::cell::RefCell::new(None)};}
+        let (entered, entered_cleanup) = crossbeam_channel::bounded(1);
+        let (release, released) = crossbeam_channel::bounded(1);
+        let (finished, finished_cleanup) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            CLEANUP.with(|cleanup| {
+                *cleanup.borrow_mut() = Some(TlsCleanup {
+                    entered,
+                    release: released,
+                    finished,
+                })
+            })
+        });
+        entered_cleanup
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !worker.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "fixture must reach the post-packet TLS destructor boundary"
+            );
+            thread::yield_now();
+        }
+        assert!(finished_cleanup.try_recv().is_err());
+        (worker, release, finished_cleanup)
+    }
+
+    #[test]
+    fn bounded_close_does_not_join_a_latched_tls_destructor_on_its_caller() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        handle.close().unwrap();
+        let (worker, release, finished) = worker_blocked_in_tls_destruction();
+        *handle.0.worker.lock().unwrap() = Some(worker);
+        let started = Instant::now();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(40))
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            handle.0.worker_joining.load(Ordering::Acquire),
+            "bounded owner service retains the actual unreturned OS thread"
+        );
+        assert!(finished.try_recv().is_err());
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle
+            .close_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(!handle.0.worker_joining.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn final_handle_drop_does_not_join_even_after_finished_packet_precedes_tls_cleanup() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        handle.close().unwrap();
+        let (worker, release, finished) = worker_blocked_in_tls_destruction();
+        *handle.0.worker.lock().unwrap() = Some(worker);
+        let shared_native = handle.0.retained_native.clone();
+        let held_native = shared_native.lock().unwrap();
+        let started = Instant::now();
+        drop(handle);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "destruction must not join a TLS destructor or wait for actor-owned native metadata"
+        );
+        drop(held_native);
+        assert!(
+            finished.try_recv().is_err(),
+            "dropping the frontend is not proof that cleanup finished"
+        );
+        release.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
@@ -7517,6 +9964,206 @@ mod tests {
     }
 
     #[test]
+    fn stdio_eof_drains_complete_frame_backlog_before_terminal_diagnostics() {
+        struct Backlog {
+            gate: Option<crossbeam_channel::Receiver<()>>,
+            received: Arc<std::sync::atomic::AtomicUsize>,
+            finished: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Adapter for Backlog {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::TurnStarted,
+                        Event::Status {
+                            busy: true,
+                            detail: "Working".into(),
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("unexpected backlog fixture command".into())
+            }
+            fn tick(&mut self) -> Step {
+                if self
+                    .gate
+                    .take()
+                    .is_some_and(|gate| gate.recv_timeout(Duration::from_secs(5)).is_err())
+                {
+                    return Step {
+                        events: vec![Event::Error {
+                            message: "backlog fixture gate failed".into(),
+                            fatal: true,
+                        }],
+                        ..Default::default()
+                    };
+                }
+                Step::default()
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                if frame == json!({}) {
+                    self.received.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Step::default());
+                }
+                if frame != json!({"done": true}) {
+                    return Err("unexpected backlog fixture frame".into());
+                }
+                self.finished.fetch_add(1, Ordering::Relaxed);
+                Ok(Step {
+                    events: vec![
+                        Event::Item(text("backlog-result", "Complete buffered answer")),
+                        Event::TurnSettled,
+                        Event::TurnFinished {
+                            key: Some("backlog-turn".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                        Event::Status {
+                            busy: false,
+                            detail: String::new(),
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+        }
+        struct OwnedActor {
+            handle: LocalHandle,
+            gate: Option<crossbeam_channel::Sender<()>>,
+            closed: bool,
+        }
+        impl Drop for OwnedActor {
+            fn drop(&mut self) {
+                // Release the tick even if setup/assertions unwind. Preserve the
+                // exact actor and private fixture until its original join; an
+                // unresolved close intentionally HOLDs rather than detaching.
+                drop(self.gate.take());
+                while !self.closed {
+                    self.closed = self.handle.close().is_ok();
+                    if !self.closed {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        const COUNT: usize = 600;
+        const TAIL: &str = "backlog-final-stderr-marker";
+        assert!(COUNT > 2 * FRAMES_PER_POLL);
+        for (suffix, exit, terminal) in [
+            ("{\"done\":true}\n", "0", true),
+            ("{\"done\":true}\n", "7", true),
+            ("{\"done\":true}\n{\"partial\":", "0", true),
+            ("{\"done\":true}", "0", false),
+        ] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let stream = directory.path().join("stream");
+            let ready = directory.path().join("pipes-closed");
+            let payload = "{}\n".repeat(COUNT) + suffix;
+            assert!(payload.len() < libc::PIPE_BUF && payload.len() < 8192);
+            std::fs::write(&stream, payload).unwrap();
+            let spec = ProcessSpec {
+                execution: None, messages: None, unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines, program: "/bin/sh".into(),
+                arguments: vec!["-c".into(),
+                    "cat -- \"$1\" || exit 2; printf '%s\\n' 'backlog-final-stderr-marker' >&2; exec 1>&- 2>&-; : > \"$2\" || exit 2; exit \"$3\"".into(),
+                    "provider".into(), stream.to_string_lossy().into_owned(), ready.to_string_lossy().into_owned(), exit.into()],
+                working_directory: directory.path().into(), environment: BTreeMap::new(),
+            };
+            let (release, gate) = crossbeam_channel::bounded(1);
+            let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut adapter: Box<dyn Adapter> = Box::new(Backlog {
+                gate: Some(gate),
+                received: received.clone(),
+                finished: finished.clone(),
+            });
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let mut owner = OwnedActor {
+                handle,
+                gate: Some(release),
+                closed: false,
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.is_file() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ready.is_file(), "provider did not close its real pipes");
+            // The actor has not polled stdout yet. The complete bounded burst
+            // and its actual EOF now coexist, making the backlog deterministic.
+            owner.gate.take().unwrap().send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !owner.handle.is_completed() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let completed = owner.handle.is_completed();
+            let failure = owner.handle.failure();
+            let closed = owner.handle.close();
+            owner.closed = closed.is_ok();
+            assert!(
+                completed,
+                "decoder did not complete before cleanup: {suffix:?}"
+            );
+            closed.unwrap();
+            let state = owner.handle.snapshot(None).unwrap();
+            assert_eq!(received.load(Ordering::Relaxed), COUNT);
+            assert_eq!(finished.load(Ordering::Relaxed), usize::from(terminal));
+            assert!(state.exited && !state.ready && !state.busy);
+            assert_eq!(state.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Complete buffered answer")), terminal);
+            if terminal {
+                assert_eq!(
+                    state.outcome,
+                    Some(crate::agent::ActivityOutcome::Succeeded)
+                );
+            } else {
+                assert!(matches!(
+                    state.outcome,
+                    Some(crate::agent::ActivityOutcome::Interrupted { .. })
+                ));
+            }
+            if !suffix.ends_with('\n') {
+                assert!(
+                    failure
+                        .as_deref()
+                        .is_some_and(|error| error.contains("incomplete JSON line")),
+                    "{failure:?}"
+                );
+            } else if exit == "0" {
+                assert_eq!(failure, None);
+                assert_eq!(state.error, None);
+            } else {
+                assert!(
+                    failure
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Provider exited with")),
+                    "{failure:?}"
+                );
+                assert!(
+                    state
+                        .provider_exit
+                        .as_ref()
+                        .unwrap()
+                        .summary
+                        .contains("status 7")
+                );
+            }
+            if let Some(diagnostic) = state.provider_exit.as_ref() {
+                assert!(diagnostic.output.contains(TAIL));
+                let log = diagnostic.log.as_ref().unwrap();
+                let (bytes, next, omitted) = owner.handle.provider_exit_output(&log.id, 0).unwrap();
+                assert!(String::from_utf8(bytes).unwrap().contains(TAIL));
+                assert_eq!(next, None);
+                assert_eq!(omitted, 0);
+            } else {
+                assert!(suffix.ends_with('\n') && exit == "0");
+            }
+        }
+    }
+
+    #[test]
     fn pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers() {
         for (tail, expected) in [
             ("sleep 0.02; exit 0", None),
@@ -7537,7 +10184,7 @@ mod tests {
             let mut adapter: Box<dyn Adapter> = Box::new(Echo);
             let mut initial = adapter.initialize().unwrap();
             let store = preflight(&spec, &mut initial).unwrap();
-            let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             while !handle.is_completed() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));

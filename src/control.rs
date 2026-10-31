@@ -2080,6 +2080,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
         ServerResponse::Work(_) => "work",
         ServerResponse::ChannelWork(_) => "channel_work",
+        ServerResponse::ChatProviderExitOutput { .. } => "chat_provider_exit_output",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -6420,6 +6421,7 @@ mod tests {
                 chat_id,
                 state,
                 generation: 1,
+                outcome: None,
             };
             let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(

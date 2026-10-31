@@ -714,6 +714,39 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_past_attention_and_optional_activity_do_not_create_retained_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        let evidence = crate::notifications::Evidence {
+            key: "old-turn".into(),
+            kind: crate::notifications::Kind::Cancelled,
+        };
+        journal.append(&Update::PastAttention(evidence)).unwrap();
+        journal
+            .append(&Update::Activity {
+                state: crate::agent::ActivityState::Idle,
+                generation: 7,
+                outcome: None,
+            })
+            .unwrap();
+        assert_eq!(journal.latest().unwrap(), 0);
+        assert_eq!(journal.acknowledged().unwrap(), 0);
+        assert!(journal.page(0).unwrap().is_empty());
+        // Current attention still crosses the existing protocol-2 outbox.
+        journal
+            .append(&Update::Attention(crate::notifications::Evidence {
+                key: "current-question".into(),
+                kind: crate::notifications::Kind::Waiting,
+            }))
+            .unwrap();
+        let page = journal.page(0).unwrap();
+        assert_eq!(page.len(), 1);
+        assert!(matches!(&page[0].update, Update::Attention(evidence)
+            if evidence.key == "current-question" && evidence.kind == crate::notifications::Kind::Waiting));
+    }
+
     fn durable_sources(directory: &Path) -> Vec<crate::chat::Session> {
         let db = Connection::open_with_flags(
             directory.join("actor-journal.sqlite"),

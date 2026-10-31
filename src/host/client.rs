@@ -88,6 +88,7 @@ impl Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        super::deferred::disconnected(&self.host, self.client_id);
         disconnect_client(&self.host, self.client_id);
         self.delivery.close_after_drain();
     }
@@ -284,7 +285,32 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
         // A request that panics has released every guard it held by the time
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
-        let request = envelope.request;
+        let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::deferred::try_defer(
+                &host,
+                client_id,
+                request_id,
+                delivery.clone(),
+                envelope.request,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::Internal,
+                "the daemon failed while admitting this provider control",
+                false,
+            ))
+        });
+        let request = match prepared {
+            Ok(Some(request)) => request,
+            Ok(None) => continue,
+            Err(error) => {
+                if push_error(&delivery, &host, request_id, error).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
         // Register even before ordinary exit starts: its writer can enter
         // after process_request releases control, before this reply is queued.
         // The final HostMutex seal closes acquisition before any handler effect.
@@ -360,7 +386,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
     let _ = writer.join();
 }
 
-fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
+pub(super) fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     // Never wait for admission while holding HostState: admitted operations
     // need to reacquire it after synchronous provider/PTY work.
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
@@ -517,6 +543,20 @@ fn ensure_startup_recovery_request(
     ))
 }
 
+/// Shared and deferred dispatch must cross the same ownership fences while
+/// holding the daemon's control gate, before any actor input is admitted.
+pub(super) fn admit_shared_request(
+    host: &SharedHost,
+    client_id: ClientId,
+    request: &ClientRequest,
+) -> Result<(), ProtocolError> {
+    ensure_request_open(host, request)?;
+    ensure_startup_recovery_request(host, request)?;
+    super::agent_execution::terminals::admit(host, client_id, request)?;
+    super::account_lifecycle::admit(host, request)?;
+    super::worktree_removal::admit(host, request)
+}
+
 pub(super) fn process_request(
     host: &SharedHost,
     client_id: ClientId,
@@ -604,11 +644,7 @@ pub(super) fn process_request(
     );
     let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
     let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
-    ensure_request_open(host, &request)?;
-    ensure_startup_recovery_request(host, &request)?;
-    super::agent_execution::terminals::admit(host, client_id, &request)?;
-    super::account_lifecycle::admit(host, &request)?;
-    super::worktree_removal::admit(host, &request)?;
+    admit_shared_request(host, client_id, &request)?;
     // Retained originals are outside the session inventory. Refuse before
     // publishing a preflight capability or requesting termination. This only
     // observes custody already published now; quarantine can publish later.
@@ -975,6 +1011,7 @@ pub(super) fn process_request(
         | ClientRequest::ChatAttach { .. }
         | ClientRequest::ChatDetach { .. }
         | ClientRequest::ChatCommand { .. }
+        | ClientRequest::ChatProviderExitOutput { .. }
         | ClientRequest::ChatVisibility { .. }
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
@@ -1686,6 +1723,137 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn wire_147_refuses_predecessor_and_future_versions_before_request_dispatch() {
+        fn forbidden(
+            _: &SharedHost,
+            _: ClientId,
+            _: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
+            panic!("an incompatible public wire must never reach a request handler")
+        }
+        for version in [127, 146, 148] {
+            let (proof, host) = panic_test_host("wire-147-version-refusal");
+            let (mut stream, server_stream) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let serving = host.clone();
+            let server = thread::spawn(move || serve_with(server_stream, 1, serving, forbidden));
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            codec
+                .write(
+                    &mut stream,
+                    &ClientEnvelope {
+                        version,
+                        request_id: 7,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::ChatProviderExitOutput {
+                            chat_id: TerminalId::new(),
+                            log_id: "original-log".into(),
+                            offset: 0,
+                        },
+                    },
+                )
+                .unwrap();
+            let response: ServerEnvelope = codec.read(&mut stream).unwrap().unwrap();
+            assert_eq!(response.version, 147);
+            assert_eq!(response.proof, proof);
+            assert_eq!(response.request_id, Some(7));
+            assert!(matches!(response.message, ServerMessage::Error(error)
+                if error.code == ProtocolErrorCode::UnsupportedVersion));
+            assert!(codec.read::<ServerEnvelope>(&mut stream).unwrap().is_none());
+            server.join().unwrap();
+            let state = host.lock().unwrap();
+            assert!(state.chats.is_empty());
+            assert!(state.chat_spawning.is_empty());
+        }
+    }
+
+    #[test]
+    fn framed_deferred_controls_cross_recovery_and_exit_fences_before_actor_lookup() {
+        fn forbidden(
+            _: &SharedHost,
+            _: ClientId,
+            _: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
+            panic!("deferred admission must return its own correlated refusal")
+        }
+        for mode in 0..3 {
+            let (proof, host) = panic_test_host("deferred-control-ownership-fences");
+            let (mut stream, server_stream) = UnixStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let serving = host.clone();
+            let server = thread::spawn(move || serve_with(server_stream, 1, serving, forbidden));
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            codec
+                .write(
+                    &mut stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 1,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::Connect {
+                            expected_host: Some(proof.clone()),
+                            resume: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
+            let connected: ServerEnvelope = codec.read(&mut stream).unwrap().unwrap();
+            assert!(matches!(
+                connected.message,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected { .. },
+                }
+            ));
+            let expected = {
+                let mut state = host.lock().unwrap();
+                match mode {
+                    0 => {
+                        state.retain_startup_recovery("exact original retained".into());
+                        "Startup recovery retained original ownership"
+                    }
+                    1 => {
+                        state.begin_ordinary_exit_cleanup();
+                        "Ordinary daemon exit is waiting for exact original child cleanup"
+                    }
+                    _ => {
+                        state.request_shutdown();
+                        "Daemon upgrade/shutdown is committed"
+                    }
+                }
+            };
+            codec
+                .write(
+                    &mut stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: 2,
+                        proof: Some(proof.clone()),
+                        request: ClientRequest::ChatCommand {
+                            chat_id: TerminalId::new(),
+                            command: crate::chat::Command::SetFastMode { enabled: true },
+                        },
+                    },
+                )
+                .unwrap();
+            let response: ServerEnvelope = codec.read(&mut stream).unwrap().unwrap();
+            assert_eq!(response.request_id, Some(2));
+            assert_eq!(response.proof, proof);
+            assert!(matches!(response.message, ServerMessage::Error(error)
+                if error.code == ProtocolErrorCode::TerminalUnavailable && error.message.starts_with(expected)));
+            stream.shutdown(Shutdown::Both).unwrap();
+            server.join().unwrap();
+            let state = host.lock().unwrap();
+            assert!(state.chats.is_empty());
+            assert!(state.chat_spawning.is_empty());
+            assert!(state.native_closing.is_empty());
+        }
+    }
 
     #[test]
     fn recovery_chat_requests_preserve_ordinary_exit_and_committed_shutdown_fences() {
@@ -2630,6 +2798,239 @@ mod tests {
                 .reserve_spawn(crate::model::TerminalId::new())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn unanswered_controls_do_not_block_stop_on_the_same_framed_connection() {
+        use crate::{
+            agent::Provider,
+            chat::{
+                self, Command, Event,
+                protocol::{Adapter, ProcessSpec, Step},
+            },
+        };
+        use std::collections::BTreeMap;
+        struct Controls {
+            admitted: crossbeam_channel::Sender<()>,
+            acknowledgement: Option<String>,
+            next: u64,
+        }
+        impl Adapter for Controls {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                match command {
+                    Command::SetPermissionMode { .. } => {
+                        self.next += 1;
+                        self.acknowledgement = Some(format!("ignored-{}", self.next));
+                        self.admitted.send(()).unwrap();
+                        Ok(Step {
+                            writes: vec![serde_json::json!({"ignored":self.next})],
+                            ..Default::default()
+                        })
+                    }
+                    Command::Interrupt => Ok(Step {
+                        events: vec![Event::TurnFinished {
+                            key: None,
+                            outcome: crate::notifications::Kind::Cancelled,
+                        }],
+                        ..Default::default()
+                    }),
+                    _ => Err("Unexpected fixture command".into()),
+                }
+            }
+            fn command_ack(&mut self) -> Option<String> {
+                self.acknowledgement.take()
+            }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        fn send(
+            stream: &mut UnixStream,
+            proof: &HostSessionProof,
+            request_id: u64,
+            request: ClientRequest,
+        ) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
+        }
+        struct Cleanup {
+            stream: UnixStream,
+            server: Option<thread::JoinHandle<()>>,
+            handle: chat::runtime::Handle,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.stream.shutdown(Shutdown::Both);
+                let _ = self.handle.close();
+                if let Some(server) = self.server.take() {
+                    let _ = server.join();
+                }
+            }
+        }
+        let (proof, host) = panic_test_host("same-stream-provider-controls");
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let (admitted, observed) = crossbeam_channel::bounded(64);
+        let mut initial = Step {
+            events: vec![Event::Ready(true), Event::TurnStarted],
+            ..Default::default()
+        };
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = chat::runtime::Handle::start(
+            spec,
+            Box::new(Controls {
+                admitted,
+                acknowledgement: None,
+                next: 0,
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let chat_id = TerminalId::new();
+        host.lock().unwrap().chats.insert(
+            chat_id,
+            super::super::chat::Record {
+                execution_instance: uuid::Uuid::nil(),
+                console_recipe: None,
+                paired_terminal: None,
+                session: chat::Session {
+                    native_continuity: Default::default(),
+                    owned_codex_listener: None,
+                    id: chat_id,
+                    launch: chat::Launch {
+                        provider: Provider::Claude,
+                        recipe,
+                        session_id: None,
+                    },
+                    proof: Some(proof.clone()),
+                    terminal: None,
+                },
+                handle: handle.clone(),
+                source_process: None,
+                subscribers: BTreeMap::from([(1, false)]),
+                observations: BTreeMap::new(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let (mut stream, server_stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let server_host = host.clone();
+        let _cleanup = Cleanup {
+            stream: stream.try_clone().unwrap(),
+            server: Some(thread::spawn(move || serve(server_stream, 1, server_host))),
+            handle: handle.clone(),
+        };
+        send(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: Some(proof.clone()),
+                resume: Vec::new(),
+            },
+        );
+        let mut reader = FrameCodec::new(MAX_FRAME_BYTES);
+        let connected = reader.read::<ServerEnvelope>(&mut stream).unwrap().unwrap();
+        assert_eq!(connected.request_id, Some(1));
+        assert!(matches!(
+            connected.message,
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. }
+            }
+        ));
+        for request_id in 2..=66 {
+            send(
+                &mut stream,
+                &proof,
+                request_id,
+                ClientRequest::ChatCommand {
+                    chat_id,
+                    command: Command::SetPermissionMode {
+                        mode: "manual".into(),
+                    },
+                },
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for _ in 0..64 {
+            observed
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("the connection blocked before admitting all bounded controls");
+        }
+        send(
+            &mut stream,
+            &proof,
+            67,
+            ClientRequest::ChatCommand {
+                chat_id,
+                command: Command::Interrupt,
+            },
+        );
+        let mut capacity_refusal = false;
+        loop {
+            let response = reader
+                .read::<ServerEnvelope>(&mut stream)
+                .expect("Stop must not wait for ignored control replies")
+                .unwrap();
+            assert_eq!(response.proof, proof);
+            match response.request_id {
+                Some(66) => {
+                    assert!(matches!(response.message, ServerMessage::Error(_)));
+                    capacity_refusal = true;
+                }
+                Some(67) => {
+                    assert!(matches!(
+                        response.message,
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted
+                        }
+                    ));
+                    break;
+                }
+                Some(id) => {
+                    panic!("unanswered ordinary request {id} unexpectedly replied before Stop")
+                }
+                None => {}
+            }
+        }
+        assert!(
+            capacity_refusal,
+            "the 65th normal control has an independent correlated refusal"
+        );
+        let snapshot = handle.snapshot(None).unwrap();
+        assert_eq!(
+            snapshot.outcome,
+            Some(crate::agent::ActivityOutcome::Cancelled)
+        );
+        assert!(snapshot.error.is_none());
     }
 
     fn panic_test_host(name: &str) -> (HostSessionProof, SharedHost) {
