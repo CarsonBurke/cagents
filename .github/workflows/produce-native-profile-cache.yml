@@ -14,7 +14,7 @@ concurrency:
 jobs:
   original-compile-only:
     # SAME approved PR merge ref. No sibling-PR cache sharing assumption.
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16' && github.event.pull_request.number == 1933
+    if: false && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16' && github.event.pull_request.number == 1933
     # Contingent SOURCE proposal only; no actual settings/token grant here.
     permissions:
       contents: read

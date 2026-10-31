@@ -75,6 +75,12 @@ jobs:
           python3 -I -B tests/prepare_validation_checkout.py -v
           python3 -I -B tests/qualification/test_process_custody.py -v
 
+      - name: Check qualifier source contracts
+        run: |
+          python3 -I -B .github/qualification/test-final-main-supervisor.py -v
+          python3 -I -B .github/qualification/test-preparation-byte-loading.py -v
+          python3 -I -B .github/qualification/test-final-main-local-settlement.py -v
+
       - name: Check all formatter contracts
         env:
           CHECK_FORMAT_CARGO_FIXTURE: "1"
