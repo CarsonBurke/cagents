@@ -206,6 +206,8 @@ struct Inner {
     completed: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
+    /// The failure is the provider's own observed exit, not lost track of work.
+    provider_exited: Arc<AtomicBool>,
     worker: Mutex<Option<JoinHandle<()>>>,
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
@@ -426,6 +428,7 @@ impl LocalHandle {
         let completed = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
+        let provider_exited = Arc::new(AtomicBool::new(false));
         let store = Arc::new(Mutex::new(store));
         let confirmed_session = Arc::new(Mutex::new(None));
         let preserve_native = Arc::new(AtomicBool::new(false));
@@ -445,6 +448,7 @@ impl LocalHandle {
             completed: completed.clone(),
             draining: draining.clone(),
             failure: failure.clone(),
+            provider_exited: provider_exited.clone(),
             worker: Mutex::new(None),
             store: store.clone(),
             notify: notify.clone(),
@@ -473,6 +477,7 @@ impl LocalHandle {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
                     process_spec: spec.clone(),
+                    provider_exited,
                     provider_process: provider_process.clone(),
                     launch_context: spec.execution.clone(),
                     launch_account_scope,
@@ -1246,6 +1251,11 @@ impl LocalHandle {
                     .unwrap_or_else(|p| p.into_inner())
                     .is_some())
     }
+    /// Whether an explicit start may replace this actor: its provider was seen
+    /// to exit and the whole process group has been cleaned up.
+    pub(crate) fn provider_exit_settled(&self) -> bool {
+        self.is_completed() && self.0.provider_exited.load(Ordering::Acquire)
+    }
     /// What the conversation is doing, read without loading its transcript.
     pub(crate) fn activity(&self) -> crate::agent::ActivityState {
         self.0
@@ -1863,6 +1873,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
 }
 struct Actor {
     process_spec: ProcessSpec,
+    provider_exited: Arc<AtomicBool>,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
@@ -2159,6 +2170,7 @@ impl Actor {
                     if status.success() {
                         return Ok(());
                     }
+                    self.provider_exited.store(true, Ordering::Release);
                     return Err(format!("Provider exited with {status}"));
                 }
                 return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());
@@ -7559,6 +7571,33 @@ mod tests {
             descendant.reaped = true;
             assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
         }
+    }
+
+    #[test]
+    fn a_provider_seen_to_exit_can_be_replaced_while_staying_protected() {
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "read -r init; exec 1>&-; exit 137".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(handle.failure().is_some());
+        assert!(handle.owns_work());
+        assert!(!handle.blocks_replacement());
     }
 
     #[test]

@@ -3386,6 +3386,13 @@ impl Runtime {
             controls.push(self.account_picker(accounts, transitioning, shortcuts));
         }
         let draft = self.is_draft();
+        // Chosen once at launch, so there is nothing to pick from here.
+        if !draft
+            && self.session.launch.provider == Provider::Antigravity
+            && let Some(model) = &snapshot.selected_model
+        {
+            controls.push(design::caption(model.clone()).into());
+        }
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
             let label: Cow<'a, str> = match snapshot
                 .models

@@ -585,6 +585,11 @@ impl Handle {
             Owner::Remote(remote) => remote.owns_work(),
         }
     }
+    /// Whether an explicit start must not replace this actor. It still counts
+    /// as owning work everywhere else, until it is closed.
+    pub(crate) fn blocks_replacement(&self) -> bool {
+        self.owns_work() && !matches!(&self.0, Owner::Local(local) if local.provider_exit_settled())
+    }
     pub(crate) fn activity(&self) -> crate::agent::ActivityState {
         match &self.0 {
             Owner::Local(local) => local.activity(),
