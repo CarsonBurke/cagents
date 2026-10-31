@@ -1,0 +1,434 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "issue": null,
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "limits": "INTERMEDIATE SOURCE PREPARATION ONLY, not final runnable source. IsolatedHOST only; check/compile/inventory earn zero parent pass credit. Sixteen exact ordinary default-captured-pretty singleton contracts require freshN-1/1P0F0I0M/zero child footers and raw reread. Preserve natural opaque authority/required absent names, original Popen waits/held pidfds/family/cancellation/sticky failures/uncertain unboundedHOLD/Cclose, canonical9004/full3790. No emitted helper/newcache/target/tempbase/context repair/provider/user proxy. FullELF not archived; failed invocation may bypass post-failed-use hash; no every-exec/embedded-version/native/WHOLE qualification. Preparation supplies no runtime evidence; actual original phases/receipts and soleRAW establish future bounded results only.",
+  "packet_deadline_seconds": 2400,
+  "phase_caps_sum_seconds": 2250,
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "planned_phase_count": 19,
+  "planned_phase_order": [
+    "host-binary-check",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-1",
+    "parent-host-lib-2",
+    "parent-host-lib-3",
+    "parent-host-lib-4",
+    "parent-host-lib-5",
+    "parent-host-lib-6",
+    "parent-host-lib-7",
+    "parent-host-lib-8",
+    "parent-host-lib-9",
+    "parent-host-lib-10",
+    "parent-host-lib-11",
+    "parent-host-lib-12",
+    "parent-host-lib-13",
+    "parent-host-lib-14",
+    "parent-host-lib-15",
+    "parent-host-lib-16"
+  ],
+  "prepared_only": true,
+  "product_head": null,
+  "product_parent": null,
+  "product_pr": null,
+  "product_tree": null,
+  "readiness": false,
+  "required_absent_environment_names": [
+    "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+    "CAGENTS_RETAINED_ACTOR_FIXTURE"
+  ],
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-issued-return-host16-preparation/qualification-packets/main15-issued-return-host16-preparation/run-packet.py",
+  "runtime_admission": {
+    "state": "INTERMEDIATE_HOST16_PREPARATION_ONLY_FINAL_SOURCE_BINDING_REQUIRED",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "source_review": null,
+  "source_review_sha256": null,
+  "tool_pin_provenance": "Immutable donor source data only, no current installed-file/context observation",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "worktree": null,
+  "source_paths_sha256": {},
+  "artifact_groups": [
+    {
+      "id": "host-lib",
+      "features": [
+        "host"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+        "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+        "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+        "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+        "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+        "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+        "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+        "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+        "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+        "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+        "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+        "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+        "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+        "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+        "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+        "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+          "seconds": 45,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+          "seconds": 15,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+          "seconds": 45,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+          "seconds": 45,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+          "seconds": 45,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement",
+          "seconds": 45,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "host-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "seconds": 480
+    }
+  ],
+  "archive_bindings": [],
+  "controller_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-issued-return-host16-preparation",
+  "preparation_only": true,
+  "precursor_api_reference": {
+    "api_head": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+    "api_tree": "834d2844924ea655ecf84952d682e8c645089425",
+    "api_parent": "9c19e1291c83c4a2f7d91fe2e6f59f4aa1d88478",
+    "worktree_locator_only": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issued-return-cleanup-api"
+  },
+  "precursor_is_final_product": false,
+  "source_DATA_ref": {
+    "path": "/tmp/issued-return-cleanup-615e62c0-host-qualification-DATA-v1.json",
+    "sha256": "ee9956573d7fc627cf517897a66950c037eec1049c3c2f335e167cd09f492542",
+    "bytes": 49097,
+    "schema": "issued-return-cleanup-host-qualification-DATA-v1",
+    "scope": "IMMUTABLE_STAGING_DATA_NOT_EXECUTION_OR_FINAL_APPROVAL"
+  },
+  "source_DATA_entry_count": 21,
+  "actual_prospective_command_phase_count": 19,
+  "source_reservations_DATA": [
+    {
+      "argv": null,
+      "id": "source-prebinding",
+      "kind": "FROZEN_SOURCE_TUPLE_VALIDATION",
+      "seconds": 30
+    },
+    {
+      "argv": null,
+      "id": "source-postbinding-and-original-receipt-collection",
+      "kind": "SOURCE_AND_RECEIPT_VALIDATION",
+      "seconds": 60
+    }
+  ],
+  "source_reservation_sum_seconds": 90,
+  "source_reservations_exact_enforcement": false,
+  "source_DATA_total_seconds": 2340,
+  "source_DATA_outer_slack_seconds": 60,
+  "known_adapter_limits": [
+    "Thirty-second prebinding and sixty-second postbinding/receipt entries are SOURCE DATA reservations only. Canonical main has no aggregate30s prelease deadline; final_observations/custody/HOLD cannot be abandoned after60s. They are not extra Popen invocations or original-wait receipts.",
+    "Canonical execute_contracts inventory argv is [ELF,--list,--color=never], while immutable DATA proposes [ELF,--list,--format,terse]. Preserve canonical code and both literal contracts. No equivalence or exact terse implementation is asserted; final additive DATA/argv reconciliation remains pending.",
+    "Nineteen command phases have2250s caps; two reservations add90s for DATA total2340 with60s outer slack. Original2400 workload cap and remaining clamps remain unchanged. No measured timing or full lifecycle bound is claimed.",
+    "Selected private /bin/cat/PTY/terminal/process/thread/file/scripted-Python fixtures are real future work, not inert arithmetic, genuine production User authority or commercial provider/account evidence.",
+    "Deferred retained_terminal_handoff_proves_original_console_cleanup is excluded and UNQUALIFIED. No emitted helper/envbinding/reexec/env_clear/nocapture/custom child mode is adopted.",
+    "Source eligibility/cfg/caller tables and pins are615e staging DATA only. Final combined API+UI consumer source and real owning declarations require fresh source binding; no615e runtime, final product adoption or transferred result."
+  ],
+  "pending_final_binding_inputs": [
+    "Genuine final combined Main15 product head/tree/sole parent, exact source objects and final API plus typed UI consumer/nonce/caller/presentation composition;615e is staging reference only.",
+    "Actual final source/cfg/fixture/caller classifications, source file/mode/blob/SHA pins and exact definition order for all16 ordinary HOST parents; DATA source claims alone do not establish executed bodies.",
+    "Genuine final API/caller/correctness/conservation/UX-source/adoption/publication proof chain in actual formats; fresh final source unions cannot inherit staging runtime qualification.",
+    "Task-main genuine typed proof reader, actual final product checkout and archive/source enrollment replacing the fixed intermediate refusal through separately reviewed SOURCE; no data flag enables this prototype.",
+    "Explicit final DATA/argv reconciliation for canonical inventory flags and honest30/60 reservation semantics; no protected cleanup deadline or invented source-phase invocation.",
+    "Frozen final controller/plan/manifest/inverses and fresh independent actual-code/conservation/argv review; later external final argv may leave only grant slot5 NULL.",
+    "Separate authentic current EC source/resource adoption and one-use scoped grant with actual source/context/tool/target/lock admission; current inherited authority remains opaque and unread.",
+    "Actual same-final-root HOST CargoJSON emitted libtest ELF and fresh full unique inventory N, then16 strict original singleton results and original waits/custody; no guessed N, child/footer inflation or historical pass transfer.",
+    "Deferred helper/reexec neighbor, full Host/UI/native cleanup/consumer flow, independent native UX and whole outcome remain separate unqualified obligations."
+  ],
+  "deferred_affected_neighbor": {
+    "boundary": "Needs separate same-head helper, caller-preservation and custody qualification. No helper path override, invocation, authority clearing/downgrade or role change is proposed here. It remains an explicitly unqualified affected neighbor.",
+    "facts": "retained_turn_final_action462 requires CAGENTS_TEST_RETAINED_ACTOR_HELPER463 and reexecs current test binary487 with --exact/--nocapture and env_clear488. It is not an ordinary no-child-results parent.",
+    "selected": false,
+    "selector": "host::chat::retained_actor_tests::retained_terminal_handoff_proves_original_console_cleanup",
+    "source": "src/host/chat/retained_actor_tests.rs:448"
+  },
+  "caller_fixture_limits": {
+    "ack": "Private UnixStream pair and synthetic authority. Two captured receipt acknowledgements, scoped denial, wrong proof and nil receipt controls. Private unscoped case is not actual production User authority.",
+    "actual_scope": "UNKNOWN/UNREAD. Caller compatibility below is source classification, not runtime/admission authority.",
+    "existing3": "Private upgrade/paired fixtures and authored Python provider/credential sentinels. These create processes/threads/files; not inert data tests or commercial provider/account evidence.",
+    "new10": "Reuse exact physical review class: private HostState/synthetic clients and owned TerminalHandle/native targets, actual private /bin/cat/PTY workers. No real User endpoint or commercial provider auth oracle.",
+    "runtime_limit": "Some selected tests create PTYs/processes/threads/files. Source caller compatibility supplies no resource/cleanup grant; existing Root16 custody/return rules remain separate.",
+    "selected16": "No selected source requires inherited authority absence or genuine User producer. Preserve opaque inherited authority; no unset/clear/replace, new context/role, remote User proxy or credential probe.",
+    "wire_controls": "In-memory framing and private stream handshake, not actual installed-peer/provider endpoint."
+  },
+  "prospective_inventory_argv_templates": {
+    "canonical_retained": [
+      null,
+      "--list",
+      "--color=never"
+    ],
+    "immutable_DATA": [
+      null,
+      "--list",
+      "--format",
+      "terse"
+    ],
+    "reconciled": null
+  },
+  "prospective_test_argv_templates": [
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ]
+  ],
+  "prospective_controller_argv": {
+    "status": "NOT_SUBMITTABLE_PREPARATION_ONLY",
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-issued-return-host16-preparation",
+    "argv": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-issued-return-host16-preparation/qualification-packets/main15-issued-return-host16-preparation/run-packet.py",
+      "--grant",
+      null,
+      "--runner-sha256",
+      null,
+      "--controller-review",
+      null,
+      "--controller-review-sha256",
+      null
+    ]
+  }
+}

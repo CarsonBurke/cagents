@@ -1,0 +1,68 @@
+{
+  "HOST16_DATA_entry_count": 21,
+  "HOST16_DATA_outer_slack": 60,
+  "HOST16_DATA_total": 2340,
+  "HOST16_command_caps_sum": 2250,
+  "HOST16_command_phase_count": 19,
+  "HOST16_original_DATA_sha256": "ee9956573d7fc627cf517897a66950c037eec1049c3c2f335e167cd09f492542",
+  "HOST16_source_reservations": [
+    30,
+    60
+  ],
+  "UI5_command_caps_seconds": [
+    300,
+    450,
+    900,
+    30,
+    90,
+    90,
+    90,
+    90,
+    90
+  ],
+  "UI5_command_caps_sum": 2130,
+  "UI5_phase_count": 9,
+  "all_actual_runtime": null,
+  "boundary_partition": "CLI and browserless UI checks are in UI5; HOST check is only in separate HOST16. Both actual packets are required for all three affected isolated boundaries; no graph union, new lane, or duplicate HOST check inside UI5.",
+  "canonical_inventory_argv": [
+    "ACTUAL_CURRENT_LIB_ELF",
+    "--list",
+    "--color=never"
+  ],
+  "canonical_singleton_argv": [
+    "ACTUAL_CURRENT_LIB_ELF",
+    "EXACT_SELECTED_NAME",
+    "--exact",
+    "--format=pretty",
+    "--color=never"
+  ],
+  "deferred_unqualified": {
+    "boundary": "Needs separate same-head helper, caller-preservation and custody qualification. No helper path override, invocation, authority clearing/downgrade or role change is proposed here. It remains an explicitly unqualified affected neighbor.",
+    "facts": "retained_turn_final_action462 requires CAGENTS_TEST_RETAINED_ACTOR_HELPER463 and reexecs current test binary487 with --exact/--nocapture and env_clear488. It is not an ordinary no-child-results parent.",
+    "selected": false,
+    "selector": "host::chat::retained_actor_tests::retained_terminal_handoff_proves_original_console_cleanup",
+    "source": "src/host/chat/retained_actor_tests.rs:448"
+  },
+  "kind": "ADDITIVE_CANONICAL_ARGV_AND_SEPARATE_BOUNDARY_BUDGET_RECONCILIATION_NOT_RUNTIME_EQUIVALENCE",
+  "no_runtime_equivalence_or_prior_count_result_transfer": true,
+  "original_HOST_inventory_argv": [
+    null,
+    "--list",
+    "--format",
+    "terse"
+  ],
+  "original_HOST_singleton_argv": [
+    null,
+    "--exact",
+    "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+    "--format",
+    "pretty"
+  ],
+  "product": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+  },
+  "source_reservation_limit": "Thirty/sixty source DATA reservations create no command or wait records and do not enforce aggregate source/finalization deadlines. Original2400 workload cap/remaining clamps and indefinite uncertain-custody HOLD remain unchanged."
+}

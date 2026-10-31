@@ -1,0 +1,3013 @@
+//! Shell effects and input layers that retain native accessibility trees.
+
+use std::{borrow::Cow, cell::RefCell, sync::Arc, time::Duration};
+
+use cosmic::cosmic_theme::{Component, Container, palette::Srgba};
+use cosmic::iced::advanced::Renderer as _;
+use cosmic::iced::advanced::{
+    Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
+    widget::{Id, Operation, Tree, operation, tree},
+};
+use cosmic::iced::{
+    Animation, Background, Border, Color, Event, Gradient, Length, Point, Radians, Rectangle,
+    Shadow, Size, Vector, gradient::Linear, mouse, time::Instant, window,
+};
+use cosmic::{Element, Renderer, Theme, widget};
+use serde::Deserialize;
+
+mod context_menu;
+mod keyed_list;
+mod list_navigation;
+pub use list_navigation::reveal_list_selection;
+
+use crate::design::space;
+
+/// How far a tooltip sits from the control it names, and how wide it may
+/// grow before its label wraps.
+const TIP_GAP: f32 = space::XS;
+const TIP_MAX_WIDTH: f32 = 320.0;
+
+/// Let a focused field answer Escape before its native blur handler runs.
+pub fn focused_escape<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_escape: impl Fn() -> Message + 'a,
+) -> Element<'a, Message> {
+    focused_key(content, move |event| {
+        matches!(
+            event,
+            cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
+                ..
+            }
+        )
+        .then(|| on_escape())
+    })
+}
+
+/// Route a key from the field that actually owns native focus, before the
+/// native input consumes it. Other fields and already captured events keep
+/// their own keyboard handling, including after programmatic focus changes.
+pub fn focused_key<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_key: impl Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::FocusedKey,
+        tip: None,
+        on_focused_key: Some(Box::new(on_key)),
+    }
+    .into()
+}
+
+/// Answer a key that nothing inside `content` claimed, wherever focus is. An
+/// open context menu claims the Escape that closes it, for example, so only a
+/// second Escape reaches the surface around it. Unlike an application-wide key
+/// subscription, nothing outside `content` can claim the key first.
+pub fn unclaimed_key<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    on_key: impl Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::UnclaimedKey,
+        tip: None,
+        on_focused_key: Some(Box::new(on_key)),
+    }
+    .into()
+}
+
+#[derive(Default)]
+struct ChildFocus(bool);
+
+impl Operation for ChildFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        self.0 |= state.is_focused();
+    }
+}
+
+/// Arrow navigation stays inside the list that owns native keyboard focus.
+pub fn keyboard_list<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    enabled: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::KeyboardList(enabled),
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+pub fn keyboard_list_row<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::ListRow,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Keyed row state with the standard column's accessibility traversal.
+pub fn keyed_list_rows<'a, Message: 'a>(
+    rows: Vec<([u8; 32], Element<'a, Message>)>,
+) -> Element<'a, Message> {
+    keyed_list::view(rows)
+}
+
+/// A filter field at the head of a keyboard list. Down enters its first
+/// result; editing keys (including Home/End) remain the field's own.
+pub fn keyboard_list_entry<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::ListEntry,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+struct ListRowMarker {
+    entry: bool,
+}
+
+#[derive(Default)]
+struct ListFocus {
+    rows: Vec<Rectangle>,
+    focused: Option<usize>,
+    active: Option<usize>,
+    active_entry: bool,
+    focused_entry: bool,
+}
+
+impl Operation for ListFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn custom(&mut self, _id: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if let Some(marker) = state.downcast_ref::<ListRowMarker>() {
+            self.active_entry = marker.entry;
+            self.active = Some(self.rows.len());
+            self.rows.push(bounds);
+        }
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if let Some(index) = self.active.take()
+            && state.is_focused()
+        {
+            self.focused = Some(index);
+            self.focused_entry = self.active_entry;
+        }
+    }
+}
+
+struct MoveListFocus {
+    target: usize,
+    index: usize,
+    active: Option<usize>,
+    bounds: Rectangle,
+}
+
+impl Operation for MoveListFocus {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn custom(&mut self, _id: Option<&Id>, _bounds: Rectangle, state: &mut dyn std::any::Any) {
+        if state.is::<ListRowMarker>() {
+            self.active = Some(self.index);
+            self.index += 1;
+        }
+    }
+    fn focusable(
+        &mut self,
+        _id: Option<&Id>,
+        _bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if let Some(index) = self.active.take() {
+            if index == self.target {
+                state.focus();
+            } else {
+                state.unfocus();
+            }
+        }
+    }
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        bounds: Rectangle,
+        content: Rectangle,
+        _translation: Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        let delta = if self.bounds.y < bounds.y {
+            self.bounds.y - bounds.y
+        } else if self.bounds.y + self.bounds.height > bounds.y + bounds.height {
+            self.bounds.y + self.bounds.height - bounds.y - bounds.height
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            state.scroll_by(
+                operation::scrollable::AbsoluteOffset { x: 0.0, y: delta },
+                bounds,
+                content,
+            );
+        }
+    }
+}
+
+const HOVER_DURATION: Duration = Duration::from_millis(120);
+const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
+
+pub fn font_zoom_chord(
+    key: &cosmic::iced::keyboard::Key,
+    physical: cosmic::iced::keyboard::key::Physical,
+    modifiers: cosmic::iced::keyboard::Modifiers,
+) -> Option<i8> {
+    use cosmic::iced::keyboard::{
+        Key,
+        key::{Code, Physical},
+    };
+    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    match (key.as_ref(), physical) {
+        (Key::Character("=" | "+"), _) | (_, Physical::Code(Code::Equal)) => Some(1),
+        (Key::Character("-"), _) | (_, Physical::Code(Code::Minus)) if !modifiers.shift() => {
+            Some(-1)
+        }
+        (Key::Character("0"), _) | (_, Physical::Code(Code::Digit0)) if !modifiers.shift() => {
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// Reserve tab-history keys before editor widgets can treat Tab as indentation.
+/// The application's keyboard subscription owns navigation and Control release.
+pub fn reserve_tab_history<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    enabled: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::TabHistory(enabled),
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Soft full-bounds hover feedback, including when a child captures the event.
+/// The native animation clock requests frames only until its target is reached.
+pub fn hover<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::Hover,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Keeps passive window-frame subscriptions advancing only while state animates.
+pub fn drive_animation<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    active: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::DriveAnimation(active),
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Reveal a right-anchored pane without reflowing its contents on every frame.
+pub fn reveal_width<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: f32,
+    progress: f32,
+) -> Element<'a, Message> {
+    reveal_width_aligned(content, width, progress, false)
+}
+
+/// Treat a vertical mouse wheel as horizontal motion.
+///
+/// iced's native scrollable only swaps axes while Shift is held. Tab strips
+/// are horizontal-only, so a normal wheel should move them without a modifier.
+pub fn horizontal_wheel<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(WheelInput {
+        content: content.into(),
+        pass_to_parent: false,
+    })
+}
+
+/// Lets the enclosing native scrollable own wheel gestures over a read-only
+/// editor while preserving the editor's selection and keyboard handling.
+pub fn parent_wheel<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(WheelInput {
+        content: content.into(),
+        pass_to_parent: true,
+    })
+}
+
+/// Fade the leading/trailing edges of a horizontal strip when it can scroll.
+///
+/// Tab rows hide their scrollbar; the fade is the usual hint that more tabs
+/// sit off-screen.
+pub fn overflow_fade_x<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Element::new(OverflowFadeX {
+        content: content.into(),
+    })
+}
+
+/// Projects a wheel gesture onto the horizontal axis.
+///
+/// Summing the two components cancels a diagonal trackpad gesture exactly - a
+/// gesture reporting `x = -d, y = +d` sums to zero - and [`WheelInput`]
+/// has already replaced the original event by then, so the motion is discarded
+/// rather than forwarded. A real horizontal delta therefore wins outright, and
+/// only a purely vertical one is remapped.
+fn wheel_as_horizontal(delta: mouse::ScrollDelta) -> Event {
+    fn horizontal(x: f32, y: f32) -> f32 {
+        if x == 0.0 { y } else { x }
+    }
+    let x = match delta {
+        mouse::ScrollDelta::Lines { x, y } => horizontal(x, y) * 60.0,
+        mouse::ScrollDelta::Pixels { x, y } => horizontal(x, y),
+    };
+    Event::Mouse(mouse::Event::WheelScrolled {
+        delta: mouse::ScrollDelta::Pixels { x, y: 0.0 },
+    })
+}
+
+/// Reveal a left-anchored pane without reflowing its contents on every frame.
+pub fn reveal_leading_width<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: f32,
+    progress: f32,
+) -> Element<'a, Message> {
+    reveal_width_aligned(content, width, progress, true)
+}
+
+fn reveal_width_aligned<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    width: f32,
+    progress: f32,
+    leading: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::RevealWidth {
+            width: width.max(0.0),
+            progress: progress.clamp(0.0, 1.0),
+            leading,
+        },
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Fades semantic COSMIC surfaces and text without moving them.
+///
+/// This is not a renderer opacity group: the pinned renderer has no group-alpha
+/// operation, and its SVG recoloring ignores color alpha, even for symbolic
+/// icons. Icons/images must use their own `.opacity(progress)`; explicit custom
+/// colors and styles which replace alpha must also apply `progress` themselves.
+/// Child events, focus, overlays, and accessibility remain available throughout.
+pub fn fade<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    progress: f32,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::Fade(progress.clamp(0.0, 1.0)),
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Delayed, stationary tooltips that do not hide their control from assistive
+/// technology (the pinned upstream Tooltip does not forward a11y nodes).
+/// Give the control its own accessible name/description as well. The dwell clock
+/// follows the control, not its label, so live status text cannot postpone it.
+pub fn tooltip<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl Into<Cow<'a, str>>,
+) -> Element<'a, Message> {
+    tooltip_positioned(content, label, false)
+}
+
+/// Keep a tooltip above chrome whose native child surface covers the area below.
+pub fn tooltip_above<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl Into<Cow<'a, str>>,
+) -> Element<'a, Message> {
+    tooltip_positioned(content, label, true)
+}
+
+fn tooltip_positioned<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl Into<Cow<'a, str>>,
+    prefer_above: bool,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::Tooltip,
+        tip: Some(Tip {
+            label: label.into(),
+            prefer_above,
+            content: None,
+        }),
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Keep the native menu beside its content: the pinned COSMIC ContextMenu
+/// does not forward `mouse_interaction`, so wrapping the content inside it
+/// loses every child cursor. The transparent front layer owns menu gestures;
+/// the real content retains its native input, cursor and accessibility tree.
+/// Schedule a frame when a stationary right click opens the menu.
+pub fn context_menu<'a, Message: Clone + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    menu: Vec<widget::menu::Tree<Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(content.into(), context_menu::surface(menu)),
+        kind: Kind::ContextMenu,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// [`context_menu`] whose entries are built only when the menu opens, for
+/// rows whose menu would otherwise be assembled on every view.
+pub fn context_menu_lazy<'a, Message: Clone + 'static>(
+    content: impl Into<Element<'a, Message>>,
+    builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
+) -> Element<'a, Message> {
+    Effect {
+        content: layer(content.into(), context_menu::lazy_surface(builder)),
+        kind: Kind::ContextMenu,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Keeps every key from the layers beneath a transient surface that the
+/// application's keyboard subscription drives, so a key that steers or
+/// dismisses it is not also typed into the pane it covers.
+pub fn keyboard_modal<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::KeyboardModal,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Blocks click-through without hiding the child's accessibility tree.
+pub fn opaque<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Effect {
+        content: content.into(),
+        kind: Kind::Opaque,
+        tip: None,
+        on_focused_key: None,
+    }
+    .into()
+}
+
+/// Two visual layers with front-first input and complete accessibility traversal.
+/// The pinned upstream Stack drops accessibility nodes for all descendants.
+pub fn layer<'a, Message: 'a>(
+    base: Element<'a, Message>,
+    front: Element<'a, Message>,
+) -> Element<'a, Message> {
+    Element::new(Layers {
+        children: [base, front],
+        front_exclusive: false,
+    })
+}
+
+/// Retain the base tree while a pane-local chooser owns input, accessibility
+/// and drawing. A stable second slot prevents opening/closing it from replacing
+/// the transcript, and nothing of the base, such as a scrollbar beside a
+/// narrower chooser, shows or answers the pointer while it is covered.
+pub fn exclusive_layer<'a, Message: 'a>(
+    base: Element<'a, Message>,
+    front: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let front_exclusive = front.is_some();
+    Element::new(Layers {
+        children: [
+            base,
+            front.unwrap_or_else(|| cosmic::iced::widget::Space::new().into()),
+        ],
+        front_exclusive,
+    })
+}
+
+struct Layers<'a, Message> {
+    children: [Element<'a, Message>; 2],
+    front_exclusive: bool,
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for Layers<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        self.children.iter().map(Tree::new).collect()
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(&mut self.children);
+    }
+    fn size(&self) -> Size<Length> {
+        self.children[0].as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let base = self.children[0]
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        let size = base.size();
+        let front = self.children[1].as_widget_mut().layout(
+            &mut tree.children[1],
+            renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        layout::Node::with_children(size, vec![base, front])
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.container(None, layout.bounds());
+        operation.traverse(&mut |operation| {
+            for (index, ((child, tree), layout)) in self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(
+                    layout
+                        .children()
+                        .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+                )
+                .enumerate()
+            {
+                if self.front_exclusive && index == 0 {
+                    continue;
+                }
+                child
+                    .as_widget_mut()
+                    .operate(tree, layout, renderer, operation);
+            }
+        });
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        mut cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let over = cursor.is_over(layout.bounds());
+        let exclusive_viewport = layout.bounds().intersection(viewport).unwrap_or_default();
+        if self.front_exclusive && !over {
+            cursor = mouse::Cursor::Unavailable;
+        }
+        let viewport = if self.front_exclusive {
+            &exclusive_viewport
+        } else {
+            viewport
+        };
+        for ((child, tree), layout) in self
+            .children
+            .iter_mut()
+            .rev()
+            .zip(tree.children.iter_mut().rev())
+            .zip(
+                layout
+                    .children()
+                    .rev()
+                    .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+            )
+        {
+            child.as_widget_mut().update(
+                tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+            );
+            if self.front_exclusive || shell.is_event_captured() {
+                return;
+            }
+            if over
+                && !cursor.is_levitating()
+                && child
+                    .as_widget()
+                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+                    != mouse::Interaction::None
+            {
+                cursor = cursor.levitate();
+            }
+        }
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.children
+            .iter()
+            .rev()
+            .zip(tree.children.iter().rev())
+            .zip(
+                layout
+                    .children()
+                    .rev()
+                    .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+            )
+            .take(if self.front_exclusive { 1 } else { 2 })
+            .map(|((child, tree), layout)| {
+                child
+                    .as_widget()
+                    .mouse_interaction(tree, layout, cursor, viewport, renderer)
+            })
+            .find(|interaction| *interaction != mouse::Interaction::None)
+            .unwrap_or_default()
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        if layout.bounds().intersection(viewport).is_none() {
+            return;
+        }
+        let mut layouts = layout
+            .children()
+            .map(|child| child.with_virtual_offset(layout.virtual_offset()));
+        let base = layouts.next().expect("base layer");
+        let front = layouts.next().expect("front layer");
+        if !self.front_exclusive {
+            let front_active = self.children[1].as_widget().mouse_interaction(
+                &tree.children[1],
+                front,
+                cursor,
+                viewport,
+                renderer,
+            ) != mouse::Interaction::None;
+            self.children[0].as_widget().draw(
+                &tree.children[0],
+                renderer,
+                theme,
+                style,
+                base,
+                if front_active {
+                    mouse::Cursor::Unavailable
+                } else {
+                    cursor
+                },
+                viewport,
+            );
+        }
+        let front_viewport = if self.front_exclusive {
+            layout.bounds().intersection(viewport).unwrap_or_default()
+        } else {
+            *viewport
+        };
+        renderer.with_layer(front_viewport, |renderer| {
+            self.children[1].as_widget().draw(
+                &tree.children[1],
+                renderer,
+                theme,
+                style,
+                front,
+                cursor,
+                &front_viewport,
+            )
+        });
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        if self.front_exclusive {
+            return self.children[1].as_widget_mut().overlay(
+                &mut tree.children[1],
+                layout.children().nth(1).expect("front layer"),
+                renderer,
+                viewport,
+                translation,
+            );
+        }
+        overlay::from_children(
+            &mut self.children,
+            tree,
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        iced_accessibility::A11yTree::join(
+            self.children
+                .iter()
+                .zip(&tree.children)
+                .zip(
+                    layout
+                        .children()
+                        .map(|child| child.with_virtual_offset(layout.virtual_offset())),
+                )
+                .enumerate()
+                .filter(|(index, _)| !self.front_exclusive || *index == 1)
+                .map(|(_, ((child, tree), layout))| {
+                    child.as_widget().a11y_nodes(layout, tree, cursor)
+                }),
+        )
+    }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        for (index, ((child, tree), child_layout)) in self
+            .children
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+            .enumerate()
+        {
+            if self.front_exclusive && index == 0 {
+                continue;
+            }
+            child.as_widget().drag_destinations(
+                tree,
+                child_layout.with_virtual_offset(layout.virtual_offset()),
+                renderer,
+                destinations,
+            );
+        }
+    }
+}
+
+struct WheelInput<'a, Message> {
+    content: Element<'a, Message>,
+    pass_to_parent: bool,
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for WheelInput<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            operation,
+        );
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if self.pass_to_parent && matches!(event, Event::Mouse(mouse::Event::WheelScrolled { .. }))
+        {
+            return;
+        }
+        let remapped;
+        let event = match event {
+            Event::Mouse(mouse::Event::WheelScrolled { delta })
+                if cursor.is_over(layout.bounds()) =>
+            {
+                remapped = wheel_as_horizontal(*delta);
+                &remapped
+            }
+            other => other,
+        };
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+        )
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content.as_widget().a11y_nodes(
+            layout.with_virtual_offset(layout.virtual_offset()),
+            &tree.children[0],
+            cursor,
+        )
+    }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            destinations,
+        );
+    }
+}
+
+const OVERFLOW_FADE_WIDTH: f32 = 24.0;
+
+fn overflow_edges(offset: f32, viewport: f32, content: f32) -> (bool, bool) {
+    (offset > 0.5, content - offset > viewport + 0.5)
+}
+
+struct OverflowFadeX<'a, Message> {
+    content: Element<'a, Message>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct OverflowState {
+    start: bool,
+    end: bool,
+}
+
+struct OverflowProbe {
+    start: bool,
+    end: bool,
+    found: bool,
+}
+
+impl<T> Operation<T> for OverflowProbe {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
+        // The strip is found near the root; every tab beneath it would
+        // otherwise be walked on each event and layout for nothing.
+        if !self.found {
+            operate(self);
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&Id>,
+        bounds: Rectangle,
+        content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn operation::Scrollable,
+    ) {
+        // The tab strip is the outermost scrollable. Nested ones (editor
+        // panes, menus) would otherwise overwrite the fade with their offset.
+        if self.found {
+            return;
+        }
+        self.found = true;
+        (self.start, self.end) = overflow_edges(translation.x, bounds.width, content_bounds.width);
+    }
+}
+
+fn read_overflow<Message>(
+    content: &mut Element<'_, Message>,
+    tree: &mut Tree,
+    layout: Layout<'_>,
+    renderer: &Renderer,
+) -> OverflowState {
+    let mut probe = OverflowProbe {
+        start: false,
+        end: false,
+        found: false,
+    };
+    content
+        .as_widget_mut()
+        .operate(tree, layout, renderer, &mut probe);
+    OverflowState {
+        start: probe.start,
+        end: probe.end,
+    }
+}
+
+impl<Message> Widget<Message, Theme, Renderer> for OverflowFadeX<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<OverflowState>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(OverflowState::default())
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+    }
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let node = self
+            .content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        let overflow = read_overflow(
+            &mut self.content,
+            &mut tree.children[0],
+            Layout::new(&node),
+            renderer,
+        );
+        *tree.state.downcast_mut::<OverflowState>() = overflow;
+        node
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            operation,
+        );
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let child_layout = layout.with_virtual_offset(layout.virtual_offset());
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            child_layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        let overflow = read_overflow(
+            &mut self.content,
+            &mut tree.children[0],
+            child_layout,
+            renderer,
+        );
+        let state = tree.state.downcast_mut::<OverflowState>();
+        if *state != overflow {
+            *state = overflow;
+            shell.request_redraw();
+        }
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout.with_virtual_offset(layout.virtual_offset()),
+            cursor,
+            viewport,
+        );
+        let state = tree.state.downcast_ref::<OverflowState>();
+        if !state.start && !state.end {
+            return;
+        }
+        let bounds = layout.bounds();
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
+        // Match the chrome behind the tabs, not the component fill sitting on it.
+        let mut color: Color = theme.current_container().base.into();
+        color.a = 1.0;
+        let mut clear = color;
+        clear.a = 0.0;
+        renderer.with_layer(clip, |renderer| {
+            if state.start {
+                fill_overflow_fade(
+                    renderer,
+                    Rectangle {
+                        x: bounds.x,
+                        y: bounds.y,
+                        width: OVERFLOW_FADE_WIDTH.min(bounds.width),
+                        height: bounds.height,
+                    },
+                    color,
+                    clear,
+                );
+            }
+            if state.end {
+                let width = OVERFLOW_FADE_WIDTH.min(bounds.width);
+                fill_overflow_fade(
+                    renderer,
+                    Rectangle {
+                        x: bounds.x + bounds.width - width,
+                        y: bounds.y,
+                        width,
+                        height: bounds.height,
+                    },
+                    clear,
+                    color,
+                );
+            }
+        });
+    }
+    fn overlay<'a>(
+        &'a mut self,
+        tree: &'a mut Tree,
+        layout: Layout<'a>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'a, Message, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content.as_widget().a11y_nodes(
+            layout.with_virtual_offset(layout.virtual_offset()),
+            &tree.children[0],
+            cursor,
+        )
+    }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            layout.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            destinations,
+        );
+    }
+}
+
+fn fill_overflow_fade(renderer: &mut Renderer, bounds: Rectangle, from: Color, to: Color) {
+    renderer.fill_quad(
+        renderer::Quad {
+            bounds,
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        // iced treats 0 rad as upward (CSS 0deg). π/2 is left-to-right.
+        Background::Gradient(Gradient::Linear(
+            Linear::new(Radians(std::f32::consts::FRAC_PI_2))
+                .add_stop(0.0, from)
+                .add_stop(1.0, to),
+        )),
+    );
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    KeyboardList(bool),
+    FocusedKey,
+    ListRow,
+    ListEntry,
+    TabHistory(bool),
+    Hover,
+    ContextMenu,
+    Fade(f32),
+    Tooltip,
+    DriveAnimation(bool),
+    RevealWidth {
+        width: f32,
+        progress: f32,
+        leading: bool,
+    },
+    Opaque,
+    KeyboardModal,
+    UnclaimedKey,
+}
+
+struct Effect<'a, Message> {
+    content: Element<'a, Message>,
+    kind: Kind,
+    tip: Option<Tip<'a, Message>>,
+    on_focused_key: Option<Box<dyn Fn(&cosmic::iced::keyboard::Event) -> Option<Message> + 'a>>,
+}
+
+struct Tip<'a, Message> {
+    label: Cow<'a, str>,
+    prefer_above: bool,
+    /// The tip's surface, built when it first opens. A view names a tooltip
+    /// for nearly every control and shows at most one of them, so the text,
+    /// its container and their widget state are not built until then.
+    content: Option<Element<'a, Message>>,
+}
+
+impl<'a, Message: 'a> Tip<'a, Message> {
+    fn content(&mut self) -> &mut Element<'a, Message> {
+        self.content.get_or_insert_with(|| {
+            // The shell's type scale owns this size. Tooltip text is the
+            // whole content of its surface rather than secondary metadata
+            // beside something else, so it takes the body role;
+            // `design::caption` also mutes its color, which an overlay with
+            // its own background must not do.
+            cosmic::widget::container(crate::design::body(self.label.clone()))
+                .class(crate::design::transparent())
+                .padding([space::XS, space::S])
+                .max_width(TIP_MAX_WIDTH)
+                .into()
+        })
+    }
+}
+
+// Distinct tags prevent a positional diff from reusing a tooltip's clock as a
+// hover/fade clock when a conditional wrapper changes kind.
+struct HoverTag;
+struct TabHistoryTag;
+struct KeyboardListTag;
+struct FocusedKeyTag;
+struct UnclaimedKeyTag;
+struct ListRowTag;
+struct FadeTag;
+struct TooltipTag;
+struct AnimationDriverTag;
+struct OpaqueTag;
+struct KeyboardModalTag;
+struct ContextMenuTag;
+struct RevealWidthTag;
+
+fn effect_layout(kind: Kind, layout: Layout<'_>) -> Layout<'_> {
+    if matches!(kind, Kind::RevealWidth { .. }) {
+        layout
+            .children()
+            .next()
+            .expect("revealed pane layout")
+            .with_virtual_offset(layout.virtual_offset())
+    } else {
+        layout
+    }
+}
+
+struct State {
+    hover: Animation<bool>,
+    tooltip: Animation<bool>,
+    entered: Option<Instant>,
+    tip_open: bool,
+    inspect_control: bool,
+    disabled: bool,
+    focused: bool,
+    now: Instant,
+    faded: RefCell<Option<FadedTheme>>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            hover: Animation::new(false).duration(HOVER_DURATION),
+            tooltip: Animation::new(false).duration(HOVER_DURATION),
+            entered: None,
+            tip_open: false,
+            inspect_control: true,
+            disabled: false,
+            focused: true,
+            now: Instant::now(),
+            faded: RefCell::new(None),
+        }
+    }
+}
+
+impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
+    fn tag(&self) -> tree::Tag {
+        match self.kind {
+            Kind::KeyboardList(_) => tree::Tag::of::<KeyboardListTag>(),
+            Kind::FocusedKey => tree::Tag::of::<FocusedKeyTag>(),
+            Kind::UnclaimedKey => tree::Tag::of::<UnclaimedKeyTag>(),
+            Kind::ListRow | Kind::ListEntry => tree::Tag::of::<ListRowTag>(),
+            Kind::TabHistory(_) => tree::Tag::of::<TabHistoryTag>(),
+            Kind::Hover => tree::Tag::of::<HoverTag>(),
+            Kind::Fade(_) => tree::Tag::of::<FadeTag>(),
+            Kind::Tooltip => tree::Tag::of::<TooltipTag>(),
+            Kind::DriveAnimation(_) => tree::Tag::of::<AnimationDriverTag>(),
+            Kind::Opaque => tree::Tag::of::<OpaqueTag>(),
+            Kind::KeyboardModal => tree::Tag::of::<KeyboardModalTag>(),
+            Kind::ContextMenu => tree::Tag::of::<ContextMenuTag>(),
+            Kind::RevealWidth { .. } => tree::Tag::of::<RevealWidthTag>(),
+        }
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(State::default())
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+    fn diff(&mut self, tree: &mut Tree) {
+        let identity = control_identity(&tree.children[0]).cloned();
+        // An open tip's state sits after the content's and is rebuilt by
+        // `overlay`; a new view starts from the content alone.
+        tree.diff_children(std::slice::from_mut(&mut self.content));
+        let changed_control = identity.as_ref() != control_identity(&tree.children[0]);
+        let state = tree.state.downcast_mut::<State>();
+        state.inspect_control = true;
+        if changed_control {
+            *state = State::default();
+        }
+    }
+    fn size(&self) -> Size<Length> {
+        let mut size = self.content.as_widget().size();
+        if let Kind::RevealWidth {
+            width, progress, ..
+        } = self.kind
+        {
+            size.width = Length::Fixed(width * progress);
+        }
+        size
+    }
+    fn size_hint(&self) -> Size<Length> {
+        if matches!(self.kind, Kind::RevealWidth { .. }) {
+            self.size()
+        } else {
+            self.content.as_widget().size_hint()
+        }
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        if let Kind::RevealWidth {
+            width,
+            progress,
+            leading,
+        } = self.kind
+        {
+            let visible = (width * progress).min(limits.max().width);
+            let child = self.content.as_widget_mut().layout(
+                &mut tree.children[0],
+                renderer,
+                &layout::Limits::new(Size::new(width, 0.0), Size::new(width, limits.max().height)),
+            );
+            let height = child.size().height;
+            let x = if leading { 0.0 } else { visible - width };
+            return layout::Node::with_children(
+                Size::new(visible, height),
+                vec![child.move_to(Point::new(x, 0.0))],
+            );
+        }
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        if matches!(self.kind, Kind::ListRow | Kind::ListEntry) {
+            operation.custom(
+                None,
+                layout.bounds() - layout.virtual_offset(),
+                &mut ListRowMarker {
+                    entry: matches!(self.kind, Kind::ListEntry),
+                },
+            );
+        }
+        self.content.as_widget_mut().operate(
+            &mut tree.children[0],
+            effect_layout(self.kind, layout),
+            renderer,
+            operation,
+        );
+    }
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if matches!(self.kind, Kind::FocusedKey)
+            && let Some(on_key) = &self.on_focused_key
+            && let Event::Keyboard(event) = event
+        {
+            if shell.is_event_captured() {
+                return;
+            }
+            let mut focus = ChildFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if focus.0
+                && let Some(message) = on_key(event)
+            {
+                shell.publish(message);
+                shell.capture_event();
+                return;
+            }
+        }
+        if let Kind::KeyboardList(true) = self.kind
+            && let Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(key),
+                modifiers,
+                ..
+            }) = event
+            && modifiers.is_empty()
+            && matches!(
+                key,
+                cosmic::iced::keyboard::key::Named::ArrowUp
+                    | cosmic::iced::keyboard::key::Named::ArrowDown
+                    | cosmic::iced::keyboard::key::Named::Home
+                    | cosmic::iced::keyboard::key::Named::End
+            )
+        {
+            let mut focus = ListFocus::default();
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            if let Some(current) = focus.focused
+                && (!focus.focused_entry || *key == cosmic::iced::keyboard::key::Named::ArrowDown)
+            {
+                use cosmic::iced::keyboard::key::Named;
+                let target = match key {
+                    Named::ArrowUp => current.saturating_sub(1),
+                    Named::ArrowDown => (current + 1).min(focus.rows.len().saturating_sub(1)),
+                    Named::Home => 0,
+                    _ => focus.rows.len().saturating_sub(1),
+                };
+                let mut movement = MoveListFocus {
+                    target,
+                    index: 0,
+                    active: None,
+                    bounds: focus.rows[target],
+                };
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut movement,
+                );
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+        }
+        // Modifier state is not a key press: widgets beneath keep their own
+        // copy of it for the clicks and drags that follow, and would be left
+        // believing a modifier is still held.
+        if matches!(self.kind, Kind::KeyboardModal)
+            && matches!(
+                event,
+                Event::Keyboard(
+                    cosmic::iced::keyboard::Event::KeyPressed { .. }
+                        | cosmic::iced::keyboard::Event::KeyReleased { .. }
+                )
+            )
+        {
+            shell.capture_event();
+            return;
+        }
+        if let Kind::TabHistory(true) = self.kind
+            && let Event::Keyboard(
+                cosmic::iced::keyboard::Event::KeyPressed { key, modifiers, .. }
+                | cosmic::iced::keyboard::Event::KeyReleased { key, modifiers, .. },
+            ) = event
+            && crate::tab_history::is_chord(key, *modifiers)
+        {
+            shell.capture_event();
+            return;
+        }
+        if let Kind::RevealWidth { progress, .. } = self.kind {
+            let clipped = layout.bounds().intersection(viewport).unwrap_or_default();
+            let cursor = if progress < 1.0 || !cursor.is_over(clipped) {
+                mouse::Cursor::Unavailable
+            } else {
+                cursor
+            };
+            if progress < 1.0 && !matches!(event, Event::Window(_)) {
+                return;
+            }
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                effect_layout(self.kind, layout),
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                &clipped,
+            );
+            return;
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if matches!(self.kind, Kind::UnclaimedKey)
+            && !shell.is_event_captured()
+            && let Event::Keyboard(event) = event
+            && let Some(message) = self
+                .on_focused_key
+                .as_ref()
+                .and_then(|on_key| on_key(event))
+        {
+            shell.publish(message);
+            shell.capture_event();
+            return;
+        }
+        if matches!(self.kind, Kind::TabHistory(_)) {
+            return;
+        }
+        if matches!(self.kind, Kind::ContextMenu) {
+            if matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right))
+            ) && cursor.is_over(layout.bounds())
+            {
+                shell.invalidate_layout();
+                shell.request_redraw();
+            }
+            return;
+        }
+        if matches!(self.kind, Kind::Opaque) {
+            if matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
+                && cursor.is_over(layout.bounds())
+            {
+                shell.capture_event();
+            }
+            return;
+        }
+        if let Kind::DriveAnimation(active) = self.kind {
+            if active {
+                shell.request_redraw();
+            }
+            return;
+        }
+        if matches!(self.kind, Kind::Fade(_)) {
+            return;
+        }
+        let state = tree.state.downcast_mut::<State>();
+        let now = match event {
+            Event::Window(window::Event::RedrawRequested(at)) => *at,
+            _ => Instant::now(),
+        };
+        state.now = now;
+        match event {
+            Event::Window(window::Event::Focused) => state.focused = true,
+            Event::Window(window::Event::Unfocused) => state.focused = false,
+            _ => {}
+        }
+        let mut inside = state.focused
+            && !matches!(event, Event::Mouse(mouse::Event::CursorLeft))
+            && layout
+                .bounds()
+                .intersection(viewport)
+                .is_some_and(|bounds| cursor.is_over(bounds));
+        if !inside {
+            state.inspect_control = true;
+        }
+        if matches!(self.kind, Kind::Tooltip) && inside && state.inspect_control {
+            // The Widget API has no enabled query. COSMIC buttons expose this
+            // through their root a11y node. Inspect on entry/rebuild, not every
+            // animation frame; noninteractive explanatory tooltips still work.
+            let nodes = self
+                .content
+                .as_widget()
+                .a11y_nodes(layout, &tree.children[0], cursor);
+            state.disabled = nodes.root().len() == 1 && nodes.root()[0].node().is_disabled();
+            state.inspect_control = false;
+        }
+        inside &= !state.disabled;
+        if state.hover.value() != inside {
+            state.hover.go_mut(inside, now);
+            state.entered = inside.then_some(now);
+            shell.request_redraw();
+        }
+        match self.kind {
+            Kind::Hover if state.hover.is_animating(now) => shell.request_redraw(),
+            Kind::Tooltip => {
+                let mut visible = false;
+                if let Some(entered) = state.entered.filter(|_| inside) {
+                    let deadline = entered + TOOLTIP_DELAY;
+                    visible = now >= deadline;
+                    if !visible {
+                        shell.request_redraw_at(deadline);
+                    }
+                }
+                if state.tooltip.value() != visible {
+                    state.tooltip.go_mut(visible, now);
+                    if visible && !state.tip_open {
+                        state.tip_open = true;
+                        shell.invalidate_layout();
+                    }
+                    shell.request_redraw();
+                }
+                if state.tooltip.is_animating(now) {
+                    shell.request_redraw();
+                } else if !visible && state.tip_open {
+                    state.tip_open = false;
+                    shell.invalidate_layout();
+                    shell.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        if let Kind::RevealWidth { progress, .. } = self.kind {
+            if progress < 1.0 || !cursor.is_over(layout.bounds()) {
+                return mouse::Interaction::None;
+            }
+        }
+        let interaction = self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            effect_layout(self.kind, layout),
+            cursor,
+            viewport,
+            renderer,
+        );
+        if matches!(self.kind, Kind::Opaque)
+            && interaction == mouse::Interaction::None
+            && cursor.is_over(layout.bounds())
+        {
+            mouse::Interaction::Idle
+        } else {
+            interaction
+        }
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        if matches!(self.kind, Kind::RevealWidth { .. }) {
+            if let Some(clipped) = layout.bounds().intersection(viewport) {
+                renderer.with_layer(clipped, |renderer| {
+                    self.content.as_widget().draw(
+                        &tree.children[0],
+                        renderer,
+                        theme,
+                        style,
+                        effect_layout(self.kind, layout),
+                        cursor,
+                        &clipped,
+                    );
+                });
+            }
+            return;
+        }
+        let state = tree.state.downcast_ref::<State>();
+        if let Kind::Fade(progress) = self.kind {
+            if progress <= 0.0 {
+                return;
+            }
+            if progress < 1.0 {
+                let mut cached = state.faded.borrow_mut();
+                if cached.as_ref().is_none_or(|cached| cached.source != *theme) {
+                    *cached = Some(FadedTheme::new(theme));
+                }
+                let faded = cached
+                    .as_mut()
+                    .expect("faded theme initialized")
+                    .at(progress);
+                let mut style = *style;
+                style.text_color.a *= progress;
+                style.icon_color.a *= progress;
+                self.content.as_widget().draw(
+                    &tree.children[0],
+                    renderer,
+                    faded,
+                    &style,
+                    layout,
+                    cursor,
+                    viewport,
+                );
+                return;
+            }
+        }
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+        if matches!(self.kind, Kind::Hover) {
+            // Keep low-emphasis rows legible against neutral surfaces without
+            // turning hover feedback into a selected-state fill.
+            let alpha = state.hover.interpolate(0.0, 0.10, state.now);
+            if alpha > 0.0 {
+                if let Some(bounds) = layout.bounds().intersection(viewport) {
+                    let mut color: Color = theme.current_container().on.into();
+                    color.a *= alpha;
+                    // Draw after the child, otherwise opaque button surfaces
+                    // completely cover the feedback. This captures no events.
+                    renderer.with_layer(bounds, |renderer| {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: layout.bounds(),
+                                border: cosmic::iced::Border {
+                                    radius: crate::design::RADIUS_S.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                            color,
+                        )
+                    });
+                }
+            }
+        }
+    }
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+        if matches!(self.kind, Kind::RevealWidth { progress, .. } if progress < 1.0) {
+            return None;
+        }
+        let tip_open = tree.state.downcast_ref::<State>().tip_open;
+        if let Some(tip) = self.tip.as_mut().filter(|_| tip_open) {
+            if tree.children.len() < 2 {
+                tree.children.push(Tree::new(&*tip.content()));
+            }
+        }
+        let (content_state, tip_state) = tree.children.split_at_mut(1);
+        let child = self.content.as_widget_mut().overlay(
+            &mut content_state[0],
+            effect_layout(self.kind, layout),
+            renderer,
+            viewport,
+            translation,
+        );
+        let state = tree.state.downcast_ref::<State>();
+        if state.tip_open {
+            if let Some(tip) = &mut self.tip {
+                let prefer_above = tip.prefer_above;
+                let tip = overlay::Element::new(Box::new(TipOverlay {
+                    content: tip.content(),
+                    tree: &mut tip_state[0],
+                    anchor: layout.bounds() + translation,
+                    progress: state.tooltip.interpolate(0.0, 1.0, state.now),
+                    prefer_above,
+                }));
+                return Some(if let Some(child) = child {
+                    overlay::Group::with_children(vec![child, tip]).overlay()
+                } else {
+                    tip
+                });
+            }
+        }
+        child
+    }
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        tree: &Tree,
+        cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        self.content.as_widget().a11y_nodes(
+            effect_layout(self.kind, layout),
+            &tree.children[0],
+            cursor,
+        )
+    }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        if matches!(self.kind, Kind::RevealWidth { progress, .. } if progress < 1.0) {
+            return;
+        }
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            effect_layout(self.kind, layout),
+            renderer,
+            destinations,
+        );
+    }
+}
+
+impl<'a, Message: 'a> From<Effect<'a, Message>> for Element<'a, Message> {
+    fn from(effect: Effect<'a, Message>) -> Self {
+        Self::new(effect)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn an_exclusive_chooser_narrower_than_its_base_hides_the_base_from_the_pointer() {
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let bounds = Rectangle::with_size(Size::new(400.0, 200.0));
+        // Only the gutter beside the narrower chooser lies over the base.
+        let gutter = mouse::Cursor::Available(Point::new(390.0, 100.0));
+        for (front, expected) in [
+            (None, mouse::Interaction::Pointer),
+            (
+                Some(
+                    widget::container(cosmic::iced::widget::Space::new())
+                        .width(300)
+                        .height(Length::Fill)
+                        .into(),
+                ),
+                mouse::Interaction::None,
+            ),
+        ] {
+            let mut element: Element<'_, u8> = exclusive_layer(
+                widget::button::custom(cosmic::iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .on_press(1)
+                    .into(),
+                front,
+            );
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, bounds.size()),
+            );
+            assert_eq!(
+                element.as_widget().mouse_interaction(
+                    &tree,
+                    Layout::new(&node),
+                    gutter,
+                    &bounds,
+                    &renderer,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn font_zoom_accepts_layout_variants_without_claiming_typing() {
+        use cosmic::iced::keyboard::{
+            Key, Modifiers,
+            key::{Code, Physical},
+        };
+        let equal = Physical::Code(Code::Equal);
+        assert_eq!(
+            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::CTRL),
+            Some(1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("+".into()),
+                equal,
+                Modifiers::CTRL | Modifiers::SHIFT
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("-".into()),
+                Physical::Code(Code::Minus),
+                Modifiers::CTRL
+            ),
+            Some(-1)
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("0".into()),
+                Physical::Code(Code::Digit0),
+                Modifiers::CTRL
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::empty()),
+            None
+        );
+        assert_eq!(
+            font_zoom_chord(
+                &Key::Character("=".into()),
+                equal,
+                Modifiers::CTRL | Modifiers::ALT
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn focused_escape_answers_before_the_native_field_blurs() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let id = Id::from("escape.find");
+        let mut element = focused_escape(
+            crate::ui_controls::field::search("Find", "needle")
+                .id(id.clone())
+                .on_input(|_| 0_u8)
+                .on_unfocus(2_u8),
+            || 1_u8,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(260.0, 100.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+        let mut published = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut published),
+            &bounds,
+        );
+        assert!(
+            published.is_empty(),
+            "an unfocused find field cannot steal Escape"
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(id),
+        );
+        let mut shell = Shell::new(&mut published);
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &bounds,
+        );
+        assert!(shell.is_event_captured());
+        assert_eq!(
+            published,
+            [1],
+            "Escape closes find before COSMIC publishes blur"
+        );
+    }
+
+    #[test]
+    fn list_arrows_move_native_focus_and_enter_activates_only_the_destination() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let first = Id::from("list.first");
+        let second = Id::from("list.second");
+        let mut element = keyboard_list(
+            widget::column::with_children(vec![
+                keyboard_list_row(
+                    crate::ui_controls::button::quiet("First")
+                        .id(first.clone())
+                        .on_press(1_u8),
+                ),
+                keyboard_list_row(
+                    crate::ui_controls::button::quiet("Second")
+                        .id(second)
+                        .on_press(2_u8),
+                ),
+            ]),
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(260.0, 200.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(first),
+        );
+        let mut published = Vec::new();
+        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Enter] {
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut published),
+                &bounds,
+            );
+        }
+        assert_eq!(published, [2]);
+    }
+
+    #[test]
+    fn filter_entry_keeps_editing_keys_and_down_enters_the_first_result() {
+        use cosmic::iced::{
+            advanced::{clipboard, renderer::Headless},
+            keyboard,
+        };
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let entry = Id::from("filter.entry");
+        let mut element = keyboard_list(
+            widget::column::with_children(vec![
+                keyboard_list_entry(
+                    crate::ui_controls::field::search("Filter", "long query")
+                        .id(entry.clone())
+                        .on_input(|_| 99_u8)
+                        .on_submit(|_: String| 100_u8),
+                ),
+                keyboard_list_row(crate::ui_controls::button::quiet("First").on_press(1_u8)),
+                keyboard_list_row(crate::ui_controls::button::quiet("Second").on_press(2_u8)),
+            ]),
+            true,
+        );
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(260.0, 240.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(entry),
+        );
+        let mut published = Vec::new();
+        for key in [
+            keyboard::key::Named::Home,
+            keyboard::key::Named::End,
+            keyboard::key::Named::ArrowUp,
+            keyboard::key::Named::Enter,
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Enter,
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Enter,
+        ] {
+            let event = Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            });
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut published),
+                &bounds,
+            );
+        }
+        assert_eq!(
+            published,
+            [100, 1, 2],
+            "editing keys keep search focus; Down moves to results"
+        );
+    }
+
+    #[test]
+    fn a_vertical_wheel_becomes_horizontal_pixels() {
+        let Event::Mouse(mouse::Event::WheelScrolled { delta }) =
+            wheel_as_horizontal(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 })
+        else {
+            panic!("expected a wheel event");
+        };
+        assert_eq!(delta, mouse::ScrollDelta::Pixels { x: 60.0, y: 0.0 });
+    }
+
+    #[test]
+    fn a_diagonal_wheel_keeps_its_horizontal_component() {
+        // Summing the axes cancelled this gesture to a standstill, and the
+        // wrapper had already replaced the original event with the sum.
+        for (delta, expected) in [
+            (
+                mouse::ScrollDelta::Lines { x: -1.0, y: 1.0 },
+                mouse::ScrollDelta::Pixels { x: -60.0, y: 0.0 },
+            ),
+            (
+                mouse::ScrollDelta::Pixels { x: -8.0, y: 8.0 },
+                mouse::ScrollDelta::Pixels { x: -8.0, y: 0.0 },
+            ),
+            (
+                mouse::ScrollDelta::Pixels { x: 0.0, y: 8.0 },
+                mouse::ScrollDelta::Pixels { x: 8.0, y: 0.0 },
+            ),
+        ] {
+            let Event::Mouse(mouse::Event::WheelScrolled { delta }) = wheel_as_horizontal(delta)
+            else {
+                panic!("expected a wheel event");
+            };
+            assert_eq!(delta, expected);
+        }
+    }
+
+    #[test]
+    fn overflow_edges_are_clear_when_content_fits() {
+        assert_eq!(overflow_edges(0.0, 200.0, 180.0), (false, false));
+        assert_eq!(overflow_edges(0.0, 200.0, 200.0), (false, false));
+        assert_eq!(overflow_edges(0.25, 200.0, 200.4), (false, false));
+    }
+
+    #[test]
+    fn overflow_edges_mark_whichever_side_can_still_scroll() {
+        assert_eq!(overflow_edges(0.0, 200.0, 400.0), (false, true));
+        assert_eq!(overflow_edges(12.0, 200.0, 400.0), (true, true));
+        assert_eq!(overflow_edges(200.0, 200.0, 400.0), (true, false));
+    }
+
+    /// Whole frames of a real context menu, driven the way the runtime drives
+    /// them: build (which diffs and lays out), then update (which builds the
+    /// overlay, lays it out and feeds it the events). Menu state, overlays and
+    /// reconciliation therefore interleave exactly as they do in the app.
+    mod context_menus {
+        use super::*;
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::event::Status;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Act {
+            Item(usize),
+        }
+
+        impl widget::menu::Action for Act {
+            type Message = Act;
+            fn message(&self) -> Self::Message {
+                *self
+            }
+        }
+
+        /// A flat menu of `items` buttons, the shape every menu in this app has.
+        fn menu(items: usize) -> Vec<widget::menu::Tree<Act>> {
+            let entries = (0..items)
+                .map(|index| {
+                    widget::menu::Item::Button(format!("Item {index}"), None, Act::Item(index))
+                })
+                .collect();
+            widget::menu::items(&std::collections::HashMap::new(), entries)
+        }
+
+        fn row(items: usize) -> Element<'static, Act> {
+            context_menu(bare_row(), menu(items))
+        }
+
+        fn bare_row() -> Element<'static, Act> {
+            cosmic::iced::widget::Space::new()
+                .width(Length::Fill)
+                .height(ROW_HEIGHT)
+                .into()
+        }
+
+        #[test]
+        fn named_button_can_move_across_an_unnamed_spacer() {
+            let row = |swapped: bool| -> Element<'static, Act> {
+                let button: Element<'static, Act> = crate::ui_controls::button::secondary("Move")
+                    .id(Id::new("test.moving.named-button"))
+                    .on_press(Act::Item(7))
+                    .into();
+                let spacer: Element<'static, Act> = cosmic::iced::widget::Space::new()
+                    .width(100)
+                    .height(ROW_HEIGHT)
+                    .into();
+                widget::row::with_children(if swapped {
+                    vec![spacer, button]
+                } else {
+                    vec![button, spacer]
+                })
+                .into()
+            };
+            let mut frames = Frames::new();
+            for swapped in [false, true, false, true] {
+                frames.frame(row(swapped), &[], ANCHOR);
+            }
+        }
+
+        #[test]
+        fn unchanged_lazy_named_buttons_keep_pressed_state_across_native_rebuilds() {
+            let builds = std::rc::Rc::new(std::cell::Cell::new(0));
+            let cached_button = || -> Element<'static, Act> {
+                let builds = builds.clone();
+                cosmic::iced::widget::lazy(0_u64, move |_| {
+                    builds.set(builds.get() + 1);
+                    // Exercise named descendants beneath both a named parent
+                    // and unnamed decorators, as in cached project rows.
+                    let content: Element<'static, Act> = widget::container(hover(
+                        crate::ui_controls::button::secondary("Cached action")
+                            .id(Id::new("test.cached.named-button"))
+                            .on_press(Act::Item(7)),
+                    ))
+                    .id(Id::new("test.cached.named-container"))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into();
+                    content
+                })
+                .into()
+            };
+            let mut frames = Frames::new();
+            frames.frame(cached_button(), &[], ANCHOR);
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert_eq!(frames.messages, vec![Act::Item(7)]);
+            assert_eq!(
+                builds.get(),
+                1,
+                "native rebuilds must restore state without rebuilding cached widgets"
+            );
+            // Removing the cached subtree must discard its named states.
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            frames.frame(bare_row(), &[], ANCHOR);
+            frames.frame(
+                cached_button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert_eq!(
+                frames.messages,
+                vec![Act::Item(7)],
+                "a new button must not inherit an old press"
+            );
+        }
+
+        const ROW_HEIGHT: f32 = 32.0;
+
+        #[test]
+        fn reusing_a_named_button_id_for_stateless_content_discards_the_button_state() {
+            let mut frames = Frames::new();
+            let button = || -> Element<'static, Act> {
+                widget::button::standard("Old action")
+                    .id(Id::new("test.reused.named-control"))
+                    .on_press(Act::Item(9))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into()
+            };
+            frames.frame(
+                button(),
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            let replacement = || -> Element<'static, Act> {
+                widget::container(widget::text("Replacement"))
+                    .id(Id::new("test.reused.named-control"))
+                    .width(200)
+                    .height(ROW_HEIGHT)
+                    .into()
+            };
+            frames.frame(replacement(), &[], ANCHOR);
+            frames.frame(
+                button(),
+                &[Event::Mouse(mouse::Event::ButtonReleased(
+                    mouse::Button::Left,
+                ))],
+                ANCHOR,
+            );
+            assert!(
+                frames.messages.is_empty(),
+                "a type change must not revive an old button press"
+            );
+        }
+        const WINDOW: Size = Size {
+            width: 400.0,
+            height: 400.0,
+        };
+        /// Inside the first row, so a right click here opens that row's menu.
+        const ANCHOR: Point = Point { x: 20.0, y: 16.0 };
+        /// Inside the menu the anchor opens, so an open menu captures motion
+        /// here and a dismissed one does not.
+        const OVER_MENU: Point = Point { x: 60.0, y: 60.0 };
+
+        fn headless_renderer() -> Renderer {
+            use cosmic::iced::advanced::renderer::Headless;
+            use cosmic::iced::{Font, Pixels};
+
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("executor")
+                .block_on(Renderer::new(
+                    Font::default(),
+                    Pixels(14.0),
+                    Some("tiny-skia"),
+                ))
+                .expect("a headless renderer")
+        }
+
+        struct Frames {
+            renderer: Renderer,
+            cache: Cache,
+            messages: Vec<Act>,
+        }
+
+        impl Frames {
+            fn new() -> Self {
+                Self {
+                    renderer: headless_renderer(),
+                    cache: Cache::new(),
+                    messages: Vec::new(),
+                }
+            }
+
+            fn frame(
+                &mut self,
+                element: Element<'static, Act>,
+                events: &[Event],
+                cursor: Point,
+            ) -> Vec<Status> {
+                let mut ui = UserInterface::build(
+                    element,
+                    WINDOW,
+                    std::mem::replace(&mut self.cache, Cache::new()),
+                    &mut self.renderer,
+                );
+                let (_, statuses) = ui.update(
+                    events,
+                    mouse::Cursor::Available(cursor),
+                    &mut self.renderer,
+                    &mut clipboard::Null,
+                    &mut self.messages,
+                );
+                self.cache = ui.into_cache();
+                statuses
+            }
+
+            /// Whether the menu anchored at [`ANCHOR`] is on screen, asked the
+            /// way a user asks: only an open menu swallows the pointer.
+            fn menu_is_open(&mut self, element: Element<'static, Act>) -> bool {
+                self.frame(element, &[moved(OVER_MENU)], OVER_MENU)
+                    .contains(&Status::Captured)
+            }
+
+            /// Mounts the row, right-clicks it and lets the requested frame
+            /// arrive, which is when the native widget measures the menu.
+            fn open_menu(&mut self, items: usize) {
+                let _ = self.frame(row(items), &[], ANCHOR);
+                let _ = self.frame(row(items), &right_click(), ANCHOR);
+                let _ = self.frame(row(items), &[redraw()], ANCHOR);
+                assert!(
+                    self.menu_is_open(row(items)),
+                    "a right click on the row should have opened its {items}-item menu"
+                );
+            }
+        }
+
+        fn moved(position: Point) -> Event {
+            Event::Mouse(mouse::Event::CursorMoved { position })
+        }
+
+        /// The frame the opening right click asks for. The native widget only
+        /// measures its menu while the pointer is still over the row, so this
+        /// is the event that puts the menu on screen.
+        fn redraw() -> Event {
+            Event::Window(window::Event::RedrawRequested(Instant::now()))
+        }
+
+        fn right_click() -> Vec<Event> {
+            vec![
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            ]
+        }
+
+        /// An open menu keeps the motions over it from everything beneath it,
+        /// and the window's input trace records them all the same.
+        #[test]
+        fn an_open_menu_does_not_hide_motion_from_the_input_trace() {
+            use crate::input_trace::{InputTrace, observe};
+
+            let input = InputTrace::default();
+            let traced = || observe(row(3), &input);
+            let mut frames = Frames::new();
+            let _ = frames.frame(traced(), &[moved(ANCHOR)], ANCHOR);
+            let _ = frames.frame(traced(), &right_click(), ANCHOR);
+            let _ = frames.frame(traced(), &[redraw()], ANCHOR);
+            let further = Point::new(OVER_MENU.x + 1.0, OVER_MENU.y);
+            let statuses = frames.frame(traced(), &[moved(OVER_MENU), moved(further)], further);
+            assert_eq!(statuses, [Status::Captured, Status::Captured]);
+            assert_eq!(input.previous_position(), Some(OVER_MENU));
+        }
+
+        #[test]
+        fn a_single_item_context_menu_activates_its_visible_item() {
+            for move_before_press in [false, true] {
+                let mut frames = Frames::new();
+                // The popup stays inside the window even when the clicked
+                // row fills its width; this point is inside its visible item.
+                let point = Point::new(220.0, 32.0);
+                let _ = frames.frame(row(1), &[], ANCHOR);
+                let _ = frames.frame(row(1), &right_click(), ANCHOR);
+                let _ = frames.frame(row(1), &[redraw()], ANCHOR);
+                if move_before_press {
+                    let _ = frames.frame(row(1), &[moved(point)], point);
+                }
+                let _ = frames.frame(
+                    row(1),
+                    &[Event::Mouse(mouse::Event::ButtonPressed(
+                        mouse::Button::Left,
+                    ))],
+                    point,
+                );
+                let _ = frames.frame(
+                    row(1),
+                    &[Event::Mouse(mouse::Event::ButtonReleased(
+                        mouse::Button::Left,
+                    ))],
+                    point,
+                );
+                assert_eq!(frames.messages, vec![Act::Item(0)]);
+            }
+        }
+
+        #[test]
+        fn a_menu_initializes_before_the_pointer_leaves_its_anchor() {
+            let mut frames = Frames::new();
+            frames.frame(row(3), &[], ANCHOR);
+            frames.frame(row(3), &right_click(), ANCHOR);
+            // Cursor motion may arrive before the requested redraw. The menu
+            // must measure at the opening click before handling that motion.
+            frames.frame(row(3), &[moved(OVER_MENU)], OVER_MENU);
+            assert!(frames.menu_is_open(row(3)));
+        }
+
+        #[test]
+        fn an_open_menu_outlives_frames_that_leave_its_items_alone() {
+            // The dismissal below must cost something, or it would be no fix at
+            // all: a menu that closes on the next frame regardless is useless.
+            let mut frames = Frames::new();
+            frames.open_menu(6);
+            for _ in 0..3 {
+                assert!(
+                    frames.menu_is_open(row(6)),
+                    "an unchanged menu should stay open across frames"
+                );
+            }
+        }
+
+        #[test]
+        fn an_open_menu_losing_items_dismisses_itself() {
+            // The native widget measures a position and a size per item once,
+            // when the menu opens, and then reads that geometry against every
+            // later frame's item list. Shrinking the list used to leave the
+            // overlay indexing the new list by the old geometry.
+            let mut frames = Frames::new();
+            frames.open_menu(6);
+            assert!(
+                !frames.menu_is_open(row(4)),
+                "a menu missing two of its items is not the menu that was opened"
+            );
+            for items in [3, 1] {
+                assert!(!frames.menu_is_open(row(items)));
+            }
+        }
+
+        #[test]
+        fn an_open_menu_gaining_items_dismisses_itself() {
+            let mut frames = Frames::new();
+            frames.open_menu(2);
+            assert!(!frames.menu_is_open(row(9)));
+        }
+
+        #[test]
+        fn a_row_that_loses_its_menu_entirely_can_get_it_back() {
+            // Sidebar and file rows drop the whole wrapper when a modal opens
+            // or the host forbids the commands, so the menu leaves and returns.
+            let mut frames = Frames::new();
+            frames.open_menu(5);
+            assert!(!frames.menu_is_open(bare_row()));
+            let _ = frames.frame(row(5), &right_click(), ANCHOR);
+            let _ = frames.frame(row(5), &[redraw()], ANCHOR);
+            assert!(
+                frames.menu_is_open(row(5)),
+                "the row should open a fresh menu once its wrapper is back"
+            );
+        }
+
+        #[test]
+        fn a_dismissed_menu_leaves_the_row_able_to_open_another() {
+            let mut frames = Frames::new();
+            frames.open_menu(6);
+            assert!(!frames.menu_is_open(row(3)));
+            let _ = frames.frame(row(3), &right_click(), ANCHOR);
+            let _ = frames.frame(row(3), &[redraw()], ANCHOR);
+            assert!(
+                frames.menu_is_open(row(3)),
+                "the surface should still open the menu it now has"
+            );
+        }
+
+        /// `rows` rows in a scrollable, the one at `anchored` carrying `items`.
+        fn scrolled(rows: usize, anchored: usize, items: usize) -> Element<'static, Act> {
+            let children = (0..rows)
+                .map(|index| {
+                    if index == anchored {
+                        row(items)
+                    } else {
+                        row(items + 1)
+                    }
+                })
+                .collect::<Vec<_>>();
+            widget::scrollable(widget::column::with_children(children))
+                .height(Length::Fixed(WINDOW.height))
+                .into()
+        }
+
+        #[test]
+        fn a_menu_in_a_scrollable_survives_its_row_moving_and_leaving() {
+            // A row can scroll away, or be replaced at its index by a row whose
+            // menu is a different length, while its menu is still up.
+            let mut frames = Frames::new();
+            let _ = frames.frame(scrolled(40, 0, 5), &[], ANCHOR);
+            let _ = frames.frame(scrolled(40, 0, 5), &right_click(), ANCHOR);
+            let _ = frames.frame(scrolled(40, 0, 5), &[redraw()], ANCHOR);
+            for events in [
+                vec![Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -240.0 },
+                })],
+                vec![moved(OVER_MENU)],
+            ] {
+                let _ = frames.frame(scrolled(40, 0, 5), &events, OVER_MENU);
+            }
+            // The anchored row's menu grows, then the row is gone altogether.
+            let _ = frames.frame(scrolled(40, 0, 8), &[moved(OVER_MENU)], OVER_MENU);
+            let _ = frames.frame(scrolled(3, 2, 8), &[moved(OVER_MENU)], OVER_MENU);
+            assert!(
+                !frames.menu_is_open(scrolled(3, 9, 5)),
+                "no menu should survive its row being replaced"
+            );
+        }
+    }
+}
+
+// Keep the wrapper anonymous: giving it its child's ID would register two
+// incompatible states under one name in iced's named-widget reconciliation.
+fn control_identity(tree: &Tree) -> Option<&Id> {
+    tree.id
+        .as_ref()
+        .or_else(|| tree.children.first().and_then(control_identity))
+}
+
+struct TipOverlay<'a, 'b, Message> {
+    content: &'a mut Element<'b, Message>,
+    tree: &'a mut Tree,
+    anchor: Rectangle,
+    progress: f32,
+    prefer_above: bool,
+}
+
+impl<Message> overlay::Overlay<Message, Theme, Renderer> for TipOverlay<'_, '_, Message> {
+    fn layout(&mut self, renderer: &Renderer, bounds: Size) -> layout::Node {
+        let node = self.content.as_widget_mut().layout(
+            self.tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, bounds),
+        );
+        let size = node.size();
+        let x = (self.anchor.center_x() - size.width / 2.0)
+            .clamp(0.0, (bounds.width - size.width).max(0.0));
+        let below = self.anchor.y + self.anchor.height + TIP_GAP;
+        let y = if !self.prefer_above && below + size.height <= bounds.height {
+            below
+        } else {
+            self.anchor.y - size.height - TIP_GAP
+        };
+        node.move_to(Point::new(
+            x,
+            y.clamp(0.0, (bounds.height - size.height).max(0.0)),
+        ))
+    }
+    fn draw(
+        &self,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        if self.progress <= 0.0 {
+            return;
+        }
+        // The same surface as every other floating element
+        // (`design::elevated`), faded as two primitives rather than by
+        // deriving and serializing an entire theme per frame.
+        let component = &theme.current_container().component;
+        let fade = |color: Color| Color {
+            a: color.a * self.progress,
+            ..color
+        };
+        let mut style = *style;
+        style.text_color = fade(component.on.into());
+        renderer.with_layer(layout.bounds(), |renderer| {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: layout.bounds(),
+                    border: cosmic::iced::Border {
+                        color: fade(crate::design::component_rule(theme)),
+                        width: crate::design::BORDER_WIDTH,
+                        radius: crate::design::RADIUS_S.into(),
+                    },
+                    ..Default::default()
+                },
+                fade(component.base.into()),
+            );
+            self.content.as_widget().draw(
+                self.tree,
+                renderer,
+                theme,
+                &style,
+                layout,
+                cursor,
+                &layout.bounds(),
+            );
+        });
+    }
+}
+
+struct FadedTheme {
+    source: Theme,
+    serialized: serde_json::Value,
+    progress: f32,
+    theme: Theme,
+}
+
+impl FadedTheme {
+    fn new(source: &Theme) -> Self {
+        Self {
+            source: source.clone(),
+            serialized: serde_json::to_value(source.cosmic())
+                .expect("pinned COSMIC theme is serializable"),
+            progress: 1.0,
+            theme: source.clone(),
+        }
+    }
+
+    fn at(&mut self, progress: f32) -> &Theme {
+        if self.progress == progress {
+            return &self.theme;
+        }
+        let source = self.source.cosmic();
+        // Only the six surface containers are private in cosmic_theme::Theme.
+        // Cache the source serialization, overwrite their colors from typed
+        // originals, and deserialize by reference (no per-frame JSON clone).
+        // ColorRepr explicitly accepts palette's floating-point RGBA variant;
+        // hex serialization would quantize alpha to 8 bits on every frame.
+        for (key, container) in [
+            ("background", source.background(false)),
+            ("primary", source.primary(false)),
+            ("secondary", source.secondary(false)),
+            ("transparent_background", source.background(true)),
+            ("transparent_primary", source.primary(true)),
+            ("transparent_secondary", source.secondary(true)),
+        ] {
+            set_container_colors(&mut self.serialized[key], container, progress);
+        }
+        let mut cosmic = cosmic::cosmic_theme::Theme::deserialize(&self.serialized)
+            .expect("typed RGBA colors preserve the pinned COSMIC theme schema");
+        // Public semantic colors can be adjusted directly without serializing,
+        // parsing, or rounding their RGB components or original transparency.
+        macro_rules! components {
+            ($($field:ident),+ $(,)?) => {$(
+                cosmic.$field = source.$field.clone();
+                for color in component_colors(&mut cosmic.$field) { color.alpha *= progress; }
+            )+};
+        }
+        components!(
+            button,
+            accent,
+            success,
+            destructive,
+            warning,
+            accent_button,
+            success_button,
+            destructive_button,
+            warning_button,
+            icon_button,
+            link_button,
+            list_button,
+            text_button
+        );
+        cosmic.palette = source.palette.clone();
+        macro_rules! palette_colors {
+            ($($field:ident),+ $(,)?) => {$(cosmic.palette.$field.alpha *= progress;)+};
+        }
+        palette_colors!(
+            bright_red,
+            bright_green,
+            bright_orange,
+            gray_1,
+            gray_2,
+            neutral_0,
+            neutral_1,
+            neutral_2,
+            neutral_3,
+            neutral_4,
+            neutral_5,
+            neutral_6,
+            neutral_7,
+            neutral_8,
+            neutral_9,
+            neutral_10,
+            accent_blue,
+            accent_indigo,
+            accent_purple,
+            accent_pink,
+            accent_red,
+            accent_orange,
+            accent_yellow,
+            accent_green,
+            accent_warm_grey,
+            ext_warm_grey,
+            ext_orange,
+            ext_yellow,
+            ext_blue,
+            ext_purple,
+            ext_pink,
+            ext_indigo
+        );
+        cosmic.shade = source.shade;
+        cosmic.shade.alpha *= progress;
+        cosmic.accent_text = source.accent_text.map(|mut color| {
+            color.alpha *= progress;
+            color
+        });
+        cosmic.control_tint = source.control_tint;
+        cosmic.text_tint = source.text_tint;
+        self.theme = Theme {
+            theme_type: cosmic::theme::ThemeType::Custom(Arc::new(cosmic)),
+            ..self.source.clone()
+        };
+        self.progress = progress;
+        &self.theme
+    }
+}
+
+fn component_colors(component: &mut Component) -> [&mut Srgba; 12] {
+    [
+        &mut component.base,
+        &mut component.hover,
+        &mut component.pressed,
+        &mut component.selected,
+        &mut component.selected_text,
+        &mut component.focus,
+        &mut component.divider,
+        &mut component.on,
+        &mut component.disabled,
+        &mut component.on_disabled,
+        &mut component.border,
+        &mut component.disabled_border,
+    ]
+}
+
+fn set_container_colors(value: &mut serde_json::Value, source: &Container, progress: f32) {
+    for (key, color) in [
+        ("base", source.base),
+        ("divider", source.divider),
+        ("on", source.on),
+        ("small_widget", source.small_widget),
+    ] {
+        set_color(&mut value[key], color, progress);
+    }
+    let component = &source.component;
+    for (key, color) in [
+        ("base", component.base),
+        ("hover", component.hover),
+        ("pressed", component.pressed),
+        ("selected", component.selected),
+        ("selected_text", component.selected_text),
+        ("focus", component.focus),
+        ("divider", component.divider),
+        ("on", component.on),
+        ("disabled", component.disabled),
+        ("on_disabled", component.on_disabled),
+        ("border", component.border),
+        ("disabled_border", component.disabled_border),
+    ] {
+        set_color(&mut value["component"][key], color, progress);
+    }
+}
+
+fn set_color(value: &mut serde_json::Value, source: Srgba, progress: f32) {
+    if !value.is_object() {
+        // Serialize the typed RGBA alternative once, not the hex-based theme
+        // serializer. Subsequent frames replace only its numeric alpha.
+        *value = serde_json::to_value(source).expect("palette RGBA is serializable");
+    }
+    value["alpha"] = (source.alpha * progress).into();
+}

@@ -1,0 +1,289 @@
+{
+  "schema": "main15_87dc6dc8_negative_bb8_UIlib_compile_root_acceptance_v1",
+  "utc": "2026-10-31T19:13:55.089002+00:00",
+  "allocation": "87dc6dc8-f800-44da-a779-7a1f20cacc04",
+  "grant": "4cc14aaa-0901-4e32-b6c4-55afef1c947c",
+  "actual_executor_return": {
+    "path": "/tmp/coord-b9-main15-bb8-ui5-87dc6dc8-actual-executor-return.json",
+    "sha256": "6180c3f2dabf0e576e1edf66f0e8ff35a3de1a6b24c74952fe2a1290dab9e260"
+  },
+  "sole_independent_raw": {
+    "path": "/tmp/coord-b9-main15-bb8-ui5-87dc6dc8-sole-raw-review.json",
+    "sha256": "8c4dc7731afe3f6929cb9e412cab879de29b00c6d3cf147098d7a8016dc1e235",
+    "verdict": "ORIGINAL_MAIN15_BB8_UI5_COMPILE_NEGATIVE"
+  },
+  "original_invocation_and_transport": {
+    "all_retained_files": [
+      {
+        "bytes": 255,
+        "path": "000-grant-readback-request.json",
+        "sha256": "2ddb34b72221caa9bf24a90806b02d545357ba61503bee9196a7cc1477cb1055"
+      },
+      {
+        "bytes": 1147,
+        "path": "001-original-exec-start.json",
+        "sha256": "3486a8ac43fb2e96594fd27623ad5d17e069a686e26dd8641be8434153ca22fc"
+      },
+      {
+        "bytes": 810,
+        "path": "002-original-wait.json",
+        "sha256": "d5a1bb861e6b35cd7b8a3dd06c74a079f46fc83bacde954ad147817b0db16408"
+      },
+      {
+        "bytes": 302,
+        "path": "003-original-wait.json",
+        "sha256": "01f79c73a5d58e52dcca0f3d34fb8cedf4bf6282d50b26438d57c4e1ffb541ae"
+      },
+      {
+        "bytes": 2330,
+        "path": "004-original-wait.json",
+        "sha256": "7ad60ac82e7fcdfccc241e859a6a131f6b3c8a7112300fcc6884fa7ee34534f8"
+      },
+      {
+        "bytes": 6274,
+        "path": "authenticated-grant-readback.json",
+        "sha256": "d1f8fa211f449ef572338aa310521710f0ff8821333e7f7ea859432ae0b5384e"
+      },
+      {
+        "bytes": 6394,
+        "path": "before-invocation-proof-hash-join.json",
+        "sha256": "3c7a9c6fb90f41df338c69427097b5a6dbe3558bad074b5f00c6206f6c3eb5ff"
+      },
+      {
+        "bytes": 124773,
+        "path": "inbox-original-readback.json",
+        "sha256": "e2d336dd3c0a321232595a04a46409f650fda270242a101162ecaa413d379233"
+      },
+      {
+        "bytes": 673,
+        "path": "original-exec-request.json",
+        "sha256": "9bd508d2d512d3037d07c0e2df06f5daa983ae211e13c5fcbe8712c252301b24"
+      },
+      {
+        "bytes": 1863,
+        "path": "original-tool-transcript-index.json",
+        "sha256": "d09e45e2e9e734e0eb180c5588134336c9b72c12dfeaddf28bc36db5550ffe9e"
+      }
+    ],
+    "authenticated_grant_readback_sha256": "d1f8fa211f449ef572338aa310521710f0ff8821333e7f7ea859432ae0b5384e",
+    "authenticated_sender_and_recipient_verified": true,
+    "before_invocation_proof_sha256": "3c7a9c6fb90f41df338c69427097b5a6dbe3558bad074b5f00c6206f6c3eb5ff",
+    "chunks": [
+      "307b8a",
+      "9a5006",
+      "4fabbd",
+      "4c0189"
+    ],
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-ui5-abi-source",
+    "directory": "/tmp/coord-b9-main15-bb8-ui5-87dc6dc8-original-tools",
+    "empty_original_wait_preserved": true,
+    "exact_argv": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-ui5-abi-source/qualification-packets/main15-bb8-ui5/run-packet.py",
+      "--grant",
+      "4cc14aaa-0901-4e32-b6c4-55afef1c947c",
+      "--runner-sha256",
+      "ce31b5d5864098da4df423b100a22dc5c0e3d8441ad8ace35ac41cc97d055915",
+      "--controller-review",
+      "/var/tmp/coord16-main15-bb8-ui5-abi-code-independent-t28cmp9d/review.json",
+      "--controller-review-sha256",
+      "fd74aab60a955902def4d82a298253340aae8020a9b5be3f64076bdce058872e"
+    ],
+    "no_transport_truncation_marker": true,
+    "original_tool_response_count": 4,
+    "original_transport_and_request_args_join": true,
+    "retained_file_index_sha256": "97776d3ff1b5add75a755a486074dd0db777ae17dde3eab6499e9c547ae0f217",
+    "saved_exact_request_sha256": "9bd508d2d512d3037d07c0e2df06f5daa983ae211e13c5fcbe8712c252301b24",
+    "session": 77217,
+    "terminal_exit": 1,
+    "transcript_index_sha256": "d09e45e2e9e734e0eb180c5588134336c9b72c12dfeaddf28bc36db5550ffe9e",
+    "transport_record_count_including_request": 5,
+    "unrelated_inbox_content_not_parsed_only_preserved_file_hash": true
+  },
+  "source": {
+    "all16_prelaunch_proofs_hashmatch": true,
+    "archived_input_count": 104,
+    "context_before_after_equal": true,
+    "context_before_sha256": "19d5ae3932412af2b307d3e2e772bb23308cd094d8bb2414961e2eb5cf061c93",
+    "controller_Git_bindings_verified": 106,
+    "controller_head": "1b12e9acf29502511d4511756926149282cb6cf3",
+    "controller_is_not_direct_product_child": true,
+    "controller_review_sha256": "fd74aab60a955902def4d82a298253340aae8020a9b5be3f64076bdce058872e",
+    "controller_sole_parent": "d177520c327f7b3bffd6ae1ab1842d9781212c2f",
+    "controller_tree": "e2f977ef500b735c67477ee7229a4f0d3e1ab78a",
+    "five_required_names_naturally_absent_in_original_record": true,
+    "opaque_authority_HOME_XDG_preserved_no_auditor_values_probed": true,
+    "original_tool_hashes_match_frozen_plan": true,
+    "plan_sha256": "6e24a3ff2cd4a224bb13aac9a5172487c5faae5f763421b90c4d7790ca5522d7",
+    "product_Git_pins_verified": 44,
+    "product_head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "product_tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+    "runner_sha256": "ce31b5d5864098da4df423b100a22dc5c0e3d8441ad8ace35ac41cc97d055915",
+    "source_after_sha256": "3bb1b3566a4850a8717137d52a3cc3fc65f269e693e89dbd86689bae5a8122e7",
+    "source_before_after_clean_equal": true,
+    "source_before_sha256": "3bb1b3566a4850a8717137d52a3cc3fc65f269e693e89dbd86689bae5a8122e7",
+    "source_review_sha256": "59cddcb5a2cb10ebeaef0952da8a7787c71b3d4262f8518818123e7576dc7866",
+    "tools_file_sha256": "1babb59ef4f3d5be7d4efb657be68aeaaff2ef025a7bb291f807f12b6e7e8cf2"
+  },
+  "accepted_actual_negative": {
+    "actual_test_invocations": 0,
+    "build_finished_success": false,
+    "compile_stderr_sha256": "082aa608cb60aca639883f6d48619c60e2169f6ca5d7affe6664f81ed71dfdf9",
+    "compile_stdout_sha256": "676039102bc5caf39549dd64eb94861d595c2f75213107f505a849e2c130c442",
+    "compiler_JSON_message_count": 976,
+    "compiler_JSON_reasons": {
+      "build-finished": 1,
+      "build-script-executed": 62,
+      "compiler-artifact": 650,
+      "compiler-message": 263
+    },
+    "compiler_error_count": 1,
+    "compiler_error_levels": {
+      "error": 1,
+      "failure-note": 1,
+      "warning": 261
+    },
+    "declared_requested_test_invocations": 5,
+    "first_error": {
+      "cause_boundary": "cfg(test) UI library compilation cannot resolve trait method probe.finish(); Operation trait exists but is not in scope. UI binary check passed; no test was executed.",
+      "code": "E0599",
+      "column": 27,
+      "compiler_suggested_import": "cosmic::widget::Operation",
+      "line": 31723,
+      "message": "no method named `finish` found for opaque type `impl cosmic::widget::Operation` in the current scope",
+      "path": "src/app/chat_ui.rs",
+      "rendered": "error[E0599]: no method named `finish` found for opaque type `impl cosmic::widget::Operation` in the current scope\n     --> src/app/chat_ui.rs:31723:27\n      |\n31723 |             let _ = probe.finish();\n      |                           ^^^^^^ method not found in `impl cosmic::widget::Operation`\n      |\n     ::: /home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15/vendor/iced-core/src/widget/operation.rs:75:8\n      |\n   75 |     fn finish(&self) -> Outcome<T> {\n      |        ------ the method is available for `impl cosmic::widget::Operation` here\n      |\n      = help: items from traits can only be used if the trait is in scope\nhelp: trait `Operation` which provides `finish` is implemented but not in scope; perhaps you want to import it\n      |\n14117 +     use cosmic::widget::Operation;\n      |\n\n",
+      "trait_definition_reference": "vendor/iced-core/src/widget/operation.rs:75"
+    },
+    "first_nonzero_stop": true,
+    "inventories": 0,
+    "inventory_N": null,
+    "jobs": 2,
+    "observed_unique_parent_names": null,
+    "owning_test_ELF_artifacts": 0,
+    "packet_cap_seconds": 2400,
+    "phases_reached": [
+      {
+        "argv": [
+          "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--bin",
+          "cagents"
+        ],
+        "cap_seconds": 300,
+        "exit": 0,
+        "finished": "2026-10-31T19:05:01.002177+00:00",
+        "label": "cli-binary-check",
+        "original_wait_complete": true,
+        "seconds": 12.067527356091887,
+        "started": "2026-10-31T19:04:49.059362+00:00",
+        "stderr_sha256": "a95f66dea5b6cb601c0c7a56319637188fe81adebcbf083a6e6792a0e9fcd9bf",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "argv": [
+          "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--bin",
+          "cagents-ui"
+        ],
+        "cap_seconds": 450,
+        "exit": 0,
+        "finished": "2026-10-31T19:05:42.610933+00:00",
+        "label": "ui-binary-check",
+        "original_wait_complete": true,
+        "seconds": 41.484467950998805,
+        "started": "2026-10-31T19:05:01.247353+00:00",
+        "stderr_sha256": "47b8dd5807a0e70a8a9722bdac62759c48f34db6d79f9f5d75b747c6b7384d30",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "argv": [
+          "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--lib",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "cap_seconds": 900,
+        "exit": 101,
+        "finished": "2026-10-31T19:06:53.606390+00:00",
+        "label": "compile-ui-lib",
+        "original_wait_complete": true,
+        "seconds": 70.85657395399176,
+        "started": "2026-10-31T19:05:42.873056+00:00",
+        "stderr_sha256": "082aa608cb60aca639883f6d48619c60e2169f6ca5d7affe6664f81ed71dfdf9",
+        "stdout_sha256": "676039102bc5caf39549dd64eb94861d595c2f75213107f505a849e2c130c442"
+      }
+    ],
+    "physical_toolchain_pinned_original_hash_observations": "1.93.0; no new version probe",
+    "planned_count": 9,
+    "qualified_parents": 0,
+    "reached_count": 3,
+    "test_ELF_manifest_created": false,
+    "unrun_parent_invocations": 5,
+    "unrun_phase_count": 6,
+    "unrun_selectors": [
+      "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+      "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+      "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+      "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+      "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+    ]
+  },
+  "root_rehashed": {
+    "manifest_members": 130,
+    "files": 131,
+    "full_actual_file_index_sha256": "eb39036346701cc36526540394ad2e0cbfa0bcb8a6db0ed5996e3f5ddbd65e99",
+    "named_original_tool_files": 10
+  },
+  "recorded_local_custody_and_order": {
+    "LOCK_UN_before_close": false,
+    "all_original_evidence_complete": true,
+    "attempted_original_children": 123,
+    "cancellations": 0,
+    "close_error": null,
+    "direct_cleanup_attempts": 0,
+    "exit_counts": {
+      "0": 122,
+      "101": 1
+    },
+    "final_clean_unforced_custody_pass_count": 2,
+    "final_source_context_equal_then_second_custody_before_close_source_bound": true,
+    "ordered_unique_attempt_state_identities_match": true,
+    "original_one_shot_Cfd_close_recorded": true,
+    "original_waits_settled": 123,
+    "phase_children": 3,
+    "phase_custody_clean_unforced_empty_observations": true,
+    "source_children": 120,
+    "summary_after_close_manifest_after_summary_compact_after_manifest_outer_exit1": true,
+    "supervision_failures": 0,
+    "unknown_waits": 0
+  },
+  "logical_C_state": "NEGATIVE_RETURN_ACCEPTED_ALLOCATION_CONSUMED_NO_NEXT_GRANT",
+  "limits": [
+    "Actual current original has CLI check0/UI check0/UI library compile101; inventory and all five singleton parent invocations were never reached. N and observed parent-name inventory remain unknown, not zero or inherited counts.",
+    "Component fixtures synthesize callbacks/Widget focus Tasks and drop provider/cleanup/save futures; even future component passes would not establish physical CLI cleanup, genuineUser5/startup47/FULL52/native UX or whole inherited55path/76commit feature stack. No such pass occurred here.",
+    "Oldf95 CLI0/UI101/allfiveUNRUN and its separately attributed POSTRUN7bfc acknowledgment remain immutable. No oldN/pass, other head, source clearance or grant transferred.",
+    "Full owning ELF bytes are not archived; no executable/test owning ELF was produced for this failed compile. Dependency compiler-artifacts do not become an owning ELF, test inventory or executed test. Failed invocations may bypass a later use hash.",
+    "Source/context/ELF/tool and family facts are discrete original observations, not continuous-write exclusion, every-exec/allchannel/kernel/global/namespace/359 closure or current physical-resource availability. Canonical9004/FULL3790 semantics reused through adopted source, not requalified by this audit.",
+    "Recorded Cfd close is not executor return, EC acceptance or a new allocation. Native/provider/installed/currentmain/wholePR/WHOLE/1749/SeedView/merge remain unqualified.",
+    "Frozen inherited limits/qualified_scope still name historicalf95; exact dynamic head/tree/argv/source bindings identify bb8. This stale policy prose does not transfer old results or alter actual negative scope."
+  ],
+  "original_negative_preserved": "CLI/UI checks passed, UIlib cfgtest compile101 exactE0599; no owningELF/inventory/all5parents UNRUN. No corrected success or old result transfer.",
+  "source_correction_owner": "Main15 exact helper-local Operation import successor underbc30ee0f; sourcefreeze/reviews/publication/reboundcontroller/freshgrant required.",
+  "next_allocation": "Separate authentic Root grant only. Selected installerae420 sourcepublished/cleared, its actual independent warmrestore/gate remains UNRUN. No oldHOST16/currentUI/startup47/Linear/native autochain.",
+  "Root_acceptance_scope": "Hash/file/manifest integrity, explicit return, sole RAW and bounded original terminal/123wait/recorded one-shot close join; no duplicate broad code/RAW review, live/global/kernel/namespace/everyexec/physical availability probe or claim."
+}

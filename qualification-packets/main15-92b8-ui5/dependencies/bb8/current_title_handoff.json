@@ -1,0 +1,260 @@
+{
+  "kind": "MAIN15_BB8_TITLE_OWNERSHIP_SOURCE_CORRECTION_LEAD_REVIEW_HANDOFF_V1",
+  "utc": "2026-10-31T18:09:31.045911+00:00",
+  "status": "SOURCE_CLEAR_FOR_ROOT_ADOPTION_REVIEW_NOT_BUILD_TEST_NATIVE_OR_EXECUTION_READY",
+  "product": {
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+    "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "branch": "fix/fw16-return-title-ownership-main15",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15"
+  },
+  "author_freeze": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-source-freeze-v1.json",
+    "sha256": "8131db186b26ee8af54b1aa623799e224634bc095741805237adc1c631b32efa",
+    "bytes": 8772
+  },
+  "independent_correctness_caller_UX_review": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-independent-source-review-v1.json",
+    "sha256": "dd632b6257efaac8ffd24d22abc2b52129dc24ec3572beaff6fe96022d2c8e8e",
+    "bytes": 6860
+  },
+  "late_format_binding_addendum": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-source-review-freeze-format-binding-addendum-v1.json",
+    "sha256": "a305a7d79759a33a4083104fbfa62196295d4b0f03e191426cf88d5032b76f73",
+    "bytes": 2913
+  },
+  "independent_conservation_privacy_review": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-independent-conservation-privacy-source-review-v1.json",
+    "sha256": "949805650285374751f4b97cb8b1d938ce29c404a10080cff0ea3b2db245bbf6",
+    "bytes": 10214
+  },
+  "source_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d",
+  "exact_scope": {
+    "changed_paths": [
+      "src/app/chat_ui.rs"
+    ],
+    "expressions": [
+      {
+        "function": "capture_shared_return_close",
+        "before": "let title = self.card_display_title(&card);",
+        "after": "let title = self.card_display_title(&card).to_owned();",
+        "reason": "Own String before the following mutable pending-record borrow."
+      },
+      {
+        "function": "capture_native_return",
+        "before": "title: self.card_display_title(card),",
+        "after": "title: self.card_display_title(card).to_owned(),",
+        "reason": "NativeReturnContext.title stores String; title getter returns &str."
+      }
+    ],
+    "other_Git_entries_conserved": 2230,
+    "all_existing_tests_and_helpers_unchanged": true,
+    "all32_protected_ledger_spans_unchanged": true,
+    "inherited_paths_vs_latest_verified_main": {
+      "main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+      "before_and_after_pathset_exact": true,
+      "count": 55
+    },
+    "not_a_narrow3file_PR_against_main": true
+  },
+  "user_behavior": {
+    "trigger": "A Return or first Close captures its original displayed title for later notices.",
+    "before": "Actual f95 UI compilation fails because two retained String fields receive borrowed str.",
+    "after_intended": "Both snapshots own the same original UTF-8 title bytes at the same capture time; no visible title/control, caller, proof, scope quarantine or cleanup behavior changes.",
+    "native_evidence": "UNRUN; no screenshots or interaction qualification created by this correction."
+  },
+  "original_negative": {
+    "executor_return": {
+      "path": "/tmp/coord-b9-main15-f95-ui5-8e36e360-actual-executor-return.json",
+      "sha256": "98435d4c5f369737073a902dadcf20116c0e13442a59023597ba849b0c6ba85d",
+      "bytes": 16362
+    },
+    "allocation": "8e36e360-c2e0-45c1-96a4-63684b72753f",
+    "product": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "controller": "a7c8f4c2a9ea158e40b0c97ac2e9500f548fff29",
+    "actual_result": {
+      "actual_ELF_inventory_tests": {
+        "UI_test_ELF_record": null,
+        "actual_inventory_N": null,
+        "actual_test_invocations": 0,
+        "inventory_reached": false,
+        "no_inventory_or_test_ELF_or_pass_invented": true,
+        "planned_parent_count": 5,
+        "qualified_parents": 0,
+        "test_pass_fail_ignore_counts": null,
+        "unrun_planned_names": [
+          "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+          "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+          "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+          "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+          "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+        ]
+      },
+      "all_five_component_parents": "UNRUN",
+      "attempted_phases": 2,
+      "compiler_failure": {
+        "causal_boundary": "Production browserless UI binary check fails while compiling cagents lib: two chat_ui title initializers require owned String but receive &str. This is before UI cfg(test) library compilation and all component tests.",
+        "coded_error_codes": {
+          "E0308": 2
+        },
+        "coded_error_count": 2,
+        "command": [
+          "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--features",
+          "ui",
+          "--bin",
+          "cagents-ui"
+        ],
+        "diagnostics": [
+          {
+            "code": "E0308",
+            "message": "mismatched types",
+            "primary_source_arrow": "--> src/app/chat_ui.rs:7399:13",
+            "source_diagnostic": [
+              "error[E0308]: mismatched types",
+              "    --> src/app/chat_ui.rs:7399:13",
+              "     |",
+              "7399 |             title,",
+              "     |             ^^^^^ expected `String`, found `&str`",
+              "     |",
+              "help: try using a conversion method",
+              "     |",
+              "7399 |             title: title.to_string(),",
+              "     |             ++++++      ++++++++++++",
+              ""
+            ],
+            "stderr_log_line": 1782
+          },
+          {
+            "code": "E0308",
+            "message": "mismatched types",
+            "primary_source_arrow": "--> src/app/chat_ui.rs:13531:20",
+            "source_diagnostic": [
+              "error[E0308]: mismatched types",
+              "     --> src/app/chat_ui.rs:13531:20",
+              "      |",
+              "13531 |             title: self.card_display_title(card),",
+              "      |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `String`, found `&str`",
+              "      |",
+              "help: try using a conversion method",
+              "      |",
+              "13531 |             title: self.card_display_title(card).to_string(),",
+              "      |                                                 ++++++++++++",
+              ""
+            ],
+            "stderr_log_line": 1793
+          }
+        ],
+        "exit": 101,
+        "footer": "error: could not compile `cagents` (lib) due to 2 previous errors; 10 warnings emitted",
+        "no_auth_environment_or_resource_cause_inferred": true,
+        "not_a_fixture_assertion_failure": true,
+        "plain_error_footer_count": 1,
+        "stderr_bytes": 75183,
+        "stderr_lines": 1839,
+        "stderr_sha256": "8ca0519ec3be43e7b084e1e84b6fd714a8b12626caff2aa171db028696f3fd32",
+        "stdout_bytes": 0
+      },
+      "original_phase_exits": [
+        0,
+        101
+      ],
+      "packet_error": "RuntimeError: Actual nonzero phase exit: ui-binary-check: 101",
+      "phases": [
+        {
+          "exit": 0,
+          "finished": "2026-10-31T18:00:05.147751+00:00",
+          "label": "cli-binary-check",
+          "pid": 86,
+          "seconds": 11.91200814594049,
+          "started": "2026-10-31T17:59:53.357662+00:00",
+          "stderr_sha256": "33d66c0ca765c08456ca502cf4c97757e8765a2aa8e8a6d91878c7d77daaeb44",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "exit": 101,
+          "finished": "2026-10-31T18:00:44.797160+00:00",
+          "label": "ui-binary-check",
+          "pid": 252,
+          "seconds": 39.52698808303103,
+          "started": "2026-10-31T18:00:05.394969+00:00",
+          "stderr_sha256": "8ca0519ec3be43e7b084e1e84b6fd714a8b12626caff2aa171db028696f3fd32",
+          "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "planned_phases": 9,
+      "qualified_parent_count": 0,
+      "unrun_phases": 7
+    },
+    "sole_independent_RAW_reference": {
+      "bounded_return": {
+        "admissible": true,
+        "basis": "Verified original CLI0/UIcheck101 first-negative stop with complete pinned original evidence, settled recorded local original waits, clean unforced scoped final custody and recorded one-shot close. No positive source/behavior qualification relies on unresolved historical scopeABI7bfc.",
+        "blockers": [],
+        "logical_C": "HELD until explicit actual negative executor return and EC acceptance.",
+        "qualification_blockers": [
+          "UI binary check failed with two E0308 errors. UIlibcompile/inventory/allfivecomponents remain UNRUN.",
+          "Supplied historical lead-scopeABI7bfc reference remains unresolved, disclosed without path invention."
+        ],
+        "this_receipt_is_acceptance_or_new_grant": false
+      },
+      "path": "/tmp/coord-b9-main15-f95-ui5-8e36e360-sole-raw-review.json",
+      "sha256": "277439bc17723dc6e62cc0f30dcfb255c337e73e10a5cfff741912aae710b7ac",
+      "verdict": "ORIGINAL_MAIN15_UI5_COMPILE_NEGATIVE_VERIFIED"
+    },
+    "root_acceptance_at_this_handoff": "PENDING_NOT_INFERRED",
+    "scope_ABI7bfc": "External lead intake supplied POSTRUN ONLY; original archive/reference limits preserved, no retroactive archival/use/admission."
+  },
+  "source_only_format": {
+    "command": "scripts/check-format",
+    "exit": 0,
+    "tool_chunk": "b952be",
+    "original_output": [
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stdout.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "0444"
+      },
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "0444"
+      }
+    ],
+    "scope": "Official formatter only; parent explicitly permitted Cargo fmt/metadata within this formatter, no check/build/test/rustc/native."
+  },
+  "lead_join": {
+    "read_hash_and_exact_tuple_diff_done": true,
+    "both_independent_source_verdicts_clear": true,
+    "format_and_two_named_output_hashes_joined": true,
+    "source_writer_and_reviewers_stopped": true,
+    "no_duplicate_RAW_core_or_full_API_review": true
+  },
+  "next_actions_and_ownership": [
+    "Root EC reviews/adopts and normally publishes exact bb8 product source after these genuine source reviews; no public mutation done by Main15.",
+    "Root16 alone rebinds the TWO frozen UI5/HOST16 controllers to genuine bb8 provenance, then fresh independent code/conservation reviews. Preserve f95/a7c8/3dd2 and negative receipts.",
+    "New original runtime requires a separate authenticated one-use resource grant and fresh actual ELF/inventory/parent results. Root finite priority places SearchFront19 ahead while correction/rebinding completes.",
+    "Original startup47/genuineUser5/FULL52/full55stack/native UX/WebPs/physical teardown/WHOLE remain separately unqualified. Physical retained helper remains explicitly DEFERRED per Root1dda627d."
+  ],
+  "all_current_head_compile_test_native_results": null,
+  "execution_authorized": false,
+  "actual_grant": null,
+  "root_source_adoption": null,
+  "root_source_publication": null,
+  "merge_ready": false,
+  "PR1933": "NEVER_MERGE",
+  "reported_current_Main15_contexts": {
+    "coordinator": 1,
+    "active_source_workers": 0,
+    "build": 0,
+    "native": 0
+  },
+  "account_model_binding": "Requested Marvin/GPT-6.1-Sol ultra; actual authenticated binding remains unverified/unexposed. No worker-count/usage-uplift inference."
+}

@@ -1,0 +1,152 @@
+{
+  "kind": "main15_frozen_assembled_consumer_lead_source_review_and_handoff_v2",
+  "observed_utc": "2026-10-31T16:31:52.423813+00:00",
+  "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+  "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+  "API_base": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15",
+  "branch": "fix/fw16-stale-shared-return-error-main15",
+  "tracked_clean": true,
+  "inputs": [
+    {
+      "scope": "freeze",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-b8-bounded-source-correction-freeze-v1.json",
+      "sha256": "24ab6dc0d43d9ce328cf4e9cf445a9f1ea6405038a93201b175bf88d1fc84a54",
+      "bytes": 14616,
+      "mode": "0o444",
+      "verdict": "FROZEN_SOURCE_FOR_INDEPENDENT_DELTA_REVIEW_NOT_RUNTIME_QUALIFIED"
+    },
+    {
+      "scope": "authority",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-independent-authority-caller-correction-source-review-v1.json",
+      "sha256": "1e1e872f25d98db457c3947fe6919993b13479bf24f9f7b125c33489c1118e1a",
+      "bytes": 13153,
+      "mode": "0o444",
+      "verdict": "CLEAR_FOR_THE_BOUNDED_AUTHORITY_CORRECTNESS_AND_CALLER_SOURCE_DELTA; B8_AUTH_01_AND_ORACLE_02_RESOLVED_AT_SOURCE_LEVEL; EXECUTION_UNRUN"
+    },
+    {
+      "scope": "UX",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-independent-b8-correction-UX-lifecycle-source-oracle-delta-review-v1.json",
+      "sha256": "b6d1243588641887cdb80632b286985eb6bbd4cb5c032f4b4568443142c8688d",
+      "bytes": 11820,
+      "mode": "0o444",
+      "verdict": "CLEAR_BOUNDED_SOURCE_DELTA_PRIOR_TWO_BLOCKERS_CLOSED"
+    },
+    {
+      "scope": "conservation",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-independent-conservation-privacy-test-delta-review-v1.json",
+      "sha256": "bc758675dcc4a05c97825a721ad36bac543f913ab2935b2cebab8295bbcc0fd8",
+      "bytes": 22094,
+      "mode": "0o444",
+      "verdict": "BOUNDED_EXACT_SOURCE_CONSERVATION_DELTA_CLEAR; AUTHORITY_UX_AND_RUNTIME_CLEARANCE_SEPARATE"
+    },
+    {
+      "scope": "fresh_three_adapted_fixture_parent_caller_classification",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-three-fixture-parent-inherited-caller-source-classification-addendum-v1.json",
+      "sha256": "cd719e229d0b1d8687157ff9fd3c25d626ae7a2e5b905d55175e33a3a87775b3",
+      "bytes": 8772,
+      "mode": "0o444",
+      "verdict": "ALL_THREE_SOURCE_CLASSIFIED_ORDINARY_INHERITED_AGENT_COMPONENT_TESTS; UI_LIB_ONLY; DEFAULT_OUTER_SCHEDULER; EXECUTION_UNRUN"
+    }
+  ],
+  "lead_source_disposition": "BOUNDED_ASSEMBLED_CONSUMER_SOURCE_CLEAR; REQUEST_STEWARD_SOURCE_ADOPTION_BEFORE_PUBLICATION_OR_CONTROLLER_FINALIZATION",
+  "lead_review": {
+    "method": "Read immutable full production correction diff, all added or changed nested oracle diff, exact vendor operation interfaces, author freeze and independent exact-head reviews; static source reasoning only.",
+    "original_user_outcome": "A rejected closed or stale managed-proof pane must be quarantined individually with visible Failed state; unrelated valid panes recover before SeedView; proof validation remains enforced.",
+    "adjacent_inherited_P1": "A first deferred Close keeps its original caller/source/handle/presentation despite accepted same-ID recipe-B updates; only the original issued tuple may be closed and ACKed, and B presentation removal remains independently gated.",
+    "concrete_corrections": [
+      "Valid first matching active issuance carries existing C1 independently of current presentation, with explicit mounted queued continuation; no conversion of B.",
+      "Rendered issued controls and owned popup keyboard ring use the same filtered local UUID/purpose IDs; missing/busy/q controls do not appear.",
+      "Absent/nil operation Err refuses before live-Target mutation.",
+      "Actual supplied-client refusal is fed into its owning exact-binding reducer; retained C1/nonce and reachable Retry are authored causal assertions."
+    ],
+    "authority_preserved": "Some cleanup uses captured original C1 or deliberate D and exact issued nonce; only typed Closed is positive, snapshot/flush precedes original R ACK; q/proof/issuer/source checks and protected native/firstsend guards are retained.",
+    "test_limits": "Only future test-local focus Widget operations are consumed. Production cleanup/save/provider/recheck Tasks are dropped; synthetic callbacks and barriers are not real Host/User/worker/durable-save evidence.",
+    "nonblocking_source_oracle_limit": "Accepted-B presentation/open/order/focus/draft assertions exist; separate raw snapshot equality/zero outgoing-model-edit assertion is not included. Source presentation-removal fence is unchanged; actual native evidence still required."
+  },
+  "finite_qualification_proposal": {
+    "maintained_preparations": [
+      {
+        "path": "/var/tmp/coord16-main15-return-error-ui2-preparation-handoff-s6joneoq/handoff.json",
+        "sha256": "718be74c467fa7075f2e816abc2deaf614876b482c7742682afd040efdf1dc8a"
+      },
+      {
+        "path": "/var/tmp/coord16-main15-issued-return-host16-preparation-handoff-s4wuzu_f/handoff.json",
+        "sha256": "88cc8a2107c7a7f438b96858c2dec8b2f41d30ec5f981ac73e18253326243ac1"
+      }
+    ],
+    "UI_scope": "UI5 proposed: two owning parents plus three changed fixture parents, all freshly source-classified inherited-Agent-compatible component tests. One existing isolated UI library artifact/fresh actual inventory/default outer Rust scheduler/default captured pretty output/strict nonadditive parent results. No genuine User wrapper, environment/context alteration or test-threads override.",
+    "selectors": [
+      "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+      "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+      "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+      "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+      "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+    ],
+    "affected_isolated_checks": "CLI, host and browserless UI independently; never ui+host in one invocation. Existing C controller only, no new lane/target/framework or cold parallel builds.",
+    "actual_argv": null,
+    "controller_final_head": null,
+    "actual_grant": null,
+    "actual_artifact": null,
+    "actual_inventory": null,
+    "actual_N": null,
+    "actual_results": null,
+    "next_actions": "EC source-adopt and coordinate normal publication of exact product branch; Root16 may finalize maintained preparation to exact tuple with genuine fresh caller map and independent review before queue. No execution inferred.",
+    "caller_classification_complete_at_source_only": true
+  },
+  "github_refresh": {
+    "index": "/tmp/held-saved-scope-fw16-evidence/20261031T162804473371Z-fresh-final-source-handoff-github-index.json",
+    "sha256": "0c8c99154f0a8df9ceeee62830fdf67466b8785010edf0ab0a299d7b619864dc",
+    "main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "PRs": "1925/1997/2013/2030 remain same open Draft heads, no assignees/review requests/automerge; unassigned is not ownership. 1997 mergeable_state dirty.",
+    "tracking": "Installed CLI channel work context/show/track unsupported as previously observed; authenticated PR tracking and requested Marvin/Solultra binding remain unverified; no invented identity."
+  },
+  "native_evidence": {
+    "before_source_candidate": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "actual_before": null,
+    "actual_after": null,
+    "615e_not_before": "API-only staging with incompatible old UI; not a runnable native baseline.",
+    "future_required": "Native matched runner Before/After WebPs on separate immutable screenshot branch, complete changed flow, original User5/native/WHOLE coverage and independent UX review at tested head. Existing table+correction remain source references only.",
+    "coverage_table": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26-615e-v4-native-case-coverage-gap-table-v1.json",
+      "sha256": "1f1ccd13e541d986e72da63bca92a8e0d32f27b23ac46854d7e4b584056c5f62",
+      "bytes": 19324
+    },
+    "mandatory_correction": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26-615e-v4-native-case-coverage-gap-table-correction-addendum-v1.json",
+      "sha256": "ddee789383e6e4435011b922c8070428d2aea83359a1f2ec8971887d44aead2b",
+      "bytes": 4697
+    }
+  },
+  "status": {
+    "compilation_tests_native": "UNRUN_AT_F95",
+    "consumer_publication": null,
+    "resource_grant": null,
+    "qualified": false,
+    "queued": false,
+    "merge_ready": false,
+    "held_outcomes": [
+      "User5",
+      "FULL52",
+      "native",
+      "WHOLE",
+      "qclosed/general/conflict"
+    ],
+    "PR1933": "NEVER_MERGE",
+    "old_results_transfer": false,
+    "permission_or_authority_change": false,
+    "active_native_task_workers": 0,
+    "runtime_account_model": "Requested Marvin/GPT-6.1-Sol ultra binding unverified/unexposed; no new probe or override.",
+    "usage": "Latest parent sole meter15 delivery3073d6de: Marvin72/73 with one missing token record keeps totals/delta/rate NULL; no model/account/billing/productivity/uplift inference. Parent alone collects; no Main15 arithmetic.",
+    "source_worker_census": "Root coordinator active; sole implementation worker and all three independent source reviewers, including finite extra fixture classification, have completed. Native harness task workers active0 at this handoff; no other team/global census inferred."
+  },
+  "supersedes": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-main15-assembled-source-review-and-finite-qualification-handoff-v1.json",
+    "sha256": "b99c7dbe5145e859b4a587498ad8ba7ab3a02f0a1e7215b9b85668ee960bc7dd",
+    "corrections": [
+      "V1 was preliminary and did not yet bind the three-adapter caller classification. V2 includes all five exact inherited-Agent-compatible source selectors.",
+      "V1 active_native_task_workers=0 was inaccurate at its seal: one finite three-adapter source classifier was still active. That worker has now completed; source author and all independent tasks are stopped. No worker count is a usage/productivity measure."
+    ]
+  }
+}

@@ -1,0 +1,384 @@
+{
+  "inverse_exact": true,
+  "kind": "EXACT_INERT_SOURCE_LINE_FORWARD_INVERSE_NOT_EXECUTION",
+  "new_runner_sha256": "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567",
+  "old_controller": "1b12e9acf29502511d4511756926149282cb6cf3",
+  "old_runner_sha256": "ce31b5d5864098da4df423b100a22dc5c0e3d8441ad8ace35ac41cc97d055915",
+  "operations": [
+    {
+      "new_end": 19,
+      "new_lines": [
+        "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15')\n"
+      ],
+      "new_start": 18,
+      "old_end": 19,
+      "old_lines": [
+        "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15')\n"
+      ],
+      "old_start": 18
+    },
+    {
+      "new_end": 23,
+      "new_lines": [
+        "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/plan.json')\n"
+      ],
+      "new_start": 22,
+      "old_end": 23,
+      "old_lines": [
+        "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-ui5-abi-source/qualification-packets/main15-bb8-ui5/plan.json')\n"
+      ],
+      "old_start": 22
+    },
+    {
+      "new_end": 28,
+      "new_lines": [
+        "PLAN_SHA = '5661c18d1df133528903bee37b2c69c5fffc63234a7b1c43e2843817890308e3'\n"
+      ],
+      "new_start": 27,
+      "old_end": 28,
+      "old_lines": [
+        "PLAN_SHA = '6e24a3ff2cd4a224bb13aac9a5172487c5faae5f763421b90c4d7790ca5522d7'\n"
+      ],
+      "old_start": 27
+    },
+    {
+      "new_end": 842,
+      "new_lines": [
+        "    assert plan['runtime_admission']['state'] == 'MAIN15_92B8_UI5_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT'\n"
+      ],
+      "new_start": 841,
+      "old_end": 842,
+      "old_lines": [
+        "    assert plan['runtime_admission']['state'] == 'MAIN15_F95_UI5_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT'\n"
+      ],
+      "old_start": 841
+    },
+    {
+      "new_end": 850,
+      "new_lines": [
+        "    assert review['kind'] == 'AUTHOR_ASSEMBLED_MAIN15_92B8_UI5_SOURCE_BINDING_NOT_APPROVAL'\n",
+        "    assert (review['head'], review['tree'], review['parent']) == ('92b8ede47f2a31c41628edfb9b934bdbecc262d8', 'c0c42d3153033da826b05736673b38e57449bee4', 'bb8df65354297c99228c6ff4f1aef75e9ae79b23')\n",
+        "    assert (plan['product_head'], plan['product_tree'], plan['product_parent']) == ('92b8ede47f2a31c41628edfb9b934bdbecc262d8', 'c0c42d3153033da826b05736673b38e57449bee4', 'bb8df65354297c99228c6ff4f1aef75e9ae79b23')\n"
+      ],
+      "new_start": 847,
+      "old_end": 850,
+      "old_lines": [
+        "    assert review['kind'] == 'AUTHOR_ASSEMBLED_MAIN15_BB8_UI5_SOURCE_BINDING_NOT_APPROVAL'\n",
+        "    assert (review['head'], review['tree'], review['parent']) == ('bb8df65354297c99228c6ff4f1aef75e9ae79b23', '6ae8fd5787f1c33349ac6e8a9f966c2e719f126f', 'f95df2da80a23b2a50c8c2304e19805423ca7da3')\n",
+        "    assert (plan['product_head'], plan['product_tree'], plan['product_parent']) == ('bb8df65354297c99228c6ff4f1aef75e9ae79b23', '6ae8fd5787f1c33349ac6e8a9f966c2e719f126f', 'f95df2da80a23b2a50c8c2304e19805423ca7da3')\n"
+      ],
+      "old_start": 847
+    },
+    {
+      "new_end": 886,
+      "new_lines": [
+        "    assert plan['source_paths_sha256']['src/app/chat_ui.rs'] == 'd4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474'\n"
+      ],
+      "new_start": 885,
+      "old_end": 886,
+      "old_lines": [
+        "    assert plan['source_paths_sha256']['src/app/chat_ui.rs'] == 'cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d'\n"
+      ],
+      "old_start": 885
+    },
+    {
+      "new_end": 963,
+      "new_lines": [
+        "    # Immutable BB8 title-only chain; never current92b8 review or result credit.\n",
+        "    bb8_binding = read_bound('historical_bb8_source_binding')\n",
+        "    bb8_identity = (bb8_binding['head'], bb8_binding['tree'], bb8_binding['parent'])\n",
+        "    assert bb8_identity == ('bb8df65354297c99228c6ff4f1aef75e9ae79b23', '6ae8fd5787f1c33349ac6e8a9f966c2e719f126f', 'f95df2da80a23b2a50c8c2304e19805423ca7da3')\n",
+        "    bb8_pins = bb8_binding['source_paths_sha256']\n",
+        "    assert len(bb8_pins) == len(plan['source_paths_sha256']) == 44\n",
+        "    assert bb8_pins['src/app/chat_ui.rs'] == 'cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d'\n",
+        "    assert all(plan['source_paths_sha256'][path] == value for path, value in bb8_pins.items() if path != 'src/app/chat_ui.rs')\n",
+        "    current_handoff = read_bound('historical_bb8_current_title_handoff')\n",
+        "    current_freeze = read_bound('historical_bb8_product_freeze')\n",
+        "    current_code = read_bound('historical_bb8_authority_review')\n",
+        "    current_conservation = read_bound('historical_bb8_product_conservation')\n",
+        "    current_format = read_bound('historical_bb8_late_format_binding')\n",
+        "    current_adoption = read_bound('historical_bb8_product_adoption')\n",
+        "    current_publication = read_bound('historical_bb8_product_publication')\n"
+      ],
+      "new_start": 948,
+      "old_end": 955,
+      "old_lines": [
+        "    current_handoff = read_bound('current_title_handoff')\n",
+        "    current_freeze = read_bound('product_freeze')\n",
+        "    current_code = read_bound('authority_review')\n",
+        "    current_conservation = read_bound('product_conservation')\n",
+        "    current_format = read_bound('late_format_binding')\n",
+        "    current_adoption = read_bound('product_adoption')\n",
+        "    current_publication = read_bound('product_publication')\n"
+      ],
+      "old_start": 948
+    },
+    {
+      "new_end": 970,
+      "new_lines": [
+        "    assert (current_handoff['product']['head'], current_handoff['product']['tree'], current_handoff['product']['parent']) == bb8_identity\n",
+        "    assert current_handoff['source_sha256'] == bb8_pins['src/app/chat_ui.rs']\n"
+      ],
+      "new_start": 968,
+      "old_end": 962,
+      "old_lines": [
+        "    assert (current_handoff['product']['head'], current_handoff['product']['tree'], current_handoff['product']['parent']) == identity\n",
+        "    assert current_handoff['source_sha256'] == plan['source_paths_sha256']['src/app/chat_ui.rs']\n"
+      ],
+      "old_start": 960
+    },
+    {
+      "new_end": 976,
+      "new_lines": [
+        "    assert (current_freeze['head'], current_freeze['tree'], current_freeze['parent']) == bb8_identity\n"
+      ],
+      "new_start": 975,
+      "old_end": 968,
+      "old_lines": [
+        "    assert (current_freeze['head'], current_freeze['tree'], current_freeze['parent']) == identity\n"
+      ],
+      "old_start": 967
+    },
+    {
+      "new_end": 978,
+      "new_lines": [
+        "    assert current_freeze['source']['src/app/chat_ui.rs']['after_sha256'] == bb8_pins['src/app/chat_ui.rs']\n"
+      ],
+      "new_start": 977,
+      "old_end": 970,
+      "old_lines": [
+        "    assert current_freeze['source']['src/app/chat_ui.rs']['after_sha256'] == plan['source_paths_sha256']['src/app/chat_ui.rs']\n"
+      ],
+      "old_start": 969
+    },
+    {
+      "new_end": 983,
+      "new_lines": [
+        "    assert (current_code['source']['head'], current_code['source']['tree'], current_code['source']['parent']) == bb8_identity\n",
+        "    assert current_code['source']['sha256'] == bb8_pins['src/app/chat_ui.rs']\n"
+      ],
+      "new_start": 981,
+      "old_end": 975,
+      "old_lines": [
+        "    assert (current_code['source']['head'], current_code['source']['tree'], current_code['source']['parent']) == identity\n",
+        "    assert current_code['source']['sha256'] == plan['source_paths_sha256']['src/app/chat_ui.rs']\n"
+      ],
+      "old_start": 973
+    },
+    {
+      "new_end": 989,
+      "new_lines": [
+        "    assert (current_conservation['bb8_identity']['head'], current_conservation['bb8_identity']['tree'], current_conservation['bb8_identity']['sole_parent']) == bb8_identity\n",
+        "    assert current_conservation['freeze']['sha256'] == review['historical_bb8_product_freeze']['sha256']\n"
+      ],
+      "new_start": 987,
+      "old_end": 981,
+      "old_lines": [
+        "    assert (current_conservation['identity']['head'], current_conservation['identity']['tree'], current_conservation['identity']['sole_parent']) == identity\n",
+        "    assert current_conservation['freeze']['sha256'] == review['product_freeze']['sha256']\n"
+      ],
+      "old_start": 979
+    },
+    {
+      "new_end": 994,
+      "new_lines": [
+        "    assert (current_format['source']['head'], current_format['source']['tree'], current_format['source']['parent']) == bb8_identity\n",
+        "    assert current_format['late_author_freeze']['sha256'] == review['historical_bb8_product_freeze']['sha256']\n",
+        "    assert current_format['prior_independent_review']['sha256'] == review['historical_bb8_authority_review']['sha256']\n"
+      ],
+      "new_start": 991,
+      "old_end": 986,
+      "old_lines": [
+        "    assert (current_format['source']['head'], current_format['source']['tree'], current_format['source']['parent']) == identity\n",
+        "    assert current_format['late_author_freeze']['sha256'] == review['product_freeze']['sha256']\n",
+        "    assert current_format['prior_independent_review']['sha256'] == review['authority_review']['sha256']\n"
+      ],
+      "old_start": 983
+    },
+    {
+      "new_end": 1003,
+      "new_lines": [
+        "    assert (current_adoption['product']['head'], current_adoption['product']['tree'], current_adoption['product']['parent']) == bb8_identity\n",
+        "    assert current_adoption['product']['worktree'] == bb8_binding['worktree'] and current_adoption['product']['branch'] == 'fix/fw16-return-title-ownership-main15'\n",
+        "    assert current_adoption['handoff']['sha256'] == review['historical_bb8_current_title_handoff']['sha256']\n",
+        "    assert current_adoption['source_sha256'] == bb8_pins['src/app/chat_ui.rs']\n",
+        "    assert current_adoption['genuine_correctness_caller_UX_review']['sha256'] == review['historical_bb8_authority_review']['sha256']\n",
+        "    assert current_adoption['genuine_conservation_privacy_review']['sha256'] == review['historical_bb8_product_conservation']['sha256']\n",
+        "    assert current_adoption['late_format_binding_addendum']['sha256'] == review['historical_bb8_late_format_binding']['sha256']\n"
+      ],
+      "new_start": 996,
+      "old_end": 995,
+      "old_lines": [
+        "    assert (current_adoption['product']['head'], current_adoption['product']['tree'], current_adoption['product']['parent']) == identity\n",
+        "    assert current_adoption['product']['worktree'] == str(WT) and current_adoption['product']['branch'] == 'fix/fw16-return-title-ownership-main15'\n",
+        "    assert current_adoption['handoff']['sha256'] == review['current_title_handoff']['sha256']\n",
+        "    assert current_adoption['source_sha256'] == plan['source_paths_sha256']['src/app/chat_ui.rs']\n",
+        "    assert current_adoption['genuine_correctness_caller_UX_review']['sha256'] == review['authority_review']['sha256']\n",
+        "    assert current_adoption['genuine_conservation_privacy_review']['sha256'] == review['product_conservation']['sha256']\n",
+        "    assert current_adoption['late_format_binding_addendum']['sha256'] == review['late_format_binding']['sha256']\n"
+      ],
+      "old_start": 988
+    },
+    {
+      "new_end": 1009,
+      "new_lines": [
+        "    assert (current_publication['product'], current_publication['tree'], current_publication['previous']) == bb8_identity\n"
+      ],
+      "new_start": 1008,
+      "old_end": 1001,
+      "old_lines": [
+        "    assert (current_publication['product'], current_publication['tree'], current_publication['previous']) == identity\n"
+      ],
+      "old_start": 1000
+    },
+    {
+      "new_end": 1011,
+      "new_lines": [
+        "    assert current_publication['source_adoption']['sha256'] == review['historical_bb8_product_adoption']['sha256']\n"
+      ],
+      "new_start": 1010,
+      "old_end": 1003,
+      "old_lines": [
+        "    assert current_publication['source_adoption']['sha256'] == review['product_adoption']['sha256']\n"
+      ],
+      "old_start": 1002
+    },
+    {
+      "new_end": 1013,
+      "new_lines": [
+        "    assert current_publication['readback'] == {'head': bb8_identity[0], 'ref': 'refs/heads/fix/fw16-issued-return-cleanup-api'}\n"
+      ],
+      "new_start": 1012,
+      "old_end": 1005,
+      "old_lines": [
+        "    assert current_publication['readback'] == {'head': review['head'], 'ref': 'refs/heads/fix/fw16-issued-return-cleanup-api'}\n"
+      ],
+      "old_start": 1004
+    },
+    {
+      "new_end": 1092,
+      "new_lines": [
+        "    # Genuine92b8 receipt schemas; earlier BB8/f95 proofs above remain historical.\n",
+        "    current_handoff = read_bound('current_source_handoff')\n",
+        "    current_freeze = read_bound('product_freeze')\n",
+        "    current_code = read_bound('authority_review')\n",
+        "    current_conservation = read_bound('product_conservation')\n",
+        "    current_format = read_bound('physical_format_binding')\n",
+        "    current_gap = read_bound('original_format_gap')\n",
+        "    current_diagnostic = read_bound('original_diagnostic_binding')\n",
+        "    current_intake = read_bound('current_source_intake')\n",
+        "    current_adoption = read_bound('product_adoption')\n",
+        "    current_publication = read_bound('product_publication')\n",
+        "    read_bound('original_bb8_negative_acceptance')\n",
+        "    assert current_freeze['kind'] == 'return-operation-trait-single-helper-import-source-freeze-v1'\n",
+        "    assert (current_freeze['head'], current_freeze['tree'], current_freeze['parent']) == identity\n",
+        "    assert current_freeze['worktree'] == str(WT) and current_freeze['branch'] == 'fix/fw16-return-operation-trait-main15'\n",
+        "    assert current_freeze['source']['src/app/chat_ui.rs']['before_sha256'] == bb8_pins['src/app/chat_ui.rs']\n",
+        "    assert current_freeze['source']['src/app/chat_ui.rs']['after_sha256'] == plan['source_paths_sha256']['src/app/chat_ui.rs']\n",
+        "    assert current_freeze['changed_paths'] == ['src/app/chat_ui.rs']\n",
+        "    assert current_freeze['conservation']['whole_file_exact_single_local_import_replacement'] is True\n",
+        "    assert current_freeze['conservation']['inverse_recovers_exact_bb8_file'] is True\n",
+        "    assert all(current_freeze[key] is None for key in ('actual_grant', 'compile_result', 'test_results', 'native_result', 'publication'))\n",
+        "    assert current_code['kind'] == '92b8-operation-trait-single-import-independent-semantic-caller-ux-source-review/v1'\n",
+        "    assert current_code['verdict'] == 'SOURCE_CLEAR' and current_code['findings'] == []\n",
+        "    assert (current_code['head'], current_code['tree'], current_code['parent']) == identity\n",
+        "    assert next(row['sha256'] for row in current_code['source_pins'] if row['path'] == 'src/app/chat_ui.rs') == plan['source_paths_sha256']['src/app/chat_ui.rs']\n",
+        "    assert current_conservation['schema'] == 'main15-operation-trait-independent-conservation-review/v1'\n",
+        "    assert current_conservation['verdict'] == 'BOUNDED_CONSERVATION_CLEAR' and current_conservation['findings'] == []\n",
+        "    assert (current_conservation['head'], current_conservation['tree'], current_conservation['sole_parent']) == identity\n",
+        "    assert current_conservation['source']['sha256'] == plan['source_paths_sha256']['src/app/chat_ui.rs']\n",
+        "    assert current_conservation['freeze']['sha256'] == review['product_freeze']['sha256']\n",
+        "    assert current_conservation['same_file_conservation']['helper_inverse_exact'] is True\n",
+        "    assert current_conservation['tree_conservation']['outside_entries_mode_type_blob_exact'] == 2230\n",
+        "    assert current_handoff['kind'] == 'main15-operation-trait-single-import-reviewed-source-assembly-handoff-v1'\n",
+        "    assert current_handoff['status'] == 'BOUNDED_REVIEWED_SOURCE_FOR_EC_ADOPTION_PUBLICATION_ONLY'\n",
+        "    assert (current_handoff['head'], current_handoff['tree'], current_handoff['parent']) == identity\n",
+        "    assert current_handoff['worktree'] == str(WT)\n",
+        "    assert current_handoff['author_freeze']['sha256'] == review['product_freeze']['sha256']\n",
+        "    assert current_handoff['independent_semantic_caller_ux_source_review']['sha256'] == review['authority_review']['sha256']\n",
+        "    assert current_handoff['independent_source_conservation_review']['sha256'] == review['product_conservation']['sha256']\n",
+        "    assert all(current_handoff[key] is None for key in ('successor_compile', 'successor_tests', 'successor_native', 'actual_grant', 'publication'))\n",
+        "    assert current_gap['kind'] == 'original-formatter-request-physical-toolchain-evidence-gap-addendum-v1'\n",
+        "    assert current_gap['status'] == 'PHYSICAL_RUST_1_93_FORMATTER_SELECTION_NOT_ESTABLISHED'\n",
+        "    assert (current_gap['head'], current_gap['tree']) == identity[:2]\n",
+        "    assert current_format['kind'] == 'main15-operation-trait-physical-rust193-official-formatter-check-v1'\n",
+        "    assert (current_format['head'], current_format['tree']) == identity[:2]\n",
+        "    assert current_format['exit_code'] == 0 and current_format['argv'] == ['scripts/check-format']\n",
+        "    assert current_format['source_before_sha256'] == current_format['source_after_sha256'] == plan['source_paths_sha256']['src/app/chat_ui.rs']\n",
+        "    assert current_format['explicit_toolchain_selection']['PATH_prefix'] == str(TOOL)\n",
+        "    assert current_format['explicit_toolchain_selection']['RUSTFMT'] == str(TOOL / 'rustfmt')\n",
+        "    assert current_format['explicit_toolchain_selection']['RUSTC'] == str(TOOL / 'rustc')\n",
+        "    assert current_handoff['formatter_history']['original_physical_selection_unestablished']['sha256'] == review['original_format_gap']['sha256']\n",
+        "    assert current_handoff['formatter_history']['separate_current_explicit_physical_rust193_check_exit0']['sha256'] == review['physical_format_binding']['sha256']\n",
+        "    assert current_diagnostic['kind'] == 'original-bb8-E0599-diagnostic-and-neighboring-operation-source-binding-addendum-v1'\n",
+        "    assert (current_diagnostic['source_head'], current_diagnostic['source_tree']) == identity[:2]\n",
+        "    assert current_diagnostic['failed_original_source'] == bb8_identity[0]\n",
+        "    assert current_intake['kind'] == 'main15-operation-trait-single-import-source-lead-intake-v1'\n",
+        "    assert (current_intake['head'], current_intake['tree'], current_intake['parent']) == identity\n",
+        "    assert current_adoption['kind'] == 'main15-92b8-single-import-root-source-adoption-v1'\n",
+        "    assert (current_adoption['head'], current_adoption['tree'], current_adoption['parent']) == identity\n",
+        "    assert current_adoption['source_sha256'] == plan['source_paths_sha256']['src/app/chat_ui.rs']\n",
+        "    assert current_adoption['status'] == 'ADOPTED_EXACT_BOUNDED_SOURCE_ONLY_FOR_NORMAL_FAST_FORWARD_PUBLICATION'\n",
+        "    assert {row['sha256'] for row in current_adoption['inputs']} == {review[key]['sha256'] for key in ('product_freeze', 'original_diagnostic_binding', 'current_source_intake', 'authority_review', 'product_conservation', 'original_format_gap', 'physical_format_binding', 'current_source_handoff')}\n",
+        "    assert all(current_adoption[key] is None for key in ('compile', 'tests', 'native', 'grant', 'publication'))\n",
+        "    assert current_publication['kind'] == 'main15-92b8-reviewed-single-import-source-publication-v1'\n",
+        "    assert (current_publication['head'], current_publication['tree'], current_publication['parent']) == identity\n",
+        "    assert current_publication['source_adoption']['sha256'] == review['product_adoption']['sha256']\n",
+        "    assert current_publication['original_push']['exit'] == 0 and current_publication['original_push']['closed'] is True\n",
+        "    assert current_publication['supported_ref_readback']['head'] == identity[0] and current_publication['supported_ref_readback']['matches'] is True\n",
+        "    assert current_publication['ref'] == 'refs/heads/fix/fw16-issued-return-cleanup-api'\n",
+        "    assert all(current_publication[key] is None for key in ('compile', 'tests', 'native', 'grant'))\n"
+      ],
+      "new_start": 1022,
+      "old_end": 1014,
+      "old_lines": [],
+      "old_start": 1014
+    },
+    {
+      "new_end": 1135,
+      "new_lines": [
+        "    assert data['schema'] == 'main15-92b8-ui5-controller-task-data-v1'\n"
+      ],
+      "new_start": 1134,
+      "old_end": 1057,
+      "old_lines": [
+        "    assert data['schema'] == 'main15-bb8-ui5-controller-task-data-v1'\n"
+      ],
+      "old_start": 1056
+    },
+    {
+      "new_end": 1138,
+      "new_lines": [
+        "    assert source_map['selected_caller_source_contract'] == selected_source\n"
+      ],
+      "new_start": 1137,
+      "old_end": 1059,
+      "old_lines": [],
+      "old_start": 1059
+    },
+    {
+      "new_end": 1182,
+      "new_lines": [
+        "    out = Path('/tmp/main15-92b8-ui5-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))\n"
+      ],
+      "new_start": 1181,
+      "old_end": 1103,
+      "old_lines": [
+        "    out = Path('/tmp/coord16-main15-bb8-ui5-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))\n"
+      ],
+      "old_start": 1102
+    },
+    {
+      "new_end": 1488,
+      "new_lines": [
+        "             'qualified_scope': 'MAIN15_92B8_UI5_PARTIAL_ONLY_NATIVE_USER5_FULL52_WHOLE_UNQUALIFIED',\n"
+      ],
+      "new_start": 1487,
+      "old_end": 1409,
+      "old_lines": [
+        "             'qualified_scope': 'MAIN15_F95_UI5_PARTIAL_ONLY_NATIVE_USER5_FULL52_WHOLE_UNQUALIFIED',\n"
+      ],
+      "old_start": 1408
+    }
+  ]
+}

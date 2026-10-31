@@ -1,0 +1,25 @@
+{
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15",
+  "execution_authorized": false,
+  "kind": "NOT_SUBMITTABLE_PRE_REVIEW_SOURCE_TEMPLATE",
+  "review_ABI": {
+    "controller_identity": "EXTERNAL_POSTCOMMIT",
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "review": "PENDING_GENUINE_FROZEN_CODE_REVIEW",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4"
+  }
+}

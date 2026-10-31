@@ -1,0 +1,185 @@
+{
+  "kind": "return-title-ownership-exact-two-expression-source-freeze-v1",
+  "status": "FROZEN_SOURCE_FOR_INDEPENDENT_REVIEW_NOT_COMPILE_OR_RUNTIME_QUALIFIED",
+  "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+  "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "parent_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+  "branch": "fix/fw16-return-title-ownership-main15",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15",
+  "tracked_clean": true,
+  "created_utc": "2026-10-31T18:06:26.533839+00:00",
+  "changed_paths": [
+    "src/app/chat_ui.rs"
+  ],
+  "exact_diff": "diff --git a/src/app/chat_ui.rs b/src/app/chat_ui.rs\nindex 77681ebe5..8aded4804 100644\n--- a/src/app/chat_ui.rs\n+++ b/src/app/chat_ui.rs\n@@ -7386,7 +7386,7 @@ impl Cagents {\n         let Some(card) = self.card_state(target.card).cloned() else {\n             return false;\n         };\n-        let title = self.card_display_title(&card);\n+        let title = self.card_display_title(&card).to_owned();\n         let pending = self.chat_ui.terminal_returns.get_mut(&target).unwrap();\n         pending.close_owner = Some(ReturnCloseOwner {\n             id: uuid::Uuid::new_v4(),\n@@ -13528,7 +13528,7 @@ impl Cagents {\n             source,\n             handle,\n             presentation: card.kind.clone(),\n-            title: self.card_display_title(card),\n+            title: self.card_display_title(card).to_owned(),\n             origin,\n             save_caller: crate::control::CallerContext::capture(),\n         };\n",
+  "changes": [
+    {
+      "function": "capture_shared_return_close",
+      "before": "let title = self.card_display_title(&card);",
+      "after": "let title = self.card_display_title(&card).to_owned();",
+      "reason": "Own String before the following mutable pending-record borrow."
+    },
+    {
+      "function": "capture_native_return",
+      "before": "title: self.card_display_title(card),",
+      "after": "title: self.card_display_title(card).to_owned(),",
+      "reason": "NativeReturnContext.title stores String; title getter returns &str."
+    }
+  ],
+  "source": {
+    "src/app/chat_ui.rs": {
+      "before_entry": "100644 blob 77681ebe5c3050ab212be626ed487e0d63618ba9",
+      "after_entry": "100644 blob 8aded4804a4055f04fadba8054fd26e42eeeba75",
+      "before_bytes": 1418988,
+      "after_bytes": 1419010,
+      "before_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+      "after_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d"
+    }
+  },
+  "conservation": {
+    "whole_file_exact_two_replacements": true,
+    "inverse_recovers_exact_f95_file": true,
+    "total_entries": 2231,
+    "outside_one_entries_mode_type_blob_equal_f95": 2230,
+    "all_mode_and_type_entries_unchanged": true,
+    "same_file_function_spans_total": 731,
+    "same_file_full_function_spans_byte_identical": 729,
+    "only_changed_full_functions": [
+      {
+        "name": "capture_shared_return_close",
+        "before": {
+          "name": "capture_shared_return_close",
+          "bytes": 1458,
+          "sha256": "284180bf43538c6d318dc3ae1a842f536c3df3dd71fcf5edc9a2c22c856a0e07"
+        },
+        "after": {
+          "name": "capture_shared_return_close",
+          "bytes": 1469,
+          "sha256": "48ef982b6fa604f67bfdf94427360ba0bc490c711ebcc8fc26c542c5e3cf958a"
+        }
+      },
+      {
+        "name": "capture_native_return",
+        "before": {
+          "name": "capture_native_return",
+          "bytes": 1725,
+          "sha256": "a6d9a83e37643964fdc83cb765fa5f096554f611762387c13f9b49cd13da495a"
+        },
+        "after": {
+          "name": "capture_native_return",
+          "bytes": 1736,
+          "sha256": "cb2f013ceb778a6334f7f12bf0e6e532a908dc698d163db39e29598e2b962521"
+        }
+      }
+    ],
+    "protected_span_dispositions": {
+      "BYTE_IDENTICAL": 32
+    },
+    "full_early_Close_function_byte_identical": {
+      "name": "begin_chat_close_as",
+      "bytes": 6047,
+      "sha256": "ab10c3abf91520f773b4201bed336f257472e60215f67d26d84693e66293cb35"
+    },
+    "all_existing_test_bodies_and_test_names_unchanged": true,
+    "new_tests": 0,
+    "ledger": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-function-span-conservation-v1.json",
+      "bytes": 142031,
+      "sha256": "e39eb61a43bd5efc82d795f658ceac50ba6f20d9538032a218ddc174a507f9df",
+      "mode": "0444"
+    },
+    "exact_patch": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-exact-two-expression-diff-v1.patch",
+      "bytes": 916,
+      "sha256": "3bb9d263783b8206cbee87bf9e17904bbbe54bb9a2cf0a1629de03213d3dbe0d",
+      "mode": "0444"
+    },
+    "method": "Author static lexical full-function span scan plus exact whole-file inverse and whole-tree mode/type/blob equality; no product import/evaluation or independent semantic review claim.",
+    "protected_scope": "No behavior/proof/authority/caller/guard/nonce/cleanup/Task/fixture/API/UI label,1749/native/retained/shared-view or controller changes. All such source bytes are exactf95."
+  },
+  "original_compiler_observation": {
+    "stderr_path": "/tmp/coord16-main15-f95-return-error-ui5-validation-20261031T175953074655Z-2/ui-binary-check/stderr.log",
+    "sha256": "8ca0519ec3be43e7b084e1e84b6fd714a8b12626caff2aa171db028696f3fd32",
+    "read_scope": "Only two E0308 blocks displayed; complete file hashed for exact binding. No whole RAW audit or run replay.",
+    "errors": [
+      {
+        "line": 7399,
+        "expression": "title",
+        "expected": "String",
+        "found": "&str"
+      },
+      {
+        "line": 13531,
+        "expression": "self.card_display_title(card)",
+        "expected": "String",
+        "found": "&str"
+      }
+    ],
+    "interpretation": "Original f95 failure is immutable. This source successor has no compile/test result; ownership fix is not a passed build."
+  },
+  "source_only_checks": [
+    {
+      "command": "rustfmt --edition 2024 --config skip_children=true src/app/chat_ui.rs",
+      "exit": 0,
+      "tool_chunk": "e83cfe",
+      "scope": "Source formatter only"
+    },
+    {
+      "command": "rustfmt --edition 2024 --config skip_children=true --check src/app/chat_ui.rs",
+      "exit": 0,
+      "tool_chunk": "c4ec17"
+    },
+    {
+      "command": "git diff --check",
+      "exit": 0,
+      "tool_chunk": "2e2407"
+    },
+    {
+      "command": "scripts/check-format",
+      "exit": 0,
+      "tool_chunk": "b952be",
+      "original_output": [
+        {
+          "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stdout.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "mode": "0444"
+        },
+        {
+          "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stderr.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "mode": "0444"
+        }
+      ],
+      "scope": "Official formatter only; parent explicitly permitted Cargo fmt/metadata within this formatter, no check/build/test/rustc/native."
+    },
+    {
+      "command": "Own static source/Git/JSON/hash conservation",
+      "exit": 0,
+      "tool_chunk": "e1debe",
+      "scope": "No product/helper/test/module/Task evaluation"
+    },
+    {
+      "command": "Private Git new worktree and source commit",
+      "exit": 0,
+      "tool_chunks": [
+        "b99b68",
+        "0b2fe2"
+      ],
+      "scope": "Private common only; hooks and commit signing disabled to avoid unadmitted tool execution; existing identity preserved."
+    }
+  ],
+  "limitations": [
+    "No Cargo check/build/test/rustc/native/helper/provider execution, no runtime/Task evaluation, and no resource/context/account/cache/target probe occurred. Official formatting is not compilation.",
+    "All five original f95 owning tests were UNRUN after original UI check101; no prior test result is transferred. This successor Rust/User5/native/full-product results remain UNRUN/HOLD.",
+    "Original f95 and other existing worktrees/refs/source receipts were not edited. No controller/publication/PR/API changes, runtime grant, C claim, queue, lane or resource authorization is inferred.",
+    "Independent correctness/UX and conservation reviews plus separately reviewed controller binding/authentic execution grant remain required. Product writes stopped at this immutable tuple; Root retains stewardship/publication."
+  ],
+  "actual_grant": null,
+  "compile_result": null,
+  "test_results": null,
+  "native_result": null,
+  "publication": null
+}
