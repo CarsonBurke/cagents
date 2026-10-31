@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -439,6 +439,14 @@ struct QueueState {
     /// change costs one `Arc` bump on this lane rather than a second deep clone
     /// of every card, title, and browser history.
     latest: Option<Arc<WorkspaceState>>,
+    /// Changes whenever a different window snapshot or an identity write is
+    /// submitted. A flush is a batch barrier, so payload equality alone cannot
+    /// distinguish a coalesced A -> B -> A while startup is checking its save.
+    window_submission: u64,
+    /// A weak identity avoids retaining another complete workspace graph. It
+    /// also keeps an expired Arc allocation from being reused as the same
+    /// submission. Arc::make_mut dissociates this weak identity on mutation.
+    last_window_snapshot: Option<Weak<WorkspaceState>>,
     conversions: VecDeque<ConversionCheckpoint>,
     ordered_identities: bool,
     projects: HashMap<ProjectId, ProjectState>,
@@ -447,6 +455,48 @@ struct QueueState {
     retry_requested: bool,
     checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     shutdown: bool,
+}
+
+impl QueueState {
+    fn submitted_window_snapshot(&mut self, snapshot: &Arc<WorkspaceState>) {
+        let incoming = Arc::downgrade(snapshot);
+        if self
+            .last_window_snapshot
+            .as_ref()
+            .is_some_and(|previous| Weak::ptr_eq(previous, &incoming))
+        {
+            return;
+        }
+        self.advance_window_submission();
+        self.last_window_snapshot = Some(incoming);
+    }
+
+    fn submitted_window_identity(&mut self) {
+        self.advance_window_submission();
+        self.last_window_snapshot = None;
+    }
+
+    fn advance_window_submission(&mut self) {
+        // Exhaustion is permanent uncertainty, never a wrapped old receipt.
+        self.window_submission = self.window_submission.saturating_add(1);
+    }
+}
+
+/// A startup check's original writer and submitted window state. This is an
+/// in-process coalescing fence, not a durable storage generation or authority.
+#[derive(Clone)]
+pub(crate) struct WindowSubmissionFence {
+    queue: Weak<(Mutex<QueueState>, Condvar)>,
+    revision: u64,
+}
+
+impl std::fmt::Debug for WindowSubmissionFence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WindowSubmissionFence")
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
 }
 
 pub struct SessionRuntime {
@@ -589,6 +639,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.submitted_window_snapshot(&state);
             queue.latest = Some(state);
             changed.notify_one();
         }
@@ -602,6 +653,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.submitted_window_identity();
             queue.ordered_identities = true;
             for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
                 queue
@@ -638,6 +690,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.submitted_window_identity();
             queue.ordered_identities = true;
             for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
                 queue
@@ -675,6 +728,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
+        queue.submitted_window_identity();
         queue.ordered_identities = true;
         for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
             queue
@@ -799,6 +853,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
+        queue.submitted_window_identity();
         queue.ordered_identities = true;
         for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
             queue
@@ -853,6 +908,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
+        queue.submitted_window_identity();
         queue.ordered_identities = true;
         for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
             queue
@@ -887,6 +943,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.submitted_window_identity();
             if queue.ordered_identities {
                 if let Some(previous) = queue.latest.take() {
                     queue
@@ -1036,6 +1093,46 @@ impl SessionRuntime {
         changed.notify_one();
         drop(queue);
         Ok(receiver)
+    }
+
+    /// Captures the current window submission under the same queue lock that
+    /// admits its flush barrier. Startup may use the receipt only if this
+    /// original writer and submission are still current after the flush.
+    pub(crate) fn request_window_flush(
+        &self,
+    ) -> std::result::Result<
+        (
+            WindowSubmissionFence,
+            std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+        ),
+        String,
+    > {
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        let (lock, changed) = &*self.queue;
+        let mut queue = lock
+            .lock()
+            .map_err(|_| "session writer queue unavailable")?;
+        if queue.shutdown || queue.window_submission == u64::MAX {
+            return Err("window submission is unavailable".into());
+        }
+        let fence = WindowSubmissionFence {
+            queue: Arc::downgrade(&self.queue),
+            revision: queue.window_submission,
+        };
+        queue.checkpoints.push(response);
+        changed.notify_one();
+        Ok((fence, receiver))
+    }
+
+    pub(crate) fn window_submission_is_current(&self, fence: &WindowSubmissionFence) -> bool {
+        if !Weak::ptr_eq(&Arc::downgrade(&self.queue), &fence.queue) {
+            return false;
+        }
+        self.queue.0.lock().is_ok_and(|queue| {
+            !queue.shutdown
+                && queue.window_submission != u64::MAX
+                && queue.window_submission == fence.revision
+        })
     }
 
     pub fn flush(&self, timeout: Duration) -> std::result::Result<(), String> {
@@ -3196,6 +3293,34 @@ mod tests {
                 }),
             }],
         }
+    }
+
+    #[test]
+    fn startup_flush_fence_rejects_an_aba_through_the_real_session_writer() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("startup-aba.sqlite3");
+        let (mut runtime, _) = SessionRuntime::open(&path, BootId::new("startup-aba")).unwrap();
+        let original = Arc::new(workspace());
+        runtime.snapshot(original.clone());
+        let (first, done) = runtime.request_window_flush().unwrap();
+        done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert!(runtime.window_submission_is_current(&first));
+        let mut changed = (*original).clone();
+        changed.cards[0].title = "Intervening B".into();
+        runtime.snapshot(Arc::new(changed));
+        runtime.snapshot(original.clone());
+        let (current, done) = runtime.request_window_flush().unwrap();
+        done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert!(!runtime.window_submission_is_current(&first));
+        assert!(runtime.window_submission_is_current(&current));
+        let saved = runtime
+            .operation_store()
+            .load_workspace(original.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.cards[0].title, original.cards[0].title);
+        runtime.shutdown();
+        assert!(!runtime.window_submission_is_current(&current));
     }
 
     #[test]
