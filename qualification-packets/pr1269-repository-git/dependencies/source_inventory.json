@@ -1,0 +1,3319 @@
+{
+  "schema": "pr1269-source-required-linux-ui-inventory-proposal/v1",
+  "status": "SOURCE_ONLY_DATA_PROPOSAL",
+  "execution_packet": false,
+  "source_review_scope": "Complete immutable test registration inventory, origin classification, fixture flags and qualification prerequisites. No repeated semantic witness or owned-hook core audit.",
+  "product": {
+    "commit": "c3b6b08ab17dca23848bb768493991784b02065b",
+    "tree": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+    "parents": [
+      "42c122d4c126404ecd446717e6d79c96f36a40ea"
+    ],
+    "repository": "/home/marvin/Documents/repositories/cagents",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-owned-hook-port",
+    "immutable_source_access": "git show/ls-tree through .worktrees/fw16-backend-control-ec204421/.git; no source checkout or execution",
+    "target": {
+      "package": "cagents",
+      "version": "0.1.3",
+      "name": "repository_git_contract",
+      "kind": "test",
+      "source_path": "tests/repository_git_contract.rs",
+      "manifest": "Cargo.toml",
+      "required_features": [
+        "ui"
+      ],
+      "default_features": false,
+      "crate_cfg": {
+        "line": 1,
+        "text": "#![cfg(feature = \"ui\")]"
+      },
+      "cargo_target_lines": [
+        187,
+        188
+      ]
+    },
+    "parent42_test_sha256": "3d6e0a85fe244b3b809445f537ff77cb646b3a03b088c00d2d48292cc5bbf611",
+    "inputs": {
+      ".cargo/config.toml": {
+        "mode": "100644",
+        "git_blob": "0e2d20b442d9256e22ecbe4852d77e2a07c45409",
+        "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+      },
+      "Cargo.lock": {
+        "mode": "100644",
+        "git_blob": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+        "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+      },
+      "Cargo.toml": {
+        "mode": "100644",
+        "git_blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+        "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+      },
+      "build.rs": {
+        "mode": "100644",
+        "git_blob": "cc0447aee8720c7e850030ca36b5385665e6a275",
+        "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+      },
+      "scripts/check-format": {
+        "mode": "100755",
+        "git_blob": "0ae25375094f337e2e5662afac70741d18af6809",
+        "sha256": null
+      },
+      "scripts/qualification/process_custody.py": {
+        "mode": "100644",
+        "git_blob": "f349b79d8312691d91c385b1a2c0477118ddc709",
+        "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
+      },
+      "src/repository.rs": {
+        "mode": "100644",
+        "git_blob": "f16a14a3afbe3c7339b37fd0c236855c8805f8bf",
+        "sha256": "d598aa218605ff551377afb223408f6af303efef2170a5b18241189868821909"
+      },
+      "src/repository_operation_witness.rs": {
+        "mode": "100644",
+        "git_blob": "6a9bc1cc690d211ed8000579dda8dfb49fa387a4",
+        "sha256": "862ae5ab528312ace8d9c5c7e904a94e46bc357b5472dd1c161e55c6bec312eb"
+      },
+      "tests/repository_git_contract.rs": {
+        "mode": "100644",
+        "git_blob": "213cce1c65b2a302c89de0baa634ccf86ab7c8ad",
+        "sha256": "58311ecb8fd66f87b4ad27ca7cf168e351da949dc3cbad63287f5da17940c3c6"
+      },
+      "tests/support/owned_hook_pipe_holder.py": {
+        "mode": "100644",
+        "git_blob": "9c0e7e013a7cfad99c7ce0a35faf8bbcc89c0c1e",
+        "sha256": "87bf22144c5f114e1331686cdd20c01a5fe6ed307270604bc574a41c8cf9c8d3"
+      },
+      "tests/support/owned_hook_pipe_holder.rs": {
+        "mode": "100644",
+        "git_blob": "df34164ac46b09b6960aeed3d44dc38b231b5ed5",
+        "sha256": "5c977985b17e34265d7d95a1d462ebcc407df6df72fa7fa21d0bf83f96215ed6"
+      },
+      "tests/support/test_owned_hook_pipe_holder.py": {
+        "mode": "100644",
+        "git_blob": "9c262f1b1c5fdefeb4ad613a6169380ffbd0b945",
+        "sha256": "f8abf92d9ea9f9a8c8db66f0e9a58a86a56ce29c269d1a71c0dc14fa3df9204f"
+      }
+    },
+    "additional_input_binding_limit": "The exact commit/tree binds all source. This finite list binds the directly relevant build/test/helper leaves and is not a complete dependency/build-script manifest."
+  },
+  "provenance": {
+    "source_prediction": {
+      "required_linux_ui_parents": 82,
+      "retained_parent42_parents": 80,
+      "added_cleanup_parents": 2,
+      "item_cfg_unix_parents": 8,
+      "source_ignored_parents": 0,
+      "source_should_panic_parents": 0,
+      "ordinary_fixture_missing_git_early_return_parents": 78
+    },
+    "origin_comparison": "Every parent42 name remains. Only the two named cleanup parents are new. The legacy-named hook parent has the ported owned fixture body; other existing parents retain their prior port-conservation receipt.",
+    "no_removed_parent_names": [],
+    "added_parent_names": [
+      "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff",
+      "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts"
+    ],
+    "expected_name_set_sha256": "2eb172adcacda72a974126059325ae9a53a1a91e6d68c26a3eba3074b241f2e4",
+    "expected_name_set_hash_encoding": "Sort the 82 full_name strings by codepoint order, UTF-8 encode one name per LF-terminated line, including a final LF.",
+    "extraction": "Static source-only parsing of contiguous top-level #[...] attributes immediately preceding fn declarations. Reset pending attributes at every other nonblank source line so enum/struct derives are not test attributes. Compare exact parent42/currentc3 name sets; independently enumerate all attribute, cfg, environment, process and output sites. No Rust parser, compiler, helper/controller import or test executable was used.",
+    "duplicate_check": {
+      "scope": "Existing /tmp/pr1269* inventory/source-contract candidates and Root's known pr1269 source/metadata receipts; prior qualification and frontend-diff plans.",
+      "result": "No existing complete exact-c3 82-name machine inventory was located in this bounded check. Existing d90 design and 86bc plan contain counts/owning subsets, not this full inventory.",
+      "exhaustive_repository_or_private_state_search": false
+    },
+    "supporting_seals": [
+      {
+        "path": "/tmp/pr1269-c3b6b08a-owned-hook-port-context-source-review-v1.json",
+        "sha256": "a0aa7aad48dd56acc6f4cfad10aa638ca618723830a9a7dcc6655963db6267ae",
+        "scope": "Existing independent exact port/context source review; no runtime transfer."
+      },
+      {
+        "path": "/tmp/pr1269-c3-existing-startup-runner-integration-frontend-diff-design-v1.txt",
+        "sha256": "d90f59c2bdac2b7335e1463a11cb05dfdbe8fed4351a1178dffa1f2c37ad3288",
+        "scope": "Accepted source-only frontend diff design; immutable579 controller basis, not later47/WIP certification."
+      }
+    ]
+  },
+  "source_required_inventory": [
+    {
+      "full_name": "simultaneous_staged_and_unstaged_state_is_reported_per_area",
+      "function_line": 280,
+      "attributes": [
+        {
+          "line": 279,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 276,
+        "parent_attributes": [
+          {
+            "line": 275,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "merge_conflicts_expose_index_stages_and_conflict_kinds",
+      "function_line": 352,
+      "attributes": [
+        {
+          "line": 351,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 348,
+        "parent_attributes": [
+          {
+            "line": 347,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "every_diff_basis_reads_the_matching_pair_of_sides",
+      "function_line": 462,
+      "attributes": [
+        {
+          "line": 461,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 458,
+        "parent_attributes": [
+          {
+            "line": 457,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "history_reports_root_and_multi_parent_commits",
+      "function_line": 572,
+      "attributes": [
+        {
+          "line": 571,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 568,
+        "parent_attributes": [
+          {
+            "line": 567,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "history_of_an_unborn_branch_is_empty",
+      "function_line": 667,
+      "attributes": [
+        {
+          "line": 666,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 663,
+        "parent_attributes": [
+          {
+            "line": 662,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "the_first_commit_on_an_unborn_branch_is_created",
+      "function_line": 715,
+      "attributes": [
+        {
+          "line": 714,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 711,
+        "parent_attributes": [
+          {
+            "line": 710,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_complete_rename_can_be_staged_unstaged_and_discarded",
+      "function_line": 766,
+      "attributes": [
+        {
+          "line": 765,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 762,
+        "parent_attributes": [
+          {
+            "line": 761,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock",
+      "function_line": 989,
+      "attributes": [
+        {
+          "line": 987,
+          "text": "#[cfg(unix)]"
+        },
+        {
+          "line": 988,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [
+        "#[cfg(unix)]"
+      ],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 846,
+        "parent_attributes": [
+          {
+            "line": 844,
+            "text": "#[cfg(unix)]"
+          },
+          {
+            "line": 845,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": true
+      },
+      "fixture_behavior": "owned_hook_helper_requires_actual_git",
+      "skip_guard_ids": [],
+      "owning_oracle_group": "owned_hook_pipe_fixture",
+      "runtime_result": null
+    },
+    {
+      "full_name": "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff",
+      "function_line": 1006,
+      "attributes": [
+        {
+          "line": 1004,
+          "text": "#[cfg(unix)]"
+        },
+        {
+          "line": 1005,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [
+        "#[cfg(unix)]"
+      ],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "added_cleanup_parent_in_c3",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "donor_commit": "dea70f4bfb8f142c3ff036786a4ee3b5c45ec33d"
+      },
+      "fixture_behavior": "owned_hook_helper_requires_actual_git",
+      "skip_guard_ids": [],
+      "owning_oracle_group": "owned_hook_pipe_fixture",
+      "runtime_result": null
+    },
+    {
+      "full_name": "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts",
+      "function_line": 1028,
+      "attributes": [
+        {
+          "line": 1026,
+          "text": "#[cfg(unix)]"
+        },
+        {
+          "line": 1027,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [
+        "#[cfg(unix)]"
+      ],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "added_cleanup_parent_in_c3",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "donor_commit": "dea70f4bfb8f142c3ff036786a4ee3b5c45ec33d"
+      },
+      "fixture_behavior": "owned_python_holder_without_git_handoff",
+      "skip_guard_ids": [],
+      "owning_oracle_group": "owned_hook_pipe_fixture",
+      "runtime_result": null
+    },
+    {
+      "full_name": "discard_refuses_a_path_that_became_tracked_after_it_was_selected",
+      "function_line": 1042,
+      "attributes": [
+        {
+          "line": 1041,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 936,
+        "parent_attributes": [
+          {
+            "line": 935,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "an_untracked_nested_repository_is_listed_as_its_directory",
+      "function_line": 1100,
+      "attributes": [
+        {
+          "line": 1099,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 994,
+        "parent_attributes": [
+          {
+            "line": 993,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "literal_pathspecs_stage_only_the_named_file",
+      "function_line": 1133,
+      "attributes": [
+        {
+          "line": 1132,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1027,
+        "parent_attributes": [
+          {
+            "line": 1026,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_commit_reports_the_object_id_and_message_it_created",
+      "function_line": 1173,
+      "attributes": [
+        {
+          "line": 1172,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1067,
+        "parent_attributes": [
+          {
+            "line": 1066,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_commit_message_keeps_the_lines_the_user_typed",
+      "function_line": 1232,
+      "attributes": [
+        {
+          "line": 1231,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1126,
+        "parent_attributes": [
+          {
+            "line": 1125,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_merge_resolved_in_favour_of_ours_is_still_committed",
+      "function_line": 1296,
+      "attributes": [
+        {
+          "line": 1295,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1190,
+        "parent_attributes": [
+          {
+            "line": 1189,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_branch_name_that_is_not_utf8_costs_nothing_but_its_own_label",
+      "function_line": 1380,
+      "attributes": [
+        {
+          "line": 1378,
+          "text": "#[cfg(unix)]"
+        },
+        {
+          "line": 1379,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [
+        "#[cfg(unix)]"
+      ],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1274,
+        "parent_attributes": [
+          {
+            "line": 1272,
+            "text": "#[cfg(unix)]"
+          },
+          {
+            "line": 1273,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_commit_date_git_cannot_normalise_costs_only_its_own_row",
+      "function_line": 1442,
+      "attributes": [
+        {
+          "line": 1441,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1336,
+        "parent_attributes": [
+          {
+            "line": 1335,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_refused_restore_changed_nothing_and_a_refused_add_may_have",
+      "function_line": 1554,
+      "attributes": [
+        {
+          "line": 1553,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1448,
+        "parent_attributes": [
+          {
+            "line": 1447,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_discard_attempts_every_path_and_names_what_it_refused",
+      "function_line": 1686,
+      "attributes": [
+        {
+          "line": 1685,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1580,
+        "parent_attributes": [
+          {
+            "line": 1579,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_remote_head_pointer_is_not_a_branch_and_an_odd_ref_is_not_fatal",
+      "function_line": 1754,
+      "attributes": [
+        {
+          "line": 1753,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1648,
+        "parent_attributes": [
+          {
+            "line": 1647,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "git_answers_missing_for_an_object_this_repository_does_not_have",
+      "function_line": 1810,
+      "attributes": [
+        {
+          "line": 1809,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1704,
+        "parent_attributes": [
+          {
+            "line": 1703,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_staged_rename_sends_each_operation_only_the_halves_it_can_match",
+      "function_line": 1858,
+      "attributes": [
+        {
+          "line": 1857,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1752,
+        "parent_attributes": [
+          {
+            "line": 1751,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "publishing_then_pushing_a_branch_updates_the_remote",
+      "function_line": 1960,
+      "attributes": [
+        {
+          "line": 1959,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1854,
+        "parent_attributes": [
+          {
+            "line": 1853,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_non_fast_forward_push_is_reported_as_not_pushed",
+      "function_line": 2037,
+      "attributes": [
+        {
+          "line": 2036,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1931,
+        "parent_attributes": [
+          {
+            "line": 1930,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "an_ambiguous_push_is_reconciled_against_the_remote",
+      "function_line": 2099,
+      "attributes": [
+        {
+          "line": 2098,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 1993,
+        "parent_attributes": [
+          {
+            "line": 1992,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_push_moves_the_remote_branch_and_invents_no_ref_in_the_remote",
+      "function_line": 2176,
+      "attributes": [
+        {
+          "line": 2175,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2070,
+        "parent_attributes": [
+          {
+            "line": 2069,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_push_follows_the_upstream_branch_name_rather_than_the_local_one",
+      "function_line": 2248,
+      "attributes": [
+        {
+          "line": 2247,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2142,
+        "parent_attributes": [
+          {
+            "line": 2141,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "snapshot_reports_remotes_and_reference_names_in_full",
+      "function_line": 2344,
+      "attributes": [
+        {
+          "line": 2343,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2238,
+        "parent_attributes": [
+          {
+            "line": 2237,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin",
+      "function_line": 2426,
+      "attributes": [
+        {
+          "line": 2425,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2320,
+        "parent_attributes": [
+          {
+            "line": 2319,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "no_fixture_git_process",
+      "skip_guard_ids": [],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_git_directory_selected_as_the_repository_resolves_to_the_work_tree",
+      "function_line": 2472,
+      "attributes": [
+        {
+          "line": 2471,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2366,
+        "parent_attributes": [
+          {
+            "line": 2365,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "the_cli_and_a_window_derive_one_repository_key_for_one_checkout",
+      "function_line": 2562,
+      "attributes": [
+        {
+          "line": 2561,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2456,
+        "parent_attributes": [
+          {
+            "line": 2455,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "the_tracked_file_count_agrees_with_git_ls_files",
+      "function_line": 2644,
+      "attributes": [
+        {
+          "line": 2643,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2538,
+        "parent_attributes": [
+          {
+            "line": 2537,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "reading_a_snapshot_never_rewrites_the_index",
+      "function_line": 2692,
+      "attributes": [
+        {
+          "line": 2691,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2586,
+        "parent_attributes": [
+          {
+            "line": 2585,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_restore_that_failed_inside_its_write_loop_never_says_nothing_happened",
+      "function_line": 2743,
+      "attributes": [
+        {
+          "line": 2741,
+          "text": "#[cfg(unix)]"
+        },
+        {
+          "line": 2742,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [
+        "#[cfg(unix)]"
+      ],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2637,
+        "parent_attributes": [
+          {
+            "line": 2635,
+            "text": "#[cfg(unix)]"
+          },
+          {
+            "line": 2636,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git",
+        "permission_premise"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_refused_unstage_wrote_no_part_of_the_index",
+      "function_line": 2822,
+      "attributes": [
+        {
+          "line": 2821,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2716,
+        "parent_attributes": [
+          {
+            "line": 2715,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_hook_that_prepends_to_the_message_does_not_fail_the_users_own_commit",
+      "function_line": 2882,
+      "attributes": [
+        {
+          "line": 2880,
+          "text": "#[cfg(unix)]"
+        },
+        {
+          "line": 2881,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [
+        "#[cfg(unix)]"
+      ],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2776,
+        "parent_attributes": [
+          {
+            "line": 2774,
+            "text": "#[cfg(unix)]"
+          },
+          {
+            "line": 2775,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_worktree_on_a_branch_that_is_not_utf8_still_lists_every_worktree",
+      "function_line": 2938,
+      "attributes": [
+        {
+          "line": 2936,
+          "text": "#[cfg(unix)]"
+        },
+        {
+          "line": 2937,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [
+        "#[cfg(unix)]"
+      ],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2832,
+        "parent_attributes": [
+          {
+            "line": 2830,
+            "text": "#[cfg(unix)]"
+          },
+          {
+            "line": 2831,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_lossy_branch_label_cannot_act_on_the_branch_it_names",
+      "function_line": 2998,
+      "attributes": [
+        {
+          "line": 2996,
+          "text": "#[cfg(unix)]"
+        },
+        {
+          "line": 2997,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [
+        "#[cfg(unix)]"
+      ],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2892,
+        "parent_attributes": [
+          {
+            "line": 2890,
+            "text": "#[cfg(unix)]"
+          },
+          {
+            "line": 2891,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_remote_whose_name_contains_a_slash_is_named_the_same_way_by_both_halves",
+      "function_line": 3075,
+      "attributes": [
+        {
+          "line": 3074,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 2969,
+        "parent_attributes": [
+          {
+            "line": 2968,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "a_pull_request_fetch_writes_only_its_private_refs_and_proves_the_head",
+      "function_line": 3130,
+      "attributes": [
+        {
+          "line": 3129,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3024,
+        "parent_attributes": [
+          {
+            "line": 3023,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "remotes_report_gits_primary_fetch_and_push_urls",
+      "function_line": 3349,
+      "attributes": [
+        {
+          "line": 3348,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3243,
+        "parent_attributes": [
+          {
+            "line": 3242,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "discard_reports_restored_paths_when_untracked_classification_fails",
+      "function_line": 3400,
+      "attributes": [
+        {
+          "line": 3399,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3294,
+        "parent_attributes": [
+          {
+            "line": 3293,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "discard_blocks_external_staging_under_the_correct_worktree_index_lock",
+      "function_line": 3514,
+      "attributes": [
+        {
+          "line": 3513,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3408,
+        "parent_attributes": [
+          {
+            "line": 3407,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "discard_refuses_foreign_index_lock_and_releases_its_lock_after_path_refusal",
+      "function_line": 3639,
+      "attributes": [
+        {
+          "line": 3638,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3533,
+        "parent_attributes": [
+          {
+            "line": 3532,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "discard_cancelled_after_classification_keeps_files_and_releases_the_index_lock",
+      "function_line": 3689,
+      "attributes": [
+        {
+          "line": 3688,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3583,
+        "parent_attributes": [
+          {
+            "line": 3582,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "mixed_discard_retains_accounting_and_foreign_lock_evidence",
+      "function_line": 3738,
+      "attributes": [
+        {
+          "line": 3737,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3632,
+        "parent_attributes": [
+          {
+            "line": 3631,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "configured_slash_remotes_support_publish_upstream_and_ref_lookup",
+      "function_line": 3831,
+      "attributes": [
+        {
+          "line": 3830,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3725,
+        "parent_attributes": [
+          {
+            "line": 3724,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "slash_path_without_configured_fetch_url_is_not_a_remote_argument",
+      "function_line": 3945,
+      "attributes": [
+        {
+          "line": 3944,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3839,
+        "parent_attributes": [
+          {
+            "line": 3838,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "remote_ref_lookup_requires_the_exact_name_and_retains_tag_object_ids",
+      "function_line": 3996,
+      "attributes": [
+        {
+          "line": 3995,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3890,
+        "parent_attributes": [
+          {
+            "line": 3889,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "ambiguous_push_reconciliation_uses_push_urls_and_git_url_rewrites",
+      "function_line": 4053,
+      "attributes": [
+        {
+          "line": 4052,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 3947,
+        "parent_attributes": [
+          {
+            "line": 3946,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "ambiguous_push_requires_the_ref_at_every_configured_push_destination",
+      "function_line": 4161,
+      "attributes": [
+        {
+          "line": 4160,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4055,
+        "parent_attributes": [
+          {
+            "line": 4054,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config",
+      "function_line": 4231,
+      "attributes": [
+        {
+          "line": 4230,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4125,
+        "parent_attributes": [
+          {
+            "line": 4124,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "ambiguous_push_refuses_evidence_from_a_retargeted_push_url",
+      "function_line": 4339,
+      "attributes": [
+        {
+          "line": 4338,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4233,
+        "parent_attributes": [
+          {
+            "line": 4232,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "successful_push_refuses_a_changed_source_oid_and_preserves_first_publish",
+      "function_line": 4424,
+      "attributes": [
+        {
+          "line": 4423,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4318,
+        "parent_attributes": [
+          {
+            "line": 4317,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "sync_uses_configured_remote_branch_with_custom_tracking_aliases",
+      "function_line": 4524,
+      "attributes": [
+        {
+          "line": 4523,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4418,
+        "parent_attributes": [
+          {
+            "line": 4417,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "sync_does_not_push_a_branch_selected_after_the_pull",
+      "function_line": 4576,
+      "attributes": [
+        {
+          "line": 4575,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4470,
+        "parent_attributes": [
+          {
+            "line": 4469,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "git_operation_fetch_sync_and_stashes_round_trip",
+      "function_line": 4649,
+      "attributes": [
+        {
+          "line": 4648,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4543,
+        "parent_attributes": [
+          {
+            "line": 4542,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "git_operation_conflict_detection_resolution_and_abort",
+      "function_line": 4809,
+      "attributes": [
+        {
+          "line": 4808,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4703,
+        "parent_attributes": [
+          {
+            "line": 4702,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "git_operation_history_revert_cherry_pick_and_branch",
+      "function_line": 4950,
+      "attributes": [
+        {
+          "line": 4949,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4844,
+        "parent_attributes": [
+          {
+            "line": 4843,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "git_operation_sync_handles_divergence_rebase_and_conflict_handoff",
+      "function_line": 5016,
+      "attributes": [
+        {
+          "line": 5015,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 4910,
+        "parent_attributes": [
+          {
+            "line": 4909,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "git_operation_explicit_merge_parent_and_patch_application",
+      "function_line": 5128,
+      "attributes": [
+        {
+          "line": 5127,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5022,
+        "parent_attributes": [
+          {
+            "line": 5021,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "snapshot_fallback_repairs_external_stash_and_clean_index_merge_state",
+      "function_line": 5213,
+      "attributes": [
+        {
+          "line": 5212,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5107,
+        "parent_attributes": [
+          {
+            "line": 5106,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "stash_drop_refuses_a_stale_selection_after_an_external_push",
+      "function_line": 5282,
+      "attributes": [
+        {
+          "line": 5281,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5176,
+        "parent_attributes": [
+          {
+            "line": 5175,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "deleted_file_unstage_patch_refuses_a_head_that_moved_after_render",
+      "function_line": 5312,
+      "attributes": [
+        {
+          "line": 5311,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5206,
+        "parent_attributes": [
+          {
+            "line": 5205,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "unborn_unstage_patch_refuses_a_commit_created_after_render",
+      "function_line": 5356,
+      "attributes": [
+        {
+          "line": 5355,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5250,
+        "parent_attributes": [
+          {
+            "line": 5249,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "operation_message_prefill_uses_the_repository_comment_policy",
+      "function_line": 5384,
+      "attributes": [
+        {
+          "line": 5383,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5278,
+        "parent_attributes": [
+          {
+            "line": 5277,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "conflict_side_resolution_handles_modify_delete_on_both_sides",
+      "function_line": 5414,
+      "attributes": [
+        {
+          "line": 5413,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5308,
+        "parent_attributes": [
+          {
+            "line": 5307,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "queued_conflict_stage_checks_current_contents_and_binds_explicit_approval",
+      "function_line": 5474,
+      "attributes": [
+        {
+          "line": 5473,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5368,
+        "parent_attributes": [
+          {
+            "line": 5367,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "stash_drop_keeps_reflog_order_and_handles_packed_last_ref",
+      "function_line": 5548,
+      "attributes": [
+        {
+          "line": 5547,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5442,
+        "parent_attributes": [
+          {
+            "line": 5441,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "external_stash_push_cannot_retarget_apply_pop_or_drop",
+      "function_line": 5616,
+      "attributes": [
+        {
+          "line": 5615,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5510,
+        "parent_attributes": [
+          {
+            "line": 5509,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "sync_reports_the_completed_pull_when_the_push_is_rejected",
+      "function_line": 5709,
+      "attributes": [
+        {
+          "line": 5708,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5603,
+        "parent_attributes": [
+          {
+            "line": 5602,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "cancelling_sync_after_pull_reports_the_completed_local_step",
+      "function_line": 5773,
+      "attributes": [
+        {
+          "line": 5772,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5667,
+        "parent_attributes": [
+          {
+            "line": 5666,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "preserved_full_feature_contract",
+      "runtime_result": null
+    },
+    {
+      "full_name": "retained_merge_recovery_refuses_a_restarted_operation_with_the_same_incoming_commit",
+      "function_line": 6052,
+      "attributes": [
+        {
+          "line": 6051,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 5946,
+        "parent_attributes": [
+          {
+            "line": 5945,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    },
+    {
+      "full_name": "captured_merge_recovery_survives_staging_conflict_resolution_and_message_edits",
+      "function_line": 6136,
+      "attributes": [
+        {
+          "line": 6135,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 6030,
+        "parent_attributes": [
+          {
+            "line": 6029,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    },
+    {
+      "full_name": "equal_byte_operation_marker_replacement_cannot_reuse_retained_recovery_authority",
+      "function_line": 6234,
+      "attributes": [
+        {
+          "line": 6233,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 6128,
+        "parent_attributes": [
+          {
+            "line": 6127,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    },
+    {
+      "full_name": "both_rebase_backends_reject_previous_step_actions_even_without_head_or_onto_change",
+      "function_line": 6295,
+      "attributes": [
+        {
+          "line": 6294,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 6189,
+        "parent_attributes": [
+          {
+            "line": 6188,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    },
+    {
+      "full_name": "multistep_cherry_pick_and_revert_refuse_recovery_from_the_previous_conflicting_step",
+      "function_line": 6411,
+      "attributes": [
+        {
+          "line": 6410,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 6305,
+        "parent_attributes": [
+          {
+            "line": 6304,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    },
+    {
+      "full_name": "operation_state_serde_roundtrip_loses_authority_but_local_request_clone_keeps_it",
+      "function_line": 6524,
+      "attributes": [
+        {
+          "line": 6523,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 6418,
+        "parent_attributes": [
+          {
+            "line": 6417,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    },
+    {
+      "full_name": "retained_recovery_checks_gits_effective_worktree_and_accepts_explicit_original_root",
+      "function_line": 6571,
+      "attributes": [
+        {
+          "line": 6570,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 6465,
+        "parent_attributes": [
+          {
+            "line": 6464,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    },
+    {
+      "full_name": "unsupported_ref_backend_fault_injection_preserves_changes_and_resolution_without_recovery",
+      "function_line": 6741,
+      "attributes": [
+        {
+          "line": 6740,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 6635,
+        "parent_attributes": [
+          {
+            "line": 6634,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    },
+    {
+      "full_name": "oversized_generated_merge_message_preserves_changes_and_original_recovery_authority",
+      "function_line": 6894,
+      "attributes": [
+        {
+          "line": 6893,
+          "text": "#[test]"
+        }
+      ],
+      "item_cfg": [],
+      "required_crate_cfg": "feature = \"ui\"",
+      "predicted_registered_on_linux_ui": true,
+      "source_ignored": false,
+      "source_should_panic": false,
+      "parent_origin": {
+        "classification": "retained_from_parent42",
+        "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+        "parent_function_line": 6788,
+        "parent_attributes": [
+          {
+            "line": 6787,
+            "text": "#[test]"
+          }
+        ],
+        "body_replaced_by_owned_fixture": false
+      },
+      "fixture_behavior": "missing_git_returns_early",
+      "skip_guard_ids": [
+        "missing_git"
+      ],
+      "owning_oracle_group": "operation_witness",
+      "runtime_result": null
+    }
+  ],
+  "proposed_workload_data": {
+    "disposition": "Root-owned task frontend implementation and independent source review still required. These are data/argv proposals, not runnable approval or a copied controller packet.",
+    "platform": "linux",
+    "isolated_feature_graph": [
+      "ui"
+    ],
+    "helper_build": null,
+    "compile": {
+      "phase_label": "compile-ui-repository-git",
+      "program_ref": "future_admitted_physical_cargo_1_93",
+      "args": [
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--test",
+        "repository_git_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "artifact_selector": {
+        "manifest": "Cargo.toml",
+        "package_name": "cagents",
+        "package_version": "0.1.3",
+        "target_name": "repository_git_contract",
+        "target_kind": "test",
+        "target_source": "tests/repository_git_contract.rs",
+        "profile_test": true,
+        "executable_required": true,
+        "unique_matching_artifacts": 1,
+        "successful_build_finished_records": 1
+      },
+      "actual_program": null,
+      "actual_exit": null,
+      "actual_cargo_json": null,
+      "actual_executable": null,
+      "actual_executable_identity": null
+    },
+    "inventory": {
+      "phase_label": "inventory-ui-repository-git",
+      "program_ref": "same_executable_from_original_compile_cargo_json",
+      "args": [
+        "--list",
+        "--color=never"
+      ],
+      "source_expected_count": 82,
+      "actual_inventory_N": null,
+      "actual_names": null,
+      "actual_original_output": null,
+      "acceptance": "Parse the fresh ordinary libtest inventory and footer from this executable. Require unique complete names exactly equal to source_required_inventory.full_name for this Linux/UI target. Missing, unexpected, duplicate, ignored or benchmark entries refuse; do not repair source predictions from observations."
+    },
+    "run": {
+      "phase_label": "parent-ui-repository-git-all",
+      "program_ref": "same_original_executable_after_identity_revalidation",
+      "args": [
+        "--test-threads=1",
+        "--nocapture",
+        "--format=pretty",
+        "--color=never"
+      ],
+      "filters": [],
+      "exact": false,
+      "unfiltered": true,
+      "serial": true,
+      "requested_original_outer_invocations": 1,
+      "actual_original_outer_invocations": null,
+      "actual_started": null,
+      "actual_exit": null,
+      "actual_counts": {
+        "running": null,
+        "completed_unique": null,
+        "passed": null,
+        "failed": null,
+        "ignored": null,
+        "measured": null,
+        "filtered_out": null
+      },
+      "acceptance": "One original whole-target invocation; reconcile original stdout full-name running/completion/footer records against the actual fresh inventory N, with passed=N and failed/ignored/measured/filtered_out=0, successful original exit and complete custody. Observe both original streams for source-defined skipped premises. Keep raw stdout/stderr separately with identities/hashes and reconcile them again at final accounting.",
+      "no_additive_child_credit": true
+    },
+    "source_prediction_is_not_a_pass": true,
+    "actualN_remains_null_until_original_elf_inventory": true,
+    "phase_deadlines_seconds": null,
+    "deadline_note": "Finite compile/list/full-run caps and sum must be supplied by the later actual task packet/grant; no old startup budget or target-duration measurement is transferred.",
+    "excluded_workloads": [
+      "--lib",
+      "host graph",
+      "retained cagentsd/HOST helper build",
+      "native app",
+      "Python component test invocation",
+      "per-name or filtered target runs",
+      "force-fresh cache/build",
+      "second Cargo compilation"
+    ]
+  },
+  "skip_guards": [
+    {
+      "id": "missing_git",
+      "literal": "skipping: `git` is not available on PATH",
+      "source": {
+        "path": "tests/repository_git_contract.rs",
+        "line": 106
+      },
+      "condition": "Fixture::new's git --version .output() returns Err; it does not establish that --version exited successfully.",
+      "source_behavior": "Most fixture parents return early and libtest can call them ok. Two owned-hook parents require actual Git via expect. The no-handoff cleanup parent requires only its holder.",
+      "observe": [
+        "original_stdout",
+        "original_stderr"
+      ],
+      "qualification": "Any observed original skip literal leaves the target unqualified; a green libtest footer alone is insufficient."
+    },
+    {
+      "id": "permission_premise",
+      "literal": "skipping: this user writes into a directory with no write bit",
+      "source": {
+        "path": "tests/repository_git_contract.rs",
+        "line": 2763
+      },
+      "parent": "a_restore_that_failed_inside_its_write_loop_never_says_nothing_happened",
+      "condition": "After chmod 0500 of the private fixture directory, writing its probe unexpectedly succeeds; fixture restores 0700 and returns.",
+      "owning_oracle": "Requires the real non-writable-directory premise, Git mid-write exit255 versus refusal exit1, and product partial-write accounting. An account/capability that bypasses permissions cannot qualify this oracle.",
+      "qualification": "Refuse skipped premise; no account switch or test-body waiver."
+    }
+  ],
+  "implicit_reexecution": {
+    "parent": "ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config",
+    "source_lines": [
+      4231,
+      4257
+    ],
+    "outer_control_variable": "CAGENTS_TEST_PUSH_ALIAS_ENV",
+    "source_branch": "If marker absent, launch std::env::current_exe(); if present, execute this parent's Git/config branch.",
+    "child_program": "original test binary via current_exe()",
+    "child_args": [
+      "--exact",
+      "ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config",
+      "--nocapture"
+    ],
+    "child_env_overrides": {
+      "CAGENTS_TEST_PUSH_ALIAS_ENV": "1",
+      "GIT_CONFIG_COUNT": "2",
+      "GIT_CONFIG_KEY_0": "protocol.allow",
+      "GIT_CONFIG_VALUE_0": "never",
+      "GIT_CONFIG_KEY_1": "protocol.file.allow",
+      "GIT_CONFIG_VALUE_1": "always"
+    },
+    "child_assertion": "Source checks child status.success() and captured stdout containing '1 passed'.",
+    "output_custody_limit": "Child stdout/stderr are captured by source .output(); successful output is not forwarded/archived as an independent outer stream. Assertion failure includes both streams. Outer skip observation cannot independently inspect a success child's hidden skip text; preserve the admitted Git/tool context and disclose this source limitation.",
+    "admission": "Refuse a preseeded outer CAGENTS_TEST_PUSH_ALIAS_ENV by name; do not unset it and claim original-path coverage. Preserve the intentional child-local Git config inputs and opaque inherited authority.",
+    "accounting": "One outer registered parent. Its self-reexec is nested/nonadditive, not a second qualified invocation or 83rd parent."
+  },
+  "fixture_environment": {
+    "service_isolate": {
+      "source_line": 80,
+      "overrides": {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "Cagents Contract",
+        "GIT_AUTHOR_EMAIL": "contract@example.invalid",
+        "GIT_COMMITTER_NAME": "Cagents Contract",
+        "GIT_COMMITTER_EMAIL": "contract@example.invalid",
+        "GIT_AUTHOR_DATE": "1700000000 +0000",
+        "GIT_COMMITTER_DATE": "1700000000 +0000"
+      }
+    },
+    "raw_fixture_run": {
+      "source_line": 150,
+      "additional_override": {
+        "GIT_TERMINAL_PROMPT": "0"
+      },
+      "removes": [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE"
+      ],
+      "same_identity_and_config_overrides_as_isolate": true
+    },
+    "raw_fixture_expected_failure": {
+      "source_line": 190,
+      "overrides": {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0"
+      },
+      "removes": [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE"
+      ]
+    },
+    "other_direct_git_children": [
+      {
+        "source_line": 375,
+        "args": [
+          "merge",
+          "--no-edit",
+          "theirs"
+        ],
+        "overrides": {
+          "GIT_CONFIG_GLOBAL": "/dev/null",
+          "GIT_CONFIG_SYSTEM": "/dev/null"
+        },
+        "ownership": "Direct raw Command.output, not only RepositoryService executor."
+      },
+      {
+        "source_line": 1824,
+        "program": "git",
+        "args": [
+          "cat-file",
+          "--batch"
+        ],
+        "overrides": {
+          "GIT_CONFIG_GLOBAL": "/dev/null",
+          "GIT_CONFIG_SYSTEM": "/dev/null",
+          "GIT_CONFIG_NOSYSTEM": "1"
+        },
+        "pipes": [
+          "stdin",
+          "stdout"
+        ],
+        "ownership": "Original spawned Child receives object IDs then wait_with_output."
+      }
+    ],
+    "comprehensive_environment_isolation": false,
+    "inherited_ordinary_inputs": "Root's later source contract must admit/bind or refuse unintended routing/template/exec/config/askpass/trace and Python startup inputs without reading private values into evidence. Source fixture clears only its listed routing variables and preserves intended Git config child semantics.",
+    "opaque_authority_policy": "Retain CAGENTS actor/authority/context and HOME unchanged. No User-only eligibility claim, blanket environment scrub, account/provider switch, authority removal or new namespace."
+  },
+  "fixture_tools_and_prerequisites": {
+    "all_actual_tool_paths_and_versions_unobserved": true,
+    "cargo_rust": {
+      "source_rust_version": "1.93",
+      "source_edition": "2024",
+      "admitted_physical_cargo": null,
+      "admitted_physical_rustc": null,
+      "locked": true,
+      "cargo_config": {
+        "build_jobs": 2,
+        "checkout_root_env": {
+          "name": "CAGENTS_CHECKOUT_ROOT",
+          "relative_value": ".",
+          "force": true
+        }
+      },
+      "qualification": "Reuse separately admitted source-bound target/cache; no toolchain installation, build probe or forced broad cold compile is authorized."
+    },
+    "git": {
+      "source_program": "git",
+      "resolution": "PATH",
+      "actual_physical_path": null,
+      "actual_version": null,
+      "probe_args": [
+        "--version"
+      ],
+      "requires": "Real files-backed Git, local bare/file remotes, linked worktrees, commit/switch/rebase --merge and --apply, sequencer/cherry-pick/revert/stash/patch features used by the full source. No exact minimum Git version is proven by this static inventory.",
+      "transport": "Private local fixtures only; no live provider or remote credential required."
+    },
+    "shell": {
+      "source_program": "/bin/sh",
+      "actual_identity": null,
+      "parents": [
+        "a_hook_that_prepends_to_the_message_does_not_fail_the_users_own_commit",
+        "sync_reports_the_completed_pull_when_the_push_is_rejected"
+      ],
+      "hook_modes": "0755",
+      "external_path_tools": [
+        "cat",
+        "mv"
+      ],
+      "shell_commands": [
+        "printf",
+        "exit"
+      ],
+      "note": "Bind the existing admitted shell/PATH tools; no availability or filesystem probe was performed."
+    },
+    "owned_holder": {
+      "rust_source": "tests/support/owned_hook_pipe_holder.rs",
+      "python_source": "tests/support/owned_hook_pipe_holder.py",
+      "program": "/usr/bin/python3",
+      "holder_args": [
+        "-I",
+        "-B",
+        "-u",
+        "<private_root>/owned-hook-holder.py",
+        "--holder"
+      ],
+      "hook_shebang": "#!/usr/bin/python3",
+      "hook_args": [],
+      "hook_startup_limit": "The holder has -I; the actual Git-hook shebang has no -I/-B/-u. Its inherited Python startup context remains a prerequisite to admit/refuse, not an observed isolated fact.",
+      "generated_private_paths": [
+        "owned-hook-holder.py",
+        "hook-writers.sock",
+        "work/.git/hooks/pre-commit"
+      ],
+      "mode_hook": "0755",
+      "control_command_template": "snapshot <fresh private cookie>",
+      "control_line_ending": "LF",
+      "stdio": {
+        "stdin": "original ChildStdin pipe",
+        "stdout": "original ChildStdout receipt pipe",
+        "stderr": "Stdio::null() in source"
+      },
+      "shutdown": "Original control-pipe EOF; receipt/status streams and original Child retained through finish/wait.",
+      "linux_requirements": [
+        "AF_UNIX socket and SCM_RIGHTS descriptor passing",
+        "two actual distinct writable pipe identities",
+        "original pidfd_open/pidfd_send_signal availability and descriptor ownership",
+        "original Child wait ownership/default reaper behavior",
+        "private fixture retained through worker joins and positive settlement"
+      ],
+      "expected_success": "Cooperative original-child exit with no rescue and completed original command/lock workers; cleanup failure/rescue/late wait never qualifies an original oracle pass.",
+      "non_linux": "Unix source has an original Child fallback, but this Linux/ELF/controller plan gives it no Darwin or other-platform qualification."
+    },
+    "temp_root": {
+      "source_api": "tempfile::tempdir()",
+      "source_selects_tmpdir_override": false,
+      "linux_socket_bound": {
+        "encoded_address_bytes_without_nul_max": 107,
+        "predicate": "encoded_address_bytes + 1 <= 108",
+        "actual_value": null
+      },
+      "actual_inherited_effective_root": null,
+      "actual_root_identity": null,
+      "actual_final_socket_bytes": null,
+      "admission": "Only the already permitted inherited effective temp root may be observed/admitted or refused. Bind a private absolute physical root/owner/mode/identity outside Git ancestry, and final allocated socket byte length including private suffix and NUL budget below Linux sockaddr_un 108-byte capacity. Do not assume that unset means an approved /tmp.",
+      "override_abi": "No approved TMPDIR override/create/restore seam was established at immutable579. No environment was read here. Invalid or unadmitted inherited root refuses rather than selecting a new root or removing Git markers."
+    },
+    "actor": {
+      "actual_identity": null,
+      "actual_sigchld_disposition": null,
+      "requires": "Existing inherited actor with normal original-child wait behavior and a genuine write-permission failure premise; no actor/account change."
+    },
+    "descendant_custody": {
+      "requires": [
+        "One original outer phase supervisor",
+        "Cargo/rustc/build scripts and entire test/Git/hook/Python/self-reexec family remain under admitted original custody",
+        "Owned holder remains its Rust fixture's child, with original control/status/pidfd and waits",
+        "No second supervisor/waiter, PID-file/group discovery, foreign/adopted-child forced cleanup or evidence-root deletion before settlement"
+      ],
+      "maintained_reference": {
+        "path": "scripts/qualification/process_custody.py",
+        "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
+      },
+      "reference_limit": "Existing process_custody APIs are not imported/executed here and are not a drop-in authorization to replace Root's canonical supervisor/settler."
+    },
+    "no_required_host_helper": true,
+    "no_required_cagents_binary_or_daemon_launch": "The CLI/window identity parent calls library functions; this test source has no CARGO_BIN_EXE/env! executable lookup. No live cagentsd/retained-actor helper is needed for this target."
+  },
+  "owning_oracles": {
+    "original_full_feature_parents": "All source_required_inventory entries are required, including diff/history/pathspec/rename/push/ref-lock/permission/HEAD guards, every existing Git operation parent and the owned hook parents. No suffix-only qualification or hidden body waiver.",
+    "witness_parent_names": [
+      "retained_merge_recovery_refuses_a_restarted_operation_with_the_same_incoming_commit",
+      "captured_merge_recovery_survives_staging_conflict_resolution_and_message_edits",
+      "equal_byte_operation_marker_replacement_cannot_reuse_retained_recovery_authority",
+      "both_rebase_backends_reject_previous_step_actions_even_without_head_or_onto_change",
+      "multistep_cherry_pick_and_revert_refuse_recovery_from_the_previous_conflicting_step",
+      "operation_state_serde_roundtrip_loses_authority_but_local_request_clone_keeps_it",
+      "retained_recovery_checks_gits_effective_worktree_and_accepts_explicit_original_root",
+      "unsupported_ref_backend_fault_injection_preserves_changes_and_resolution_without_recovery",
+      "oversized_generated_merge_message_preserves_changes_and_original_recovery_authority"
+    ],
+    "witness_scope": "Backend/service retained Abort/Continue requests refuse restarted/equal-byte-replaced/advanced steps before recovery dispatch; both real rebase backends and sequencer multi-step cherry-pick/revert; legitimate staging/resolution/message edits; serialized/forged display loses local authority; effective worktree checks; unsupported-proof display/staging and oversized optional draft preserve intended behavior.",
+    "stale_refusal_helper": {
+      "source_line": 6023,
+      "checks": [
+        "MutationOutcome::NotApplied with Rejected",
+        "no additional --abort/--continue executor dispatch",
+        "same repository evidence before/after"
+      ]
+    },
+    "owned_hook_original": {
+      "parent": "a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock",
+      "scope": "Actual two pipe writers remain held through product TimedOut and subsequent mutation-lock reacquisition; original failure retained before cleanup.",
+      "source_timeout_seconds": 2,
+      "result_receive_cap_seconds": 60,
+      "lock_receive_cap_seconds": 10
+    },
+    "owned_hook_nested_negatives": {
+      "parent": "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff",
+      "injections": [
+        "AfterHandoff",
+        "AfterTimeout"
+      ],
+      "expected_caught_payloads": [
+        "injected failure after actual hook handoff",
+        "injected failure after original command timeout"
+      ],
+      "scope": "Both deliberate original oracle failures survive positive owned cleanup.",
+      "counting": "Two nested cases inside one registered parent; caught panic diagnostics may appear in original stderr without being separate outer tests or ignored failures."
+    },
+    "owned_hook_no_handoff": {
+      "parent": "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts",
+      "scope": "Original child ready before any Git command; control EOF settles/reaps original child without handoff."
+    },
+    "optional_component_file": {
+      "path": "tests/support/test_owned_hook_pipe_holder.py",
+      "compiled_by_this_ui_target": false,
+      "requested_runtime_invocation": false,
+      "credit": "Historical Python component results and nested malformed cases do not qualify the current Rust/real-Git target or add parents."
+    }
+  },
+  "remaining_gates": {
+    "current_rust_compile": "UNRUN",
+    "original_fresh_elf_inventory": "UNRUN",
+    "whole_serial_real_git_target": "UNRUN",
+    "existing_ui_lib_queue_sidebar_cache_owners": "UNRUN and outside this one integration target; service request clones are not the app queue/rendered control path.",
+    "focused_witness_cancellation": "No dedicated current integration parent located for token/typed cancellation during capture; Sync-after-pull cancellation is a different oracle.",
+    "optional_message_gaps": "Comment-policy/message-edit/oversize parents do not directly exercise every unreadable-presentation, stripspace-failure or A-draft/B-proof interleaving.",
+    "native_ui_and_realistic_concurrency": "UNRUN; no native/performance claim.",
+    "exact_task_frontend_source_review": "Pending Root implementation after current47; this inventory/data proposal is not that review.",
+    "actual_executable": null,
+    "actual_inventory_N": null,
+    "actual_passes": null,
+    "actual_failures": null,
+    "actual_original_phase_ledger": null,
+    "actual_environment_admission": null,
+    "actual_grant": null,
+    "actual_C_claim": null,
+    "actual_release": null,
+    "authorization": "No build, test, helper import/execution, tool/environment/process/cache/native/provider/account/inbox/GitHub action or new worker was performed or authorized by this proposal."
+  }
+}

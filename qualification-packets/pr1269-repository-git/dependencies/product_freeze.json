@@ -1,0 +1,22 @@
+{
+  "head": "c3b6b08ab17dca23848bb768493991784b02065b",
+  "tree": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+  "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+  "donor": "dea70f4bfb8f142c3ff036786a4ee3b5c45ec33d",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-owned-hook-port",
+  "changed_paths": {
+    "tests/repository_git_contract.rs": "58311ecb8fd66f87b4ad27ca7cf168e351da949dc3cbad63287f5da17940c3c6",
+    "tests/support/owned_hook_pipe_holder.py": "87bf22144c5f114e1331686cdd20c01a5fe6ed307270604bc574a41c8cf9c8d3",
+    "tests/support/owned_hook_pipe_holder.rs": "5c977985b17e34265d7d95a1d462ebcc407df6df72fa7fa21d0bf83f96215ed6",
+    "tests/support/test_owned_hook_pipe_holder.py": "f8abf92d9ea9f9a8c8db66f0e9a58a86a56ce29c269d1a71c0dc14fa3df9204f"
+  },
+  "method": "Clean ordinarycherry-pick existingoriginalEC/backendownedfixture4filecommit; no manualresolution/newhelperframework/productionchange.",
+  "source_plan": {
+    "path": "/tmp/pr1269-42c122d4-repository-git-qualification-plan-source-only-v1.txt",
+    "sha256": "86bcfb2f9f999bdf4dd921e941c7f664c8515377dfbec82a243f1866dca0ab48"
+  },
+  "ownership": "Main15 actuale20cc170/nointersectingwriter; correctiond7511007 donor belongsEC/backendlineage, notMain15originalauthorship. No claimed authority.",
+  "validation": "NewRust/Git/nativeUNRUN. HistoricalexacthelperPythoncomponent3pass mayretainowningsourcecomponent scope after genuinepinjoin; no currentRust/effect qualification.",
+  "publication": null,
+  "created_utc": "2026-10-31T12:13:53.485411+00:00"
+}

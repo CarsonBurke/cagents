@@ -1,0 +1,89 @@
+{
+  "kind": "AUTHOR_PR1269_SINGLE_UI_INTEGRATION_SOURCE_BINDING_NOT_APPROVAL",
+  "head": "c3b6b08ab17dca23848bb768493991784b02065b",
+  "tree": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+  "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+  "product_pr": 1269,
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "docs/development.md": "cceaa574be6a5df7c72124add0a3c7cfa3307536fd5fa073c6eea541a6639d11",
+    "scripts/qualification/process_custody.py": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "src/fs_safety.rs": "454611aaa94871e2677fce9dd87e8e8e7cef04cafb3b5d1f92fbab6322dd5c35",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/process.rs": "0181de1b4c7b3fb10aaa6cc3aeabf06d4d7105ecffd0915f0b4a440be194740e",
+    "src/repository.rs": "d598aa218605ff551377afb223408f6af303efef2170a5b18241189868821909",
+    "src/repository_operation_witness.rs": "862ae5ab528312ace8d9c5c7e904a94e46bc357b5472dd1c161e55c6bec312eb",
+    "src/repository_stash.rs": "c8108db3a4c14333b04b8648ad976ca1cb07fdc377f5b58e949de393b183dde4",
+    "tests/repository_git_contract.rs": "58311ecb8fd66f87b4ad27ca7cf168e351da949dc3cbad63287f5da17940c3c6",
+    "tests/support/owned_hook_pipe_holder.py": "87bf22144c5f114e1331686cdd20c01a5fe6ed307270604bc574a41c8cf9c8d3",
+    "tests/support/owned_hook_pipe_holder.rs": "5c977985b17e34265d7d95a1d462ebcc407df6df72fa7fa21d0bf83f96215ed6"
+  },
+  "command_data": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/command-data.json",
+    "sha256": "3aeefc138db551fef965a7169b5d7a5606b1c635b9a5a4627f1e98169631bc44",
+    "bytes": 27444
+  },
+  "current_source_map": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/current-source-map.json",
+    "sha256": "6c8985d5ceb867d10b2161c789a10cff356d945ffdd31b55e66f770833195dda",
+    "bytes": 2354
+  },
+  "source_inventory": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/source_inventory.json",
+    "sha256": "e51c3886eb4277d3f83efc5b68a31e16aefcb9d57e7b25e2b453a731eff3a9e9",
+    "bytes": 108415
+  },
+  "frontend_design": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/frontend_design.txt",
+    "sha256": "d90f59c2bdac2b7335e1463a11cb05dfdbe8fed4351a1178dffa1f2c37ad3288",
+    "bytes": 16735
+  },
+  "tmpdir_design": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/tmpdir_design.json",
+    "sha256": "f2cb4a91babc230308ff67d23c946c05509ffc821ec4ba3109165901a571b5ed",
+    "bytes": 13382
+  },
+  "product_port_review": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/product_port_review.json",
+    "sha256": "a0aa7aad48dd56acc6f4cfad10aa638ca618723830a9a7dcc6655963db6267ae",
+    "bytes": 11048
+  },
+  "product_freeze": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/product_freeze.json",
+    "sha256": "355bb01737a5cc7de237594202434a56c1d147794686c1c2da9ffd37095950c9",
+    "bytes": 1570
+  },
+  "canonical_function": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_function.py",
+    "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "bytes": 877
+  },
+  "canonical_semantic": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_semantic.json",
+    "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8",
+    "bytes": 8938
+  },
+  "canonical_conservation": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_conservation.json",
+    "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4",
+    "bytes": 13262
+  },
+  "runtime_admission": {
+    "state": "PR1269_UI_INTEGRATION_REQUIRES_CURRENT_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "scope": "Existing component scopes remain unchanged. No new controller review or execution grant is manufactured."
+}

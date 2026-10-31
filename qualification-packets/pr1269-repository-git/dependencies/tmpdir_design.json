@@ -1,0 +1,174 @@
+{
+  "receipt_type": "prospective_source_design_only",
+  "task": "PR1269 c3 minimal child-only private TMPDIR prerequisite; disjoint from inventory/frontend implementation review",
+  "verdict": "SUPPORTED_BY_REPOSITORY_SOURCE_POLICY; new limited source exception, independent review and fresh exact Root grant required before execution",
+  "scope_limits": {
+    "executed_tests_builds_helpers_imports_native_probes": false,
+    "inspected_current_environment_processes_accounts_resources": false,
+    "changed_repository_source_or_environment": false,
+    "created_proposed_fixture_root": false,
+    "new_framework_adapter_or_worker": false,
+    "actual_execution_authority_granted_by_this_report": false,
+    "old47_grant_transfer": false,
+    "compiler_test_native_results": "UNRUN",
+    "complete_82_inventory_or_other_fixture_socket_layouts_reviewed_here": false
+  },
+  "identities": {
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-owned-hook-port",
+    "head_before_after": "c3b6b08ab17dca23848bb768493991784b02065b",
+    "tree_before_after": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+    "source_pins_before_after": {
+      "tests/repository_git_contract.rs": {
+        "bytes": 258853,
+        "sha256": "58311ecb8fd66f87b4ad27ca7cf168e351da949dc3cbad63287f5da17940c3c6"
+      },
+      "src/repository_operation_witness.rs": {
+        "bytes": 40633,
+        "sha256": "862ae5ab528312ace8d9c5c7e904a94e46bc357b5472dd1c161e55c6bec312eb"
+      },
+      "tests/support/owned_hook_pipe_holder.rs": {
+        "bytes": 11356,
+        "sha256": "5c977985b17e34265d7d95a1d462ebcc407df6df72fa7fa21d0bf83f96215ed6"
+      },
+      "tests/support/owned_hook_pipe_holder.py": {
+        "bytes": 6723,
+        "sha256": "87bf22144c5f114e1331686cdd20c01a5fe6ed307270604bc574a41c8cf9c8d3"
+      },
+      "docs/development.md": {
+        "bytes": 29978,
+        "sha256": "cceaa574be6a5df7c72124add0a3c7cfa3307536fd5fa073c6eea541a6639d11"
+      },
+      "CLAUDE.md": {
+        "bytes": 8820,
+        "sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987"
+      }
+    },
+    "existing_plan": {
+      "path": "/tmp/pr1269-c3-existing-startup-runner-integration-frontend-diff-design-v1.txt",
+      "bytes": 16735,
+      "sha256": "d90f59c2bdac2b7335e1463a11cb05dfdbe8fed4351a1178dffa1f2c37ad3288"
+    },
+    "module862_resolution": "src/repository_operation_witness.rs, not the helper or src/modules.rs",
+    "worktree_cleanliness": "not assessed; scoped HEAD/tree and listed source bytes rechecked"
+  },
+  "policy": {
+    "applicable_repository_instructions": "AGENTS.md points to CLAUDE.md; repository workflow requires appropriate narrow tests and development-runner native validation when applicable. No additional TMPDIR-specific user approval requirement found.",
+    "positive_source_support": {
+      "path": "docs/development.md",
+      "lines": "377-405",
+      "meaning": "Explicitly recommends a fresh private short physical absolute TMPDIR outside Git ancestry, verifies chosen parent first, requires final socket length, retains root until original children settle and deliberately omits automatic deletion traps."
+    },
+    "scope_of_example": "HOST helper example is source support for fixture preparation only. This PR1269 design adds neither HOST build nor helper binary and does not presume any current XDG_RUNTIME_DIR is admitted.",
+    "actual_prohibition_found": null,
+    "remaining_admission_boundary": "The old579/47 runner lacks the required creation/child-environment exception. Its absent field is an old-task admission limit, not a repository ban or a new user-permission requirement. Future exact source/review/grant must name the one-key exception; no current action authorized here.",
+    "plan_anchor": "Existing plan lines61-68 and79 expressly reserve a new narrow independently reviewed exception before a fresh grant; preserve that distinction."
+  },
+  "minimal_future_design": [
+    {
+      "step": 1,
+      "design": "Declare one existing parent explicitly in the new task rather than auto-selecting an inherited runtime/temp directory or fallback. Future admission must establish a physical absolute path with no symlink/.. spelling, no .git file/directory/symlink in the prospective base or any ancestor, an appropriately trusted parent and sufficient path budget. No current parent was selected or inspected. Do not delete Git markers, alter foreign directories or silently retry another root."
+    },
+    {
+      "step": 2,
+      "design": "Create exactly one fresh exclusive short ASCII-named task directory using a standard secure temporary-directory primitive under that declared parent, not an auto-cleanup context manager. Ensure and verify the newly owned root is owned by the executing actor with mode0700, canonical physical spelling and identity. Retain its original directory identity/ownership evidence and, if held by the existing task custody, its original directory handle until explicit settlement; no source assertion substitutes for future observed creation. Mode correction, if needed, is confined to the verified newly created owned directory."
+    },
+    {
+      "step": 3,
+      "design": "For the single original full-target test invocation only, derive its child environment from the already admitted phase environment and change exactly TMPDIR to the new physical absolute root. Leave controller/global environment untouched. Keep compile/list under their already admitted environment; no TMPDIR creation is needed for source inventory. Preserve opaque CAGENTS authority/context, HOME, PATH, inherited Git configuration and every other admitted variable exactly as the existing phase would supply them. Existing compiler/target settings and existing test-local Git/self-reexec settings retain their own unchanged scope. Do not use env_clear, User-caller helpers, global tempfile override APIs, account changes or a compiler-override field as a hidden TMPDIR channel."
+    },
+    {
+      "step": 4,
+      "design": "Bind this one-key delta, declared parent/root identity and permissions, exact source/dependency pins, and unchanged outer cwd to the future task source and before/after evidence using existing task records. Do not publish opaque environment values. Controller environment needs no restoration because it was never mutated. A source review and fresh Root grant must cover creation, the single child-environment exception and custody lifetime explicitly; no reuse of grant47."
+    },
+    {
+      "step": 5,
+      "design": "Retain the root throughout the entire original full-target invocation, all discovered ordinary outer parents (source prediction82), legitimate self-reexec and Python helper descendants, original writer FDs, original worker joins and the existing supervisor settlement/HOLD. No automatic recursive cleanup on exception, timeout, cancellation or outer Cargo success. Cleanup, if later separately performed under existing custody, must follow positive original child/writer/worker/final-custody settlement and confirmed ownership of the same directory. Unknown settlement retains the root and existing HOLD/accounting; it never permits extra signals, unknown-descendant cleanup or converting failure into pass."
+    },
+    {
+      "step": 6,
+      "design": "Keep all original test guards, assertions, captured stdout/stderr and --nocapture skip detection. Existing refusal on a preseeded CAGENTS_TEST_PUSH_ALIAS_ENV remains; do not remove the marker. Unavailable Git/Python or a write-bit premise that does not hold must refuse qualification, not cause environment/account/permission manipulation to manufacture a passing fixture."
+    }
+  ],
+  "socket_path_proof": {
+    "source_anchor": "tests/support/owned_hook_pipe_holder.rs:25-35 plus tests/repository_git_contract.rs:109,852-854,1026-1035",
+    "pinned_dependency": {
+      "package": "tempfile",
+      "version": "3.27.0",
+      "Cargo_lock_checksum": "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+    },
+    "primary_source_derivation": "tempfile v3.27.0 src/lib.rs:195,228-235,595-596 defaults to .tmp plus six alphanumeric bytes and uses env::temp_dir; src/util.rs:7-19,29-37,67 constructs that leaf beneath the supplied base. Rust1.93 std env.rs:660-669,692-693 documents Unix TMPDIR selection. Version-source support only; no installed executable/dependency provenance probe or downloaded-crate checksum verification.",
+    "formula": "For physical absolute P with no trailing slash: R=P+\"/\"+\".tmpXXXXXX\"; socket=R+\"/hook-writers.sock\". Byte length is B(P)+1+10+1+17=B(P)+29. Require socket bytes<108, hence B(P)<=78 for this exact default layout.",
+    "units": "filesystem bytes, not character count; the terminating NUL accounts for the remaining Linux sun_path byte",
+    "cwd": "An absolute canonical P is invariant across existing Git current_dir(work) and Python/hook cwd. Preserve outer product-worktree cwd and all existing command cwd; no chdir shortcut.",
+    "git_boundary": "The new base and ancestors must be outside Git. Fixture::new intentionally creates work/.git and origin.git BELOW the base (repository_git_contract.rs:112-127); do not recursively reject or remove these owned fixture repositories.",
+    "bounded_claim": "Only this inspected hook layout and its no-hook control are covered. Other fixture layouts remain the separate inventory/source reviewer responsibility; the HOST docs example has a different79-byte suffix and is not this formula."
+  },
+  "lifetime_and_guard_anchors": [
+    {
+      "path": "tests/repository_git_contract.rs",
+      "lines": "101-109",
+      "claim": "Git unavailable returns a skipping ok branch; root is tempfile::tempdir. TMPDIR is useful only when actual fixture premises remain enforced."
+    },
+    {
+      "path": "tests/repository_git_contract.rs",
+      "lines": "845-953,987-1035",
+      "claim": "Original helper/worker ownership, both injected failure branches, finish and original joins remain causal; original panic is resumed after cleanup. No new supervisor needed."
+    },
+    {
+      "path": "tests/support/owned_hook_pipe_holder.rs",
+      "lines": "25-80,143-173,228-308",
+      "claim": "Absolute root-derived socket; original Python Child/control/status/pidfd; explicit original writer identity checks; EOF/wait and rescue cannot qualify pass; failed cleanup retains original wait or indefinite HOLD."
+    },
+    {
+      "path": "tests/support/owned_hook_pipe_holder.py",
+      "lines": "13-14,29-47,50-86,101-161",
+      "claim": "Exact injected socket path/cookie, SCM_RIGHTS FD ownership, validation and retention until original control EOF; TMPDIR only changes the Rust fixture base, not this ownership protocol."
+    },
+    {
+      "path": "tests/repository_git_contract.rs",
+      "lines": "2756-2764",
+      "claim": "Actual write attempt tests nonwritable-directory premise and prints skipping when it fails. Private mode0700 base alone cannot establish effective-user/capability/filesystem write-bit behavior. Preserve guard and reject skip as qualification."
+    },
+    {
+      "path": "tests/repository_git_contract.rs",
+      "lines": "4231-4254",
+      "claim": "Legitimate original self-reexec inherits TMPDIR and sets its own existing marker/Git config; its result remains nonadditive. Outer preseeded marker must refuse rather than be scrubbed."
+    }
+  ],
+  "primary_version_sources": [
+    {
+      "url": "https://raw.githubusercontent.com/Stebalien/tempfile/v3.27.0/src/lib.rs",
+      "bytes": 26362,
+      "sha256": "d182721b62c126916b73bb4865ced5d3637bd1a4a77d27ea9e9708973e5f9493"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Stebalien/tempfile/v3.27.0/src/dir/mod.rs",
+      "bytes": 17189,
+      "sha256": "d144325a6528a9a6e7c78a42e0eec42ee401c3b834ef5851376323725756f219"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Stebalien/tempfile/v3.27.0/src/env.rs",
+      "bytes": 2142,
+      "sha256": "c4af61bd8edea07f769adac3746d1b0d804fc95269f9c7c3e2c9a69d174b8b46"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/Stebalien/tempfile/v3.27.0/src/util.rs",
+      "bytes": 2952,
+      "sha256": "f70d9ecc5a778a01c783dd84baaa6ab81ab48a6faac0693cfec124ee42db421b"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/1.93.0/library/std/src/env.rs",
+      "bytes": 37907,
+      "sha256": "24031d1032a749d5d649ddc77a1abc7648b7229c1ef7b58612e621b6f82e0816"
+    }
+  ],
+  "future_unobserved_prerequisites": [
+    "Specific admitted existing parent and root creation/physical ancestry/identity/mode/path length",
+    "Actual effective actor and filesystem write-bit premise",
+    "Actual Git/Python availability and unchanged admitted inherited authority/environment",
+    "Exact future task source/review/grant tuple and bounded timing",
+    "Actual executable inventory and original full-run results",
+    "Original child/writer/worker/final custody settlement before any cleanup"
+  ],
+  "decision": "A minimal task-private TMPDIR override is a legitimate prospective fixture-preparation design, with no identified repository/source-policy prohibition. Freeze and independently review the explicit one-key exception and custody details, then Root may decide a fresh exact grant under existing authorization. This receipt authorizes no operation and manufactures no fixture pass."
+}

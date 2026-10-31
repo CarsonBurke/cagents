@@ -1,0 +1,675 @@
+{
+  "product_pr": 1269,
+  "product_head": "c3b6b08ab17dca23848bb768493991784b02065b",
+  "product_tree": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+  "product_parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-owned-hook-port",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/run-packet.py",
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/source-binding.json",
+  "source_review_sha256": "6f5599bae5de3db7b71f1289663c86d1c16bf74f666fe1ee07c74d5603298319",
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "docs/development.md": "cceaa574be6a5df7c72124add0a3c7cfa3307536fd5fa073c6eea541a6639d11",
+    "scripts/qualification/process_custody.py": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "src/fs_safety.rs": "454611aaa94871e2677fce9dd87e8e8e7cef04cafb3b5d1f92fbab6322dd5c35",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/process.rs": "0181de1b4c7b3fb10aaa6cc3aeabf06d4d7105ecffd0915f0b4a440be194740e",
+    "src/repository.rs": "d598aa218605ff551377afb223408f6af303efef2170a5b18241189868821909",
+    "src/repository_operation_witness.rs": "862ae5ab528312ace8d9c5c7e904a94e46bc357b5472dd1c161e55c6bec312eb",
+    "src/repository_stash.rs": "c8108db3a4c14333b04b8648ad976ca1cb07fdc377f5b58e949de393b183dde4",
+    "tests/repository_git_contract.rs": "58311ecb8fd66f87b4ad27ca7cf168e351da949dc3cbad63287f5da17940c3c6",
+    "tests/support/owned_hook_pipe_holder.py": "87bf22144c5f114e1331686cdd20c01a5fe6ed307270604bc574a41c8cf9c8d3",
+    "tests/support/owned_hook_pipe_holder.rs": "5c977985b17e34265d7d95a1d462ebcc407df6df72fa7fa21d0bf83f96215ed6"
+  },
+  "helper_build": null,
+  "artifact_groups": [
+    {
+      "id": "ui-repository-git",
+      "features": [
+        "ui"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "repository_git_contract",
+      "target_kind": [
+        "test"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--test",
+        "repository_git_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "run_seconds": 600,
+      "selectors": [
+        {
+          "name": "simultaneous_staged_and_unstaged_state_is_reported_per_area",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "merge_conflicts_expose_index_stages_and_conflict_kinds",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "every_diff_basis_reads_the_matching_pair_of_sides",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "history_reports_root_and_multi_parent_commits",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "history_of_an_unborn_branch_is_empty",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "the_first_commit_on_an_unborn_branch_is_created",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_complete_rename_can_be_staged_unstaged_and_discarded",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "discard_refuses_a_path_that_became_tracked_after_it_was_selected",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "an_untracked_nested_repository_is_listed_as_its_directory",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "literal_pathspecs_stage_only_the_named_file",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_commit_reports_the_object_id_and_message_it_created",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_commit_message_keeps_the_lines_the_user_typed",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_merge_resolved_in_favour_of_ours_is_still_committed",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_branch_name_that_is_not_utf8_costs_nothing_but_its_own_label",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_commit_date_git_cannot_normalise_costs_only_its_own_row",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_refused_restore_changed_nothing_and_a_refused_add_may_have",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_discard_attempts_every_path_and_names_what_it_refused",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_remote_head_pointer_is_not_a_branch_and_an_odd_ref_is_not_fatal",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "git_answers_missing_for_an_object_this_repository_does_not_have",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_staged_rename_sends_each_operation_only_the_halves_it_can_match",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "publishing_then_pushing_a_branch_updates_the_remote",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_non_fast_forward_push_is_reported_as_not_pushed",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "an_ambiguous_push_is_reconciled_against_the_remote",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_push_moves_the_remote_branch_and_invents_no_ref_in_the_remote",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_push_follows_the_upstream_branch_name_rather_than_the_local_one",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "snapshot_reports_remotes_and_reference_names_in_full",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_git_directory_selected_as_the_repository_resolves_to_the_work_tree",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "the_cli_and_a_window_derive_one_repository_key_for_one_checkout",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "the_tracked_file_count_agrees_with_git_ls_files",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "reading_a_snapshot_never_rewrites_the_index",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_restore_that_failed_inside_its_write_loop_never_says_nothing_happened",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_refused_unstage_wrote_no_part_of_the_index",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_hook_that_prepends_to_the_message_does_not_fail_the_users_own_commit",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_worktree_on_a_branch_that_is_not_utf8_still_lists_every_worktree",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_lossy_branch_label_cannot_act_on_the_branch_it_names",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_remote_whose_name_contains_a_slash_is_named_the_same_way_by_both_halves",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "a_pull_request_fetch_writes_only_its_private_refs_and_proves_the_head",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "remotes_report_gits_primary_fetch_and_push_urls",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "discard_reports_restored_paths_when_untracked_classification_fails",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "discard_blocks_external_staging_under_the_correct_worktree_index_lock",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "discard_refuses_foreign_index_lock_and_releases_its_lock_after_path_refusal",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "discard_cancelled_after_classification_keeps_files_and_releases_the_index_lock",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "mixed_discard_retains_accounting_and_foreign_lock_evidence",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "configured_slash_remotes_support_publish_upstream_and_ref_lookup",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "slash_path_without_configured_fetch_url_is_not_a_remote_argument",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "remote_ref_lookup_requires_the_exact_name_and_retains_tag_object_ids",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "ambiguous_push_reconciliation_uses_push_urls_and_git_url_rewrites",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "ambiguous_push_requires_the_ref_at_every_configured_push_destination",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "ambiguous_push_refuses_evidence_from_a_retargeted_push_url",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "successful_push_refuses_a_changed_source_oid_and_preserves_first_publish",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "sync_uses_configured_remote_branch_with_custom_tracking_aliases",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "sync_does_not_push_a_branch_selected_after_the_pull",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "git_operation_fetch_sync_and_stashes_round_trip",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "git_operation_conflict_detection_resolution_and_abort",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "git_operation_history_revert_cherry_pick_and_branch",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "git_operation_sync_handles_divergence_rebase_and_conflict_handoff",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "git_operation_explicit_merge_parent_and_patch_application",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "snapshot_fallback_repairs_external_stash_and_clean_index_merge_state",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "stash_drop_refuses_a_stale_selection_after_an_external_push",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "deleted_file_unstage_patch_refuses_a_head_that_moved_after_render",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "unborn_unstage_patch_refuses_a_commit_created_after_render",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "operation_message_prefill_uses_the_repository_comment_policy",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "conflict_side_resolution_handles_modify_delete_on_both_sides",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "queued_conflict_stage_checks_current_contents_and_binds_explicit_approval",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "stash_drop_keeps_reflog_order_and_handles_packed_last_ref",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "external_stash_push_cannot_retarget_apply_pop_or_drop",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "sync_reports_the_completed_pull_when_the_push_is_rejected",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "cancelling_sync_after_pull_reports_the_completed_local_step",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "retained_merge_recovery_refuses_a_restarted_operation_with_the_same_incoming_commit",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "captured_merge_recovery_survives_staging_conflict_resolution_and_message_edits",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "equal_byte_operation_marker_replacement_cannot_reuse_retained_recovery_authority",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "both_rebase_backends_reject_previous_step_actions_even_without_head_or_onto_change",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "multistep_cherry_pick_and_revert_refuse_recovery_from_the_previous_conflicting_step",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "operation_state_serde_roundtrip_loses_authority_but_local_request_clone_keeps_it",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "retained_recovery_checks_gits_effective_worktree_and_accepts_explicit_original_root",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "unsupported_ref_backend_fault_injection_preserves_changes_and_resolution_without_recovery",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "oversized_generated_merge_message_preserves_changes_and_original_recovery_authority",
+          "expected_stdout_child_results": 0
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "simultaneous_staged_and_unstaged_state_is_reported_per_area",
+        "merge_conflicts_expose_index_stages_and_conflict_kinds",
+        "every_diff_basis_reads_the_matching_pair_of_sides",
+        "history_reports_root_and_multi_parent_commits",
+        "history_of_an_unborn_branch_is_empty",
+        "the_first_commit_on_an_unborn_branch_is_created",
+        "a_complete_rename_can_be_staged_unstaged_and_discarded",
+        "a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock",
+        "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff",
+        "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts",
+        "discard_refuses_a_path_that_became_tracked_after_it_was_selected",
+        "an_untracked_nested_repository_is_listed_as_its_directory",
+        "literal_pathspecs_stage_only_the_named_file",
+        "a_commit_reports_the_object_id_and_message_it_created",
+        "a_commit_message_keeps_the_lines_the_user_typed",
+        "a_merge_resolved_in_favour_of_ours_is_still_committed",
+        "a_branch_name_that_is_not_utf8_costs_nothing_but_its_own_label",
+        "a_commit_date_git_cannot_normalise_costs_only_its_own_row",
+        "a_refused_restore_changed_nothing_and_a_refused_add_may_have",
+        "a_discard_attempts_every_path_and_names_what_it_refused",
+        "a_remote_head_pointer_is_not_a_branch_and_an_odd_ref_is_not_fatal",
+        "git_answers_missing_for_an_object_this_repository_does_not_have",
+        "a_staged_rename_sends_each_operation_only_the_halves_it_can_match",
+        "publishing_then_pushing_a_branch_updates_the_remote",
+        "a_non_fast_forward_push_is_reported_as_not_pushed",
+        "an_ambiguous_push_is_reconciled_against_the_remote",
+        "a_push_moves_the_remote_branch_and_invents_no_ref_in_the_remote",
+        "a_push_follows_the_upstream_branch_name_rather_than_the_local_one",
+        "snapshot_reports_remotes_and_reference_names_in_full",
+        "staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin",
+        "a_git_directory_selected_as_the_repository_resolves_to_the_work_tree",
+        "the_cli_and_a_window_derive_one_repository_key_for_one_checkout",
+        "the_tracked_file_count_agrees_with_git_ls_files",
+        "reading_a_snapshot_never_rewrites_the_index",
+        "a_restore_that_failed_inside_its_write_loop_never_says_nothing_happened",
+        "a_refused_unstage_wrote_no_part_of_the_index",
+        "a_hook_that_prepends_to_the_message_does_not_fail_the_users_own_commit",
+        "a_worktree_on_a_branch_that_is_not_utf8_still_lists_every_worktree",
+        "a_lossy_branch_label_cannot_act_on_the_branch_it_names",
+        "a_remote_whose_name_contains_a_slash_is_named_the_same_way_by_both_halves",
+        "a_pull_request_fetch_writes_only_its_private_refs_and_proves_the_head",
+        "remotes_report_gits_primary_fetch_and_push_urls",
+        "discard_reports_restored_paths_when_untracked_classification_fails",
+        "discard_blocks_external_staging_under_the_correct_worktree_index_lock",
+        "discard_refuses_foreign_index_lock_and_releases_its_lock_after_path_refusal",
+        "discard_cancelled_after_classification_keeps_files_and_releases_the_index_lock",
+        "mixed_discard_retains_accounting_and_foreign_lock_evidence",
+        "configured_slash_remotes_support_publish_upstream_and_ref_lookup",
+        "slash_path_without_configured_fetch_url_is_not_a_remote_argument",
+        "remote_ref_lookup_requires_the_exact_name_and_retains_tag_object_ids",
+        "ambiguous_push_reconciliation_uses_push_urls_and_git_url_rewrites",
+        "ambiguous_push_requires_the_ref_at_every_configured_push_destination",
+        "ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config",
+        "ambiguous_push_refuses_evidence_from_a_retargeted_push_url",
+        "successful_push_refuses_a_changed_source_oid_and_preserves_first_publish",
+        "sync_uses_configured_remote_branch_with_custom_tracking_aliases",
+        "sync_does_not_push_a_branch_selected_after_the_pull",
+        "git_operation_fetch_sync_and_stashes_round_trip",
+        "git_operation_conflict_detection_resolution_and_abort",
+        "git_operation_history_revert_cherry_pick_and_branch",
+        "git_operation_sync_handles_divergence_rebase_and_conflict_handoff",
+        "git_operation_explicit_merge_parent_and_patch_application",
+        "snapshot_fallback_repairs_external_stash_and_clean_index_merge_state",
+        "stash_drop_refuses_a_stale_selection_after_an_external_push",
+        "deleted_file_unstage_patch_refuses_a_head_that_moved_after_render",
+        "unborn_unstage_patch_refuses_a_commit_created_after_render",
+        "operation_message_prefill_uses_the_repository_comment_policy",
+        "conflict_side_resolution_handles_modify_delete_on_both_sides",
+        "queued_conflict_stage_checks_current_contents_and_binds_explicit_approval",
+        "stash_drop_keeps_reflog_order_and_handles_packed_last_ref",
+        "external_stash_push_cannot_retarget_apply_pop_or_drop",
+        "sync_reports_the_completed_pull_when_the_push_is_rejected",
+        "cancelling_sync_after_pull_reports_the_completed_local_step",
+        "retained_merge_recovery_refuses_a_restarted_operation_with_the_same_incoming_commit",
+        "captured_merge_recovery_survives_staging_conflict_resolution_and_message_edits",
+        "equal_byte_operation_marker_replacement_cannot_reuse_retained_recovery_authority",
+        "both_rebase_backends_reject_previous_step_actions_even_without_head_or_onto_change",
+        "multistep_cherry_pick_and_revert_refuse_recovery_from_the_previous_conflicting_step",
+        "operation_state_serde_roundtrip_loses_authority_but_local_request_clone_keeps_it",
+        "retained_recovery_checks_gits_effective_worktree_and_accepts_explicit_original_root",
+        "unsupported_ref_backend_fault_injection_preserves_changes_and_resolution_without_recovery",
+        "oversized_generated_merge_message_preserves_changes_and_original_recovery_authority"
+      ],
+      "source_predicted_absent_names": []
+    }
+  ],
+  "planned_phase_count": 3,
+  "planned_phase_order": [
+    "compile-ui-repository-git",
+    "inventory-ui-repository-git",
+    "parent-ui-repository-git-all"
+  ],
+  "packet_deadline_seconds": 1230,
+  "phase_caps_sum_seconds": 1230,
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "tool_pin_provenance": "Immutable donor259793 source pins only; actual files are checked by future admitted runner, no source-time installed probe.",
+  "archive_bindings": [
+    {
+      "name": "input-source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/source-binding.json",
+      "sha256": "6f5599bae5de3db7b71f1289663c86d1c16bf74f666fe1ee07c74d5603298319"
+    },
+    {
+      "name": "input-command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/command-data.json",
+      "sha256": "3aeefc138db551fef965a7169b5d7a5606b1c635b9a5a4627f1e98169631bc44"
+    },
+    {
+      "name": "input-current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/current-source-map.json",
+      "sha256": "6c8985d5ceb867d10b2161c789a10cff356d945ffdd31b55e66f770833195dda"
+    },
+    {
+      "name": "source-archive/dependencies/canonical_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_conservation.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4"
+    },
+    {
+      "name": "source-archive/dependencies/canonical_function.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_function.py",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+    },
+    {
+      "name": "source-archive/dependencies/canonical_semantic.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_semantic.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
+    },
+    {
+      "name": "source-archive/dependencies/donor259793-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/donor259793-plan.json",
+      "sha256": "a2f9a7e957dc4aaabc3d48a1f52696ef46d106261f97181b24eaff8fdf4b73c0"
+    },
+    {
+      "name": "source-archive/dependencies/donor259793-run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/donor259793-run-packet.py",
+      "sha256": "76098afc1e030865ef257f62d711ca64690241e10bac2016ae58397ec416c1de"
+    },
+    {
+      "name": "source-archive/dependencies/donor259793-source-conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/donor259793-source-conservation.json",
+      "sha256": "6f5e8ed839f211522a7e967826db129cf2d615425176cd04577a4cf55ea26ab5"
+    },
+    {
+      "name": "source-archive/dependencies/frontend_design.txt",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/frontend_design.txt",
+      "sha256": "d90f59c2bdac2b7335e1463a11cb05dfdbe8fed4351a1178dffa1f2c37ad3288"
+    },
+    {
+      "name": "source-archive/dependencies/product_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/product_freeze.json",
+      "sha256": "355bb01737a5cc7de237594202434a56c1d147794686c1c2da9ffd37095950c9"
+    },
+    {
+      "name": "source-archive/dependencies/product_port_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/product_port_review.json",
+      "sha256": "a0aa7aad48dd56acc6f4cfad10aa638ca618723830a9a7dcc6655963db6267ae"
+    },
+    {
+      "name": "source-archive/dependencies/source_inventory.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/source_inventory.json",
+      "sha256": "e51c3886eb4277d3f83efc5b68a31e16aefcb9d57e7b25e2b453a731eff3a9e9"
+    },
+    {
+      "name": "source-archive/dependencies/tmpdir_design.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/tmpdir_design.json",
+      "sha256": "f2cb4a91babc230308ff67d23c946c05509ffc821ec4ba3109165901a571b5ed"
+    },
+    {
+      "name": "source-archive/product-source/.cargo/config.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/.cargo/config.toml",
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+    },
+    {
+      "name": "source-archive/product-source/Cargo.lock",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/Cargo.lock",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    {
+      "name": "source-archive/product-source/Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/Cargo.toml",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    {
+      "name": "source-archive/product-source/build.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/build.rs",
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+    },
+    {
+      "name": "source-archive/product-source/docs/development.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/docs/development.md",
+      "sha256": "cceaa574be6a5df7c72124add0a3c7cfa3307536fd5fa073c6eea541a6639d11"
+    },
+    {
+      "name": "source-archive/product-source/scripts/qualification/process_custody.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/scripts/qualification/process_custody.py",
+      "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
+    },
+    {
+      "name": "source-archive/product-source/src/fs_safety.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/src/fs_safety.rs",
+      "sha256": "454611aaa94871e2677fce9dd87e8e8e7cef04cafb3b5d1f92fbab6322dd5c35"
+    },
+    {
+      "name": "source-archive/product-source/src/lib.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/src/lib.rs",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+    },
+    {
+      "name": "source-archive/product-source/src/modules.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/src/modules.rs",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+    },
+    {
+      "name": "source-archive/product-source/src/process.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/src/process.rs",
+      "sha256": "0181de1b4c7b3fb10aaa6cc3aeabf06d4d7105ecffd0915f0b4a440be194740e"
+    },
+    {
+      "name": "source-archive/product-source/src/repository.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/src/repository.rs",
+      "sha256": "d598aa218605ff551377afb223408f6af303efef2170a5b18241189868821909"
+    },
+    {
+      "name": "source-archive/product-source/src/repository_operation_witness.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/src/repository_operation_witness.rs",
+      "sha256": "862ae5ab528312ace8d9c5c7e904a94e46bc357b5472dd1c161e55c6bec312eb"
+    },
+    {
+      "name": "source-archive/product-source/src/repository_stash.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/src/repository_stash.rs",
+      "sha256": "c8108db3a4c14333b04b8648ad976ca1cb07fdc377f5b58e949de393b183dde4"
+    },
+    {
+      "name": "source-archive/product-source/tests/repository_git_contract.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/tests/repository_git_contract.rs",
+      "sha256": "58311ecb8fd66f87b4ad27ca7cf168e351da949dc3cbad63287f5da17940c3c6"
+    },
+    {
+      "name": "source-archive/product-source/tests/support/owned_hook_pipe_holder.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/tests/support/owned_hook_pipe_holder.py",
+      "sha256": "87bf22144c5f114e1331686cdd20c01a5fe6ed307270604bc574a41c8cf9c8d3"
+    },
+    {
+      "name": "source-archive/product-source/tests/support/owned_hook_pipe_holder.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/product-source/tests/support/owned_hook_pipe_holder.rs",
+      "sha256": "5c977985b17e34265d7d95a1d462ebcc407df6df72fa7fa21d0bf83f96215ed6"
+    }
+  ],
+  "private_tmpdir": {
+    "parent": "/var/tmp",
+    "maximum_base_filesystem_bytes": 28,
+    "child_environment_key": "TMPDIR",
+    "only_phase": "parent-ui-repository-git-all",
+    "automatic_cleanup": false
+  },
+  "required_absent_environment_names": [
+    "CAGENTS_TEST_PUSH_ALIAS_ENV",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+    "CAGENTS_RETAINED_ACTOR_FIXTURE"
+  ],
+  "runtime_admission": {
+    "state": "PR1269_UI_INTEGRATION_REQUIRES_CURRENT_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "readiness": false,
+  "limits": "One full Linux/UI repository_git_contract target only. Source82 is not actualN or pass credit. No UI-lib queue/sidebar/cache, native UX, perf, Darwin, provider or WHOLE PR qualification. Retain private root, original waits/writers and C/HOLD on uncertainty; no unknown-adopted signals. Successful self-reexec output is hidden/nonadditive. Uncapped original phase log storage and unbounded positive cleanup/HOLD remain limits."
+}

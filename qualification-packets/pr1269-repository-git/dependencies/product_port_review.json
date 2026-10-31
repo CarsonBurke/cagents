@@ -1,0 +1,119 @@
+{
+  "schema": "pr1269.owned-hook-port-context-semantic-review.v1",
+  "verdict": "BOUNDED_PORT_CONTEXT_SOURCE_CLEAR; NO_CURRENT_RUST_REAL_GIT_NATIVE_PASS_OR_EXECUTION_GRANT",
+  "reviewer": "/root/fresh1549_search_cancellation",
+  "independence": "Reviewer proposed source plan and did not author the donor implementation or Root's actual cherry-pick.",
+  "actual": {
+    "head": "c3b6b08ab17dca23848bb768493991784b02065b",
+    "tree": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+    "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+    "donor": "dea70f4bfb8f142c3ff036786a4ee3b5c45ec33d",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-owned-hook-port",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1269-owned-hook-port-source-freeze-v1.json",
+      "sha256": "355bb01737a5cc7de237594202434a56c1d147794686c1c2da9ffd37095950c9",
+      "verified": true
+    },
+    "clean_before_after": true,
+    "changed_paths_sha256": {
+      "tests/repository_git_contract.rs": "58311ecb8fd66f87b4ad27ca7cf168e351da949dc3cbad63287f5da17940c3c6",
+      "tests/support/owned_hook_pipe_holder.rs": "5c977985b17e34265d7d95a1d462ebcc407df6df72fa7fa21d0bf83f96215ed6",
+      "tests/support/owned_hook_pipe_holder.py": "87bf22144c5f114e1331686cdd20c01a5fe6ed307270604bc574a41c8cf9c8d3",
+      "tests/support/test_owned_hook_pipe_holder.py": "f8abf92d9ea9f9a8c8db66f0e9a58a86a56ce29c269d1a71c0dc14fa3df9204f"
+    },
+    "production_module_sha256": "862ae5ab528312ace8d9c5c7e904a94e46bc357b5472dd1c161e55c6bec312eb",
+    "no_production_cargo_config_workflow_script_delta": true
+  },
+  "scope": "Actual donor/helper identity and current consumer ABI/oracle/cleanup integration. Existing Rust guard/Python core source reviews reused at exact helper pins; no repeated whole-helper or semantic witness audit.",
+  "conservation": {
+    "entire_commit_diff": "Exactly four test-only paths; no manual-resolution or new framework delta was found.",
+    "complete_test_file_diff": "Only the cfg(unix) support-module import and the old hook-regression region are changed. Every other current PR1269 witness/full-feature test body is conserved.",
+    "normalized_rest_hash": "fd0023ef2f9f7cef30b9bd8c7dd451c0a003a076d30c9d4a0822e8e87dfae70f",
+    "normalized_rest_method": "From immutable parent42 and actualc3 Git contents, omit only each revision's complete hook-region comment-to-next-discard-comment range; remove only current lines34–37 support import. Both remaining full-file byte streams hash identically. This is a source comparison, not source execution.",
+    "exact_actual_and_donor_consumer_region_hash": "b78a113a6bddb82c33fe88d8e6eac9f162245f7ba6ded4db2c4fd4710e23e7be",
+    "consumer_method": "The complete actual new hook helper/types/three-parent region and donor dea70 region independently produce this same hash.",
+    "donor_helpers": "All three actual support hashes match donor/91a/aeb and the supplied existing review pins exactly. New context does not substitute a hidden helper body.",
+    "full_target": "Original named hook parent is retained; two cleanup parents are added. No existing PR1269 test is ignored, filtered, removed or bypassed by this port. Actual compiled inventory and N remain UNRUN/unknown."
+  },
+  "context_assessment": [
+    {
+      "area": "ABI and build context",
+      "result": "cfg(unix) module path resolves to tracked tests/support Rust; its include_str resolves the matching Python sibling. Holder::start/holding/snapshot/finish calls match existing pub(super) API. Current imports already supply Write, mpsc, thread, Arc, Duration and repository types; serde_json/uuid/libc are existing dependencies. No new dependency/feature graph or production API was introduced. This is source reasoning, not compiler success."
+    },
+    {
+      "area": "Actual hazard",
+      "result": "Real Git executes the generated pre-commit hook and passes its actual distinct stdout/stderr capture writers via SCM_RIGHTS to a directly owned holder outside Git's group. holding and snapshot require the same real writers/cookie and live original holder. No timer or early cleanup releases them before either normal oracle. Scope remains pipe EOF/timeout/lock release, not detached-hook genealogy."
+    },
+    {
+      "area": "Original regression preserved",
+      "result": "Actual service commit command retains2s timeout; result must be TimedOut within60s while the writers remain held. The same original mutation lock must then be reacquired within10s, followed by another held-writer snapshot before finish. Neither a missing Git fixture nor a missing hook handoff can satisfy the new parent."
+    },
+    {
+      "area": "Failure and body conservation",
+      "result": "catch_unwind records the real or deliberately injected oracle failure before cancellation/EOF. The original parent resumes that saved panic; a cleanup-induced late reader return cannot convert it into success. On an otherwise successful oracle, all explicit holder/command/lock cleanup Results must be Ok. No actual hazard assertion was replaced with a canned result or structural-only check."
+    },
+    {
+      "area": "Original settlement and lifetime",
+      "result": "finish acts on the original retained Child/pidfd/control channel; the actual consumer joins the same command and optional lock JoinHandles before returning while Fixture/TempDir remains local. Cleanup deadline branches still join/retain original handles and return sticky Err even after late settlement. Indefinite retained joins/HOLD are not finite teardown success. Helper Drop and rescue rules retain their existing exact reviewed code."
+    },
+    {
+      "area": "Negative cleanup controls",
+      "result": "AfterHandoff and AfterTimeout injections occur only after actual writer handoff, and after actual TimedOut plus held snapshot respectively. Their parent requires cleanup Ok and exactly the saved expected panic payload. The no-handoff parent requires ready original holder followed by successful cooperative finish. Two injection variants remain nested cases, not extra registered test passes."
+    }
+  ],
+  "legacy_and_neighbor_check": {
+    "old_numeric_group_signal": "The literal holder.pid/setsid sleeper/raw Command::new(\"kill\")/kill -9 route is absent from the actual consumer and support leaves.",
+    "scan_exit_code": 1,
+    "scan_stderr_stdout": "",
+    "neighbor": {
+      "path": "tests/support/repository_scale.rs",
+      "sha256": "5cc407ebe3e76f6873b04ebf7de5992a2f22de6f32ed84cba8c65f0d530c429d",
+      "checked_with_wrapper": "tests/repository_scale_contract.rs",
+      "finding": "No same legacy literal pattern found; no fifth file is required for this bounded pattern correction. No scale semantics/runtime clearance claimed."
+    },
+    "resolution": "The specific unsafe legacy hook-fixture source admission blocker in the earlier plan is removed by this reviewed port. This does not grant C or establish complete runtime admission."
+  },
+  "reused_reviews": {
+    "rust_ownership": {
+      "path": "/tmp/owned-hook-pipe-fixture-rust-ownership-review-v4.json",
+      "sha256": "70c7b4e8f54619c1c71717c99985b8c3fc308d72b38fe7fcf137fc236cfcfcce",
+      "matching_support": "5c977985",
+      "scope": "Retained original Child/pidfd, Drop/HOLD/context lifetime and sticky error source delta; all Rust execution UNRUN."
+    },
+    "primary_oracle": {
+      "path": "/tmp/owned-hook-pipe-fixture-primary-oracle-review-v4.json",
+      "sha256": "56155e09a1dac40313199b431ed47f520492a64e4fcf2eb0cf718b2d2bd31380",
+      "matching_current_consumer_region": true,
+      "scope": "Real pipe/timeout/lock oracle, original failure and worker/context preservation; no actual Rust/Git execution."
+    },
+    "python_original_component": {
+      "path": "/tmp/fw16-backend-ec204421/owned-hook-pipe-fixture-component-original-v3.json",
+      "sha256": "4301f8d77513e6d3440352afd3609a501d236d258b69dd77c444dd98f0c44841",
+      "original_metadata_result": "3 parents passed/0 failed; seven malformed frame variants are nonadditive",
+      "source_join": {
+        "freeze": "/tmp/fw16-backend-ec204421/owned-hook-pipe-fixture-source-freeze-v3.json",
+        "freeze_sha256": "bf25ee9c0456619fa8ccb4fbfb8485509b0fbabfd90490661bd4ca46e4bf7063",
+        "python_and_component_test_hashes_match_actual": true
+      },
+      "limit": "Metadata/source join retains historical exact Python component scope only. It is not Rust guard, current target, real Git, new actor, native or C execution evidence."
+    },
+    "ownership": "Root supplied Main15 correction d7511007: donor belongs original EC/backend lineage and there is no incoming writer. This reviewer claims no donor implementation authorship."
+  },
+  "remaining_gates": {
+    "official_format": "Root states Rust1.93 format is running; no result observed or inferred here.",
+    "current_rust_git_native": "UNRUN. Compile the final UI target, obtain fresh actual emitted test inventory, and run the full unfiltered target serially only under a separate real allocation/admission.",
+    "required_three_hook_parents": [
+      "a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock",
+      "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff",
+      "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts"
+    ],
+    "no_count_credit": "The original55 source attributes, historical69 or f92 counts, and Python3 component result are not the current target N or a Rust pass. Inventory must include all preserved current witness/full-feature parents and these cleanup controls.",
+    "environment_and_actor": "Admit real Git, /usr/bin/python3, original wait owner/default reaper, Linux pidfd context and private short physical TMPDIR/socket paths; retain roots/handles through positive settlement. Source review does not probe or establish those premises.",
+    "held_cleanup": "10s observation deadlines followed by retained waits can HOLD indefinitely. Neither late settlement nor rescue can qualify a pass or release the actual lane early.",
+    "qualification_frontend": "The earlier plan's target-specific artifact/inventory/skip enforcement and original-family custody interface gap remains separately owned; this test port is not that packet.",
+    "product_limits": "Existing direct witness-capture cancellation/draft interleaving, UI queue/cache, native/UX/performance gates remain within their earlier source/execution scopes; no broad feature approval or body waiver.",
+    "allocation": "C9995 remains Root16-held; this review supplies no C grant, permission, readiness, publication or merge approval."
+  },
+  "actions": "Only exact Git/source/diff/hash/status and sealed-review reads plus static text normalization/hash analysis and this one task-owned /tmp receipt. No helper import/execution, tests/builds/probes, source/index/ref/worktree/commit/push/GitHub edits, native/provider/process/live-state/account/inbox/meter actions or new worker.",
+  "stopped": "Finite actual port/context source review complete."
+}

@@ -1,0 +1,84 @@
+PR1269 single-integration-target frontend — bounded SOURCE EDIT DESIGN ONLY
+Not an adapter, command packet, controller CLEAR, execution permission or C grant. No code edits/imports/builds/tests/runtime/probes were performed. Root implementation follows the separately frozen/reviewed47 accounting successor; this design itself binds only immutable579, not the changing controller worktree.
+
+Inputs actually read
+Controller579f9a58eee6561f6f7317284091b99f72172281/tree4f1ddf27876c3ca9e77ebfb1b24070e83fd85f3f:
+ qualification-packets/startup30/run-packet.py SHAec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f
+ plan.json46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043
+ command-data.json18fd276bdb8496587cb21de0f03a52f1c1afc54fb54918e391f4cfe00b439355
+ source-binding.json92b313f6588178d976332f00fb6dbec93c776d14cc2e77347e492332c2a5c929
+ execution-template.jsona08d481eca67e4601ec47f23e4ef69380d6c5fea31fdca467b4e5f3635744869
+ manifest.json88b3efed78a640f0c071cb1dd50a9e1352550c65c5568ab9b320eb9cd258b122
+The working controller was observed changing during planning; its later count-wrapper/template reads are not mixed into these immutable pins. Root explicitly accepted this immutable basis and the need for an honest one-invocation qualification predicate.
+
+Productc3b6b08ab17dca23848bb768493991784b02065b/tree90f4b5802add402c86fbfe7015d0cc67674d37b6 in .worktrees/fw16-pr1269-owned-hook-port:
+ current test58311ecb8fd66f87b4ad27ca7cf168e351da949dc3cbad63287f5da17940c3c6
+ module862ae5ab528312ace8d9c5c7e904a94e46bc357b5472dd1c161e55c6bec312eb
+ custody helper scripts/qualification/process_custody.pyd9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9
+Prior source plan86bcfb2f9f999bdf4dd921e941c7f664c8515377dfbec82a243f1866dca0ab48 and actual port-context reviewa0aa7aad48dd56acc6f4cfad10aa638ca618723830a9a7dcc6655963db6267ae remain their stated scopes. Owned hook source is not re-audited here.
+
+Minimal architecture
+Specialize the existing Root C packet in a separately owned task path/branch, retaining one supervisor and its original evidence/C-release machinery. No new generic engine, lib target, HOST helper, native run or production changes. This is NOT achievable through JSON-only edits: several existing task functions and one final task qualification predicate contain three-library assumptions. Change those explicitly; do not fake three rows or silently widen a byte-conservation claim.
+
+Concrete source diff design, anchored at frozen579
+1. Constants and main844–1055: retarget WT/PLAN/PLAN_SHA/runner path and validated product tuple to exactc3; replace the startup52/Agent47/User5 joins with genuine PR1269 actual-merge/port/source-review joins. Preserve the same external grant/runner/controller-review argument ABI and independent receipt gate364–369. Data requires product_pr1269, exactc3 parent42/tree90f4, readinessfalse, helper_buildnull, runtime fieldsnull and one isolated features[ui] graph. Do not turn the old startup classification into a PR1269 approval.
+2. cargo_test_artifact249–268: change only the admitted target identity from root cagents/lib to repository_git_contract/test with manifestCargo.toml, source pathtests/repository_git_contract.rs and features exactly[ui]. Keep exactly one successful build-finished, exactly one matching artifact, profile.testtrue and original Cargo metadata/fresh field. This task-only parser specialization is a small explicit ABI delta, not a new general selector registry.
+3. grouped_contracts477–492: build ONE contract from the entire freshly validated ordinary test inventory. names=all actual ordinary names; filters=[]; exactfalse; actual_inventory_N=len(actual); expected_filtered_out0. Require no benchmark/duplicate/ignored target identity and exact source-pinned Linux membership. Do not enumerate82 filters or use--exact.
+4. execute_contracts566–662: retain the existing compile→Cargo artifact→no-follow ELF observation→inventory→before/after ELF identity→original run→strict result/evidence sequence. Change only target parsing and whole-target argv construction. Keep one artifact group and one parent-prefixed execution label, e.g. ui-repository-git / parent-ui-repository-git-all. Use the exact vectors below; no additional list/run attempt or per-parent invocation.
+5. Result enforcement: reuse grouped_result495–563 for strict original outer stdout and full-name/footer accounting. It already supports a general count and can validate the full actualN with filtered0. Add a narrow PR1269 fixture-premise observer over the retained ORIGINAL stdout and stderr, refusing any source-defined skip messages. Reconcile the same original stderr hash/observer again during final raw accounting. Do not count the two deliberate caught hook panics as failed outer tests or erase them; libtest outer exit/completions/footer and the fixture's assertions determine their result.
+6. parent_accounting689–781: replace the three hardcoded expected labels, <=3 bound, qualified-row==3, 9-phase count and three requested/unrun invocation arithmetic with this validated task's ONE label / THREE phases / ONE invocation. Replace declared30 with the source-declared82 contract, separately from discovered actualN. Preserve raw stdout hash reread, original-state/exit evidence, earlier parsed record reconciliation, null/unknown counts, semantic-refusal handling and nonadditive child semantics. Merely wrapping the old return's declared count is insufficient: its internal label and three-row requirements would still refuse the real single invocation. An explicit small task-accounting parameter or narrow literal specialization is acceptable; no fake rows, test waits or observed counts.
+7. The one final owning_commands_qualified predicate at1281 must change explicitly from len(tests)==3 plus the three startup labels to len(tests)==1 plus the single new label, retaining every original error/cancellation/raw-semantics/phase-order/actual-release condition. This is an irreducible task-only protected-tail exception. Keep the lease open/flock, original wait/evidence/custody predicates, canonical unsignaled settle_children9004..., HOLD paths, no-LOCK_UN close, uncertain-close no-retry, summary ledger/hashmanifest, compact output and return rule otherwise intact. Do not claim the entire old3790-byte suffix is unchanged.
+8. Refuse preexisting fixture-only markers/scheduler inputs using the existing name-only admission style; in particular the self-reexec CAGENTS_TEST_PUSH_ALIAS_ENV must not be preseeded by the outer actor. Preserve opaque inherited CAGENTS authority/context/HOME. Do not introduce User-only absence gates or rewrite identity/environment to make a fixture pass.
+
+Only three workload phase vectors
+compile-ui-repository-git:
+ [physical admitted1.93 cargo, "test","--locked","--no-default-features","--features","ui","--test","repository_git_contract","--no-run","--message-format=json"]
+inventory-ui-repository-git:
+ [EXE_FROM_THAT_CARGO_JSON,"--list","--color=never"]
+parent-ui-repository-git-all:
+ [SAME_EXE,"--test-threads=1","--nocapture","--format=pretty","--color=never"]
+
+Use the existing list format: inventory_names271 expects ordinary named rows and the actual total footer. Do not switch to a new terse/list parser or guessed target/debug/deps path. No--lib, HOST graph, helper binary build, --exact, filters, --ignored, --skip or Cargo re-execution is needed. The full test executes once. A new task budget must name finite compile/list/full-run caps whose sum fits its actual grant; the old9-phase2310/2400 arithmetic and UI40 duration are not measurements for this target. No warmth/fit/availability was probed.
+
+--nocapture is deliberate for this target: two fixture branches print skipping messages then return ok, so a footer alone can conceal missing Git/permission premises. Reject "skipping: git is not available on PATH" and "skipping: this user writes into a directory with no write bit" (including the source's punctuation/backticks), or any other identified source-supported fixture skip. Current direct test output sites are these stderr messages; unknown/interleaved stdout remains a strict parser refusal, not discarded noise. Preserve original stderr and deliberate cleanup-injection panic diagnostics separately; never concatenate child/outer result streams or accept a partial failure dump as a pass.
+
+Truthful parent data/accounting
+Static source inspection finds80 existing #[test] attributes at42 and82 atc3. The two additions are:
+ owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff
+ owned_hook_pipe_holder_settles_when_no_hook_handoff_starts
+The original a_hook_that_backgrounds_a_pipe_holder_still_releases_the_mutation_lock remains one of80 with its corrected body. Keep the complete source-required Linux name set and all nine witness suffix parents/full feature parents from the prior plan; the backend/refbase tests are not replaced by only these two additions.
+
+Record source_predicted_parent_count82 and the80+2 origin classification as predictions only. Before listing, actual_inventory_N and discovered names staynull. At listing, record actualN and complete names from THIS executable and require exact appropriate Linux membership against the frozen source contract; unexpected/missing names cause review/refusal, not count rewriting. Contract/running/completions/footer must use that same actualN. One success is ONE original test invocation with actualN logical unique outer parents, actualN passed/0failed/0ignored/0measured/0filtered; no per-name wait receipts are fabricated. On compile/inventory failure, discovered/qualified counts remain unknown/zero as actually observed, never82passed.
+
+The ambiguous_push_resolves_chained_rewrites_once_and_preserves_inherited_config parent self-reexecs its own binary with --exact and an intentionally child-local marker/config environment, then asserts the child result. That child result is NONADDITIVE; source/helper assertion scope is not a second qualified target invocation or83rd parent. Similarly the hook failure parent has two nested injections, and Python malformed cases are nested. Preserve the full original opaque child behavior; no extra runner launch is needed and successful child stdout is not invented as an archived outer stream.
+
+Data files to specialize, not append an unrelated framework
+plan.json and command-data.json: exactc3 product/worktree/parents, one target identity/compile argv, three phase labels/caps, source-required82 names and origin classes, featureui, no lib groups or helper_build, source predictions separated from all-null actuals, existing target/new_cachefalse and actual tool pins. Keep only relevant complete source/fixture/build input bindings and genuine source-seal dependencies.
+source-binding.json: original PR1269 actualmerge/port/conservation reviews and exact file hashes, not renamed startup52 receipts. Archive actual old reports unchanged; do not fabricate a nonauthor review of the new controller.
+execution-template.json: existing isolated12argv ABI may remain, with NEW exact runner hash/path/cwd and null grant/review slots until genuinely supplied. Do not copy579/47's actual review tuple or reuse a prior C message.
+manifest.json/archive bindings: regenerate honestly for the new exact source/data/runner/dependencies, preserving earlier scopes and complete captured bytes. Any revised source policy/helper import needs fresh explicit hashes. The new independent controller receipt must bind head/tree/runnerSHA/planSHA with the actual required verdict; this design is not that receipt.
+
+Inherited authority, TMPDIR and owned Linux helper
+Root47 main997 copies inherited env and overrides only compiler/target/jobs/PATH entries; context1031–1054 does NOT bind TMPDIR. Dormant invoke_fixture_group1156 admits only CAGENTS_TEST_RETAINED_ACTOR_HELPER. It is not a permission to set TMPDIR or scrub variables. Keep helper_buildnull and do not invoke that HOST helper path.
+
+Add only a read-only task-specific admission/binding for the already permitted INHERITED effective temp root, and include its unchanged path/physical directory identity/mode/ownership plus relevant ordinary environment identity in before/after context. Verify no symlink/relative/.. ancestor or Git ancestry and that this task's final fixture Unix socket path is short enough; the source helper appends hook-writers.sock below a private tempfile directory. Do not assume unset→/tmp is approved or that a short base proves the final byte length. This planning run inspected no environment/path.
+
+If no already-admitted inherited root meets those premises, REFUSE this task. Current579 has no approved TMPDIR override/creation/restoration ABI. Creating a new root and adding/replacing TMPDIR would require its own explicit narrow source/admission exception and independent review BEFORE a fresh grant; it must not be smuggled in as a compiler override or a generic environment cleanup. Do not change HOME, clear CAGENTS authority, remove enclosing Git markers, auto-select another runtime root or bypass socket limits.
+
+The ported Rust helper already owns its /usr/bin/python3 child/control/status/pidfd and keeps actual pipe FDs alive until explicit settlement. Parent fixture/worker joins and HOLD ownership remain as reviewed; no new wrapper actor is required. Bind the helper's exact Rust/Python source and the existing current actor/tool assumptions, with inherited opaque authority copied untouched. External Python/Git path/environment prerequisites must be admitted or refused, never reset to manufacture success. Actual privilege/write-bit discrimination and all original fd/wait settlement remain runtime premises.
+
+This packet is Linux-only: Root runner uses /proc, prctl subreaper, original pidfds and ELF observation. Its receipts cannot qualify Darwin/non-Linux Holder fallback, macOS native behavior or a different reaper/actor. No unsupported fakecfg, account switch, namespace migration or portability shim is proposed.
+
+Existing process_custody.py — reuse boundary, not a second supervisor
+The current helper exposes Custody.launch/capture/snapshot/settle_all/close_pidfds, bounded original-new-child tracking, and explicit incomplete-result retention. Root47 already has its own single original-Popen ledger/direct-pidfd wait/canonical UNSIGNALED orphan HOLD. Dropping a second Custody into run would change wait ownership and ledger/schema semantics; capture has no env argument while launch accepts one, and its result/settlement shape is not the Root phase record. It also must not turn newly adopted unknown survivors into forced-clean C release.
+
+For the minimal frontend, keep Root47 as sole phase supervisor and the already reviewed owned fixture as sole owner of its helper. Reuse process_custody's existing original-child interface/constraints as the maintained source reference where needed; no import or replacement is required merely to select an integration artifact. If Root instead requires that class to become the actual phase launcher, an adapter for BOTH source captures and phase launches plus original ledger/final-custody reconciliation is a genuinely larger custody ABI change, outside this minimal plan and requiring its own review. Do not claim that switch is a data-only frontend edit or quietly replace canonicalsettler9004.
+
+Irreducible gaps / implementation preconditions
+- Data-only/main-only reuse cannot honestly bypass the hardcoded lib artifact and three-invocation accounting/final predicate. The narrow task semantic changes above must be explicitly reviewed.
+- No approved short-root override seam exists at579; inherited root admission can succeed or refuse, not manufacture a new environment grant.
+- --nocapture/skip and one-full-target raw accounting need source-specific semantics; old library result/parser assumptions alone do not prove fixture bodies ran.
+- The current47 accounting successor is not frozen by this document. Rebase the design onto its actual reviewed successor while preserving the already corrected declared field, then freeze/hash/review the new PR1269 task.
+- All C/current environment/resources/tool availability, compilation, actual inventoryN, Rust/Git/native results and release remain unobserved/UNRUN here. No lib/HOST/native scope is added and existing separate queue/cache/cancellation/native gaps remain separate. Root's existing held allocation or prior accepted return is not a PR1269 grant.
+
+Only one task-owned design text was written. No adapter/code/data packet source was edited or imported/executed; no build/test/helper/runtime/process/target/lock/environment/account/provider/inbox/GitHub action or new worker.

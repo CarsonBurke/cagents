@@ -1,0 +1,120 @@
+{
+  "kind": "AUTHOR_STATIC_SOURCE_CONSERVATION_NOT_REVIEW_OR_EXECUTION",
+  "donor": {
+    "head": "25979306f6b70db86d1aeb95df2b9cbe8f4758a2",
+    "tree": "61c4dbfb92556b863f37b65616e14551f00b3303",
+    "runner_sha256": "76098afc1e030865ef257f62d711ca64690241e10bac2016ae58397ec416c1de",
+    "snapshot": "dependencies/donor259793-run-packet.py"
+  },
+  "runner_sha256": "0cae9539cd658f2fe5cf0e5f05518bd1545803ad0e31a29b502a901ea584b10f",
+  "plan_sha256": "bf5397a92aa14d50daf2f6d34a4a8c024c433f12cc628d2662fea11b94e21596",
+  "original_top_functions": 32,
+  "current_top_functions": 35,
+  "changed_functions": [
+    "cargo_test_artifact",
+    "execute_contracts",
+    "grouped_contracts",
+    "main",
+    "parent_accounting"
+  ],
+  "added_task_functions": [
+    "task_fixture_premises",
+    "task_private_tmpdir",
+    "task_tmpdir_observation"
+  ],
+  "unchanged_original_top_function_count": 27,
+  "unchanged_original_top_function_sha256": {
+    "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+    "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+    "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+    "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+    "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+    "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+    "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+    "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+    "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+    "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+    "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+    "settle_children": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+    "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+    "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+    "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad",
+    "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+    "cargo_helper_artifact": "cce4fa0819e7ce38157c45c4d8eb40df7e154d6d2fa94f3e39dfea52bd0d2712",
+    "task_elf_observation": "3cd165b37eb78c86f9bf35fe2ed7eef1401f073c3b166512763f6a7af75e2814",
+    "task_group_assets": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4",
+    "grouped_result": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115",
+    "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+    "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+    "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+    "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+    "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+    "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9"
+  },
+  "changed_function_sha256": {
+    "main": "5ab5e2130abec47d58ced9e3d0467ff2f52b19dbab9a95c2dfda514b8edb1f6e",
+    "grouped_contracts": "599d34091af403c15985a65f4159657ed04483c4b0fc45455546f4aabe6e1278",
+    "cargo_test_artifact": "eed3ab68a39f25af59e1afe5c6f1cd44f74d9204dc94fb49f9b246a309af639b",
+    "parent_accounting": "b97bef860f9ca2506f24fbd97d9585961d153ddd5685c4f2718d396e32604013",
+    "execute_contracts": "bc85b6f5320b765fcdf8592a78423c9eef569a64adb6b992181230d8df0cc8d5"
+  },
+  "added_task_function_sha256": {
+    "task_fixture_premises": "ed0324d9bef5f2857e4a116d2cf9d4d28928402ca76dec74ece440b59dc3cb26",
+    "task_tmpdir_observation": "3e0e1d69fa39ae69bbab5700dbd70fc3a3ced00046a1cafb47bd12a978d45a4b",
+    "task_private_tmpdir": "9244347ac852d5b388b494eacdb1b7585df72ed3fc8eeca3fecbffb6e783793b"
+  },
+  "unchanged_nested_main_functions": {
+    "read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
+    "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711",
+    "invoke_fixture_group": "288e08759f96075a6a091c01f6626016f8ff55fda5a2033cf58c6d31537493f4"
+  },
+  "changed_nested_main_functions": {
+    "context": "7c66eb717bb2af10488bae0b60af118fdc475205cc73d42934796f5064e48057",
+    "run": "061a9dd2b4380c942942d3906600a99f912fed52441e36f9d3eb4528f2d2d986"
+  },
+  "nested_run_exception": "Only branch-local env.copy()+TMPDIR for one full-test phase, command metadata, Popen env=phase_env. Removing these exact seams reconstructs original nested run. All original waits/timeout/held pidfd/direct cleanup/evidence logic unchanged.",
+  "nested_context_exception": "Bind ordinary TMPDIR/Git/Python environment hashes and original owned root identity; root uncertainty is sticky supervision failure/HOLD. Opaque CAGENTS values not accessed/hashed/serialized.",
+  "protected3790": {
+    "byte_exact": true,
+    "bytes": 3790,
+    "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4"
+  },
+  "canonical9004_exact": true,
+  "strict_grouped_result_exact": true,
+  "original_imports_exact": true,
+  "summary_exceptions": [
+    "single task label in existing owning-qualification predicate",
+    "task-only qualified scope/non-WHOLE field/kind",
+    "declared source82 and discovered actualN compact count fields"
+  ],
+  "source_predicted_parent_count": 82,
+  "actual_inventory_N": null,
+  "requested_original_test_invocations": 1,
+  "requested_phases": 3,
+  "bounds_seconds": [
+    600,
+    30,
+    600
+  ],
+  "packet_absolute_seconds": 1230,
+  "private_TMPDIR": {
+    "parent": "/var/tmp",
+    "maximum_base_filesystem_bytes": 28,
+    "child_environment_key": "TMPDIR",
+    "only_phase": "parent-ui-repository-git-all",
+    "automatic_cleanup": false
+  },
+  "raw_stdout_and_stderr_final_hash_reconciliation": true,
+  "source_skip_observer_original_streams_only": true,
+  "source_pin_count": 16,
+  "runtime_archive_count": 30,
+  "original_authored_utility_failure": {
+    "tool_chunk": "70e0f7",
+    "scope": "Source generator referenced nonexistent guessed src/cancellation.rs; Git source read refused before live runner was written. Corrected source input to actual src/process.rs. No candidate/extracted function call, execution or runtime effects occurred."
+  },
+  "candidate_execution_import_call_tests_build_probes": "NONE",
+  "actual_grant": null,
+  "current_nonauthor_review": null,
+  "queueable": false
+}

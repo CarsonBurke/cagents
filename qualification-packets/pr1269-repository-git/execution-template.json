@@ -1,0 +1,30 @@
+{
+  "kind": "TEMPLATE_NOT_SUBMITTABLE_REQUIRES_GENUINE_CURRENT_REVIEW_AND_ROOT_GRANT",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "0cae9539cd658f2fe5cf0e5f05518bd1545803ad0e31a29b502a901ea584b10f",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source",
+  "actual_grant": null,
+  "actual_independent_current_review": null,
+  "execution": "UNRUN",
+  "required_existing_controller_review_ABI": {
+    "verdict": "CONTROLLER_SOURCE_CLEAR",
+    "head": "c3b6b08ab17dca23848bb768493991784b02065b",
+    "tree": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+    "runner_sha256": "0cae9539cd658f2fe5cf0e5f05518bd1545803ad0e31a29b502a901ea584b10f",
+    "plan_sha256": "bf5397a92aa14d50daf2f6d34a4a8c024c433f12cc628d2662fea11b94e21596",
+    "scope": "Required future genuine record shape only, not an authored approval."
+  },
+  "scope": "One whole Linux/UI repository_git_contract invocation only, no native/WHOLE PR qualification. Fresh grant explicitly covers fixed /var/tmp root creation and one full-test child TMPDIR exception; no old allocation transfers."
+}
