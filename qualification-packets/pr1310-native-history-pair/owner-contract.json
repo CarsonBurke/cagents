@@ -278,7 +278,7 @@
       "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01"
     }
   },
-  "native_owner_sha256": "a5b1dff85e6f6e02b0181468a78b98ed6d89cf02a2a49a5b9ef60fda4424262d",
+  "native_owner_sha256": "24694638becae5dbaeffa796212fed8a6668869d48664b5da1b0dc4109da16e8",
   "physical_evidence_successor": {
     "C_boundary": "ABSENT_EXTERNAL/HOLD: original entry-owned C descriptor is not supplied to this library. No number/JSON/closed flag establishes C ownership, acquisition, release or acceptance.",
     "acquisitions": "Every locally returned regular/input/raw FD is retained before metadata; prepare root_fd keeps its EXISTING one _retain_raw record. Final-census opens are additional distinct real acquisitions. Original FD numbers remain recorded after published-node pop. Any attempted/returned/ambiguous close is sticky; no double close/numeric retry. Memory snapshots survive negative paths.",

@@ -376,10 +376,10 @@ class NativeHistoryOwner:
         self._remaining(cleanup=cleanup)
         require(not self.cancelled() and not self.custody.closed,
                 "Cancellation/closure refuses new workload")
+        require(self.final_no_more_work is None, "final no-more-work barrier refuses launch")
         number = len(self.custody.direct)
         stdout = self._new_file(self.root / f"process-{number}-{name}.stdout", cleanup=cleanup)
         stderr = self._new_file(self.root / f"process-{number}-{name}.stderr", cleanup=cleanup)
-        require(self.final_no_more_work is None, "final no-more-work barrier refuses launch")
         command = list(argv)
         arguments = {"cwd": str(self.root), "close_fds": True, "stdin": subprocess.DEVNULL,
                      "env": environment, "stdout": stdout["fd"], "stderr": stderr["fd"], "pass_fds": pass_fds}
