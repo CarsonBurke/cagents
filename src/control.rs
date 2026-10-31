@@ -4403,11 +4403,8 @@ mod tests {
     fn channel_spawn_opens_the_project_then_creates_the_channel_it_minted() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let peer_proof = proof("session", "boot", "incarnation");
-        // No usable `git` means there is no key to derive and nothing this test
-        // can assert. Every lane that runs it has one.
-        let Some(checkout) = git_checkout() else {
-            return;
-        };
+        let checkout = git_checkout()
+            .expect("the channel-spawn success contract requires a usable Git checkout");
         let repository = checkout.path().to_path_buf();
         // The common Git directory, which is what a window stores for a project
         // and therefore what the channel has to be keyed on.
