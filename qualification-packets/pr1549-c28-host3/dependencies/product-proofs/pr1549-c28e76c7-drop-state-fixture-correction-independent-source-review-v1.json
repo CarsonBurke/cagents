@@ -1,0 +1,136 @@
+{
+  "correctness_conclusion": "Both reported E0509 causes are removed at source. Assignments have the same directly constrained field types and values as former intended initializers; no additional type/API issue is evident in this finite delta. This is source inspection, not type checking. Production, all assertions, unchanged-generation positive controls and generation-replacement negative controls are preserved.",
+  "findings": [],
+  "fixture_equivalence": [
+    {
+      "new_initialization_lines": [
+        856,
+        860
+      ],
+      "proof": "State derives Default and Options derives Default. Initializing full State then assigning root, generation41, options.query=needle and error=original error preserves old explicit values and every other default field. No fields are moved out of a temporary Drop type; production Drop remains untouched.",
+      "selector": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering"
+    },
+    {
+      "new_initialization_lines": [
+        924,
+        935
+      ],
+      "proof": "Initializes full default State then assigns the same root, generation41 and identical single Match (original.rs, line0, column0, length3, identity hit, snippet hit, highlight0..3). Options/cancel/error/other fields retain previous defaults. No move out of temporary State occurs.",
+      "selector": "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches"
+    }
+  ],
+  "freeze": {
+    "all_18_pins_verified": true,
+    "metadata_v3": "Verified exact v3 metadata correction; no formatter invocation repeated.",
+    "path": "/tmp/fw16-backend-ec204421/pr1549-current-main-search-source-freeze-v3.json",
+    "sha256": "9c4361dead8b82c4f07aa076265fadbb800880814a5ba10bb3b97d50c10044b7"
+  },
+  "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "limits": {
+    "compilation_tests_inventory_native_current_head": "ALL UNRUN by reviewer; no current-head execution result consumed.",
+    "format": "Root freeze v3 reports official physical1.93 scripts/check-format original96536/final29ce02 EXIT0 and diff0f3a4c EXIT0; not rerun.",
+    "readiness": "No native UX/screenshot/performance/whole-PR readiness or execution grant; fresh owning compilation and tests remain necessary at frozen corrected source.",
+    "review_operations": "Immutable source/Git-tree reads and stdlib text/hash comparison only; no edits, candidate import/evaluation, compiler/test/build/native, process/environment/authority/account/resource probe, new worker or public write."
+  },
+  "original_negative_preserved": {
+    "evidence_owner": "Root acceptance of independent RAW and actual executor return; this reviewer did not re-audit RAW or execute candidate",
+    "outcome": "UI bin check0, cfg(test) UI library compile101, exactly9 E0509 at the two State struct-update sites; all3 selected UI bodies and inventory/N UNRUN",
+    "path": "/tmp/fw16-backend-ec204421/pr1549-b7df772a-negative-ui3-root-acceptance-v1.json",
+    "sha256": "8dd3a2e63b3a6d15e2382cb7805de1556f8e445e1a0f704b9fd2305353121668",
+    "tested_head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "transfer": "No previous result relabeled a current-head runtime result."
+  },
+  "parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+  "prior_assembly_review": {
+    "path": "/tmp/pr1549-9e63cde8-current-main-assembly-independent-source-review-v2.json",
+    "retained_result": "9e63 blocked by inherited cfg(test) E0509; no new merge-specific source blocker",
+    "sha256": "0e3ce65315608c7c524e08eedce80dce75933c93f29cc77923b9bad0b26ca5c4"
+  },
+  "prospective_owning_oracles": {
+    "HOST3": [
+      {
+        "definition_line": 951,
+        "path": "src/git_watch.rs",
+        "selector": "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 983,
+        "path": "src/git_watch.rs",
+        "selector": "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 1572,
+        "path": "src/git_watch.rs",
+        "selector": "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory",
+        "status": "SOURCE_PRESENT_UNRUN"
+      }
+    ],
+    "UI4": [
+      {
+        "definition_line": 1232,
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 1345,
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 849,
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+        "status": "SOURCE_PRESENT_UNRUN"
+      },
+      {
+        "definition_line": 917,
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+        "status": "SOURCE_PRESENT_UNRUN"
+      }
+    ],
+    "status": "DATA ONLY; source names verified, no invocation or admission grant",
+    "why_existing_result_gesture_included": "Second actual cfg(test) failure site is corrected; successful compilation alone would not exercise its held-press/fresh-press controls."
+  },
+  "result": "BOUNDED_SOURCE_CLEAR_KNOWN_E0509_CAUSE_REMOVED_NO_NEW_DELTA_BLOCKER",
+  "reviewer": "/root/1954_directory_durability_bound",
+  "schema": "pr1549_c28e76c7_drop_state_fixture_correction_independent_source_review_v1",
+  "scope": "Only two State test fixture initializers changed from inherited compile-negative main assembly. Reuses prior merge/source reviews; no compiler success or feature readiness claim.",
+  "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+  "verified_conservation": {
+    "all_other_test_bytes_including_assertions_and_control_branches_exact_parent": true,
+    "all_other_tree_entries_exact_parent_modes_types_blobs": 2222,
+    "all_production_bytes_exact_parent": true,
+    "changed_mode": "100644 unchanged",
+    "changed_path_only": "src/app/search_ui.rs",
+    "exact_diff_sha256": "b4834f07bac8bc08a9523997c911b668dc32f0c0d59c63ea4470a8ae5584bd9b",
+    "no_State_struct_update_Default_remaining_in_leaf": true,
+    "numstat": {
+      "deletions": 24,
+      "insertions": 17
+    },
+    "outside_18_feature_entries_exact_main": 2205,
+    "production_prefix_sha256": "68cfbcbb3145a1be0f7e3c19b7048bbd2bbcb375e31efd217e7ab130388fe39d",
+    "reconstructed_parent_leaf_sha256": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+    "source_pins": {
+      "src/app/search_ui.rs": {
+        "blob": "812b30fb212924f19957cb42b8d5ce359dd7da37",
+        "sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534"
+      },
+      "src/git_watch.rs": {
+        "blob": "6dad4e31b2b6aa249c7249182d480a15d480af39",
+        "sha256": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8"
+      },
+      "src/project_search.rs": {
+        "blob": "57d7b18422355dbce3d36afdaeda1587f410b520",
+        "sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6"
+      }
+    },
+    "two_setup_reverse_reconstruction_yields_exact_parent_leaf": true
+  },
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main"
+}

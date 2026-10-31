@@ -1,0 +1,28 @@
+{
+  "schema": "pr1549_c28_current_main_reviewed_source_publication_v1",
+  "utc": "2026-10-31T15:33:22.047226+00:00",
+  "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+  "source_adoption": {
+    "path": "/tmp/fw16-backend-ec204421/pr1549-c28-current-main-root-source-adoption-v1.json",
+    "sha256": "36686d074bef22212398582de92ed3aab456713d5f1584e4c90179e0ac547a2a"
+  },
+  "separate_branch": {
+    "branch": "fix/fw16-pr1549-search-current-main",
+    "start": "ac9ad2",
+    "original_session": 67440,
+    "final": "06556b",
+    "exit": 0
+  },
+  "existing_PR_fastforward": {
+    "pr": 1549,
+    "branch": "fix/trashbear-project-content-search-1120",
+    "before": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "start": "d82cb6",
+    "original_session": 95771,
+    "final": "c95fab",
+    "exit": 0,
+    "supported_GitHub_PR_readback": "exactc28,stillDraft"
+  },
+  "scope": "NormalnonforceGitsourcewritesonly; noPRmetadata/rejectedtoolretry/ready/merge/CIpass. Updatedmaincomposition andtwoE0509testsetups, threescopedindependentreviewsclear/officialformatdiff0. CurrentheadallRustchecks/7ordinaryparents/nativeUX/WebPs/performanceUNRUN; oldee7HOST2positive/UI3negative preservedanddistinct. Cnocurrentlease afteracceptedb7dfnegative; no newgrant fromthisrecord."
+}

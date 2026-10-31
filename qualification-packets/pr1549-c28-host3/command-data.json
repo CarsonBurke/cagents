@@ -1,0 +1,157 @@
+{
+  "schema": "pr1549-c28-host3-controller-task-data-v1",
+  "product_PR_reference": 1549,
+  "boundary": "host",
+  "source": {
+    "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+    "parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main"
+  },
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "selected_names": [
+    "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+    "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+    "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory"
+  ],
+  "selected_parents": [
+    {
+      "name": "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+      "source": "src/git_watch.rs",
+      "source_sha256": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8",
+      "line": 951,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "0d9d07e5de091a664e8d1bd596d49d051f45d95bac78a2e37aa54f457633a36b",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+      "source": "src/git_watch.rs",
+      "source_sha256": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8",
+      "line": 983,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "11a40dace6df76cd1a75d5df2f0c52277d9433ccbd800a4f79d42ce992fb6f68",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory",
+      "source": "src/git_watch.rs",
+      "source_sha256": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8",
+      "line": 1572,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "d64e685cea3553e944b6a262a7f8785e0a3a13497059983f2a7a8fff8d10ff7a",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "host-lib",
+      "features": [
+        "host"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+        "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+        "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "host-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "seconds": 600
+    }
+  ],
+  "planned_phase_order": [
+    "host-binary-check",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-1",
+    "parent-host-lib-2",
+    "parent-host-lib-3"
+  ],
+  "runtime_admission": {
+    "state": "PR1549_C28_HOST3_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  }
+}

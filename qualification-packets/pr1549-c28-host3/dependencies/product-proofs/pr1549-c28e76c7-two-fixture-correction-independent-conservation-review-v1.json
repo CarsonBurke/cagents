@@ -1,0 +1,125 @@
+{
+  "assertion_and_source_conservation": [
+    "Within both changed parent functions, all source before the setup and from the first control/row construction to the function end is byte-identical. This includes both replacefalse/true branches, renderer/layout/event calls, original press/refusal, ordinary-rerender positive control, fresh-replacement press and exact resulting action assertions.",
+    "All nine search test names/order remain; the other seven parent function bodies and every production/helper byte are exact9e63. Replacing only the two new setup regions with the old regions reconstructs the entire parent source byte-for-byte.",
+    "All2222 other tracked entries retain exact9e63 mode/type/blob; the other17 feature leaves are exact9e63, and all2205 entries outside18 retain exact publicmain442. The reviewed merge union, main/feature joins, workflow/config, permissions/proof/native/quarantine/Seed/1749 source conservation is therefore unchanged."
+  ],
+  "delta": {
+    "all2205_outside18_entries_exact_main442": true,
+    "all9_test_names_and_order_exact": true,
+    "all_other2222_entries_modes_types_blobs_exact9e63": true,
+    "all_production_bytes_before_cfg_test_module_exact9e63": true,
+    "deletions": 24,
+    "entire_in_memory_inverse_reconstructs_9e63_source": true,
+    "entry": {
+      "mode": "100644",
+      "oid": "812b30fb212924f19957cb42b8d5ce359dd7da37",
+      "type": "blob"
+    },
+    "insertions": 17,
+    "only_two_setup_regions_changed": true,
+    "other17_feature_paths_exact9e63": true,
+    "other7_parent_function_bodies_exact9e63": true,
+    "parent_sha256": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+    "path": "src/app/search_ui.rs",
+    "sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534"
+  },
+  "fixtures": [
+    {
+      "all_prefix_and_suffix_assertions_branches_widget_and_scope_bytes_exact": true,
+      "assigned_fields": [
+        "root",
+        "generation",
+        "options.query",
+        "error"
+      ],
+      "current_function_body_sha256": "f8caefe48421686b0ec14fcf0e34f53285a875f452562529e4a7f17149c82788",
+      "name": "retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "new_line": 849,
+      "new_setup_sha256": "14c14916dd053c16e7d1e5e39d0068c17bc505e0b71d7c83d36195266a10c5a6",
+      "old_line": 849,
+      "old_setup_sha256": "b2d151a1c131c14c40c749048cc91c4249019b7bb805885e899ad3bb2b77d599"
+    },
+    {
+      "all_prefix_and_suffix_assertions_branches_widget_and_scope_bytes_exact": true,
+      "assigned_fields": [
+        "root",
+        "generation",
+        "matches"
+      ],
+      "current_function_body_sha256": "ed448f0abdc6e26f9af0aaf5631961e7b59ee496a3a7c86c28d1af29726f6f11",
+      "name": "a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+      "new_line": 917,
+      "new_setup_sha256": "ab70f1f9a52de261cf25a658354f2f6bdff761041e45d8d2e156fc305be2c032",
+      "old_line": 922,
+      "old_setup_sha256": "822ee1f7e3b207b98858f14b58d49ee52d5338bb70f26832a092b813450b5aa2"
+    }
+  ],
+  "input_and_ownership_conclusions": [
+    "Both setups now initialize the sole local mutable State via derived Default, then assign the same root clone and generation41 before constructing any widget Tree. State's Drop and cancel behavior are unchanged; cancel stays the default None in both fixtures and the same lexical owner survives through the unchanged event/assertion sequence.",
+    "The Retry setup preserves queryneedle, original error, all remaining Options defaults and all other State defaults. State.options uses the same derived Options::default as the removed nested Options literal; assigning query changes only that field.",
+    "The result setup preserves the same single Match, including original.rs path, zero-based line/column0, length3, LineIdentity(hit), snippethit and highlight0..3. Remaining options/matches-related defaults and setup scope are unchanged.",
+    "The illegal struct-update move from a temporary State implementing Drop is removed. Direct field assignment does not move unlisted fields out of a Drop type. This addresses the reported source pattern; actual compiler acceptance of c28e76c7 remains untested."
+  ],
+  "limits": [
+    "Current c28e76c7 compilation, all owning Rust bodies, fixture/helper execution, native/UI/UX/screenshots/performance remain UNRUN. No oldee7 UI-bin0/HOST outcome, Script contract result or prior negative is relabeled as current success.",
+    "Root freezev3 records physicalRust1.93 formatter0/diff0 with corrected original metadata pins; this reviewer did not execute formatting or validate raw execution receipts.",
+    "No new source blocker identified in this finite correction/conservation scope. Whole-feature readiness still requires the exact-head validation and actual native evidence in the preserved plan.",
+    "Read-only source/Git/hash plus this task-owned /tmp receipt only. No source/Git/ref edits, runtime/native/provider/process/account/DB/environment/resource/target probe, build/tests/imports/calls, public writes or new workers."
+  ],
+  "ownership_basis": {
+    "Options_derives_Default_and_has_no_custom_initializer": true,
+    "State_Drop_and_cancel_field_unmodified": true,
+    "State_derives_Default_Options_field_uses_Options_Default": true,
+    "cancel_remains_default_None_both_setups": true,
+    "no_partial_moves_from_temporary_State_with_Drop": true,
+    "same_default_unused_fields_and_before_first_widget_value_overrides": true,
+    "same_sole_local_mutable_State_owner_same_scope": true
+  },
+  "preserved_receipts": {
+    "actual_merge": {
+      "path": "/tmp/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json",
+      "qualification": "Its immutable9e63 assembly-conservation conclusion and inherited UI-test-compile negative remain intact. Only the separately described setup correction is qualified here.",
+      "sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348"
+    },
+    "plan": {
+      "path": "/tmp/pr1549-ee7-main442-current-main-composition-plan-v1.json",
+      "sha256": "aff6ff3c0fd592a061270d32b4758d4f5400036a7809e8ef852710c190e7e8b2"
+    }
+  },
+  "read_end_worktree": {
+    "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "status": ""
+  },
+  "retained_metadata": {
+    "format": {
+      "diff_check": "0f3a4c EXIT0",
+      "exit": 0,
+      "final": "29ce02",
+      "official_physical1_93_check_format_start": "82d6a6",
+      "original_session": 96536
+    },
+    "previous_actual_negative": {
+      "acceptance": "/tmp/fw16-backend-ec204421/pr1549-b7df772a-negative-ui3-root-acceptance-v1.json",
+      "scope": "ee7UIbincheck0/libcompile1019E0509;N/inventory/3parentsUNRUN. Negativecannotbe relabeledpass on correction.",
+      "sha256": "8dd3a2e63b3a6d15e2382cb7805de1556f8e445e1a0f704b9fd2305353121668"
+    }
+  },
+  "reviewer": "/root/1281_holder_reconcile_review",
+  "schema": "pr1549_c28e76c7_two_fixture_correction_independent_conservation_review_v1",
+  "scope": "Only the two cfg(test) State initializations in c28e76c7 vs immutable9e63. No semantic/native review repetition or source implementation.",
+  "source": {
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-current-main-search-source-freeze-v3.json",
+      "sha256": "9c4361dead8b82c4f07aa076265fadbb800880814a5ba10bb3b97d50c10044b7"
+    },
+    "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "parents": [
+      "9e63cde8e9e6b1e80e128c7e1aa22681840f690d"
+    ],
+    "status": "",
+    "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main"
+  },
+  "verdict": "BOUNDED_FIXTURE_CORRECTION_SOURCE_CLEAR_CURRENT_COMPILE_UNRUN"
+}
