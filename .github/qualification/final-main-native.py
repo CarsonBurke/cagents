@@ -5,6 +5,7 @@ once. Real GTK Cancel and the portal Response drive the production callback.
 """
 import ast
 import ctypes
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -31,9 +32,77 @@ SUFFIX = ' Keyboard focus stayed here.'
 BAD_TEXT = 'Rejected sibling keeps its saved café draft.\nNever submit or start it.'
 RENDERER = {'ICED_BACKEND': 'wgpu', 'WGPU_BACKEND': 'gl', 'LIBGL_ALWAYS_SOFTWARE': '1'}
 children = []
+ownership_errors = []
+cancellation = None
 stopped = set()
 out = None
 arm = None
+
+
+class NativeCancelled(RuntimeError):
+    pass
+
+
+class Cancellation:
+    """Defer Python cancellation delivery, without masking child OS signals."""
+    def __init__(self):
+        self.depth = 0
+        self.signum = None
+        self.delivered = False
+        self.finalizing = False
+        self.interruptible = False
+        self.failure = None
+
+    def latch(self, error):
+        if self.failure is None:
+            self.failure = error
+
+    def request(self, signum, frame):
+        # Preserve an exception already unwinding into protected cleanup.
+        active = sys.exc_info()[1]
+        if active is not None:
+            self.latch(active)
+        if self.signum is None:
+            self.signum = signum
+            self.latch(NativeCancelled('Native integration cancelled by signal ' + str(signum)))
+        if active is None and self.interruptible:
+            self.checkpoint()
+
+    def checkpoint(self):
+        if self.signum is not None and not self.delivered and not self.depth and not self.finalizing:
+            self.delivered = True
+            raise self.failure
+
+    @contextmanager
+    def defer(self):
+        self.depth += 1
+        failed = False
+        try:
+            yield
+        except BaseException as error:
+            failed = True
+            self.latch(error)
+            raise
+        finally:
+            self.depth -= 1
+            if not failed and sys.exc_info()[1] is None:
+                self.checkpoint()
+
+    @contextmanager
+    def work(self):
+        # Only work bodies may receive an asynchronous first exception. In
+        # particular, the transition into a normal finally is latch-only.
+        self.checkpoint()
+        previous = self.interruptible
+        self.interruptible = True
+        try:
+            yield
+        finally:
+            self.interruptible = previous
+
+    def install(self):
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, self.request)
 
 
 def user():
@@ -71,13 +140,51 @@ def family(table, roots):
         result = expanded
 
 
-def register(process):
-    value = processes().get(process.pid)
-    process.owned_identity = dict(pid=process.pid, stamp=value['stamp'], group=value['group']) if value else None
-    if value:
-        assert value['group'] == process.pid, 'Owned Popen must have its own new session'
+def register(process, *, resources=None, role=None, expected_mount=None):
+    # Retain the actual Popen before any fallible identity lookup/publication.
     children.append(process)
+    process.owned_identity = None
+    process.ownership_error = 'Original child identity registration incomplete'
+    process.publication_error = None
+    process.owned_resources = resources
+    process.owned_role = role
+    process.owned_graceful = None
+    process.expected_mount = expected_mount
+    try:
+        value = processes().get(process.pid)
+        assert value is not None, 'Original child creation identity unavailable'
+        assert value['group'] == process.pid, 'Owned Popen must have its own new session'
+        process.owned_identity = dict(pid=process.pid, stamp=value['stamp'], group=value['group'])
+        process.ownership_error = None
+    except BaseException as error:
+        process.ownership_error = repr(error)
+        cancellation.latch(error)
+        raise
+    finally:
+        # Even a registration failure retains the role and original handle.
+        # A pending signal cannot run cleanup until both publications finish.
+        try:
+            if resources is not None:
+                resources[role] = process
+                if expected_mount is not None:
+                    resources['mount'] = expected_mount
+        except BaseException as error:
+            process.publication_error = repr(error)
+            cancellation.latch(error)
+            raise
     return process
+
+
+def start_owned(argv, *, resources=None, role=None, expected_mount=None, **options):
+    assert resources is None or role is not None
+    cancellation.checkpoint()
+    with cancellation.defer():
+        try:
+            process = subprocess.Popen(argv, start_new_session=True, **options)
+        except BaseException as error:
+            ownership_errors.append('Child creation unresolved for ' + str(role or argv) + ': ' + repr(error))
+            raise
+        return register(process, resources=resources, role=role, expected_mount=expected_mount)
 
 
 def stop(process):
@@ -85,17 +192,21 @@ def stop(process):
     key = (process.pid, identity['stamp'] if identity else None)
     if key in stopped:
         return
+    assert process.ownership_error is None, 'Original child identity unresolved: ' + str(process.ownership_error)
+    def terminal():
+        process.wait(timeout=0)
+        stopped.add(key)
     table = processes()
     current = table.get(process.pid)
     if identity is None:
         assert process.poll() is not None, 'No process-start receipt; refusing a borrowed PID'
-        stopped.add(key)
+        terminal()
         return
     # Never discover a new family through a reused/reaped root PID.
     original = current is not None and current['stamp'] == identity['stamp']
     if current is not None and not original:
         assert process.poll() is not None, 'Original process is unresolved after PID reuse'
-        stopped.add(key)
+        terminal()
         return
     owned = {pid: table[pid]['stamp'] for pid in family(table, {process.pid}) if pid in table} if original else {}
     def live_owned():
@@ -104,8 +215,7 @@ def stop(process):
                 and current_table[pid]['stamp'] == stamp and current_table[pid]['state'] not in ('Z','X')}
     for signum in (signal.SIGTERM, signal.SIGKILL):
         if not live_owned():
-            process.poll()
-            stopped.add(key)
+            terminal()
             return
         current = processes().get(process.pid)
         if current and current['stamp'] == identity['stamp'] and current['group'] == identity['group']:
@@ -126,8 +236,7 @@ def stop(process):
             time.sleep(.05)
     if live_owned():
         raise RuntimeError('Owned descendants survived cleanup: ' + str(live_owned()))
-    process.poll()
-    stopped.add(key)
+    terminal()
 
 
 def drain_adopted():
@@ -166,22 +275,37 @@ def drain_adopted():
 
 def cleanup_arm(resources):
     errors = []
+    for child in children:
+        if child.owned_resources is resources:
+            role = child.owned_role
+            if resources.get(role) is not child:
+                errors.append('Original child role publication unresolved: ' + str(role))
+                resources.setdefault(role, child)
+            if child.expected_mount is not None:
+                if resources.get('mount', child.expected_mount) != child.expected_mount:
+                    errors.append('Original Documents expected mount changed')
+                resources.setdefault('mount', child.expected_mount)
+            if child.ownership_error is not None:
+                errors.append(str(role) + ' original identity: ' + child.ownership_error)
     for name in ('ui','clipboard','fixture'):
         if resources.get(name) is not None:
             try:
                 stop(resources[name])
             except BaseException as error:
+                cancellation.latch(error)
                 errors.append(name + ': ' + repr(error))
     if resources.get('monitor') is not None:
         try:
             resources['monitor'].close()
         except BaseException as error:
+            cancellation.latch(error)
             errors.append('monitor: ' + repr(error))
     for name in ('frontend','backend'):
         if resources.get(name) is not None:
             try:
                 stop(resources[name])
             except BaseException as error:
+                cancellation.latch(error)
                 errors.append(name + ': ' + repr(error))
     documents = resources.get('documents')
     graceful = None
@@ -195,17 +319,21 @@ def cleanup_arm(resources):
             assert code == 0, ('Documents did not complete normal signal/unmount cleanup', code)
             assert not resources['mount'].is_mount(), 'Documents mount survived graceful process exit'
             graceful = dict(exit_code=code, mount=str(resources['mount']), mounted_after=False, identity=identity)
+            documents.owned_graceful = graceful
             stopped.add((documents.pid, identity['stamp']))
         except BaseException as error:
+            cancellation.latch(error)
             errors.append('documents graceful-unmount: ' + repr(error))
             try:
                 stop(documents)
             except BaseException as forced:
+                cancellation.latch(forced)
                 errors.append('documents forced cleanup: ' + repr(forced))
     if resources.get('permissions') is not None:
         try:
             stop(resources['permissions'])
         except BaseException as error:
+            cancellation.latch(error)
             errors.append('permission-store: ' + repr(error))
     if resources.get('mount') is not None and resources['mount'].is_mount():
         errors.append('Documents FUSE mount remains active')
@@ -232,27 +360,35 @@ def cleanup_arm(resources):
     return dict(errors=errors, documents_graceful=graceful, private_bus_names=names, owned_descendants_remaining=remaining)
 
 
-def spawn(argv, *, env=None, cwd=None, log=None, stdin=None):
+
+def spawn(argv, *, env=None, cwd=None, log=None, stdin=None, resources=None, role=None, expected_mount=None):
     user()
-    process = register(subprocess.Popen(argv, env=env, cwd=cwd, stdin=stdin, stdout=log, stderr=subprocess.STDOUT,
-                                       start_new_session=True))
-    emit('process-started', argv=list(map(str, argv)), pid=process.pid, cwd=str(cwd or Path.cwd()))
-    return process
+    with cancellation.defer():
+        process = start_owned(argv, env=env, cwd=cwd, stdin=stdin, stdout=log, stderr=subprocess.STDOUT,
+                              resources=resources, role=role, expected_mount=expected_mount)
+        emit('process-started', argv=list(map(str, argv)), pid=process.pid, cwd=str(cwd or Path.cwd()))
+        return process
 
 
-def command(argv, *, env=None, cwd=None, timeout=20, stdout=None):
+def command(argv, *, env=None, cwd=None, timeout=20, stdout=None, allowed_exit_codes=(0,)):
     user()
     started = time.time_ns()
-    process = register(subprocess.Popen(argv, env=env, cwd=cwd, stdout=stdout or subprocess.PIPE,
-                                       stderr=subprocess.PIPE, start_new_session=True))
+    process = start_owned(argv, env=env, cwd=cwd, stdout=stdout or subprocess.PIPE,
+                          stderr=subprocess.PIPE, role='command')
     try:
-        output, errors = process.communicate(timeout=timeout)
-    except BaseException:
-        stop(process)
+        with cancellation.work():
+            output, errors = process.communicate(timeout=timeout)
+    except BaseException as error:
+        cancellation.latch(error)
+        with cancellation.defer():
+            try:
+                stop(process)
+            except BaseException as cleanup_error:
+                ownership_errors.append('Command cleanup: ' + repr(cleanup_error))
         raise
     emit('command', argv=list(map(str, argv)), cwd=str(cwd or Path.cwd()), exit_code=process.returncode,
          started_unix_ns=started, stderr=(errors or b'').decode(errors='replace'))
-    if process.returncode:
+    if process.returncode not in allowed_exit_codes:
         raise subprocess.CalledProcessError(process.returncode, argv, output=output, stderr=errors)
     return output or b''
 
@@ -330,11 +466,10 @@ def click(pid, name):
     command(['xdotool', 'mousemove', '--sync', str(x + width // 2), str(y + height // 2), 'click', '1'])
 
 
-def clipboard_image(root):
-    stream = (root / 'offered.png').open('rb')
-    process = spawn(['xclip', '-selection', 'clipboard', '-target', 'image/png', '-in', '-quiet'], stdin=stream,
-                    log=(out / (arm + '-clipboard.log')).open('wb'))
-    stream.close()
+def clipboard_image(root, resources):
+    with (root / 'offered.png').open('rb') as stream:
+        process = spawn(['xclip', '-selection', 'clipboard', '-target', 'image/png', '-in', '-quiet'], stdin=stream,
+                        log=(out / (arm + '-clipboard.log')).open('wb'), resources=resources, role='clipboard')
     emit('clipboard-offer', bytes=(root / 'offered.png').stat().st_size, sha256=sha(root / 'offered.png'), pid=process.pid)
     command(['xdotool', 'key', 'ctrl+v'])
     return process
@@ -477,6 +612,14 @@ class PortalObserver:
         self.query.close_sync(None)
 
 
+def open_monitor(resources, output):
+    with cancellation.defer():
+        monitor = PortalObserver.__new__(PortalObserver)
+        resources['monitor'] = monitor
+        monitor.__init__(output)
+        return monitor
+
+
 def compile_helper(control, checkout, label, target, base):
     artifact = out / (label + '-development-ui.jsonl')
     with artifact.open('xb') as stream:
@@ -527,15 +670,13 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     icon.parent.mkdir(parents=True)
     icon.write_text('"Adwaita"\n')
     permissions = spawn(['/usr/libexec/xdg-permission-store', '--verbose'], env=env,
-                        log=(out / (label + '-permission-store.log')).open('wb'))
-    resources['permissions'] = permissions
+                        log=(out / (label + '-permission-store.log')).open('wb'), resources=resources, role='permissions')
     command(['gdbus', 'wait', '--session', '--timeout', '30', 'org.freedesktop.impl.portal.PermissionStore'], env=env, timeout=35)
     permission_owner = bus_owner('org.freedesktop.impl.portal.PermissionStore')
     assert permission_owner['pid'] == permissions.pid
     documents = spawn(['/usr/libexec/xdg-document-portal', '--verbose'], env=env,
-                      log=(out / (label + '-documents.log')).open('wb'))
-    resources['documents'] = documents
-    resources['mount'] = root / 'runtime/doc'
+                      log=(out / (label + '-documents.log')).open('wb'),
+                      resources=resources, role='documents', expected_mount=root / 'runtime/doc')
     command(['gdbus', 'wait', '--session', '--timeout', '30', 'org.freedesktop.portal.Documents'], env=env, timeout=35)
     document_owner = bus_owner('org.freedesktop.portal.Documents')
     assert document_owner['pid'] == documents.pid
@@ -544,27 +685,22 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
         GLib.VariantType.new('(ay)'), Gio.DBusCallFlags.NONE, 30000, None).unpack()[0]
     mount = Path(bytes(mount_reply).rstrip(b'\0').decode())
     assert mount == root / 'runtime/doc' and mount.is_mount()
-    backend = spawn(['/usr/libexec/xdg-desktop-portal-gtk', '--verbose'], env=env, log=(out / (label + '-portal-gtk.log')).open('wb'))
-    resources['backend'] = backend
+    backend = spawn(['/usr/libexec/xdg-desktop-portal-gtk', '--verbose'], env=env, log=(out / (label + '-portal-gtk.log')).open('wb'), resources=resources, role='backend')
     command(['gdbus', 'wait', '--session', '--timeout', '30', 'org.freedesktop.impl.portal.desktop.gtk'], env=env, timeout=35)
-    frontend = spawn(['/usr/libexec/xdg-desktop-portal', '--verbose'], env=env, log=(out / (label + '-portal.log')).open('wb'))
-    resources['frontend'] = frontend
+    frontend = spawn(['/usr/libexec/xdg-desktop-portal', '--verbose'], env=env, log=(out / (label + '-portal.log')).open('wb'), resources=resources, role='frontend')
     command(['gdbus', 'wait', '--session', '--timeout', '30', 'org.freedesktop.portal.Desktop'], env=env, timeout=35)
-    monitor = PortalObserver(out / (label + '-portal.jsonl'))
-    resources['monitor'] = monitor
+    monitor = open_monitor(resources, out / (label + '-portal.jsonl'))
     assert monitor.bus_call('GetConnectionUnixProcessID', monitor.bus_call('GetNameOwner', 'org.freedesktop.portal.Desktop', '(s)'), '(u)') == frontend.pid
     backend_owner = monitor.bus_call('GetNameOwner', 'org.freedesktop.impl.portal.desktop.gtk', '(s)')
     assert monitor.bus_call('GetConnectionUnixProcessID', backend_owner, '(u)') == backend.pid
-    fixture = spawn([str(helper), str(root)], env=env, log=(out / (label + '-fixture.log')).open('wb'))
-    resources['fixture'] = fixture
+    fixture = spawn([str(helper), str(root)], env=env, log=(out / (label + '-fixture.log')).open('wb'), resources=resources, role='fixture')
     wait(lambda: (root / 'fixture.jsonl').exists() and any(json.loads(line)['event'] == 'ready' for line in (root / 'fixture.jsonl').read_text().splitlines()))
     ui = spawn(['scripts/run-development', '--browserless', '--debug', '--log-file', str(out / (label + '-ui.log'))],
-               env=env, cwd=checkout, log=(out / (label + '-runner.log')).open('wb'))
-    resources['ui'] = ui
+               env=env, cwd=checkout, log=(out / (label + '-runner.log')).open('wb'), resources=resources, role='ui')
     def owned_window():
         assert ui.poll() is None, 'Development runner exited'
-        result = subprocess.run(['xdotool', 'search', '--onlyvisible', '--class', 'cagents'], text=True, stdout=subprocess.PIPE, timeout=5)
-        values = result.stdout.split()
+        result = command(['xdotool', 'search', '--onlyvisible', '--class', 'cagents'], timeout=5, allowed_exit_codes=(0, 1))
+        values = result.decode().split()
         assert len(values) <= 1
         return values[0] if values else None
     window = wait(owned_window, 1800)
@@ -647,8 +783,7 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     wait(lambda: key_target(''))
     command(['xdotool', 'type', '--clearmodifiers', '--delay', '1', TEXT])
     wait(lambda: key_target(TEXT))
-    clipboard = clipboard_image(root)
-    resources['clipboard'] = clipboard
+    clipboard = clipboard_image(root, resources)
     def pasted():
         value = storage(root)
         images = value and value['metadata'].get('chat_draft_attachments', {}).get(A, [])
@@ -780,46 +915,122 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
         assert sha(Path(value['path'])) == value['sha256'], 'Matched executable changed during its native arm'
 
 
+def complete_arm_cleanup(resources, label, errors):
+    active_error = sys.exc_info()[1]
+    with cancellation.defer():
+        try:
+            result = cleanup_arm(resources)
+        except BaseException as error:
+            result = dict(errors=['Arm cleanup: ' + repr(error)], documents_graceful=None,
+                          private_bus_names={}, owned_descendants_remaining=['UNKNOWN: arm cleanup incomplete'])
+        try:
+            (out / (label + '-cleanup.json')).write_text(json.dumps(result, indent=2) + '\n')
+        except BaseException as error:
+            result['errors'].append('Cleanup receipt: ' + repr(error))
+        errors.extend(label + ': ' + error for error in result['errors'])
+        if result['errors'] and active_error is None:
+            error = RuntimeError('Arm cleanup failed before another arm: ' + repr(result))
+            cancellation.latch(error)
+            raise error
+    return result
+
+
+def finish_cleanup(errors):
+    """Protected local settlement only; not a complete native-writer ledger."""
+    cancellation.finalizing = True
+    errors.extend(ownership_errors)
+    for child in reversed(children):
+        try:
+            stop(child)
+        except BaseException as error:
+            cancellation.latch(error)
+            errors.append(str(getattr(child, 'owned_role', 'unpublished-role')) + ' cleanup: ' + repr(error))
+    try:
+        remaining = drain_adopted()
+    except BaseException as error:
+        cancellation.latch(error)
+        errors.append('Owned descendant drain: ' + repr(error))
+        remaining = ['UNKNOWN: descendant drain did not complete']
+    for child in children:
+        identity = getattr(child, 'owned_identity', None)
+        role = getattr(child, 'owned_role', None)
+        if role is None:
+            errors.append('Original child role remains unpublished')
+        if getattr(child, 'ownership_error', 'unregistered') is not None or identity is None:
+            errors.append(str(role) + ' original identity remains unresolved')
+        elif (child.pid, identity['stamp']) not in stopped or child.returncode is None:
+            errors.append(str(child.owned_role) + ' original wait remains unresolved')
+        if getattr(child, 'publication_error', 'unpublished') is not None:
+            errors.append(str(role) + ' original role/mount publication remains unresolved')
+        if role == 'documents':
+            try:
+                assert child.owned_graceful is not None, 'Documents normal wait/unmount was not verified'
+                assert child.expected_mount is not None and not child.expected_mount.is_mount(), 'Documents mount unresolved'
+            except BaseException as error:
+                cancellation.latch(error)
+                errors.append('Documents role settlement: ' + repr(error))
+    cleanup = dict(errors=errors, owned_descendants_remaining=remaining)
+    try:
+        (out / 'cleanup.json').write_text(json.dumps(cleanup, indent=2) + '\n')
+    except BaseException as error:
+        cancellation.latch(error)
+        errors.append('Cleanup receipt publication: ' + repr(error))
+        return cleanup
+    if not errors and not remaining:
+        try:
+            (out / 'cleanup-complete').write_text('Owned application, fixture, portal, WM and accessibility descendants closed.\n')
+        except BaseException as error:
+            cancellation.latch(error)
+            errors.append('Cleanup marker publication: ' + repr(error))
+            try:
+                (out / 'cleanup-complete').unlink(missing_ok=True)
+                (out / 'cleanup.json').write_text(json.dumps(cleanup, indent=2) + '\n')
+            except BaseException as publication_error:
+                cancellation.latch(publication_error)
+                errors.append('Failed marker/error receipt removal/publication: ' + repr(publication_error))
+    return cleanup
+
+
+
 def main():
-    global out
+    global out, cancellation
     user()
     assert len(sys.argv) == 4
     control, before, after = [Path(value).resolve(strict=True) for value in sys.argv[1:]]
     plan = json.loads((control / '.github/qualification/final-main-plan.json').read_text())
     out = Path(os.environ['QUALIFICATION_EVIDENCE']) / 'native'
     out.mkdir(parents=True, exist_ok=True)
-    (out / 'source.json').write_text(json.dumps(dict(product=plan['product'], before=plan['before'],
-        control_sha=command(['git', '-C', str(control), 'rev-parse', 'HEAD']).decode().strip(),
-        control_tree=command(['git', '-C', str(control), 'rev-parse', 'HEAD^{tree}']).decode().strip(),
-        driver_sha256=sha(Path(__file__)), fixture_sha256=sha(control / '.github/qualification/final-main-fixture.rs'),
-        workflow_sha256=sha(control / '.github/workflows/qualify-final-main-integration.yml'),
-        run=os.environ['GITHUB_RUN_ID'], attempt=os.environ['GITHUB_RUN_ATTEMPT']), indent=2) + '\n')
-    base = Path(tempfile.mkdtemp(prefix='h2018.', dir='/tmp')).resolve(strict=True)
-    os.chmod(base, 0o700)
-    target_dir = Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True)
-    # Adopt escaped descendants for observed, exact owned cleanup.
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(36, 1, 0, 0, 0) != 0:
-        raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER failed')
+    cancellation = Cancellation()
+    cancellation.install()  # Before metadata command() creates the first child.
     errors = []
     arm_cleanups = {}
-    def cancelled(signum, frame):
-        raise RuntimeError('Native integration cancelled; owned cleanup is required')
-    signal.signal(signal.SIGTERM, cancelled)
     try:
+        # Adopt escaped descendants before any originally retained child exists.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER failed')
+        (out / 'source.json').write_text(json.dumps(dict(product=plan['product'], before=plan['before'],
+            control_sha=command(['git', '-C', str(control), 'rev-parse', 'HEAD']).decode().strip(),
+            control_tree=command(['git', '-C', str(control), 'rev-parse', 'HEAD^{tree}']).decode().strip(),
+            driver_sha256=sha(Path(__file__)), fixture_sha256=sha(control / '.github/qualification/final-main-fixture.rs'),
+            workflow_sha256=sha(control / '.github/workflows/qualify-final-main-integration.yml'),
+            run=os.environ['GITHUB_RUN_ID'], attempt=os.environ['GITHUB_RUN_ATTEMPT']), indent=2) + '\n')
+        base = Path(tempfile.mkdtemp(prefix='h2018.', dir='/tmp')).resolve(strict=True)
+        os.chmod(base, 0o700)
+        target_dir = Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True)
         launcher = next(path for path in [Path('/usr/libexec/at-spi-bus-launcher'), Path('/usr/lib/at-spi2-core/at-spi-bus-launcher')] if path.exists())
-        spawn([str(launcher), '--launch-immediately'], log=(out / 'atspi.log').open('wb'))
+        spawn([str(launcher), '--launch-immediately'], log=(out / 'atspi.log').open('wb'), role='accessibility-launcher')
         for key in ('IsEnabled', 'ScreenReaderEnabled'):
             command(['gdbus', 'call', '--session', '--dest', 'org.a11y.Bus', '--object-path', '/org/a11y/bus',
                      '--method', 'org.freedesktop.DBus.Properties.Set', 'org.a11y.Status', key, '<true>'])
         bus = command(['gdbus', 'call', '--session', '--dest', 'org.a11y.Bus', '--object-path', '/org/a11y/bus', '--method', 'org.a11y.Bus.GetAddress'])
         os.environ['AT_SPI_BUS_ADDRESS'] = ast.literal_eval(bus.decode())[0]
         registry = next(path for path in [Path('/usr/libexec/at-spi2-registryd'), Path('/usr/lib/at-spi2-core/at-spi2-registryd')] if path.exists())
-        spawn([str(registry)], env=dict(os.environ, DBUS_SESSION_BUS_ADDRESS=os.environ['AT_SPI_BUS_ADDRESS']), log=(out / 'atspi-registry.log').open('wb'))
+        spawn([str(registry)], env=dict(os.environ, DBUS_SESSION_BUS_ADDRESS=os.environ['AT_SPI_BUS_ADDRESS']), log=(out / 'atspi-registry.log').open('wb'), role='accessibility-registry')
         rc = base / 'rc.xml'
         rc.write_text('<openbox_config xmlns="http://openbox.org/3.4/rc"><focus><focusNew>yes</focusNew><followMouse>no</followMouse></focus></openbox_config>')
         (out / 'openbox-rc.xml').write_bytes(rc.read_bytes())
-        wm = spawn(['/usr/bin/openbox', '--config-file', str(rc)], log=(out / 'openbox.log').open('wb'))
+        wm = spawn(['/usr/bin/openbox', '--config-file', str(rc)], log=(out / 'openbox.log').open('wb'), role='window-manager')
         wait(lambda: b'_NET_SUPPORTING_WM_CHECK(WINDOW)' in command(['xprop', '-root', '_NET_SUPPORTING_WM_CHECK']))
         (out / 'desktop.json').write_text(json.dumps(dict(openbox_pid=wm.pid, config_sha256=sha(rc),
             supporting_wm=command(['xprop', '-root', '_NET_SUPPORTING_WM_CHECK']).decode(),
@@ -837,30 +1048,27 @@ def main():
             resources = {'desktop_owners':[child.owned_identity for child in children
                          if child.owned_identity is not None and child.poll() is None]}
             try:
-                exercise(control, checkout, label, helper, base, target_dir, plan, resources)
-            finally:
-                result = cleanup_arm(resources)
-                arm_cleanups[label] = result
-                (out / (label + '-cleanup.json')).write_text(json.dumps(result, indent=2) + '\n')
-                errors.extend(label + ': ' + error for error in result['errors'])
-                if result['errors']:
-                    raise RuntimeError('Arm cleanup failed before another arm: ' + repr(result))
-    except BaseException:
-        (out / 'failure-traceback.txt').write_text(traceback.format_exc())
-        raise
-    finally:
-        for child in reversed(children):
-            try:
-                stop(child)
+                with cancellation.work():
+                    exercise(control, checkout, label, helper, base, target_dir, plan, resources)
             except BaseException as error:
-                errors.append(repr(error))
-        remaining = drain_adopted()
-        cleanup = dict(errors=errors, owned_descendants_remaining=remaining)
-        (out / 'cleanup.json').write_text(json.dumps(cleanup, indent=2) + '\n')
-        if not errors and not remaining:
-            (out / 'cleanup-complete').write_text('Owned application, fixture, portal, WM and accessibility descendants closed.\n')
-        else:
-            raise RuntimeError('Native cleanup incomplete: ' + repr(cleanup))
+                cancellation.latch(error)
+                raise
+            finally:
+                arm_cleanups[label] = complete_arm_cleanup(resources, label, errors)
+    except BaseException as error:
+        cancellation.finalizing = True
+        cancellation.latch(error)
+        try:
+            (out / 'failure-traceback.txt').write_text(traceback.format_exc())
+        except BaseException as publication_error:
+            errors.append('Original failure publication: ' + repr(publication_error))
+    finally:
+        cleanup = finish_cleanup(errors)
+    if cancellation.failure is not None:
+        raise cancellation.failure
+    if cleanup['errors'] or cleanup['owned_descendants_remaining']:
+        raise RuntimeError('Native cleanup incomplete: ' + repr(cleanup))
+
 
 
 if __name__ == '__main__':
