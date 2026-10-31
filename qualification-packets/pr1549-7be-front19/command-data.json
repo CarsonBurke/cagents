@@ -1,0 +1,515 @@
+{
+  "schema": "pr1549-7be-front19-controller-task-data-v1",
+  "product_PR_reference": 1549,
+  "boundary": "ui",
+  "source": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope"
+  },
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "selected_names": [
+    "app::search_ui::tests::held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects",
+    "app::search_ui::tests::narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit",
+    "app::search_ui::tests::opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file",
+    "app::search_ui::tests::held_result_and_submit_cannot_open_a_new_queries_same_index",
+    "app::search_ui::tests::new_queries_cancel_old_search_and_reject_stale_batches",
+    "repository_widget::tests::search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer",
+    "repository_widget::tests::file_location_jumps_separate_same_position_deletions_in_undo",
+    "repository_widget::tests::cached_file_and_search_jumps_retire_the_previous_completion_intent",
+    "repository_widget::tests::deferred_search_location_applies_after_the_requested_loading_path",
+    "repository_widget::tests::scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor",
+    "repository_widget::tests::scanned_search_location_validates_the_actual_deferred_file_read",
+    "repository_widget::tests::cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history",
+    "repository_widget::tests::ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file",
+    "repository_widget::tests::failed_search_read_drops_its_guard_before_a_later_ordinary_reopen",
+    "app::palette_ui::tests::project_content_search_palette_command_requires_a_selected_root_and_opens_search",
+    "app::settings_ui::tests::keyboard_page_renders_project_content_search_and_records_its_actual_field",
+    "workspace_widget::tests::project_content_search_uses_its_own_configurable_chord",
+    "workspace_widget::tests::project_search_and_pane_find_have_distinct_workspace_chords",
+    "app::refresh_ui::tests::activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused"
+  ],
+  "selected_parents": [
+    {
+      "name": "app::search_ui::tests::held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 998,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "074da0001984ddd477eb2a25a72fa71054e403380aa126fa8ccb2654bdaaa687",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 1036,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "154f9f98e7bf4d464e1e9bd09f9ad76822e9374d8b474fdb6f1903ecd5b904ca",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 1126,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "6df1e640921ed32f0acb28b89ddea863a1b87b51c1ad561f69cd29a20ce4c675",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::held_result_and_submit_cannot_open_a_new_queries_same_index",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 1177,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "54a49c1d997dfbe91b63cc30b0060c890fd4107cc1a29cb5f4d7669211092457",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::new_queries_cancel_old_search_and_reject_stale_batches",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 1435,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "ff804fa553dbd0033e2b8cccc0d897bd12878b2bcf18e18afc9635e4418d2ea7",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 12754,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "1943b416bb0979bf907d0ec3311493891266e36d4133acef158b731e4afdca25",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::file_location_jumps_separate_same_position_deletions_in_undo",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 12790,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "0f8deb3fa4f33b3dfcbcd8aac2f2f44c8363dede65dbdd6bdc2e0a345b03c4a2",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::cached_file_and_search_jumps_retire_the_previous_completion_intent",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 12818,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "345ed23ed34f047cfc0507d322f24fd5ce2aef676951773a52812e61e3e87d13",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::deferred_search_location_applies_after_the_requested_loading_path",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 12848,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "5f840cd224e6c2a30831d8d7d6e47e3a07995ba2d0cb7c0ea0148b7e6ddc0f38",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 12911,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "19e147d075b67988f2f605bdd1f1644c88b486cbe62f824a74ec3c0f00bd7bc9",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::scanned_search_location_validates_the_actual_deferred_file_read",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 12950,
+      "attributes": [
+        "tokio::test"
+      ],
+      "ignored": false,
+      "body_sha256": "032d00a0f1c9c60ebf253088c2d9f20aa68a15139708476640678893fd8c8cfe",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 12988,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "d0bc49c5201249ac00f78430b2623bc74419fe91efd341cf3c85c0d43976d63f",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 13049,
+      "attributes": [
+        "tokio::test"
+      ],
+      "ignored": false,
+      "body_sha256": "a54d64cc1ce26f647651197d11c7b78616ec86f07b126dfa291ae56532879eb3",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "repository_widget::tests::failed_search_read_drops_its_guard_before_a_later_ordinary_reopen",
+      "source": "src/repository_widget.rs",
+      "source_sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "line": 13089,
+      "attributes": [
+        "tokio::test"
+      ],
+      "ignored": false,
+      "body_sha256": "6c87a25e8fee864cf4a75dc9bf9eb4aeb7eae7202fbbe95bc0935d5f9bd4bfdf",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::palette_ui::tests::project_content_search_palette_command_requires_a_selected_root_and_opens_search",
+      "source": "src/app/palette_ui.rs",
+      "source_sha256": "982b7391ba960d12d41e8c17270deb4b82e7840d4c66b365484d15934cc1c9ea",
+      "line": 1288,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "e8bd833c9ff115de3aadd58814c5a17923b46dfd3ca3ba2c9918d58b5403f500",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::settings_ui::tests::keyboard_page_renders_project_content_search_and_records_its_actual_field",
+      "source": "src/app/settings_ui.rs",
+      "source_sha256": "ebabb40f72d28a46c3721dffeca3d237d86613accebe2af50251e53a9cce073e",
+      "line": 1621,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "59e5052ff182e345ff9114687ca4b49e312663df551eb665a7b50eac3f0c5e8d",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "workspace_widget::tests::project_content_search_uses_its_own_configurable_chord",
+      "source": "src/workspace_widget.rs",
+      "source_sha256": "4ca92f5d0698ac66bc34199f6d6fa8043788cf2fa472da1eb5ed890965efb45e",
+      "line": 3118,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "6e5e2ce93606230c3542bfaf0b07efd76ae3446237421fe715e8bfa75f5413c2",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "workspace_widget::tests::project_search_and_pane_find_have_distinct_workspace_chords",
+      "source": "src/workspace_widget.rs",
+      "source_sha256": "4ca92f5d0698ac66bc34199f6d6fa8043788cf2fa472da1eb5ed890965efb45e",
+      "line": 3403,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "24b31ea1ec91fe98350c37a42fe6b3151e1262ac21f96310096316f215af232b",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::refresh_ui::tests::activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused",
+      "source": "src/app/refresh_ui.rs",
+      "source_sha256": "87ce7af9d52272f62d15ccd8ed88871a8f015bd71a4fed32d6ec1347e65d4d86",
+      "line": 415,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "d15028577868b00c003843c8b9b5e83e97ff054496bd8e1604ac34aa0a473be1",
+      "seconds": 60,
+      "expected_stdout_child_results": 0
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "app::search_ui::tests::held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects",
+        "app::search_ui::tests::narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit",
+        "app::search_ui::tests::opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file",
+        "app::search_ui::tests::held_result_and_submit_cannot_open_a_new_queries_same_index",
+        "app::search_ui::tests::new_queries_cancel_old_search_and_reject_stale_batches",
+        "repository_widget::tests::search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer",
+        "repository_widget::tests::file_location_jumps_separate_same_position_deletions_in_undo",
+        "repository_widget::tests::cached_file_and_search_jumps_retire_the_previous_completion_intent",
+        "repository_widget::tests::deferred_search_location_applies_after_the_requested_loading_path",
+        "repository_widget::tests::scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor",
+        "repository_widget::tests::scanned_search_location_validates_the_actual_deferred_file_read",
+        "repository_widget::tests::cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history",
+        "repository_widget::tests::ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file",
+        "repository_widget::tests::failed_search_read_drops_its_guard_before_a_later_ordinary_reopen",
+        "app::palette_ui::tests::project_content_search_palette_command_requires_a_selected_root_and_opens_search",
+        "app::settings_ui::tests::keyboard_page_renders_project_content_search_and_records_its_actual_field",
+        "workspace_widget::tests::project_content_search_uses_its_own_configurable_chord",
+        "workspace_widget::tests::project_search_and_pane_find_have_distinct_workspace_chords",
+        "app::refresh_ui::tests::activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "app::search_ui::tests::held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::held_result_and_submit_cannot_open_a_new_queries_same_index",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::new_queries_cancel_old_search_and_reject_stale_batches",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::file_location_jumps_separate_same_position_deletions_in_undo",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::cached_file_and_search_jumps_retire_the_previous_completion_intent",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::deferred_search_location_applies_after_the_requested_loading_path",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::scanned_search_location_validates_the_actual_deferred_file_read",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "repository_widget::tests::failed_search_read_drops_its_guard_before_a_later_ordinary_reopen",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::palette_ui::tests::project_content_search_palette_command_requires_a_selected_root_and_opens_search",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::settings_ui::tests::keyboard_page_renders_project_content_search_and_records_its_actual_field",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "workspace_widget::tests::project_content_search_uses_its_own_configurable_chord",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "workspace_widget::tests::project_search_and_pane_find_have_distinct_workspace_chords",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::refresh_ui::tests::activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [],
+  "planned_phase_order": [
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3",
+    "parent-ui-lib-4",
+    "parent-ui-lib-5",
+    "parent-ui-lib-6",
+    "parent-ui-lib-7",
+    "parent-ui-lib-8",
+    "parent-ui-lib-9",
+    "parent-ui-lib-10",
+    "parent-ui-lib-11",
+    "parent-ui-lib-12",
+    "parent-ui-lib-13",
+    "parent-ui-lib-14",
+    "parent-ui-lib-15",
+    "parent-ui-lib-16",
+    "parent-ui-lib-17",
+    "parent-ui-lib-18",
+    "parent-ui-lib-19"
+  ],
+  "runtime_admission": {
+    "state": "PR1549_7BE_FRONT19_SOURCE_REQUIRES_TWO_REVIEWS_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null,
+    "controller_source_adoption": null,
+    "controller_source_publication": null,
+    "queue": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "front_editor_source_contract": {
+    "kind": "SOURCE_ONLY_FRONT_EDITOR19_EXACT_SELECTION_NOT_COMPILED_INVENTORY",
+    "selectors": [
+      "app::search_ui::tests::held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects",
+      "app::search_ui::tests::narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit",
+      "app::search_ui::tests::opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file",
+      "app::search_ui::tests::held_result_and_submit_cannot_open_a_new_queries_same_index",
+      "app::search_ui::tests::new_queries_cancel_old_search_and_reject_stale_batches",
+      "repository_widget::tests::search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer",
+      "repository_widget::tests::file_location_jumps_separate_same_position_deletions_in_undo",
+      "repository_widget::tests::cached_file_and_search_jumps_retire_the_previous_completion_intent",
+      "repository_widget::tests::deferred_search_location_applies_after_the_requested_loading_path",
+      "repository_widget::tests::scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor",
+      "repository_widget::tests::scanned_search_location_validates_the_actual_deferred_file_read",
+      "repository_widget::tests::cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history",
+      "repository_widget::tests::ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file",
+      "repository_widget::tests::failed_search_read_drops_its_guard_before_a_later_ordinary_reopen",
+      "app::palette_ui::tests::project_content_search_palette_command_requires_a_selected_root_and_opens_search",
+      "app::settings_ui::tests::keyboard_page_renders_project_content_search_and_records_its_actual_field",
+      "workspace_widget::tests::project_content_search_uses_its_own_configurable_chord",
+      "workspace_widget::tests::project_search_and_pane_find_have_distinct_workspace_chords",
+      "app::refresh_ui::tests::activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused"
+    ],
+    "count": 19,
+    "UI5_selected": false,
+    "worker21_selected": false,
+    "CLI3_selected": false,
+    "low_FD_selected": false,
+    "ignored_manual_benchmark_selected": false,
+    "expected_visible_outer_stdout_child_results": 0,
+    "scheduler_and_capture": "Captured default outer scheduler; no overrides or manual childmode; source cases nonadditive.",
+    "global_configuration_scope_decision": "Selected production worker/scanner paths may perform bounded read-only inherited global Git ignore/configuration and ancestor ignore discovery. This normal task read behavior is allowed within the existing filesystem sandbox; it is not fixture-confined. Preserve inherited HOME/XDG/opaqueauthority and current no-write policy; do not inspect/print configuration contents in preparation, rewrite HOME, read account/provider databases or claim a broader User authority. If original execution refuses or fails context/config prerequisites, preserve it without scrub/fallback/retry.",
+    "actual_ELF_or_N_or_results": null,
+    "native_UX_qualification": false
+  }
+}

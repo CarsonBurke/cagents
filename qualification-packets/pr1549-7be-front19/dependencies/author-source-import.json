@@ -1,0 +1,25 @@
+{
+  "kind": "AUTHOR_NORMAL_EXACT_SOURCE_IMPORT_NOT_INDEPENDENT_APPROVAL",
+  "product_head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "product_tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+  "product_parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+  "actual_product_entries": 2223,
+  "original_fetch": {
+    "chunk_id": "955485",
+    "wall_time_seconds": 0.068867319,
+    "exit_code": 0,
+    "original_token_count": 43,
+    "output": "From /home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main\n * branch                c28e76c72425a59abd32d977cef2c7995e8095c3 -> FETCH_HEAD\n"
+  },
+  "original_tuple_verification": {
+    "status": "fulfilled",
+    "value": {
+      "chunk_id": "09cea8",
+      "wall_time_seconds": 0.000019096,
+      "exit_code": 0,
+      "original_token_count": 73,
+      "output": "{\n  \"head_tree_parent\": [\n    \"c28e76c72425a59abd32d977cef2c7995e8095c3\",\n    \"164a8860b6740bf36734fc6bfa5d812aceafd751\",\n    \"9e63cde8e9e6b1e80e128c7e1aa22681840f690d\"\n  ],\n  \"actual_product_entries\": 2223,\n  \"immediate_delta\": \"M\\tsrc/app/search_ui.rs\\n\",\n  \"normal_source_fetch_exit\": 0\n}\n"
+    }
+  },
+  "limits": "Exact normal local source Git fetch and immutable source tuple/count reads only. No product edits or runtime/probes."
+}

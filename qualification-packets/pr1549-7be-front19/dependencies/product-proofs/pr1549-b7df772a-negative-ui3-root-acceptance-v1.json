@@ -1,0 +1,281 @@
+{
+  "schema": "pr1549_b7df772a_negative_ui3_root_acceptance_v1",
+  "utc": "2026-10-31T15:23:29.996580+00:00",
+  "allocation": "b7df772a-3fa6-46a4-b1da-d07277e79050",
+  "grant": "6a64c26a-c1bd-44d1-a552-415ee3a0172f",
+  "product_head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+  "controller_head": "43bba2489a8d121ed3e53679b8c3addc285c755e",
+  "sources": [
+    {
+      "path": "/tmp/coord-b9-pr1549-ui3-b7df772a-sole-raw-review.json",
+      "sha256": "c66de8bf457f476da9c5f8818f7d825da6ad9b45e8291858d7a8f270254a3e4c"
+    },
+    {
+      "path": "/tmp/coord-b9-pr1549-ui3-b7df772a-actual-executor-return.json",
+      "sha256": "722cfae1edae4a9f61a4176cb4774c11e6ecfbc33d309fbd68c82429ffcfacd5"
+    }
+  ],
+  "manifest": {
+    "path": "/tmp/coord16-pr1549-ee7-ui3-validation-20261031T151206088290Z-2/SHA256SUMS",
+    "sha256": "39580709bb8fd64d379af5d6a82195ab259437ac33328ec06a6a03d3a7c6a3cb",
+    "members_rehashed": 69,
+    "actual_files": 70
+  },
+  "original_transport_summary_rehashed": true,
+  "accepted_negative": "ActualUIbincheck0,UIlibcompile101; exact9E0509 in two StateDrop struct-update testfixtures. No inventory/N/threeparentbody outcomes, zeroqualified. EarlierHOST2twoP staysonlyee7 scope.",
+  "compiler_failure": {
+    "build_finished_success": false,
+    "causal_boundary": "UI binary check passed, but compiling the cfg(test) library rejects struct-update moves from State::default() because app::search_ui::State implements Drop. No test invocation occurred.",
+    "command": [
+      "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "test",
+      "--locked",
+      "--no-default-features",
+      "--features",
+      "ui",
+      "--lib",
+      "--no-run",
+      "--message-format=json"
+    ],
+    "complete_JSON_rows": 989,
+    "diagnostics": [
+      {
+        "code": "E0509",
+        "index": 1,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 865,
+            "label": "cannot move out of here",
+            "line": 856,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 865,
+            "label": "move occurs because value has type `std::option::Option<process::CancellationToken>`, which does not implement the `Copy` trait",
+            "line": 856,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "438c7edb3436ef2945efdf0ec7c65ab585a1aecb498d5d26db0932607a0ec4ff"
+      },
+      {
+        "code": "E0509",
+        "index": 2,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 865,
+            "label": "cannot move out of here",
+            "line": 856,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 865,
+            "label": "move occurs because value has type `Vec<project_search::Match>`, which does not implement the `Copy` trait",
+            "line": 856,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "7ab628e7010c95a92edaae6cdd4a0af64af9bbf94392d7d41993c14084489af6"
+      },
+      {
+        "code": "E0509",
+        "index": 3,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 865,
+            "label": "cannot move out of here",
+            "line": 856,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 865,
+            "label": "move occurs because value has type `RefCell<std::collections::BTreeMap<usize, CachedSnippet>>`, which does not implement the `Copy` trait",
+            "line": 856,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "cb237c0f4c416ea61ca2b5dbbcba293ae3e60daccf1958465dfe12345eab43ae"
+      },
+      {
+        "code": "E0509",
+        "index": 4,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 865,
+            "label": "cannot move out of here",
+            "line": 856,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 865,
+            "label": "move occurs because value has type `std::collections::BTreeMap<std::path::PathBuf, usize>`, which does not implement the `Copy` trait",
+            "line": 856,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "2543167957cf6a1dfa5a6d63c205d5f88f536135360264a5f74b9412273acb22"
+      },
+      {
+        "code": "E0509",
+        "index": 5,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 942,
+            "label": "cannot move out of here",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 942,
+            "label": "move occurs because value has type `project_search::Options`, which does not implement the `Copy` trait",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "6cb18b729a7f5bc0192986785e342c66edc1f7af8229f82887788475d01f5769"
+      },
+      {
+        "code": "E0509",
+        "index": 6,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 942,
+            "label": "cannot move out of here",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 942,
+            "label": "move occurs because value has type `std::option::Option<process::CancellationToken>`, which does not implement the `Copy` trait",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "f76281eb612372d3751e60e8e21df1b5f24ed82b0d6d97a0a8e1c74f0a1f4f07"
+      },
+      {
+        "code": "E0509",
+        "index": 7,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 942,
+            "label": "cannot move out of here",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 942,
+            "label": "move occurs because value has type `RefCell<std::collections::BTreeMap<usize, CachedSnippet>>`, which does not implement the `Copy` trait",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "5ffdae5e87281ff6b76db79697144ef7ddecaef1d0916d0264ec678545094ba4"
+      },
+      {
+        "code": "E0509",
+        "index": 8,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 942,
+            "label": "cannot move out of here",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 942,
+            "label": "move occurs because value has type `std::collections::BTreeMap<std::path::PathBuf, usize>`, which does not implement the `Copy` trait",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "a75d38317349ab663f2a9c66393c6f81a7467194d4fc38589f67f028e45acecb"
+      },
+      {
+        "code": "E0509",
+        "index": 9,
+        "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+        "primary_spans": [
+          {
+            "end_line": 942,
+            "label": "cannot move out of here",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          },
+          {
+            "end_line": 942,
+            "label": "move occurs because value has type `std::option::Option<std::string::String>`, which does not implement the `Copy` trait",
+            "line": 929,
+            "path": "src/app/search_ui.rs"
+          }
+        ],
+        "rendered_sha256": "d1b2e247feedb3a8b1d4aee1bc728feb4c1f33a7ac5d85b2ef7365be09f9117e"
+      }
+    ],
+    "error_codes": {
+      "E0509": 9
+    },
+    "error_diagnostic_count": 9,
+    "exit": 101,
+    "first_error": {
+      "code": "E0509",
+      "index": 1,
+      "message": "cannot move out of type `app::search_ui::State`, which implements the `Drop` trait",
+      "primary_spans": [
+        {
+          "end_line": 865,
+          "label": "cannot move out of here",
+          "line": 856,
+          "path": "src/app/search_ui.rs"
+        },
+        {
+          "end_line": 865,
+          "label": "move occurs because value has type `std::option::Option<process::CancellationToken>`, which does not implement the `Copy` trait",
+          "line": 856,
+          "path": "src/app/search_ui.rs"
+        }
+      ],
+      "rendered_sha256": "438c7edb3436ef2945efdf0ec7c65ab585a1aecb498d5d26db0932607a0ec4ff"
+    },
+    "non_JSON_lines": 0,
+    "note": "The unselected neighboring cfg(test) initializer still must compile before any selected UI3 parent can execute. This is source ownership routing, not a patch or successful correction.",
+    "reason_counts": {
+      "build-finished": 1,
+      "build-script-executed": 64,
+      "compiler-artifact": 656,
+      "compiler-message": 268
+    },
+    "source_sites": [
+      {
+        "diagnostics": 4,
+        "end_line": 865,
+        "in_requested_UI3": true,
+        "line": 856,
+        "owning_parent": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+        "path": "src/app/search_ui.rs"
+      },
+      {
+        "diagnostics": 5,
+        "end_line": 942,
+        "in_requested_UI3": false,
+        "line": 929,
+        "owning_parent": "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+        "path": "src/app/search_ui.rs"
+      }
+    ],
+    "stderr_sha256": "eba506be97fd22720502ee28028ac2bfdfa85e3bb0f88c842e22843a2985609b",
+    "stderr_terminal": "could not compile cagents (lib test) due to 9 previous errors; 18 warnings emitted",
+    "stdout_sha256": "60790115784875e0f6c15029858bab6fd7b0af09038312b3497a9d56e92f480b"
+  },
+  "custody": "92recordedoriginalwaitssettled0unknown; sealedsoleRAWboundednegativeadmissible/recordedcloseorder accepted, no live/global/physicalavailabilityprobe.",
+  "logical_C": "CONSUMED_UI3_NEGATIVE_ACCEPTED; NO_CURRENT_LEASE; no newattempt/grant from thisrecord.",
+  "next_source": "Root fixes both identified testfixtures only in current-main successor; originalee7/controller/evidence immutable. Newsource must be independently reviewed and admitted underfreshgrant; no sameheadretry or native/wholePR/mergeclaim."
+}

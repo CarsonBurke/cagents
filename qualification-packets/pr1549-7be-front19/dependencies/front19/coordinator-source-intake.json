@@ -1,0 +1,84 @@
+{
+  "actual_N": null,
+  "actual_results": null,
+  "assignment_message": "6116e5a4-2a03-4e2a-8ca6-b322b6f7d1c3",
+  "budget_honesty": "2400 unchanged original packet cap; source/finalisation counters are proposed reservations not newly enforced aggregate bounds. Unknown custody/evidence stays HOLD beyond workload cap. Source DATA original --list --format terse is not executor ABI; canonical currently --list --color=never/full inventory must be explicitly reconciled by source owner, no source/actualcount guess.",
+  "global_configuration_scope_decision": "Selected production worker/scanner paths may perform bounded read-only inherited global Git ignore/configuration and ancestor ignore discovery. This normal task read behavior is allowed within the existing filesystem sandbox; it is not fixture-confined. Preserve inherited HOME/XDG/opaqueauthority and current no-write policy; do not inspect/print configuration contents in preparation, rewrite HOME, read account/provider databases or claim a broader User authority. If original execution refuses or fails context/config prerequisites, preserve it without scrub/fallback/retry.",
+  "inputs": [
+    {
+      "path": "/tmp/pr1549-c28-full-feature-remaining-qualification-DATA-v1.json",
+      "sha256": "7190a9f8d0825b75bc5bbf1b5a6acd06c66183fe89d1bc7dfd6bb06999fe6a40"
+    },
+    {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-7be-full-feature-qualification-source-binding-addendum-v1.json",
+      "sha256": "28c949506a78c96eda81a0a791c731851f6e29cc2a1c01cb1f268663262e3993"
+    },
+    {
+      "path": "/tmp/pr1549-7be-final-qualification-DATA-binding-independent-review-v1.json",
+      "sha256": "6ed2fa670f9b06844a8b9ece23db086f2901a0540dce9418b923c58eae436d03"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/reconciliation.json",
+      "sha256": "efed45ec4a276fe07f1576da1ab13e73dee86d0daeb1fe6a90a9d363b9acafc2"
+    }
+  ],
+  "kind": "SOURCE_ONLY_FRONT19_COORDINATOR_INTAKE_NOT_ADOPTION_OR_RUNTIME",
+  "original_packet_cap": 2400,
+  "other_groups_disjoint": true,
+  "owner_session": "b9aa3f1d-524e-49e2-a43c-e5d9acf6bbc6",
+  "phase_ceiling_sum": 2070,
+  "planned_phase_caps": [
+    900,
+    30,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60,
+    60
+  ],
+  "planned_phase_count": 21,
+  "product": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046"
+  },
+  "publication": null,
+  "queue_place": null,
+  "runtime_grant": null,
+  "selected_count": 19,
+  "selectors": [
+    "app::search_ui::tests::held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects",
+    "app::search_ui::tests::narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit",
+    "app::search_ui::tests::opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file",
+    "app::search_ui::tests::held_result_and_submit_cannot_open_a_new_queries_same_index",
+    "app::search_ui::tests::new_queries_cancel_old_search_and_reject_stale_batches",
+    "repository_widget::tests::search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer",
+    "repository_widget::tests::file_location_jumps_separate_same_position_deletions_in_undo",
+    "repository_widget::tests::cached_file_and_search_jumps_retire_the_previous_completion_intent",
+    "repository_widget::tests::deferred_search_location_applies_after_the_requested_loading_path",
+    "repository_widget::tests::scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor",
+    "repository_widget::tests::scanned_search_location_validates_the_actual_deferred_file_read",
+    "repository_widget::tests::cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history",
+    "repository_widget::tests::ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file",
+    "repository_widget::tests::failed_search_read_drops_its_guard_before_a_later_ordinary_reopen",
+    "app::palette_ui::tests::project_content_search_palette_command_requires_a_selected_root_and_opens_search",
+    "app::settings_ui::tests::keyboard_page_renders_project_content_search_and_records_its_actual_field",
+    "workspace_widget::tests::project_content_search_uses_its_own_configurable_chord",
+    "workspace_widget::tests::project_search_and_pane_find_have_distinct_workspace_chords",
+    "app::refresh_ui::tests::activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused"
+  ]
+}

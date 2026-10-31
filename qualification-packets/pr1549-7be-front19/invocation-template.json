@@ -1,0 +1,36 @@
+{
+  "kind": "NOT_SUBMITTABLE_PRE_TWO_REVIEWS_ADOPTION_PUBLICATION_AND_QUEUE",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-front19-source",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-front19-source/qualification-packets/pr1549-7be-front19/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "cb2e7aa2dffbe911732c438987163a047a41ef4452b90d87cef5e4511ddeccab",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "grant_value_index": 5,
+  "execution_authorized": false,
+  "independent_code_review": null,
+  "independent_conservation_review": null,
+  "controller_source_adoption": null,
+  "controller_source_publication": null,
+  "queue": null,
+  "runtime": null,
+  "actual_N": null,
+  "actual_results": null,
+  "review_ABI": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "runner_sha256": "cb2e7aa2dffbe911732c438987163a047a41ef4452b90d87cef5e4511ddeccab",
+    "plan_sha256": "e7f83248f9294243390fa6b33dc58d3d59ca79f203a9063b1c847104d51d537c",
+    "controller_identity": "EXTERNAL_POSTCOMMIT_REQUIRED"
+  },
+  "limits": "Grant syntax is not authentication/freshness/once-use. Genuine Root adoption/publication/new grant required; product and Worker21 proofs are not Front19 approval or pass transfer."
+}

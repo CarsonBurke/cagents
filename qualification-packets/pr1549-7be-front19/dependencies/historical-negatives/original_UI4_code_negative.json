@@ -1,0 +1,330 @@
+{
+  "activity": "Static source/JSON/text/hash/AST and immutable commit header only, private receipt write. No candidate import/function/parser-example/algorithm/test/build/helper/ELF/toolversion/runtime/native/env/account/authority/process/resource/context/target/cache probes, source/public edits, children or new context.",
+  "additional_blocker_count": 0,
+  "additional_blocking_findings": [],
+  "assembly_preservation": {
+    "meaning": "Original9e63 compileblocked assembly not cleared or retargeted; current c28 known-cause correction source-only, all actual current compile/test/nativeUNRUN.",
+    "schema": "pr1549_9e63_current_main_actual_merge_independent_assembly_conservation_review_v1",
+    "status": "BLOCKED pending separately pinned fixture-only successor",
+    "verdict": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED"
+  },
+  "blocking_findings": [
+    {
+      "assertion": "assert main_assembly['known_whole_head_blocker']['status'] == 'BLOCKED'",
+      "effect": "Source-derived pre-effects refusal, not actual runtime result.",
+      "genuine_pinned_value": "BLOCKED pending separately pinned fixture-only successor",
+      "id": "R1_SHARED_ASSEMBLY_STATUS_LITERAL",
+      "line": 902,
+      "minimum_correction": "Match exact genuine full status string; preserve273ab original blocked verdict and evidence. Freeze independent successor, no proof mutation/waiver/status-prefix admission.",
+      "path": "qualification-packets/pr1549-c28-ui4/run-packet.py",
+      "proof_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/dependencies/product-proofs/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json",
+      "proof_sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348",
+      "severity": "blocking_source_integration",
+      "source_expected": "BLOCKED"
+    }
+  ],
+  "checked_fact_count": 19,
+  "checked_facts": [
+    {
+      "meaning": "Exact original UI4 frozen code, separate product/controller identities. No successor byte or runtime result adopted.",
+      "name": "frozen original UI4 pin verification",
+      "source": "object-freeze; original immutable Git header45f652 exit0",
+      "verified": true
+    },
+    {
+      "meaning": "Reuses HOST scoped valid reader/result facts only after exact byte/hash check. No duplicate full tree/DAG/inverse/3790 audit, no outcome or ABI clearance transfer.",
+      "name": "focused common reader and strict execution helpers exact",
+      "source": "current UI4 source and original HOST3 source; helpers plus main855-962",
+      "verified": true
+    },
+    {
+      "meaning": "Actual current-main proof role and hash retained exactly; shared source validation valid portions reuse the prior code review, not runtime admission.",
+      "name": "product_freeze same genuine payload binding",
+      "source": "own source-binding product_freeze",
+      "verified": true
+    },
+    {
+      "meaning": "Actual current-main proof role and hash retained exactly; shared source validation valid portions reuse the prior code review, not runtime admission.",
+      "name": "product_correctness same genuine payload binding",
+      "source": "own source-binding product_correctness",
+      "verified": true
+    },
+    {
+      "meaning": "Actual current-main proof role and hash retained exactly; shared source validation valid portions reuse the prior code review, not runtime admission.",
+      "name": "product_conservation same genuine payload binding",
+      "source": "own source-binding product_conservation",
+      "verified": true
+    },
+    {
+      "meaning": "Actual current-main proof role and hash retained exactly; shared source validation valid portions reuse the prior code review, not runtime admission.",
+      "name": "product_ux_source same genuine payload binding",
+      "source": "own source-binding product_ux_source",
+      "verified": true
+    },
+    {
+      "meaning": "Actual current-main proof role and hash retained exactly; shared source validation valid portions reuse the prior code review, not runtime admission.",
+      "name": "product_main_assembly same genuine payload binding",
+      "source": "own source-binding product_main_assembly",
+      "verified": true
+    },
+    {
+      "meaning": "Actual current-main proof role and hash retained exactly; shared source validation valid portions reuse the prior code review, not runtime admission.",
+      "name": "product_adoption same genuine payload binding",
+      "source": "own source-binding product_adoption",
+      "verified": true
+    },
+    {
+      "meaning": "Actual current-main proof role and hash retained exactly; shared source validation valid portions reuse the prior code review, not runtime admission.",
+      "name": "product_publication same genuine payload binding",
+      "source": "own source-binding product_publication",
+      "verified": true
+    },
+    {
+      "meaning": "Correct two reducer and two headless real widget Tree controls; ordinary tests not ignored. No operational Task/native input/keyboard/focus/UX proof. Actual inventory still NULL.",
+      "name": "four source selectors/cfg/caller contracts",
+      "source": "main963-977; search_ui.rs849/917/1232/1345",
+      "verified": true
+    },
+    {
+      "meaning": "Exact currentc28 known-source correction is mutable initialization; no new product semantic/type review or actual compile. Real component events retain widget tree across rerenders, refuse replacement press, allow fresh press. Component name native is not nativeOS qualification.",
+      "name": "corrected state setup and existing owned helper source present",
+      "source": "search_ui.rs801-995; ui_controls/owned.rs45-52",
+      "verified": true
+    },
+    {
+      "meaning": "Current main all18feature/config/enrollment plus existing actual control/helper dependencies pinned. Source files only, not helper execution or fresh tool/context facts. Other reviewer owns83-file/exhaustive conservation.",
+      "name": "own40 pins/74 bound archive inputs",
+      "source": "plan/source-binding/source-map and main990-994/1037-1051",
+      "verified": true
+    },
+    {
+      "meaning": "No host/UI union, helper env/proxy, arbitrary executor, new target/cache or old ELF. UI bin check is not a test target; same actual rootlib emitted ELF inventory required.",
+      "name": "UI-only graph and seven phases",
+      "source": "main963-980 and actual execute_contracts565-652",
+      "verified": true
+    },
+    {
+      "meaning": "Three setup/check phases plus4 exact parents; capturedpretty/default scheduler/one1P0F0I0M/fullN-1; final raw+hash/wait0/evidence/earlier result match. Nested gestures/branches/children nonadditive. Shared failed/control/read/asset sticky priority unchanged, no retry/expectednegativePASS/zero-test credit.",
+      "name": "four singleton labels/counts/default strict raw result and errors",
+      "source": "grouped_contracts475-491; parent_accounting680-762; main1304-1310",
+      "verified": true
+    },
+    {
+      "meaning": "Original2400 shared remaining deadline and opaque HOME/authority/compiler-only overlays/name-only fences. Unknown custody indefinite HOLD; no current env/context/resource probe or native timeout result.",
+      "name": "budgets and absent/environment/context limits",
+      "source": "main845-847/978-983/1020-1075/1092 onward",
+      "verified": true
+    },
+    {
+      "meaning": "Own fixed hash-bound relative names/new private output/nonsymlink0700parents/exclusivewrite; no reset/adoption/delete/path escape. Not runtime filesystem testing.",
+      "name": "safe fixed nested archive parents",
+      "source": "main990-1014; exact evidence_copy370-375",
+      "verified": true
+    },
+    {
+      "meaning": "Correct proof hash/schema/head/parents/verdict followed by wrong exact status literal. Every operationally bound original attempt naturally refuses at this source assertion before outputarchive/C/workload; static inference only, not executed failure.",
+      "name": "knownR1 exact static source counterexample",
+      "source": "main902; genuine273ab JSON /known_whole_head_blocker/status",
+      "verified": true
+    },
+    {
+      "meaning": "Successful future receipt must TOPproductc28/tree164a plus own runner/plan, separatecontroller identity. This receipt is CHANGES_REQUIRED and must not be accepted as ABI clearance or relabeled after correction.",
+      "name": "expected executable ABI remains negative/unadmitted",
+      "source": "validate_controller_review362-367; main984-989; own invocation/manifest",
+      "verified": true
+    },
+    {
+      "meaning": "Original UI4 and HOST3 frozen sources unchanged; no edits/imports/candidate calls.",
+      "name": "review input stable",
+      "source": "seal reread",
+      "verified": true
+    }
+  ],
+  "clear_portions": "UI-only sevenphase/1890within2400/4selectors/raw reread/error/absence/archive/ABI contracts coherent in bounded reading; no additional verified blocker. R1 still prevents approval.",
+  "controller_head": "e799278ee7bde497479966099bb51f5f0df79c56",
+  "controller_parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "controller_tree": "d18490665f6a142d1684b887eb19a541a25d8441",
+  "focused_shared_source_reuse": {
+    "main855_962_text_exact": true,
+    "original_HOST3_negative": {
+      "path": "/var/tmp/coord16-pr1549-c28-host3-code-negative-final-4ufxi6h5/review.json",
+      "sha256": "8f8927f72338a448c610f8985f34fce4d067c99ef8c564d52e075f532a31de98"
+    },
+    "scope": "Valid source facts only; no HOST3 result, context, positive ABI, grant or current execution transfer.",
+    "shared_helpers": {
+      "cargo_test_artifact": {
+        "end_line": 266,
+        "exact_HOST3": true,
+        "line": 247,
+        "sha256": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285"
+      },
+      "evidence_copy": {
+        "end_line": 375,
+        "exact_HOST3": true,
+        "line": 370,
+        "sha256": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8"
+      },
+      "execute_contracts": {
+        "end_line": 652,
+        "exact_HOST3": true,
+        "line": 565,
+        "sha256": "584d6c3b8076b29a92d12454bd3c3e04b1d14abe5f46323c62cbd451151c41bc"
+      },
+      "grouped_result": {
+        "end_line": 562,
+        "exact_HOST3": true,
+        "line": 494,
+        "sha256": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115"
+      },
+      "guard_git_metadata": {
+        "end_line": 200,
+        "exact_HOST3": true,
+        "line": 143,
+        "sha256": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193"
+      },
+      "inventory_names": {
+        "end_line": 285,
+        "exact_HOST3": true,
+        "line": 269,
+        "sha256": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f"
+      },
+      "validate_controller_review": {
+        "end_line": 367,
+        "exact_HOST3": true,
+        "line": 362,
+        "sha256": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
+      }
+    },
+    "shared_product_proof_payloads_exact": [
+      "product_freeze",
+      "product_correctness",
+      "product_conservation",
+      "product_ux_source",
+      "product_main_assembly",
+      "product_adoption",
+      "product_publication"
+    ]
+  },
+  "frozen_inputs": {
+    "immutable_commit_header": {
+      "chunk": "45f652",
+      "controller": {
+        "head": "e799278ee7bde497479966099bb51f5f0df79c56",
+        "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+        "tree": "d18490665f6a142d1684b887eb19a541a25d8441"
+      },
+      "exit": 0
+    },
+    "manifest": {
+      "declared_files": 83,
+      "declared_payloads": 82,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/manifest.json",
+      "sha256": "27a072323aab009dceca65e231a92318b5752061bade0856ce22039f80cb5e0a"
+    },
+    "object_receipt": {
+      "path": "/var/tmp/coord16-pr1549-c28-ui4-author-freeze-0l1eyo6_/object-freeze.json",
+      "sha256": "e0e75e319023a4ff0576e351020bc4481f4e0ae2c9eaef2c8ab53a5c5cd4b0a4"
+    }
+  },
+  "future_own_ABI_required_after_correction": {
+    "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "not_satisfied_by_this_negative": true,
+    "plan_sha256": "must bind exact fresh successor plan",
+    "runner_sha256": "must bind exact fresh successor bytes",
+    "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+    "verdict": "CONTROLLER_SOURCE_CLEAR"
+  },
+  "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "instruction_source": {
+    "latest_user_precedence": true,
+    "record": {
+      "bytes_flags_changed_by_author": false,
+      "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+      "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+      "index_flag": "H AGENTS.md",
+      "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+      "latest_user_AGENTS_instructions_followed": true,
+      "variance": true
+    },
+    "same_actualcurrent_AGENTS_instruction_text_read_in_HOSTreview": true,
+    "variance_retained_unwaived_noFSagreement_claim": true
+  },
+  "kind": "INDEPENDENT_ORIGINAL_UI4_CODE_REVIEW_R1_PRESERVED_NO_SOURCE_CLEAR_ABI",
+  "new_workers": false,
+  "plan_sha256": "f555dd87cc3438f71a464a386be2e34b3447606c537a1ffd7727c2729361be30",
+  "product_parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+  "product_pr": 1549,
+  "proof_roles": [
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/dependencies/product-proofs/pr1549-current-main-search-source-freeze-v3.json",
+      "role": "product_freeze",
+      "sha256": "9c4361dead8b82c4f07aa076265fadbb800880814a5ba10bb3b97d50c10044b7"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/dependencies/product-proofs/pr1549-c28e76c7-drop-state-fixture-correction-independent-source-review-v1.json",
+      "role": "product_correctness",
+      "sha256": "30a8b6cd3d357d5812f62b5f0a40e1200c423a85b9a3bd23609eafe4d3d73edf"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/dependencies/product-proofs/pr1549-c28e76c7-two-fixture-correction-independent-conservation-review-v1.json",
+      "role": "product_conservation",
+      "sha256": "283ea3f460f4ff0ec7c07692c2e63339f9c8e90ba66b6717950c8c8f1e8c0202"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/dependencies/product-proofs/pr1549-current-main-c28-independent-ux-source-evidence-refresh-1335-v1.json",
+      "role": "product_ux_source",
+      "sha256": "9ef393cd5fff6ae7824fbf84f3f283ec756d83e98a5c998f85f4edd4bfa45bd9"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/dependencies/product-proofs/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json",
+      "role": "product_main_assembly",
+      "sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/dependencies/product-proofs/product-adoption.json",
+      "role": "product_adoption",
+      "sha256": "36686d074bef22212398582de92ed3aab456713d5f1584e4c90179e0ac547a2a"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/dependencies/product-proofs/product-publication.json",
+      "role": "product_publication",
+      "sha256": "cb42afaf0caf230f28286cd2adac98cb5fc8b57e530bc91f2a35b411e5b474e0"
+    }
+  ],
+  "qualification_limits": {
+    "ELF": null,
+    "all_current_compile_runtime_native": "UNRUN",
+    "current_tools_context_resource_caller": null,
+    "execution_authorized": false,
+    "grant": null,
+    "inventory_N": null,
+    "no_global_kernel_namespace_manager_installed_everyinternalexec_claim": true,
+    "old_ee7_acceptance_and_UI_negative": "HISTORICAL_ORIGINAL_HEAD_ONLY",
+    "results": null,
+    "separate_conservation_required": true,
+    "whole_PR_mainflow_beforeafter_WebP_performance_UX_caller_adoption_WHOLE_merge": "UNKNOWN_UNQUALIFIED"
+  },
+  "reviewer": "/root/editor_recovery_review, nonauthor",
+  "runner_sha256": "351392ffb7f52e47974d43f7207d338a1efd63929f0a92a258ad2462d72f3533",
+  "schema": "pr1549_c28_ui4_independent_original_task_code_negative_source_review_v1",
+  "scope": "Finite sibling task/typed-reader/UIgraph/4sourceparent/defaultstrictresult/error/ABI review; shared proof/read helper valid portions reused ONLY after exact current byte/hash crosschecks with originalHOST3. No duplicated full product semantics or exhaustivecore/tree/DAG/inverse3790 audit.",
+  "source_binding_sha256": "b29c0c6251b6c59d6d208ccafc30bc443e6b496022926ef06a72e78a6bbf3047",
+  "source_edits_or_public_writes": false,
+  "source_fixture_contract": {
+    "actual_results": null,
+    "existing_owned_helper_sha256": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690",
+    "native_OS_input_window_keyboard_focus_UX": false,
+    "nonadditive_branches_children": true,
+    "selected_names": [
+      "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+      "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+      "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches"
+    ],
+    "two_reducer_parents": "Existing app/sidebar fixture reducers and dropped operational Tasks",
+    "two_widget_parents": "Actual retained IcedTree/diff/layout/operate/update, bounds-derived synthetic Mousepress/release/headlessrenderer; samegeneration continuity/replacement refusal/freshclick"
+  },
+  "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+  "verdict": "CHANGES_REQUIRED",
+  "writing_released": true
+}

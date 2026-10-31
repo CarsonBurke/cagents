@@ -1,0 +1,326 @@
+{
+  "artifacts": {
+    "command-data.json": {
+      "bytes": 8571,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/command-data.json",
+      "sha256": "7609dfa3b65a4deb692df7770b4b984cf227827fd9a44e71c1704dd28361423b"
+    },
+    "current-source-map.json": {
+      "bytes": 15366,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/current-source-map.json",
+      "sha256": "41e1e18d078cdc0b074414c03232a77e57829b4142f6c68dcf2c0b2190259d5e"
+    },
+    "from-993-forward.diff.json": {
+      "bytes": 193626,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/from-993-forward.diff.json",
+      "sha256": "5c1a6074001f8a776620ba60a9787c64de4ea0160f094a556e2d7181a20d1c3c"
+    },
+    "from-c28-UI4-forward.diff.json": {
+      "bytes": 197987,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/from-c28-UI4-forward.diff.json",
+      "sha256": "354a477758d0d7e1bbaf0b01ff2852cbcfe80ebc0329fcb9a6711bb23eca2b35"
+    },
+    "invocation-template.json": {
+      "bytes": 829,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/invocation-template.json",
+      "sha256": "e41befedf219f8ee49a027b495ff61a848fe54fae05ae19ba4a1f6b57e78aa4b"
+    },
+    "manifest.json": {
+      "bytes": 20136,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/manifest.json",
+      "sha256": "1aaf863a7629b94434edaf8d5b903e7f4293c1028dd29e585e081d36caecbc5f"
+    },
+    "plan.json": {
+      "bytes": 45324,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/plan.json",
+      "sha256": "e14d5f9624be911fcf415b69028e5d0c21b81e12595960e80538597277b6e2a8"
+    },
+    "reconciliation.json": {
+      "bytes": 6839,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/reconciliation.json",
+      "sha256": "efed45ec4a276fe07f1576da1ab13e73dee86d0daeb1fe6a90a9d363b9acafc2"
+    },
+    "run-packet.py": {
+      "bytes": 93700,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/run-packet.py",
+      "sha256": "153bc925907ccd722407140f96b93b3d5bec53e11dd1b05ba114417cf799ab38"
+    },
+    "selected-source-contract.json": {
+      "bytes": 4426,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/selected-source-contract.json",
+      "sha256": "6ec5a6e364eb23fa83000c245d5b52dd9604ce5d89131c14984ea60af818a981"
+    },
+    "source-binding.json": {
+      "bytes": 33769,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/source-binding.json",
+      "sha256": "2be679120c9e3c85de1e9ae317637a3f699421644240191afe18a0fc2f1780a1"
+    },
+    "source-conservation.json": {
+      "bytes": 8348,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/source-conservation.json",
+      "sha256": "c0de55fe090fb91ee817aa51913f4dcbbb20dbfeb8b499fedeb074d547a16eac"
+    },
+    "to-993-true-inverse.diff.json": {
+      "bytes": 193631,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/to-993-true-inverse.diff.json",
+      "sha256": "f4969d2c4716023b14cad7d7c1e9a9526697311d9016319fff4b0bd147ad9105"
+    },
+    "to-c28-UI4-true-inverse.diff.json": {
+      "bytes": 197992,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/to-c28-UI4-true-inverse.diff.json",
+      "sha256": "5a93420daaf691ca7b09f87d7eece92be29ebe5cf4dfc6646b7e7dc8f503bf8b"
+    }
+  },
+  "author_freeze": {
+    "path": "/var/tmp/coord16-pr1549-7be-ui5-author-freeze-7wg34ie9/object-freeze.json",
+    "sha256": "647c35197fc7477d517a9886e3c73fda768c91af048bde45ef1ec57efd049b3c"
+  },
+  "changed_task_seams": [
+    "grouped_contracts:five exact UI singleton source contracts; successful visible nested stdout footer expectations remain zero.",
+    "parent_accounting:task labels and5parents/8phases cardinalities only, with exact source inverse.",
+    "main:separate original c28 proof identity from current7be; typed genuine new review/adoption/publication/DATA joins, safe nested archives, six names-only absence requirements, UI5 source/plan accounting.",
+    "Only WT/PLAN/PLAN_SHA globals and task source/data/hash/path bindings outside those three task functions; no integration callee alias."
+  ],
+  "conservation": {
+    "canonical9004_exact": true,
+    "compact_terminal_and_return_exact": true,
+    "full3790_exact": true,
+    "scope": "Three task functions plus task path/hash globals and source/data proof bindings; detailed forward/true inverse source receipts linked.",
+    "unchanged_nested": 5,
+    "unchanged_top_level": 29
+  },
+  "controller": {
+    "branch": "qualification/coord16-pr1549-7be-ui5",
+    "head": "b8961158ee6fe6a259f1c95e95c9289f299989bf",
+    "packet": "qualification-packets/pr1549-7be-ui5",
+    "sole_parent": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "65ffb6a4e6b03261d935983a160afb3dca0d4d86",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source"
+  },
+  "counts": {
+    "added_packet_files": 107,
+    "archive_binding_records": 95,
+    "hashed_payloads": 106,
+    "max_owning_passes": 5,
+    "other_pending_parents_not_invoked": 43,
+    "physical_dependency_and_source_snapshot_files": 90,
+    "planned_serial_phases": 8,
+    "product_entries_mode_type_blob_exact": 2223,
+    "source_pins": 47
+  },
+  "execution_authorized": false,
+  "future_scope": {
+    "actual_ELF": null,
+    "actual_inventory_N": null,
+    "actual_results": null,
+    "captured_default_scheduler": true,
+    "graph": [
+      "ui"
+    ],
+    "inventory_argv": [
+      "ACTUAL_ORIGINAL_UI_LIB_ELF",
+      "--list",
+      "--color=never"
+    ],
+    "original_absolute_workload_cap": 2400,
+    "phase_caps_seconds": [
+      600,
+      900,
+      30,
+      90,
+      90,
+      90,
+      90,
+      90
+    ],
+    "planned_cap_sum": 1980,
+    "selectors": [
+      "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+      "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+      "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+      "project_search::traversal::tests::deep_search_and_resource_failures_release_descriptors_with_a_low_child_limit"
+    ],
+    "singleton_argv": [
+      "ACTUAL_ORIGINAL_UI_LIB_ELF",
+      "EXACT_SELECTOR",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ]
+  },
+  "grant": null,
+  "independent_conservation_review": null,
+  "independent_controller_review": null,
+  "instruction_baseline_variance": {
+    "bytes_flags_changed_by_author": false,
+    "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+    "index_flag": "H AGENTS.md",
+    "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+    "latest_user_AGENTS_instructions_followed": true,
+    "variance": true
+  },
+  "kind": "FROZEN_AUTHOR_HANDOFF_PENDING_INDEPENDENT_SOURCE_CODE_AND_CONSERVATION_REVIEW",
+  "low_FD_source_only_contract": {
+    "actual_environment_inspected": false,
+    "expected_success_outer_visible_nested_stdout_results": 0,
+    "failed_outer_invocation_remains_FAIL_STOP": true,
+    "intrinsic_child_nonadditive": true,
+    "intrinsic_same_ELF_child": 1,
+    "natural_outer_child_flag_absence_required_by_name": "CAGENTS_SEARCH_FD_BUDGET_CHILD",
+    "original_child_output_files_and_assertions_source_pinned": true,
+    "separate_original_child_PID_wait_or_RAW_attestation": false
+  },
+  "next_owner_action": "Root routes exact frozen code and conservation review, then creates separate genuine review-bearing external handoff; only a later separately authenticated admission may authorize runtime.",
+  "original_final_source_tools": {
+    "full_retained_tool_results": 21,
+    "path": "/var/tmp/coord16-pr1549-7be-ui5-author-freeze-7wg34ie9/original-final-source-tools.json",
+    "sha256": "b32263dc4075ca0f58d2e4cb91fc0479549fe96fe0fb34613bef86d6e6d9375f"
+  },
+  "parked_integration": {
+    "receipt": "/var/tmp/coord16-linear918-integration1-priority-park-xyjjpnty/wip.json",
+    "sha256": "c985958307b16a4bfb7ee7bc61715d16f40734766e64692d154b793017752166",
+    "status": "UNCHANGED_PARKED_UNFROZEN_UNREVIEWED_WIP"
+  },
+  "product": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "sole_parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046"
+  },
+  "proofs": {
+    "command-data.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/command-data.json",
+      "sha256": "7609dfa3b65a4deb692df7770b4b984cf227827fd9a44e71c1704dd28361423b"
+    },
+    "current-source-map.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/current-source-map.json",
+      "sha256": "41e1e18d078cdc0b074414c03232a77e57829b4142f6c68dcf2c0b2190259d5e"
+    },
+    "from-993-forward.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/from-993-forward.diff.json",
+      "sha256": "5c1a6074001f8a776620ba60a9787c64de4ea0160f094a556e2d7181a20d1c3c"
+    },
+    "from-c28-UI4-forward.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/from-c28-UI4-forward.diff.json",
+      "sha256": "354a477758d0d7e1bbaf0b01ff2852cbcfe80ebc0329fcb9a6711bb23eca2b35"
+    },
+    "instruction-source.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/instruction-source.json",
+      "sha256": "399f888da8d60f7825a6671ef1e995baba2309749c3bffca56315ab2166e4e93"
+    },
+    "original-pre-freeze-source-tools.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/original-pre-freeze-source-tools.json",
+      "sha256": "4c34ceb6db57268a827083e28f6163401f5dbd3c6e7ad5e188c3ba6011ffc0bc"
+    },
+    "reconciliation.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/reconciliation.json",
+      "sha256": "efed45ec4a276fe07f1576da1ab13e73dee86d0daeb1fe6a90a9d363b9acafc2"
+    },
+    "selected-source-contract.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/selected-source-contract.json",
+      "sha256": "6ec5a6e364eb23fa83000c245d5b52dd9604ce5d89131c14984ea60af818a981"
+    },
+    "source-binding.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/source-binding.json",
+      "sha256": "2be679120c9e3c85de1e9ae317637a3f699421644240191afe18a0fc2f1780a1"
+    },
+    "source-conservation.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/source-conservation.json",
+      "sha256": "c0de55fe090fb91ee817aa51913f4dcbbb20dbfeb8b499fedeb074d547a16eac"
+    },
+    "to-993-true-inverse.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/to-993-true-inverse.diff.json",
+      "sha256": "f4969d2c4716023b14cad7d7c1e9a9526697311d9016319fff4b0bd147ad9105"
+    },
+    "to-c28-UI4-true-inverse.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/to-c28-UI4-true-inverse.diff.json",
+      "sha256": "5a93420daaf691ca7b09f87d7eece92be29ebe5cf4dfc6646b7e7dc8f503bf8b"
+    }
+  },
+  "prospective_invocation": {
+    "argv": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/run-packet.py",
+      "--grant",
+      null,
+      "--runner-sha256",
+      "153bc925907ccd722407140f96b93b3d5bec53e11dd1b05ba114417cf799ab38",
+      "--controller-review",
+      null,
+      "--controller-review-sha256",
+      null
+    ],
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source",
+    "execution_authorized": false,
+    "kind": "NOT_SUBMITTABLE_PRE_REVIEW_SOURCE_TEMPLATE",
+    "review_ABI": {
+      "controller_identity": "EXTERNAL_POSTCOMMIT",
+      "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+      "review": "PENDING_GENUINE_FROZEN_CODE_REVIEW",
+      "tree": "532d48f268b00fa658fea22a8418d41432879046"
+    }
+  },
+  "queue": null,
+  "scope_and_limits": [
+    "Original DATA48 pending parents is UI5 plus43 NOT_INVOKED/UNQUALIFIED; no worker21/front19/CLI3 claim.",
+    "Root DATA inventory/singleton planning argv is reconciled additively with canonical unchanged ABI, not asserted runtime-equivalent.",
+    "Source/post-finalization reservations are not new enforced aggregate deadlines; custody uncertainty retains indefinite HOLD.",
+    "Selected source may read inherited global Gitignore/config/ancestor information under Root addendum; this is not a fixture-only isolation claim. HOME/XDG/opaque authority remain natural and unread by authoring.",
+    "All Rust typing, algorithms, tests, native UI/keyboard/hover/scroll/performance/independent UX and integrated consumers remain UNRUN/HOLD.",
+    "Prior c28 actual proof/results and source negatives remain exact immutable history; no old runtime/N/count qualification transfers to7be.",
+    "No full ELF archive, embedded identity extraction, every-child-exec attestation or whole-kernel settlement proof is claimed."
+  ],
+  "source_pins": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    ".github/workflows/script-contracts.yml": "d0bd373b65d73b24c0d6df64bfe089cf20093e70566a597597d0ab15a4aff975",
+    "Cargo.lock": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d",
+    "Cargo.toml": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "crates/browser-import/Cargo.toml": "f5b6050089d17dbbb3f939c2dfd064c9e5b79a2c4e72d621c6d9c8083ddb0158",
+    "crates/ceditor/Cargo.toml": "ec03c70fe7f2151744e68208837dbe84e589b4940e0772c03427146be1237b76",
+    "crates/iced-contracts/Cargo.toml": "2b52fa79d91cb859f66855d5ea3ff8b01cb7ff9b0da1d12dd56daea0942c4d94",
+    "scripts/check-format": "8ac5f5ce28fe8d80229d6048b1a20edacfc9283f3cbc9d6f5100df632d089ee7",
+    "scripts/check-format-cache.py": "d722ec3c11165c22897630d0d5197afd49bd5d156c31068534c983153d3dd00b",
+    "scripts/prepare-validation-checkout": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+    "scripts/qualification/process_custody.py": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+    "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+    "src/app.rs": "c020d39216c6829c1416bea8ef021489d31de9dfddacb09fb07bf917c3197f55",
+    "src/app/chrome_ui.rs": "978db2251313b3c27541a584195d0e7c7bcc3ae705d552c94eefb9d998728f44",
+    "src/app/git_ui.rs": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+    "src/app/palette_ui.rs": "982b7391ba960d12d41e8c17270deb4b82e7840d4c66b365484d15934cc1c9ea",
+    "src/app/refresh_ui.rs": "87ce7af9d52272f62d15ccd8ed88871a8f015bd71a4fed32d6ec1347e65d4d86",
+    "src/app/search_ui.rs": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+    "src/app/settings_ui.rs": "ebabb40f72d28a46c3721dffeca3d237d86613accebe2af50251e53a9cce073e",
+    "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+    "src/fs_safety.rs": "23e606a5132e1f519d3c44e138e96b623f5f378824f6d2c3d37375a6561301f3",
+    "src/git_watch.rs": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8",
+    "src/interaction.rs": "7881579c46f30348f5b48c30319a38a89551e2bdbc9e47eda21cf2398a11f01e",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/model.rs": "cc4455180a27d116ff43f18ccb91e55fdf4dcc6aee43efc077df31948f270ba0",
+    "src/modules.rs": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f",
+    "src/process.rs": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47",
+    "src/project_search.rs": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+    "src/project_search/ignore_policy.rs": "7a78519d0450b2b701fc3ff44011b25a8d800a7df6e5377273d6757dd647aeb8",
+    "src/project_search/traversal.rs": "efe6e92570f66931b12c658765f6d3291a58620238c5ffd066d0752f84a2fd75",
+    "src/repository_widget.rs": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+    "src/settings.rs": "d9fffd9744ce76279865c1f9346e82e78c32d089b415f7830ddb06840b7a8932",
+    "src/sidebar.rs": "d158cd57a692865ace96995a968c6c32b7caf44a5190956adffb9ea9beaac9c9",
+    "src/ui_controls.rs": "ca1dfc78cd7e4cb18e6495f62ed4565debd8354e60637be62a32a7d72361b2b7",
+    "src/ui_controls/button.rs": "a03038b946f946a2afdec251bb4b8b99f1e8604e05ad3cc3413c8545293fce04",
+    "src/ui_controls/find_options.rs": "80b725764c0eacc95f1869768b1824eeceecb9a0fa68b3470b3867c9a34a56dd",
+    "src/ui_controls/gauge.rs": "72a89032143778b499b28208095186d4cdb1325ae95649fb45402c6d954bc6a6",
+    "src/ui_controls/owned.rs": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690",
+    "src/workspace_model.rs": "e7a38710703927852addf327b7433880fe110f014b36a438d28dc10950421782",
+    "src/workspace_widget.rs": "4ca92f5d0698ac66bc34199f6d6fa8043788cf2fa472da1eb5ed890965efb45e",
+    "tests/check_format.py": "2558dca124d3029b6fa351d777fdac377b211833481f58b77ef8a00fcb53a3e0",
+    "tests/linear_cli_contract.rs": "d41bf29c8d1accd7b03eaec7b315e466f5ec77aba682550b62f88c1d10ca8152",
+    "tests/prepare_validation_checkout.py": "8c74298c6d6caaabaf590d65ce081f4fd807f610a44203028da4ee3688507592",
+    "tests/qualification/test_process_custody.py": "90cbae4a068bddfda052d3e517e9320278d7b63e822198986a2e2aae4930fcec",
+    "tests/run-development-zig.py": "68582131d7bbea343801937830bb0519be438022e56de4a3d36aaa3b51910e20"
+  },
+  "writer_released": true
+}

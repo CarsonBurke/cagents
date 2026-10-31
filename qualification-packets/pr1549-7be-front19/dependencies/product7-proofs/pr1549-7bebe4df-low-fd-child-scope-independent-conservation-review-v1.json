@@ -1,0 +1,151 @@
+{
+  "authority_runtime_access": "NONE: only source text and Git objects read",
+  "authority_source_conclusion": "The only AUTHORITY_ENV reference in the new setup is a name comparison excluding that name from env_remove. The loop ignores values; it does not select, read back, set, copy into Command, serialize, print or remove the authority value. Inheritance remains opaque. Every enumerated other parent environment name is explicitly removed, after which the same CHILD=1 and private HOME overrides are applied. This matches the already-existing CLI fixture name-filter pattern.",
+  "cfg_and_Host_bound": {
+    "Cargo_and_modules_exact_c28": true,
+    "changed_module_ui_only": true,
+    "isolated_host_feature_closure_excludes_ui_and_integrated_browser": true,
+    "qualification": "The changed test module is absent from isolated HOST-only source graph; unchanged c28 HOST contracts remain unchanged source. No actual old receipt audit or newhead compile/execution is claimed.",
+    "test_setup_cfg_test_only": true
+  },
+  "custody_and_oracle_conclusions": [
+    "The same current executable and exact owning selector are supplied with --exact/--nocapture/--test-threads=1. The setup now uses a local Command builder before spawn; no new child, helper executable or process-discovery mechanism is added.",
+    "Original OwnedChild Drop still kills and waits for its original Child. From the unchanged CHILD/HOME/stdout/stderr/spawn chain onward, all source bytes are exact: original child handle,30-second deadline, try_wait loop, timeout kill+wait, output reads, success/one-owning-test assertions and raw child output framing.",
+    "child_cases is byte-identical, including descriptor budget, deep/wide traversal, actual EMFILE, cancellation/refusal and descriptor-release assertions. The other existing traversal parent is byte-identical. Two static test parents remain two; no nested branch or child run is credited as an additional test parent.",
+    "All production bytes and all other2222 tracked mode/type/blob entries are exactc28, including previous fixture corrections, current-main merge, Cargo/cfg, workflow, HOST/native/proof/permissions/quarantine/Seed/1749 source. Replacing only the new setup with the old setup reconstructs the entire traversal source byte-for-byte."
+  ],
+  "delta": {
+    "all2222_other_entries_exact_c28_modes_types_blobs": true,
+    "all_module_bytes_exact_outside_one_setup": true,
+    "all_production_before_cfg_test_module_bytes_exact_c28": true,
+    "deletions": 3,
+    "entire_in_memory_setup_inverse_reconstructs_parent_source": true,
+    "insertions": 9,
+    "no_added_deleted_path_or_mode_type_change": true,
+    "only_cfg_test_setup_changed": true,
+    "path": "src/project_search/traversal.rs"
+  },
+  "format_metadata": {
+    "diff_check_commit": "2ef3f4 EXIT0",
+    "exit": 0,
+    "final": "60b5ad",
+    "session": 50828,
+    "start": "9c2725"
+  },
+  "limits": [
+    "All current7bebe builds, compiler/test/body/helper/self-child/CLI/native/provider execution, full Search inventory/selection and UX/performance remain UNRUN here. No authority/environment/current-state value was inspected; only source text and immutable Git objects were read.",
+    "Official format/diff0 is recorded in the freeze and was not executed by this reviewer.",
+    "No new blocker identified in this finite source-conservation scope. It is not whole-PR semantic/selection/readiness, new-head runtime, process-policy, authority, merge/publication or permission approval.",
+    "No source/Git/ref writes, imports/candidate calls, process/account/DB/environment/resource/target probes, compiler/tests/ELF inspection, child/newworker or public write. Only this task-owned /tmp receipt was written."
+  ],
+  "old_evidence_boundary": {
+    "C": "Root reports NO_CURRENT_LEASE. No admission, allocation, C grant or execution was requested/performed by this review; c28 UI4 remains UNRUN/ungranted.",
+    "qualification": "The earlier c28 HOST3 scope observes unchanged HOST-only source contracts and may remain attached to its exact old source/evidence boundaries. This seal does not audit its original runtime receipt, relabel it to7bebe, or establish any new-head compile/test/native result.",
+    "source_graph": "project_search is gated by featureui at src/modules.rs:102-103; the changed setup is further inside #[cfg(test)] traversal::tests. Cargo/modules are exactc28 and the isolated host feature closure excludes ui/integrated-browser."
+  },
+  "owning_parent": {
+    "all2_test_parent_names_order_exact": true,
+    "body_sha256": "7319e284a9cf80b3f4a13705413701679e73d2cd7cb76f43459a4b4aefca7e1b",
+    "child_cases_helper_body_exact": true,
+    "line": 569,
+    "new_parent_count": 0,
+    "old_line": 569,
+    "original_OwnedChild_Drop_guard_exact": true,
+    "other1_parent_function_body_exact": true,
+    "prefix_before_Command_setup_exact": true,
+    "selector": "project_search::traversal::tests::deep_search_and_resource_failures_release_descriptors_with_a_low_child_limit",
+    "static_parent_count": 2,
+    "suffix_from_CHILD_HOME_streams_spawn_through_deadline_kill_wait_assertions_output_exact": true
+  },
+  "pins": {
+    "Cargo.lock": {
+      "entry": {
+        "mode": "100644",
+        "oid": "20f963235fff416f76487a8a74a9f4b1d7bb4f8d",
+        "type": "blob"
+      },
+      "exact_c28": true,
+      "sha256": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d"
+    },
+    "Cargo.toml": {
+      "entry": {
+        "mode": "100644",
+        "oid": "5a981df1f743b2ccf624d498d24d3df120f13116",
+        "type": "blob"
+      },
+      "exact_c28": true,
+      "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac"
+    },
+    "src/app/search_ui.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "812b30fb212924f19957cb42b8d5ce359dd7da37",
+        "type": "blob"
+      },
+      "exact_c28": true,
+      "sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534"
+    },
+    "src/modules.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "6db64e6c78a4a733ab00ed07cb780e8bdb7b05ab",
+        "type": "blob"
+      },
+      "exact_c28": true,
+      "sha256": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f"
+    },
+    "src/project_search/traversal.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "e192a308d1828483171501130a886114689b2a57",
+        "type": "blob"
+      },
+      "exact_c28": false,
+      "sha256": "efe6e92570f66931b12c658765f6d3291a58620238c5ffd066d0752f84a2fd75"
+    },
+    "tests/linear_cli_contract.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "e8447735228567f3c77d7c29a387ff8a6ac326b4",
+        "type": "blob"
+      },
+      "exact_c28": true,
+      "sha256": "d41bf29c8d1accd7b03eaec7b315e466f5ec77aba682550b62f88c1d10ca8152"
+    }
+  },
+  "preserved_c28_receipt": {
+    "path": "/tmp/pr1549-c28e76c7-two-fixture-correction-independent-conservation-review-v1.json",
+    "sha256": "283ea3f460f4ff0ec7c07692c2e63339f9c8e90ba66b6717950c8c8f1e8c0202"
+  },
+  "read_end_worktree": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "status": ""
+  },
+  "reviewer": "/root/1281_holder_reconcile_review",
+  "schema": "pr1549_7bebe4df_low_fd_child_scope_independent_conservation_review_v1",
+  "scope": "Only the9+/3- owning cfg(test) low-FD self-child Command environment setup vs c28. Full Search selection/admission audit belongs to the separate worker and is not repeated.",
+  "setup": {
+    "AUTHORITY_value_not_explicitly_looked_up_copied_serialized_printed_or_removed": true,
+    "existing_CHILD_1_and_private_HOME_readded_unchanged": true,
+    "new_setup_sha256": "3bda9b5431e64cee86fd38d7f61e72081107aad8709b872e868a7a83d4ae4f4d",
+    "non_AUTHORITY_env_names_removed": true,
+    "old_setup_sha256": "aa32102ae21aa1ea7b0565ca704fc6e33ce2b54162252d6bc7f4f32f69eef172",
+    "one_AUTHORITY_symbol_occurrence_only_in_exclusion_comparison": true,
+    "same_current_exe_and_exact_args": true,
+    "same_existing_CLI_fixture_name_filter_pattern": true
+  },
+  "source": {
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-low-fd-child-scope-source-freeze-v1.json",
+      "sha256": "f3e5626484baf74bfd80b67ca32f159145bebf4871766358e35ce0276439f0e9"
+    },
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "parents": [
+      "c28e76c72425a59abd32d977cef2c7995e8095c3"
+    ],
+    "status": "",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope"
+  },
+  "verdict": "BOUNDED_TEST_SETUP_CONSERVATION_SOURCE_CLEAR_EXECUTION_UNRUN"
+}

@@ -1,0 +1,502 @@
+{
+  "addendum": {
+    "path": "/tmp/fw16-backend-ec204421/pr1549-7be-full-feature-qualification-source-binding-addendum-v1.json",
+    "sha256": "28c949506a78c96eda81a0a791c731851f6e29cc2a1c01cb1f268663262e3993"
+  },
+  "admission_statement_review": [
+    {
+      "conclusion": "New source excludes AUTHORITY_ENV from environment removals and leaves it naturally inherited; no authority value was read or substituted. Natural external CAGENTS_SEARCH_FD_BUDGET_CHILD absence remains required because572 selects child_cases immediately when present. Do not inject that flag into the outer caller to bypass the original parent/spawn path. Old c28 env_clear HOLD remains historical; new source clear is not runtime admission.",
+      "subject": "Natural context and authority"
+    },
+    {
+      "conclusion": "Root now explicitly allows bounded read-only production global Git ignore/configuration/ancestor-ignore discovery inside existing sandbox. This resolves the old DATA scope prerequisite, not via probes or context substitution. Outer HOME/XDG/authority remain unchanged. The source child retains its previously authored private HOME and cwd fixture at597\u2013598; this is unchanged test-internal setup, not an external runner substitution. Preparation read no private configuration or current environment values.",
+      "subject": "HOME/XDG and inherited configuration"
+    },
+    {
+      "conclusion": "Static48 is selector cardinality, not libtest inventory N. Actual new CLI/UI ELF paths, hashes and N remain null/unknown until original authenticated compile/inventory. Old DATA --list --format terse is not canonical executable ABI. Future source author must explicitly bind the canonical full inventory --list --color=never and its actual parser/format, plus exact singleton names and ordinary captured outer policy. This review changes no controller or argv and grants nothing.",
+      "subject": "Counts, inventory and future executable ABI"
+    },
+    {
+      "conclusion": "Addendum arithmetic is correct: UI5 workload1980s, worker21 workload2190s, front/editor19 workload2070s, each below2400. These are workload sums, not newly enforced aggregate guarantees; final source must reconcile its reservations and canonical packet cap. Original custody/evidence uncertainty remains HOLD after workload cap. No cache availability, queue place, lane ownership or grant is inferred.",
+      "subject": "Caps and evidence closure"
+    },
+    {
+      "conclusion": "The test retains the same actual std::process::Child and original try_wait/wait/timeout/Drop sites. Source conservation is not runtime settlement evidence and establishes no every-exec, unknown-descendant, kernel-family closure or provider claim.",
+      "subject": "Child process custody limit"
+    },
+    {
+      "conclusion": "All new-head Rust checks, inventory,48 parents, ceditor/integrated consumer checks and native flow/UX/WebPs/performance remain UNRUN here. Genuine old c28 HOST3 remains accepted only in its recorded scope. Source adoption and publication do not transfer an execution result or grant.",
+      "subject": "Qualification limits"
+    }
+  ],
+  "canonical_child_output_accounting": {
+    "additive_child_parent_credit": 0,
+    "expected_stderr_child_results": 0,
+    "expected_stdout_child_results": 0,
+    "low_FD_selector": "project_search::traversal::tests::deep_search_and_resource_failures_release_descriptors_with_a_low_child_limit",
+    "negative_visibility": "A failed outer test may expose captured output; preserve whatever original bytes actually occur. Do not strip a real child footer, invent absent markers, require a suppressed marker for a positive pass, or credit it as an extra parent.",
+    "old_DATA_override": "Old held_child_policy wording requiring separately captured child markers/footer is historical. It must not become an impossible mandatory positive outer-RAW requirement for default capture. This explicit accounting is a required prospective binding for the future source author.",
+    "outer_singleton_policy": "Actual outer default scheduler and default libtest capture, ordinary pretty output; preserve source child --exact TEST --nocapture --test-threads=1. No outer nocapture/show-output override.",
+    "owning_outer_parent_credit": 1,
+    "positive_visibility": "On a passing default-captured outer test, parent print!/eprint! output is captured and suppressed. Temporary child files are not separately archived by this source. The canonical successful archived outer stream therefore expects zero child footer/result records, not one.",
+    "source_chain": [
+      "src/project_search/traversal.rs:587 child args",
+      "src/project_search/traversal.rs:599 child stdout/stderr regular files",
+      "src/project_search/traversal.rs:607 actual same Rust Child try_wait",
+      "src/project_search/traversal.rs:613 same Child wait on timeout",
+      "src/project_search/traversal.rs:617 read child files",
+      "src/project_search/traversal.rs:619 status and child footer assertions",
+      "src/project_search/traversal.rs:623 print child stdout",
+      "src/project_search/traversal.rs:626 eprint child stderr"
+    ],
+    "source_same_ELF_inline_child_invocations": 1,
+    "what_a_pass_can_establish": "A source-bound owning-parent pass can qualify its assertions, including observed child success and matching footer. It does not independently archive or authenticate child RAW streams/markers unless those bytes are actually present in retained original evidence."
+  },
+  "findings": [],
+  "future_source_author_required_reconciliations": [
+    "Bind updated7be pins and exact48 selectors, without stale c28 execution claims.",
+    "Set canonical expected_stdout_child_results=0 for successful default-captured low-FD outer parent, with no independent child RAW requirement or additive credit.",
+    "Reconcile canonical --list --color=never/full inventory versus old terse DATA before any actual executor invocation.",
+    "Bind genuine phase/finalisation/custody caps and actual inherited-context absence refusals in the existing reviewed executor; no new framework."
+  ],
+  "genuine_source_review_and_publication_refs": [
+    {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-7bebe4df-low-fd-scope-root-source-adoption-v1.json",
+      "sha256": "3c1547c781a6a624b570035f1eceac14ab9c7ab1663d711ea0035cf23254ca7b"
+    },
+    {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-7bebe4df-reviewed-source-publication-v1.json",
+      "sha256": "da981cd62a7df706a509a3c095ddb6d53d360cd24442a9ec513199f90aaeb074"
+    },
+    {
+      "path": "/tmp/pr1549-7bebe4df-low-fd-authority-custody-independent-source-review-v1.json",
+      "scope": "Existing source/custody or conservation verdict retained; not re-audited as a runtime proof.",
+      "sha256": "85967cf2f75f0dd4b48a89308a242b919e5fc842add05084d839ee41cd61d65d"
+    },
+    {
+      "path": "/tmp/pr1549-7bebe4df-low-fd-child-scope-independent-conservation-review-v1.json",
+      "scope": "Existing source/custody or conservation verdict retained; not re-audited as a runtime proof.",
+      "sha256": "1c76e11d9b425c041de746c1bb4a8568309c85f449167dbe715ef8e44d0b6c60"
+    }
+  ],
+  "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+  "original_DATA_immutable": {
+    "path": "/tmp/pr1549-c28-full-feature-remaining-qualification-DATA-v1.json",
+    "sha256": "7190a9f8d0825b75bc5bbf1b5a6acd06c66183fe89d1bc7dfd6bb06999fe6a40"
+  },
+  "performed": "Immutable source/tree and supplied addendum/receipt reads, static cfg/selector and SHA256 comparisons, own report only. No compiler/ELF/runtime/C/cache/resource/current environment or authority probe, provider/native operation, child, source/controller/public write or execution grant.",
+  "review_scope": "Final addendum binding, selector/dedup/cfg correction and prospective admission/output statements only. Reuses genuine existing source reviews; no new all-scope audit.",
+  "reviewer": "/root/1954_directory_durability_bound",
+  "schema": "pr1549_7be_final_qualification_DATA_binding_independent_review_v1",
+  "selector_binding": {
+    "HOST3": "c28 accepted old-head scope only, per Root addendum/adoption. No HOST3 name is re-counted in pending48; no old HOST N3106 is transferred into new UI/CLI inventories. This review did not read RAW or re-accept that execution.",
+    "classification": "45 UI and3 CLI, all source-present with unchanged gates. UI5 is old4 unrun UI parents plus corrected low-FD parent. Other groups exactly conserve old DATA selector order.",
+    "dedup_exact": true,
+    "ignored_benchmark": "repository_first_result_latency remains outside selected48 and unqualified; no ignored flag or benchmark input is synthesized.",
+    "pending_groups": {
+      "UI5_first": 5,
+      "front_editor_UI19": 19,
+      "remaining_worker_UI21": 21,
+      "shared_CLI3": 3
+    },
+    "unique_new_head_pending": 48,
+    "verified_selectors": [
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1232,
+        "graph": "ui",
+        "group": "UI5_first",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1345,
+        "graph": "ui",
+        "group": "UI5_first",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 849,
+        "graph": "ui",
+        "group": "UI5_first",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 917,
+        "graph": "ui",
+        "group": "UI5_first",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 569,
+        "graph": "ui",
+        "group": "UI5_first",
+        "path": "src/project_search/traversal.rs",
+        "selector": "project_search::traversal::tests::deep_search_and_resource_failures_release_descriptors_with_a_low_child_limit"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 709,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::ignore_hidden_globs_and_options"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 736,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 838,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 874,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 926,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 943,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::large_search_streams_first_results_before_completion"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 976,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1056,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1104,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::deep_ignore_error_terminates_without_a_finished_event"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1120,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::regex_errors_and_binary_files"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1132,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::content_search_never_follows_links_outside_the_selected_root"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1176,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1204,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1234,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1269,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::caps_results_and_cancels_during_delivery"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1301,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1331,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1451,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search.rs",
+        "selector": "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 419,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search/ignore_policy.rs",
+        "selector": "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 462,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search/ignore_policy.rs",
+        "selector": "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 302,
+        "graph": "ui",
+        "group": "remaining_worker_UI21",
+        "path": "src/project_search/traversal.rs",
+        "selector": "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 998,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1036,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1126,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1177,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::held_result_and_submit_cannot_open_a_new_queries_same_index"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1435,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/app/search_ui.rs",
+        "selector": "app::search_ui::tests::new_queries_cancel_old_search_and_reject_stale_batches"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 12754,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 12790,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::file_location_jumps_separate_same_position_deletions_in_undo"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 12818,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::cached_file_and_search_jumps_retire_the_previous_completion_intent"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 12848,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::deferred_search_location_applies_after_the_requested_loading_path"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 12911,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 12950,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::scanned_search_location_validates_the_actual_deferred_file_read"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 12988,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 13049,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 13089,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/repository_widget.rs",
+        "selector": "repository_widget::tests::failed_search_read_drops_its_guard_before_a_later_ordinary_reopen"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1288,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/app/palette_ui.rs",
+        "selector": "app::palette_ui::tests::project_content_search_palette_command_requires_a_selected_root_and_opens_search"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 1621,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/app/settings_ui.rs",
+        "selector": "app::settings_ui::tests::keyboard_page_renders_project_content_search_and_records_its_actual_field"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 3118,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/workspace_widget.rs",
+        "selector": "workspace_widget::tests::project_content_search_uses_its_own_configurable_chord"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 3403,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/workspace_widget.rs",
+        "selector": "workspace_widget::tests::project_search_and_pane_find_have_distinct_workspace_chords"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 415,
+        "graph": "ui",
+        "group": "front_editor_UI19",
+        "path": "src/app/refresh_ui.rs",
+        "selector": "app::refresh_ui::tests::activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 2079,
+        "graph": "cli",
+        "group": "shared_CLI3",
+        "path": "src/fs_safety.rs",
+        "selector": "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 3674,
+        "graph": "cli",
+        "group": "shared_CLI3",
+        "path": "src/settings.rs",
+        "selector": "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord"
+      },
+      {
+        "actual_inventory_N": null,
+        "definition_line": 3628,
+        "graph": "cli",
+        "group": "shared_CLI3",
+        "path": "src/settings.rs",
+        "selector": "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords"
+      }
+    ]
+  },
+  "sole_parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "status": "BOUNDED_SOURCE_DATA_BINDING_CLEAR_WITH_EXPLICIT_CHILD_OUTPUT_ACCOUNTING",
+  "tree": "532d48f268b00fa658fea22a8418d41432879046",
+  "verified_source_binding": {
+    "all_other_entries_exact_parent_modes_types_blobs": 2222,
+    "exact_delta_sha256": "ce529b945eb3f98424328448d57a1a8c1ed678e2b8e59c3621768fafbadb5c83",
+    "inverse_replacement_of_environment_setup_reconstructs_entire_parent_leaf": true,
+    "only_changed_path": "src/project_search/traversal.rs",
+    "production_prefix_exact_parent": true,
+    "source_child_args_algorithms_assertions_waits_and_output_calls_unchanged": true,
+    "updated_pins_all_verified": 22
+  }
+}
