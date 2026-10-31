@@ -5835,95 +5835,133 @@ mod tests {
     fn review_artifact_button_retains_exact_uri_and_rendered_origin_without_answering() {
         use iced::advanced::{Layout, Shell, Widget, clipboard, layout, mouse, widget::Tree};
         use iced::{Event, Point, Rectangle, Size};
-        let question = "Compare tree-real-*.png and [Expanded](docs/tree%20expanded.png).";
-        let request = chat::Request {
-            kind: chat::RequestKind::Question,
-            id: "review".into(),
-            title: "Review".into(),
-            description: String::new(),
-            fields: vec![chat::Field {
-                id: question.into(),
-                label: question.into(),
-                description: "Screenshots".into(),
-                choices: vec![],
-                multiple: false,
-                secret: false,
-                initial: String::new(),
-            }],
-            actions: vec![],
-        };
-        let answers = Answers::new();
-        let target = Target {
-            card: CardId::new(),
-            generation: 17,
-        };
-        let document = Some(PathBuf::from("/producing/worktree/.chat"));
-        let mut element =
-            request_view(target, &request, &answers, true, RequestSurface::Transcript)
-                .map(move |message| capture_document_link(message, target, &document));
-        let renderer = crate::app::tests::headless_renderer();
-        let mut tree = Tree::new(element.as_widget());
-        let viewport = Rectangle::with_size(Size::new(520.0, 1000.0));
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(Size::ZERO, viewport.size()),
-        );
-        let accessible =
-            element
-                .as_widget()
-                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
-        let buttons: Vec<_> = accessible
-            .root()
-            .iter()
-            .chain(accessible.children())
-            .filter(|node| {
-                node.node().role() == iced_accessibility::accesskit::Role::Button
-                    && node
-                        .node()
-                        .label()
-                        .is_some_and(|label| label.starts_with("Open artifact:"))
-            })
-            .collect();
-        assert_eq!(
-            buttons.len(),
-            1,
-            "the bare pattern never becomes a file action"
-        );
-        assert_eq!(buttons[0].node().label(), Some("Open artifact: Expanded"));
-        let bounds = buttons[0].node().bounds().unwrap();
-        let cursor = mouse::Cursor::Available(Point::new(
-            ((bounds.x0 + bounds.x1) / 2.0) as f32,
-            ((bounds.y0 + bounds.y1) / 2.0) as f32,
-        ));
-        let mut messages = Vec::new();
-        for event in [
-            mouse::Event::ButtonPressed(mouse::Button::Left),
-            mouse::Event::ButtonReleased(mouse::Button::Left),
+        for (question, button_label, expected_uri) in [
+            (
+                "Compare tree-real-*.png and [Expanded](docs/tree%20expanded.png).",
+                "Open artifact: Expanded",
+                "docs/tree%20expanded.png",
+            ),
+            (
+                "Compare tree-real-*.png and [Manifest](Cargo.toml:42).",
+                "Open artifact: Manifest",
+                "Cargo.toml:42",
+            ),
+            (
+                "Compare tree-real-*.png and [Source](main.rs:42:7).",
+                "Open artifact: Source",
+                "main.rs:42:7",
+            ),
+            (
+                "Compare tree-real-*.png and [Unicode source](src/résumé.rs:9:2).",
+                "Open artifact: Unicode source",
+                "src/résumé.rs:9:2",
+            ),
+            (
+                "Compare tree-real-*.png and [Source revision](file:///producing/worktree/main.rs?revision=7:3#L12:3).",
+                "Open artifact: Source revision",
+                "file:///producing/worktree/main.rs?revision=7:3#L12:3",
+            ),
+            (
+                "Compare tree-real-*.png and [Filtered source](FILE:/producing/worktree/main.rs?filter=*?[one]{a,b}#section[one]).",
+                "Open artifact: Filtered source",
+                "FILE:/producing/worktree/main.rs?filter=*?[one]{a,b}#section[one]",
+            ),
+            (
+                "Compare tree-real-*.png and [Literal source](file:///producing/worktree/literal%2A%3F%5Bone%5D.rs?revision=7:3#L12:3).",
+                "Open artifact: Literal source",
+                "file:///producing/worktree/literal%2A%3F%5Bone%5D.rs?revision=7:3#L12:3",
+            ),
         ] {
-            element.as_widget_mut().update(
+            let request = chat::Request {
+                kind: chat::RequestKind::Question,
+                id: "review".into(),
+                title: "Review".into(),
+                description: String::new(),
+                fields: vec![chat::Field {
+                    id: question.into(),
+                    label: question.into(),
+                    description: "Screenshots".into(),
+                    choices: vec![],
+                    multiple: false,
+                    secret: false,
+                    initial: String::new(),
+                }],
+                actions: vec![],
+            };
+            let answers = Answers::new();
+            let target = Target {
+                card: CardId::new(),
+                generation: 17,
+            };
+            let document = Some(PathBuf::from("/producing/worktree/.chat"));
+            let mut element =
+                request_view(target, &request, &answers, true, RequestSurface::Transcript)
+                    .map(move |message| capture_document_link(message, target, &document));
+            let renderer = crate::app::tests::headless_renderer();
+            let mut tree = Tree::new(element.as_widget());
+            let viewport = Rectangle::with_size(Size::new(520.0, 1000.0));
+            let node = element.as_widget_mut().layout(
                 &mut tree,
-                &Event::Mouse(event),
-                Layout::new(&node),
-                cursor,
                 &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                mouse::Cursor::Unavailable,
+            );
+            let buttons: Vec<_> = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .filter(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node
+                            .node()
+                            .label()
+                            .is_some_and(|label| label.starts_with("Open artifact:"))
+                })
+                .collect();
+            assert_eq!(
+                buttons.len(),
+                1,
+                "the bare pattern never becomes a file action"
+            );
+            assert_eq!(buttons[0].node().label(), Some(button_label));
+            let bounds = buttons[0].node().bounds().unwrap();
+            let cursor = mouse::Cursor::Available(Point::new(
+                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+            ));
+            let mut messages = Vec::new();
+            for event in [
+                mouse::Event::ButtonPressed(mouse::Button::Left),
+                mouse::Event::ButtonReleased(mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Mouse(event),
+                    Layout::new(&node),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+            }
+            assert!(
+                matches!(messages.as_slice(), [Message::ChatUi(Action::OpenDocumentFrom(found, Some(origin), uri))]
+                if *found == target && origin == Path::new("/producing/worktree/.chat") && uri == expected_uri)
+            );
+            assert_eq!(
+                request.fields[0].id, question,
+                "the provider answer key stays literal"
+            );
+            assert!(
+                answers.is_empty(),
+                "opening an artifact must not answer the question"
             );
         }
-        assert!(
-            matches!(messages.as_slice(), [Message::ChatUi(Action::OpenDocumentFrom(found, Some(origin), uri))]
-            if *found == target && origin == Path::new("/producing/worktree/.chat") && uri == "docs/tree%20expanded.png")
-        );
-        assert_eq!(
-            request.fields[0].id, question,
-            "the provider answer key stays literal"
-        );
-        assert!(
-            answers.is_empty(),
-            "opening an artifact must not answer the question"
-        );
     }
 
     #[test]

@@ -764,6 +764,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn document_link_coordinates_survive_dispatch_and_file_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.md");
+        let target = directory.path().join("target.txt");
+        let encoded_name = directory.path().join("target#part?.txt");
+        let numeric_name = directory.path().join("target.txt:12:3");
+        let text: String = (1..=16)
+            .map(|line| format!("line {line:02} content\n"))
+            .collect();
+        std::fs::write(&source, "[target](target.txt#L12:3)\n").unwrap();
+        std::fs::write(&target, &text).unwrap();
+        std::fs::write(&encoded_name, &text).unwrap();
+        std::fs::write(&numeric_name, &text).unwrap();
+        let file_url = Url::from_file_path(&target).unwrap();
+        for (uri, expected_path, line, column) in [
+            ("target.txt#L12:3".to_owned(), &target, 11, 2),
+            (format!("{}#L12:3", target.display()), &target, 11, 2),
+            (format!("{file_url}#L12:3"), &target, 11, 2),
+            ("target.txt:12:3".to_owned(), &target, 11, 2),
+            ("target.txt?revision=7:3".to_owned(), &target, 0, 0),
+            ("target.txt?revision=7:3#L12:3".to_owned(), &target, 11, 2),
+            ("target%23part%3F.txt:12:3".to_owned(), &encoded_name, 11, 2),
+            (
+                format!("file:{}", numeric_name.display()),
+                &numeric_name,
+                0,
+                0,
+            ),
+            (
+                format!("FILE:{}", numeric_name.display()),
+                &numeric_name,
+                0,
+                0,
+            ),
+        ] {
+            let mut app = app();
+            let terminal = app.workspace.focused().unwrap();
+            let task = app.update(Message::OpenDocumentLink(
+                terminal,
+                Url::from_file_path(&source).unwrap().into(),
+            ));
+            settle(&mut app, task).await;
+            let editor = app.workspace.focused().unwrap();
+            assert_ne!(editor, terminal);
+            assert_eq!(
+                runtime(&app, editor).selected_path(),
+                Some(Path::new("source.md"))
+            );
+
+            // Use the actual rendered-document action and loader callbacks;
+            // the fragment must also survive the deferred Loading state.
+            let task = app.update(Message::Repository(RepositoryAction::MarkdownLink {
+                card: editor,
+                uri: uri.clone(),
+            }));
+            settle(&mut app, task).await;
+            let runtime = runtime(&app, editor);
+            assert_eq!(app.workspace.focused(), Some(editor), "{uri}");
+            assert_eq!(
+                runtime
+                    .descriptor
+                    .worktree
+                    .join(runtime.selected_path().unwrap()),
+                *expected_path,
+                "{uri}"
+            );
+            assert_eq!(
+                runtime.editor_text().as_deref(),
+                Some(text.as_str()),
+                "{uri}"
+            );
+            assert_eq!(
+                runtime.cursor_position(),
+                Some(crate::lsp::LspPosition::new(line, column)),
+                "{uri}"
+            );
+            assert!(!runtime.is_dirty(), "navigation must not edit {uri}");
+            assert_eq!(
+                std::fs::read_to_string(expected_path).unwrap(),
+                text,
+                "{uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn local_document_links_resolve_relative_paths_but_chat_rejects_remote_files() {
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("first.md");
