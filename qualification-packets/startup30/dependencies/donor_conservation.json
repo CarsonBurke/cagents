@@ -1,0 +1,116 @@
+{
+  "kind": "AUTHOR_OPTION_B_R3_REQUIRED_EVIDENCE_SOURCE_CONSERVATION_NOT_INDEPENDENT_REVIEW",
+  "prior_head": "66b650de6b3e4079009089c3f3be7cd2b68a4d23",
+  "runner_sha256": "f820d314bda28a4e183a50ace3b05fb4ca0506d12ebb6b41bfdb868039a497ae",
+  "plan_sha256": "f8f4ce29c17716463777ae4fcc247f895e917f779772e820922f398de1ef68fe",
+  "24_generic_byte_exact": {
+    "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+    "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+    "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+    "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+    "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+    "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+    "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+    "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+    "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+    "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+    "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+    "settle_children": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
+    "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+    "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+    "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+    "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad",
+    "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+    "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+    "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+    "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+    "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+    "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+    "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9"
+  },
+  "four_original_nested_main_byte_exact": {
+    "read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
+    "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711",
+    "context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
+    "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06"
+  },
+  "one_added_task_nested_binder": "invoke_fixture_group",
+  "new_task_top_functions": [
+    "cargo_helper_artifact",
+    "task_elf_observation",
+    "task_group_assets"
+  ],
+  "only_changed_existing_top_functions_vs246": [
+    "execute_contracts",
+    "main"
+  ],
+  "R1_R2_bodies_byte_exact246": true,
+  "main_summary_and_return_byte_exact246": true,
+  "protected_acquire_finalize_Cclose_exact": true,
+  "protected_block_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+  "sole_added_binder_environment_assignment": [
+    "scoped_env[key]"
+  ],
+  "no_new_os_environ_write_or_authority_lookup": true,
+  "binder_restore_in_finally_source_present": true,
+  "diffs": {
+    "cli5": {
+      "forward": {
+        "path": "from-cli5.diff",
+        "sha256": "20bc844a18ff31525cbc108f6fa1a752d60021ad8d9dbb1d986b500d1d46ed3a"
+      },
+      "true_inverse": {
+        "path": "to-cli5.inverse.diff",
+        "sha256": "08186f5a85596463df3f46504c498abf151cbfa7a3f4b2d93c76443a482f5fff"
+      },
+      "bounded_line_reconstruction_byte_equal": true
+    },
+    "option-b": {
+      "forward": {
+        "path": "option-b.diff",
+        "sha256": "1c110b24414494f9568d859a82b8cd367a9f04f92fd8470d4441d8bd5f02bad6"
+      },
+      "true_inverse": {
+        "path": "option-b.inverse.diff",
+        "sha256": "6cc02503c1e882e63f50aa95d1518021cdccc1fff39712238210bc9712852e08"
+      },
+      "bounded_line_reconstruction_byte_equal": true
+    },
+    "required-evidence-sticky": {
+      "forward": {
+        "path": "required-evidence-sticky.diff",
+        "sha256": "3c053fdd9e21c5a65e362bf5c34be6e6fc785bf40ea103277eabfedfeca28c4a"
+      },
+      "true_inverse": {
+        "path": "required-evidence-sticky.inverse.diff",
+        "sha256": "c51d95565a6090b3312e90d0f6685a5b275faf5f2b43f048e2aeefcf4b0017b4"
+      },
+      "bounded_line_reconstruction_byte_equal": true
+    }
+  },
+  "source_identity_proof": "option-b-source-proof.json",
+  "all_candidate_function_calls_imports_tests_compile": "UNRUN",
+  "all_actual_runtime_facts": null,
+  "fresh_option_B_code_review": null,
+  "old_author_utility_session_status_wait": "UNKNOWN; no closure inference",
+  "archive_bindings": 33,
+  "full_genuine_conservation_bytes": 851665,
+  "option_b_design_base_head": "24601394d541c85ee123bcfb4a3c089a5f659cb3",
+  "only_changed_existing_top_functions_vs66": [
+    "execute_contracts"
+  ],
+  "main_body_byte_exact66": true,
+  "all_original_and_task_functions_except_execute_contracts_byte_exact66": true,
+  "existing_initial_helper_observation_guard_byte_exact66": true,
+  "required_write_original_exception_rethrows": true,
+  "prior_R3_negative_review": {
+    "path": "dependencies/option_b_r3_negative_review.json",
+    "original_path": "/var/tmp/coord16-2025-option-b-code-independent-ijmhz64b/review.json",
+    "sha256": "a1d4c265730347e6fa1a716cb8f5381ae19ad63486499fd735fd11b7e1ad362b",
+    "bytes": 6279,
+    "scope": "Original frozen66 CHANGES_REQUIRED R3 history only; not successor approval"
+  },
+  "runtime_archive_bindings_unchanged": true,
+  "additional_historical_R3_archives": 1
+}

@@ -1,0 +1,105 @@
+{
+  "blocking_findings": [],
+  "controller_head": "d412d6fdb7f137df179b415aae18e4e5cabc3a1a",
+  "controller_parent": "66b650de6b3e4079009089c3f3be7cd2b68a4d23",
+  "controller_tree": "3de03d67fbe2a2a8f3bab931d83d9734a430399f",
+  "end_verification": {
+    "author_negative_and_root_assembly_hashes_rechecked": true,
+    "frozen_source_plan_manifest_snapshot_hashes_rechecked": {
+      "manifest.json": "01d8c85bace85ac75457e1968f77080091a6fd3908431745f1144a590f4ce550",
+      "plan.json": "f8f4ce29c17716463777ae4fcc247f895e917f779772e820922f398de1ef68fe",
+      "prior-run-packet.py": "3575bd3787db100c4ee2296e5515bbef1a5fc50348e78ca9b9e490e9152cbd3f",
+      "run-packet.py": "f820d314bda28a4e183a50ace3b05fb4ca0506d12ebb6b41bfdb868039a497ae"
+    }
+  },
+  "errors": [],
+  "evidence": {
+    "author_receipt": {
+      "path": "/var/tmp/coord16-2025-r3-author-freeze-d412d6fd/receipt.json",
+      "role": "Author freeze/source tool evidence only",
+      "sha256": "86f79042e72d53eaafde1481b58bffe38786c087b9f8d8a1b6efcc6f00832248"
+    },
+    "focused_static_verification": {
+      "path": "/var/tmp/coord16-2025-r3-code-independent-u77_6ilp/focused-delta-verification.json",
+      "sha256": "effd4ca2787a10f3026db11069f6e53319afde96d87ab4479b6b48cf3f5bfad5"
+    },
+    "immutable_source_receipts": {
+      "path": "/var/tmp/coord16-2025-r3-code-independent-u77_6ilp/initial-source-receipts.json",
+      "sha256": "6de882c9e823ba0e276f35bf7211780237b5ef771c93cca26f11f704ed568534"
+    },
+    "readable": {
+      "bytes": 3441,
+      "path": "/var/tmp/coord16-2025-r3-code-independent-u77_6ilp/readable.md",
+      "sha256": "d55fe77644f92044dad85596a0eda3f0e26aefb167c9fcddcd4caad718a0f4e2"
+    },
+    "root_assembly": {
+      "path": "/var/tmp/coord16-2025-r3-root-assembly-rdyefjpf/assembly.json",
+      "role": "Separate exact payload/product assembly, not code approval",
+      "sha256": "ed7d25480ee87421dd54b0607644c5e0a015a2b588f48babf3623b3c23c32d7d"
+    }
+  },
+  "findings": [],
+  "head": "fff2a4d558a788ab70591baf93f0ff713537d38a",
+  "issue": 2025,
+  "kind": "independent-r3-controller-delta-code-review",
+  "manifest_sha256": "01d8c85bace85ac75457e1968f77080091a6fd3908431745f1144a590f4ce550",
+  "operations": "Immutable Git/source and named receipts; static standard AST/text/hash only; own external receipt writes; no reviewed file changes, execution, probes or publication",
+  "plan_sha256": "f8f4ce29c17716463777ae4fcc247f895e917f779772e820922f398de1ef68fe",
+  "preserved_negative_review": {
+    "path": "/var/tmp/coord16-2025-option-b-code-independent-ijmhz64b/review.json",
+    "scope": "Original66 CHANGES_REQUIRED; unchanged, no retroactive approval",
+    "sha256": "a1d4c265730347e6fa1a716cb8f5381ae19ad63486499fd735fd11b7e1ad362b"
+  },
+  "product_pr": null,
+  "qualification_limits": {
+    "actual_ELF_inventory_counts": null,
+    "actual_context_tools_resources": null,
+    "actual_helper_provenance": null,
+    "actual_safe_release": null,
+    "algorithm_tests": "UNRUN",
+    "candidate_parser_helper_imports_calls": false,
+    "compiler_Cargo_runtime_native": "UNRUN",
+    "execution_authorized": false,
+    "execution_grant": null,
+    "queue_position": null,
+    "runtime_results": null,
+    "whole_product_embedded_version_every_exec_or_full_ELF_qualification": false
+  },
+  "resolved_findings": [
+    {
+      "id": "R3",
+      "new_sticky_stage_anchors": [
+        606,
+        619
+      ],
+      "preserved_classifications": "Original invoke nonzero and invalid/ambiguous Cargo metadata remain outside new guards and ordinary FAIL_STOP; genuine observation/read/close errors retain prior sticky handling",
+      "required_receipts": [
+        "helper-build-artifact.json",
+        "helper-discovery.json"
+      ],
+      "resolution": "Only the two save calls gain narrow BaseException guards invoking existing supervision_failure then bare rethrow. Required evidence errors now retain the existing stronger sticky HOLD behavior without changing original exceptions",
+      "unchanged_initial_observation_guard_anchor": 611,
+      "validation": "Actual frozen source/AST and full-module inverse only; no candidate/parser examples or tests executed"
+    }
+  ],
+  "runner_sha256": "f820d314bda28a4e183a50ace3b05fb4ca0506d12ebb6b41bfdb868039a497ae",
+  "schema": 1,
+  "scope": "Nonauthor finite correction code review of R3 two required receipt writes; exact surrounding code preserved. Exhaustive manifest/data/delta conservation separately assigned. Source-only clearance",
+  "tree": "45f9508843e11cc1d05b70d7fcc5b08aba3b9383",
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "verified_code_conservation": {
+    "R1_R2_and_group_selection_unchanged": true,
+    "bare_original_exception_rethrow": true,
+    "generic_bodies_unchanged_from66": 24,
+    "main_binder_context_source_authority_budgets_unchanged": true,
+    "only_changed_function": "execute_contracts",
+    "only_two_added_write_guards": true,
+    "original_nested_bodies_unchanged_from66": 4,
+    "plan_byte_exact66": true,
+    "protected_acquire_finalize_Cclose_byte_exact": true,
+    "protected_acquire_finalize_Cclose_bytes": 3790,
+    "protected_acquire_finalize_Cclose_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "whole_module_inverse_to66_exact": true
+  },
+  "writing_released": true
+}

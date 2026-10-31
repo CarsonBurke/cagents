@@ -1,0 +1,36 @@
+{
+  "schema": "fw16-startup-recovery-reviewed-source-publication-v1",
+  "branch": "qualification/fw16-startup-recovery-composition",
+  "head": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+  "tree": "21c43715d5de2288b27d5408e460fc7eaa7485de",
+  "target_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "inputs": [
+    "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+    "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd"
+  ],
+  "push_original_chunk": "6ce601",
+  "push_original_exit": 0,
+  "supported_ref_readback": "exact",
+  "commit_original_chunk": "2b49e6",
+  "source_tree_matches_independent_calculated_tree": true,
+  "format_rust193_exit": 0,
+  "path_count_vs_main": 15,
+  "outside_entries_exact": 2207,
+  "focused_startup_ui_parent_count": 28,
+  "additional_inherited_new_HOST_parent": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+  "focused_UI_plus_HOST_authored_count": 29,
+  "case_loops_and_modified_existing_HOST_assertions": "nonadditive",
+  "wire": "preserves original2029 protocol128/StartupState appendedvariants; main127; no further allocation",
+  "issue2025_testguard_source_included": false,
+  "rust_tests_native_ux": "UNRUN_MISSING",
+  "product_PR_or_metadata_write": "NONE",
+  "merge": false,
+  "C_grant": null,
+  "freeze": "/tmp/fw16-backend-ec204421/startup-recovery-2030-2029-on-4429-source-v1/freeze.json",
+  "reviews": {
+    "/tmp/startup-recovery-2030-2029-on-4429-gate-source-review-v1.md": "b18d74d7b260317efcb26568d0f95a38f2ebf64b33cb20551769e98d0d93bfbd",
+    "/tmp/startup-recovery-2030-2029-cross-oracle-api-independent-review-v1.json": "5a821bb2a13da5fc74af1ef0f277fea2bf79ec975d36bf88dad75c9b4e367f0b",
+    "/tmp/startup-recovery-composition-conservation-i6_m2ww3/review.json": "94bb0d85b4218e1e8f5069de74b4a1b2e81aa2b4973078c71ba564e51cfd1958",
+    "/tmp/pr2030-2029-on-4429-backend-startup-semantics-join-review-v1.json": "32aefa8abe9198ce341082026684afaa66dd35eb10ac9cd619b18f48bc781349"
+  }
+}

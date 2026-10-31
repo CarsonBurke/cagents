@@ -1,0 +1,595 @@
+{
+  "product_pr": null,
+  "product_head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "product_tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+  "product_parent": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/run-packet.py",
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/source-binding.json",
+  "source_review_sha256": "9152208de93ade8d0c299543d316e6eb68d0333351b0e01853d7b34e6d17db08",
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/app.rs": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
+    "src/app/chat_ui.rs": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+    "src/app/saved_terminal.rs": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+    "src/app/shared_views.rs": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
+    "src/app/shared_views/tests/startup_terminals.rs": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+    "src/app/startup_gate.rs": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+    "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+    "src/app/startup_gate/tests.rs": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+    "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+    "src/host/agent_execution/terminals.rs": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+    "src/host/client.rs": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+    "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+    "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/terminal/hosted.rs": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+    "src/terminal/ipc.rs": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+    "src/terminal/surface.rs": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21"
+  },
+  "helper_build": null,
+  "artifact_groups": [
+    {
+      "id": "cli-lib",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "selectors": [
+        {
+          "name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+          "expected_stdout_child_results": 0
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals"
+      ],
+      "source_predicted_absent_names": [
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+      ],
+      "execution": {
+        "label": "parent-cli-lib-exact",
+        "seconds": 60
+      }
+    },
+    {
+      "id": "host-lib",
+      "features": [
+        "host"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "selectors": [
+        {
+          "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+          "expected_stdout_child_results": 0
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests"
+      ],
+      "source_predicted_absent_names": [
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+      ],
+      "execution": {
+        "label": "parent-host-lib-exact",
+        "seconds": 60
+      }
+    },
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "selectors": [
+        {
+          "name": "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+          "expected_stdout_child_results": 0
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+      ],
+      "source_predicted_absent_names": [
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests"
+      ],
+      "execution": {
+        "label": "parent-ui-lib-exact",
+        "seconds": 300
+      }
+    }
+  ],
+  "planned_phase_count": 9,
+  "planned_phase_order": [
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-exact",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-exact",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-exact"
+  ],
+  "packet_deadline_seconds": 2400,
+  "phase_caps_sum_seconds": 2310,
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "tool_pin_provenance": "Immutable donor source only; no installed tool observation",
+  "archive_bindings": [
+    {
+      "name": "input-command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/command-data.json",
+      "sha256": "ba2c97c227d2cc981f4b9d5121c085886a4c0cb148fc06583c1e087ad5adf0c6"
+    },
+    {
+      "name": "input-current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/current-source-map.json",
+      "sha256": "20b88a5a34cc4540bea663f60258bb2501337c80330becbc87b490a50f695113"
+    },
+    {
+      "name": "input-dependencies__composition_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/composition_conservation.json",
+      "sha256": "94bb0d85b4218e1e8f5069de74b4a1b2e81aa2b4973078c71ba564e51cfd1958"
+    },
+    {
+      "name": "input-dependencies__composition_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/composition_freeze.json",
+      "sha256": "de41158a936a4086958ca95b126c621cf16b119c50870e25131bbe49df5727bc"
+    },
+    {
+      "name": "input-dependencies__composition_publication.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/composition_publication.json",
+      "sha256": "52915b047ce2000a11652a0be727715d87145a74307688617b5a54027c8160cf"
+    },
+    {
+      "name": "input-dependencies__design.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/design.md",
+      "sha256": "86cc623314a871d84af548e0abedb8118a2ee56434a7300268901c93079148c3"
+    },
+    {
+      "name": "input-dependencies__donor_code_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/donor_code_review.json",
+      "sha256": "2d827e1767f1690a41e39d74803ea74637caca48c85bc2e59c4e365f01640bd8"
+    },
+    {
+      "name": "input-dependencies__donor_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/donor_conservation.json",
+      "sha256": "9db0531260f4e5384d727c16e2cfa91db483db48983a91fae64668592cf86064"
+    },
+    {
+      "name": "input-dependencies__donor_conservation_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/donor_conservation_review.json",
+      "sha256": "74f0aad4c408a3d8a6c055368a3cd949fa71c1ff7675996f38e64bb898858e4b"
+    },
+    {
+      "name": "input-dependencies__donor_reviewed_handoff.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/donor_reviewed_handoff.json",
+      "sha256": "acb9c2aeedc0b9a365d0cc82ac48850587f30e36967614a8380432f94b3ba4e6"
+    },
+    {
+      "name": "input-dependencies__donor_runner.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/donor_runner.py",
+      "sha256": "f820d314bda28a4e183a50ace3b05fb4ca0506d12ebb6b41bfdb868039a497ae"
+    },
+    {
+      "name": "input-dependencies__seam_map.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/seam_map.md",
+      "sha256": "6c02bcd3ef8bb9f2935d17c5c9df8189bf359c906e58a8e961cc77cdcf8badf0"
+    },
+    {
+      "name": "input-dependencies__shared_test_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/shared_test_freeze.json",
+      "sha256": "a346a4e9e743ebb5f2cca6eb1a637eb050fd5756d546eaeeea8a28443e2ab633"
+    },
+    {
+      "name": "input-dependencies__shared_test_publication.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/shared_test_publication.json",
+      "sha256": "706f56d4db64e69847f3bdd2b5dbcd20eface342156a05c91bf1e8231ea81114"
+    },
+    {
+      "name": "input-dependencies__shared_test_review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/shared_test_review.json",
+      "sha256": "fcfa4aa9cb29c643668a0887c9d77e4d2d60d4a024783a4466c5282bf1a47015"
+    },
+    {
+      "name": "input-dependencies__source_assignment.txt",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/source_assignment.txt",
+      "sha256": "ace67309ca85f1811851428c0cfd68f0eaa7d88a2b1cb5ece98698d34677259e"
+    },
+    {
+      "name": "input-product-source__.cargo__config.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/.cargo/config.toml",
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+    },
+    {
+      "name": "input-product-source__Cargo.lock",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/Cargo.lock",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    {
+      "name": "input-product-source__Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/Cargo.toml",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    {
+      "name": "input-product-source__build.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/build.rs",
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+    },
+    {
+      "name": "input-product-source__src__app__chat_ui.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/app/chat_ui.rs",
+      "sha256": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84"
+    },
+    {
+      "name": "input-product-source__src__app__saved_terminal.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/app/saved_terminal.rs",
+      "sha256": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd"
+    },
+    {
+      "name": "input-product-source__src__app__shared_views__tests__startup_terminals.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/app/shared_views/tests/startup_terminals.rs",
+      "sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb"
+    },
+    {
+      "name": "input-product-source__src__app__shared_views.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/app/shared_views.rs",
+      "sha256": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd"
+    },
+    {
+      "name": "input-product-source__src__app__startup_gate__attachment_tests.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/app/startup_gate/attachment_tests.rs",
+      "sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717"
+    },
+    {
+      "name": "input-product-source__src__app__startup_gate__tests.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/app/startup_gate/tests.rs",
+      "sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c"
+    },
+    {
+      "name": "input-product-source__src__app__startup_gate.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/app/startup_gate.rs",
+      "sha256": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d"
+    },
+    {
+      "name": "input-product-source__src__app.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/app.rs",
+      "sha256": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf"
+    },
+    {
+      "name": "input-product-source__src__control.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/control.rs",
+      "sha256": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1"
+    },
+    {
+      "name": "input-product-source__src__host__agent_execution__terminals.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/host/agent_execution/terminals.rs",
+      "sha256": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf"
+    },
+    {
+      "name": "input-product-source__src__host__client.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/host/client.rs",
+      "sha256": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7"
+    },
+    {
+      "name": "input-product-source__src__host__mod.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/host/mod.rs",
+      "sha256": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864"
+    },
+    {
+      "name": "input-product-source__src__host__state.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/host/state.rs",
+      "sha256": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090"
+    },
+    {
+      "name": "input-product-source__src__lib.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/lib.rs",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+    },
+    {
+      "name": "input-product-source__src__modules.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/modules.rs",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+    },
+    {
+      "name": "input-product-source__src__terminal__hosted.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/terminal/hosted.rs",
+      "sha256": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8"
+    },
+    {
+      "name": "input-product-source__src__terminal__ipc.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/terminal/ipc.rs",
+      "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885"
+    },
+    {
+      "name": "input-product-source__src__terminal__surface.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/product-source/src/terminal/surface.rs",
+      "sha256": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21"
+    },
+    {
+      "name": "input-source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/source-binding.json",
+      "sha256": "9152208de93ade8d0c299543d316e6eb68d0333351b0e01853d7b34e6d17db08"
+    }
+  ],
+  "runtime_admission": {
+    "state": "SOURCE_STARTUP30_CANDIDATE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null,
+    "required_future_admission": "Actual accepted donor return and packet A positive return, then separately authenticated current Root C grant and reviewed source/context; source preparation is not authority."
+  },
+  "actual": {
+    "grant": null,
+    "queue_position": null,
+    "current_context": null,
+    "current_resources": null,
+    "current_tools": null,
+    "actual_elf": null,
+    "actual_inventory": null,
+    "actual_selected_names": null,
+    "actual_counts": null,
+    "actual_parallel_degree": null,
+    "actual_parallel_overlap": null,
+    "phase_receipts": null,
+    "runtime_results": null,
+    "RAW_review": null,
+    "safe_release": null
+  },
+  "readiness": false,
+  "limits": "Focused CLI1/HOST1/UI28 only; no all-target, whole-suite, native/provider/UX/current installation result. Packet A separate. No helper or fixture environment addition. Original workload2400; uncertain custody retains original owner/HOLD and never implies safe return."
+}

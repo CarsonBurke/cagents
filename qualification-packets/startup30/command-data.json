@@ -1,0 +1,744 @@
+{
+  "schema": "startup-eb7-three-libtest-groups-task-data-v1",
+  "kind": "SOURCE_PREPARATION_NOT_ADMISSION",
+  "product_pr": null,
+  "scope_parent": null,
+  "source": {
+    "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+    "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+    "parent": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+    "source_paths_sha256": {
+      ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+      "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+      "src/app.rs": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
+      "src/app/chat_ui.rs": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+      "src/app/saved_terminal.rs": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+      "src/app/shared_views.rs": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
+      "src/app/shared_views/tests/startup_terminals.rs": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "src/app/startup_gate.rs": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+      "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "src/app/startup_gate/tests.rs": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "src/host/agent_execution/terminals.rs": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+      "src/host/client.rs": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+      "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+      "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+      "src/terminal/hosted.rs": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+      "src/terminal/ipc.rs": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+      "src/terminal/surface.rs": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21"
+    }
+  },
+  "helper_build": null,
+  "artifact_groups": [
+    {
+      "id": "cli-lib",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "selectors": [
+        {
+          "name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+          "expected_stdout_child_results": 0
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals"
+      ],
+      "source_predicted_absent_names": [
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+      ],
+      "execution": {
+        "label": "parent-cli-lib-exact",
+        "seconds": 60
+      }
+    },
+    {
+      "id": "host-lib",
+      "features": [
+        "host"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "selectors": [
+        {
+          "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+          "expected_stdout_child_results": 0
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests"
+      ],
+      "source_predicted_absent_names": [
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+      ],
+      "execution": {
+        "label": "parent-host-lib-exact",
+        "seconds": 60
+      }
+    },
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "selectors": [
+        {
+          "name": "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+          "expected_stdout_child_results": 0
+        }
+      ],
+      "source_predicted_compiled_names": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+      ],
+      "source_predicted_absent_names": [
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests"
+      ],
+      "execution": {
+        "label": "parent-ui-lib-exact",
+        "seconds": 300
+      }
+    }
+  ],
+  "selected_parents": [
+    {
+      "selector": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+      "artifact_group": "cli-lib",
+      "source_path": "src/control.rs",
+      "source_sha256": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "line": 5943,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": true
+    },
+    {
+      "selector": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+      "artifact_group": "host-lib",
+      "source_path": "src/host/state.rs",
+      "source_sha256": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "line": 5037,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 118,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 156,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 171,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 191,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 229,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 254,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 271,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 351,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 417,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 454,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 496,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 615,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/tests.rs",
+      "source_sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "line": 746,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/attachment_tests.rs",
+      "source_sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "line": 154,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/attachment_tests.rs",
+      "source_sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "line": 232,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/attachment_tests.rs",
+      "source_sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "line": 285,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/attachment_tests.rs",
+      "source_sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "line": 349,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/startup_gate/attachment_tests.rs",
+      "source_sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "line": 425,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 297,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 322,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 350,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 373,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 415,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 449,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 481,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 493,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 577,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    },
+    {
+      "selector": "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+      "artifact_group": "ui-lib",
+      "source_path": "src/app/shared_views/tests/startup_terminals.rs",
+      "source_sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "line": 638,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "nonadditive_cases": false
+    }
+  ],
+  "planned_phase_count": 9,
+  "planned_phase_order": [
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-exact",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-exact",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-exact"
+  ],
+  "runtime_admission": {
+    "state": "SOURCE_STARTUP30_CANDIDATE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null,
+    "required_future_admission": "Actual accepted donor return and packet A positive return, then separately authenticated current Root C grant and reviewed source/context; source preparation is not authority."
+  },
+  "actual": {
+    "grant": null,
+    "queue_position": null,
+    "current_context": null,
+    "current_resources": null,
+    "current_tools": null,
+    "actual_elf": null,
+    "actual_inventory": null,
+    "actual_selected_names": null,
+    "actual_counts": null,
+    "actual_parallel_degree": null,
+    "actual_parallel_overlap": null,
+    "phase_receipts": null,
+    "runtime_results": null,
+    "RAW_review": null,
+    "safe_release": null
+  }
+}
