@@ -1,0 +1,309 @@
+{
+  "schema": "pr1310-finite-native-history-source-v1",
+  "status": "SOURCE_METHODS_IMPLEMENTED_ROOT_UNSUPPLIED_UNRUN",
+  "intended_user_task": "Find an old commit, understand bounded search, inspect immutable files, refine and page without misleading state.",
+  "controller_base": "9dc2a70caebbfc972e537712b9f9326843f232d0",
+  "controller_scope": [
+    "qualification-packets/pr1310-native-history-pair/README.md",
+    "qualification-packets/pr1310-native-history-pair/history_driver.py",
+    "qualification-packets/pr1310-native-history-pair/observations.py",
+    "qualification-packets/pr1310-native-history-pair/root-interface.md",
+    "qualification-packets/pr1310-native-history-pair/plan.json"
+  ],
+  "sources": {
+    "before": {
+      "head": "a174dc7e7aa651745c95714971054fc4c270c5a3",
+      "tree": "2d557d0cd3757a01ee9ca2da32d15f211ce464b6",
+      "paths": {
+        "src/app/native_history_fixture.rs": {
+          "sha256": "9b9a88548098c15333e323aab0fd14d5b0e231ef4f68ff403ed924349eadcbb1",
+          "bytes": 19805
+        },
+        "src/app.rs": {
+          "sha256": "1ff20d4487526da1a4773bb36e4bb85a91ec8d03a6f804fb5493744153cf04ed",
+          "bytes": 1379070
+        },
+        "src/bin/cagents-ui.rs": {
+          "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
+          "bytes": 25035
+        },
+        "src/app/history_ui.rs": {
+          "sha256": "48e0bad0f3b9a3b49ae56111ddc3e59ae1cf9c2fb60d923066b319ae660ccaac",
+          "bytes": 9660
+        },
+        "src/sidebar.rs": {
+          "sha256": "d158cd57a692865ace96995a968c6c32b7caf44a5190956adffb9ea9beaac9c9",
+          "bytes": 827351
+        },
+        "src/repository.rs": {
+          "sha256": "a5f586b27a589cb81b18b70fe371c84431b6f16e13b775ecee7ea8a357cdaf32",
+          "bytes": 542656
+        },
+        "src/repository_widget.rs": {
+          "sha256": "d1d440a154502c29905b852eacadc22858b812b044d0a3937ff2862bc9d106b2",
+          "bytes": 901280
+        },
+        "src/ui_controls/field.rs": {
+          "sha256": "12da26711454d00c76dd022dbabf8b0172d624b7d5de8946d9a95e55f32babc9",
+          "bytes": 7070
+        },
+        "src/ui_controls/editable.rs": {
+          "sha256": "692cf52336ec4ba7e70cdc685374cc8b195b647e0a12f0ee8c352c6ff6d84dcb",
+          "bytes": 27929
+        },
+        "scripts/run-development": {
+          "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+          "bytes": 8296
+        },
+        "qualification-packets/pr1310-native-fixture/build.py": {
+          "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01",
+          "bytes": 18468
+        }
+      },
+      "native": "UNRUN",
+      "matched_executables": null
+    },
+    "after": {
+      "head": "9dc2a70caebbfc972e537712b9f9326843f232d0",
+      "tree": "fcb1b582d894dc46590cc8fc8f20e9cb17920a0a",
+      "paths": {
+        "src/app/native_history_fixture.rs": {
+          "sha256": "2ccd222776616f0189684a81105dafa0486b3751f2f8640c1c5e66881f336ea0",
+          "bytes": 19371
+        },
+        "src/app.rs": {
+          "sha256": "e551b3e627726c6f5ac77410e94ce03a586397018341f084bcae8132e4130321",
+          "bytes": 1436088
+        },
+        "src/bin/cagents-ui.rs": {
+          "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
+          "bytes": 25035
+        },
+        "src/app/history_ui.rs": {
+          "sha256": "a89b62a04dfae81c0328ba0a0aa25fcb58e93dcb3cf8ad0906783aaee5d1e0df",
+          "bytes": 21126
+        },
+        "src/sidebar.rs": {
+          "sha256": "b2981bcbff521775545950a6c82f1e5252112438b9a8165c19c88154d2d89fc1",
+          "bytes": 864507
+        },
+        "src/repository.rs": {
+          "sha256": "0d89a9619ff6e64a4f120b5a7cb6c2295ead416537da1a0a759ef02f83217409",
+          "bytes": 657927
+        },
+        "src/repository_widget.rs": {
+          "sha256": "c6f9e9f6283b7c5bcf1f27863a7519312fdb9ef31278ffbfffa55a48393056d2",
+          "bytes": 911005
+        },
+        "src/ui_controls/field.rs": {
+          "sha256": "12da26711454d00c76dd022dbabf8b0172d624b7d5de8946d9a95e55f32babc9",
+          "bytes": 7070
+        },
+        "src/ui_controls/editable.rs": {
+          "sha256": "692cf52336ec4ba7e70cdc685374cc8b195b647e0a12f0ee8c352c6ff6d84dcb",
+          "bytes": 27929
+        },
+        "scripts/run-development": {
+          "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+          "bytes": 8296
+        },
+        "qualification-packets/pr1310-native-fixture/build.py": {
+          "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01",
+          "bytes": 18468
+        }
+      },
+      "native": "UNRUN",
+      "matched_executables": null
+    }
+  },
+  "inputs": {
+    "data_delivery": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/delivery.json",
+      "sha256": "719ee08a201a8ecd8e5dc1d6fd4e152c1d82ca8638245812a6b093cf99eb93a3",
+      "bytes": 17916,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "source_export": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b9-existing-3e-native-source-routing-export-receipt-v1.json",
+      "sha256": "59518b508c855a1a3df9797648f573ca1f20b324ed28c5819a45841ccb16a754",
+      "bytes": 3048,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "inert_native_source": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b9-source-routing-3e2c925b-native-driver-inert-source-v1.txt",
+      "sha256": "9b2ec0f052b0e052de85ef848a585b1ea2f49599fa59dfec325cd62c28daf497",
+      "bytes": 156897,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "private_direct_launch_source_note": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/ee291-private-xvfb-dbus-direct-launch-source-contract-v1.json",
+      "sha256": "73a54b5accb61c65436871ced756570414e33db4981ff74ceee59ad5877a411c",
+      "bytes": 13413,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "existing_custody_primitive": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2002-host-driver/scripts/qualification/process_custody.py",
+      "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+      "bytes": 21755,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "data_source-contract.json": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/data/source-contract.json",
+      "sha256": "c71b45835c01bcc143d13c30a0c706cc1f7dfb964fc22a0eba4efba3e4b075f6",
+      "bytes": 25589,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "data_capture-matrix.json": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/data/capture-matrix.json",
+      "sha256": "0334e30d8716bac2f6fb3303ad1707131e9e6b051cf59a3c3a0e52bcbcbdb576",
+      "bytes": 13409,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "data_capabilities.json": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/data/capabilities.json",
+      "sha256": "53c23d5ced0b34cbc0a79eb060813099ef03ba18724f1bb4f3973066b1b9159d",
+      "bytes": 9930,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "data_manifest.json": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/data/manifest.json",
+      "sha256": "33806e0a8c2901ff9e4b18553854a56044245b2a37b862d453432829246b18d6",
+      "bytes": 5842,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "data_performance-plan.json": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/data/performance-plan.json",
+      "sha256": "a1c64ac2414f078fd5088d14483f328f215b786bf88f2563197518f3fe624f92",
+      "bytes": 4882,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    },
+    "data_README.md": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/data/README.md",
+      "sha256": "a7208b29580d642b4a539f92a489f200d011f614db6aebcc29a67b1fde9d43e9",
+      "bytes": 6678,
+      "role": "SOURCE_ONLY_NOT_ADMISSION_OR_NATIVE_EVIDENCE"
+    }
+  },
+  "data": {
+    "generated_fixture": null,
+    "actual_OIDs": null,
+    "fixture_schema": "pr1310-public-git-fixture-v1",
+    "builder_sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01",
+    "historical_builder_pair": {
+      "before": "a3221af83d56663f0dcbef90f67b30ad6d9fe53d",
+      "after": "efa9288b3fd79a7214307a11b1c6d50c6cde3630"
+    },
+    "required_separate_original_owner_evidence": "owned nofollow manifest/index/repository plus actual Git commands/object IDs; JSON declarations alone are insufficient"
+  },
+  "runtime": {
+    "actual_User_resource_admission": null,
+    "original_root_interface_implementation": null,
+    "matched_native_binaries": null,
+    "private_desktop_and_bus": null,
+    "ledger_and_writer_custody": null,
+    "attempts": 0,
+    "native": "UNRUN",
+    "performance": "UNRUN",
+    "independent_source_review": "PENDING",
+    "native_UX_review": "UNRUN",
+    "screenshots": null,
+    "ready": false
+  },
+  "native_methods": {
+    "entry": "history_driver.py refuses ROOT_INTERFACE_UNSUPPLIED",
+    "future_method": "HistoryDriver(root, actual_pyatspi, actual_PIL_Image, arm, validated_fixture).run_current_dataset()",
+    "is_runtime_command": false,
+    "same_data": true,
+    "viewports": {
+      "wide": [
+        1440,
+        900
+      ],
+      "narrow": [
+        900,
+        700
+      ]
+    },
+    "theme": "dark",
+    "configured_app_scale": 1.0,
+    "internal_native_scale": "UNMEASURED",
+    "frames": "mandatory original owned-XID screen-window rectangle AND direct drawable PNG+losslessWebP with same dimensions/nonblank and before/after binding; separate screenshot branch only later",
+    "row_binding": "actual discovered button/descendant subject+author+8charOID versus generated index; not full-object proof",
+    "input": "real xdotool keyboard/pointer; disclosed AX focus setup for selected Enter activation; no SetValue/clipboard/provider"
+  },
+  "cases": [
+    {
+      "id": "populated",
+      "source_status": "IMPLEMENTED_INTERACTION_SOURCE",
+      "scope": "Observe initial200 and ordinary pager; no runtime yet.",
+      "native": "UNRUN",
+      "evidence": null
+    },
+    {
+      "id": "empty-loading-unborn",
+      "source_status": "IMPLEMENTED_INTERACTION_SOURCE_PARTIAL",
+      "scope": "Observe real no-match/unborn; loading only if actually seen, no producer seam.",
+      "native": "UNRUN",
+      "evidence": null
+    },
+    {
+      "id": "limited-known-and-zero",
+      "source_status": "IMPLEMENTED_INTERACTION_SOURCE_PARTIAL",
+      "scope": "Issue real queries; observe actual caption/rows; cannot force Limited or zero on 25k.",
+      "native": "UNRUN",
+      "evidence": null
+    },
+    {
+      "id": "full-SHA-OR",
+      "source_status": "IMPLEMENTED_INTERACTION_SOURCE_PARTIAL",
+      "scope": "Enter actual generated siblingOID; native row association only; optional resolution/fullidentity unproven.",
+      "native": "UNRUN",
+      "evidence": null
+    },
+    {
+      "id": "refine",
+      "source_status": "IMPLEMENTED_INTERACTION_SOURCE",
+      "scope": "Replace/clear field and realEnter; query clears detail/list by product contract.",
+      "native": "UNRUN",
+      "evidence": null
+    },
+    {
+      "id": "stale-query",
+      "source_status": "BLOCKED_CAUSAL_PRODUCER_UNSUPPLIED",
+      "scope": "No actual delayed callback ledger or supported producer; no stale proof.",
+      "native": "UNRUN",
+      "evidence": null
+    },
+    {
+      "id": "pager-owner",
+      "source_status": "IMPLEMENTED_ORDINARY_PAGING_ONLY",
+      "scope": "401 rows and real pager input; no held/duplicate producer or callback ownership proof.",
+      "native": "UNRUN",
+      "evidence": null
+    },
+    {
+      "id": "narrow-keyboard-hover-scroll",
+      "source_status": "IMPLEMENTED_INTERACTION_SOURCE",
+      "scope": "Actual roles, physical keys/wheel/pointer; globalfixtureKeyEvent excluded; native UX unrun.",
+      "native": "UNRUN",
+      "evidence": null
+    },
+    {
+      "id": "inspect-recovery",
+      "source_status": "IMPLEMENTED_INSPECTION_SOURCE_RECOVERY_BLOCKED",
+      "scope": "Real detail/file navigation; exactreaderbody/fullOID observer and realfailureproducer unsupplied.",
+      "native": "UNRUN",
+      "evidence": null
+    }
+  ],
+  "limits": [
+    "No process/lifecycle code copied from3e; no HOME/CODEX_HOME rewrite or authority scrub.",
+    "run-development adds verified Zig PATH normally; effective child PATH is not promised literal.",
+    "Normal pre-main selected-provider-home detachment remains unchanged.",
+    "100000 prefix-work includes cumulative skip+count; 25k dataset is not a guaranteed Limited or scanned25k oracle.",
+    "No callback event producer/held stale result, read-failure producer or attributable performance observer is supplied.",
+    "Before has no query/refine/fullSHAsearch/Limited controls; ordinary baseline only.",
+    "Current source methods and AST parsing are neither execution admission nor native/UX qualification.",
+    "Existing1775 Custody signal policy must be reconciled explicitly for planned owned-service shutdown; no transfer of safe handback."
+  ]
+}
