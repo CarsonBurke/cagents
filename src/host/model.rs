@@ -61,6 +61,8 @@ const FILE_MODE: u32 = 0o600;
 #[derive(Debug)]
 pub(crate) struct Applied {
     pub(crate) model: WorkspaceModel,
+    /// Sequence committed by this edit, independent of a later response snapshot.
+    pub(crate) sequence: u64,
     /// Whether the edit changed anything. A retitle to the same title, or a
     /// delete of a channel that is already gone, must neither bump `sequence`
     /// nor wake a watcher: a window that reacted to it would redraw for nothing
@@ -71,6 +73,8 @@ pub(crate) struct Applied {
 pub(crate) struct Registry {
     db: Connection,
     path: PathBuf,
+    #[cfg(test)]
+    after_workspace_commit: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Registry {
@@ -87,6 +91,8 @@ impl Registry {
         Ok(Self {
             db,
             path: path.to_owned(),
+            #[cfg(test)]
+            after_workspace_commit: None,
         })
     }
 
@@ -97,8 +103,16 @@ impl Registry {
         Self::at(&self.path)
     }
 
+    /// Independent layout writes keep FULL durability without borrowing HostState.
+    pub(crate) fn workspace_connection(&self) -> Result<Self, String> {
+        Self::at(&self.path)
+    }
+
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
+        // Execution and layout use separate connections. Every component of
+        // this response must belong to one coherent WAL read snapshot.
+        let transaction = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
         let (identity, sequence) = self
             .db
             .query_row(
@@ -195,7 +209,7 @@ impl Registry {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(WorkspaceModel {
+        let model = WorkspaceModel {
             navigation_orders,
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
@@ -204,7 +218,9 @@ impl Registry {
             projects,
             channels,
             closed_projects,
-        })
+        };
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(model)
     }
 
     /// Applies one edit as a single transaction, bumping `sequence` when it
@@ -444,9 +460,19 @@ impl Registry {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        let sequence: u64 = transaction
+            .query_row("SELECT sequence FROM metadata WHERE key=0", [], |row| {
+                row.get(0)
+            })
+            .map_err(|error| error.to_string())?;
         transaction.commit().map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        if let Some(after_commit) = self.after_workspace_commit.take() {
+            after_commit();
+        }
         Ok(Applied {
             model: self.model()?,
+            sequence,
             changed,
         })
     }
@@ -1495,5 +1521,21 @@ mod tests {
             1,
             "the rank is durable too"
         );
+    }
+    #[test]
+    fn edit_edge_uses_its_committed_sequence_when_a_later_writer_wins_the_snapshot_race() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.sqlite3");
+        let mut registry = Registry::at(&path).unwrap();
+        let before = registry.model().unwrap().sequence;
+        registry.after_workspace_commit = Some(Box::new(move || {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+                .unwrap();
+        }));
+        let applied = registry.apply(&open("/sequence-race")).unwrap();
+        assert_eq!(applied.sequence, before + 1);
+        assert_eq!(applied.model.sequence, before + 2);
     }
 }
