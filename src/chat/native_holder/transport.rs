@@ -2956,6 +2956,7 @@ exec /bin/sleep 60
         let mut legacy = serde_json::to_value(Report::Started {
             protocol: PROTOCOL,
             record: record.clone(),
+            scope_error: None,
             directory_pin: true,
         })
         .unwrap();
