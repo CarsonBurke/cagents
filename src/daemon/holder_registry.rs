@@ -59,7 +59,10 @@ impl BuildIdentity {
                 .and_then(|metadata| metadata.split('.').next())
                 .map(str::to_owned),
             capabilities: match kind {
-                Kind::Native => vec!["event-driven-orphan-reaping".into()],
+                Kind::Native => vec![
+                    "event-driven-orphan-reaping".into(),
+                    "provider-exit-diagnostics".into(),
+                ],
                 Kind::Terminal => Vec::new(),
             },
         }
