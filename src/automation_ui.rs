@@ -2841,6 +2841,12 @@ impl Draft {
             } else {
                 "▸ Advanced settings"
             }))
+            // The disclosure glyph is decorative; say what pressing it does.
+            .name(if self.advanced {
+                "Hide advanced settings"
+            } else {
+                "Show advanced settings"
+            })
             .class(crate::ui_controls::control_style(false, None))
             .on_press(Action::ToggleAdvanced)
             .into(),
@@ -2953,6 +2959,7 @@ impl Draft {
             for name in matches.iter().copied() {
                 column = column.push(
                     widget::button::custom(crate::design::body(name))
+                        .name(name)
                         .class(crate::ui_controls::control_style(false, None))
                         .width(Length::Fill)
                         .on_press(Action::Field(Field::Timezone, name.to_owned())),
@@ -5169,6 +5176,63 @@ mod tests {
         });
         assert!(state.selected.is_none());
         assert!(state.pending.is_some());
+    }
+
+    #[test]
+    fn every_automation_button_is_exposed_by_name() {
+        let names = |state: &State| {
+            crate::ui_controls::accessibility_probe::accessible_buttons(
+                state.view(),
+                cosmic::iced::Size::new(1200.0, 800.0),
+            )
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+        };
+        let exposes = |names: &[String], expected: &[&str]| {
+            for name in expected {
+                assert!(
+                    names.iter().any(|found| found == name),
+                    "{name} in {names:?}"
+                );
+            }
+            assert!(
+                names.iter().all(|name| !name.is_empty()),
+                "unnamed button in {names:?}"
+            );
+        };
+        // Each of these button rows wraps when the pane is narrow.
+        let mut state = State {
+            selected: Some(automation()),
+            ..State::default()
+        };
+        exposes(
+            &names(&state),
+            &[
+                "New automation",
+                "Refresh automations",
+                "Edit",
+                "Enable…",
+                "Run now…",
+                "Remove…",
+            ],
+        );
+        state.update(Action::RunNow);
+        exposes(&names(&state), &["Cancel", "Confirm"]);
+        state.update(Action::CancelConfirmation);
+        state.update(Action::New);
+        state.update(Action::Field(Field::Timezone, "Vancouver".into()));
+        exposes(
+            &names(&state),
+            &[
+                "Cancel",
+                "Save automation",
+                "Show advanced settings",
+                "America/Vancouver",
+            ],
+        );
+        state.update(Action::ToggleAdvanced);
+        exposes(&names(&state), &["Hide advanced settings"]);
     }
 
     fn models() -> Models {

@@ -1,0 +1,57 @@
+[package]
+name = "iced_widget"
+description = "The built-in widgets for iced"
+version = "0.14.2"
+edition = "2024"
+authors = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
+license = "MIT"
+repository = "https://github.com/iced-rs/iced"
+homepage = "https://iced.rs"
+categories = ["gui"]
+keywords = ["gui", "ui", "graphics", "interface", "widgets"]
+
+[workspace]
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+all-features = true
+
+[features]
+lazy = ["ouroboros"]
+image = ["iced_renderer/image"]
+svg = ["iced_renderer/svg"]
+canvas = ["iced_renderer/geometry"]
+qr_code = ["canvas", "dep:qrcode"]
+wgpu = ["iced_renderer/wgpu-bare"]
+markdown = ["dep:pulldown-cmark"]
+highlighter = ["dep:iced_highlighter"]
+advanced = []
+crisp = []
+a11y = ["iced_accessibility"]
+wayland = ["iced_runtime/wayland", "dep:cctk"]
+
+[dependencies]
+iced_renderer = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+iced_runtime = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
+num-traits = "0.2"
+log = "0.4"
+rustc-hash = "2.0"
+thiserror = "2"
+unicode-segmentation = "1.0"
+window_clipboard = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+dnd = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+
+ouroboros = { version = "0.18", optional = true }
+
+qrcode = { version = "0.13", default-features = false, optional = true }
+
+pulldown-cmark = { version = "0.12", optional = true }
+
+iced_highlighter = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
+
+[target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_vendor = "apple"))))'.dependencies]
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "32283d7", optional = true }
+
+[build-dependencies]
+build_helpers = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
