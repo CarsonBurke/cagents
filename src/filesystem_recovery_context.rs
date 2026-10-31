@@ -622,18 +622,39 @@ pub(crate) mod fixtures {
         let protection =
             crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false)?;
         let source = Arc::new(source.try_clone()?);
+        // Keep the original owners alive while reporting either setup error,
+        // including when from_placement drops its supplied owner on failure.
+        let owner = Arc::new((guard, runtime, outside));
+        let report_setup_error = |stage, error: &io::Error| {
+            use std::io::Write as _;
+            // These lexical spellings are diagnostics, never placement authority.
+            // A failed stderr write must not replace the original setup error.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "recovery fixture setup: stage={stage} error_kind={:?} source_reporting_spelling={:?} source_is_absolute={} runtime_reporting_spelling={:?} runtime_is_absolute={} outside_reporting_spelling={:?} outside_is_absolute={}",
+                error.kind(),
+                source.path(),
+                source.path().is_absolute(),
+                owner.1.path(),
+                owner.1.path().is_absolute(),
+                owner.2.path(),
+                owner.2.path().is_absolute(),
+            );
+        };
         let placement = RecoveryPlacement::acquire(
-            Arc::new(Root::open(outside.path())?),
+            Arc::new(Root::open(owner.2.path())?),
             source.clone(),
             Arc::from([source.clone()]),
-        )?;
+        )
+        .inspect_err(|error| report_setup_error("acquire_outside", error))?;
         FilesystemRecoveryContext::from_placement(
             &source,
             protection,
             placement,
-            (guard, runtime, outside),
+            owner.clone(),
             None,
         )
+        .inspect_err(|error| report_setup_error("from_placement", error))
     }
 }
 

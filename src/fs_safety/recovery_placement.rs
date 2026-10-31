@@ -134,7 +134,7 @@ fn validate_recovery_ancestry(
         ));
     }
     let mut cursor = start.try_clone()?;
-    for _ in 0..MAX_ANCESTORS {
+    for _ancestor_index in 0..MAX_ANCESTORS {
         let current = identity(&cursor)?;
         let current_mount = mount_identity(&cursor)?;
         if excluded.contains(&current) {
@@ -146,7 +146,27 @@ fn validate_recovery_ancestry(
         // locator, follow a symlink, or adopt unknown foreign Git metadata.
         match metadata_beneath(&cursor, Path::new(".git")) {
             Err(error) if error.is_not_found() => {}
-            Ok(_) => {
+            Ok(_locator) => {
+                #[cfg(test)]
+                {
+                    use std::io::Write as _;
+                    // Report only the observation already made through the held
+                    // ancestor. This lexical spelling grants no path authority.
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "recovery locator refusal: ancestor_index_zero_based={} ancestor_device={} ancestor_inode={} ancestor_mount_id={} locator_reporting_spelling={:?} locator_is_absolute={} locator_type={:?} locator_device={} locator_inode={} locator_mode={:#o}",
+                        _ancestor_index,
+                        current.0,
+                        current.1,
+                        current_mount,
+                        cursor.path().join(".git"),
+                        cursor.path().is_absolute(),
+                        _locator.file_type(),
+                        _locator.dev(),
+                        _locator.ino(),
+                        _locator.mode(),
+                    );
+                }
                 return Err(unsupported(
                     "Recovery placement has an enclosing Git checkout locator; this step was refused and existing recovery was retained.",
                 ));
