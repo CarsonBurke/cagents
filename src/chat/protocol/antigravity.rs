@@ -45,7 +45,9 @@ pub fn business_sign_in(environment: &dyn Fn(&str) -> Option<String>, home: &Pat
     };
     let settings = read(home.join(".gemini/antigravity-cli/settings.json"));
     settings["modelProvider"] == "gemini"
-        || settings["gcp"].is_object()
+        || settings["gcp"]
+            .as_object()
+            .is_some_and(|gcp| !gcp.is_empty())
         || environment("AGY_ADC_AUTH").as_deref() == Some("true")
         || read(home.join(".gemini/config/config.json"))["enableAdc"] == true
 }
@@ -66,6 +68,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     let mut kept = STREAMING.map(str::to_owned).to_vec();
     let mut mode = "default".to_owned();
     let mut model = None;
+    let mut skips_permissions = false;
     let mut arguments = launch.recipe.arguments.iter();
     while let Some(argument) = arguments.next() {
         let (name, inline) = argument
@@ -88,7 +91,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
                 continue;
             }
             "--continue" | "-c" => continue,
-            "--dangerously-skip-permissions" => mode = "yolo".into(),
+            "--dangerously-skip-permissions" => skips_permissions = true,
             _ => {}
         }
         let value = crate::agent::Provider::Antigravity.is_value_option(name);
@@ -113,6 +116,10 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         } else if name == "--model" {
             model = inline.map(str::to_owned);
         }
+    }
+    if skips_permissions {
+        // It outranks any mode beside it.
+        mode = "yolo".into();
     }
     let arguments = kept.clone();
     if let Some(id) = &launch.session_id {
@@ -451,6 +458,12 @@ impl Antigravity {
                 run,
                 event: ProviderEvent::Settled,
             });
+            // A run has no attention state: stopping it is cancelling it.
+            let outcome = if outcome == Kind::Interrupted {
+                Kind::Cancelled
+            } else {
+                outcome
+            };
             step.events.push(Event::Execution {
                 run,
                 event: ProviderEvent::Finished { outcome },
@@ -570,6 +583,13 @@ impl Adapter for Antigravity {
 
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = Step::default();
+        // One process and one turn at a time, so its output is that run's.
+        if let Some(run) = self.execution {
+            step.events.push(Event::Execution {
+                run,
+                event: ProviderEvent::Scope,
+            });
+        }
         match frame["event"].as_str() {
             Some("init") => self.opened(&frame, &mut step)?,
             Some("step_update") => self.step_update(&frame["step_update"], &mut step),
@@ -615,6 +635,8 @@ mod tests {
         )
         .unwrap();
         assert!(business_sign_in(&none, home.path()));
+        std::fs::write(settings.join("settings.json"), r#"{"gcp":{}}"#).unwrap();
+        assert!(!business_sign_in(&none, home.path()));
     }
 
     #[test]
@@ -719,6 +741,46 @@ mod tests {
             event,
             Event::TurnFinished {
                 outcome: Kind::Interrupted,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_stopped_run_is_cancelled_and_its_output_is_in_scope() {
+        let run = crate::model::RunId::new();
+        let mut adapter = adapter();
+        adapter.receive(init()).unwrap();
+        adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "hi".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let reply = adapter
+            .receive(json!({"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"pong"}}))
+            .unwrap();
+        assert!(reply.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Scope,
+                ..
+            }
+        )));
+        adapter.command(Command::Interrupt).unwrap();
+        let end = adapter
+            .receive(json!({"event":"result","result":{"status":"ERROR","finished_reason":"interrupted"}}))
+            .unwrap();
+        assert!(end.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Finished {
+                    outcome: Kind::Cancelled
+                },
                 ..
             }
         )));

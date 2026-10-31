@@ -9567,13 +9567,11 @@ impl Cagents {
                 // Nothing holds an exited provider's conversation, so attaching
                 // would only show the same ended actor again. Start admits
                 // replacing it under this exact identity.
-                if runtime.connected()
+                if session.launch.provider == Provider::Antigravity
+                    && runtime.connected()
                     && runtime.snapshot.exited
-                    && !session.native_continuity.retains_provider()
-                    && !session.owns_codex_listener()
                     && session.launch.session_id.is_some()
                     && runtime.snapshot.session_id == session.launch.session_id
-                    && !session.is_saved_claude_history()
                 {
                     return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }

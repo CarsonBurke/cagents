@@ -1333,7 +1333,13 @@ fn chip_with_window(
             tooltip: format!("{name} is signed out. Sign in to see its usage."),
         },
         UsageStatus::Unavailable => Chip {
-            text: "Unavailable".into(),
+            // It answered as a login, and only has no limits to report.
+            text: if account.identity.is_some() {
+                "Signed in"
+            } else {
+                "Unavailable"
+            }
+            .into(),
             gauge: None,
             tone: ChipTone::Stale,
             essential: false,
@@ -1410,6 +1416,18 @@ fn chip_with_window(
     }
 }
 
+/// Marks a terminal running plain `agy` as a sign-in, which its command cannot
+/// say, and holds the home it signs in to.
+const ANTIGRAVITY_SIGN_IN: &str = "CAGENTS_ANTIGRAVITY_SIGN_IN";
+
+/// The launch variable that names the home a sign-in terminal is signing in to.
+fn sign_in_variable(provider: Provider) -> Option<&'static str> {
+    match provider {
+        Provider::Antigravity => Some(ANTIGRAVITY_SIGN_IN),
+        _ => account::home_variable(provider),
+    }
+}
+
 /// How a provider's CLI signs in: through the browser by default, or, for
 /// Codex, with a device code a reader can finish on another machine.
 fn login_arguments(provider: Provider, device: bool) -> Option<&'static [&'static str]> {
@@ -1440,10 +1458,9 @@ fn login_launch(
         login_arguments(account.provider, device)?
     };
     let mut environment = BTreeMap::new();
-    if let (Some(variable), Some(account_home)) = (
-        account::home_variable(account.provider),
-        account.resolved_home(),
-    ) {
+    if let (Some(variable), Some(account_home)) =
+        (sign_in_variable(account.provider), account.resolved_home())
+    {
         environment.insert(variable.to_owned(), account_home.display().to_string());
     }
     // The CLI was found on the search path the reader's shell sets up, and
@@ -1475,6 +1492,9 @@ pub(super) fn is_sign_in(recipe: &LaunchRecipe) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     let arguments: Vec<&str> = recipe.arguments.iter().map(String::as_str).collect();
+    if program == "agy" {
+        return arguments.is_empty() && recipe.environment.contains_key(ANTIGRAVITY_SIGN_IN);
+    }
     matches!(
         (program, arguments.as_slice()),
         ("claude", ["auth", "login"])
@@ -2913,10 +2933,10 @@ impl Cagents {
                     state.signing_in_from = None;
                     state.sign_in_terminal = None;
                 }
-                // A provider that reports no limits still names a working login.
+                // Antigravity reports no limits, yet still names a working login.
                 state.present = snapshot.status != UsageStatus::Unavailable
                     || !state.account.is_system()
-                    || identity.is_some();
+                    || (state.account.provider == Provider::Antigravity && identity.is_some());
                 // A signed-out answer, or an identity lookup that failed this
                 // time, names nobody; the account last seen is still the one
                 // it is, or the one to sign back in to.
@@ -3219,10 +3239,9 @@ impl Cagents {
         }) {
             return true;
         }
-        let (Some(variable), Some(home)) = (
-            account::home_variable(account.provider),
-            account.resolved_home(),
-        ) else {
+        let (Some(variable), Some(home)) =
+            (sign_in_variable(account.provider), account.resolved_home())
+        else {
             return false;
         };
         self.durable.cards.iter().any(|card| {
@@ -3279,7 +3298,7 @@ impl Cagents {
 
     /// The open card running a sign-in to `home`, if any.
     fn sign_in_card(&self, provider: Provider, home: &Path) -> Option<CardId> {
-        let variable = account::home_variable(provider)?;
+        let variable = sign_in_variable(provider)?;
         self.durable
             .cards
             .iter()
@@ -5679,6 +5698,14 @@ mod tests {
             &["auth", "login", "--claudeai"]
         )));
         assert!(is_sign_in(&recipe("codex", &["login"])));
+        // Plain `agy` is a conversation unless this app opened it to sign in.
+        assert!(!is_sign_in(&recipe("agy", &[])));
+        let mut signing_in = recipe("agy", &[]);
+        signing_in.environment.insert(
+            ANTIGRAVITY_SIGN_IN.into(),
+            "/home/a/.gemini/antigravity-cli".into(),
+        );
+        assert!(is_sign_in(&signing_in));
         assert!(is_sign_in(&recipe("codex", &["login", "--device-auth"])));
         assert!(!is_sign_in(&recipe("claude", &[])));
         assert!(!is_sign_in(&recipe("claude", &["login"])));

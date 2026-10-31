@@ -2157,11 +2157,13 @@ impl Actor {
                     .observe_exit_within(PROTOCOL_EXIT_GRACE)
                     .map_err(|error| error.to_string())?
                 {
+                    self.provider_exited.store(true, Ordering::Release);
                     if closing.is_none()
                         && let Some((arguments, step)) = self.adapter.relaunch_after_exit()
                     {
                         self.step(step)?;
                         (stdin, stdout, stderr) = self.relaunch(arguments)?;
+                        self.provider_exited.store(false, Ordering::Release);
                         stdout_eof = false;
                         stderr_eof = false;
                         partial_started = None;
@@ -2170,7 +2172,6 @@ impl Actor {
                     if status.success() {
                         return Ok(());
                     }
-                    self.provider_exited.store(true, Ordering::Release);
                     return Err(format!("Provider exited with {status}"));
                 }
                 return Err("Provider closed its protocol stream; process terminated to avoid an unobservable writer".into());

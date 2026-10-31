@@ -231,7 +231,13 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     if let Some(model) = &spec.model {
         arguments.extend(["--model".into(), model.clone()]);
     }
-    if let Some(mode) = &spec.permission_mode {
+    if spec.provider == Provider::Antigravity && spec.permission_mode.as_deref() == Some("yolo") {
+        arguments.push("--dangerously-skip-permissions".into());
+    } else if let Some(mode) = spec
+        .permission_mode
+        .as_ref()
+        .filter(|mode| spec.provider != Provider::Antigravity || *mode != "default")
+    {
         let flag = match spec.provider {
             Provider::Claude => "--permission-mode",
             Provider::Omp => "--approval-mode",
