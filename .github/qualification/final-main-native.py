@@ -600,8 +600,10 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
         if field is None or field.queryText().getText(0, -1) != expected or not field.getState().contains(pyatspi.STATE_FOCUSED):
             return None
         native_focus = int(command(['xdotool', 'getwindowfocus']).strip())
+        if native_focus != int(window):
+            return None  # GTK can unmap before normal WM focus restoration.
         native_pid = int(command(['xdotool', 'getwindowpid', str(native_focus)]).strip())
-        assert native_focus == int(window) and native_pid == pid
+        assert native_pid == pid
         assert processes()[pid]['stamp'] == ui_identity['stamp'], 'Native UI process generation changed'
         text = field.queryText()
         assert text.caretOffset == len(expected) and text.getNSelections() == 0
@@ -673,8 +675,16 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     wait(dialog)
     def gtk_key_owner():
         focus = int(command(['xdotool', 'getwindowfocus']).strip())
+        if focus in (0, 1):  # None/PointerRoot have no process owner.
+            return None
+        owner_property = command(['xprop', '-id', str(focus), '_NET_WM_PID']).decode().strip()
+        owner_match = re.fullmatch(r'_NET_WM_PID\(CARDINAL\) = ([0-9]+)', owner_property)
+        if owner_match is None or int(owner_match[1]) != backend.pid:
+            return None  # Root/other-window focus can precede GTK activation.
         owner = int(command(['xdotool', 'getwindowpid', str(focus)]).strip())
-        return focus if owner == backend.pid else None
+        assert owner == backend.pid
+        assert processes()[owner]['stamp'] == backend.owned_identity['stamp'], 'GTK process generation changed'
+        return focus
     wait(gtk_key_owner)  # Observe normal WM activation before chooser-only keys.
     # libcosmic's portal path omits parent and ignores Dialog.directory. Use
     # the real GTK location entry to prevent captures of private Home listings.
