@@ -111,10 +111,22 @@ pub enum Action {
     PromptCursor(text_editor::Cursor),
     Shell(text_editor::Action),
     ShellCursor(text_editor::Cursor),
-    Enable,
-    Pause,
-    RunNow,
-    Remove,
+    Enable {
+        id: Uuid,
+        revision: u64,
+    },
+    Pause {
+        id: Uuid,
+        revision: u64,
+    },
+    RunNow {
+        id: Uuid,
+        revision: u64,
+    },
+    Remove {
+        id: Uuid,
+        revision: u64,
+    },
     Confirm(u64),
     CancelConfirmation,
     History,
@@ -124,8 +136,14 @@ pub enum Action {
     MoreLifecycle,
     Run(Uuid),
     InspectRun(crate::model::RunId),
-    CancelRun,
-    OpenSession,
+    CancelRun {
+        automation: Uuid,
+        firing: Uuid,
+    },
+    OpenSession {
+        automation: Uuid,
+        firing: Uuid,
+    },
     Received {
         sequence: u64,
         result: std::sync::Arc<Result<Response, String>>,
@@ -1138,6 +1156,51 @@ impl State {
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
+        // Captured controls may arrive after another definition or run was read.
+        // Reject them before consuming a current read or confirmation.
+        if let Action::Enable { id, revision }
+        | Action::Pause { id, revision }
+        | Action::RunNow { id, revision }
+        | Action::Remove { id, revision } = &action
+        {
+            let available = self.draft.is_none()
+                && self.run.is_none()
+                && !self.all_history
+                && self.confirmation.is_none()
+                && self.selected.as_ref().is_some_and(|selected| {
+                    selected.id == *id
+                        && selected.revision == *revision
+                        && match &action {
+                            Action::Pause { .. } => selected.enabled,
+                            Action::Enable { .. } => {
+                                !selected.enabled && selected.blocked.is_none()
+                            }
+                            _ => selected.active_firing.is_none() && selected.blocked.is_none(),
+                        }
+                });
+            if !available {
+                return None;
+            }
+        }
+        if let Action::OpenSession { automation, firing } = &action
+            && !self
+                .run
+                .as_ref()
+                .is_some_and(|run| run.firing.automation == *automation && run.firing.id == *firing)
+        {
+            return None;
+        }
+        if let Action::CancelRun { automation, firing } = &action
+            && !self.run.as_ref().is_some_and(|run| {
+                run.firing.automation == *automation
+                    && run.firing.id == *firing
+                    && run.firing.state.is_active()
+            })
+        {
+            // Refuse a stale callback before it can consume a current read,
+            // confirmation, or another run's mutation slot.
+            return None;
+        }
         if self.lifecycle_notice.is_some() {
             // This surface is historical only. Retained callbacks from the
             // previous editor cannot mutate or open a different run behind it.
@@ -1413,7 +1476,16 @@ impl State {
                         }
                     }
                     self.notice = Some(format!("Run requested: {}", state_label(firing.state)));
-                    self.history.insert(0, firing);
+                    if let Some(current) = self.history.iter_mut().find(|row| row.id == firing.id) {
+                        // An idempotent retry can return a firing already read
+                        // by polling. Refresh its receipt without moving it.
+                        *current = firing;
+                    } else {
+                        let index = self
+                            .history
+                            .partition_point(|row| history_key(row) > history_key(&firing));
+                        self.history.insert(index, firing);
+                    }
                 }
                 Ok(Response::Removed) => {
                     self.lifecycle = None;
@@ -1756,11 +1828,11 @@ impl State {
                     draft.shell.perform(action);
                 }
             }
-            Action::Enable | Action::RunNow | Action::Remove => {
+            Action::Enable { .. } | Action::RunNow { .. } | Action::Remove { .. } => {
                 if let Some(automation) = &self.selected {
                     self.sequence = self.sequence.wrapping_add(1);
                     let (request, title) = match action {
-                        Action::Enable => (
+                        Action::Enable { .. } => (
                             Request::SetEnabled {
                                 id: automation.id,
                                 revision: automation.revision,
@@ -1769,7 +1841,7 @@ impl State {
                             },
                             "Enable scheduled execution?",
                         ),
-                        Action::RunNow => (
+                        Action::RunNow { .. } => (
                             Request::RunNow {
                                 id: automation.id,
                                 execution_revision: automation.execution_revision,
@@ -1801,18 +1873,16 @@ impl State {
                     });
                 }
             }
-            Action::Pause => {
-                if let Some(automation) = &self.selected {
-                    return self.request(
-                        Pending::Mutate,
-                        Request::SetEnabled {
-                            id: automation.id,
-                            revision: automation.revision,
-                            enabled: false,
-                            confirmed: false,
-                        },
-                    );
-                }
+            Action::Pause { id, revision } => {
+                return self.request(
+                    Pending::Mutate,
+                    Request::SetEnabled {
+                        id,
+                        revision,
+                        enabled: false,
+                        confirmed: false,
+                    },
+                );
             }
             Action::Lifecycle | Action::MoreLifecycle => {
                 if let Some(selected) = &self.selected {
@@ -1878,22 +1948,17 @@ impl State {
                 }
                 self.run = None;
             }
-            Action::CancelRun => {
-                if let Some(run) = &self.run {
-                    return self.request(
-                        Pending::Mutate,
-                        Request::Cancel {
-                            id: run.firing.automation,
-                            firing: run.firing.id,
-                        },
-                    );
-                }
+            Action::CancelRun { automation, firing } => {
+                return self.request(
+                    Pending::Mutate,
+                    Request::Cancel {
+                        id: automation,
+                        firing,
+                    },
+                );
             }
-            Action::OpenSession => {
-                if let Some(run) = &self.run {
-                    return self
-                        .request(Pending::OpenRun, Request::ShowFiring { id: run.firing.id });
-                }
+            Action::OpenSession { firing, .. } => {
+                return self.request(Pending::OpenRun, Request::ShowFiring { id: firing });
             }
             _ => {}
         }
@@ -2246,22 +2311,16 @@ impl State {
             } else {
                 "The agent may change files and use tools allowed by these permissions. Confirm only this displayed launch configuration."
             }));
-            content = content.push(
-                widget::row::with_children(vec![
-                    button("Cancel", Action::CancelConfirmation, !busy),
-                    if matches!(confirmation.request, Request::Remove { .. }) {
-                        crate::ui_controls::button::destructive("Remove automation")
-                            .on_press_maybe(
-                                (!busy).then_some(Action::Confirm(confirmation.generation)),
-                            )
-                            .into()
-                    } else {
-                        button("Confirm", Action::Confirm(confirmation.generation), !busy)
-                    },
-                ])
-                .spacing(space::S)
-                .wrap(),
-            );
+            content = content.push(action_row(vec![
+                button("Cancel", Action::CancelConfirmation, !busy),
+                if matches!(confirmation.request, Request::Remove { .. }) {
+                    crate::ui_controls::button::destructive("Remove automation")
+                        .on_press_maybe((!busy).then_some(Action::Confirm(confirmation.generation)))
+                        .into()
+                } else {
+                    button("Confirm", Action::Confirm(confirmation.generation), !busy)
+                },
+            ]));
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));
         } else {
@@ -2407,15 +2466,29 @@ impl State {
                         if let Some(blocked) = &selected.blocked {
                             content = content.push(crate::design::body(blocked));
                         }
-                        content = content.push(
-                            widget::row::with_children(vec![
+                        let mut subject = [0; 32];
+                        subject[..16].copy_from_slice(selected.id.as_bytes());
+                        subject[16..24].copy_from_slice(&selected.revision.to_be_bytes());
+                        content = content.push(crate::interaction::keyed_list_rows(vec![(
+                            subject,
+                            action_row(vec![
                                 button("Edit", Action::Edit, !busy),
                                 if selected.enabled {
-                                    button("Pause", Action::Pause, !busy)
+                                    button(
+                                        "Pause",
+                                        Action::Pause {
+                                            id: selected.id,
+                                            revision: selected.revision,
+                                        },
+                                        !busy,
+                                    )
                                 } else {
                                     button(
                                         "Enable…",
-                                        Action::Enable,
+                                        Action::Enable {
+                                            id: selected.id,
+                                            revision: selected.revision,
+                                        },
                                         !busy && selected.blocked.is_none(),
                                     )
                                 },
@@ -2427,22 +2500,26 @@ impl State {
                                     } else {
                                         "Run now…"
                                     },
-                                    Action::RunNow,
+                                    Action::RunNow {
+                                        id: selected.id,
+                                        revision: selected.revision,
+                                    },
                                     !busy
                                         && selected.active_firing.is_none()
                                         && selected.blocked.is_none(),
                                 ),
                                 button(
                                     "Remove…",
-                                    Action::Remove,
+                                    Action::Remove {
+                                        id: selected.id,
+                                        revision: selected.revision,
+                                    },
                                     !busy
                                         && selected.active_firing.is_none()
                                         && selected.blocked.is_none(),
                                 ),
-                            ])
-                            .spacing(space::S)
-                            .wrap(),
-                        );
+                            ]),
+                        )]));
                     }
                 }
                 if self.selected.is_some() {
@@ -2611,26 +2688,36 @@ impl State {
                         ));
                     }
                 }
-                content = content.push(
-                    widget::row::with_children(vec![
+                let mut subject = [0; 32];
+                subject[..16].copy_from_slice(run.firing.automation.as_bytes());
+                subject[16..].copy_from_slice(run.firing.id.as_bytes());
+                // A retained press belongs to the exact displayed run. Keep
+                // its native state for the same subject, retire it on replacement.
+                content = content.push(crate::interaction::keyed_list_rows(vec![(
+                    subject,
+                    action_row(vec![
                         button(
                             "Cancel run",
-                            Action::CancelRun,
+                            Action::CancelRun {
+                                automation: run.firing.automation,
+                                firing: run.firing.id,
+                            },
                             !busy && run.firing.state.is_active(),
                         ),
                         button(
                             "Open agent",
-                            Action::OpenSession,
+                            Action::OpenSession {
+                                automation: run.firing.automation,
+                                firing: run.firing.id,
+                            },
                             !busy
                                 && run
                                     .agent
                                     .as_ref()
                                     .is_some_and(|agent| !agent.closed && agent.session.is_some()),
                         ),
-                    ])
-                    .spacing(space::S)
-                    .wrap(),
-                );
+                    ]),
+                )]));
             }
         }
         let vertical =
@@ -2891,16 +2978,12 @@ impl Draft {
                 })),
             );
         }
-        let fields = fields.push(
-            widget::row::with_children(vec![
-                button("Cancel", Action::CancelEdit, !busy),
-                crate::ui_controls::button::primary("Save automation")
-                    .on_press_maybe((!busy).then_some(Action::Save))
-                    .into(),
-            ])
-            .spacing(space::S)
-            .wrap(),
-        );
+        let fields = fields.push(action_row(vec![
+            button("Cancel", Action::CancelEdit, !busy),
+            crate::ui_controls::button::primary("Save automation")
+                .on_press_maybe((!busy).then_some(Action::Save))
+                .into(),
+        ]));
         widget::container(fields)
             .max_width(1040)
             .width(Length::Fill)
@@ -3254,6 +3337,12 @@ fn crumb_style() -> cosmic::theme::Button {
     }
 }
 
+// The pinned iced Row::wrap omits accessibility traversal. COSMIC's FlexRow
+// keeps wrapping and exposes the actual controls to assistive technology.
+fn action_row(children: Vec<Element<'_, Action>>) -> Element<'_, Action> {
+    widget::flex_row(children).spacing(space::S as u16).into()
+}
+
 fn button(label: &'static str, action: Action, enabled: bool) -> Element<'static, Action> {
     let mut button = crate::ui_controls::button::secondary(label);
     if enabled {
@@ -3373,7 +3462,31 @@ fn optional(value: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    mod action_admission;
+    mod manual_receipts;
+
     use super::*;
+
+    fn enable(owner: &Automation) -> Action {
+        Action::Enable {
+            id: owner.id,
+            revision: owner.revision,
+        }
+    }
+
+    fn run_now(owner: &Automation) -> Action {
+        Action::RunNow {
+            id: owner.id,
+            revision: owner.revision,
+        }
+    }
+
+    fn remove(owner: &Automation) -> Action {
+        Action::Remove {
+            id: owner.id,
+            revision: owner.revision,
+        }
+    }
 
     fn automation() -> Automation {
         Automation {
@@ -3546,7 +3659,7 @@ mod tests {
             selected: Some(automation()),
             ..State::default()
         };
-        state.update(Action::Enable);
+        state.update(enable(state.selected.as_ref().unwrap()));
         assert!(!state.can_open_run());
         assert!(state.update(Action::InspectRun(run)).is_none());
         assert!(state.confirmation.is_some());
@@ -3595,7 +3708,7 @@ mod tests {
             selected: Some(automation()),
             ..State::default()
         };
-        state.update(Action::Enable);
+        state.update(enable(state.selected.as_ref().unwrap()));
         let old = state.confirmation.as_ref().unwrap().generation;
         state.update(Action::Edit);
         state.update(Action::Field(Field::Name, "New launch".into()));
@@ -4333,6 +4446,45 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn confirmation_and_draft_actions_remain_accessible_when_wrapped() {
+        for width in [280.0, 900.0] {
+            let selected = automation();
+            for (action, command) in [
+                (enable(&selected), "Confirm"),
+                (remove(&selected), "Remove automation"),
+            ] {
+                let mut state = State {
+                    selected: Some(selected.clone()),
+                    ..Default::default()
+                };
+                assert!(state.update(action).is_none());
+                assert!(state.confirmation.is_some());
+                let controls = buttons(&state, width);
+                for label in ["Cancel", command] {
+                    assert!(
+                        controls
+                            .iter()
+                            .any(|(name, enabled)| name == label && *enabled),
+                        "{label} must remain accessible at width {width}: {controls:?}"
+                    );
+                }
+            }
+            let mut state = State::default();
+            assert!(state.update(Action::New).is_none());
+            assert!(state.draft.is_some());
+            let controls = buttons(&state, width);
+            for label in ["Cancel", "Save automation"] {
+                assert!(
+                    controls
+                        .iter()
+                        .any(|(name, enabled)| name == label && *enabled),
+                    "{label} must remain accessible at width {width}: {controls:?}"
+                );
+            }
+        }
     }
 
     fn run_of(owner: &Automation) -> RunDetail {
@@ -5103,7 +5255,7 @@ mod tests {
             selected: Some(selected.clone()),
             ..State::default()
         };
-        state.update(Action::Enable);
+        state.update(enable(state.selected.as_ref().unwrap()));
         let confirmation = state.confirmation.as_ref().unwrap();
         let generation = confirmation.generation;
         assert_eq!(confirmation.automation, selected);
@@ -5131,7 +5283,7 @@ mod tests {
             selected: Some(automation()),
             ..State::default()
         };
-        state.update(Action::RunNow);
+        state.update(run_now(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request {
             sequence,
@@ -5144,7 +5296,7 @@ mod tests {
             sequence,
             result: std::sync::Arc::new(Err("Connection lost after send".into())),
         });
-        state.update(Action::RunNow);
+        state.update(run_now(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request { request: retry, .. }) =
             state.update(Action::Confirm(generation))
@@ -6792,7 +6944,7 @@ mod tests {
             selected: Some(a.clone()),
             ..Default::default()
         };
-        state.update(Action::RunNow);
+        state.update(run_now(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request {
             sequence,
@@ -6853,7 +7005,7 @@ mod tests {
 
         // Refused navigation cannot consume the prior confirmation or an
         // accepted/uncertain request's original UUID.
-        state.update(Action::RunNow);
+        state.update(run_now(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request {
             sequence,
@@ -6899,7 +7051,7 @@ mod tests {
 
         // A removal already returned to the list has no selected subject to
         // leave: refreshing that list should retain its useful confirmation.
-        state.update(Action::Remove);
+        state.update(remove(state.selected.as_ref().unwrap()));
         let generation = state.confirmation.as_ref().unwrap().generation;
         let Some(Effect::Request {
             sequence,
@@ -6972,7 +7124,10 @@ mod tests {
                         id,
                         firing: requested,
                     },
-            }) = state.update(Action::CancelRun)
+            }) = state.update(Action::CancelRun {
+                automation: owner.id,
+                firing: firing.firing.id,
+            })
             else {
                 panic!("explicit cancel")
             };
@@ -7088,10 +7243,13 @@ mod tests {
         for action in [
             Action::Tick,
             Action::Refresh,
-            Action::Enable,
-            Action::RunNow,
-            Action::Remove,
-            Action::OpenSession,
+            Action::Enable { id, revision: 4 },
+            Action::RunNow { id, revision: 4 },
+            Action::Remove { id, revision: 4 },
+            Action::OpenSession {
+                automation: id,
+                firing: Uuid::new_v4(),
+            },
             Action::Run(Uuid::new_v4()),
             Action::New,
         ] {
@@ -7243,6 +7401,808 @@ mod tests {
             matches!(selecting.update(Action::InspectRun(run)),Some(Effect::Request{request:Request::ShowRun{run:actual},..}) if actual==run)
         );
         assert!(selecting.lifecycle_notice.is_none());
+    }
+    fn cancel_detail(owner: &Automation) -> RunDetail {
+        let mut detail = run_of(owner);
+        let run = crate::model::RunId::new();
+        detail.firing.state = crate::automations::FiringState::Running;
+        detail.firing.run = Some(run);
+        detail.run = Some(crate::agent_execution::Run {
+            id: run,
+            agent: crate::model::AgentId::new(),
+            state: crate::agent_execution::State::Running,
+            revision: 1,
+            accepted_ms: 100,
+            started_ms: Some(100),
+            finished_ms: None,
+            provider_key: None,
+            result: Default::default(),
+        });
+        detail
+    }
+
+    fn inspect_cancel_detail(state: &mut State, detail: &RunDetail) {
+        let run = detail.run.as_ref().unwrap().id;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::ShowRun { run: requested },
+        }) = state.update(Action::InspectRun(run))
+        else {
+            panic!("the public activation must request its exact run")
+        };
+        assert_eq!(requested, run);
+        assert!(matches!(
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(detail.clone()))),
+            }),
+            Some(Effect::ReadRun(read)) if read == run
+        ));
+        assert_eq!(state.run.as_ref().unwrap().firing.id, detail.firing.id);
+        assert!(state.pending.is_none());
+    }
+
+    fn assert_cancel_request(state: &mut State, action: Action, detail: &RunDetail) {
+        let Some(Effect::Request {
+            request: Request::Cancel { id, firing },
+            ..
+        }) = state.update(action)
+        else {
+            panic!("a fresh exact active subject must still cancel")
+        };
+        assert_eq!((id, firing), (detail.firing.automation, detail.firing.id));
+        assert!(matches!(state.pending, Some((_, Pending::Mutate))));
+    }
+
+    #[test]
+    fn queued_cancel_cannot_retarget_after_another_run_is_read_or_consume_its_ui_work() {
+        let owner = automation();
+        let a = cancel_detail(&owner);
+        let mut other_owner = owner.clone();
+        other_owner.id = Uuid::new_v4();
+        let b = cancel_detail(&other_owner);
+        let old = Action::CancelRun {
+            automation: a.firing.automation,
+            firing: a.firing.id,
+        };
+        let mut state = State::default();
+        inspect_cancel_detail(&mut state, &a);
+        inspect_cancel_detail(&mut state, &b);
+        assert!(state.update(old.clone()).is_none());
+        assert!(state.pending.is_none());
+        assert_eq!(state.run.as_ref().unwrap().firing.id, b.firing.id);
+
+        // A foreign callback must not even supersede B's real background read.
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("current run should refresh")
+        };
+        assert!(matches!(request, Request::ShowFiring { id } if id == b.firing.id));
+        assert!(state.update(old.clone()).is_none());
+        assert!(
+            matches!(state.pending, Some((pending, Pending::RefreshRun)) if pending == sequence)
+        );
+        assert!(matches!(
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Detail(b.clone()))),
+            }),
+            Some(Effect::ReadRun(read)) if read == b.run.as_ref().unwrap().id
+        ));
+
+        for action in [
+            old,
+            Action::CancelRun {
+                automation: a.firing.automation,
+                firing: b.firing.id,
+            },
+            Action::CancelRun {
+                automation: b.firing.automation,
+                firing: a.firing.id,
+            },
+        ] {
+            assert!(state.update(action).is_none());
+            assert!(state.pending.is_none());
+        }
+        select_control_definition(&mut state, &other_owner);
+        assert!(state.update(enable(&other_owner)).is_none());
+        let consent = state.confirmation.as_ref().unwrap().generation;
+        assert!(
+            state
+                .update(Action::CancelRun {
+                    automation: a.firing.automation,
+                    firing: a.firing.id,
+                })
+                .is_none()
+        );
+        assert_eq!(state.confirmation.as_ref().unwrap().generation, consent);
+        assert!(state.update(Action::CancelConfirmation).is_none());
+
+        // The exact original subject is no longer cancellable after settlement.
+        let mut completed = b.clone();
+        completed.firing.state = crate::automations::FiringState::Succeeded;
+        completed.firing.finished_ms = Some(200);
+        completed.run.as_mut().unwrap().state = crate::agent_execution::State::Succeeded;
+        completed.run.as_mut().unwrap().finished_ms = Some(200);
+        inspect_cancel_detail(&mut state, &completed);
+        assert!(
+            state
+                .update(Action::CancelRun {
+                    automation: b.firing.automation,
+                    firing: b.firing.id,
+                })
+                .is_none()
+        );
+        assert!(state.pending.is_none());
+
+        inspect_cancel_detail(&mut state, &b);
+        let fresh = Action::CancelRun {
+            automation: b.firing.automation,
+            firing: b.firing.id,
+        };
+        assert_cancel_request(&mut state, fresh.clone(), &b);
+        assert!(
+            state.update(fresh).is_none(),
+            "in-flight mutation keeps its slot"
+        );
+    }
+
+    type CancelUi<'a> =
+        cosmic::iced::runtime::UserInterface<'a, Action, cosmic::Theme, cosmic::Renderer>;
+
+    fn cancel_frame<'a>(
+        state: &'a State,
+        cache: cosmic::iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> CancelUi<'a> {
+        cancel_frame_at_size(
+            state,
+            cache,
+            renderer,
+            cosmic::iced::Size::new(900.0, 1100.0),
+        )
+    }
+
+    fn cancel_frame_at_size<'a>(
+        state: &'a State,
+        cache: cosmic::iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+        size: cosmic::iced::Size,
+    ) -> CancelUi<'a> {
+        let mut ui =
+            cosmic::iced::runtime::UserInterface::build(state.view(), size, cache, renderer);
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &cosmic::iced::advanced::renderer::Style::default(),
+            cosmic::iced::mouse::Cursor::Unavailable,
+        );
+        ui
+    }
+
+    fn announced_button<'a>(
+        nodes: &'a iced_accessibility::A11yTree,
+        label: &str,
+    ) -> &'a iced_accessibility::A11yNode {
+        let mut controls = nodes.root().iter().chain(nodes.children()).filter(|node| {
+            node.node().role() == iced_accessibility::accesskit::Role::Button
+                && node.node().label() == Some(label)
+        });
+        let control = controls
+            .next()
+            .unwrap_or_else(|| panic!("the actual {label} button is mounted"));
+        assert!(controls.next().is_none(), "exactly one {label} button");
+        assert!(
+            matches!(control.id(), iced_accessibility::A11yId::Widget(_)),
+            "the actual {label} button has a widget identity"
+        );
+        control
+    }
+
+    fn cancel_bounds(ui: &CancelUi<'_>) -> cosmic::iced::Rectangle {
+        use cosmic::iced::{Point, Rectangle, Size, mouse};
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let rect = announced_button(&nodes, "Cancel run")
+            .node()
+            .bounds()
+            .unwrap();
+        let bounds = Rectangle::new(
+            Point::new(rect.x0 as f32, rect.y0 as f32),
+            Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
+        );
+        assert!(Rectangle::with_size(Size::new(900.0, 1100.0)).contains(bounds.center()));
+        bounds
+    }
+
+    fn cancel_pointer(
+        ui: &mut CancelUi<'_>,
+        renderer: &mut cosmic::Renderer,
+        point: cosmic::iced::Point,
+        pressed: bool,
+    ) -> Vec<Action> {
+        use cosmic::iced::{Event, mouse};
+        let mut messages = Vec::new();
+        let event = if pressed {
+            mouse::Event::ButtonPressed(mouse::Button::Left)
+        } else {
+            mouse::Event::ButtonReleased(mouse::Button::Left)
+        };
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(event),
+            ],
+            mouse::Cursor::Available(point),
+            renderer,
+            &mut cosmic::iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        messages
+    }
+
+    #[test]
+    fn scrolled_cancel_accessibility_bounds_reach_the_original_control() {
+        use cosmic::iced::{
+            Event, Point, Rectangle, Size, Vector,
+            advanced::widget::{Operation, operation},
+            mouse,
+            runtime::user_interface::Cache,
+        };
+        struct Geometry {
+            target: widget::Id,
+            control: Option<Rectangle>,
+            scrolls: Vec<(Rectangle, Vector)>,
+        }
+        impl Operation for Geometry {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn scrollable(
+                &mut self,
+                _: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                self.scrolls.push((bounds, translation));
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&self.target) {
+                    self.control = Some(bounds);
+                }
+            }
+        }
+        let owner = automation();
+        let mut detail = cancel_detail(&owner);
+        detail.firing.diagnostic = Some("Retained diagnostic line\n".repeat(40));
+        for width in [280.0, 900.0] {
+            let mut state = State::default();
+            inspect_cancel_detail(&mut state, &detail);
+            let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let size = Size::new(width, 400.0);
+            let mut ui = cancel_frame_at_size(&state, Cache::new(), &mut renderer, size);
+            let cursor = mouse::Cursor::Available(Point::new(width / 2.0, 300.0));
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[Event::Mouse(mouse::Event::WheelScrolled {
+                    delta: mouse::ScrollDelta::Lines { x: 0.0, y: -1000.0 },
+                })],
+                cursor,
+                &mut renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut messages,
+            );
+            assert!(messages.is_empty());
+            ui.draw(
+                &mut renderer,
+                &cosmic::theme::active(),
+                &cosmic::iced::advanced::renderer::Style::default(),
+                cursor,
+            );
+            let nodes = ui.a11y_nodes(cursor);
+            // The text and its parent button share the visible label. The
+            // scroll owner's AX flattening may place that text first; it is
+            // not the focusable control whose ID/bounds this oracle needs.
+            assert!(nodes.root().iter().chain(nodes.children()).any(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Paragraph
+                    && node.node().label() == Some("Cancel run")
+            }));
+            let control = announced_button(&nodes, "Cancel run");
+            let iced_accessibility::A11yId::Widget(id) = control.id() else {
+                panic!("a cancellation control has a widget identity");
+            };
+            let bounds = control.node().bounds().unwrap();
+            let bounds = Rectangle::new(
+                Point::new(bounds.x0 as f32, bounds.y0 as f32),
+                Size::new(
+                    (bounds.x1 - bounds.x0) as f32,
+                    (bounds.y1 - bounds.y0) as f32,
+                ),
+            );
+            let mut geometry = Geometry {
+                target: id.clone(),
+                control: None,
+                scrolls: Vec::new(),
+            };
+            ui.operate(&renderer, &mut geometry);
+            let [(viewport, translation)] = geometry.scrolls.as_slice() else {
+                panic!(
+                    "Details has one actual scroll owner: {:?}",
+                    geometry.scrolls
+                );
+            };
+            assert!(translation.y > 0.0, "the real wheel event must scroll");
+            assert_eq!(bounds, geometry.control.unwrap() - *translation);
+            assert!(viewport.contains(bounds.center()));
+            assert!(Rectangle::with_size(size).contains(bounds.center()));
+            assert!(cancel_pointer(&mut ui, &mut renderer, bounds.center(), true).is_empty());
+            let mut messages = cancel_pointer(&mut ui, &mut renderer, bounds.center(), false);
+            assert_eq!(messages.len(), 1);
+            let _ = ui.into_cache();
+            assert_cancel_request(&mut state, messages.remove(0), &detail);
+        }
+    }
+
+    #[test]
+    fn retained_details_cancel_press_stays_with_its_run_across_coalesced_reads() {
+        use cosmic::iced::runtime::user_interface::Cache;
+        let owner = automation();
+        let a = cancel_detail(&owner);
+        let b = cancel_detail(&owner);
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for replacement in [false, true] {
+            let mut state = State::default();
+            inspect_cancel_detail(&mut state, &a);
+            let mut ui = cancel_frame(&state, Cache::new(), &mut renderer);
+            let point = cancel_bounds(&ui).center();
+            assert!(cancel_pointer(&mut ui, &mut renderer, point, true).is_empty());
+            let cache = ui.into_cache();
+            let next = if replacement { &b } else { &a };
+            // Real public read + exact reply, coalesced before the next frame.
+            // Rendering a loading frame here would mask this replacement race.
+            inspect_cancel_detail(&mut state, next);
+            let mut ui = cancel_frame(&state, cache, &mut renderer);
+            assert_eq!(
+                cancel_bounds(&ui).center(),
+                point,
+                "same physical control geometry"
+            );
+            let mut messages = cancel_pointer(&mut ui, &mut renderer, point, false);
+            if replacement {
+                assert!(
+                    messages.is_empty(),
+                    "A's press cannot publish B's callback: {messages:?}"
+                );
+                assert!(cancel_pointer(&mut ui, &mut renderer, point, true).is_empty());
+                messages = cancel_pointer(&mut ui, &mut renderer, point, false);
+            }
+            let _ = ui.into_cache();
+            assert_eq!(
+                messages.len(),
+                1,
+                "unchanged release or fresh successor click: {messages:?}"
+            );
+            assert_cancel_request(&mut state, messages.remove(0), next);
+        }
+    }
+
+    #[test]
+    fn unchanged_details_cancel_keeps_native_keyboard_focus_and_replacement_retires_it() {
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::{Rectangle, runtime::user_interface::Cache};
+        struct Focus {
+            bounds: Rectangle,
+            id: Option<widget::Id>,
+            focused: bool,
+        }
+        impl Operation for Focus {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if bounds == self.bounds {
+                    self.id = id.cloned();
+                    self.focused = state.is_focused();
+                }
+            }
+        }
+        let owner = automation();
+        let a = cancel_detail(&owner);
+        let b = cancel_detail(&owner);
+        let mut state = State::default();
+        inspect_cancel_detail(&mut state, &a);
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = cancel_frame(&state, Cache::new(), &mut renderer);
+        let bounds = cancel_bounds(&ui);
+        let mut focus = Focus {
+            bounds,
+            id: None,
+            focused: false,
+        };
+        ui.operate(&renderer, &mut focus);
+        ui.operate(
+            &renderer,
+            &mut operation::focusable::focus::<()>(focus.id.expect("actual Cancel button ID")),
+        );
+        let cache = ui.into_cache();
+        inspect_cancel_detail(&mut state, &a);
+        let mut ui = cancel_frame(&state, cache, &mut renderer);
+        let mut focus = Focus {
+            bounds: cancel_bounds(&ui),
+            id: None,
+            focused: false,
+        };
+        ui.operate(&renderer, &mut focus);
+        assert!(
+            focus.focused,
+            "same exact run keeps its native keyboard owner"
+        );
+        let cache = ui.into_cache();
+        inspect_cancel_detail(&mut state, &b);
+        let mut ui = cancel_frame(&state, cache, &mut renderer);
+        let mut focus = Focus {
+            bounds: cancel_bounds(&ui),
+            id: None,
+            focused: false,
+        };
+        ui.operate(&renderer, &mut focus);
+        assert!(
+            !focus.focused,
+            "another run cannot inherit A's native focus"
+        );
+    }
+
+    fn select_control_definition(state: &mut State, owner: &Automation) {
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Select(owner.id))
+        else {
+            panic!("public selection must read the exact definition")
+        };
+        assert_eq!(id, owner.id);
+        finish_control_definition_read(state, sequence, owner);
+    }
+
+    fn finish_control_definition_read(state: &mut State, sequence: u64, owner: &Automation) {
+        let Some(Effect::Request {
+            sequence,
+            request: Request::History { id, before, .. },
+        }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(owner.clone()))),
+        })
+        else {
+            panic!("definition read must request its actual history")
+        };
+        assert_eq!(id, Some(owner.id));
+        assert!(before.is_none());
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(
+                        crate::automations::HistoryPage {
+                            firings: Vec::new(),
+                            next: None,
+                        }
+                    ))),
+                })
+                .is_none()
+        );
+        assert_eq!(state.selected.as_ref().unwrap().id, owner.id);
+        assert!(state.pending.is_none(), "both actual reads have settled");
+    }
+
+    fn assert_pause_request(state: &mut State, action: Action, owner: &Automation) {
+        let Some(Effect::Request {
+            request:
+                Request::SetEnabled {
+                    id,
+                    revision,
+                    enabled,
+                    confirmed,
+                },
+            ..
+        }) = state.update(action)
+        else {
+            panic!("fresh enabled subject must still pause")
+        };
+        assert_eq!((id, revision), (owner.id, owner.revision));
+        assert!(!enabled && !confirmed);
+        assert!(matches!(state.pending, Some((_, Pending::Mutate))));
+    }
+
+    #[test]
+    fn queued_pause_keeps_its_definition_revision_without_consuming_successor_work() {
+        let mut a = automation();
+        a.enabled = true;
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        b.revision += 1;
+        let old = Action::Pause {
+            id: a.id,
+            revision: a.revision,
+        };
+        let fresh = Action::Pause {
+            id: b.id,
+            revision: b.revision,
+        };
+        let mut state = State::default();
+        select_control_definition(&mut state, &a);
+        select_control_definition(&mut state, &b);
+        // Both Show(B) and History(B) completed: a foreground-read guard
+        // cannot mask a stale callback that would otherwise pause B.
+        assert!(state.update(old.clone()).is_none());
+        assert!(state.pending.is_none());
+        for action in [
+            Action::Pause {
+                id: a.id,
+                revision: b.revision,
+            },
+            Action::Pause {
+                id: b.id,
+                revision: a.revision,
+            },
+        ] {
+            assert!(state.update(action).is_none());
+            assert!(state.pending.is_none());
+        }
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("selected definition must refresh")
+        };
+        assert!(matches!(request, Request::Show { id } if id == b.id));
+        assert!(state.update(old.clone()).is_none());
+        assert!(matches!(state.pending,
+            Some((pending, Pending::RefreshAutomation)) if pending == sequence));
+        finish_control_definition_read(&mut state, sequence, &b);
+        assert!(
+            state
+                .update(run_now(state.selected.as_ref().unwrap()))
+                .is_none()
+        );
+        let confirmation = state.confirmation.as_ref().unwrap().generation;
+        assert!(state.update(old).is_none());
+        assert_eq!(
+            state.confirmation.as_ref().unwrap().generation,
+            confirmation
+        );
+        assert!(state.update(Action::CancelConfirmation).is_none());
+
+        let mut paused = b.clone();
+        paused.enabled = false;
+        select_control_definition(&mut state, &paused);
+        assert!(state.update(fresh.clone()).is_none());
+        assert!(state.pending.is_none());
+        select_control_definition(&mut state, &b);
+        assert_pause_request(&mut state, fresh.clone(), &b);
+        assert!(
+            state.update(fresh).is_none(),
+            "mutation retains its original slot"
+        );
+    }
+
+    fn pause_bounds(ui: &CancelUi<'_>) -> cosmic::iced::Rectangle {
+        use cosmic::iced::{Point, Rectangle, Size, mouse};
+        let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+        let rect = announced_button(&nodes, "Pause").node().bounds().unwrap();
+        let bounds = Rectangle::new(
+            Point::new(rect.x0 as f32, rect.y0 as f32),
+            Size::new((rect.x1 - rect.x0) as f32, (rect.y1 - rect.y0) as f32),
+        );
+        assert!(Rectangle::with_size(Size::new(900.0, 1100.0)).contains(bounds.center()));
+        bounds
+    }
+
+    #[test]
+    fn retained_pause_press_follows_definition_identity_and_revision_not_refresh_metadata() {
+        use cosmic::iced::runtime::user_interface::Cache;
+        let mut a = automation();
+        a.enabled = true;
+        let mut refreshed = a.clone();
+        refreshed.updated_ms += 1;
+        let mut b = a.clone();
+        b.id = Uuid::new_v4();
+        let mut revised = a.clone();
+        revised.revision += 1;
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for next in [&refreshed, &b, &revised] {
+            let replaced = (next.id, next.revision) != (a.id, a.revision);
+            let mut state = State::default();
+            // Stable list shape ensures only the actual selected-control key
+            // discriminates the held gesture; no loading frame is rendered.
+            state.rows = vec![a.summary(None), b.summary(None)];
+            select_control_definition(&mut state, &a);
+            let mut ui = cancel_frame(&state, Cache::new(), &mut renderer);
+            let point = pause_bounds(&ui).center();
+            assert!(cancel_pointer(&mut ui, &mut renderer, point, true).is_empty());
+            let cache = ui.into_cache();
+            select_control_definition(&mut state, next);
+            let mut ui = cancel_frame(&state, cache, &mut renderer);
+            assert_eq!(
+                pause_bounds(&ui).center(),
+                point,
+                "same physical control geometry"
+            );
+            let mut messages = cancel_pointer(&mut ui, &mut renderer, point, false);
+            if replaced {
+                assert!(
+                    messages.is_empty(),
+                    "old press cannot activate a new subject: {messages:?}"
+                );
+                assert!(cancel_pointer(&mut ui, &mut renderer, point, true).is_empty());
+                messages = cancel_pointer(&mut ui, &mut renderer, point, false);
+            }
+            let _ = ui.into_cache();
+            assert_eq!(
+                messages.len(),
+                1,
+                "same subject or fresh successor click: {messages:?}"
+            );
+            assert!(matches!(&messages[0], Action::Pause { id, revision }
+                if *id == next.id && *revision == next.revision));
+            assert_pause_request(&mut state, messages.remove(0), next);
+        }
+    }
+
+    fn settled_agent_detail(owner: &Automation) -> RunDetail {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Placement};
+        let mut detail = run_of(owner);
+        let placement = Placement::Channel(crate::model::ChannelId::new());
+        let mut spec = owner.definition.agent.clone();
+        spec.target.placement = Some(placement.clone());
+        let agent = Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin: Origin::Automation { id: owner.id },
+            spec,
+            placement,
+            session: Some(HostedSession::Chat(crate::chat::Session {
+                native_continuity: Default::default(),
+                id: crate::model::TerminalId::new(),
+                proof: Some(crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("fixture-host"),
+                    boot_id: crate::model::BootId::new("fixture-boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
+                }),
+                terminal: None,
+                owned_codex_listener: None,
+                launch: crate::chat::Launch {
+                    provider: Provider::Claude,
+                    session_id: None,
+                    recipe: crate::model::LaunchRecipe {
+                        program: "claude".into(),
+                        arguments: Vec::new(),
+                        working_directory: "/fixture".into(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                },
+            })),
+            console: None,
+            created_ms: 100,
+            closed: false,
+        };
+        detail.firing.agent = Some(agent.id);
+        detail.agent = Some(agent);
+        assert!(!detail.firing.state.is_active());
+        assert!(detail.run.is_none() && detail.firing.run.is_none());
+        detail
+    }
+
+    fn show_control_detail(state: &mut State, detail: &RunDetail) {
+        let Some(Effect::Request {
+            sequence,
+            request: Request::ShowFiring { id },
+        }) = state.update(Action::Run(detail.firing.id))
+        else {
+            panic!("public history activation must request the original firing")
+        };
+        assert_eq!(id, detail.firing.id);
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::Detail(detail.clone()))),
+                })
+                .is_none()
+        );
+        assert_eq!(state.run.as_ref().unwrap().firing.id, detail.firing.id);
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn queued_open_agent_keeps_its_firing_and_settled_agent_uses_the_public_read_route() {
+        let a = settled_agent_detail(&automation());
+        let b = settled_agent_detail(&automation());
+        let old = Action::OpenSession {
+            automation: a.firing.automation,
+            firing: a.firing.id,
+        };
+        let mut state = State::default();
+        show_control_detail(&mut state, &a);
+        show_control_detail(&mut state, &b);
+        assert!(state.update(old.clone()).is_none());
+        assert!(state.pending.is_none());
+        let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+            panic!("current detail must refresh")
+        };
+        assert!(matches!(request, Request::ShowFiring { id } if id == b.firing.id));
+        assert!(state.update(old.clone()).is_none());
+        assert!(
+            matches!(state.pending, Some((pending, Pending::RefreshRun)) if pending == sequence)
+        );
+        assert!(
+            state
+                .update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::Detail(b.clone()))),
+                })
+                .is_none()
+        );
+        for stale in [
+            old,
+            Action::OpenSession {
+                automation: a.firing.automation,
+                firing: b.firing.id,
+            },
+            Action::OpenSession {
+                automation: b.firing.automation,
+                firing: a.firing.id,
+            },
+        ] {
+            assert!(state.update(stale).is_none());
+            assert!(state.pending.is_none());
+        }
+        assert!(
+            buttons(&state, 900.0)
+                .iter()
+                .any(|(label, enabled)| label == "Open agent" && *enabled)
+        );
+        let Some(Effect::Request {
+            sequence,
+            request: Request::ShowFiring { id },
+        }) = state.update(Action::OpenSession {
+            automation: b.firing.automation,
+            firing: b.firing.id,
+        })
+        else {
+            panic!("fresh settled agent must be read before opening")
+        };
+        assert_eq!(id, b.firing.id);
+        assert!(matches!(state.pending, Some((_, Pending::OpenRun))));
+        assert!(
+            state
+                .update(Action::OpenSession {
+                    automation: b.firing.automation,
+                    firing: b.firing.id,
+                })
+                .is_none(),
+            "the existing foreground read keeps its request slot"
+        );
+        assert!(matches!(state.pending, Some((pending, Pending::OpenRun)) if pending == sequence));
+        let Some(Effect::OpenRun(opened)) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Detail(b.clone()))),
+        }) else {
+            panic!("matching authoritative detail must reach the existing open effect")
+        };
+        assert_eq!(
+            (opened.firing.automation, opened.firing.id),
+            (b.firing.automation, b.firing.id)
+        );
+        assert_eq!(opened.agent.unwrap().id, b.agent.as_ref().unwrap().id);
+        assert!(opened.run.is_none());
     }
 }
 pub fn state_label(state: crate::automations::FiringState) -> &'static str {
