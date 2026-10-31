@@ -21,7 +21,7 @@ SOURCE = Path(__file__).with_name('final-main-native.py').read_text()
 NAMES = {'NativeCancelled','Cancellation','family','register','start_owned','stop','cleanup_arm',
          'spawn','command','open_monitor','complete_arm_cleanup','finish_cleanup','IncompleteTree','wait',
          'DriverLedger','open_parent','close_parent','write_payload','original_wait','drain_adopted',
-         'publish_ledger','PortalObserver','save_image','backup_database'}
+         'publish_ledger','PortalObserver','save_image','backup_database','wait_record','admit_work'}
 
 
 class InertPath:
@@ -184,8 +184,10 @@ class Harness:
         assert {node.name for node in selected} == NAMES
         exec(compile(ast.Module(body=selected,type_ignores=[]),'<actual-driver-definitions>','exec'),namespace)
         namespace['cancellation'] = namespace['Cancellation']()
-        namespace['ledger'] = namespace['DriverLedger'](namespace['time'].time_ns,Lock())
-        namespace['ledger'].binding = {'algorithm_only':'not a native/source/closure evidence packet'}
+        namespace['ledger'] = namespace['DriverLedger'](namespace['time'].time_ns,Lock(),1000)
+        namespace['ledger'].binding = dict(algorithm_only='not a native/source/closure evidence packet',
+            logical_job='algorithm-only-logical-job',numeric_job_id=None,
+            driver_instance=dict(pid=1000,observation=dict(state='R',parent=900,group=900,stamp='12345')))
         namespace['ledger'].subreaper = True
         self.ns = namespace
 
@@ -629,6 +631,131 @@ class AtomicOwnershipTests(unittest.TestCase):
                     self.assertIn(('connection-close',connection.name),h.events)
                 self.assertTrue(h.ns['ledger'].errors())
                 self.assertFalse(observer.record['accepting']);self.assertEqual(observer.record['inflight'],0)
+
+    def test_actual_original_terminal_policy_distinguishes_unissued_kill_TERM_and_command_exits(self):
+        h=Harness();child=h.spawn();child.returncode,child.state=0,'Z'
+        self.assertEqual(h.ns['finish_cleanup']([])['errors'],[])
+        for code in (-9,-15,7,-2):
+            with self.subTest(code=code):
+                h=Harness();child=h.spawn();child.returncode,child.state=code,'Z'
+                result=h.ns['finish_cleanup']([])
+                row=h.ns['ledger'].creations[0]
+                self.assertFalse(row['forced']);self.assertEqual(row['signals'],[])
+                self.assertEqual(row['terminal']['exit_code'],code)
+                self.assertTrue(any('unexpected original terminal outcome' in error for error in result['errors']))
+                self.assertNotIn('cleanup-complete',h.output.files)
+        h=Harness();child=h.spawn()
+        def controlled(pid, signum):
+            h.events.append(('signal',pid,signum));child.returncode,child.state=-signum,'Z'
+        h.ns['os'].kill=h.ns['os'].killpg=controlled
+        self.assertEqual(h.ns['finish_cleanup']([])['errors'],[])
+        self.assertEqual(h.ns['ledger'].creations[0]['terminal']['exit_code'],-15)
+        for allowed in ((0,1),(0,)):
+            h=Harness();h.creation=lambda handle:setattr(handle,'communicate_code',1)
+            if 1 in allowed:self.assertEqual(h.ns['command'](['algorithm-search'],allowed_exit_codes=allowed),b'observed bytes')
+            else:
+                with self.assertRaises(subprocess.CalledProcessError):h.ns['command'](['algorithm-search'],allowed_exit_codes=allowed)
+            self.assertEqual(h.ns['ledger'].creations[0]['exit_policy'],dict(kind='declared-command-exits',allowed_exit_codes=list(allowed)))
+            self.assertEqual(bool(h.ns['finish_cleanup']([])['errors']),1 not in allowed)
+
+    def test_wait_recording_failure_preserves_exact_first_error_and_original_cleanup(self):
+        h=Harness();child=h.spawn()
+        self.assertEqual(h.ns['original_wait'](child,1),0)
+        self.assertEqual(h.ns['ledger'].creations[0]['terminal']['exit_code'],0)
+        for stage in ('wait','communicate','successful-communicate'):
+            with self.subTest(stage=stage):
+                h=Harness();original=RuntimeError('actual original '+stage);secondary=RuntimeError('diagnostic metadata failed')
+                def broken_clock():raise secondary
+                def broken_record(*args, **kwargs):raise secondary
+                if stage=='wait':
+                    child=h.spawn();child.wait_error=original
+                    h.ns['ledger'].clock=broken_clock  # Actual record_wait clock fails after the actual wait exception.
+                    with self.assertRaises(RuntimeError) as caught:h.ns['original_wait'](child,1)
+                    self.assertIs(caught.exception,original)
+                else:
+                    def setup(handle):
+                        if stage=='communicate':
+                            def fail():raise original
+                            handle.on_communicate=fail
+                    h.creation=setup;h.ns['ledger'].record_wait=broken_record
+                    with self.assertRaises(RuntimeError) as caught:h.ns['command'](['algorithm-only-command'])
+                    self.assertIs(caught.exception,original if stage=='communicate' else secondary)
+                    child=h.handles[0]
+                    self.assertTrue(any(event[0]=='wait' and event[1]==child.pid for event in h.events))
+                    self.assertTrue(child.stdout.closed and child.stderr.closed)
+                expected=secondary if stage=='successful-communicate' else original
+                self.assertIs(h.ns['cancellation'].failure,expected)
+                self.assertTrue(any('wait metadata UNKNOWN' in error for error in h.ns['ownership_errors']))
+                result=h.ns['finish_cleanup']([])
+                self.assertTrue(result['errors']);self.assertNotIn('cleanup-complete',h.output.files)
+                self.assertIs(h.ns['cancellation'].failure,expected)
+
+    def test_callback_failure_after_final_query_refuses_arm_and_new_work_but_settles_owners(self):
+        h=Harness();portal=PortalHarness(h);observer=portal.open()
+        observer.close();self.assertEqual(h.ns['finish_cleanup']([])['errors'],[])
+        for stage in ('parse','write'):
+            with self.subTest(stage=stage):
+                h=Harness();portal=PortalHarness(h);child=h.spawn(portal.resources,'ui');observer=portal.open()
+                class Response(Message):
+                    def get_interface(self):return 'org.freedesktop.portal.Request'
+                    def get_member(self):return 'Response'
+                    def get_sender(self):return ':1.algorithm-frontend'
+                    def get_body(self):return SimpleNamespace(unpack=lambda:[1,{}])
+                opened=dict(request_path='/algorithm-only',frontend_owner=':1.algorithm-frontend')
+                observer.receive(None,Response(),True,None)
+                self.assertEqual(observer.cancelled(opened)['body'],[1,{}])  # Successful final query precedes failure.
+                original=h.ns['IncompleteTree']('asynchronous terminal callback '+stage)
+                if stage=='parse':
+                    class Broken(Message):
+                        def get_body(self):raise original
+                    observer.receive(None,Broken(),True,None)
+                else:
+                    def fail(name):
+                        if name=='portal.jsonl':raise original
+                    h.output.on_write=fail;observer.receive(None,Message(),True,None)
+                count=len(h.handles);attempts=len(h.ns['ledger'].creations)
+                with self.assertRaises(h.ns['IncompleteTree']) as caught:h.ns['complete_arm_cleanup'](portal.resources,'before',[])
+                self.assertIs(caught.exception,original)
+                self.assertTrue(observer.stream.closed)
+                self.assertTrue(all(('connection-close',connection.name) in h.events for connection in portal.created))
+                with self.assertRaises(h.ns['IncompleteTree']) as caught:h.ns['command'](['forbidden-next-arm-input'])
+                self.assertIs(caught.exception,original)
+                queries=[]
+                with self.assertRaises(h.ns['IncompleteTree']) as caught:h.ns['wait'](lambda:queries.append('forbidden') or True)
+                self.assertIs(caught.exception,original);self.assertEqual(queries,[])
+                self.assertEqual((len(h.handles),len(h.ns['ledger'].creations)),(count,attempts))
+                self.assertTrue(h.ns['finish_cleanup']([])['errors'])
+                self.assertTrue(any(event[0]=='wait' and event[1]==child.pid for event in h.events))
+                self.assertIs(h.ns['cancellation'].failure,original)
+        for kind in ('incomplete','stale'):
+            h=Harness();self.assertTrue(h.ns['wait'](lambda:True))
+            original=(h.ns['IncompleteTree'] if kind=='incomplete' else h.ns['GLib'].Error)('Unknown object terminal callback')
+            queries=[];inputs=[]
+            def query():
+                queries.append('query');h.ns['cancellation'].latch(original);return True
+            with self.assertRaises(type(original)) as caught:
+                h.ns['wait'](query);inputs.append('forbidden-after-positive-query')
+            self.assertIs(caught.exception,original);self.assertEqual(queries,['query']);self.assertEqual(inputs,[])
+
+    def test_driver_binding_requires_actual_shaped_original_self_observation(self):
+        h=Harness()
+        self.assertEqual(h.ns['ledger'].errors(),[])
+        self.assertEqual(h.ns['ledger'].binding['driver_instance']['pid'],1000)
+        self.assertIsNone(h.ns['ledger'].binding['numeric_job_id'])
+        self.assertEqual(h.ns['finish_cleanup']([])['errors'],[])
+        for case in ('missing-instance','missing-observation','null-observation','missing-stamp','bad-stamp','zero-group','wrong-pid','numeric-job'):
+            with self.subTest(case=case):
+                h=Harness();binding=h.ns['ledger'].binding
+                if case=='missing-instance':del binding['driver_instance']
+                elif case=='missing-observation':del binding['driver_instance']['observation']
+                elif case=='null-observation':binding['driver_instance']['observation']=None
+                elif case=='missing-stamp':del binding['driver_instance']['observation']['stamp']
+                elif case=='bad-stamp':binding['driver_instance']['observation']['stamp']=''
+                elif case=='zero-group':binding['driver_instance']['observation']['group']=0
+                elif case=='wrong-pid':binding['driver_instance']['pid']=1001
+                else:binding['numeric_job_id']=123
+                self.assertTrue(any('instance binding UNKNOWN' in error for error in h.ns['ledger'].errors()))
+                self.assertTrue(h.ns['finish_cleanup']([])['errors']);self.assertNotIn('cleanup-complete',h.output.files)
 
     def test_callback_gate_drains_actual_admission_before_stream_close_and_rejects_late_work(self):
         h=Harness();portal=PortalHarness(h);observer=portal.open()

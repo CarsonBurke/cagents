@@ -44,8 +44,9 @@ ledger = None
 
 class DriverLedger:
     """Driver-created originals/writers only; never an outside-family census."""
-    def __init__(self, clock, lock):
+    def __init__(self, clock, lock, instance_pid):
         self.clock,self.lock = clock,lock
+        self.instance_pid = instance_pid
         self.scope = 'global-driver'
         self.entered = []
         self.creations,self.writers,self.callbacks = [],[],[]
@@ -63,15 +64,24 @@ class DriverLedger:
             self.entered.append(label)
             self.scope = label
 
-    def attempt(self, argv, cwd, role, mount):
+    def attempt(self, argv, cwd, role, mount, allowed_exit_codes):
         with self.lock:
             assert not self.fenced and not self.sealed, 'Driver spawning phase is closed'
             assert role is not None and len(self.creations) < 4096, 'Creation role/count unresolved'
+            if role=='command':
+                assert allowed_exit_codes and all(type(code) is int and 0<=code<=255 for code in allowed_exit_codes)
+                policy = dict(kind='declared-command-exits',allowed_exit_codes=list(allowed_exit_codes))
+            elif role=='documents':
+                policy = dict(kind='documents-normal-TERM-wait0-unmount',allowed_exit_codes=[0])
+            else:
+                assert role in ('accessibility-launcher','accessibility-registry','window-manager','permissions',
+                    'backend','frontend','fixture','ui','clipboard'), 'Unknown native role outcome policy'
+                policy = dict(kind='ordinary-native-zero-or-issued-TERM',allowed_exit_codes=[0])
             row = dict(id='creation-'+str(len(self.creations)+1),scope=self.scope,role=role,
                 argv=list(map(str,argv)),cwd=None if cwd is None else str(cwd),attempted_ns=self.clock(),
                 pid=None,identity=None,pidfd=None,pidfd_note='Not acquired; authority is the original retained Popen.',
                 expected_mount=None if mount is None else str(mount),returned=False,published=False,
-                error=None,writers=[],waits=[],terminal=None,signals=[],forced=False)
+                error=None,writers=[],waits=[],terminal=None,signals=[],forced=False,exit_policy=policy)
             self.creations.append(row)
             return row
 
@@ -130,12 +140,32 @@ class DriverLedger:
 
     def errors(self):
         errors = []
-        if self.binding is None: errors.append('Driver source/instance binding UNKNOWN')
+        binding = self.binding if isinstance(self.binding,dict) else {}
+        instance = binding.get('driver_instance')
+        instance = instance if isinstance(instance,dict) else {}
+        observation = instance.get('observation')
+        observation = observation if isinstance(observation,dict) else {}
+        if not (type(instance.get('pid')) is int and instance['pid']>0 and instance['pid']==self.instance_pid
+                and set(observation)=={'state','parent','group','stamp'}
+                and observation.get('state') in ('R','S','D','T','t','I','P','W')
+                and type(observation.get('parent')) is int and observation['parent']>=0
+                and type(observation.get('group')) is int and observation['group']>0
+                and isinstance(observation.get('stamp'),str) and re.fullmatch(r'[1-9][0-9]{0,31}',observation['stamp'])
+                and isinstance(binding.get('logical_job'),str) and binding['logical_job']
+                and 'numeric_job_id' in binding and binding['numeric_job_id'] is None):
+            errors.append('Driver source/instance binding UNKNOWN')
         by_id = {row['id']:row for row in self.creations}
         for row in self.creations:
             if not row['returned'] or row['identity'] is None or not row['published'] or row['error'] or row['terminal'] is None:
                 errors.append(row['id']+' original creation/role/wait UNKNOWN')
             if row['forced']: errors.append(row['id']+' required forced termination')
+            terminal = row['terminal']
+            if terminal is not None:
+                code = terminal['exit_code']
+                issued_term = any(item['signal']==signal.SIGTERM and item['scope']=='original group' for item in row['signals'])
+                controlled_term = row['exit_policy']['kind']=='ordinary-native-zero-or-issued-TERM' and issued_term and code==-signal.SIGTERM
+                if code==-signal.SIGKILL or not (code in row['exit_policy']['allowed_exit_codes'] or controlled_term):
+                    errors.append(row['id']+' unexpected original terminal outcome: '+str(code))
         for row in self.writers:
             if not row['acquired'] or not row['closed'] or row['error']:
                 errors.append(row['id']+' parent stream UNKNOWN')
@@ -212,14 +242,29 @@ def write_payload(path, data, append=False):
         if first is not None: raise first
 
 
+def wait_record(process, method, began, code=None, error=None):
+    try:
+        ledger.record_wait(process,method,began,code=code,error=error)
+    except BaseException as secondary:
+        # Missing diagnostic metadata is UNKNOWN, never a replacement for the
+        # actual wait/communicate exception or a reason to skip original cleanup.
+        cancellation.latch(error if error is not None else secondary)
+        detail = 'Original wait metadata UNKNOWN: '+repr(secondary)
+        ownership_errors.append(detail)
+        row = ledger.handles.get(id(process))
+        if row is not None: row['error'] = row['error'] or detail
+        if error is None: raise
+
+
 def original_wait(process, timeout, method='wait'):
     began = time.time_ns()
     try:
         code = process.wait(timeout=timeout)
     except BaseException as error:
-        ledger.record_wait(process,method,began,error=error)
+        cancellation.latch(error)
+        wait_record(process,method,began,error=error)
         raise
-    ledger.record_wait(process,method,began,code=code)
+    wait_record(process,method,began,code=code)
     return code
 
 
@@ -406,15 +451,22 @@ def register(process, creation, options, *, resources=None, role=None, expected_
     return process
 
 
-def start_owned(argv, *, resources=None, role=None, expected_mount=None, **options):
-    assert resources is None or role is not None
+def admit_work():
+    if cancellation.failure is not None: raise cancellation.failure
     cancellation.checkpoint()
+
+
+def start_owned(argv, *, resources=None, role=None, expected_mount=None, allowed_exit_codes=None, **options):
+    assert resources is None or role is not None
+    admit_work()
     with cancellation.defer():
-        creation = ledger.attempt(argv,options.get('cwd'),role,expected_mount)
+        admit_work()
+        creation = ledger.attempt(argv,options.get('cwd'),role,expected_mount,allowed_exit_codes)
         try:
             for name in ('stdin','stdout','stderr'):
                 stream = options.get(name)
                 assert not hasattr(stream,'close') or id(stream) in ledger.streams, 'Unretained original parent descriptor'
+            admit_work()
             process = subprocess.Popen(argv, start_new_session=True, **options)
         except BaseException as error:
             creation['error'] = repr(error)
@@ -623,16 +675,16 @@ def command(argv, *, env=None, cwd=None, timeout=20, stdout=None, allowed_exit_c
     user()
     started = time.time_ns()
     process = start_owned(argv, env=env, cwd=cwd, stdout=stdout or subprocess.PIPE,
-                          stderr=subprocess.PIPE, role='command')
+                          stderr=subprocess.PIPE, role='command',allowed_exit_codes=allowed_exit_codes)
     closure_failure = None
     began = time.time_ns()
     try:
         with cancellation.work():
             output, errors = process.communicate(timeout=timeout)
-            ledger.record_wait(process,'communicate',began,code=process.returncode)
+            wait_record(process,'communicate',began,code=process.returncode)
     except BaseException as error:
-        ledger.record_wait(process,'communicate',began,error=error)
         cancellation.latch(error)
+        wait_record(process,'communicate',began,error=error)
         with cancellation.defer():
             try:
                 stop(process)
@@ -659,11 +711,11 @@ class IncompleteTree(RuntimeError):
 
 
 def wait(query, timeout=30):
-    cancellation.checkpoint()
+    admit_work()
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        cancellation.checkpoint()
+        admit_work()
         result = None
         try:
             result = query()
@@ -676,11 +728,11 @@ def wait(query, timeout=30):
             last = error
         # Cancellation is distinct control, checked outside recoverable catches
         # and before even a positive observation can permit the next input.
-        cancellation.checkpoint()
+        admit_work()
         if result:
             return result
         time.sleep(.15)
-    cancellation.checkpoint()
+    admit_work()
     raise RuntimeError('Observation did not settle; no input was repeated') from last
 
 
@@ -818,6 +870,7 @@ class PortalObserver:
         self.filter_id = None
         self.accepting = False
         self.inflight = 0
+        self.failure = None
         self.record['initialized'] = False
         try:
             self.stream = open_parent(output,'a','callback-log')
@@ -880,6 +933,7 @@ class PortalObserver:
         except BaseException as error:
             with self.condition:
                 self.record['errors'].append('Observer callback: '+repr(error))
+                if self.failure is None: self.failure = error
             cancellation.latch(error)
             return message  # Gio must not silently erase the recorded failure.
         finally:
@@ -933,7 +987,7 @@ class PortalObserver:
         monitor = getattr(self,'monitor',None)
         query = getattr(self,'query',None)
         filter_id = getattr(self,'filter_id',None)
-        if monitor is not None and filter_id is not None:
+        if monitor is not None and filter_id is not None and not self.record['filter_removed']:
             try:
                 monitor.remove_filter(filter_id)
                 self.record['filter_removed'] = True
@@ -941,7 +995,7 @@ class PortalObserver:
         elif not self.record['initialized']:
             self.record['filter_removed'] = True
         for name,connection in [('monitor',monitor),('query',query)]:
-            if connection is not None:
+            if connection is not None and self.record[name]!='closed':
                 try:
                     connection.close_sync(None)
                     self.record[name] = 'closed'
@@ -958,9 +1012,10 @@ class PortalObserver:
             try: close_parent(getattr(self,'stream',None))
             except BaseException as error: errors.append('Observer output close: '+repr(error))
         self.record['errors'].extend(errors)
-        self.record['closed'] = (not errors and not self.record['inflight']
+        self.record['closed'] = (not self.record['errors'] and not self.record['inflight']
             and self.record['filter_removed'] and self.record['monitor'] in ('closed','uncreated')
             and self.record['query'] in ('closed','uncreated'))
+        if getattr(self,'failure',None) is not None: raise self.failure
         if errors: raise RuntimeError('Observer writer settlement: '+repr(errors))
 
 
@@ -1267,7 +1322,7 @@ def complete_arm_cleanup(resources, label, errors):
         if result['errors'] and active_error is None:
             error = RuntimeError('Arm cleanup failed before another arm: ' + repr(result))
             cancellation.latch(error)
-            raise error
+            raise cancellation.failure or error
     return result
 
 
@@ -1380,7 +1435,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     cancellation = Cancellation()
     cancellation.install()  # Before metadata command() creates the first child.
-    ledger = DriverLedger(time.time_ns,threading.RLock())
+    ledger = DriverLedger(time.time_ns,threading.RLock(),os.getpid())
     errors = []
     arm_cleanups = {}
     try:
