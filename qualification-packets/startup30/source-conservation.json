@@ -1,10 +1,11 @@
 {
-  "kind": "AUTHOR_SOURCE_CONSERVATION_NOT_REVIEW",
-  "donor_head": "d412d6fdb7f137df179b415aae18e4e5cabc3a1a",
-  "donor_runner_sha256": "f820d314bda28a4e183a50ace3b05fb4ca0506d12ebb6b41bfdb868039a497ae",
-  "runner_sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+  "kind": "AUTHOR_SOURCE_PORT_CONSERVATION_NOT_INDEPENDENT_REVIEW",
+  "base_controller": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+  "base_runner_sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+  "runner_sha256": "9b5d0ce0eb9e753ff1616674fd8853457a6dc82d1fc4a4e16e022dd981202e68",
   "plan_sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
-  "24_generic_byte_exact": {
+  "only_changed_existing_top_function": "settle_children",
+  "23_generic_functions_byte_exact_to347_and_original_donor": {
     "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
     "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
     "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
@@ -16,7 +17,6 @@
     "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
     "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
     "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
-    "settle_children": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
     "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
     "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
     "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
@@ -30,112 +30,80 @@
     "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
     "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9"
   },
-  "four_original_nested_main_byte_exact": {
+  "corrected_generic_function": {
+    "name": "settle_children",
+    "old_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "new_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "canonical_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "canonical_exact": true,
+    "old_three_second_prefix_first18lines_exact": true
+  },
+  "all_other31_top_functions_byte_exact_to347": {
+    "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+    "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+    "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+    "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+    "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+    "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+    "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+    "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+    "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+    "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+    "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+    "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
+    "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+    "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+    "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+    "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad",
+    "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+    "cargo_helper_artifact": "cce4fa0819e7ce38157c45c4d8eb40df7e154d6d2fa94f3e39dfea52bd0d2712",
+    "task_elf_observation": "3cd165b37eb78c86f9bf35fe2ed7eef1401f073c3b166512763f6a7af75e2814",
+    "task_group_assets": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4",
+    "grouped_contracts": "a717b21552220893af18c2a2bf076134426141aff6e6cdfb2c18bef87c91d545",
+    "grouped_result": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115",
+    "execute_contracts": "4e4a89a2ff0c78b44801023b9cf14a93757773baccf911a6886b3d38cbd43b8d",
+    "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+    "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+    "parent_accounting": "b19820d92daeac72458a2ff1461eb0455f391c5cfa34630701aeff6ec74e6e37",
+    "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+    "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+    "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+    "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9",
+    "main": "60746b03ba38a0bae7bd4fa522c846610312e3efa5cace337118ba8cc7605b92"
+  },
+  "all_nested_main_functions_byte_exact_to347": {
     "read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
     "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711",
     "context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
-    "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06"
+    "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06",
+    "invoke_fixture_group": "288e08759f96075a6a091c01f6626016f8ff55fda5a2033cf58c6d31537493f4"
   },
-  "grouped_result_byte_exact": true,
-  "dormant_helper_functions_and_binder_byte_exact": true,
-  "changed_existing_top_functions": [
-    "grouped_contracts",
-    "execute_contracts",
-    "parent_accounting",
-    "main"
-  ],
-  "protected_block_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
-  "protected_acquire_finalize_Cclose_exact": true,
-  "task_required_evidence": "Task-local required_save/read/ELF observation preserve sticky failures and original exception; no generic lifecycle edits",
-  "actual": {
-    "grant": null,
-    "queue_position": null,
-    "current_context": null,
-    "current_resources": null,
-    "current_tools": null,
-    "actual_elf": null,
-    "actual_inventory": null,
-    "actual_selected_names": null,
-    "actual_counts": null,
-    "actual_parallel_degree": null,
-    "actual_parallel_overlap": null,
-    "phase_receipts": null,
-    "runtime_results": null,
-    "RAW_review": null,
-    "safe_release": null
+  "main_parser_run_and_returns_byte_exact_to347": true,
+  "protected_lifecycle_tail": {
+    "bytes": 3790,
+    "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "byte_exact_to347": true
   },
-  "donor_runtime_qualification": "No runtime qualification transferred; current actual acceptance remains external Root prerequisite",
-  "all_candidate_calls_imports_compile_tests_native": "UNRUN",
-  "diffs": {
-    "from-d412": {
-      "path": "from-d412.diff.json",
-      "container_sha256": "9620b2f9ec1f6895879979d12217c543a94804cdd21f4f4dc6ac521bf7f33e32",
-      "original_unified_diff_sha256": "9ad84da9005bc65c11c44ad0a004196adb3c384f2532f02fb4389ada858eb103"
+  "direct_original_Popen_timeout_wait_held_pidfd_cleanup": "Byte-exact in bounded_capture and nested run; no edits to direct-owner signal/wait/close paths.",
+  "caller_HOLD_conservation": "custody_clean/safe_lane_handoff/final_observations/retain_uncertain_lane and entire main remain exact. Remaining unclean custody cannot authorize acquired C close even if later census becomes empty. Prelease source failure remains its distinct no-acquired-C refusal path.",
+  "all_bytes_outside_live_settle_children_definition_exact": true,
+  "historical_files": "All pre-existing dependencies/history/product-source/task data and earlier diff artifacts remain unchanged except README.md, run-packet.py, source-conservation.json and manifest.json; originals of those four are retained in history/347c2adc.",
+  "historical_347_conservation": {
+    "path": "history/347c2adc/source-conservation.json",
+    "sha256": "bcaf8b9a34f4de324f0e879303e2a9305ca6f90df6990a5b693f3239d664cdd4",
+    "scope": "Original347-only all24 conservation record, not retargeted to this successor."
+  },
+  "new_diff_records": {
+    "from-347c2adc.diff.json": {
+      "sha256": "a0b49d8c8bb52f7b28b55bf754e5a954b0eaa01e5b100dcc6331bc5e03b6f063",
+      "unified_diff_sha256": "7481a1714888695b2a364a07ec2c0ff7408f0e1e2d17be86e462df632c28d8e0"
     },
-    "to-d412.inverse": {
-      "path": "to-d412.inverse.diff.json",
-      "container_sha256": "07b0690a25e0fc6d1cfdde3d826e112bf95da06fcafd2160109d05693a0ba54c",
-      "original_unified_diff_sha256": "fc3cd6906c33c4b0aee5d190e0d433cf0962d3a16ac88e25ed21d0bf28a6efa3"
-    },
-    "from-982feefc": {
-      "path": "from-982feefc.diff.json",
-      "container_sha256": "670c668687b094ac8a6cd1d20205bb3abb728825cb884aae7870236c6458fbff",
-      "original_unified_diff_sha256": "b08fd620d71da3c036bbb0f4f2f679ff867a279c74862c80b4c08d4db2d23d35"
-    },
-    "to-982feefc.inverse": {
-      "path": "to-982feefc.inverse.diff.json",
-      "container_sha256": "6567862dae1ec757d10c7138c307e3eb8058cf27a7f78071bc0edf2487f65ca1",
-      "original_unified_diff_sha256": "c6cf5451016594b3a844bc34c5e48aa215fdbf87e858ba33b8487e9e227db8f0"
-    },
-    "from-7e057dc0": {
-      "path": "from-7e057dc0.diff.json",
-      "container_sha256": "456e4746b5eab9e168411fa1a58b93ca09c7108f239b0adb438c6228cfff4ab2",
-      "original_unified_diff_sha256": "d0ae5b40cfc26d6c01e8386c19b75699f5dfbcda7663bf374460183eab69df42"
-    },
-    "to-7e057dc0.inverse": {
-      "path": "to-7e057dc0.inverse.diff.json",
-      "container_sha256": "1dc158ac1e491043e8b54f611de3c3f74284061d458d564f8b667effcdd6eb09",
-      "original_unified_diff_sha256": "f69fedcd4e0d397f50e94b553283a3ea6867dca4d2d636c215ef2c044f2328a3"
+    "to-347c2adc.inverse.diff.json": {
+      "sha256": "8bc200abf378c90371e0f2ff4a412280dfbf14ba91796294b57e01b79edaa09a",
+      "unified_diff_sha256": "73e1dbfc890bb5afa685e55bb0066bf8192daf1c4f52381f20034c85d4814247"
     }
   },
-  "pre_freeze_artifact_packaging_failure": {
-    "original_chunk": "3da7ed",
-    "staged_diff_check_exit": 2,
-    "scope": "Raw unified-diff context-space lines reported as artifact trailing whitespace; controller code not implicated",
-    "correction": "Original exact unified-diff bytes retained as JSON string; no whitespace predicate or diff payload weakened"
-  },
-  "accounting_discovery_correction": {
-    "prior_controller": "359623881492576f122532ded4ac6c7ce36adf01",
-    "only_changed_existing_function": "parent_accounting",
-    "old_negative_sha256": "a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465",
-    "old_negative_archive": "dependencies/accounting_negative_review.json",
-    "scope": "Read produced cumulative contract independent of original parent attempt; FileNotFound without attempts remains unknown; malformed/read errors remain raw errors/HOLD. No pass or wait predicates changed."
-  },
-  "base_controller": "7e057dc05cf1333a22f60a12d6b97b9393edeac5",
-  "changed_since_base_top_functions": [
-    "main"
-  ],
-  "all_other31_top_functions_exact": true,
-  "lifecycle_tail_bytes": 3790,
-  "early_nonassert_guard": "if not __debug__: raise RuntimeError before imports",
-  "compact_terminal": "After unchanged full summary/hash archive and protected lifecycle tail; scalars plus explicit complete-artifact paths only",
-  "product_chain": {
-    "BASE_b914": "b914f9d9b55527aa1bb22d591968c58958d717ee",
-    "BASE_eb7": "eb7ff16beb8864349573231521c5d4eab5270cc6",
-    "current": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
-    "current_tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
-    "only_product_delta": "src/app/startup_gate.rs",
-    "new_delta_review_sha256": "a81bc8b8f89c38deec1028a9b33b2648a434cf80ec69ca6736dfd163c721ee8f",
-    "new_publication_sha256": "ee9ab001aa3144c657de2db1fd379c1b9a6fc60263e14d5e45be6f4c28b528ef"
-  },
-  "terminal_error_bound_correction": {
-    "historical_controller": "7e057dc05cf1333a22f60a12d6b97b9393edeac5",
-    "scope": "Only terminal error prefix and explicit truncation flag; original complete summary/error, all ledgers/SHA256SUMS, original return/HOLD and3790-byte protected lifecycle tail unchanged.",
-    "maximum_error_characters": 1024,
-    "raw_summary_error": "UNMODIFIED",
-    "truncation_flag": "error is not None and len(error)>1024",
-    "history": "history/7e057dc0",
-    "independent_successor_review": "PENDING; no7e review retargeted",
-    "actual_oversized_incident": null
-  }
+  "not_runnable_or_queueable": "See adoption-port.json for intentionally unrefreshed absolute selfbindings and frozen6ceb product failure. Future corrected fixture/source bindings are not authored here.",
+  "runtime_test_build_native": "No port candidate invocation/import/function execution, tests, Cargo/build/native or probes performed. This is a source-author receipt only.",
+  "independent_review": "PENDING for this exact port; canonical source reviews are archived for their original scope only."
 }

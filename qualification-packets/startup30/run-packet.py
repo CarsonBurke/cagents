@@ -240,33 +240,10 @@ def settle_children():
         if time.monotonic() >= deadline:
             break
         time.sleep(0.05)
-    observed = remaining
-    deadline = time.monotonic() + 10
-    while remaining and time.monotonic() < deadline:
-        forced = True
-        for child in remaining:
-            if time.monotonic() >= deadline:
-                break
-            try:
-                fd = os.pidfd_open(child['pid'])
-                try:
-                    if any(c['pid'] == child['pid'] and c['start'] == child['start'] for c in children()):
-                        signal_pidfd(fd, signal.SIGKILL)
-                finally:
-                    os.close(fd)
-            except OSError as error:
-                if error.errno != errno.ESRCH:
-                    raise
-        time.sleep(0.05)
-        while time.monotonic() < deadline:
-            try:
-                pid, _ = os.waitpid(-1, os.WNOHANG)
-                if pid == 0:
-                    break
-            except ChildProcessError:
-                break
-        remaining = children()
-    return {'clean': not remaining, 'forced': forced, 'observed': observed, 'remaining': remaining}
+    # Current parentage and a freshly opened pidfd do not establish original
+    # custody or permission to stop an adopted provider descendant. Leave
+    # unproven survivors unsignaled; the caller must retain its C/HOLD state.
+    return {'clean': False, 'forced': forced, 'observed': remaining, 'remaining': remaining}
 
 
 def cargo_test_artifact(text, manifest_path, expected_features):
