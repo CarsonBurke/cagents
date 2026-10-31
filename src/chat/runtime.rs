@@ -2555,7 +2555,9 @@ impl Actor {
                         );
                     }
                 }
-                if stdout_eof && self.pending.is_empty() {
+                // A parsing budget can leave complete lines queued even after
+                // the pipe closes. Keep fair poll passes until those drain.
+                if stdout_eof && self.pending.is_empty() && !frames_ready {
                     if !self.output.is_empty() {
                         return Err("Provider ended with an incomplete JSON line".into());
                     }
@@ -2700,7 +2702,6 @@ impl Actor {
                     match stdout.read(&mut buffer[..available]) {
                         Ok(0) => {
                             stdout_eof = true;
-                            stdout_eof_at.get_or_insert_with(Instant::now);
                         }
                         Ok(n) => {
                             reserve_frame(&mut self.output, n)?;
@@ -9959,6 +9960,206 @@ mod tests {
             );
             descendant.reaped = true;
             assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn stdio_eof_drains_complete_frame_backlog_before_terminal_diagnostics() {
+        struct Backlog {
+            gate: Option<crossbeam_channel::Receiver<()>>,
+            received: Arc<std::sync::atomic::AtomicUsize>,
+            finished: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Adapter for Backlog {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::TurnStarted,
+                        Event::Status {
+                            busy: true,
+                            detail: "Working".into(),
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("unexpected backlog fixture command".into())
+            }
+            fn tick(&mut self) -> Step {
+                if self
+                    .gate
+                    .take()
+                    .is_some_and(|gate| gate.recv_timeout(Duration::from_secs(5)).is_err())
+                {
+                    return Step {
+                        events: vec![Event::Error {
+                            message: "backlog fixture gate failed".into(),
+                            fatal: true,
+                        }],
+                        ..Default::default()
+                    };
+                }
+                Step::default()
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                if frame == json!({}) {
+                    self.received.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Step::default());
+                }
+                if frame != json!({"done": true}) {
+                    return Err("unexpected backlog fixture frame".into());
+                }
+                self.finished.fetch_add(1, Ordering::Relaxed);
+                Ok(Step {
+                    events: vec![
+                        Event::Item(text("backlog-result", "Complete buffered answer")),
+                        Event::TurnSettled,
+                        Event::TurnFinished {
+                            key: Some("backlog-turn".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                        Event::Status {
+                            busy: false,
+                            detail: String::new(),
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+        }
+        struct OwnedActor {
+            handle: LocalHandle,
+            gate: Option<crossbeam_channel::Sender<()>>,
+            closed: bool,
+        }
+        impl Drop for OwnedActor {
+            fn drop(&mut self) {
+                // Release the tick even if setup/assertions unwind. Preserve the
+                // exact actor and private fixture until its original join; an
+                // unresolved close intentionally HOLDs rather than detaching.
+                drop(self.gate.take());
+                while !self.closed {
+                    self.closed = self.handle.close().is_ok();
+                    if !self.closed {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        const COUNT: usize = 600;
+        const TAIL: &str = "backlog-final-stderr-marker";
+        assert!(COUNT > 2 * FRAMES_PER_POLL);
+        for (suffix, exit, terminal) in [
+            ("{\"done\":true}\n", "0", true),
+            ("{\"done\":true}\n", "7", true),
+            ("{\"done\":true}\n{\"partial\":", "0", true),
+            ("{\"done\":true}", "0", false),
+        ] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let stream = directory.path().join("stream");
+            let ready = directory.path().join("pipes-closed");
+            let payload = "{}\n".repeat(COUNT) + suffix;
+            assert!(payload.len() < libc::PIPE_BUF && payload.len() < 8192);
+            std::fs::write(&stream, payload).unwrap();
+            let spec = ProcessSpec {
+                execution: None, messages: None, unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines, program: "/bin/sh".into(),
+                arguments: vec!["-c".into(),
+                    "cat -- \"$1\" || exit 2; printf '%s\\n' 'backlog-final-stderr-marker' >&2; exec 1>&- 2>&-; : > \"$2\" || exit 2; exit \"$3\"".into(),
+                    "provider".into(), stream.to_string_lossy().into_owned(), ready.to_string_lossy().into_owned(), exit.into()],
+                working_directory: directory.path().into(), environment: BTreeMap::new(),
+            };
+            let (release, gate) = crossbeam_channel::bounded(1);
+            let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut adapter: Box<dyn Adapter> = Box::new(Backlog {
+                gate: Some(gate),
+                received: received.clone(),
+                finished: finished.clone(),
+            });
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let mut owner = OwnedActor {
+                handle,
+                gate: Some(release),
+                closed: false,
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.is_file() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ready.is_file(), "provider did not close its real pipes");
+            // The actor has not polled stdout yet. The complete bounded burst
+            // and its actual EOF now coexist, making the backlog deterministic.
+            owner.gate.take().unwrap().send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !owner.handle.is_completed() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let completed = owner.handle.is_completed();
+            let failure = owner.handle.failure();
+            let closed = owner.handle.close();
+            owner.closed = closed.is_ok();
+            assert!(
+                completed,
+                "decoder did not complete before cleanup: {suffix:?}"
+            );
+            closed.unwrap();
+            let state = owner.handle.snapshot(None).unwrap();
+            assert_eq!(received.load(Ordering::Relaxed), COUNT);
+            assert_eq!(finished.load(Ordering::Relaxed), usize::from(terminal));
+            assert!(state.exited && !state.ready && !state.busy);
+            assert_eq!(state.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Complete buffered answer")), terminal);
+            if terminal {
+                assert_eq!(
+                    state.outcome,
+                    Some(crate::agent::ActivityOutcome::Succeeded)
+                );
+            } else {
+                assert!(matches!(
+                    state.outcome,
+                    Some(crate::agent::ActivityOutcome::Interrupted { .. })
+                ));
+            }
+            if !suffix.ends_with('\n') {
+                assert!(
+                    failure
+                        .as_deref()
+                        .is_some_and(|error| error.contains("incomplete JSON line")),
+                    "{failure:?}"
+                );
+            } else if exit == "0" {
+                assert_eq!(failure, None);
+                assert_eq!(state.error, None);
+            } else {
+                assert!(
+                    failure
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Provider exited with")),
+                    "{failure:?}"
+                );
+                assert!(
+                    state
+                        .provider_exit
+                        .as_ref()
+                        .unwrap()
+                        .summary
+                        .contains("status 7")
+                );
+            }
+            if let Some(diagnostic) = state.provider_exit.as_ref() {
+                assert!(diagnostic.output.contains(TAIL));
+                let log = diagnostic.log.as_ref().unwrap();
+                let (bytes, next, omitted) = owner.handle.provider_exit_output(&log.id, 0).unwrap();
+                assert!(String::from_utf8(bytes).unwrap().contains(TAIL));
+                assert_eq!(next, None);
+                assert_eq!(omitted, 0);
+            } else {
+                assert!(suffix.ends_with('\n') && exit == "0");
+            }
         }
     }
 
