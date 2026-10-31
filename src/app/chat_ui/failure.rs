@@ -788,7 +788,9 @@ impl State {
                         })
                 });
                 let (index, incident) = owned.next()?;
-                (owned.next().is_none()
+                // An interruption stops a turn rather than failing it.
+                (incident.kind != Some(FailureKind::Interrupted)
+                    && owned.next().is_none()
                     && work.iter().all(|id| {
                         incident
                             .sources
@@ -1511,6 +1513,17 @@ mod tests {
                 (1, Some("p3".into()))
             ]
         );
+        // Interrupted turns.
+        let interrupted = "API Error: Request was interrupted";
+        assert_eq!(
+            notices(vec![
+                prompt("p1"),
+                provider_error(provider, "e1", interrupted),
+                prompt("p2"),
+                provider_error(provider, "e2", interrupted),
+            ]),
+            [(1, Some("p1".into())), (1, Some("p2".into()))]
+        );
         // Unclassified failures that read differently.
         assert_eq!(
             notices(vec![
@@ -1530,9 +1543,8 @@ mod tests {
                 provider_error(provider, "e2", expired),
                 text("m1:1", chat::Role::User, "Fix the build"),
                 provider_error(provider, "e3", expired),
-            ])
-            .len(),
-            2
+            ]),
+            [(1, Some("m1:0".into())), (1, Some("p2".into()))]
         );
         // Work the failing attempt did before it failed.
         assert_eq!(
