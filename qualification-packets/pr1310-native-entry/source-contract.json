@@ -1,0 +1,108 @@
+{
+  "schema": "pr1310-finite-original-arm-source-contract-v1",
+  "status": "SOURCE_ONLY_REAL_WORKER_PARENT_PRE_EFFECT_PROVENANCE_BLOCKED",
+  "worker": {
+    "path": "qualification-packets/pr1310-native-entry/arm-worker.py",
+    "sha256": "48da7ff84a126366eb5fd1d66fb7abbb4fb05f2a1a443c9d9ec13fbd729bffba",
+    "invocation": "PINNED_PHYSICAL_PYTHON -I -B arm-worker.py --packet ACTUAL_PACKET --packet-sha256 ACTUAL_SHA --worker-sha256 FROZEN_WORKER_SHA --whole-deadline ORIGINAL_ABSOLUTE_DEADLINE",
+    "standalone_admission": null,
+    "authority": "Actual authenticated outer Root/User instruction; no argument or JSON authenticates it."
+  },
+  "immutable_dependencies": {
+    "library": {
+      "head": "b756e6f9165f6bf164b8acad1c77cdab34d3fd07",
+      "tree": "825fdfda1d7f15d928683449259d86ced8493d23",
+      "relative_directory": "qualification-packets/pr1310-native-history-pair",
+      "files": {
+        "native_owner.py": "e2e4a520087bf95c902646b4dbe6b69531944bb3cfad5fc8ddc1d3f77aab9fd8",
+        "history_driver.py": "0bd819fce05fc0559da8b874a190e666f5cc19ce768af4e23ee21690deaa27ce",
+        "observations.py": "bb97545b94c76d7ea85e404109241e49b3b985f97ba95aad52029cca5e22d4d2"
+      }
+    },
+    "custody": {
+      "path": ".worktrees/fw16-issue2002-host-driver/scripts/qualification/process_custody.py",
+      "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+      "used": "Actual Custody, original direct/nodes/scan/pin/wait/pidfd records through unchanged NativeHistoryOwner."
+    },
+    "checkout_helper": {
+      "path": ".worktrees/fw16-issue2002-host-driver/scripts/prepare-validation-checkout",
+      "sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+      "worker_usage": "NONE; source context only, never authentication/C ownership."
+    },
+    "physical_review": {
+      "path": "/tmp/coord-b9-pr1310-8aa5dbbd-independent-physical-FD-review.json",
+      "sha256": "aabb34bb047c39c21059dd4b644121c61b9c503f5991e4237c245a2e60592ae6",
+      "scope": "8aa immutable dependency source only; not new worker/native/parent qualification."
+    }
+  },
+  "packet": {
+    "schema": "pr1310-original-arm-inputs-v1",
+    "exact_keys": [
+      "schema",
+      "arm",
+      "root",
+      "library_directory",
+      "custody_path",
+      "sources",
+      "tools",
+      "native_import_inputs"
+    ],
+    "arm": "exactly before OR after; sources contains exactly this one arm",
+    "root": "Already admitted fresh UID-owned0700 direct /tmp/cagents-history-<canonical UUID>, empty for original owner.",
+    "library_directory": "Actual canonical absolute frozen library directory; executable bytes checked against constants, not a mutable ref.",
+    "custody_path": "Actual canonical absolute d9ee source path.",
+    "sources": "Existing owner-contract.json constructor.sources_shape[arm] unchanged, plus manifest_sha256 and index_sha256{small,large} for original owned-byte reads. Existing indexes{small,large} remain canonical path strings; no mutation/repin.",
+    "source_driver": "Exact library_directory/history_driver.py plus pinned0bd819fc source digest, checked before owner preparation.",
+    "tools": "Actual owner tools_shape canonical absolute path/sha256 bindings, no discovery/fallback.",
+    "native_import_inputs": "Nonempty list <=4096 unique actual {path,sha256} files, opened/pinned by existing owner before imports. Presence/hashes do NOT establish complete installed closure or native authority.",
+    "all_actual_runtime_input_values": null,
+    "no_sample_positive_packet": true
+  },
+  "finite_flow": [
+    "Validate isolated no-bytecode Python, original deadline <=2400 remaining, source/packet hashes and one-arm shape; install original cancellation.",
+    "Load exact source bytes only (no pycache); construct real d9ee Custody and original owner while actual main remains on stack.",
+    "Retain returned owner before private desktop preparation. Adopt ONLY exact six PRIVATE_KEYS plus four proved ENDPOINT_KEYS returned by original owner; no HOME/CODEX_HOME/opaque authority value rewrite.",
+    "Pin actual expected native input files. Refuse preinitialized GI/pyatspi/PIL. Import actual pyatspi then PIL.Image only after endpoint adoption, with original before/after deadline fences.",
+    "Read original pinned manifest/index bytes; actual Fixture.from_owned_bytes; real HistoryDriver for small,large,unborn sequentially; normal original runner for each.",
+    "After each real driver return request normal original close; retain raw history_application_outcome records without inference.",
+    "Settle original owner; emit bounded raw report to original parent stdout. Parent original Popen wait/pidfd terminal separately bounds this final writer.",
+    "Ambiguous/failed settlement retains original owner/worker HOLD, no new work/detach/unknown PID signal/close retry."
+  ],
+  "lifetime": {
+    "worker": "One original Popen/pidfd per arm, held by missing original parent. Before terminal/physical closure precedes After target mutation/admission.",
+    "C_descriptor": "Never inherited or closed by worker. Original parent holds it through actual producer/terminal/custody/source/evidence and one-shot-close predicates.",
+    "logical_allocation": "HELD until soleRAW + explicit executor return + Root acceptance; physical flock close alone is not logical return.",
+    "original_budget": "One original absolute whole deadline from parent, max2400 seconds; worker does not renew per arm/dataset/import/read/capture/cleanup.",
+    "raw_UI_unknown": "Retains None; no Cargo0/UI0 inference or native/UX PASS.",
+    "upstream_owner_gap": "d9ee unpublished-FD acquisition coverage remains unknown in owner. Known local settlement is not global/whole-family/C acceptance; original worker terminal is a separate future observation."
+  },
+  "precise_missing_supported_seams": [
+    "Original producer/consumer of actual installed shell/Cargo/rustup/shim executable chain and all applicable effective ancestor/CARGO_HOME/env target/cfg runner configuration before effects. b756 only pins nonempty evidence bytes and explicitly lacks this producer.",
+    "Original serial C-build producer/evidence receiver selecting actual three isolated dev-runtime matched artifacts for each arm, actual renderer package/input/version/build/wait/writer provenance. Normal runner has no build-only mode; do not fabricate prior build records or reuse changing path hashes.",
+    "Original parent actual C custody, worker Popen/pidfd supervision, bounded native import/compound AX containment, full original descendant/writer/source/context finalization, one-shot physical close and separate logical handback. No run-entry stub or ad-hoc positive schema supplied.",
+    "Actual admitted installed Python/GI/Atspi/PIL/module input baseline; hash expectations here do not discover or qualify the transitive closure.",
+    "Actual generated shared Git data, matched native executions/screenshots/readbacks and independent UX review; stale/held-page/full-reader/error/performance producers remain absent in driver."
+  ],
+  "runtime": {
+    "actual_parent": null,
+    "actual_User_resource_instruction": null,
+    "C_grant": null,
+    "C_fd": null,
+    "generated_data": null,
+    "matched_builds": null,
+    "native_imports": null,
+    "native_inputs": null,
+    "native_frames": null,
+    "native_UX_review": null,
+    "application": "UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW",
+    "before": "UNRUN",
+    "after": "UNRUN",
+    "actual_return": null
+  },
+  "source_limitations": [
+    "No helper/module/function/case/test/build/tool/probe/native/provider/desktop/input/clipboard/env/account/runtime execution in authoring.",
+    "Future blocking imports/kernel/library calls are cooperative in worker; actual original parent containment is missing.",
+    "Normal app pre-main account detachment is unchanged and may conditionally remove provider home variables; no whole-app HOME-access/natural-startup claim.",
+    "No product/library/builder or existing driver API edits; only three new task-specific entry leaves."
+  ]
+}
