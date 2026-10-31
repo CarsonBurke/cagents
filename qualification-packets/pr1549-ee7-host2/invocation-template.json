@@ -1,0 +1,20 @@
+{
+  "kind": "FROZEN_CODE_REVIEW_PENDING_NOT_SUBMITTABLE",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-ee7-host2-source",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-ee7-host2-source/qualification-packets/pr1549-ee7-host2/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "546c0a252fe1461c2a2f1d8262a511750cd1f31bb830ccb822dce3a4f21048fd",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "execution_authorized": false,
+  "product_source_reviews_publication": "Genuine ee7 separate source-branch receipts bound; no runtime/controller approval or assertion about existing PR current head."
+}

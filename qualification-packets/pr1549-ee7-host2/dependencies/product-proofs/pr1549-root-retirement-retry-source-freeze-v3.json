@@ -1,0 +1,64 @@
+{
+  "schema": "pr1549_search_root_retirement_retry_source_freeze_v3",
+  "utc": "2026-10-31T14:26:20.394282+00:00",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-root-retirement",
+  "branch": "fix/fw16-pr1549-search-root-retirement",
+  "parent": "ee06ef2fb397455505fe2c047db906552cc5064d",
+  "head": "f5d80ee3dc76c5f97299dad907706977ad529f21",
+  "tree": "c99e3c10e51f0826aceef58b1f921662c077c9b6",
+  "changed_paths": [
+    "src/app/git_ui.rs",
+    "src/app/search_ui.rs",
+    "src/git_watch.rs"
+  ],
+  "unchanged_other_entries": 2203,
+  "pins": {
+    "src/app/git_ui.rs": {
+      "sha256": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+      "git_blob": "0a11d3c861b4ef51e27ca95a1f1161c56bc36d14"
+    },
+    "src/app/search_ui.rs": {
+      "sha256": "1b3ed55c6e10be3654d0df78ecbc1a1475b340ebebe1891a0bcfe285bdeddbb3",
+      "git_blob": "38189321f18822c8f98ce3b5f17da78d9e030e0d"
+    },
+    "src/git_watch.rs": {
+      "sha256": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533",
+      "git_blob": "dca90b7d34462060327d8d042893fb6079755c2d"
+    }
+  },
+  "intent": "After exact root retirement, cancel/clear/restart matching search generation so queued old Batch/Error/Finished cannot publish under the same logical key. Ordinary changes, rescan flags, other roots/projects and mode/config removal preserve ongoing search.",
+  "implementation": "Background Project event classification and existing registered-root dev/ino comparison retain exact paths; Change.merge preserves them; production per-project Git-change ingestion schedules fresh search immediately. No synchronous filesystem work added to UI.",
+  "owning_regression_parents": [
+    "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+    "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+    "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+    "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+    "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering"
+  ],
+  "format_validation": {
+    "official_script_chunks": [
+      "964feb",
+      "wait1169"
+    ],
+    "official_script_exit": 0,
+    "receipt": "/tmp/fw16-backend-ec204421/pr1549-search-root-retirement-format-v3/receipt.json",
+    "diff_check": "Included in normal source commit command"
+  },
+  "runtime": "All5new owning parent bodies/compiles/native/UX/BeforeAfter/performance UNRUN. Component gesture fixture is not native validation.",
+  "scope_limits": [
+    "No1871 merge, no new timer or generic-change cancellation.",
+    "Missed/ambiguous watcher events remain outside established retirement evidence.",
+    "No app.rs/sidebar/Cargo/protocol/auth/managedproof/SeedView/1749/provider/unknown-descendant change.",
+    "Host+UI isolated boundaries and actual native before/after fullflow plus independent UX review required before ready."
+  ],
+  "independent_reviews": null,
+  "public_write": null,
+  "base_public_head": "1a7a6c5d2aa6c0ef113dd3946a9b5cafb8ad9763",
+  "correction": "Visible Retry search control on errors dispatches captured generation; only matching current error/root/context and nonmodal current query may reschedule. Query/options/root preserved; old Retry/Error cannot affect newer search. No automatic retry loop or generic-change restart.",
+  "original82_UX_HOLD": {
+    "path": "/tmp/pr1549-82bb77e7-independent-ux-source-evidence-review-v1.json",
+    "sha256": "037011f2e42249d53a72680407cf7841ec19eaa83b6610503cf08ab3197aeb80",
+    "scope": "Delayed-root error lacked recovery action; old verdict preserved, not transferred."
+  },
+  "final_delta": "Retry uses existing query-focus operation after schedule. Its standard button is in a generation-keyed subtree with no named button state; real widget press/rerender/release fixture covers replacement refusal, ordinary-render continuity and fresh press. Existing result-pointer helper delegates unchanged event/layout body to generic control fixture."
+}

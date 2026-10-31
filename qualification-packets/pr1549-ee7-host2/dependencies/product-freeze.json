@@ -1,0 +1,65 @@
+{
+  "schema": "pr1549_search_root_retirement_retry_source_freeze_v4",
+  "utc": "2026-10-31T14:33:02.521519+00:00",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-root-retirement",
+  "branch": "fix/fw16-pr1549-search-root-retirement",
+  "parent": "f5d80ee3dc76c5f97299dad907706977ad529f21",
+  "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+  "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d",
+  "changed_paths": [
+    "src/app/git_ui.rs",
+    "src/app/search_ui.rs",
+    "src/git_watch.rs"
+  ],
+  "unchanged_other_entries": 2203,
+  "pins": {
+    "src/app/git_ui.rs": {
+      "sha256": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+      "git_blob": "0a11d3c861b4ef51e27ca95a1f1161c56bc36d14"
+    },
+    "src/app/search_ui.rs": {
+      "sha256": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+      "git_blob": "fafc5771676703baec355c91587c83dae38b0858"
+    },
+    "src/git_watch.rs": {
+      "sha256": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533",
+      "git_blob": "dca90b7d34462060327d8d042893fb6079755c2d"
+    }
+  },
+  "intent": "After exact root retirement, cancel/clear/restart matching search generation so queued old Batch/Error/Finished cannot publish under the same logical key. Ordinary changes, rescan flags, other roots/projects and mode/config removal preserve ongoing search.",
+  "implementation": "Background Project event classification and existing registered-root dev/ino comparison retain exact paths; Change.merge preserves them; production per-project Git-change ingestion schedules fresh search immediately. No synchronous filesystem work added to UI.",
+  "owning_regression_parents": [
+    "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+    "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+    "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+    "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+    "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering"
+  ],
+  "format_validation": {
+    "official_script_start_chunk": "1884d5",
+    "official_script_final_chunk": "8f70d4",
+    "original_session": 49547,
+    "official_script_exit": 0,
+    "output": "",
+    "diff_check_chunk": "f8ca3c",
+    "diff_check_exit": 0
+  },
+  "runtime": "All5new owning parent bodies/compiles/native/UX/BeforeAfter/performance UNRUN. Component gesture fixture is not native validation.",
+  "scope_limits": [
+    "No1871 merge, no new timer or generic-change cancellation.",
+    "Missed/ambiguous watcher events remain outside established retirement evidence.",
+    "No app.rs/sidebar/Cargo/protocol/auth/managedproof/SeedView/1749/provider/unknown-descendant change.",
+    "Host+UI isolated boundaries and actual native before/after fullflow plus independent UX review required before ready."
+  ],
+  "independent_reviews": null,
+  "public_write": null,
+  "base_public_head": "1a7a6c5d2aa6c0ef113dd3946a9b5cafb8ad9763",
+  "correction": "Visible Retry search control on errors dispatches captured generation; only matching current error/root/context and nonmodal current query may reschedule. Query/options/root preserved; old Retry/Error cannot affect newer search. No automatic retry loop or generic-change restart.",
+  "original82_UX_HOLD": {
+    "path": "/tmp/pr1549-82bb77e7-independent-ux-source-evidence-review-v1.json",
+    "sha256": "037011f2e42249d53a72680407cf7841ec19eaa83b6610503cf08ab3197aeb80",
+    "scope": "Delayed-root error lacked recovery action; old verdict preserved, not transferred."
+  },
+  "final_delta": "Correct f5 keyed-column state bug by using existing ui_controls::owned(state.generation,retry). It explicitly replaces child tree on generation change; fifth real widget gesture parent unchanged. Query focus operation retained. Only three lines search_ui delta; helper/producer/other paths exact f5.",
+  "supersedes_source_only": "f5 source blocker remains sealed; no test/runtime transfer. All five new parents, compilation/native/evidence UNRUN."
+}

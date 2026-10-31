@@ -1,0 +1,61 @@
+{
+  "kind": "AUTHOR_OBJECT_AND_OWNING_SOURCE_MAP_NOT_INDEPENDENT_APPROVAL",
+  "product": {
+    "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d",
+    "parent": "f5d80ee3dc76c5f97299dad907706977ad529f21"
+  },
+  "tracked_entry_count": 2206,
+  "direct_parent_delta": [
+    "src/app/search_ui.rs"
+  ],
+  "direct_parent_unchanged_entries": 2205,
+  "cumulative_freeze_changed_paths": [
+    "src/app/git_ui.rs",
+    "src/app/search_ui.rs",
+    "src/git_watch.rs"
+  ],
+  "cumulative_changed_paths_are_not_immediate_parent_delta": true,
+  "selected_parents": [
+    {
+      "name": "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+      "source": "src/git_watch.rs",
+      "source_sha256": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533",
+      "line": 951,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "0d9d07e5de091a664e8d1bd596d49d051f45d95bac78a2e37aa54f457633a36b",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+      "source": "src/git_watch.rs",
+      "source_sha256": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533",
+      "line": 983,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "11a40dace6df76cd1a75d5df2f0c52277d9433ccbd800a4f79d42ce992fb6f68",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    }
+  ],
+  "boundary": "host",
+  "actual_runtime_inventory_N": null,
+  "actual_results": null,
+  "execution_authorized": false,
+  "gates": [
+    "src/modules.rs #[cfg(any(feature=\"ui\", feature=\"host\"))] git_watch module",
+    "src/git_watch.rs #[cfg(test)] tests and ordinary #[test] parents",
+    "Cargo.toml cagentsd required-features=[\"host\"]; test=false/bench=false"
+  ],
+  "fixtures": [
+    "Synthetic Project/Census/Worktrees and real change classification/coalescing; no provider or daemon execution.",
+    "Private TempDir, real notify::recommended_watcher and filesystem identity reconciliation. Backend/threads/timings/results UNRUN; emitted cagentsd helper is not required by these bodies."
+  ],
+  "source_negative_predecessor": "f5 keyed-column retention finding is source-only negative history, never an executed parent/native failure or transferred clearance."
+}

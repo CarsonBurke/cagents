@@ -1,0 +1,10 @@
+{
+  "kind": "EXISTING_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+  "filesystem_sha256": "b7545d4b8b564b64a46396c77b76911bced5497f5182fdd67728ed4e9f9cc983",
+  "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+  "variance": true,
+  "index_flag": "H AGENTS.md",
+  "bytes_flags_changed_by_author": false,
+  "latest_user_AGENTS_instructions_followed": true,
+  "scope": "No blanket working-filesystem-to-Git equality claim. Final Git object conservation and selected product source pins are separate."
+}
