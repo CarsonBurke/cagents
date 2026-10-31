@@ -786,9 +786,10 @@ mod tests {
         );
         for protocol in source_protocols() {
             assert!(supports_protocol(protocol));
-            // Frozen postcard envelope with request 7, proof s/b/i and an empty
-            // ChatListed response. The only version-specific byte is first.
-            let payload = [protocol as u8, 1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0];
+            // Frozen postcard envelope suffix with request 7, proof s/b/i and
+            // an empty ChatListed response. The version scalar may use multiple bytes.
+            let mut payload = postcard::to_allocvec(&protocol).unwrap();
+            payload.extend([1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0]);
             let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
             frame.extend(payload);
             let envelope = read_response(&mut frame.as_slice()).unwrap();
