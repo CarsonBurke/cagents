@@ -5847,14 +5847,27 @@ impl RepositoryRuntime {
                     crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire_for_save(
                         &root, &destination, &known,
                     )
-                    .map_err(|error| match error.authority {
-                        Some(authority) => {
-                            crate::editor::retained_save::RetainedSaveError::Recovery {
-                                message: error.message,
-                                authority,
-                            }
+                    .map_err(|error| {
+                        #[cfg(test)]
+                        {
+                            use std::io::Write as _;
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "[save-worker-diagnostic] stage=acquire_for_save boundary=Err fd_role=original_source source={:?} destination={:?} raw_errno=not_retained error={}",
+                                root.path(),
+                                destination,
+                                error,
+                            );
                         }
-                        None => crate::editor::retained_save::RetainedSaveError::Io(error.message),
+                        match error.authority {
+                            Some(authority) => {
+                                crate::editor::retained_save::RetainedSaveError::Recovery {
+                                    message: error.message,
+                                    authority,
+                                }
+                            }
+                            None => crate::editor::retained_save::RetainedSaveError::Io(error.message),
+                        }
                     })
                     .and_then(|context| {
                         let result = write(
@@ -5865,6 +5878,18 @@ impl RepositoryRuntime {
                             overwrite,
                             &context,
                         );
+                        #[cfg(test)]
+                        if let Err(error) = &result {
+                            use std::io::Write as _;
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "[save-worker-diagnostic] stage=write boundary=Err fd_roles=original_source,recovery_placement source={:?} destination={:?} placement={:?} raw_errno=not_retained error={}",
+                                root.path(),
+                                destination,
+                                context.placement().directory().path(),
+                                error,
+                            );
+                        }
                         crate::editor::retained_save::finish_context(&context, result)
                     });
                 let authority = match &result {
