@@ -1,0 +1,74 @@
+{
+  "schema": "startup30_packet_B_scoped_code_source_review_successor_binding_v1",
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+  "runner_sha256": "4fbf68307dbe2f0e6dde36522b8660a2e2c6ff60e0619f1078a17ffd80e75c12",
+  "plan_sha256": "5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c",
+  "controller_commit": "982feefc3688bf73c874800cf1f83da67ba343cc",
+  "controller_tree": "e2d900ce777f974b2f4979a0da3f4dbe27e24a07",
+  "controller_parent": "359623881492576f122532ded4ac6c7ce36adf01",
+  "manifest_sha256": "8d1771c996fd59b1796f04f2d5fb57ab76b33613be456d9783cbafeb6ef206a1",
+  "scope": "Latest-head binding refresh only: exact conservation of previously cleared main task readers/assertions, grouped_contracts and execute_contracts, runtime archives and new immutable runner pin. Prior bounded code-source semantics retained by byte identity, not rereview of accounting/generic/parser.",
+  "prior_independent_review": {
+    "path": "/tmp/startup30-35962388-independent-task-code-source-review-v1.json",
+    "sha256": "f20b597909367ff4edd6067594363c8b11733d6a83860997907dc47364238fa1",
+    "controller_commit": "359623881492576f122532ded4ac6c7ce36adf01",
+    "runner_sha256": "535836c4b6c922f4c37a7b297ac04463e00b50112bd192a0c02fcda2d6d4234c",
+    "scope_retained": "New main task admission, product/source/selector-feature graph, exact grouped selection/default scheduler, no-helper execution/library evidence/required reads+writes/original-error handling"
+  },
+  "blocking_findings": [],
+  "binding_checks": {
+    "actual_commit_tree_parent_match_supplied": true,
+    "runner_changed_top_level_functions_only": [
+      "parent_accounting"
+    ],
+    "whole_runner_bytes_outside_parent_accounting_exact": true,
+    "parent_accounting_old_range": [
+      710,
+      795
+    ],
+    "parent_accounting_new_range": [
+      710,
+      802
+    ],
+    "prior_scope_function_bodies_exact": {
+      "grouped_contracts": [
+        498,
+        513
+      ],
+      "execute_contracts": [
+        587,
+        682
+      ],
+      "main": [
+        865,
+        1292
+      ]
+    },
+    "plan_exact_previous": true,
+    "command_data_exact_previous": true,
+    "source_binding_exact_previous": true,
+    "current_source_map_exact_previous": true,
+    "all_plan_archive_bindings_byte_exact_previous_and_declared_hash_match": true,
+    "runtime_archive_binding_count": 39,
+    "accounting_negative_preserved": {
+      "git_path": "qualification-packets/startup30/dependencies/accounting_negative_review.json",
+      "sha256": "a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465",
+      "interpretation": "Retained original negative history; not a new approval"
+    },
+    "end_runner_plan_manifest_pins_match": true
+  },
+  "excluded_approval": "The changed parent_accounting function is independently reviewed by its assigned accounting reviewer. This receipt does not approve its correction, final counters, complete controller admission or inventory/conservation scope separately owned by1239.",
+  "runtime_status": {
+    "candidate_execution_import_build_test_native_by_reviewer": false,
+    "packet_B": "ALL_UNRUN_NO_GRANT",
+    "donor_2025": "Root reports started session40495/HOSTbuild; no result/RAW acceptance/positive return observed by this reviewer",
+    "packet_A_positive_return": null,
+    "donor_runtime_qualification": null,
+    "donor_positive_return": null
+  },
+  "remaining_admission": "Separate accounting-correction approval and conservation scope, actual accepted donor RAW/positive return, Packet A positive return and a distinct current B grant/context before queue/runtime. No one-use donor grant/result transfer.",
+  "operations": "Immutable Git source/JSON/AST/hash comparisons and own/tmp receipt only. No source edit, spawn, candidate import/call, compiler/test, context/resource/process/target/helper/native probe or public write.",
+  "scope_limit": "Source-only CONTROLLER_SOURCE_CLEAR for retained exclusive semantic scope bound to successor bytes; no whole accounting/runtime/pass/native/provider/UX claim."
+}

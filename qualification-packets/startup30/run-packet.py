@@ -1,4 +1,6 @@
-"""Startup30 source candidate: CLI1/HOST1/UI28 libtest groups. Reviewed source and a distinct actual grant required; no helper or native qualification."""
+"""Startup30 stable-guard source successor: same CLI1/HOST1/UI28 groups; no execution or native authority."""
+if not __debug__:
+    raise RuntimeError("Startup30 requires assertions enabled before any effects")
 import argparse
 import ctypes
 import errno
@@ -16,16 +18,16 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition')
+WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard')
 TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
 LOCK = TARGET.parent / 'lane-c.lock'
 TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/plan.json')
+PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source/qualification-packets/startup30/plan.json')
 PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
 PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
 SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
 CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
-PLAN_SHA = '5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c'
+PLAN_SHA = '46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31'
 SCOPE_PARENT = None  # No grouped contract enables the dormant donor staged-scope path.
 
 
@@ -863,6 +865,7 @@ def retain_uncertain_lane(save, evidence):
 
 
 def main():
+    assert sys.flags.isolated == 1 and sys.dont_write_bytecode, 'Use the admitted /usr/bin/python3 -I -B outer invocation'
     parser = argparse.ArgumentParser()
     parser.add_argument('--grant', required=True, help='Fresh actual EC lane grant message ID; preparation is not authority')
     parser.add_argument('--runner-sha256', required=True, help='Externally frozen and independently reviewed executing-runner SHA256')
@@ -891,8 +894,8 @@ def main():
     assert review['kind'] == 'AUTHOR_ASSEMBLED_STARTUP30_SOURCE_BINDING_NOT_APPROVAL'
     assert review['verdict'] == 'BOUND_GENUINE_PRODUCT_SOURCE_REVIEW_SCOPES_CONTROLLER_REVIEW_PENDING'
     assert (review['head'], review['tree'], review['parent']) == (
-        'eb7ff16beb8864349573231521c5d4eab5270cc6', '8d60fb0154109a82861f9b595f2b7296e4f55c26',
-        'b914f9d9b55527aa1bb22d591968c58958d717ee')
+        '6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194', '726b28c2d8d10abc2a2e8340b98e9e6015a089c4',
+        'eb7ff16beb8864349573231521c5d4eab5270cc6')
     assert (plan['product_head'], plan['product_tree'], plan['product_parent']) == (review['head'], review['tree'], review['parent'])
     assert review['product_pr'] is plan['product_pr'] is None
     def read_bound(key, as_json=True):
@@ -908,25 +911,46 @@ def main():
     shared_freeze = read_bound('shared_test_freeze')
     shared_review = read_bound('shared_test_review')
     shared_publication = read_bound('shared_test_publication')
-    assert data['schema'] == 'startup-eb7-three-libtest-groups-task-data-v1'
+    stable_review = read_bound('stable_guard_review')
+    stable_publication = read_bound('stable_guard_publication')
+    stable_receipt = read_bound('stable_guard_source_receipt')
+    base_product = review['base_product']
+    assert (base_product['head'], base_product['tree'], base_product['parent']) == (
+        'eb7ff16beb8864349573231521c5d4eab5270cc6', '8d60fb0154109a82861f9b595f2b7296e4f55c26',
+        'b914f9d9b55527aa1bb22d591968c58958d717ee')
+    assert review['parent'] == base_product['head']
+    assert stable_review['verdict'] == 'SOURCE_CLEAR_CURRENT_HEAD_STABLE_GUARD_DELTA_ONLY' and stable_review['findings'] == []
+    assert (stable_review['head'], stable_review['tree'], stable_review['parents']) == (review['head'], review['tree'], [base_product['head']])
+    assert (stable_publication['head'], stable_publication['tree'], stable_publication['sole_parent']) == (review['head'], review['tree'], base_product['head'])
+    assert (stable_receipt['head'], stable_receipt['tree'], stable_receipt['sole_parent']) == (review['head'], review['tree'], base_product['head'])
+    assert stable_publication['current_head_nonauthor_review']['sha256'] == review['stable_guard_review']['sha256']
+    assert stable_publication['source_receipt']['sha256'] == stable_review['author_receipt']['sha256'] == review['stable_guard_source_receipt']['sha256']
+    assert stable_review['binding_checks']['changed_paths'] == ['src/app/startup_gate.rs']
+    assert stable_review['binding_checks']['all_other_mode_type_blob_entries_exact'] == stable_publication['all_other_mode_type_blob_entries_exact'] == 2221
+    assert stable_review['binding_checks']['old_test_and_direct_helper_blobs_unchanged'] is True
+    assert stable_review['source_file']['original_sha256'] == base_product['source_paths_sha256']['src/app/startup_gate.rs']
+    assert stable_review['source_file']['current_sha256'] == plan['source_paths_sha256']['src/app/startup_gate.rs']
+    assert set(base_product['source_paths_sha256']) == set(plan['source_paths_sha256'])
+    assert all(value == plan['source_paths_sha256'][path] for path, value in base_product['source_paths_sha256'].items() if path != 'src/app/startup_gate.rs')
+    assert data['schema'] == 'startup-6ceb-three-libtest-groups-task-data-v1'
     assert data['product_pr'] is None and data['scope_parent'] is SCOPE_PARENT is None
     assert data['source'] == source_map['new_product']
     assert (data['source']['head'], data['source']['tree'], data['source']['parent']) == (review['head'], review['tree'], review['parent'])
     assert data['source']['worktree'] == str(WT)
     assert data['source']['source_paths_sha256'] == plan['source_paths_sha256'] == review['source_paths_sha256']
-    assert published['head'] == review['parent'] and published['tree'] == '21c43715d5de2288b27d5408e460fc7eaa7485de'
+    assert published['head'] == base_product['parent'] and published['tree'] == '21c43715d5de2288b27d5408e460fc7eaa7485de'
     assert conserved['verdict'] == 'BOUNDED_OUTSIDE_GATE_SOURCE_CONSERVATION_CLEAR_RUNTIME_UNRUN'
     assert conserved['pins']['calculated_uncommitted_source_tree'] == published['tree']
     assert conserved['freeze']['sha256'] == review['composition_freeze']['sha256']
     assert shared_review['result'] == 'SOURCE_CLEAR_BOUNDED_SHARED_TRANSPORT_TEST' and shared_review['blocking_findings'] == []
     assert shared_review['freeze']['sha256'] == review['shared_test_freeze']['sha256']
-    assert shared_freeze['base'] == review['parent'] and shared_freeze['sha256'] == plan['source_paths_sha256']['src/control.rs']
-    assert (shared_publication['head'], shared_publication['tree'], shared_publication['parent']) == (review['head'], review['tree'], review['parent'])
+    assert shared_freeze['base'] == base_product['parent'] and shared_freeze['sha256'] == plan['source_paths_sha256']['src/control.rs']
+    assert (shared_publication['head'], shared_publication['tree'], shared_publication['parent']) == (base_product['head'], base_product['tree'], base_product['parent'])
     assert shared_publication['source_review_sha256'] == review['shared_test_review']['sha256']
     assert shared_review['freeze']['file_sha256_after'] == plan['source_paths_sha256']['src/control.rs']
     assert shared_review['conservation']['production_prefix_before_cfg_test_module_byte_exact'] is True
     assert shared_review['conservation']['inverse_delete_only_new_insertion_equals_full_base_file'] is True
-    assert all(value['sha256'] == plan['source_paths_sha256'][path] for path, value in composition['files'].items() if path != 'src/control.rs')
+    assert all(value['sha256'] == base_product['source_paths_sha256'][path] for path, value in composition['files'].items() if path != 'src/control.rs')
     assert data['runtime_admission'] == source_map['runtime_admission'] == review['runtime_admission'] == plan['runtime_admission']
     assert data['actual'] == source_map['actual'] == review['actual'] == plan['actual'] and all(value is None for value in plan['actual'].values())
     assert data['helper_build'] is plan['helper_build'] is None
@@ -977,7 +1001,7 @@ def main():
     for name, expected_sha in plan['tool_sha256'].items():
         path = TOOL / name
         assert path.is_file() and not path.is_symlink() and digest(path) == expected_sha
-    out = Path('/tmp/fw16-startup30-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
+    out = Path('/tmp/fw16-startup30-stable-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
     out.mkdir(mode=0o700)
     save = lambda name, value: (out / name).write_text(json.dumps(value, indent=2) + '\n')
     # Custody and original bytes are archived before touching the lane lock.
@@ -1286,7 +1310,20 @@ def main():
         files = sorted(path for path in out.rglob('*') if path.is_file())
         (out / 'SHA256SUMS').write_text(''.join(digest(path) + '  ' + str(path.relative_to(out)) + '\n' for path in files))
         # Root owns coordination; this runner never sends a message or starts another agent.
-        print(json.dumps(summary), flush=True)
+        terminal = {'record': 'startup30-compact-terminal-v1',
+             'head': summary['head'], 'tree': summary['tree'], 'grant': summary['grant'],
+             'runner_sha256': summary['runner_sha256'], 'plan_sha256': summary['plan_sha256'],
+             'error': summary['error'], 'owning_commands_qualified': summary['owning_commands_qualified'],
+             'actual_release': summary['actual_release'], 'phase_count': len(summary['phases']),
+             'declared_requested_unique_parent_count': summary['declared_requested_unique_parent_count'],
+             'discovered_requested_unique_parent_count': summary['discovered_requested_unique_parent_count'],
+             'qualified_unique_parent_count': summary['qualified_unique_parent_count'],
+             'attempted_test_invocation_count': summary['attempted_test_invocation_count'],
+             'qualified_test_invocation_count': summary['qualified_test_invocation_count'],
+             'unknown_process_count': summary['unknown_process_count'],
+             'evidence_directory': str(out), 'full_summary_path': str(out / 'summary.json'),
+             'full_artifact_hashes_path': str(out / 'SHA256SUMS')}
+        print(json.dumps(terminal), flush=True)
         print('EVIDENCE ' + str(out), flush=True)
         print('RELEASE_STATUS ' + ('ACTUAL_CLEAN_C_RELEASE' if summary['actual_release'] else 'NO_SAFE_RELEASE_CLAIM'), flush=True)
     return 0 if summary['owning_commands_qualified'] else 1

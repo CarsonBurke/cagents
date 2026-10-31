@@ -1,0 +1,165 @@
+{
+  "blockers_in_this_scope": [],
+  "code_delta": {
+    "added_removed_functions": [],
+    "after_function": {
+      "bytes": 7383,
+      "end_line": 802,
+      "line": 710,
+      "sha256": "b19820d92daeac72458a2ff1461eb0455f391c5cfa34630701aeff6ec74e6e37"
+    },
+    "all_runner_text_outside_parent_accounting_byte_exact": true,
+    "before_function": {
+      "bytes": 7070,
+      "end_line": 795,
+      "line": 710,
+      "sha256": "543698ff6cf0898424615440a07caf249069f5ab64093728a2ade5b70390aa58"
+    },
+    "changed_existing_functions": [
+      "parent_accounting"
+    ],
+    "exact_git_diff": "diff --git a/qualification-packets/startup30/run-packet.py b/qualification-packets/startup30/run-packet.py\nindex 9b0415718..c87a52a6b 100644\n--- a/qualification-packets/startup30/run-packet.py\n+++ b/qualification-packets/startup30/run-packet.py\n@@ -710,9 +710,16 @@ def safe_lane_handoff(attempts, states, phases, final_custody, failures):\n def parent_accounting(attempts, states, phases, parents, out):\n     attempted = [attempt for attempt in attempts if attempt[0] == 'phase' and attempt[1].startswith('parent-')]\n     raw, errors, contracts = [], [], {}\n-    if attempted:\n+    try:\n+        contract_bytes = (out / 'group-contracts.json').read_bytes()\n+    except FileNotFoundError as exc:\n+        if attempted:\n+            errors.append('Group contract evidence: ' + type(exc).__name__ + ': ' + str(exc))\n+    except Exception as exc:\n+        errors.append('Group contract evidence: ' + type(exc).__name__ + ': ' + str(exc))\n+    else:\n         try:\n-            values = json.loads((out / 'group-contracts.json').read_bytes())\n+            values = json.loads(contract_bytes)\n             expected = ['parent-cli-lib-exact', 'parent-host-lib-exact', 'parent-ui-lib-exact']\n             assert 0 < len(values) <= len(expected)\n             assert [value['label'] for value in values] == expected[:len(values)]\n",
+    "exact_git_diff_sha256": "bad6faf394a79bca41a46010efc809c3c666b0a7d8503e82ad8701f36e1a7184",
+    "function_count_before_after": [
+      32,
+      32
+    ],
+    "signature_exact": true,
+    "source_shape": "Only the original conditional contract-read block is changed to an unconditional read with separate FileNotFoundError and other Exception recording, followed by the existing JSON validation. No claim about complete behavioral correctness is made by this conservation review."
+  },
+  "controller": {
+    "clean_start_and_end": true,
+    "head": "982feefc3688bf73c874800cf1f83da67ba343cc",
+    "manifest_sha256": "8d1771c996fd59b1796f04f2d5fb57ab76b33613be456d9783cbafeb6ef206a1",
+    "plan_sha256": "5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c",
+    "runner_sha256": "4fbf68307dbe2f0e6dde36522b8660a2e2c6ff60e0619f1078a17ffd80e75c12",
+    "sole_parent": "359623881492576f122532ded4ac6c7ce36adf01",
+    "tree": "e2d900ce777f974b2f4979a0da3f4dbe27e24a07",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source"
+  },
+  "cumulative_diff_proof": {
+    "from-d412": {
+      "blank_space_context_lines_retained": 11,
+      "container_bytes": 37355,
+      "container_sha256": "01582868a61411f1a9a7dc4b742a3aaeac685679939fb8a114c406e3d09ed4d2",
+      "exact_regeneration_with_actual_stored_headers": true,
+      "headers": [
+        "donor",
+        "startup30"
+      ],
+      "payload_bytes": 36660,
+      "payload_sha256": "dea0f01b2b3fae8361839519e427b4bdf28968b64d0cae4a10c6e7da262376c7",
+      "strict_in_memory_forward_or_inverse_reconstruction": true
+    },
+    "to-d412.inverse": {
+      "blank_space_context_lines_retained": 11,
+      "container_bytes": 37355,
+      "container_sha256": "69a5080aee38d548fffebc3143e81771458710e1a79d7088ebab7c5708a790c5",
+      "exact_regeneration_with_actual_stored_headers": true,
+      "headers": [
+        "startup30",
+        "donor"
+      ],
+      "payload_bytes": 36660,
+      "payload_sha256": "4b1935bf74e4eb6cd7da4edf8ad30af57998aaff54c35a364f66332ffc74deb5",
+      "strict_in_memory_forward_or_inverse_reconstruction": true
+    }
+  },
+  "diff_header_delta": "Forward labels changed from d412/run-packet.py -> startup30/run-packet.py to donor -> startup30; inverse labels changed correspondingly. Actual payloads regenerate exactly with these stored labels and strictly reconstruct both complete sources. No payload was edited here. Historical 3596 payloads remain in immutable parent and prior receipt.",
+  "manifest": {
+    "added_payloads": [
+      "dependencies/accounting_negative_review.json"
+    ],
+    "all_payload_hashes_bytecounts_exact_no_duplicate_missing_extra_paths": true,
+    "changed_existing_payload_entries": [
+      "from-d412.diff.json",
+      "run-packet.py",
+      "source-conservation.json",
+      "to-d412.inverse.diff.json"
+    ],
+    "manifest_self_excluded": true,
+    "negative_archive": {
+      "bytes": 13052,
+      "full_original_byte_exact": true,
+      "historical_negative_preserved_not_relabelled_as_successor_approval": true,
+      "original_path": "/tmp/startup30-parent-accounting-source-review-texya0k0/review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/dependencies/accounting_negative_review.json",
+      "sha256": "a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465"
+    },
+    "payload_count_before_after": [
+      45,
+      46
+    ],
+    "physical_regular_files": 47,
+    "removed_payloads": [],
+    "source_conservation_added_key": "accounting_discovery_correction",
+    "source_conservation_changed_prior_keys": [
+      "runner_sha256",
+      "diffs"
+    ],
+    "source_conservation_sha256": "c02fb61fe0114a81f44650c3f434ee74790b352a7378b8319690bab688830f9a"
+  },
+  "operations": "Only read-only source/AST/JSON/Git/hashes and this one task-owned /tmp successor receipt. No candidate import/call, compile/test/build/Cargo/native/process/context/environment/resource/account/DB/target probe, source edit, worker or public write. Rust/runtime/native all UNRUN.",
+  "preserved_history_and_limits": {
+    "current_B_grant_and_actual_runtime_fields": "NULL/UNOBSERVED in current source data; execution_authorized false, helper binding null. No runtime/native/donor/PacketA proof transfer.",
+    "donor_status_limit": "Root-reported original #2025 once-started HOST build is not accepted donor qualification or return; no session/process/runtime query was made in this review.",
+    "old_negative_sha256": "a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465",
+    "original_record": {
+      "correction": "Original exact unified-diff bytes retained as JSON string; no whitespace predicate or diff payload weakened",
+      "original_chunk": "3da7ed",
+      "scope": "Raw unified-diff context-space lines reported as artifact trailing whitespace; controller code not implicated",
+      "staged_diff_check_exit": 2
+    },
+    "original_staged_diff_check_exit2_record_byte_exact_to3596": true,
+    "runtime_prerequisites": "The archived source-preparation exception relaxes only authoring order; accepted donor return, actual Packet A positive return and a separately authenticated fresh B grant/current gates remain required."
+  },
+  "prior_review_reused": {
+    "conservation_basis": "Exactly one existing function changed; all other runner text is byte-exact. Exactly six tracked packet paths changed; all other Git entries/modes/types/blobs are exact.",
+    "head": "359623881492576f122532ded4ac6c7ce36adf01",
+    "immutable_parent_runner_sha256": "535836c4b6c922f4c37a7b297ac04463e00b50112bd192a0c02fcda2d6d4234c",
+    "path": "/tmp/startup30-packetB-conservation-35962388.json",
+    "review_file_unchanged": true,
+    "sha256": "fc9dbb49c40c3d663befcc0f4a178680670b81a1b1d9d2b21ca4072f8b9ac025",
+    "tree": "10dc77a01badf5dec7745da41cda21b2d244e762"
+  },
+  "protected_inheritance": {
+    "all_other_31_top_level_functions_byte_exact": true,
+    "generic24_original_nested4_grouped_result_helpers_dormant_binder_main_and_generic_lifecycle_byte_exact_to3596": true,
+    "protected_acquire_finalize_Cclose": {
+      "bytes": 3790,
+      "current_line": 1208,
+      "occurrences": 1,
+      "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4"
+    }
+  },
+  "schema": "startup30-packetB-independent-successor-delta-conservation-v1",
+  "scope": "Only exact 3596 -> 982f source conservation/manifest delta. Reuses prior fc9db whole-packet conservation by byte/object identity; no repeated code/semantic/counter audit. The accounting correction is independently reviewed by its owning reviewer, not approved here.",
+  "unchanged_data_and_product": {
+    "all2222_original_product_entries_modes_types_blobs_untouched_transitively": true,
+    "all22_product_source_pin_maps_copies_unchanged_and_hashes_exact": true,
+    "all39_runtime_archive_bindings_unchanged_and_hashes_exact": true,
+    "changed_existing_modes_retained": "100644",
+    "copied_product_source_immutable_eb7_verification_reused": "All22 copied files were verified against eb7 in fc9db and lie outside this exact six-path delta; no product/copy changes exist.",
+    "git_entries_before_after": [
+      2268,
+      2269
+    ],
+    "new_archive_mode": "100644",
+    "plan_sourcebinding_map_commanddata_all_byte_exact_to3596": [
+      "plan.json",
+      "source-binding.json",
+      "current-source-map.json",
+      "command-data.json"
+    ],
+    "tracked_paths_changed_exactly": [
+      "qualification-packets/startup30/dependencies/accounting_negative_review.json",
+      "qualification-packets/startup30/from-d412.diff.json",
+      "qualification-packets/startup30/manifest.json",
+      "qualification-packets/startup30/run-packet.py",
+      "qualification-packets/startup30/source-conservation.json",
+      "qualification-packets/startup30/to-d412.inverse.diff.json"
+    ],
+    "unchanged_prior_entries": 2263
+  },
+  "verdict": "BOUNDED_982F_DELTA_CONSERVATION_AND_MANIFEST_CLEAR"
+}

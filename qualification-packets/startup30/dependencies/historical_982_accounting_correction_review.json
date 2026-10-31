@@ -1,0 +1,133 @@
+{
+  "schema": "finite-startup30-ACCOUNTING-DISCOVERY-1-correction-review-v1",
+  "utc": "2026-10-31T09:38:24.879068+00:00",
+  "reviewer_role": "/root/1945_cache_io_oracles; independent finite accounting correction reviewer, not author, executor, admission authority or resource acceptor",
+  "verdict": "SCOPED_SOURCE_CLEAR_ACCOUNTING_DISCOVERY_1_CLOSED",
+  "controller": {
+    "head": "982feefc3688bf73c874800cf1f83da67ba343cc",
+    "tree": "e2d900ce777f974b2f4979a0da3f4dbe27e24a07",
+    "parent": "359623881492576f122532ded4ac6c7ce36adf01",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source",
+    "runner_sha256": "4fbf68307dbe2f0e6dde36522b8660a2e2c6ff60e0619f1078a17ffd80e75c12",
+    "plan_sha256": "5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c",
+    "manifest_sha256": "8d1771c996fd59b1796f04f2d5fb57ab76b33613be456d9783cbafeb6ef206a1"
+  },
+  "scope": "Only exact correction of prior discovery accounting negative and its bounded conservation/hash bookkeeping. Prior accepted counter/join/summary checks carried forward by exact body conservation; no repeated controller/admission/execution/parser/finalizer semantic review.",
+  "preserved_negative": {
+    "path": "/tmp/startup30-parent-accounting-source-review-texya0k0/review.json",
+    "sha256": "a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465",
+    "committed_copy": "qualification-packets/startup30/dependencies/accounting_negative_review.json",
+    "full_bytes_exact": true,
+    "old_verdict_preserved": true
+  },
+  "correction": {
+    "id": "ACCOUNTING-DISCOVERY-1",
+    "status": "CLOSED_AT_SOURCE_LEVEL",
+    "anchors": [
+      "run-packet.py:713-728",
+      "run-packet.py:768",
+      "run-packet.py:798"
+    ],
+    "decision": "The original cumulative-contract read is unconditional. The produced valid singleton CLI contract is parsed before any attempted parent, so discovery reports CLI1 rather than null. No parent credit is manufactured because all raw-row/wait/output/hash/historical reconciliation and qualified-row logic remains byte-exact."
+  },
+  "static_cases_not_executed": [
+    {
+      "case": "Contract not produced, no parent attempt",
+      "source_result": "FileNotFoundError is tolerated; contracts empty; discovered names/count None; qualified0; declared30 unchanged."
+    },
+    {
+      "case": "Contract missing after a parent attempt",
+      "source_result": "FileNotFoundError creates raw evidence error; no contract/pass credit; unchanged finalizer records sticky supervision failure/HOLD."
+    },
+    {
+      "case": "Other contract read failure, including zero attempts",
+      "source_result": "Raw evidence error retained; unchanged finalizer HOLD rather than silently unknown/clean return."
+    },
+    {
+      "case": "Malformed JSON or invalid/empty/duplicate/out-of-order label prefix",
+      "source_result": "Existing parse/prefix checks retain raw evidence error and no contract credit. No claim of expanded schema validation beyond those existing checks."
+    },
+    {
+      "case": "Valid CLI singleton contract, zero parent attempts",
+      "source_result": "Discovery singleton/count1; attempted0 and qualified0; three test invocations remain unrun; final group semantics false."
+    },
+    {
+      "case": "Valid CLI/HOST partial prefix",
+      "source_result": "Both actual-discovery contracts retained regardless of parent launch progress; final qualification only from unchanged attempted-row/original stdout/wait reconciliation; incomplete full group false."
+    },
+    {
+      "case": "Valid full CLI/HOST/UI prefix",
+      "source_result": "Discovery30 from actual validated contracts; declaration30 supplies no pass credit. Whole group requires all three actual qualified raw rows and historical records in original exact order; main requires unchanged nine-phase/error/cancel/actual-release predicates."
+    }
+  ],
+  "conservation": {
+    "top_level_function_count_before_after": [
+      32,
+      32
+    ],
+    "only_changed_function": "parent_accounting",
+    "all_bytes_before_function_and_after_function_exact_3596": true,
+    "entire_accounting_tail_from_original_attempt_join_exact_3596": true,
+    "summary_and_finalizer_exact_3596": true,
+    "plan_byte_exact": true,
+    "runtime_archive_bindings_unchanged": 39,
+    "changed_runtime_archives": [],
+    "manifest_member_hashes_verified": 46,
+    "forward_inverse_diffs": {
+      "from-d412.diff.json": {
+        "sha256": "01582868a61411f1a9a7dc4b742a3aaeac685679939fb8a114c406e3d09ed4d2",
+        "honest_exact_derivation": true
+      },
+      "to-d412.inverse.diff.json": {
+        "sha256": "69a5080aee38d548fffebc3143e81771458710e1a79d7088ebab7c5708a790c5",
+        "honest_exact_derivation": true
+      }
+    },
+    "changed_paths": [
+      "qualification-packets/startup30/dependencies/accounting_negative_review.json",
+      "qualification-packets/startup30/from-d412.diff.json",
+      "qualification-packets/startup30/manifest.json",
+      "qualification-packets/startup30/run-packet.py",
+      "qualification-packets/startup30/source-conservation.json",
+      "qualification-packets/startup30/to-d412.inverse.diff.json"
+    ]
+  },
+  "carried_prior_scoped_checks": [
+    "Exact three artifact/group labels and nine phases; declared30 distinct assigned parents CLI1/HOST1/UI28 remain source declarations.",
+    "Cumulative prefix persistence survives later artifact failure; actual inventory N is never populated from source predictions.",
+    "Original stage/label/PID wait state, phase evidence hash and original stdout strict parser/historical reconciliation remain unchanged; no fabricated per-name waits.",
+    "Historical observations, discovered contracts and qualified raw rows remain separate and nonadditive; missing/failed groups receive no borrowed credit.",
+    "Scoped summary error/cancellation/full group/phase order/actual-release conjunction is byte-exact; semantic FAIL_STOP versus evidence/control HOLD remains unchanged."
+  ],
+  "remaining_blockers_in_this_exact_correction": [],
+  "not_a_whole_controller_clearance": [
+    "Main admission and execute semantics independently owned.",
+    "Full source conservation/assembled review independently owned.",
+    "Actual accepted donor return and Packet A positive return still prerequisites before distinct B admission."
+  ],
+  "actual": {
+    "B_grant": null,
+    "B_execution": "UNRUN",
+    "native": "UNRUN",
+    "actual_inventory_N": null,
+    "actual_original_waits_or_results": null,
+    "resource_release": null,
+    "donor2025": "Root reports actual original session40495 started once/HOST build; this review did not inspect runtime evidence and does not qualify it or assert return."
+  },
+  "effects": "Only inert exact Git/source/AST/JSON/hash/data-diff comparisons and own /tmp receipt. No candidate/parser/helper import or function execution, extracted test, build/test/Cargo/native/process/env/context/resource probe, source edit, public mutation or worker.",
+  "signature": "Signed in role by /root/1945_cache_io_oracles; source-only finite correction closure with prior immutable negative retained.",
+  "artifacts": [
+    {
+      "path": "/tmp/startup30-accounting-discovery-correction-67bc1g_j/exact-runner-delta.diff",
+      "sha256": "02bef56c7351d35e54f1f6ed6cfa89dc024ef6e077a085118d06c0e2564112aa"
+    },
+    {
+      "path": "/tmp/startup30-accounting-discovery-correction-67bc1g_j/parent_accounting.frozen.txt",
+      "sha256": "b19820d92daeac72458a2ff1461eb0455f391c5cfa34630701aeff6ec74e6e37"
+    },
+    {
+      "path": "/tmp/startup30-accounting-discovery-correction-67bc1g_j/source-conservation.frozen.json",
+      "sha256": "c02fb61fe0114a81f44650c3f434ee74790b352a7378b8319690bab688830f9a"
+    }
+  ]
+}

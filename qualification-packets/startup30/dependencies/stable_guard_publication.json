@@ -1,0 +1,53 @@
+{
+  "kind": "INDEPENDENTLY_REVIEWED_SYNTAX_FIX_SOURCE_PUBLICATION_ONLY",
+  "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+  "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+  "sole_parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "branch": "fix/b9-startup-stable-match-guard",
+  "original_push": {
+    "chunk_id": "112304",
+    "wall_time_seconds": 1.000977395,
+    "session_id": 61611,
+    "original_token_count": 26,
+    "output": "\n** (process:46): CRITICAL **: 03:09:39.381: store failed: Cannot create an item in a locked collection\n"
+  },
+  "terminal": {
+    "chunk_id": "9d410f",
+    "wall_time_seconds": 0.000011772,
+    "exit_code": 0,
+    "original_token_count": 93,
+    "output": "remote: \nremote: Create a pull request for 'fix/b9-startup-stable-match-guard' on GitHub by visiting:        \nremote:      https://github.com/CarsonBurke/cagents/pull/new/fix/b9-startup-stable-match-guard        \nremote: \nTo https://github.com/CarsonBurke/cagents.git\n * [new branch]        6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194 -> fix/b9-startup-stable-match-guard\n"
+  },
+  "remote_readback": {
+    "chunk": "5e9774",
+    "exit_code": 0,
+    "exact": true
+  },
+  "exact_changed_path": "src/app/startup_gate.rs",
+  "all_other_mode_type_blob_entries_exact": 2221,
+  "source_receipt": {
+    "path": "/tmp/coord-b9-startup-stable-guard-evidence/source-receipt.json",
+    "sha256": "07f2f51ab299616525ee75b369068d5068a3b88b5c5b1fbfb9a894c050063243"
+  },
+  "current_head_nonauthor_review": {
+    "path": "/tmp/coord-b9-startup-stable-match-guard-6ceb2e98-independent-current-head-review.json",
+    "sha256": "a81bc8b8f89c38deec1028a9b33b2648a434cf80ec69ca6736dfd163c721ee8f"
+  },
+  "actual_verification": {
+    "official_physical_Rust1_93_format_exit": 0,
+    "diff_check_exit": 0,
+    "first_formatter_exit": 1,
+    "first_formatter_requested": "Guard whitespace line collapse only; original negative retained",
+    "all_compilation_tests_native": "UNRUN_AT_NEW_HEAD"
+  },
+  "intended_behavior": "Preserves existing short-circuit, detached reason/failure and pending-pane fallthrough while lowering unsupported if-let match-guard syntax. No UX/readiness/policy/ACK change.",
+  "original_A3_negative": "CLI0/HOST0/UI101 at eb7 remains negative; no pass transfer",
+  "original_A3_return_acceptance": {
+    "message": "1414c9da-1669-4ce8-95e8-b751749e0394",
+    "path": "/tmp/fw16-backend-ec204421/startup-A-a4c5357c-negative-return-root-acceptance-v1.json",
+    "sha256": "285f1340e79ee91aea8697e636f415bbd44fa34f4c1b8358d2dbef9d587c47e8"
+  },
+  "source_ownership": "3e5b1d3f-7aa0-42fc-9bb3-634a293fbec1",
+  "future_A2_controller": "Source-only authoring in separate new WT, no runtime or grant",
+  "github_metadata_write": false
+}

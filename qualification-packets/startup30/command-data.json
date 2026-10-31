@@ -1,13 +1,13 @@
 {
-  "schema": "startup-eb7-three-libtest-groups-task-data-v1",
+  "schema": "startup-6ceb-three-libtest-groups-task-data-v1",
   "kind": "SOURCE_PREPARATION_NOT_ADMISSION",
   "product_pr": null,
   "scope_parent": null,
   "source": {
-    "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
-    "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
-    "parent": "b914f9d9b55527aa1bb22d591968c58958d717ee",
-    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+    "head": "6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194",
+    "tree": "726b28c2d8d10abc2a2e8340b98e9e6015a089c4",
+    "parent": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard",
     "source_paths_sha256": {
       ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
       "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
@@ -18,7 +18,7 @@
       "src/app/saved_terminal.rs": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
       "src/app/shared_views.rs": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
       "src/app/shared_views/tests/startup_terminals.rs": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
-      "src/app/startup_gate.rs": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+      "src/app/startup_gate.rs": "6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339",
       "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
       "src/app/startup_gate/tests.rs": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
       "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",

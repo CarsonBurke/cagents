@@ -3,23 +3,28 @@
   "members": [
     {
       "path": "README.md",
-      "sha256": "4f78630d7169620b9881a2790a971ca2d9427e0ede3d1331aa4a243ffa7e0bc3",
-      "bytes": 765
+      "sha256": "e41e91d6fe775ba939adbf8ccbf66d05469bdb71cdd5c969c8b3f0ce8b01c5b5",
+      "bytes": 1458
     },
     {
       "path": "command-data.json",
-      "sha256": "ba2c97c227d2cc981f4b9d5121c085886a4c0cb148fc06583c1e087ad5adf0c6",
-      "bytes": 34501
+      "sha256": "473b30389d70303af3b903245eb7e6d822e74f0272f9b456ffee5cab2dd3d6a6",
+      "bytes": 34498
     },
     {
       "path": "current-source-map.json",
-      "sha256": "20b88a5a34cc4540bea663f60258bb2501337c80330becbc87b490a50f695113",
-      "bytes": 3637
+      "sha256": "b46d22934cd7a21878e6331c7ac59cc83b3766171a34f297256b4bec978a107b",
+      "bytes": 6613
     },
     {
       "path": "dependencies/accounting_negative_review.json",
       "sha256": "a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465",
       "bytes": 13052
+    },
+    {
+      "path": "dependencies/base_eb7_startup_gate.rs",
+      "sha256": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+      "bytes": 28521
     },
     {
       "path": "dependencies/composition_conservation.json",
@@ -67,6 +72,51 @@
       "bytes": 81287
     },
     {
+      "path": "dependencies/historical_982_accounting_correction_review.json",
+      "sha256": "ceed7e7c18e372eb740c24d18c78e96f3812dcd89704ca56b73c4cc6b57759d8",
+      "bytes": 7760
+    },
+    {
+      "path": "dependencies/historical_982_admission_selection_execution_review.json",
+      "sha256": "d951567f385b8460a77974b835d3b6fca79d5cf6e256390407132319b3365e2d",
+      "bytes": 4155
+    },
+    {
+      "path": "dependencies/historical_982_conservation_review.json",
+      "sha256": "28cdb9f4fea77697a29bde4a7c45cde047c7aaf32e1a8550e02eba4e899ba8da",
+      "bytes": 9982
+    },
+    {
+      "path": "dependencies/historical_982_manifest.json",
+      "sha256": "8d1771c996fd59b1796f04f2d5fb57ab76b33613be456d9783cbafeb6ef206a1",
+      "bytes": 7788
+    },
+    {
+      "path": "dependencies/historical_982_plan.json",
+      "sha256": "5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c",
+      "bytes": 34983
+    },
+    {
+      "path": "dependencies/historical_982_publication.json",
+      "sha256": "d0953a18077c360d69134ec1dfe102fd1186ed54bf1063f17ae04d05436b2882",
+      "bytes": 3579
+    },
+    {
+      "path": "dependencies/historical_982_run-packet.py",
+      "sha256": "4fbf68307dbe2f0e6dde36522b8660a2e2c6ff60e0619f1078a17ffd80e75c12",
+      "bytes": 78032
+    },
+    {
+      "path": "dependencies/historical_982_source-binding.json",
+      "sha256": "9152208de93ade8d0c299543d316e6eb68d0333351b0e01853d7b34e6d17db08",
+      "bytes": 10820
+    },
+    {
+      "path": "dependencies/historical_982_source-conservation.json",
+      "sha256": "c02fb61fe0114a81f44650c3f434ee74790b352a7378b8319690bab688830f9a",
+      "bytes": 5577
+    },
+    {
       "path": "dependencies/seam_map.md",
       "sha256": "6c02bcd3ef8bb9f2935d17c5c9df8189bf359c906e58a8e961cc77cdcf8badf0",
       "bytes": 14438
@@ -92,14 +142,39 @@
       "bytes": 833
     },
     {
+      "path": "dependencies/stable_guard_publication.json",
+      "sha256": "ee9ab001aa3144c657de2db1fd379c1b9a6fc60263e14d5e45be6f4c28b528ef",
+      "bytes": 2743
+    },
+    {
+      "path": "dependencies/stable_guard_review.json",
+      "sha256": "a81bc8b8f89c38deec1028a9b33b2648a434cf80ec69ca6736dfd163c721ee8f",
+      "bytes": 4252
+    },
+    {
+      "path": "dependencies/stable_guard_source_receipt.json",
+      "sha256": "07f2f51ab299616525ee75b369068d5068a3b88b5c5b1fbfb9a894c050063243",
+      "bytes": 2202
+    },
+    {
+      "path": "execution-template.json",
+      "sha256": "a27fd66541360dbe2e749f50c2bc75b7e00b3299e3659d7ce25884e4a8e1f87d",
+      "bytes": 757
+    },
+    {
+      "path": "from-982feefc.diff.json",
+      "sha256": "164f9c9c324959dc51b0a7c4bf56f987dc11e15d86b4b72df1b8f0a9e1b1b76d",
+      "bytes": 11430
+    },
+    {
       "path": "from-d412.diff.json",
-      "sha256": "01582868a61411f1a9a7dc4b742a3aaeac685679939fb8a114c406e3d09ed4d2",
-      "bytes": 37355
+      "sha256": "0943a4fba40f5662384f7ced196aab9ea049909d609be7c255459e85b4ed8149",
+      "bytes": 42039
     },
     {
       "path": "plan.json",
-      "sha256": "5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c",
-      "bytes": 34983
+      "sha256": "46afab1695db7e99c77b4e3e0048d331875d6a4de0039a919509d860ea479d31",
+      "bytes": 40134
     },
     {
       "path": "product-source/.cargo/config.toml",
@@ -153,8 +228,8 @@
     },
     {
       "path": "product-source/src/app/startup_gate.rs",
-      "sha256": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
-      "bytes": 28521
+      "sha256": "6c8788790825737e54de89644d36a4bb961696b7a713e2bfbc431a5c82491339",
+      "bytes": 28602
     },
     {
       "path": "product-source/src/app.rs",
@@ -213,23 +288,28 @@
     },
     {
       "path": "run-packet.py",
-      "sha256": "4fbf68307dbe2f0e6dde36522b8660a2e2c6ff60e0619f1078a17ffd80e75c12",
-      "bytes": 78032
+      "sha256": "e86273f69b504f1b613c9539b55636c38a34b1795b13909f60b09468eae2a1cc",
+      "bytes": 81625
     },
     {
       "path": "source-binding.json",
-      "sha256": "9152208de93ade8d0c299543d316e6eb68d0333351b0e01853d7b34e6d17db08",
-      "bytes": 10820
+      "sha256": "660afcf28d44317d2e2ce5340f59d7b0293f42b76562c6a0edb98fc84a3125a4",
+      "bytes": 18095
     },
     {
       "path": "source-conservation.json",
-      "sha256": "c02fb61fe0114a81f44650c3f434ee74790b352a7378b8319690bab688830f9a",
-      "bytes": 5577
+      "sha256": "081029d2877992fb33409afc2334ed248d713a11cd81e35f80b8f6c823132b6d",
+      "bytes": 7123
+    },
+    {
+      "path": "to-982feefc.inverse.diff.json",
+      "sha256": "482a824f69b9635531092ad15e708a00d3a5a8fba450033055b97e7749775b07",
+      "bytes": 11442
     },
     {
       "path": "to-d412.inverse.diff.json",
-      "sha256": "69a5080aee38d548fffebc3143e81771458710e1a79d7088ebab7c5708a790c5",
-      "bytes": 37355
+      "sha256": "bf86c14dc52670df2da1cf4015817b3d466a8386e1e77138283a5e8f523b7d8e",
+      "bytes": 42051
     }
   ]
 }

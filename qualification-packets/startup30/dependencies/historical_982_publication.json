@@ -1,0 +1,84 @@
+{
+  "schema": "fw16-startup30-reviewed-source-publication-v1",
+  "utc": "2026-10-31T09:46:52.055267+00:00",
+  "branch": "qualification/fw16-startup30-source",
+  "controller_head": "982feefc3688bf73c874800cf1f83da67ba343cc",
+  "controller_tree": "e2d900ce777f974b2f4979a0da3f4dbe27e24a07",
+  "controller_parent": "359623881492576f122532ded4ac6c7ce36adf01",
+  "product_head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "product_tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+  "runner_sha256": "4fbf68307dbe2f0e6dde36522b8660a2e2c6ff60e0619f1078a17ffd80e75c12",
+  "plan_sha256": "5979e384b3d0aed321f048562a09634dbc3387e3611d7f75e305f65ff9b0818c",
+  "manifest_sha256": "8d1771c996fd59b1796f04f2d5fb57ab76b33613be456d9783cbafeb6ef206a1",
+  "scope": {
+    "isolated_libtest_artifacts": [
+      "cli",
+      "host",
+      "ui"
+    ],
+    "assigned_parents": [
+      1,
+      1,
+      28
+    ],
+    "nonadditive_total": 30,
+    "serial_phases": 9,
+    "helper": null,
+    "default_outer_scheduler": true
+  },
+  "source_reviews": {
+    "admission_selection_execution": {
+      "path": "/tmp/startup30-982feefc-independent-task-code-binding-refresh-v1.json",
+      "sha256": "d951567f385b8460a77974b835d3b6fca79d5cf6e256390407132319b3365e2d"
+    },
+    "accounting_correction": {
+      "path": "/tmp/startup30-accounting-discovery-correction-67bc1g_j/review.json",
+      "sha256": "ceed7e7c18e372eb740c24d18c78e96f3812dcd89704ca56b73c4cc6b57759d8"
+    },
+    "conservation": {
+      "path": "/tmp/startup30-packetB-delta-conservation-982feefc.json",
+      "sha256": "28cdb9f4fea77697a29bde4a7c45cde047c7aaf32e1a8550e02eba4e899ba8da"
+    }
+  },
+  "original_negative": {
+    "controller_head": "359623881492576f122532ded4ac6c7ce36adf01",
+    "finding": "ACCOUNTING-DISCOVERY-1",
+    "source_review_sha256": "a1df2b47a76b8fa9ebf78fadec686a620d2f58404a49d28a5c2c6bc8ee957465",
+    "preserved": true
+  },
+  "conserved": {
+    "generic_functions": 24,
+    "original_nested_functions": 4,
+    "lifecycle_tail_bytes": 3790,
+    "grouped_result_parser": "BYTE_EXACT",
+    "product_entries_unchanged": 2222
+  },
+  "normal_push_original_chunk": "7de600",
+  "normal_push_exit": 0,
+  "supported_ref_readback": "982feefc3688bf73c874800cf1f83da67ba343cc",
+  "original_credential_warning": "Nonfatal locked collection warning preserved; no credential workaround",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source",
+  "controller_argv_TEMPLATE_NOT_SUBMITTABLE": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-source/qualification-packets/startup30/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "4fbf68307dbe2f0e6dde36522b8660a2e2c6ff60e0619f1078a17ffd80e75c12",
+    "--controller-review",
+    "/tmp/startup30-982feefc-independent-task-code-binding-refresh-v1.json",
+    "--controller-review-sha256",
+    "d951567f385b8460a77974b835d3b6fca79d5cf6e256390407132319b3365e2d"
+  ],
+  "execution": "UNRUN",
+  "C_grant": null,
+  "queue": null,
+  "prerequisites_before_any_execution": [
+    "Accepted actual donor return/qualification within its actual scope",
+    "Packet A positive return and source/tool/build-context compatibility assessment",
+    "Fresh original scoped Root C grant and current original source/context/tool/resource guards"
+  ],
+  "limits": "Source preparation only. No test count/ELF/inventory result, native/UX/whole-suite/all-target or installed progress. A actual 3 binary checks separate; no aggregate claims across unexplained context drift."
+}
