@@ -1,19 +1,19 @@
 {
   "API_base": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
   "API_inherited_physical_review": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/API_inherited_physical_review.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/API_inherited_physical_review.json",
     "sha256": "7ffd6b69f603c73edf13350926d6d87932bae550369d6383a6926591be759ee0"
   },
   "HOST16_DATA": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/HOST16_DATA.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/HOST16_DATA.json",
     "sha256": "ee9956573d7fc627cf517897a66950c037eec1049c3c2f335e167cd09f492542"
   },
   "HOST16_preparation_handoff": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/HOST16_preparation_handoff.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/HOST16_preparation_handoff.json",
     "sha256": "88cc8a2107c7a7f438b96858c2dec8b2f41d30ec5f981ac73e18253326243ac1"
   },
   "UI2_preparation_handoff": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/UI2_preparation_handoff.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/UI2_preparation_handoff.json",
     "sha256": "718be74c467fa7075f2e816abc2deaf614876b482c7742682afd040efdf1dc8a"
   },
   "actual": {
@@ -38,239 +38,267 @@
     "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
   },
   "adoption_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_conservation.json",
     "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4"
   },
   "adoption_freeze": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_freeze.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_freeze.json",
     "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682"
   },
   "adoption_function": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_function.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_function.py",
     "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
   },
   "adoption_intake": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_intake.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_intake.json",
     "sha256": "e9aa09101ca6d215e6876de5b50c1fe1bc57bb3cc14f7bdd397b7772cd1e5843"
   },
   "adoption_old_function": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_old_function.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_old_function.py",
     "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
   },
   "adoption_original_finding": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_original_finding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_original_finding.json",
     "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
   },
   "adoption_pure4_reference": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_pure4_reference.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_pure4_reference.json",
     "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005"
   },
   "adoption_semantic": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_semantic.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/adoption_semantic.json",
     "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
   },
   "authority_review": {
     "original_path": "/tmp/92b8-operation-trait-single-import-independent-semantic-caller-ux-source-review-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/authority_review.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/authority_review.json",
     "sha256": "079eef1d3c39569141008ee704e9cdd4fefd4fab5e0850856aa6426a880921d4"
   },
   "base_f95_Root_exact_source_import": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/Root_exact_source_import.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/Root_exact_source_import.json",
     "sha256": "21e6e510dacbc7c4a0fe0b68c582e33ef3e7eed27a032d18db31fa1ad249bd6e"
   },
   "base_f95_UI5_postrun_scope_ABI": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-a7c8f4c2-UI5-reviewed-controller-main15-lead-scope-ABI-intake-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/base_f95_UI5_postrun_scope_ABI.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/base_f95_UI5_postrun_scope_ABI.json",
     "sha256": "7bfc05fea563f2837ef60ac3accd162b6dac0a6c00d27fc8caef3ad449e79138"
   },
   "base_f95_UI5_reviewed_handoff": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/base-f95-UI5-reviewed-handoff.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/base-f95-UI5-reviewed-handoff.json",
     "sha256": "438e152c1b00503e6c94c65869a8c8b2960825e95479640a39cd1d76691399b6"
   },
   "base_f95_UX_source_review": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/UX_source_review.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/UX_source_review.json",
     "sha256": "b6d1243588641887cdb80632b286985eb6bbd4cb5c032f4b4568443142c8688d"
   },
   "base_f95_authority_review": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/authority_review.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/authority_review.json",
     "sha256": "1e1e872f25d98db457c3947fe6919993b13479bf24f9f7b125c33489c1118e1a"
   },
   "base_f95_consumer_handoff": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/consumer_handoff.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/consumer_handoff.json",
     "sha256": "4df849a52f347731c626c635909815b4b9a93e00d53a458c780491403d8742ae"
   },
   "base_f95_delivery_scope": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/delivery_scope.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/delivery_scope.json",
     "sha256": "0aa37edca542f46d862ae116553bc7e4d483988319ade491cf435ba982bd2107"
   },
   "base_f95_product_adoption": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/product_adoption.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/product_adoption.json",
     "sha256": "1510be9772e73e375bdeff0161f9e2f0ae215b05cb30d6b31182859f575ab402"
   },
   "base_f95_product_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/product_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/product_conservation.json",
     "sha256": "bc758675dcc4a05c97825a721ad36bac543f913ab2935b2cebab8295bbcc0fd8"
   },
   "base_f95_product_freeze": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/product_freeze.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/product_freeze.json",
     "sha256": "24ab6dc0d43d9ce328cf4e9cf445a9f1ea6405038a93201b175bf88d1fc84a54"
   },
   "base_f95_product_publication": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/product_publication.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/product_publication.json",
     "sha256": "b2977545645c0cf1df6fb6eb9ec40004f72d4d03432ba6d0b94d9f5701e19166"
   },
   "base_f95_reviewed_controller_handoff": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/base-f95-reviewed-controller-handoff.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/base-f95-reviewed-controller-handoff.json",
     "sha256": "438e152c1b00503e6c94c65869a8c8b2960825e95479640a39cd1d76691399b6"
   },
   "base_f95_source_binding": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/base-f95-source-binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/base-f95-source-binding.json",
     "sha256": "8cdf8e8494443080ba00dd2beacef6fac10085d53e032f2cc1b04899a8aa667f"
   },
   "base_f95_three_caller_map": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/three_caller_map.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/three_caller_map.json",
     "sha256": "cd719e229d0b1d8687157ff9fd3c25d626ae7a2e5b905d55175e33a3a87775b3"
   },
   "bb8_readonly_intake": {
     "original_path": "/var/tmp/coord16-main15-bb8-readonly-rebind-mbdk1dr_/rebind-intake.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/bb8_readonly_intake.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/bb8_readonly_intake.json",
     "sha256": "dce9494cd98907541d512c307c3bcfa2aeda542614c458d9e403fbcf39e53a9a"
   },
   "command_data": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/command-data.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/command-data.json",
     "sha256": "39bf88fd9c035450ba7e9a7cbddb4808cce8dd38389ec64a3c22a9572a3260ae"
   },
   "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
   "current_source_handoff": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-main15-operation-trait-reviewed-source-assembly-handoff-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/current_source_handoff.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/current_source_handoff.json",
     "sha256": "b76ef3abaf0188ba68578feb33aa46a14fe8e439dbf4db02bb3397ee36f014b3"
   },
   "current_source_intake": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-main15-operation-trait-single-import-source-lead-intake-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/current_source_intake.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/current_source_intake.json",
     "sha256": "1f0dc2be5b7100c2703c984b8f7e2d87eb218d818b9ed42a0acd345e719e7534"
   },
   "current_source_map": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/current-source-map.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/current-source-map.json",
     "sha256": "1dbacb38a0af685854121e3d5783afc9cd19b187798e3b0e2eea80cc6b6c0241"
   },
   "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
   "historical_bb8_authority_review": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-independent-source-review-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/authority_review.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/authority_review.json",
     "sha256": "dd632b6257efaac8ffd24d22abc2b52129dc24ec3572beaff6fe96022d2c8e8e"
   },
   "historical_bb8_current_title_handoff": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-main15-two-title-source-correction-reviewed-handoff-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/current_title_handoff.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/current_title_handoff.json",
     "sha256": "b3e3ead0f9d85260c5b2867dcbd4073c2c2825ea14c589f0489f6b4876e6227f"
   },
   "historical_bb8_late_format_binding": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-source-review-freeze-format-binding-addendum-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/late_format_binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/late_format_binding.json",
     "sha256": "a305a7d79759a33a4083104fbfa62196295d4b0f03e191426cf88d5032b76f73"
   },
   "historical_bb8_product_adoption": {
     "original_path": "/tmp/fw16-backend-ec204421/issued-return-bb8df653-title-ownership-root-source-adoption-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/product_adoption.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/product_adoption.json",
     "sha256": "81e5631986046571b2388fef51997daab6c370964a2c3463f3e61a89b0cc7a94"
   },
   "historical_bb8_product_conservation": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-independent-conservation-privacy-source-review-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/product_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/product_conservation.json",
     "sha256": "949805650285374751f4b97cb8b1d938ce29c404a10080cff0ea3b2db245bbf6"
   },
   "historical_bb8_product_freeze": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-source-freeze-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/product_freeze.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/product_freeze.json",
     "sha256": "8131db186b26ee8af54b1aa623799e224634bc095741805237adc1c631b32efa"
   },
   "historical_bb8_product_publication": {
     "original_path": "/tmp/fw16-backend-ec204421/issued-return-bb8df653-title-ownership-reviewed-source-publication-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/product_publication.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/product_publication.json",
     "sha256": "8d14ce129c0833d55f7fba198f84839cab095ae9ec8ee270c31a2e8bc1400141"
   },
   "historical_bb8_source_binding": {
     "original_controller": "1b12e9acf29502511d4511756926149282cb6cf3",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/previous-bb8-controller/source-binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/previous-bb8-controller/source-binding.json",
     "sha256": "59cddcb5a2cb10ebeaef0952da8a7787c71b3d4262f8518818123e7576dc7866"
   },
   "historical_postrun_scope_ABI_limit": "7bfc is unchanged f95/a7c8 source intake supplied POSTRUN ONLY to the original run, not retroactive archive/use/admission. New archival begins only with this successor; no HOST/current whole-stack/User credit.",
   "instruction_source": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/instruction-source.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/instruction-source.json",
     "sha256": "1b9ba5668e22b6ba8bf02e53ea2811ff0d48e75deb1528a258b9ff124b46bf8b"
   },
   "kind": "AUTHOR_ASSEMBLED_MAIN15_92B8_UI5_SOURCE_BINDING_NOT_APPROVAL",
   "original_bb8_negative_acceptance": {
     "original_path": "/tmp/fw16-backend-ec204421/main15-87dc6dc8-negative-bb8-ui5-root-acceptance-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/original_bb8_negative_acceptance.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/original_bb8_negative_acceptance.json",
     "sha256": "9475db1c02f4a18f724ecd4e0d210127b8f1fbbcea63ce4d695e07a0cba646a6"
   },
   "original_diagnostic_binding": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-diagnostic-neighbor-source-binding-addendum-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/original_diagnostic_binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/original_diagnostic_binding.json",
     "sha256": "92832731f3d2f00142e8d3473f1f85a5578c6166f5a2fa12eada0f18b265d4fe"
   },
   "original_f95_negative_acceptance": {
     "original_path": "/tmp/fw16-backend-ec204421/main15-8e36e360-negative-ui5-root-acceptance-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/original_f95_negative_acceptance.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/bb8/original_f95_negative_acceptance.json",
     "sha256": "5e90f51b2a915f9ea32c748ee624d972e41279ea7746a15a5f2fadceb3d14a60"
   },
   "original_format_gap": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-official-formatter-physical-toolchain-gap-addendum-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/original_format_gap.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/original_format_gap.json",
     "sha256": "69fe55e3b145b27d61379dc10321983bf0d7bf49b07b04c075adf5b30d3176a7"
   },
   "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
   "physical_format_binding": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-physical-rust193-official-format-check-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/physical_format_binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/physical_format_binding.json",
     "sha256": "4dab228c1f2406792174e942b0953cfb0d07055548166578d447eb35413f0a0d"
   },
+  "prior_blocked_controller_history": {
+    "head": "35c4996c56e5005bb94043489f7f169d213bbc86",
+    "independent_HOST_review_claimed": false,
+    "inputs": [
+      {
+        "bytes": 7781,
+        "original_path": "/tmp/held-saved-scope-fw16-evidence/35c4996c-ui5-92b8-controller-source-freeze-v1.json",
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/prior-blocked-controller/author-freeze.json",
+        "scope": "Immutable blocked-source history only; not current review or execution evidence.",
+        "sha256": "138cecc2c3519094d4d54242150ed3eba3b83506821e40f5dedbd2f7b167f9c4"
+      },
+      {
+        "bytes": 13220,
+        "original_path": "/tmp/held-saved-scope-fw16-evidence/35c4996c-ui5-92b8-independent-semantic-caller-ABI-source-review-v1.json",
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/prior-blocked-controller/semantic-ABI-negative.json",
+        "scope": "Immutable blocked-source history only; not current review or execution evidence.",
+        "sha256": "510b6abf49496f86638c9f99ea696c41e4454d6910cdeb20679094da264e2dcd"
+      },
+      {
+        "bytes": 13970,
+        "original_path": "/tmp/held-saved-scope-fw16-evidence/35c4996c-ui5-independent-conservation-source-review-v1.json",
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/prior-blocked-controller/conservation-negative.json",
+        "scope": "Immutable blocked-source history only; not current review or execution evidence.",
+        "sha256": "2b6d4e200cdb41074d16abef6508877fa0225fb170a837ec9283ece55c4415b5"
+      }
+    ],
+    "qualification_transfer": false
+  },
   "prior_ca_additive_hold": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/prior_ca_additive_hold.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/prior_ca_additive_hold.json",
     "sha256": "a32b9501efcfc05ba117cd89f10d903a02434943ce0ac5d70440b7ea69767ef9"
   },
   "prior_ca_author_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/prior_ca_author_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/prior_ca_author_conservation.json",
     "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd"
   },
   "prior_ca_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/prior_ca_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/prior_ca_conservation.json",
     "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d"
   },
   "prior_ca_task_hold": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/prior_ca_task_hold.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/canonical/prior_ca_task_hold.json",
     "sha256": "e342ee5b3258889e2f258433b7cf3a47614d79e340a4313e678060b99bf53560"
   },
   "product_adoption": {
     "original_path": "/tmp/fw16-backend-ec204421/main15-92b8-single-import-root-source-adoption-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/product_adoption.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/product_adoption.json",
     "sha256": "0bd78745ea46c83ba62cdd8d84efc5076a3713aa1ad4651fab3137b46e7e2195"
   },
   "product_conservation": {
     "original_path": "/tmp/main15-92b8-import-conservation-hwrwp28k/review.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/product_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/product_conservation.json",
     "sha256": "44daf3c9ac1f71d6a4b062e56e331077eb09cf2bc9c79a8c769ec35585352a4d"
   },
   "product_freeze": {
     "original_path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-single-import-source-freeze-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/product_freeze.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/product_freeze.json",
     "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd"
   },
   "product_pr": null,
   "product_publication": {
     "original_path": "/tmp/fw16-backend-ec204421/main15-92b8-reviewed-single-import-source-publication-v1.json",
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/product_publication.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/product_publication.json",
     "sha256": "1560ced27039fb2f3fc5f9fb7ed3390953bd492ad417fc3a8ece9a006e7fd59b"
   },
   "readonly_author_intake": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/readonly_author_intake.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/dependencies/source-proofs/readonly_author_intake.json",
     "sha256": "136055fab971f1809447a47ddb8448b46228a038f4e6da36c96fc9159ff8b62f"
   },
   "reconciliation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/reconciliation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/reconciliation.json",
     "sha256": "f00abfbd7c06e04194afe9001ae28c7a5cea54f570c40c4479dc1d3c6160f33e"
   },
   "runtime_admission": {
@@ -279,7 +307,7 @@
     "state": "MAIN15_92B8_UI5_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT"
   },
   "selected_source_contract": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/selected-source-contract.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/selected-source-contract.json",
     "sha256": "67790ccf337335ec4972be28b684b7d4012b8caf2d211093c7104bf7fd05b1ba"
   },
   "source_paths_sha256": {

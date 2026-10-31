@@ -1,0 +1,163 @@
+{
+  "kind": "fresh-current-92b8-ui5-controller-author-source-freeze-v1",
+  "status": "FROZEN_SOURCE_FOR_INDEPENDENT_REVIEW_NOT_ADOPTED_OR_QUEUEABLE",
+  "created_utc": "2026-10-31T19:49:34.575470+00:00",
+  "controller": {
+    "head": "35c4996c56e5005bb94043489f7f169d213bbc86",
+    "tree": "5f6aa082fc3f18bbdaff08fc8c46347ebbd9a77e",
+    "parent": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "branch": "qual/fw16-return-ui5-92b8-source-main15",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15",
+    "packet": "qualification-packets/main15-92b8-ui5",
+    "tracked_clean": true,
+    "ancestry": "Direct product92b8 child, not an old-controller descendant or retarget."
+  },
+  "product": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+  },
+  "original_controller": {
+    "head": "1b12e9acf29502511d4511756926149282cb6cf3",
+    "tree": "e2f977ef500b735c67477ee7229a4f0d3e1ab78a",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-ui5-abi-source",
+    "packet": "qualification-packets/main15-bb8-ui5",
+    "unchanged": true
+  },
+  "pins": {
+    "run-packet.py": {
+      "sha256": "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567",
+      "bytes": 105486
+    },
+    "plan.json": {
+      "sha256": "5661c18d1df133528903bee37b2c69c5fffc63234a7b1c43e2843817890308e3",
+      "bytes": 56587
+    },
+    "manifest.json": {
+      "sha256": "3da69fe090824a286c68360c8f7e697fde46e0cd9c627d34c1ac18474b45ebba",
+      "bytes": 26446
+    },
+    "source-binding.json": {
+      "sha256": "9a9b5a6e0b144ba9fd8e35bdd0e4718424911dd6d3f35ac07ad7cbb70f965e9e",
+      "bytes": 26626
+    },
+    "source-conservation.json": {
+      "sha256": "13a3ccc954f396a8d7b1f2ebdc8486d1fa1d94bb6c57d99f1359c54a88f4829d",
+      "bytes": 5641
+    },
+    "current-source-map.json": {
+      "sha256": "1dbacb38a0af685854121e3d5783afc9cd19b187798e3b0e2eea80cc6b6c0241",
+      "bytes": 10924
+    },
+    "selected-source-contract.json": {
+      "sha256": "67790ccf337335ec4972be28b684b7d4012b8caf2d211093c7104bf7fd05b1ba",
+      "bytes": 3307
+    },
+    "invocation-template.json": {
+      "sha256": "a1847b04aaf062b24b6cb0b9886923a3c1ccbefa69ba5349f2df4e1002a753fe",
+      "bytes": 840
+    }
+  },
+  "product_tree_conservation": {
+    "all_original_product_entries_exact_mode_type_blob": 2231,
+    "only_added_controller_packet_paths": 145,
+    "no_product_entry_removed_or_modified": true
+  },
+  "source_conservation": {
+    "other_top_level_functions_exact": 31,
+    "nested_definitions_exact": 7,
+    "canonical9004_exact": true,
+    "FULL3790_exact": true,
+    "FULL3790_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "only_main_task_source_binding_segment_and_allowed_literals_changed": true,
+    "main_generic_execution_tail_exact_except_allowed_output_prefix_and_qualified_scope": true,
+    "original_prologue_hard_refusal_read_bound_canonical_island_command_contract_island_preserved": true,
+    "TARGET_LOCK_TOOL_and_caps_unchanged": true,
+    "runner_exact_diff": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/35c4996c-ui5-92b8-task-binding-exact-runner-diff-v1.patch",
+      "sha256": "df7fc3910317f9bed99067c7e62635f190961a1f42d1fc0f6707c5eea7400de3",
+      "bytes": 26221,
+      "mode": "0444"
+    },
+    "complete_inverse_and_hash_ledger": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/35c4996c-ui5-92b8-payload-inverse-and-conservation-v1.json",
+      "sha256": "c82d240698327275617b398d0a7503bee8336e8df6b9cbf620fb7f4fd51392ca",
+      "bytes": 57052,
+      "mode": "0444"
+    }
+  },
+  "metadata": {
+    "current_invocation_review_ABI_product_equals_plan": true,
+    "nested_selected_caller_contract_equals_standalone": true,
+    "fail_closed_equality_guard_present": true,
+    "current_source_map_total": 44,
+    "other_unchanged_source_pins": 43,
+    "old_manifest_files": 121,
+    "old_payloads": 120,
+    "old_runtime_archive_refs": 104,
+    "new_manifest_files": 145,
+    "new_payloads": 144,
+    "new_runtime_archive_refs": 127,
+    "runtime_archive_is_not_entire_manifest": true,
+    "current_receipt_shapes": "Genuine92b8 freeze/semantic/conservation/assembly/formatter/adoption/publication validated, flat current receipt tuples used; no fake product.worktree/branch fields. Current freeze.before binds immediate BB8cab7, afterd4e; f95base35c remains historical.",
+    "history": "Old BB8/f95 receipt bytes/NULLs/outcomes/source proofs remain exact archived history; acceptedBB8negative9475 included. Original formattergap69fe separate from fresh explicit physical193 formatter4dab."
+  },
+  "commands": {
+    "serial_count": 9,
+    "caps_sum_seconds": 2130,
+    "workload_seconds": 2400,
+    "jobs": 2,
+    "default_outer_scheduler_and_capture": true,
+    "selected_names": [
+      "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+      "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+      "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+      "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+      "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+    ],
+    "singleton_result_contract": "Original1P0F0I0M,N-1; actual CargoJSON/same-root ELF/hash and inventoryN remain FUTURE only.",
+    "separate_source_DATA_reservations": "Preserved original source-only reconciliation, not added invocation/deadline/wait claims."
+  },
+  "source_only_checks": [
+    {
+      "operation": "Author AST/JSON parse, actual source/header/mode/hash and manifest/runtime archive checks",
+      "exit": 0,
+      "execution": "No candidate/module/runner/helper/test imported or evaluated."
+    },
+    {
+      "operation": "Exact old payload/runner forward inverse and all protected function/island/block comparisons",
+      "exit": 0
+    },
+    {
+      "operation": "git staged diff --check",
+      "exit": 0,
+      "tool_chunk": "UI5 static/staged check prior commit"
+    },
+    {
+      "operation": "Private source commit",
+      "exit": 0,
+      "note": "Hooks/signing disabled; no identity changes, old source refs/WTs untouched."
+    }
+  ],
+  "limits": [
+    "No runner/helper/module/app/Task evaluation, Cargo/check/build/test/native/provider or environment/account/authority/process/resource/cache/target probe; no network/publication/queue/new worker.",
+    "Data source path/tool/hash declarations are immutable source facts only, not current availability/warmth/context observations or grants.",
+    "No old grant/pass/N/ELF/result transfer. Fresh current grant/controller-review/ELF/N/results remainNULL.",
+    "Physical retained helper remains deferred/unselected. Native/genuineUser5/FULL52/whole-product/full inherited-stack outcomes remainUNQUALIFIED.",
+    "31 other functions and7 nested are conserved; main current source-schema assertion segment necessarily changes and is not mislabeled32-exact. Source integrity added one nested==standalone equality guard.",
+    "Root/EC own independent source review/adoption/publication and later exact controller binding/grants. This author receipt is not independent approval."
+  ],
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "grant": null,
+  "controller_review": null,
+  "execution_authorized": false,
+  "queueable": false
+}

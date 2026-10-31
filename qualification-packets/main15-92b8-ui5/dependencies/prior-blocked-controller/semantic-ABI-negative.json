@@ -1,0 +1,231 @@
+{
+  "actual": {
+    "ELF": null,
+    "caller_context": null,
+    "execution_authorized": false,
+    "grant": null,
+    "inventory_N": null,
+    "native": null,
+    "queued": false,
+    "results": null
+  },
+  "author_freeze": {
+    "bytes": 7781,
+    "mode": "0o444",
+    "path": "/tmp/held-saved-scope-fw16-evidence/35c4996c-ui5-92b8-controller-source-freeze-v1.json",
+    "sha256": "138cecc2c3519094d4d54242150ed3eba3b83506821e40f5dedbd2f7b167f9c4"
+  },
+  "bounded_checks": {
+    "caller_and_selection": {
+      "all_actual_caller_runtime_null": true,
+      "all_expected_child_results_zero": true,
+      "all_rows_ordinary_inherited_Agent_source_class": true,
+      "current_source_hash_all_rows": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+      "fail_closed_guard_at": "run-packet.py:1138",
+      "graphs": [
+        "ui"
+      ],
+      "nested_contract_exact_standalone": true,
+      "owning_max": 5,
+      "scope": "Same previously source-reviewed ordinary five UI component parents. Operation trait import source proof preserves caller/UX behavior; no genuine User wrapper or physical retained helper is selected. Task-only-widget focus exception and synthetic typed/barrier limitations remain explicit. No fresh caller environment or actual test inventory was observed.",
+      "selectors": [
+        "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+        "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+        "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+        "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+        "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+      ]
+    },
+    "core_conservation": {
+      "canonical_settler_bytes": 877,
+      "canonical_settler_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+      "generic_main_execution_tail": "Byte-identical after normalizing only allowed output-directory prefix and qualified_scope label. Source admission additions stay before that boundary. Thus no new execution/custody/parser/inventory/deadline/finalizer logic was introduced. FULL3790 donor core remains within that conserved tail; its frozen provenance is not current runtime evidence.",
+      "nested_definitions_AST_identical": 7,
+      "only_changed_top_function": "main",
+      "other_top_functions_byte_identical": 31,
+      "top_functions_total": 32
+    },
+    "current_product_source": {
+      "all44_pins_and_product_source_copies_equal_immutable92b": true,
+      "hash_roles": "Current92b chat_ui d4e2bc...; immediate BB8 parent cab7a8...; earlier f95 base35c465... kept separate by the new admission code at949\u2013956/1038\u20131039. No historical result transfer.",
+      "other_source_pins_unchanged_vs_bb8_and_f95": 43,
+      "product_tuple": [
+        "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+        "c0c42d3153033da826b05736673b38e57449bee4",
+        "bb8df65354297c99228c6ff4f1aef75e9ae79b23"
+      ],
+      "runner_plan_binding_source_map_and_standalone_product_consistent": true,
+      "source_pins": 44,
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+    },
+    "runtime_ABI": {
+      "important_limit": "This receipt deliberately has verdict BLOCKED_SOURCE_REVIEW and cannot satisfy validate_controller_review. Required external head/tree denote PRODUCT identity, distinct from controller_head/controller_tree. A future genuine independent receipt is an external postcommit input; neither embedded source binding nor manifest author claims are runtime approval.",
+      "invocation_template": {
+        "argv": [
+          "/usr/bin/python3",
+          "-I",
+          "-B",
+          "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/run-packet.py",
+          "--grant",
+          null,
+          "--runner-sha256",
+          "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567",
+          "--controller-review",
+          null,
+          "--controller-review-sha256",
+          null
+        ],
+        "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15",
+        "execution_authorized": false,
+        "kind": "NOT_SUBMITTABLE_PRE_REVIEW_SOURCE_TEMPLATE",
+        "review_ABI": {
+          "controller_identity": "EXTERNAL_POSTCOMMIT",
+          "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+          "review": "PENDING_GENUINE_FROZEN_CODE_REVIEW",
+          "tree": "c0c42d3153033da826b05736673b38e57449bee4"
+        }
+      },
+      "null_argv_positions": [
+        5,
+        9,
+        11
+      ],
+      "required_external_fields": {
+        "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+        "plan_sha256": "5661c18d1df133528903bee37b2c69c5fffc63234a7b1c43e2843817890308e3",
+        "runner_sha256": "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567",
+        "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+        "verdict": "CONTROLLER_SOURCE_CLEAR"
+      },
+      "unchanged_validator_sha256": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad",
+      "validator_at": "run-packet.py:362"
+    },
+    "source_and_archive_conservation": {
+      "all_eight_author_freeze_pins_verified_against_immutable_git": true,
+      "historical_truth": "Old BB8/f95 source receipts, NULLs and validation remain historical. Accepted BB8 negative9475 and original format gap69fe are separately archived; 4dab physical193 formatting remains a separate source-only check, not a Rust/native test pass.",
+      "manifest_payloads_verified": 144,
+      "old_dependency_files_byte_preserved": 56,
+      "old_manifest_counts": "121/120/104 retained only as history, not current counts",
+      "runtime_archive_not_entire_manifest": true,
+      "runtime_archive_refs_verified": 127,
+      "tracked_packet_files": 145
+    },
+    "strict_outcome_and_budgets": {
+      "caps": [
+        300,
+        450,
+        900,
+        30,
+        90,
+        90,
+        90,
+        90,
+        90
+      ],
+      "default_capture_and_outer_scheduler": true,
+      "inventory": "Original Cargo JSON identifies exact same-root ui-lib ELF; --list --color=never inventory provides fresh N with each selected full name exactly once. No cached or source-predicted N substitutes.",
+      "jobs": 2,
+      "not_selected": "Deferred host::chat::retained_actor_tests::retained_terminal_handoff_proves_original_console_cleanup and genuine User5 remain outside this packet. HOST19/2250 and separately declared DATA30+60 reserves remain metadata for the separate HOST packet, not new UI commands or finalization bounds.",
+      "packet_deadline_seconds": 2400,
+      "parent": "Each exact original captured stdout must have running1, exact namedok, one1P0F0I0M summary with fresh N-1 filtered. Nested assertions/helpers/focus/fixture processes are nonadditive. Parent parser269\u2013313 and execute_contracts565\u2013652 are byte-identical.",
+      "phase_caps_sum_seconds": 2130,
+      "serial_phase_count": 9
+    }
+  },
+  "controller_head": "35c4996c56e5005bb94043489f7f169d213bbc86",
+  "controller_parent": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "controller_tree": "5f6aa082fc3f18bbdaff08fc8c46347ebbd9a77e",
+  "controller_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15",
+  "created_utc": "2026-10-31T19:53:04.810260+00:00",
+  "file_pins": {
+    "current-source-map.json": {
+      "bytes": 10924,
+      "git_blob": "f265069ba12eada0a358fce74f5c6e426c8bb96e",
+      "sha256": "1dbacb38a0af685854121e3d5783afc9cd19b187798e3b0e2eea80cc6b6c0241"
+    },
+    "invocation-template.json": {
+      "bytes": 840,
+      "git_blob": "9f86823837329d6b302a288f2936538922cac60b",
+      "sha256": "a1847b04aaf062b24b6cb0b9886923a3c1ccbefa69ba5349f2df4e1002a753fe"
+    },
+    "manifest.json": {
+      "bytes": 26446,
+      "git_blob": "9dd7129f982f1e3e8e08fc7fe7b92f9e8a678ee7",
+      "sha256": "3da69fe090824a286c68360c8f7e697fde46e0cd9c627d34c1ac18474b45ebba"
+    },
+    "plan.json": {
+      "bytes": 56587,
+      "git_blob": "e644e032ea53447b4ee288ea085736c02a0204d1",
+      "sha256": "5661c18d1df133528903bee37b2c69c5fffc63234a7b1c43e2843817890308e3"
+    },
+    "run-packet.py": {
+      "bytes": 105486,
+      "git_blob": "662a7b9f1420b2b56c146b03ba0cb4b7046f7cf1",
+      "sha256": "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567"
+    },
+    "selected-source-contract.json": {
+      "bytes": 3307,
+      "git_blob": "66b18b99d0a53d9e16ee4fe7b392151b5ca17f99",
+      "sha256": "67790ccf337335ec4972be28b684b7d4012b8caf2d211093c7104bf7fd05b1ba"
+    },
+    "source-binding.json": {
+      "bytes": 26626,
+      "git_blob": "42323720387a644af85bca55b52f4a77c40ec334",
+      "sha256": "9a9b5a6e0b144ba9fd8e35bdd0e4718424911dd6d3f35ac07ad7cbb70f965e9e"
+    },
+    "source-conservation.json": {
+      "bytes": 5641,
+      "git_blob": "f5bad7530ae7aced109584663921237438bc8957",
+      "sha256": "13a3ccc954f396a8d7b1f2ebdc8486d1fa1d94bb6c57d99f1359c54a88f4829d"
+    }
+  },
+  "finding": {
+    "at": "qualification-packets/main15-92b8-ui5/run-packet.py:988",
+    "bound_historical_receipt": {
+      "absent_key": "bb8_identity",
+      "actual_identity": {
+        "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+        "observed_HEAD_tree_match": true,
+        "observed_branch": "fix/fw16-return-title-ownership-main15",
+        "parent_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+        "raw_diff": {
+          "new_blob": "8aded4804a4055f04fadba8054fd26e42eeeba75",
+          "new_mode": "100644",
+          "old_blob": "77681ebe5c3050ab212be626ed487e0d63618ba9",
+          "old_mode": "100644",
+          "path": "src/app/chat_ui.rs",
+          "status": "M"
+        },
+        "sole_parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+        "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+        "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15"
+      },
+      "actual_key": "identity",
+      "packet_path": "qualification-packets/main15-92b8-ui5/dependencies/bb8/product_conservation.json",
+      "sha256": "949805650285374751f4b97cb8b1d938ce29c404a10080cff0ea3b2db245bbf6"
+    },
+    "causal_failure": "The source earlier reads this unchanged94980565 receipt through historical_bb8_product_conservation. On reaching line988 after valid upstream source checks, Python would subscript an absent key and raise KeyError before external controller review, lane lock or workload. No runner or function was evaluated to establish this source failure.",
+    "classification": "A concrete schema/admission defect, not an observed execution, authority bypass, physical cleanup failure or new product issue.",
+    "id": "UI5-92B8-ABI-01",
+    "minimal_correction": "Use the receipt literal key identity for its head/tree/sole_parent values and compare against the local bb8_identity variable. Preserve the historical JSON bytes and all validation. Freeze a new exact successor with regenerated runner/plan/manifest/hash bindings before any independent clear.",
+    "severity": "BLOCKER_SOURCE_ADMISSION",
+    "source_expression": "(current_conservation['bb8_identity']['head'], current_conservation['bb8_identity']['tree'], current_conservation['bb8_identity']['sole_parent']) == bb8_identity",
+    "title": "Historical JSON identity key accidentally changed to local variable name"
+  },
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "kind": "main15-ui5-controller-independent-semantic-caller-ABI-source-review-v1",
+  "limits": {
+    "admission": "Source blocked; no grant/queue/adoption/publication/merge or result transfer. User5/FULL52/native/WHOLE/qclosed/general remain HOLD. PR1933 NEVER_MERGE.",
+    "methods": "Immutable git/source/AST/JSON/hash only. Static literal JSON-key census found this absent key; no candidate assertion/function/module/helper or runner execution/import/eval. No Cargo/rustc/build/test/native/API, authority/env/process/resource/cache/target/account probes or new worker.",
+    "review": "Only exact UI5 controller semantic/caller/source ABI and finite source conservation joins. HOST moving candidate, startup47/whole product guards, physical APIs/providers and original RAW were not reviewed.",
+    "sole_write": "This exclusive0444 external independent source/ABI receipt."
+  },
+  "manifest_sha256": "3da69fe090824a286c68360c8f7e697fde46e0cd9c627d34c1ac18474b45ebba",
+  "packet_path": "qualification-packets/main15-92b8-ui5",
+  "plan_sha256": "5661c18d1df133528903bee37b2c69c5fffc63234a7b1c43e2843817890308e3",
+  "reviewer": "/root/authority_regressions",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/run-packet.py",
+  "runner_sha256": "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567",
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "verdict": "BLOCKED_SOURCE_REVIEW"
+}

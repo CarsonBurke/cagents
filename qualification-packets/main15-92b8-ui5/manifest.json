@@ -4,16 +4,16 @@
   "controller_identity": "EXTERNAL_POSTCOMMIT",
   "controller_review": null,
   "execution_authorized": false,
-  "file_count_including_manifest": 145,
+  "file_count_including_manifest": 148,
   "grant": null,
-  "hashed_payload_count": 144,
+  "hashed_payload_count": 147,
   "kind": "FROZEN_SOURCE_PAYLOAD_INDEX_SELF_EXCLUDED_NOT_ADMISSION",
   "limits": "Author source index only; current exact frozen controller requires separate genuine code/conservation review and a fresh grant. No source result or whole inherited stack qualification.",
   "members": [
     {
-      "bytes": 2417,
+      "bytes": 2929,
       "path": "README.md",
-      "sha256": "418155bf56759d9f7fe27d05e666a4cc4b251a90143e8442f3a1322ba604b22d"
+      "sha256": "ba24a336bde6f98b32e7f3c98ecde8a342ec11a60defd5c93c618ba376357f2d"
     },
     {
       "bytes": 8003,
@@ -346,6 +346,21 @@
       "sha256": "86a538f3d51dbf50203190ceebbb9f72fa688f25117ac2f00feaecdc792804ec"
     },
     {
+      "bytes": 7781,
+      "path": "dependencies/prior-blocked-controller/author-freeze.json",
+      "sha256": "138cecc2c3519094d4d54242150ed3eba3b83506821e40f5dedbd2f7b167f9c4"
+    },
+    {
+      "bytes": 13970,
+      "path": "dependencies/prior-blocked-controller/conservation-negative.json",
+      "sha256": "2b6d4e200cdb41074d16abef6508877fa0225fb170a837ec9283ece55c4415b5"
+    },
+    {
+      "bytes": 13220,
+      "path": "dependencies/prior-blocked-controller/semantic-ABI-negative.json",
+      "sha256": "510b6abf49496f86638c9f99ea696c41e4454d6910cdeb20679094da264e2dcd"
+    },
+    {
       "bytes": 22488,
       "path": "dependencies/source-proofs/API_inherited_physical_review.json",
       "sha256": "7ffd6b69f603c73edf13350926d6d87932bae550369d6383a6926591be759ee0"
@@ -451,9 +466,9 @@
       "sha256": "1b9ba5668e22b6ba8bf02e53ea2811ff0d48e75deb1528a258b9ff124b46bf8b"
     },
     {
-      "bytes": 840,
+      "bytes": 844,
       "path": "invocation-template.json",
-      "sha256": "a1847b04aaf062b24b6cb0b9886923a3c1ccbefa69ba5349f2df4e1002a753fe"
+      "sha256": "53a82f3f2d80d88f60689018032379e2baa0441d4b5ac4e824e8257085ffd0df"
     },
     {
       "bytes": 180142,
@@ -461,9 +476,9 @@
       "sha256": "39068229265b0258b627902674a5e7d61a60c4de12701bb5ba80c3d4960aada6"
     },
     {
-      "bytes": 56587,
+      "bytes": 58044,
       "path": "plan.json",
-      "sha256": "5661c18d1df133528903bee37b2c69c5fffc63234a7b1c43e2843817890308e3"
+      "sha256": "d13d5ea7a3e07d92233cac082655d05b23769b3d809ba9100a79e7ed891525b0"
     },
     {
       "bytes": 412,
@@ -691,9 +706,9 @@
       "sha256": "f00abfbd7c06e04194afe9001ae28c7a5cea54f570c40c4479dc1d3c6160f33e"
     },
     {
-      "bytes": 105486,
+      "bytes": 105485,
       "path": "run-packet.py",
-      "sha256": "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567"
+      "sha256": "31318c0ce5410967dc7561bb7241c86e91097e7823f6ca9d580a696d68ea7988"
     },
     {
       "bytes": 3307,
@@ -701,14 +716,14 @@
       "sha256": "67790ccf337335ec4972be28b684b7d4012b8caf2d211093c7104bf7fd05b1ba"
     },
     {
-      "bytes": 26626,
+      "bytes": 28634,
       "path": "source-binding.json",
-      "sha256": "9a9b5a6e0b144ba9fd8e35bdd0e4718424911dd6d3f35ac07ad7cbb70f965e9e"
+      "sha256": "5f8d0b256b825a48c2668189b89ec73023226eeb5ae15dd4f4252d1819512b23"
     },
     {
-      "bytes": 5641,
+      "bytes": 8052,
       "path": "source-conservation.json",
-      "sha256": "13a3ccc954f396a8d7b1f2ebdc8486d1fa1d94bb6c57d99f1359c54a88f4829d"
+      "sha256": "bd34fa807dad139f28eb84c129d94a8f78143364a859ddc3e6045090df011f40"
     },
     {
       "bytes": 197734,

@@ -1,0 +1,274 @@
+{
+  "kind": "UI5_35C4996C_INDEPENDENT_CONTROLLER_CONSERVATION_SOURCE_REVIEW",
+  "reviewer": "/root/async_races",
+  "verdict": "BLOCKED_SOURCE_HISTORICAL_RECEIPT_KEY_MISMATCH; CONTROLLER_UNRUN_NOT_ADOPTABLE",
+  "scope": "Frozen UI5 only. Bounded runner/source-data conservation, actual packet/manifests/archives/inverse, product outside-packet identity and source-provenance shape. No runtime caller/authority semantic approval, product/core/whole55/native or moving HOST/startup review.",
+  "controller": {
+    "head": "35c4996c56e5005bb94043489f7f169d213bbc86",
+    "tree": "5f6aa082fc3f18bbdaff08fc8c46347ebbd9a77e",
+    "sole_parent": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15",
+    "branch": "qual/fw16-return-ui5-92b8-source-main15",
+    "packet": "qualification-packets/main15-92b8-ui5",
+    "observed_HEAD_tree_branch_match": true
+  },
+  "product": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23"
+  },
+  "baseline": {
+    "head": "1b12e9acf29502511d4511756926149282cb6cf3",
+    "tree": "e2f977ef500b735c67477ee7229a4f0d3e1ab78a",
+    "packet": "qualification-packets/main15-bb8-ui5",
+    "runner_sha256": "ce31b5d5864098da4df423b100a22dc5c0e3d8441ad8ace35ac41cc97d055915",
+    "runner_bytes": 97406,
+    "relation": "Historical immutable source comparison only. New controller is a direct product92b8 child; old-controller ancestry is neither required nor asserted."
+  },
+  "freeze": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/35c4996c-ui5-92b8-controller-source-freeze-v1.json",
+    "sha256": "138cecc2c3519094d4d54242150ed3eba3b83506821e40f5dedbd2f7b167f9c4",
+    "bytes": 7781,
+    "mode": "0444",
+    "hash_size_match": true,
+    "role": "Author source observations; independent review below finds an actual historical receipt shape blocker."
+  },
+  "pins": {
+    "run-packet.py": {
+      "bytes": 105486,
+      "sha256": "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567"
+    },
+    "plan.json": {
+      "bytes": 56587,
+      "sha256": "5661c18d1df133528903bee37b2c69c5fffc63234a7b1c43e2843817890308e3"
+    },
+    "manifest.json": {
+      "bytes": 26446,
+      "sha256": "3da69fe090824a286c68360c8f7e697fde46e0cd9c627d34c1ac18474b45ebba"
+    },
+    "source-conservation.json": {
+      "bytes": 5641,
+      "sha256": "13a3ccc954f396a8d7b1f2ebdc8486d1fa1d94bb6c57d99f1359c54a88f4829d"
+    },
+    "source-binding.json": {
+      "bytes": 26626,
+      "sha256": "9a9b5a6e0b144ba9fd8e35bdd0e4718424911dd6d3f35ac07ad7cbb70f965e9e"
+    },
+    "current-source-map.json": {
+      "bytes": 10924,
+      "sha256": "1dbacb38a0af685854121e3d5783afc9cd19b187798e3b0e2eea80cc6b6c0241"
+    },
+    "command-data.json": {
+      "bytes": 8003,
+      "sha256": "39bf88fd9c035450ba7e9a7cbddb4808cce8dd38389ec64a3c22a9572a3260ae"
+    },
+    "reconciliation.json": {
+      "bytes": 2742,
+      "sha256": "f00abfbd7c06e04194afe9001ae28c7a5cea54f570c40c4479dc1d3c6160f33e"
+    },
+    "selected-source-contract.json": {
+      "bytes": 3307,
+      "sha256": "67790ccf337335ec4972be28b684b7d4012b8caf2d211093c7104bf7fd05b1ba"
+    },
+    "invocation-template.json": {
+      "bytes": 840,
+      "sha256": "a1847b04aaf062b24b6cb0b9886923a3c1ccbefa69ba5349f2df4e1002a753fe"
+    }
+  },
+  "findings": [
+    {
+      "id": "UI5-CONSERVATION-HISTORICAL-SHAPE-1",
+      "severity": "BLOCKER",
+      "refs": [
+        "qualification-packets/main15-92b8-ui5/run-packet.py:988",
+        "qualification-packets/main15-92b8-ui5/dependencies/bb8/product_conservation.json",
+        "qualification-packets/main15-92b8-ui5/source-binding.json:historical_bb8_product_conservation"
+      ],
+      "cause": "The rewritten historical BB8 comparison uses current_conservation['bb8_identity']['head'/'tree'/'sole_parent']. The unchanged original receipt has top-level identity, not bb8_identity. The local tuple variable is correctly named bb8_identity, but that does not rename the archived JSON key.",
+      "bound_receipt": {
+        "path": "dependencies/bb8/product_conservation.json",
+        "sha256": "949805650285374751f4b97cb8b1d938ce29c404a10080cff0ea3b2db245bbf6",
+        "hash_match": true,
+        "existing_key": "identity",
+        "nonexistent_key": "bb8_identity",
+        "actual_tuple": {
+          "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+          "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+          "sole_parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3"
+        }
+      },
+      "source_consequence": "With these supplied hash-bound bytes, indexing the nonexistent key raises KeyError in source admission before output/target validation, lane lock or compilation. This is a source-shaped deterministic preflight blocker, not an observed failed run.",
+      "minimal_correction": "In that one assertion, restore the three archived receipt lookups to current_conservation['identity'][...], comparing the resulting tuple to the local bb8_identity variable. Do not rename/rewrite the original receipt or relax the exact identity/hash check. Use an immutable successor and preserve this negative source receipt.",
+      "qualification": "Actual candidate execution remains UNRUN; no call/import/evaluation was used to find the mismatch."
+    }
+  ],
+  "independent_conservation": {
+    "product_and_packet": {
+      "product_entries": 2231,
+      "outside_packet_entries_exact_product_mode_type_blob": 2231,
+      "added_packet_entries": 145,
+      "no_product_entry_removed_modified_or_retyped": true
+    },
+    "runner": {
+      "top_level_definitions": 32,
+      "other31_byte_and_AST_exact": true,
+      "nested_definitions": 7,
+      "all7_byte_and_AST_exact": true,
+      "only_changed_function": "main",
+      "canonical_settle_children": {
+        "name": "settle_children",
+        "line": 223,
+        "end": 244,
+        "bytes": 877,
+        "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+        "ast_sha256": "5c7b33e3e38227d91f7b184483408c3a6fea4066f15ee5793d3a0a8b8ee9d304"
+      },
+      "FULL3790": [
+        {
+          "line": 1417,
+          "offset": 96926,
+          "bytes": 3790,
+          "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4"
+        }
+      ],
+      "execution_tail": true,
+      "canonical_assertion_island": true,
+      "command_contract_island": true
+    },
+    "allowed_envelope": "WT/PLAN/PLAN_SHA and current source/receipt joins adapt to92b8; runtime-admission label/output prefix/qualified_scope identify92b8 with all unqualified qualifiers retained. TARGET/LOCK/TOOL, actual captured context, strict parsers, fixed selected parents/default scheduler/argv, deadlines and generic execution/custody/finalizer machinery remain exact. This envelope permits honest source rebinding, not the incorrect historical key.",
+    "caller_integrity_guard": {
+      "source": "assert source_map['selected_caller_source_contract'] == selected_source",
+      "present_once_in_source_binding_segment": true,
+      "actual_current_nested_object_equals_standalone": true,
+      "limit": "Source-data equality only; no actual caller observation, capability or runtime approval."
+    },
+    "plan_contract": {
+      "binary_checks_exact_baseline": true,
+      "artifact_group_graph_selectors_timeouts_exact_baseline": true,
+      "parent_count": 5,
+      "phase_count": 9,
+      "phase_cap_sum_seconds": 2130,
+      "packet_deadline_seconds": 2400,
+      "required_natural_absent_names_exact_baseline": true,
+      "physical_helper_selected": false
+    },
+    "source_snapshots": {
+      "pins_verified": 44,
+      "unchanged_other_pins": 43,
+      "current_chat_ui_sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+      "all_44_product_source_bytes_equal_immutable92b8": true,
+      "all_source_map_binding_plan_pin_maps_equal": true
+    },
+    "counts_and_custody": "Fresh actual Cargo JSON/ELF/inventoryN/results remain absent. The singleton parser still requires one exact name and original1P0F0I0M/N-1, without nested child credit. Canonical9004 remains natural-only3-second grace and unsignaled unknown-descendant C/HOLD; FULL3790/direct-child wait/pidfd/cleanup/release policy is unchanged. No release or qualification is inferred from source equality."
+  },
+  "archive_and_inverse": {
+    "manifest": {
+      "actual_packet_entries": 145,
+      "declared_file_count": 145,
+      "nonself_payload_members": 144,
+      "all_exact_membership_sizes_sha256_verified": true,
+      "self_index_excluded": "manifest.json"
+    },
+    "runtime_archive": {
+      "binding_count": 127,
+      "distinct_archive_names": true,
+      "all_referenced_packet_bytes_hash_match": true,
+      "not_entire_manifest": true
+    },
+    "source_binding_refs": {
+      "count": 57,
+      "all_packet_local_hash_bound_ref_bytes_match": true
+    },
+    "historical_packet_reconstruction": {
+      "old_file_count": 121,
+      "old_payload_count": 120,
+      "old_runtime_bindings": 104,
+      "unchanged_in_place": 109,
+      "previous_bb8_archive_copies": 12,
+      "all_old_entries_bytes_modes_types_blobs_reconstruct_exact": true,
+      "recovered_entries": [
+        {
+          "old": "README.md",
+          "archive": "dependencies/previous-bb8-controller/README.md"
+        },
+        {
+          "old": "command-data.json",
+          "archive": "dependencies/previous-bb8-controller/command-data.json"
+        },
+        {
+          "old": "current-source-map.json",
+          "archive": "dependencies/previous-bb8-controller/current-source-map.json"
+        },
+        {
+          "old": "invocation-template.json",
+          "archive": "dependencies/previous-bb8-controller/invocation-template.json"
+        },
+        {
+          "old": "manifest.json",
+          "archive": "dependencies/previous-bb8-controller/manifest.json"
+        },
+        {
+          "old": "plan.json",
+          "archive": "dependencies/previous-bb8-controller/plan.json"
+        },
+        {
+          "old": "product-source/src/app/chat_ui.rs",
+          "archive": "dependencies/previous-bb8-controller/product-source/src/app/chat_ui.rs"
+        },
+        {
+          "old": "reconciliation.json",
+          "archive": "dependencies/previous-bb8-controller/reconciliation.json"
+        },
+        {
+          "old": "run-packet.py",
+          "archive": "dependencies/previous-bb8-controller/run-packet.py"
+        },
+        {
+          "old": "selected-source-contract.json",
+          "archive": "dependencies/previous-bb8-controller/selected-source-contract.json"
+        },
+        {
+          "old": "source-binding.json",
+          "archive": "dependencies/previous-bb8-controller/source-binding.json"
+        },
+        {
+          "old": "source-conservation.json",
+          "archive": "dependencies/previous-bb8-controller/source-conservation.json"
+        }
+      ]
+    },
+    "new_actual_runner_inverse": {
+      "operations": 22,
+      "forward_actual_current": true,
+      "inverse_actual_old": true,
+      "old_sha256": "ce31b5d5864098da4df423b100a22dc5c0e3d8441ad8ace35ac41cc97d055915",
+      "new_sha256": "867e9ab22f1dd252308e2971ffb7d1595e7ac2679aa34c82a3aa6d1c6cee3567"
+    },
+    "old_history": "All original dependencies, old inverse envelopes and previous manifest/source assertions remain original bytes in place or the explicit previous-bb8-controller archive; no global relabeling of original historical payloads. Their source provenance is separate from the new controller's direct-parent product ancestry.",
+    "original_bb8_negative": {
+      "original_path": "/tmp/fw16-backend-ec204421/main15-87dc6dc8-negative-bb8-ui5-root-acceptance-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/dependencies/current-92b8/original_bb8_negative_acceptance.json",
+      "sha256": "9475db1c02f4a18f724ecd4e0d210127b8f1fbbcea63ce4d695e07a0cba646a6"
+    },
+    "current_proof_join": "Eleven current92b8 input payloads including exact accepted9475 negative, original diagnostic/formatter gap, separate physical193 formatter, reviews/handoff/adoption/publication are present and hash-bound. Current-vs-historical source schema matching is not fully cleared because finding1 blocks one original historical validator. Earlier negative/pass/admission evidence is not donated to current actuals.",
+    "limits": "Manifest/archive/Git/inert line-diff verification only. No runtime archive was produced or consumed by a candidate; no actual filesystem availability, helper, ELF, tool or caller instance was probed."
+  },
+  "actuals_and_limits": {
+    "all_plan_source_data_actual_values_null": true,
+    "grant": null,
+    "controller_review": null,
+    "ELF": null,
+    "inventory_N": null,
+    "results": null,
+    "execution_authorized": false,
+    "adoptable": false,
+    "queueable": false,
+    "runtime_qualified": false,
+    "resource_acceptance": false,
+    "merge_approval": false,
+    "performed": "Static immutable Git metadata/show/tree, AST parse and function/line hashes, inert JSON membership/shape comparisons, own forward/inverse reconstruction and source diffs. Author code was not imported/evaluated.",
+    "not_performed": "No runner/helper/product/module/function/Task/test/build/Cargo/rustc/formatter/native/provider execution, env/authority/account/process/cache/target/resource/API probe, source/Git/public mutation or new worker/child.",
+    "scope_stop": "Root asked finite source-negative consolidation after duplicate independent confirmation of finding1; no additional whole review was opened. Preserve35c source/author freeze/this negative. Physical retained helper, User5/native/FULL52/WHOLE and whole inherited stack remain HOLD/UNQUALIFIED; PR1933 NEVER_MERGE."
+  },
+  "stop": true
+}

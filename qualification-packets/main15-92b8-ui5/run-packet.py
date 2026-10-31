@@ -20,12 +20,12 @@ WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-op
 TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
 LOCK = TARGET.parent / 'lane-c.lock'
 TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-source-main15/qualification-packets/main15-92b8-ui5/plan.json')
+PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-ui5-92b8-identity-main15/qualification-packets/main15-92b8-ui5/plan.json')
 PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
 PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
 SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
 CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
-PLAN_SHA = '5661c18d1df133528903bee37b2c69c5fffc63234a7b1c43e2843817890308e3'
+PLAN_SHA = 'd13d5ea7a3e07d92233cac082655d05b23769b3d809ba9100a79e7ed891525b0'
 SCOPE_PARENT = None  # No grouped contract enables the dormant donor staged-scope path.
 
 
@@ -985,7 +985,7 @@ def main():
     assert current_code['blockers'] == [] and current_code['source']['two_literal_inverse_recovers_entire_f95_chat_ui_source'] is True
     assert current_conservation['kind'] == 'BB8DF653_TITLE_OWNERSHIP_INDEPENDENT_CONSERVATION_PRIVACY_SOURCE_DELTA_REVIEW'
     assert current_conservation['verdict'] == 'EXACT_TWO_EXPRESSION_CONSERVATION_SOURCE_CLEAR; NO_BUILD_TEST_NATIVE_OR_READINESS_CLEARANCE'
-    assert (current_conservation['bb8_identity']['head'], current_conservation['bb8_identity']['tree'], current_conservation['bb8_identity']['sole_parent']) == bb8_identity
+    assert (current_conservation['identity']['head'], current_conservation['identity']['tree'], current_conservation['identity']['sole_parent']) == bb8_identity
     assert current_conservation['freeze']['sha256'] == review['historical_bb8_product_freeze']['sha256']
     assert current_conservation['findings']['in_scope_conservation_or_privacy_blockers'] == []
     assert current_format['schema'] == 'main15-bb8df653-title-source-review-late-freeze-format-binding-addendum-v1'
@@ -1179,7 +1179,7 @@ def main():
     for name, expected_sha in plan['tool_sha256'].items():
         path = TOOL / name
         assert path.is_file() and not path.is_symlink() and digest(path) == expected_sha
-    out = Path('/tmp/main15-92b8-ui5-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
+    out = Path('/tmp/main15-92b8-ui5-identity-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
     out.mkdir(mode=0o700)
     save = lambda name, value: (out / name).write_text(json.dumps(value, indent=2) + '\n')
     # Custody and original bytes are archived before touching the lane lock.
