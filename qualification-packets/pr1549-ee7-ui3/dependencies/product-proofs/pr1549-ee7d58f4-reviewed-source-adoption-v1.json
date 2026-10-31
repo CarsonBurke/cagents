@@ -1,0 +1,61 @@
+{
+  "schema": "pr1549_ee7d58f4_reviewed_source_adoption_v1",
+  "utc": "2026-10-31T14:38:51.749182+00:00",
+  "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+  "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-root-retirement",
+  "branch": "fix/fw16-pr1549-search-root-retirement",
+  "base_public_head": "1a7a6c5d2aa6c0ef113dd3946a9b5cafb8ad9763",
+  "artifacts": [
+    {
+      "role": "freeze",
+      "path": "/tmp/fw16-backend-ec204421/pr1549-root-retirement-retry-source-freeze-v4.json",
+      "sha256": "a67ed94eff05d74ad9f29f026b2438dc6d509a7d29bb30a2127d57d6985c7f95",
+      "bytes": 4241
+    },
+    {
+      "role": "correctness",
+      "path": "/tmp/pr1549-ee7d58f4-owned-retry-gesture-independent-correction-source-review-v1.json",
+      "sha256": "2622a43bd2fa972ccd4c9b891dd7de2985d1a7592adac48dbca18f3a9072ad9d",
+      "bytes": 6394
+    },
+    {
+      "role": "conservation",
+      "path": "/tmp/pr1549-ee7d58f4-retry-owned-delta-conservation-api-review-v4.json",
+      "sha256": "dddeb7bf831c457e1b939c7129596d0f52b3fa1292f4d16f112037b63c58034c",
+      "bytes": 10262
+    },
+    {
+      "role": "ux_source",
+      "path": "/tmp/pr1549-ee7d58f4-independent-owned-retry-ux-source-refresh-v4.json",
+      "sha256": "100d8cdf9587852449484567b7f2c8a940d4a918d444e5349f32b245723de05a",
+      "bytes": 10829
+    },
+    {
+      "role": "preserved_negative",
+      "path": "/tmp/pr1549-f5d80ee3-held-retry-gesture-independent-negative-source-review-v1.json",
+      "sha256": "677f019c2766fb165899a5b2e1d10774e12bb7dfac47777b5cb8c5e10f183492",
+      "bytes": 7162
+    },
+    {
+      "role": "description",
+      "path": "/tmp/fw16-backend-ec204421/pr1549-ee7d58f4-prepared-description-v1.md",
+      "sha256": "5569bece3a763459f3512a125991e4fc0826e9deaa3a2e22734155226c4d48d7",
+      "bytes": 2208
+    }
+  ],
+  "conservation": {
+    "outside_three_paths_exact": true,
+    "outside_entries": 2203,
+    "worktree_clean": true,
+    "physical_three_source_files_match_freeze": true
+  },
+  "source_verdict": "Bounded final correctness, conservation/API and UX-source reviews clear; original82/f5 negatives preserved. Adopt for ordinary separate reviewable source branch publication and independently reviewed exact-source qualification packets.",
+  "qualification": {
+    "format": "Official physical1.93 scripts/check-format EXIT0; diff check EXIT0",
+    "all_five_new_parents_compilation_component_native_screenshots_performance": "UNRUN",
+    "merge_ready": false,
+    "C_grant": null
+  },
+  "public_metadata": "ExistingPR1549 remains1a7 Draft; no rejected metadata-write retry or alternate route. Separate branch publication is ordinary authorized Git source write."
+}

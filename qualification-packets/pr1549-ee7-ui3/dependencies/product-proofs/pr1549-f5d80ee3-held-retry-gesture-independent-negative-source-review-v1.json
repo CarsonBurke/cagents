@@ -1,0 +1,118 @@
+{
+  "finding": {
+    "at": "src/app/search_ui.rs:85",
+    "causal_chain": [
+      {
+        "at": "src/app/search_ui.rs:85",
+        "fact": "retry_control wraps exactly one unnamed standard button in keyed::Column::with_children([(generation,retry)]). G41\u2192G42 still leaves exactly one child."
+      },
+      {
+        "at": "iced/widget/src/keyed/column.rs:227",
+        "fact": "Column::diff delegates to tree::diff_children_custom_with_search; key mismatch is only maybe_changed, while its callback diffs the existing child widget. Updating Column stored keys later does not reset child state."
+      },
+      {
+        "at": "vendor/iced-core/src/widget/tree.rs:342",
+        "fact": "maybe_changed selects splices only when lengths differ. Equal1\u21921 creates no new Tree; final loop diffs existing state. The key value does not tag the button subtree."
+      },
+      {
+        "at": "vendor/libcosmic/src/widget/button/widget.rs:310",
+        "fact": "Button::diff reconciles content only; original State.is_pressed survives. No named/custom ID is required for this failure."
+      },
+      {
+        "at": "vendor/libcosmic/src/widget/button/widget.rs:821",
+        "fact": "Release sees surviving is_pressed and publishes NEW on_press, Retry(42), despite the press originating on41."
+      },
+      {
+        "at": "src/app/search_ui.rs:166",
+        "fact": "The unchanged reducer correctly checks generation/error/root/context, but NEW message42 passes those guards, allowing an old gesture to restart/clear the replacement search."
+      }
+    ],
+    "id": "SEARCH-RETRY-KEYED-EQUAL-LENGTH",
+    "owning_oracle": {
+      "at": "src/app/search_ui.rs:849",
+      "selector": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "source_prediction": "replace=true release emits Retry(42), violating released.is_empty. This is source-derived, not an executed failure. Preserve unchanged-generation and fresh-press controls."
+    },
+    "priority": "P2 correctness/source blocker",
+    "scope": "Interaction identity failure; no provider/session authority escalation or actual native failure is claimed.",
+    "title": "A one-child keyed Column preserves native held button state when its generation key changes"
+  },
+  "kind": "independent finite correctness delta review; preserved f5 negative",
+  "limits": {
+    "GitHub_writes_new_agents": "NONE",
+    "compile_tests_widget_execution_native_UX_performance": "UNRUN",
+    "imports_helpers_Tasks_runtime_env_process_account_resource_probes": "NONE",
+    "runtime_grant_readiness": "NONE",
+    "source_Git_edits": "NONE",
+    "writes": "Own exclusive /tmp negative JSON and SHA256 sidecar only."
+  },
+  "other_delta": {
+    "focus_Task": "Retry focus uses the identical query-focus API already used by Open, after current-generation guards. No concrete type/API blocker established.",
+    "keyed_API_type": "u64 satisfies Copy+PartialEq+static and Column From<Element> API shape. The blocker is state semantics.",
+    "test_helper": "result_pointer_step delegates its existing production result Element to pointer_step. Layout, operation traversal and Widget.update event delivery body remain equivalent. New parent uses production retry_control and actual mouse press/release; it does not manually alter pressed state."
+  },
+  "prior_review_reused": {
+    "path": "/tmp/pr1549-ee06ef2f-scoped-search-retry-independent-correctness-source-review-v1.json",
+    "scope": "ee06 clear retains only its original generation-scoped Retry handler/query preservation scope. Watcher/Git consumer not re-reviewed.",
+    "sha256": "0ec01b0fb342cc937e6acac1e3b58317f554381488c08463a8e88b15f3b50fc9"
+  },
+  "smallest_correct_correction": {
+    "actual_diff": "owned.rs stores KeyState<Key>. Widget::diff compares stored key; mismatch replaces state and rebuilds children via Tree::new, while equality ordinarily diffs child Tree. This explicitly recreates native child state on owner mismatch instead of relying on keyed layout hints.",
+    "constraints": "Keep Retry unnamed. Preserve reducer guards, focus Task, query/options and fifth actual gesture parent. A key vector/callback generation alone is insufficient. Root owns any source correction; no successor is approved by this negative.",
+    "existing_pattern": "Use existing crate::ui_controls::owned(state.generation,retry), already used by search result rows; no new helper needed."
+  },
+  "source": {
+    "dependency": {
+      "actual_checkout_HEAD_gitlink_and_file_match_immutable_objects": true,
+      "git_blob": "ef7d9d9a339b545097b7ebec9e1badb23ab3150a",
+      "iced_gitlink": "87c0358985cae50fefdcb15eabb0271e19ecf4a2",
+      "libcosmic_repository": "https://github.com/pop-os/libcosmic.git",
+      "libcosmic_revision": "caec74c2559924443f12fc6faf97a5bcefe6271d",
+      "path": "widget/src/keyed/column.rs",
+      "selection": "Cargo.lock iced_widget0.14.2 uses libcosmic caec74c/iced gitlink87c0358. Cargo patch overrides iced_core/libcosmic locally, not iced_widget.",
+      "sha256": "ca6408ed3be256092d192db2f8a10cda4bb1319bd44eb8bb371a43eb8ac7eeb0"
+    },
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-root-retirement-retry-source-freeze-v3.json",
+      "sha256": "09ba711a7348604cd354a0b8c976453992d6f1376ff20c7165b25bbf2c11276f"
+    },
+    "head": "f5d80ee3dc76c5f97299dad907706977ad529f21",
+    "parent": "ee06ef2fb397455505fe2c047db906552cc5064d",
+    "pins": {
+      "Cargo.lock": {
+        "blob": "20f963235fff416f76487a8a74a9f4b1d7bb4f8d",
+        "sha256": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d"
+      },
+      "Cargo.toml": {
+        "blob": "5a981df1f743b2ccf624d498d24d3df120f13116",
+        "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac"
+      },
+      "src/app/search_ui.rs": {
+        "blob": "38189321f18822c8f98ce3b5f17da78d9e030e0d",
+        "sha256": "1b3ed55c6e10be3654d0df78ecbc1a1475b340ebebe1891a0bcfe285bdeddbb3"
+      },
+      "src/ui_controls.rs": {
+        "blob": "4fde1dc01074d754729a757e60c9cc778fd3dc12",
+        "sha256": "5de9d5d7f36f729d627f4e0f2f7ddcf1da56626580b1174850f43f8d8304ce53"
+      },
+      "src/ui_controls/button.rs": {
+        "blob": "cc36672162f69816cad210faf67508dd4999c1c0",
+        "sha256": "a03038b946f946a2afdec251bb4b8b99f1e8604e05ad3cc3413c8545293fce04"
+      },
+      "src/ui_controls/owned.rs": {
+        "blob": "373350682c452b096cd519665493fea7b2f86c22",
+        "sha256": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690"
+      },
+      "vendor/iced-core/src/widget/tree.rs": {
+        "blob": "544e56c2859460aec55b586a30fee4640f3c4fca",
+        "sha256": "c2070003526b77f988f18c4bcd47f91fa9277f7b4a5eb8f2c7c0b80fa394050d"
+      },
+      "vendor/libcosmic/src/widget/button/widget.rs": {
+        "blob": "801d892b1be11544692f339aff4bf9bf877e00be",
+        "sha256": "382c40f4f8546793c7f8244ad5ecde17dae6bddcb53491fc7886175912371367"
+      }
+    },
+    "tree": "c99e3c10e51f0826aceef58b1f921662c077c9b6"
+  },
+  "verdict": "HOLD: concrete introduced stale-held-press blocker; source-predicted regression, all execution UNRUN"
+}

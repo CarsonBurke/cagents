@@ -1,0 +1,262 @@
+{
+  "schema": "pr1549-root-retirement-independent-ux-source-evidence-review/v1",
+  "disposition": "HOLD: DELAYED_RECOVERY_BLOCKER_AND_NATIVE_EVIDENCE_OPEN; IMMEDIATE_RETIREMENT_SOURCE_PATH_SUPPORTED",
+  "source": {
+    "head": "82bb77e7ec3df9564a8af281374fccd33cb83838",
+    "tree": "10c9951c4e962ec92fe7272351abd636d0e4784e",
+    "parent": "1a7a6c5d2aa6c0ef113dd3946a9b5cafb8ad9763",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-root-retirement",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-root-retirement-source-freeze-v1.json",
+      "sha256": "f7d19b6b6085b32bef27640a79a8ee24357abb6886a20b32fb638ab502365a09",
+      "verified_before_and_after_reads": true
+    },
+    "leaf_sha256": {
+      "src/app/git_ui.rs": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+      "src/app/search_ui.rs": "6161b999418e295016e6486b5fa6195665aeaf4e335a6e4094e0027fdb0adf41",
+      "src/git_watch.rs": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533"
+    },
+    "leaf_git_blobs": {
+      "src/app/git_ui.rs": "0a11d3c861b4ef51e27ca95a1f1161c56bc36d14",
+      "src/app/search_ui.rs": "c6f90a2a72d2f405df60345d9394328e8aae903c",
+      "src/git_watch.rs": "dca90b7d34462060327d8d042893fb6079755c2d"
+    },
+    "review_scope": "Independent source/UX evidence review of the actual three-leaf Root-authored correction. Correctness reviewer1954 and conservation reviewer1281 retain their disjoint scopes. No broad watcher, layout or feature-series re-review.",
+    "author_of_fix": false
+  },
+  "user_task": {
+    "intended": "Search the current local checkout. After exact root retirement, old A rows/errors/completion must not become B's current search. Keep the user's query/options and resume searching the same-key replacement. Ordinary Git edits, generic rescans/polls, other roots and other projects should preserve an ongoing search.",
+    "before": "The logical key and generation could survive same-path replacement, accepting delayed old Batch/Error/Finished under the replacement.",
+    "after_supported_from_source": "An ingested matching exact retirement cancels the old token, clears retired results/error/cap/skipped state, advances generation and schedules the existing 75ms debounce. The same query/options/root remain. Late old progress and held activation fail existing generation checks.",
+    "readiness": "Not native UX, performance or whole-feature approval."
+  },
+  "source_flow_assessment": [
+    {
+      "topic": "Real producer/consumer seam",
+      "source": [
+        "src/git_watch.rs:307-315",
+        "src/git_watch.rs:384-405",
+        "src/git_watch.rs:731-792",
+        "src/git_watch.rs:826-878",
+        "src/app/git_ui.rs:352-362",
+        "src/app/git_ui.rs:446-465"
+      ],
+      "conclusion": "Exact root Remove/Name events can add the real worktree root to retired_roots; reconciliation can observe a registered same-mode path's changed/missing identity. Coalescing retains the set. The production Changed handler actually invokes apply_git_watch_change, which retires search before queuing the ordinary Git read.",
+      "limit": "This is event/point-observation evidence. It is not a physical snapshot, a native delivery result, or a guarantee for missed/ambiguous events."
+    },
+    {
+      "topic": "Query, options and focus preservation",
+      "source": [
+        "src/app/search_ui.rs:94-131",
+        "src/app/search_ui.rs:150-162",
+        "src/app/search_ui.rs:403-450"
+      ],
+      "conclusion": "The retirement path does not overwrite Options, root or query_focused, nor add a focus command. It clears obsolete result/cache/count/selection/error state. Existing stable query widget ID and controls remain.",
+      "limit": "Actual caret, keyboard focus, hover, scrolling and native transitions are UNRUN. Resetting selected old row is appropriate; focus preservation is source intent, not observed native behavior."
+    },
+    {
+      "topic": "Restart/cancellation ordering",
+      "source": [
+        "src/app/search_ui.rs:107-131",
+        "src/app/search_ui.rs:164-174",
+        "src/app/search_ui.rs:222-265"
+      ],
+      "conclusion": "Cancellation and generation increment happen synchronously at notification ingestion, before the returned future waits75ms. Old Run/progress messages fail generation checks. The timer schedules a new worker; it does not itself prove reopening or source results from B.",
+      "limit": "Repeated actual retirement messages can postpone the debounce and cause more than one restart. There is no added recurring timer or ordinary-event restart source, but cadence/stall behavior needs original event/run evidence."
+    },
+    {
+      "topic": "No broad change-triggered restart",
+      "source": [
+        "src/app/search_ui.rs:94-104",
+        "src/git_watch.rs:307-315",
+        "src/git_watch.rs:835-855"
+      ],
+      "conclusion": "Matching requires the same project and exact retired root. Ordinary file/metadata data changes, a retired descendant/other root, generic rescan flags and pure configuration removal do not by themselves call schedule_project_search. The added consumer controls check three such nonmatching cases.",
+      "limit": "This source assessment does not claim every native backend event classification or event burst was exercised."
+    },
+    {
+      "topic": "Old row activation",
+      "source": [
+        "src/app/search_ui.rs:295-310",
+        "src/app/search_ui.rs:614-639"
+      ],
+      "conclusion": "The new generation also changes the existing row ownership key and rejects an old captured ResultTarget or Submit generation before route/open effects. Fresh rows keep their existing source-line and dirty-buffer navigation protections.",
+      "limit": "No new test exercises an actual held native pointer press or queued keyboard submit across replacement. Exact editor selection/focus remains a native gate."
+    },
+    {
+      "topic": "UI work boundary",
+      "source": [
+        "src/app/search_ui.rs:94-131",
+        "src/app/git_ui.rs:446-465",
+        "src/git_watch.rs:648-688",
+        "src/git_watch.rs:826-878"
+      ],
+      "conclusion": "New UI-path work is project/path-set matching and the preexisting bounded result-state retirement/scheduling. No synchronous canonicalization, stat, directory open or filesystem traversal was added there. The metadata identity observation remains in the git-watch thread.",
+      "limit": "Source placement does not establish frame/resource performance or a hard cancellation deadline."
+    }
+  ],
+  "recovery_concern": {
+    "id": "UX-DELAYED-ROOT-RECOVERY",
+    "priority": "P2 source-supported conditional recovery concern",
+    "title": "A replacement that is not ready at the single75ms restart can leave the unchanged query on a folder error",
+    "condition": "The active project/worktree/path key never passes through None, but the old root is absent when the restart opens W; B becomes valid later. This includes a Git read that fails while primary metadata is absent, leaving the prior sidebar row, or a busy/queued Git refresh that only publishes the later same-key B state.",
+    "causal_source": [
+      {
+        "path": "src/app/search_ui.rs",
+        "lines": [
+          107,
+          131,
+          164,
+          174,
+          263,
+          265
+        ],
+        "fact": "The retirement schedules exactly one debounced run. A current-generation error sets error and running=false."
+      },
+      {
+        "path": "src/project_search.rs",
+        "lines": [
+          225,
+          239
+        ],
+        "fact": "If W is still absent when Root::open runs, the real worker publishes 'Could not search this folder: ...' and returns."
+      },
+      {
+        "path": "src/git_watch.rs",
+        "lines": [
+          307,
+          315,
+          336,
+          350
+        ],
+        "fact": "A later Create of W can produce topology/membership invalidation but is not a retired_roots event."
+      },
+      {
+        "path": "src/app/search_ui.rs",
+        "lines": [
+          85,
+          104
+        ],
+        "fact": "A recovered same-key row keeps the equal-key rebind early return; an ordinary change with empty retired_roots does not restart search."
+      },
+      {
+        "path": "src/app/git_ui.rs",
+        "lines": [
+          429,
+          438,
+          446,
+          465,
+          536,
+          543
+        ],
+        "fact": "Git read failure can retain the previous row. Later successful inventory/status recovery does not explicitly resume a failed retired-root search."
+      },
+      {
+        "path": "src/git_watch.rs",
+        "lines": [
+          835,
+          878
+        ],
+        "fact": "If the missing original registration was already removed, later new registration has no retained old identity to report as a second retirement; it only returns rearmed ownership."
+      },
+      {
+        "path": "src/app/search_ui.rs",
+        "lines": [
+          403,
+          410,
+          452,
+          474,
+          295,
+          302
+        ],
+        "fact": "The query's Enter action opens a selected match; the error is a caption and exposes no explicit retry action."
+      }
+    ],
+    "user_effect": "The query text survives, but the user can remain on a transient folder error after the same-path checkout is usable. Editing a query/option or reopening Search reruns it, but the error does not communicate that recovery path.",
+    "classification": "The underlying error-caption/no-retry pattern is inherited. The new automatic retirement restart exposes this delayed-publication schedule; it is separate from closing the original stale-generation P2. This review did not execute the schedule and does not claim every replacement takes it.",
+    "required_resolution": "Before claiming the complete replacement/recovery flow, establish an explicit recovery contract and test it: either a narrow post-retirement ready/retry transition resumes the preserved query, or a clear action lets the user retry the same query. Preserve the requirement that ordinary successful searches are not restarted by generic edits/rescans/polls.",
+    "root_coordination": "Root accepted this recovery blocker and is authoring a minimal explicit Action::Retry plus visible keyboard-focusable Retry search control in the existing error state, preserving query/options/root. No new polling or root-ready protocol. That is an announced correction plan, not reviewed successor source or native evidence;82bb stays HOLD until the actual new freeze is reviewed.",
+    "smallest_owning_oracle": "In the actual app consumer fixture, retire the matching root, execute the returned75ms Run against an absent private W and accept its real current-generation folder error. Restore a valid same-key checkout, deliver the supported recovery/Create/Git read path without publishing active=None, and require the intended same-query recovery without typing, changing filters or reopening the panel. Keep the immediate-B success and ordinary/unrelated event controls. This is a focused source/worker test plus later native case, not a request for a generic retry framework."
+  },
+  "authored_test_evidence": {
+    "all_execution": "UNRUN",
+    "parents": [
+      {
+        "name": "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+        "source": "src/git_watch.rs:951",
+        "what_it_can_establish": "Constructed root-removal event classification and Change merge preserve exact retired root while ordinary file/index events do not retire.",
+        "cannot_establish": "No actual native root callback, physical replacement or app search restart."
+      },
+      {
+        "name": "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+        "source": "src/git_watch.rs:983",
+        "what_it_can_establish": "A real private directory is renamed and recreated; manual reconciliation observes different device/inode, while ordinary writes and configuration removal do not retire.",
+        "cannot_establish": "Its native watcher callback is discarded. This does not prove that real callback delivery, monitor drain and search restart compose."
+      },
+      {
+        "name": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+        "source": "src/app/search_ui.rs:1118",
+        "what_it_can_establish": "Calls the same apply_git_watch_change used by production; checks cancellation/generation/state clearing, rejects old Batch/Error/Finished through Application::update and accepts injected current-generation progress.",
+        "cannot_establish": "Drops the returned task and directly injects a new-generation Batch using the prior synthetic Match. It does not await75ms, launch the real worker, read B, process real Monitor drain, demonstrate physical replacement, assert all query/filter/focus fields or cover delayed readiness/stale native click."
+      }
+    ],
+    "source_format": "Freeze attributes existing official format/diff checks to Root's recorded receipts. They are not compilation, executed test bodies or UX evidence."
+  },
+  "minimum_native_evidence_plan": {
+    "before_revision": "1a7a6c5d2aa6c0ef113dd3946a9b5cafb8ad9763",
+    "after_revision": "82bb77e7ec3df9564a8af281374fccd33cb83838",
+    "after_refresh_rule": "If source changes to resolve recovery or other reviewed behavior, freeze the new actual head and refresh affected review/capture. Do not present82bb evidence as a successor pass.",
+    "execution_authority": "No runtime grant, lane, C claim, fixture execution or development-runner launch is supplied by this plan.",
+    "app": "Actual native app through scripts/run-development --browserless, with the repository's matched executable/fresh-daemon requirements when separately admitted. The behavior is local filesystem/Git work; no live agent/provider is required.",
+    "data": "Use private prepared local A/B checkout data at the same physical W and stable logical key, with distinguishable matched snippets and a fresh B result at an index previously occupied by A. Keep matched viewport, scale, theme, query/options, fixture content and event workload for before/after. No user repository/content.",
+    "causality": "Retain original watcher event/drain, search generation/cancel/Run and original progress provenance sufficient to establish notification ordering and whether output came from A or B. Physical rename plus a final screenshot alone does not prove delayed old progress was rejected. A state fixture in the running native app can qualify rendering/interaction only; label it and do not call an injected Change or result a native producer/worker pass.",
+    "scenarios": [
+      {
+        "id": "same_key_success",
+        "states": [
+          "A populated while search is running",
+          "exact retirement has been ingested: old rows cleared, preserved query/options, searching/empty transition",
+          "B populated or genuinely empty after the fresh real worker finishes"
+        ],
+        "interactions": "Leave query/caret in place, hold an A row press or queued Enter across retirement, release after B reuses the index, then activate a fresh B row. Require no old opening, correct B editor selection/focus, usable scrolling and keyboard navigation."
+      },
+      {
+        "id": "retired_error_and_delayed_readiness",
+        "states": [
+          "old A Error/Finished queued beside retirement",
+          "W absent beyond75ms and current retry error/wait state",
+          "B restored under the same key, with the agreed visible retry/recovery result"
+        ],
+        "interactions": "Do not let another query/options change, active=None interval or unrelated edit rescue the recovery observation. Old A error/cap/count must never overwrite B. Check the source-supported transient-error concern above."
+      },
+      {
+        "id": "ordinary_updates_preserve",
+        "states": [
+          "ongoing populated Search under realistic local Git edits and one generic rescan/poll",
+          "other worktree/project retirement",
+          "completion of the original unchanged query"
+        ],
+        "interactions": "Require no query loss, unnecessary repeated restart/blanking, stalled spinner/hover, scroll reset or late incorrect opening. Original generation/run provenance must distinguish preservation from an unnoticed restart."
+      }
+    ],
+    "minimal_visual_artifacts": [
+      "Matched wide Before/After WebP pair for the affected post-retirement result state: retired A output before versus current B output after, with the state description below the pair.",
+      "Matched Before/After error/recovery pair for the delayed-ready or queued-error state actually supported by the final correction; include its intermediate empty/searching state in the interaction record.",
+      "One matched narrow affected-result/recovery pair if that layout is exercised, verifying query/filter access, readable notice, result activation and no unusable clipping."
+    ],
+    "screenshot_delivery": "Only two side-by-side columns labeled Before/After, state description underneath. Save descriptive WebP images on a separate screenshot branch under pr-screenshots and use immutable commit URLs. Check private data before publication. No images or native evidence exist from this review.",
+    "responsiveness": "Compare the same private search corpus/concurrent UI update workload at before and final after. Record first-result/restart-to-result behavior, frame stalls and relevant resource use; show ordinary event bursts do not produce a recurring search restart/stall. Existing200ms target and historical timings remain unmeasured here; no new broad performance redesign.",
+    "independent_native_ux_review": "Supply original interaction evidence, source/tested-head pins and intended flow to an independent reviewer. Source labels or unit results cannot waive the missing native path."
+  },
+  "final_limits": {
+    "exact_source_immediate_case": "Supported by source; not a whole-source/functional/native CLEAR.",
+    "recovery_concern": "Open pending Root's contract/implementation and meaningful owning/native evidence; not waived as an unexplained stall or follow-up.",
+    "actual_compilation": null,
+    "actual_new_test_results": null,
+    "actual_native_interactions": null,
+    "actual_before_after_images": null,
+    "actual_performance": null,
+    "old_P2_receipt": "/tmp/pr1549-1a7a6c5d-pr1871-a482-same-key-search-retirement-source-finding-v1.json remains historical; this successor review does not overwrite it.",
+    "changes_performed": "Only this task-owned /tmp review and checksum. No code/test writes, imports/builds/tests/native/runtime/provider/environment/process/account probes, Git/GitHub writes, new workers or grant."
+  }
+}

@@ -1,0 +1,156 @@
+{
+  "schema": "pr1549-ee7-ui3-controller-task-data-v1",
+  "issue": 1549,
+  "boundary": "ui",
+  "source": {
+    "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d",
+    "parent": "f5d80ee3dc76c5f97299dad907706977ad529f21",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-root-retirement"
+  },
+  "selected_names": [
+    "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+    "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+    "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering"
+  ],
+  "selected_parents": [
+    {
+      "name": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+      "line": 1239,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "9dbbc868112ef82ac846736945be0e1e9669816a163a0d35f8c808bc5fa5ddae",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+      "line": 1352,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "394ae3ff757fddae7fb3e8b89440bc24d266c93b21e5475d6debe0ced4a53607",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+      "line": 849,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "1033ae0da607015536bfaf1dfd014dd10c28cf28c16840163cdfdda823bd3178",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+        "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+        "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 600
+    }
+  ],
+  "planned_phase_order": [
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3"
+  ],
+  "runtime_admission": {
+    "state": "PR1549_UI3_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  }
+}

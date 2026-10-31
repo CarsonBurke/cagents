@@ -1,0 +1,54 @@
+{
+  "kind": "PR1549_UI3_SOURCE_MAP_NOT_APPROVAL",
+  "product": {
+    "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d",
+    "parent": "f5d80ee3dc76c5f97299dad907706977ad529f21",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-root-retirement"
+  },
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.toml": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac",
+    "Cargo.lock": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f",
+    "src/bin/cagents-ui.rs": "025b4d6fbbf168bdcb5055c0684b914f0e3cb3a1ba669ea275005cd336518efd",
+    "src/git_watch.rs": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533",
+    "src/model.rs": "cc4455180a27d116ff43f18ccb91e55fdf4dcc6aee43efc077df31948f270ba0",
+    "src/workspace_model.rs": "f94501960436304becf2735881d6a8bb04020c4ddd34018d515b0b7eb1e62b3f",
+    "src/app.rs": "6d02eb6349c395b5218e4d39678fde950a31326c655786e9ca55341d3065c8a6",
+    "src/sidebar.rs": "ab8116c3471ae02a45d45430454f463cfcedb2f0ef58983067f22a5d893f0b98",
+    "src/ui_controls.rs": "5de9d5d7f36f729d627f4e0f2f7ddcf1da56626580b1174850f43f8d8304ce53",
+    "src/app/git_ui.rs": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+    "src/app/search_ui.rs": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+    "src/ui_controls/owned.rs": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690"
+  },
+  "selected_names": [
+    "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+    "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+    "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering"
+  ],
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "owner_gate": "src/app/search_ui.rs:1239 ordinary #[test]; src/app/search_ui.rs:1352 ordinary #[test]; src/app/search_ui.rs:849 ordinary #[test]",
+  "fixture_limits": "Existing context_inspector_test_app(false) and sidebar panel fixtures exercise real reducers; returned Tasks are dropped, no operational futures polled. Synthetic Progress/Retry callbacks are not native keyboard/provider proof. Existing owned wrapper explicitly replaces child Tree on generation changes; headless retained-tree gestures remain component source only, not native input or focus-task execution.",
+  "scope": "UI3 source/test scope only; not native/UX/BeforeAfter/keyboard/performance or wholePR qualification.",
+  "current_product_source_review_limits": "Genuine final correction/conservation/source-UX receipts are bounded source evidence only; no compiler, owning parent, component/native UX/performance or whole-PR readiness transfer.",
+  "historical_source_only_holds": [
+    "82bb missing recovery action",
+    "f5 keyed-Column held-press retargeting",
+    "ee06/f5 uncommitted controller drafts preserved separately"
+  ]
+}

@@ -1,0 +1,227 @@
+{
+  "actual_frozen_worktree": {
+    "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "parents": [
+      "f5d80ee3dc76c5f97299dad907706977ad529f21"
+    ],
+    "status": "",
+    "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d"
+  },
+  "conservation": {
+    "all_2203_outside_three_paths_exact_public1a7": true,
+    "all_2205_other_entries_exact_f5": true,
+    "all_5_parent_names_match_freeze": true,
+    "all_search_test_function_bytes_exact_f5": true,
+    "both_producers_exact82": true,
+    "changed_paths": [
+      "src/app/search_ui.rs"
+    ],
+    "deletions": 2,
+    "exact_comment_and_call_substitution_only": true,
+    "insertions": 2,
+    "same_2206_path_set_modes_types": true,
+    "source_inverse_reconstructs_full_f5": true
+  },
+  "dependency_pin": {
+    "anchors": {
+      "cargo_patch": 338,
+      "export_owned": 27,
+      "owned_api": 12,
+      "owned_diff": 45,
+      "quiet_button": 58,
+      "vendored_button_diff": 310,
+      "vendored_button_pressed": 808,
+      "vendored_button_release": 826,
+      "vendored_tree_final_positional_loop": 411,
+      "vendored_tree_keyed_search": 342
+    },
+    "keyed": {
+      "cached_bytes_match_immutable_pinned_source": true,
+      "diff_line": 227,
+      "iced_submodule_revision": "87c0358985cae50fefdcb15eabb0271e19ecf4a2",
+      "libcosmic_revision": "caec74c2559924443f12fc6faf97a5bcefe6271d",
+      "path": "/home/marvin/.cargo/git/checkouts/libcosmic-41009aea1d72760b/caec74c/iced/widget/src/keyed/column.rs",
+      "relative_path": "iced/widget/src/keyed/column.rs",
+      "sha256": "ca6408ed3be256092d192db2f8a10cda4bb1319bd44eb8bb371a43eb8ac7eeb0"
+    },
+    "unchanged_dependency_entries_exact_public_base_f5_ee7": true
+  },
+  "finding_resolution": {
+    "exact_delta": "2 insertions/2 deletions only in src/app/search_ui.rs:96-97: comment rewording and replacement of keyed Column with crate::ui_controls::owned(state.generation, retry).",
+    "id": "PR1549-F5-RETRY-KEYED-STATE",
+    "mechanism": [
+      "Existing src/ui_controls/owned.rs:12 accepts Key: Clone + Eq + 'static and returns the same cosmic Element<'a, Message>; State.generation is u64 at src/app/search_ui.rs:15 and the retry is explicitly Element<'_, Message> at86. The fully qualified call needs no new import or public helper.",
+      "owned.rs:45 compares stored KeyState to current key. A change replaces state and tree.children with freshly constructed children; equal owner uses diff_children. Thus changed generation receives a fresh button State, while ordinary rerender retains the press.",
+      "src/ui_controls/button.rs:58/62 initializes id=None; this retry supplies no id, and the adapter sets an explicit widget id only when Some at144. The retry therefore introduces no named-state restore route around the child replacement.",
+      "The focus task, admission guards, helper body, producer code and all five owning regression bodies are byte-identical to f5."
+    ],
+    "negative_receipt": "/tmp/pr1549-f5d80ee3-retry-control-conservation-api-negative-review-v3.json",
+    "status": "source correction removes the confirmed equal-child-count keyed-column path; runtime remains UNRUN"
+  },
+  "fixture": {
+    "all_old_test_function_bytes_exact": true,
+    "execution": "UNRUN",
+    "names": [
+      "retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+      "held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects",
+      "narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit",
+      "opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file",
+      "held_result_and_submit_cannot_open_a_new_queries_same_index",
+      "delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+      "retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+      "new_queries_cancel_old_search_and_reject_stale_batches"
+    ],
+    "new_parent_intent": "Real standard retry widget Tree receives press, production rerender with same generation or replacement generation, and release. Replacement must emit none; fresh replacement press/release emits Retry(42); ordinary same-generation rerender emits Retry(41). The unchanged fixture uses a headless component renderer, not native interaction evidence.",
+    "new_search_tests": 9,
+    "new_test": {
+      "body_sha256": "99d7236c7580970e9655c9e85225604f9323162cd55590e07d92ad5c9227cbc0",
+      "line": 849,
+      "name": "retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "not_additive_case_counts": true,
+      "same_exact_body_in_ee7": true,
+      "variants": [
+        false,
+        true
+      ]
+    },
+    "old_pointer_event_layout_update_body_exact_after_single_diagnostic_rewording": true,
+    "old_search_tests": 8,
+    "old_test_names_and_order_exact": true,
+    "pointer_helper_line": 801,
+    "result_pointer_delegation_line": 787
+  },
+  "limits": {
+    "authority": "No merge, publication, grant, permission, deployment, readiness or whole-feature approval. No repository/source/Git changes, runtime/process/account/DB/resource/target probes, native/provider activity or new workers.",
+    "execution": "All builds, Rust test bodies, helper/candidate execution, native UI, before/after evidence, performance and UX interaction remain UNRUN in this review. Source prediction is not an observed failure or pass.",
+    "format": "Official Rust 1.93 format/diff exit 0 is reported in the respective freeze; this reviewer did not run formatting.",
+    "remaining": "Affected isolated HOST/UI builds and meaningful owning regression execution, plus actual native recovery/focus/held-gesture evidence and independent UX review remain required; prior receipts retain only their exact source scope."
+  },
+  "no_new_blocker_in_declared_source_scope": true,
+  "prior_receipts": [
+    {
+      "path": "/tmp/pr1549-82bb77e7-search-root-retirement-conservation-integration-review-v1.json",
+      "sha256": "4ee77418dfc517a6f65a723cb93f0a286f764c1691b46ef8df4acf0b129f9f64"
+    },
+    {
+      "path": "/tmp/pr1549-ee06ef2f-search-root-retirement-retry-delta-conservation-review-v2.json",
+      "sha256": "eb1ce5b5126b1e98d61c90445223046dd591cc5e9ae190f25ea6bda7af80c077"
+    }
+  ],
+  "reviewer": "/root/1281_holder_reconcile_review",
+  "schema": "pr1549_ee7_retry_owned_delta_conservation_api_review_v4",
+  "scope": "Finite source correction and conservation of ee7 vs f5 only; no generic owned framework audit or repeated whole-feature review.",
+  "source": {
+    "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "parent": "f5d80ee3dc76c5f97299dad907706977ad529f21",
+    "path": "/tmp/fw16-backend-ec204421/pr1549-root-retirement-retry-source-freeze-v4.json",
+    "sha256": "a67ed94eff05d74ad9f29f026b2438dc6d509a7d29bb30a2127d57d6985c7f95",
+    "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d"
+  },
+  "source_pins": {
+    "existing_api": [
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "373350682c452b096cd519665493fea7b2f86c22",
+          "type": "blob"
+        },
+        "path": "src/ui_controls/owned.rs",
+        "sha256": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690"
+      },
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "cc36672162f69816cad210faf67508dd4999c1c0",
+          "type": "blob"
+        },
+        "path": "src/ui_controls/button.rs",
+        "sha256": "a03038b946f946a2afdec251bb4b8b99f1e8604e05ad3cc3413c8545293fce04"
+      },
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "801d892b1be11544692f339aff4bf9bf877e00be",
+          "type": "blob"
+        },
+        "path": "vendor/libcosmic/src/widget/button/widget.rs",
+        "sha256": "382c40f4f8546793c7f8244ad5ecde17dae6bddcb53491fc7886175912371367"
+      },
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "544e56c2859460aec55b586a30fee4640f3c4fca",
+          "type": "blob"
+        },
+        "path": "vendor/iced-core/src/widget/tree.rs",
+        "sha256": "c2070003526b77f988f18c4bcd47f91fa9277f7b4a5eb8f2c7c0b80fa394050d"
+      },
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "5a981df1f743b2ccf624d498d24d3df120f13116",
+          "type": "blob"
+        },
+        "path": "Cargo.toml",
+        "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac"
+      },
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "20f963235fff416f76487a8a74a9f4b1d7bb4f8d",
+          "type": "blob"
+        },
+        "path": "Cargo.lock",
+        "sha256": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d"
+      },
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "4fde1dc01074d754729a757e60c9cc778fd3dc12",
+          "type": "blob"
+        },
+        "path": "src/ui_controls.rs",
+        "sha256": "5de9d5d7f36f729d627f4e0f2f7ddcf1da56626580b1174850f43f8d8304ce53"
+      }
+    ],
+    "predecessor": {
+      "entry": {
+        "mode": "100644",
+        "oid": "38189321f18822c8f98ce3b5f17da78d9e030e0d",
+        "type": "blob"
+      },
+      "path": "src/app/search_ui.rs",
+      "sha256": "1b3ed55c6e10be3654d0df78ecbc1a1475b340ebebe1891a0bcfe285bdeddbb3"
+    },
+    "producers": [
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "0a11d3c861b4ef51e27ca95a1f1161c56bc36d14",
+          "type": "blob"
+        },
+        "path": "src/app/git_ui.rs",
+        "sha256": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246"
+      },
+      {
+        "entry": {
+          "mode": "100644",
+          "oid": "dca90b7d34462060327d8d042893fb6079755c2d",
+          "type": "blob"
+        },
+        "path": "src/git_watch.rs",
+        "sha256": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533"
+      }
+    ],
+    "product": {
+      "entry": {
+        "mode": "100644",
+        "oid": "fafc5771676703baec355c91587c83dae38b0858",
+        "type": "blob"
+      },
+      "path": "src/app/search_ui.rs",
+      "sha256": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b"
+    }
+  },
+  "verdict": "BOUNDED_SOURCE_CLEAR_FOR_DECLARED_CORRECTION_AND_CONSERVATION"
+}

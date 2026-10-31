@@ -1,0 +1,113 @@
+{
+  "schema": "pr1549-owned-retry-independent-ux-source-evidence-refresh/v4",
+  "verdict": "SCOPED_UX_SOURCE_CLEAR: VISIBLE_RECOVERY_FOCUS_AND_GENERATION_OWNERSHIP_CORRECTIONS_SUPPORTED",
+  "ready": false,
+  "source": {
+    "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d",
+    "parent": "f5d80ee3dc76c5f97299dad907706977ad529f21",
+    "base_public_head": "1a7a6c5d2aa6c0ef113dd3946a9b5cafb8ad9763",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-root-retirement",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-root-retirement-retry-source-freeze-v4.json",
+      "sha256": "a67ed94eff05d74ad9f29f026b2438dc6d509a7d29bb30a2127d57d6985c7f95",
+      "verified_before_and_after_reads": true
+    },
+    "leaf_sha256": {
+      "src/app/search_ui.rs": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+      "src/app/git_ui.rs": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+      "src/git_watch.rs": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533",
+      "src/ui_controls/owned.rs": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690"
+    },
+    "exact_delta": "Relative f5, only one comment and retry_control's return expression change (+2/-2): existing ui_controls::owned(state.generation,retry) replaces keyed Column. The immutable whole diff changes only search_ui.rs. Fifth component parent, focus Task, handler, producer/Git consumer and helper bytes are unchanged.",
+    "scope": "Independent narrow UX/source refresh of the actual correction and remaining evidence. This does not replace parallel whole-tree conservation/correctness reviews or re-audit the broad feature.",
+    "author_of_code": false
+  },
+  "preserved_history": [
+    {
+      "path": "/tmp/pr1549-82bb77e7-independent-ux-source-evidence-review-v1.json",
+      "sha256": "037011f2e42249d53a72680407cf7841ec19eaa83b6610503cf08ab3197aeb80",
+      "state": "Historical missing-recovery-action HOLD unchanged."
+    },
+    {
+      "path": "/tmp/pr1549-ee06ef2f-independent-retry-ux-source-review-v2.json",
+      "sha256": "9ba8b6dfc8f9ed83f72287ec543e1e2c029a7a655e67ff70aa9dab8912edbf78",
+      "state": "Original scoped source CLEAR and identified focus/held-press risks remain at ee06."
+    },
+    {
+      "path": "/tmp/pr1549-f5d80ee3-independent-ux-source-negative-v3.json",
+      "sha256": "e004a6910ca24a81faf7ee449ee22bce5e479727756cfcf53b17ef27758381eb",
+      "state": "Historical f5 HOLD sealed before this successor review; not relabeled."
+    },
+    {
+      "path": "/tmp/pr1549-f5d80ee3-held-retry-gesture-independent-negative-source-review-v1.json",
+      "sha256": "677f019c2766fb165899a5b2e1d10774e12bb7dfac47777b5cb8c5e10f183492",
+      "state": "1954 actual pinned-dependency negative receipt read and SHA-verified after this reviewer's f5 HOLD. It supplies the primary-pinned keyed-column diagnosis; no executed widget/native result."
+    }
+  ],
+  "user_flow_source_verdict": {
+    "visible_recovery": "The existing error state still offers the standard own-line Retry search control. Current generation/error/root/active-key/query/context/modal guards and preserved query/options/root remain as reviewed at ee06.",
+    "focus_handoff": {
+      "source": "src/app/search_ui.rs:166-180",
+      "conclusion": "After a valid Retry, the code batches the existing query_id focus operation with schedule_project_search. It targets the same still-rendered query field as Open and is independent of the75ms debounce. This addresses the prior source-level missing keyboard handoff; actual focus/caret/Tab behavior remains unrun."
+    },
+    "held_press_owner": {
+      "source": "src/app/search_ui.rs:85-98; src/ui_controls/owned.rs:27-50; vendor/iced-core/src/widget/tree.rs:44-58",
+      "conclusion": "The actual Retry control now passes its generation and standard unnamed button to the existing Owned wrapper. Owner mismatch explicitly replaces wrapper state and rebuilds child Tree via Tree::new; that creates widget.state() and children(), rather than ordinary-diffing a retained pressed ButtonState. Equal generation uses ordinary child diff, retaining a valid in-progress press."
+    },
+    "no_new_policy": "This correction adds neither automatic retry/polling nor a generic Git-change restart, new filesystem work, label/width policy or provider/authority path.",
+    "labels_and_narrow_layout": "Retry search retains the shared accessible name/style, short label and its own row below the error caption. The ownership wrapper forwards child sizing/layout; no source layout regression is identified. Actual wrapping, focus outline, clipping and reachability still require wide/narrow native evidence.",
+    "result": "The specific visible recovery, source focus and stale-held-Retry concerns are addressed at this exact source. No remaining concrete UX/source blocker was established in this narrow successor delta."
+  },
+  "component_oracle": {
+    "selector": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+    "source": "src/app/search_ui.rs:849-919",
+    "actual_execution": "UNRUN",
+    "production_binding": "Calls the actual retry_control used by project_search_panel, keeps its actual Tree across mouse events/rerender, obtains the real focusable button bounds through Widget::operate, then calls Widget::update through the shared pointer_step helper.",
+    "discriminating_controls": [
+      "Press on generation41, change error and generation to42, diff/rerender, release: no message.",
+      "Following that refusal, a fresh press/release on42 emits Retry42.",
+      "Change only diagnostic text while generation remains41: the original press/release still emits Retry41."
+    ],
+    "source_prediction": "The explicit owned child-tree replacement supplies the intended changed-generation reset, while equality retains the unchanged-generation control. This is a source-derived expectation, not a passed assertion.",
+    "unchanged_test_constraints": "Fifth parent and all previous test bodies are unchanged by ee7d. Existing result_pointer_step continues delegating the original production result Element to the same layout/event delivery body; no old oracle was weakened to admit the fix.",
+    "not_proven": [
+      "No native window, OS pointer capture, touch delivery, rendering/compositor or actual device input was exercised.",
+      "No keyboard focus Task was executed by this mouse component fixture.",
+      "No original monitor→Git change→retirement→75ms Run→physical B worker/channel flow was executed.",
+      "No Rust compilation or test-executable inventory/result was observed. Five source-declared new parents are not five passes."
+    ]
+  },
+  "remaining_native_evidence": {
+    "all": "UNRUN; required before full flow/readiness acceptance.",
+    "before_revision": "1a7a6c5d2aa6c0ef113dd3946a9b5cafb8ad9763",
+    "final_after_revision": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+    "application": "Actual development-runner native app with private local A/B Git/checkout fixtures and matched executable set under a later real admission. No live provider is required for this local search flow. No launch/grant is supplied here.",
+    "minimum_complete_flow": [
+      "With an actual A search streaming, replace the exact root at the same path/key. Retain original event/drain, cancellation/generation, debounce/Run and original worker-output ordering to establish that queued old Batch/Error/Finished never presents as B.",
+      "Keep W absent beyond75ms, observe the real current-generation folder error and visible Retry. Restore valid same-key B; activate Retry without editing the query/options. Require fresh B result/completion and correct result opening/line selection, with old output still refused.",
+      "Keyboard-only: Tab to Retry, press Enter, verify query focus/caret/text after the button disappears, then use arrow selection/Enter to open a fresh B result without lost focus or an excessive recovery Tab cycle.",
+      "Actual held Retry and result pointer/touch gestures across generation/error replacement: release must not retarget. Keep the same-generation rerender and fresh-press positive controls so a disabled/nonfunctional button cannot qualify.",
+      "Ordinary edits/rescan/poll/other-root events while searching: generation/run provenance must show no unnecessary repeated restart, blanking or focus theft. Inspect hover, scrolling and spinner/result transitions on the same realistic workload.",
+      "Affected populated, transient empty/searching, error/Retry and recovered-result states at wide and narrow inspector widths. Check notice wrapping, visible focus, fully reachable Retry, scroll position and primary result activation."
+    ],
+    "evidence_honesty": "A headless widget fixture is component evidence only. A state fixture loaded in the native app can establish rendering/interaction if labeled, but cannot establish native watcher/physical-root/worker causality. Physical rename plus a final screenshot alone is insufficient.",
+    "screenshots": "Matching actual native Before/After WebP pairs at the stated revisions, same viewport/scale/theme/private data/state, two columns labeled Before/After with state description beneath. Keep images on a separate screenshot branch with immutable commit links. No captures exist from this review.",
+    "responsiveness": "Matched before/final-after frame stalls and relevant resource behavior, including ordinary event bursts and retry-to-result behavior. No first-result200ms, no-stall or resource claim is established here.",
+    "independent_ux_acceptance": "Give the reviewer actual native interaction evidence and tested-head pins. Resolve primary-flow failures and affected evidence gaps before calling ready. Later source changes require affected evidence/review refresh."
+  },
+  "final_limits": {
+    "source_clear_only": true,
+    "native_ready": false,
+    "actual_compilation": null,
+    "actual_owning_test_results": null,
+    "actual_component_result": null,
+    "actual_native_result": null,
+    "actual_screenshots": null,
+    "actual_performance": null,
+    "actual_grant": null,
+    "format": "Root's freeze records official formatting/diff success; those remain attributed source checks, not execution of product/test/native bodies.",
+    "historical_limits": "Missed/ambiguous root notifications, physical-before-worker-open guarantees, blocked filesystem cancellation latency and broader search performance remain their existing scoped limits.",
+    "actions": "Only own /tmp receipt/checksum writes. No source/test edits, imports/builds/tests/native/runtime/env/process/account/provider probes, Git/GitHub writes or new workers."
+  }
+}

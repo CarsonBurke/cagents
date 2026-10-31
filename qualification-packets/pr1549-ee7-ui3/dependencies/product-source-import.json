@@ -1,0 +1,15 @@
+{
+  "schema": "coord16_pr1549_ee7_exact_corrected_source_import_v1",
+  "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+  "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d",
+  "parent": "f5d80ee3dc76c5f97299dad907706977ad529f21",
+  "three_source_pins": {
+    "src/app/git_ui.rs": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+    "src/app/search_ui.rs": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b",
+    "src/git_watch.rs": "817a70bfd70ed8985523dbcc235cb8adbd72093ce6695edbee6536e90e442533"
+  },
+  "actual_product_Git_entries": 2206,
+  "original_import_chunk": "69ad67",
+  "import_exit": 0,
+  "scope": "Normal exact local source import/header/threeblob pins/tree count only. No productedit/checkout/formatter/compiler/test/helper/runtime/toolversion/env/authority/target/process probe."
+}

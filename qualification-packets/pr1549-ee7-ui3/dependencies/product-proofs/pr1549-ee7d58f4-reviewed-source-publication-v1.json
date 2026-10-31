@@ -1,0 +1,21 @@
+{
+  "schema": "pr1549_ee7d58f4_reviewed_source_publication_v1",
+  "utc": "2026-10-31T14:39:11.528555+00:00",
+  "head": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+  "tree": "1f564ba2c0bc8ae9588f7ced908e3894783ddd5d",
+  "branch": "fix/fw16-pr1549-search-root-retirement",
+  "url": "https://github.com/CarsonBurke/cagents/tree/ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+  "source_adoption": {
+    "path": "/tmp/fw16-backend-ec204421/pr1549-ee7d58f4-reviewed-source-adoption-v1.json",
+    "sha256": "dd537a7c989ba6d92bcdc0e01fdba76c2df0d371be57e458d20a7432088b879a"
+  },
+  "normal_nonforce_push": {
+    "start_chunk": "84b3ae",
+    "original_session": 64101,
+    "final_chunk": "00a287",
+    "exit": 0,
+    "result": "New separate branch; actual public ref verified via supported GitHub fetch to exact head. Credential-store locked-collection warning nonfatal; no approval rejection from this Git source write."
+  },
+  "existing_pr1549": "Unchanged public1a7 Draft; no metadata retry/ready/merge claim. NewPR metadata remains unsubmitted due previously explicit automatic rejection of that action.",
+  "qualification": "Formatting/diff checks passed; final three independent source reviews clear; compilation, all5newparents, nativeflow, WebPs and performance UNRUN. No newCgrant."
+}
