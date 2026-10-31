@@ -1329,7 +1329,8 @@ impl Cagents {
         card: CardId,
         source: &TerminalSession,
     ) -> bool {
-        if self.shared_views.defaults.contains_key(&card)
+        if self.pane_is_quarantined(card)
+            || self.shared_views.defaults.contains_key(&card)
             || self.durable.pending_terminal_creations.contains(&card)
         {
             return false;
@@ -3292,6 +3293,29 @@ mod tests {
             .initialized
             .extend([Scope::Channel(a), Scope::Channel(b)]);
         (app, a, b, pane)
+    }
+
+    #[test]
+    fn quarantined_terminal_refuses_the_unattached_restore_fallback() {
+        for persisted in [false, true] {
+            let (mut app, _, _, _) = fixture();
+            let card = crate::app::tests::terminal_card_state();
+            let CardKind::Terminal(source) = &card.kind else {
+                unreachable!()
+            };
+            assert!(!app.shared_views.attached.contains(&card.id));
+            assert!(app.shared_terminal_ready_for_restored_attach(card.id, source));
+            if persisted {
+                Arc::make_mut(&mut app.durable)
+                    .quarantined_panes
+                    .insert(card.id, card.kind.clone());
+            } else {
+                app.shared_views.quarantined.insert(card.id);
+            }
+            assert!(app.pane_is_quarantined(card.id));
+            assert!(!app.shared_terminal_ready_for_restored_attach(card.id, source));
+            assert!(!app.shared_views.attached.contains(&card.id));
+        }
     }
 
     fn channel_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
