@@ -468,7 +468,7 @@ impl Actor {
 
     fn websocket_closed(&self, busy: bool) -> Result<(), String> {
         if !self.first_frame || busy || !self.pending.is_empty() {
-            Err("Codex shared connection closed before pending work was confirmed; inspect the exact thread before recovery".into())
+            Err("Codex connection closed before pending work was confirmed; restart the session to continue".into())
         } else {
             Ok(())
         }

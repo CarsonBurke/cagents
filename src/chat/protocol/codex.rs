@@ -444,6 +444,8 @@ fn create_inner(
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            lifecycle_turn: None,
+            lifecycle_unidentified: false,
             notification_turn: None,
             notification_revision: 0,
             busy: false,
@@ -497,6 +499,8 @@ enum Pending {
         notification_revision: u64,
         model: Option<String>,
         tier: Option<String>,
+        completions: BTreeMap<String, TurnCompletion>,
+        completion_bytes: usize,
         /// Completion can precede this exact request's acknowledgement.
         /// Only the reply's turn ID may promote one of these bounded frames.
         early: BTreeMap<String, EarlyNotification>,
@@ -528,6 +532,14 @@ enum Pending {
     StopChild,
     Prediction,
     Fork,
+}
+
+#[derive(Clone)]
+struct TurnCompletion {
+    status: Value,
+    outcome: crate::notifications::Kind,
+    error: Option<String>,
+    announced: bool,
 }
 
 fn permission_mode(approval: &Value, sandbox: &Value) -> Option<&'static str> {
@@ -595,6 +607,12 @@ struct Codex {
     pricing: chat::pricing::CostTracker,
     turn_pricing: std::collections::VecDeque<(String, Option<String>, Option<String>)>,
     turn: Option<String>,
+    /// The latest established lifecycle owner survives idle/settled state.
+    /// Clearing active work must not grant an older completion current scope.
+    lifecycle_turn: Option<String>,
+    /// Observed work without a turn ID cannot give the previous turn authority
+    /// merely because the thread later becomes idle.
+    lifecycle_unidentified: bool,
     /// Exact live notice authority. Scalar status and paged history must not
     /// replace it; they can arrive after a newer turn's start.
     notification_turn: Option<String>,
@@ -798,6 +816,7 @@ impl Codex {
     fn finish_execution(
         &mut self,
         turn: &Value,
+        current: bool,
         step: &mut Step,
         publish_content: bool,
     ) -> Result<(), String> {
@@ -839,10 +858,19 @@ impl Codex {
                     .extend(parse_item(value, true, id)?.into_iter().map(Event::Item));
             }
             if let Some(message) = turn["error"]["message"].as_str() {
-                step.events.push(Event::Error {
-                    message: message.into(),
-                    fatal: false,
-                });
+                if current {
+                    step.events.push(Event::Error {
+                        message: message.into(),
+                        fatal: false,
+                    });
+                } else {
+                    step.events.push(Event::Execution {
+                        run: execution.run,
+                        event: crate::agent_execution::ProviderEvent::Diagnostic {
+                            message: message.into(),
+                        },
+                    });
+                }
             }
         }
         execution_end(execution.run, outcome, step);
@@ -1235,6 +1263,8 @@ impl Codex {
             let active = turn["status"] == "inProgress";
             if active && self.busy && self.turn.is_none() {
                 self.turn = Some(turn_id.into());
+                self.lifecycle_turn = Some(turn_id.into());
+                self.lifecycle_unidentified = false;
             }
             if turn["itemsView"]
                 .as_str()
@@ -1401,6 +1431,114 @@ impl Codex {
         for id in std::mem::take(&mut self.requests).into_keys() {
             step.events.push(Event::RequestResolved { id });
         }
+    }
+    fn resolve_turn_requests(&mut self, thread: &str, turn: &str, step: &mut Step) {
+        if thread.is_empty() || turn.is_empty() {
+            return;
+        }
+        let resolved = self
+            .requests
+            .iter()
+            .filter(|(_, request)| {
+                let params = &request.frame["params"];
+                params["threadId"].as_str() == Some(thread)
+                    && params["turnId"].as_str() == Some(turn)
+                    && !(matches!(request.kind, RequestKind::Questions)
+                        && params["isBlocking"] == false)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in resolved {
+            self.requests.remove(&id);
+            step.events.push(Event::RequestResolved { id });
+        }
+    }
+    fn remember_pending_completion(
+        &mut self,
+        turn: &str,
+        status: &Value,
+        outcome: crate::notifications::Kind,
+        error: Option<String>,
+        current: bool,
+    ) -> Result<(), String> {
+        let Some(Pending::Turn {
+            completions,
+            completion_bytes,
+            ..
+        }) = self
+            .pending
+            .values_mut()
+            .find(|pending| matches!(pending, Pending::Turn { .. }))
+        else {
+            return Ok(());
+        };
+        let previous = completions.get(turn);
+        let previous_bytes = previous.map_or(0, |completion| {
+            turn.len() + completion.error.as_ref().map_or(0, String::len)
+        });
+        let error = error.or_else(|| {
+            previous
+                .filter(|completion| completion.outcome == outcome)
+                .and_then(|completion| completion.error.clone())
+        });
+        let bytes = completion_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(turn.len())
+            .saturating_add(error.as_ref().map_or(0, String::len));
+        if (previous.is_none() && completions.len() >= 8)
+            || bytes > crate::agent_execution::MAX_RESULT_BYTES
+        {
+            return Err(
+                "Codex completed turns exceeded pending request correlation capacity".into(),
+            );
+        }
+        let announced = current || previous.is_some_and(|completion| completion.announced);
+        *completion_bytes = bytes;
+        completions.insert(
+            turn.into(),
+            TurnCompletion {
+                status: status.clone(),
+                outcome,
+                error,
+                announced,
+            },
+        );
+        Ok(())
+    }
+    fn observe_turn_lifecycle(
+        &mut self,
+        turn: &str,
+        status: &Value,
+        started: bool,
+        step: &mut Step,
+    ) {
+        if !started {
+            step.events.push(Event::TurnSettled);
+        }
+        self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
+        self.lifecycle_turn = Some(turn.to_owned());
+        self.lifecycle_unidentified = false;
+        self.busy = started;
+        self.subagent_waiting = false;
+        self.subagent_detail = turn_detail(status);
+        self.subagent_status = if started {
+            Some(ToolStatus::Running)
+        } else {
+            agent_status(status)
+        };
+        step.events.push(Event::Waiting(false));
+        self.turn = started.then(|| turn.to_owned());
+    }
+    fn publish_turn_status(&mut self, status: &Value, step: &mut Step) {
+        if !self.busy {
+            self.active_items.clear();
+            self.output_streams.clear();
+            self.output_windows.clear();
+        }
+        step.events.push(Event::Status {
+            busy: self.busy,
+            detail: turn_detail(status),
+        });
     }
     fn request(&mut self, frame: Value, step: &mut Step) -> Result<(), String> {
         let id = rpc_id(&frame["id"])?;
@@ -1739,7 +1877,7 @@ impl Adapter for Codex {
                         let mut params = json!({"threadId":self.thread,"input":input});
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
-                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0 })?;
+                        self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0, completions: BTreeMap::new(), completion_bytes: 0 })?;
                         self.notification_turn = None;
                         step.notification_preview = Some(Default::default());
                         self.suggestion_turn = None;
@@ -2027,7 +2165,9 @@ impl Adapter for Codex {
                     error["message"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| error.to_string())
+                        .unwrap_or_else(|| {
+                            "The provider reported an error without a readable message".into()
+                        })
                 );
                 step.events
                     .push(if matches!(pending, Pending::History { .. }) {
@@ -2139,6 +2279,10 @@ impl Adapter for Codex {
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
                     self.busy = thread["status"]["type"] == "active";
+                    if self.busy && self.turn.is_none() {
+                        self.lifecycle_unidentified = true;
+                        self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
+                    }
                     step.events.push(Event::PermissionMode(
                         permission_mode(&result["approvalPolicy"], &result["sandbox"])
                             .map(str::to_owned),
@@ -2410,10 +2554,18 @@ impl Adapter for Codex {
                     model,
                     tier,
                     mut early,
+                    mut completions,
                     ..
                 } => {
                     self.materialized = true;
                     let id = string(&result["turn"], "id")?;
+                    if id.is_empty() {
+                        return Err("Codex acknowledged an empty turn identity".into());
+                    }
+                    // Keep both exact notification and lifecycle ownership:
+                    // correlation alone never displaces newer observed work.
+                    let ack_lifecycle_authority =
+                        revision == self.lifecycle_revision || self.turn.as_deref() == Some(id);
                     let owns_current = notification_revision == self.notification_revision
                         || self.notification_turn.as_deref() == Some(id);
                     let early_completion = early.remove(id);
@@ -2426,15 +2578,21 @@ impl Adapter for Codex {
                             // Scalar idle can follow this early completion.
                             // It announces no newer work to protect from replay.
                             || (!self.busy
-                                && !early_completion.as_ref().is_some_and(|entry| entry.superseded)));
+                                && !early_completion.as_ref().is_some_and(|entry| entry.superseded)))
+                        && ack_lifecycle_authority;
+                    let completion_authority = owns_lifecycle;
                     let early_completion = early_completion.filter(|_| owns_lifecycle);
+                    if completion_authority {
+                        self.lifecycle_turn = Some(id.to_owned());
+                        self.lifecycle_unidentified = false;
+                    }
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
                     if owns_lifecycle {
                         self.notification_turn = Some(id.to_owned());
                     }
-                    if revision == self.lifecycle_revision {
+                    if owns_lifecycle && revision == self.lifecycle_revision {
                         self.turn = Some(id.into());
                         self.busy = true;
                         self.subagent_status = Some(ToolStatus::Running);
@@ -2456,6 +2614,9 @@ impl Adapter for Codex {
                     } else {
                         None
                     };
+                    let replayed_completion = early_completion
+                        .as_ref()
+                        .is_some_and(|entry| entry.completed.is_some());
                     if let Some(early) = early_completion {
                         if !early.preview_transferred {
                             step.notification_preview = Some(early.preview);
@@ -2479,8 +2640,9 @@ impl Adapter for Codex {
                         // The replay above normally settles the exact managed
                         // execution too. Otherwise retain its outcome without
                         // changing a newer conversation lifecycle.
-                        self.finish_execution(&completed, &mut step, true)?;
-                        if !self.busy || self.turn.as_deref() == Some(id) {
+                        self.finish_execution(&completed, completion_authority, &mut step, true)?;
+                        if completion_authority && (!self.busy || self.turn.as_deref() == Some(id))
+                        {
                             self.busy = false;
                             self.turn = None;
                             step.events.push(Event::Status {
@@ -2488,6 +2650,31 @@ impl Adapter for Codex {
                                 detail: turn_detail(&completed["status"]),
                             });
                         }
+                    }
+                    if let Some(completed) = completions.remove(id)
+                        && !completed.announced
+                        && !replayed_completion
+                        && completion_authority
+                    {
+                        let thread = self
+                            .thread
+                            .clone()
+                            .ok_or("Codex completion has no confirmed thread")?;
+                        self.resolve_turn_requests(&thread, id, &mut step);
+                        step.events.push(Event::TurnFinished {
+                            key: Some(format!("codex:{thread}:{id}")),
+                            outcome: completed.outcome,
+                        });
+                        self.observe_turn_lifecycle(id, &completed.status, false, &mut step);
+                        self.publish_turn_status(&completed.status, &mut step);
+                        if let Some(message) = completed.error {
+                            step.events.push(Event::Error {
+                                message,
+                                fatal: false,
+                            });
+                        }
+                        self.notification_revision = self.notification_revision.wrapping_add(1);
+                        self.notification_turn = None;
                     }
                 }
                 // The one visible effect of compaction is the context figure,
@@ -2664,6 +2851,17 @@ impl Adapter for Codex {
             if let Some(id) = thread
                 && self.children.contains_key(id)
             {
+                // Forwarded child decisions are held by the parent, rather
+                // than the child's adapter. End only this exact turn's scope.
+                if method == "turn/completed"
+                    && matches!(
+                        params["turn"]["status"].as_str(),
+                        Some("completed" | "failed" | "interrupted")
+                    )
+                    && let Some(turn) = params["turn"]["id"].as_str()
+                {
+                    self.resolve_turn_requests(id, turn, &mut step);
+                }
                 if method == "serverRequest/resolved" {
                     let request_id = rpc_id(&params["requestId"])?;
                     if self.requests.get(&request_id).is_some_and(|request| {
@@ -2806,6 +3004,9 @@ impl Adapter for Codex {
             "turn/started" | "turn/completed" => {
                 let turn = &params["turn"];
                 let turn_id = string(turn, "id")?;
+                if turn_id.is_empty() {
+                    return Err("Codex reported an empty turn identity".into());
+                }
                 // A completed ID is current only when a start, active attach,
                 // or exact accepted request reply has established ownership.
                 let current =
@@ -2848,7 +3049,7 @@ impl Adapter for Codex {
                     step.events.push(Event::TurnStarted);
                 }
                 self.materialized = true;
-                if method == "turn/completed" && current {
+                if method == "turn/completed" {
                     use crate::notifications::Kind;
                     let outcome = match turn["status"].as_str() {
                         Some("completed") => Some(Kind::Succeeded),
@@ -2857,13 +3058,25 @@ impl Adapter for Codex {
                         _ => None,
                     };
                     if let Some(outcome) = outcome {
-                        step.events.push(Event::TurnFinished {
-                            key: Some(format!(
-                                "codex:{}:{}",
-                                string(params, "threadId")?,
-                                string(turn, "id")?
-                            )),
+                        let thread = string(params, "threadId")?;
+                        self.remember_pending_completion(
+                            turn_id,
+                            &turn["status"],
                             outcome,
+                            turn["error"].is_object().then(|| {
+                                turn["error"]["message"]
+                                    .as_str()
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| turn["error"].to_string())
+                            }),
+                            current,
+                        )?;
+                        self.resolve_turn_requests(thread, turn_id, &mut step);
+                        let key = Some(format!("codex:{thread}:{turn_id}"));
+                        step.events.push(if current {
+                            Event::TurnFinished { key, outcome }
+                        } else {
+                            Event::PastTurnFinished { key, outcome }
                         });
                     }
                 }
@@ -2889,20 +3102,12 @@ impl Adapter for Codex {
                     self.prediction_turn = None;
                 }
                 if current {
-                    if method == "turn/completed" {
-                        step.events.push(Event::TurnSettled);
-                    }
-                    self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
-                    self.busy = method == "turn/started";
-                    self.subagent_waiting = false;
-                    self.subagent_detail = turn_detail(&turn["status"]);
-                    self.subagent_status = if self.busy {
-                        Some(ToolStatus::Running)
-                    } else {
-                        agent_status(&turn["status"])
-                    };
-                    step.events.push(Event::Waiting(false));
-                    self.turn = self.busy.then(|| turn_id.to_owned());
+                    self.observe_turn_lifecycle(
+                        turn_id,
+                        &turn["status"],
+                        method == "turn/started",
+                        &mut step,
+                    );
                 }
                 for value in array(turn, "items")? {
                     let mut windows = BTreeMap::new();
@@ -2924,17 +3129,9 @@ impl Adapter for Codex {
                 // Non-blocking questions can outlive their originating turn.
                 // Only serverRequest/resolved or thread closure invalidates them.
                 if current {
-                    if !self.busy {
-                        self.active_items.clear();
-                        self.output_streams.clear();
-                        self.output_windows.clear();
-                    }
-                    step.events.push(Event::Status {
-                        busy: self.busy,
-                        detail: turn_detail(&turn["status"]),
-                    });
+                    self.publish_turn_status(&turn["status"], &mut step);
                 }
-                if turn["error"].is_object() {
+                if current && turn["error"].is_object() {
                     step.events.push(Event::Error {
                         message: turn["error"]["message"]
                             .as_str()
@@ -2944,7 +3141,7 @@ impl Adapter for Codex {
                     });
                 }
                 if method == "turn/completed" {
-                    self.finish_execution(turn, &mut step, false)?;
+                    self.finish_execution(turn, current, &mut step, false)?;
                     if current {
                         self.notification_revision = self.notification_revision.wrapping_add(1);
                         self.notification_turn = None;
@@ -3166,7 +3363,7 @@ impl Adapter for Codex {
                 let message = params["error"]["message"]
                     .as_str()
                     .map(str::to_owned)
-                    .unwrap_or_else(|| params["error"].to_string());
+                    .unwrap_or_else(|| "Codex reported an error without a readable message".into());
                 // A retry describes work still in progress. Putting it in
                 // Snapshot.error leaves a recovered turn marked as failed.
                 if params["willRetry"] == true {
@@ -3187,9 +3384,10 @@ impl Adapter for Codex {
                     .as_str()
                     .or_else(|| params["summary"].as_str())
                     .filter(|text| !text.trim().is_empty());
-                let mut message = summary
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| params.to_string());
+                let mut message = summary.map(str::to_owned).unwrap_or_else(|| {
+                    "Codex reported a configuration warning; check the provider log for details"
+                        .into()
+                });
                 if summary.is_some() {
                     for key in ["details", "path"] {
                         if let Some(text) = params[key].as_str().filter(|text| !text.is_empty()) {
@@ -3283,6 +3481,9 @@ impl Codex {
         }
         self.lifecycle_revision = self.lifecycle_revision.saturating_add(1);
         self.busy = status["type"] == "active";
+        if self.busy && self.turn.is_none() {
+            self.lifecycle_unidentified = true;
+        }
         self.subagent_waiting = waiting_on_user(status);
         self.subagent_detail = status_detail(status);
         match status["type"].as_str() {
@@ -4526,36 +4727,6 @@ mod tests {
         });
     }
 
-    fn output_window_command(output: &str) -> Value {
-        json!({"id":"window-cmd","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":output})
-    }
-    fn output_window_started(output: &str) -> Value {
-        json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"window-turn","item":output_window_command(output)}})
-    }
-    fn output_window_delta(delta: &str) -> Value {
-        json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"window-turn","itemId":"window-cmd","delta":delta}})
-    }
-    fn large_window_output() -> String {
-        format!(
-            "first🦀\n{}last🦀\n",
-            "middle🦀\n".repeat(MAX_ITEM_BYTES / 8)
-        )
-    }
-    fn assert_window_accounting(adapter: &Codex, source: &str) {
-        let key = item_key("window-turn", "window-cmd");
-        let item = adapter.active_items.get(&key).unwrap();
-        let ItemContent::Command { output, .. } = &item.content else {
-            panic!("missing command");
-        };
-        let window = adapter.output_windows.get(&key).unwrap();
-        assert!(window.omitted > 0);
-        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
-        assert!(output.contains(&marker));
-        assert!(output.starts_with("first🦀\n"));
-        assert!(source.ends_with(output.rsplit_once(&marker).unwrap().1));
-        assert_eq!(source.len(), output.len() - marker.len() + window.omitted);
-        assert!(item.content.byte_len() <= MAX_ITEM_BYTES);
-    }
     #[test]
     fn snapshot_output_preserves_its_partial_terminal_state_for_the_next_delta() {
         for snapshot in ["item", "turn", "history"] {
@@ -4620,6 +4791,38 @@ mod tests {
         }
     }
 
+    fn output_window_command(output: &str) -> Value {
+        json!({"id":"window-cmd","type":"commandExecution","command":"cat data","cwd":"/tmp","status":"inProgress","aggregatedOutput":output})
+    }
+    fn output_window_started(output: &str) -> Value {
+        json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"window-turn","item":output_window_command(output)}})
+    }
+    fn output_window_delta(delta: &str) -> Value {
+        json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"window-turn","itemId":"window-cmd","delta":delta}})
+    }
+    fn large_window_output() -> String {
+        format!(
+            "first🦀\n{}last🦀\n",
+            "middle🦀\n".repeat(MAX_ITEM_BYTES / 8)
+        )
+    }
+    fn assert_window_accounting(adapter: &Codex, source: &str) {
+        let key = item_key("window-turn", "window-cmd");
+        let item = adapter.active_items.get(&key).unwrap();
+        let ItemContent::Command { output, .. } = &item.content else {
+            panic!("missing command");
+        };
+        let window = adapter.output_windows.get(&key).unwrap();
+        assert!(window.omitted > 0);
+        let marker = format!("\n[... {} bytes omitted ...]\n", window.omitted);
+        assert_eq!(output.matches("\n[... ").count(), 1);
+        let (head, tail) = output.split_once(&marker).unwrap();
+        assert!(source.starts_with(head));
+        assert!(source.ends_with(tail));
+        assert_eq!(head.len(), window.head);
+        assert_eq!(source.len(), head.len() + tail.len() + window.omitted);
+        assert!(item.content.byte_len() <= MAX_ITEM_BYTES);
+    }
     #[test]
     fn repeated_native_started_replaces_clipped_window_and_partial_decoder_together() {
         for whole_turn in [false, true] {
@@ -4639,6 +4842,7 @@ mod tests {
                 output_window_started(replacement)
             };
             adapter.receive(frame).unwrap();
+            assert!(!adapter.output_streams.contains_key(&key));
             let window = adapter.output_windows.get(&key).unwrap();
             assert_eq!((window.omitted, window.head), (0, 0));
             let delta = "31m-tail🦀";
@@ -4651,38 +4855,97 @@ mod tests {
     }
     #[test]
     fn native_started_snapshot_retains_original_clipping_accounting_for_next_delta() {
-        let mut adapter = adapter();
-        adapter.busy = true;
-        let mut source = large_window_output();
-        adapter.receive(output_window_started(&source)).unwrap();
-        assert_window_accounting(&adapter, &source);
-        let delta = "new-tail🦀\n";
-        source.push_str(delta);
-        adapter.receive(output_window_delta(delta)).unwrap();
-        assert_window_accounting(&adapter, &source);
+        for whole_turn in [false, true] {
+            for initial in [
+                large_window_output(),
+                format!("first{}last", "x".repeat(MAX_ITEM_BYTES * 2)),
+            ] {
+                let mut adapter = adapter();
+                adapter.busy = true;
+                let mut source = initial;
+                let snapshot = if whole_turn {
+                    json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"window-turn","status":"inProgress","items":[output_window_command(&source)]}}})
+                } else {
+                    output_window_started(&source)
+                };
+                adapter.receive(snapshot).unwrap();
+                assert_window_accounting(&adapter, &source);
+                let key = item_key("window-turn", "window-cmd");
+                let initial_omitted = adapter.output_windows[&key].omitted;
+                for delta in ["new-tail🦀\n".to_owned(), "y".repeat(2048)] {
+                    source.push_str(&delta);
+                    let streamed = adapter.receive(output_window_delta(&delta)).unwrap();
+                    assert_window_accounting(&adapter, &source);
+                    let ItemContent::Command { output, .. } = &adapter.active_items[&key].content
+                    else {
+                        panic!("missing command");
+                    };
+                    assert!(streamed.events.iter().any(|event| matches!(event,
+                        Event::Item(Item { content: ItemContent::Command { output: shown, .. }, .. }) if shown == output
+                    )));
+                    assert!(adapter.output_windows[&key].omitted >= initial_omitted);
+                }
+                let mut completed = output_window_command("authoritative final output🦀\n");
+                completed["status"] = json!("completed");
+                let finished = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"window-turn","item":completed}})).unwrap();
+                assert!(finished.events.iter().any(|event| matches!(event,
+                    Event::Item(Item { content: ItemContent::Command { status: ToolStatus::Succeeded, output, .. }, .. })
+                    if output == "authoritative final output🦀\n"
+                )));
+                assert!(!adapter.active_items.contains_key(&key));
+                assert!(!adapter.output_windows.contains_key(&key));
+                assert!(!adapter.output_streams.contains_key(&key));
+            }
+        }
     }
     #[test]
     fn active_history_hydration_retains_clipping_window_without_replacing_live_owner() {
-        for existing in [false, true] {
-            let mut adapter = adapter();
-            adapter.busy = true;
-            let mut source = large_window_output();
-            if existing {
-                adapter.receive(output_window_started("")).unwrap();
-                adapter.receive(output_window_delta(&source)).unwrap();
+        for initial in [
+            large_window_output(),
+            format!("first{}last", "x".repeat(MAX_ITEM_BYTES * 2)),
+        ] {
+            for existing in [false, true] {
+                let mut adapter = adapter();
+                adapter.busy = true;
+                let mut source = initial.clone();
+                if existing {
+                    adapter.receive(output_window_started("")).unwrap();
+                    adapter.receive(output_window_delta(&source)).unwrap();
+                }
+                let mut step = Step::default();
+                let page_output = if existing {
+                    "older page must not replace the current stream"
+                } else {
+                    &source
+                };
+                adapter.page(&json!({"data":[{"id":"window-turn","status":"inProgress","items":[output_window_command(page_output)]}],"nextCursor":null}), &mut step, false).unwrap();
+                assert_window_accounting(&adapter, &source);
+                let key = item_key("window-turn", "window-cmd");
+                let initial_omitted = adapter.output_windows[&key].omitted;
+                for delta in ["history-followed-by-tail🦀\n".to_owned(), "x".repeat(1024)] {
+                    source.push_str(&delta);
+                    let streamed = adapter.receive(output_window_delta(&delta)).unwrap();
+                    assert_window_accounting(&adapter, &source);
+                    let ItemContent::Command { output, .. } = &adapter.active_items[&key].content
+                    else {
+                        panic!("missing command");
+                    };
+                    assert!(streamed.events.iter().any(|event| matches!(event,
+                        Event::Item(Item { content: ItemContent::Command { output: shown, .. }, .. }) if shown == output
+                    )));
+                    assert!(adapter.output_windows[&key].omitted >= initial_omitted);
+                }
+                let mut completed = output_window_command("authoritative final output🦀\n");
+                completed["status"] = json!("completed");
+                let finished = adapter.receive(json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"window-turn","item":completed}})).unwrap();
+                assert!(finished.events.iter().any(|event| matches!(event,
+                    Event::Item(Item { content: ItemContent::Command { status: ToolStatus::Succeeded, output, .. }, .. })
+                    if output == "authoritative final output🦀\n"
+                )));
+                assert!(!adapter.active_items.contains_key(&key));
+                assert!(!adapter.output_windows.contains_key(&key));
+                assert!(!adapter.output_streams.contains_key(&key));
             }
-            let mut step = Step::default();
-            let page_output = if existing {
-                "older page must not replace the current stream"
-            } else {
-                &source
-            };
-            adapter.page(&json!({"data":[{"id":"window-turn","status":"inProgress","items":[output_window_command(page_output)]}],"nextCursor":null}),&mut step,false).unwrap();
-            assert_window_accounting(&adapter, &source);
-            let delta = "history-followed-by-tail🦀\n";
-            source.push_str(delta);
-            adapter.receive(output_window_delta(delta)).unwrap();
-            assert_window_accounting(&adapter, &source);
         }
     }
 
@@ -5839,6 +6102,8 @@ mod tests {
             pricing: Default::default(),
             turn_pricing: Default::default(),
             turn: None,
+            lifecycle_turn: None,
+            lifecycle_unidentified: false,
             notification_turn: None,
             notification_revision: 0,
             busy: false,
@@ -6403,6 +6668,932 @@ mod tests {
                         .any(|event| matches!(event, Event::TurnSettled))
                 );
             }
+        }
+    }
+
+    /// Initialized Codex protocol state feeds the actual actor and SQLite Store.
+    /// Only the provider transport is replaced: batches are injected at command
+    /// boundaries and outgoing RPCs are not sent to a live provider.
+    struct RuntimeFrames {
+        adapter: Codex,
+        batches: crossbeam_channel::Receiver<Vec<Value>>,
+        outgoing: crossbeam_channel::Sender<Value>,
+    }
+    impl RuntimeFrames {
+        fn without_transport(&self, mut step: Step) -> Step {
+            for frame in step.writes.drain(..) {
+                let _ = self.outgoing.send(frame);
+            }
+            step
+        }
+    }
+    impl Adapter for RuntimeFrames {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::Ready(true),
+                    Event::Capabilities(self.adapter.capabilities()),
+                ],
+                ..Default::default()
+            })
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            if !matches!(command, Command::Compact) {
+                let step = self.adapter.command(command)?;
+                return Ok(self.without_transport(step));
+            }
+            let mut step = Step::default();
+            for frame in self.batches.try_recv().map_err(|_| "No fixture batch")? {
+                let received = self.adapter.receive(frame)?;
+                step.events.extend(self.without_transport(received).events);
+            }
+            Ok(step)
+        }
+        fn command_for_run(
+            &mut self,
+            run: crate::model::RunId,
+            command: Command,
+        ) -> Result<Step, String> {
+            let step = self.adapter.command_for_run(run, command)?;
+            Ok(self.without_transport(step))
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Err("Unexpected provider transport frame".into())
+        }
+    }
+    fn runtime_frames(
+        adapter: Codex,
+        batches: Vec<Vec<Value>>,
+    ) -> (
+        chat::runtime::Handle,
+        crossbeam_channel::Receiver<chat::runtime::Update>,
+    ) {
+        let (handle, updates, frames, _) = controlled_runtime_frames(adapter);
+        for batch in batches {
+            frames.send(batch).unwrap();
+        }
+        (handle, updates)
+    }
+    fn controlled_runtime_frames(
+        adapter: Codex,
+    ) -> (
+        chat::runtime::Handle,
+        crossbeam_channel::Receiver<chat::runtime::Update>,
+        crossbeam_channel::Sender<Vec<Value>>,
+        crossbeam_channel::Receiver<Value>,
+    ) {
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let (frames, batches) = crossbeam_channel::unbounded();
+        let (outgoing, writes) = crossbeam_channel::unbounded();
+        let mut adapter = RuntimeFrames {
+            adapter,
+            batches,
+            outgoing,
+        };
+        let mut initial = adapter.initialize().unwrap();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = chat::runtime::Handle::start(
+            spec,
+            Box::new(adapter),
+            initial,
+            store,
+            None,
+            move |update| {
+                let _ = send.send(update);
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.snapshot(None).unwrap().ready {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime fixture did not become ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (handle, receive, frames, writes)
+    }
+    fn turn_frame(thread: &str, turn: &str, status: &str) -> Value {
+        json!({"method":if status == "inProgress" { "turn/started" } else { "turn/completed" },"params":{"threadId":thread,"turn":{"id":turn,"status":status,"items":[]}}})
+    }
+    fn approval_frame(id: &str, thread: &str, turn: &str) -> Value {
+        json!({"id":id,"method":"item/commandExecution/requestApproval","params":{"threadId":thread,"turnId":turn,"itemId":"cmd","availableDecisions":["accept","decline"],"command":"echo fixture"}})
+    }
+    fn command_frame(thread: &str, turn: &str) -> Value {
+        json!({"method":"item/started","params":{"threadId":thread,"turnId":turn,"item":{"id":"cmd","type":"commandExecution","command":"echo fixture","cwd":"/tmp","status":"inProgress","aggregatedOutput":"retained output","commandActions":[]}}})
+    }
+    fn feed_frames(
+        handle: &chat::runtime::Handle,
+        frames: &crossbeam_channel::Sender<Vec<Value>>,
+        batch: Vec<Value>,
+    ) {
+        frames.send(batch).unwrap();
+        handle.command(Command::Compact).unwrap();
+    }
+    fn runtime_prompt(
+        handle: &chat::runtime::Handle,
+        writes: &crossbeam_channel::Receiver<Value>,
+        run: Option<crate::model::RunId>,
+    ) -> Value {
+        let command = Command::Prompt {
+            text: "new prompt".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        };
+        if let Some(run) = run {
+            handle.command_for_run(run, command).unwrap();
+        } else {
+            handle.command(command).unwrap();
+        }
+        writes
+            .try_iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .expect("real Codex turn/start request")
+    }
+
+    #[test]
+    fn old_completion_during_pending_prompt_cannot_suppress_exact_start_acknowledgement() {
+        for status in ["failed", "interrupted"] {
+            let (handle, updates, frames, writes) = controlled_runtime_frames(adapter());
+            feed_frames(
+                &handle,
+                &frames,
+                vec![
+                    turn_frame("thread-exact", "old", "inProgress"),
+                    turn_frame("thread-exact", "old", "completed"),
+                ],
+            );
+            writes.try_iter().for_each(drop);
+            let request = runtime_prompt(&handle, &writes, None);
+            let pending = handle.snapshot(None).unwrap();
+            assert!(
+                pending.busy,
+                "the real actor marks the submitted prompt busy before its acknowledgement"
+            );
+            updates.try_iter().for_each(drop);
+            feed_frames(
+                &handle,
+                &frames,
+                vec![turn_frame("thread-exact", "old", status)],
+            );
+            let replayed = handle.snapshot(None).unwrap();
+            assert!(replayed.busy);
+            assert_eq!(replayed.outcome, pending.outcome);
+            assert_eq!(replayed.turn_generation, pending.turn_generation);
+            assert!(!updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:old")));
+            feed_frames(
+                &handle,
+                &frames,
+                vec![
+                    json!({"id":request["id"],"result":{"turn":{"id":"new","status":"inProgress"}}}),
+                ],
+            );
+            assert!(
+                handle.snapshot(None).unwrap().busy,
+                "old completion must not invalidate the pending start's revision"
+            );
+            feed_frames(
+                &handle,
+                &frames,
+                vec![
+                    turn_frame("thread-exact", "new", "inProgress"),
+                    command_frame("thread-exact", "new"),
+                    approval_frame("new-approval", "thread-exact", "new"),
+                ],
+            );
+            let started = handle.snapshot(None).unwrap();
+            assert!(started.busy);
+            assert_eq!(started.requests.len(), 1);
+            assert_eq!(started.items[0].content.status(), Some(ToolStatus::Running));
+            feed_frames(
+                &handle,
+                &frames,
+                vec![turn_frame("thread-exact", "new", "completed")],
+            );
+            assert_eq!(
+                handle.snapshot(None).unwrap().activity(),
+                crate::agent::ActivityState::Idle
+            );
+            handle.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn exact_pre_ack_completion_settles_once_and_preserves_native_and_managed_results() {
+        use crate::{
+            agent::ActivityOutcome,
+            agent_execution::{State, Update},
+            notifications::Kind,
+        };
+        for (status, outcome, finished) in [
+            ("completed", Kind::Succeeded, State::Succeeded),
+            ("failed", Kind::Failed, State::Failed),
+            ("interrupted", Kind::Cancelled, State::Cancelled),
+        ] {
+            for announced in [false, true] {
+                for managed in [false, true] {
+                    let (handle, updates, frames, writes) = controlled_runtime_frames(adapter());
+                    let run = managed.then(crate::model::RunId::new);
+                    let request = runtime_prompt(&handle, &writes, run);
+                    if announced {
+                        feed_frames(
+                            &handle,
+                            &frames,
+                            vec![turn_frame("thread-exact", "new", "inProgress")],
+                        );
+                    }
+                    let mut completion = turn_frame("thread-exact", "new", status);
+                    completion["params"]["turn"]["items"] =
+                        json!([{"id":"answer","type":"agentMessage","text":"retained answer"}]);
+                    if status == "failed" {
+                        completion["params"]["turn"]["error"] = json!({"message":"exact failure"});
+                    }
+                    feed_frames(&handle, &frames, vec![completion]);
+                    let before_ack = handle.snapshot(None).unwrap();
+                    assert_eq!(before_ack.busy, !announced);
+                    let mut evidence = updates.try_iter().collect::<Vec<_>>();
+                    if !announced {
+                        assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:new")));
+                    }
+                    feed_frames(
+                        &handle,
+                        &frames,
+                        vec![
+                            json!({"id":request["id"],"result":{"turn":{"id":"new","status":"inProgress"}}}),
+                        ],
+                    );
+                    let after = handle.snapshot(None).unwrap();
+                    assert!(!after.busy);
+                    assert_eq!(after.activity(), crate::agent::ActivityState::Idle);
+                    assert_eq!(after.items.len(), 1);
+                    assert_eq!(after.items[0].content, before_ack.items[0].content);
+                    assert_eq!(
+                        after.outcome,
+                        Some(match outcome {
+                            Kind::Succeeded => ActivityOutcome::Succeeded,
+                            Kind::Failed => ActivityOutcome::Failed {
+                                reason: "exact failure".into()
+                            },
+                            Kind::Cancelled => ActivityOutcome::Cancelled,
+                            _ => unreachable!(),
+                        })
+                    );
+                    evidence.extend(updates.try_iter());
+                    assert_eq!(evidence.iter().filter(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:new" && evidence.kind == outcome)).count(), 1);
+                    let results = evidence
+                        .iter()
+                        .filter_map(|update| match update {
+                            chat::runtime::Update::Execution {
+                                run: actual,
+                                update: Update::Finished { state, result },
+                            } if Some(*actual) == run => Some((state, result)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if managed {
+                        assert_eq!(results.len(), 1);
+                        assert_eq!(*results[0].0, finished);
+                        assert_eq!(results[0].1.text, "retained answer");
+                        if status == "failed" {
+                            assert_eq!(results[0].1.diagnostic.as_deref(), Some("exact failure"));
+                        }
+                    } else {
+                        assert!(results.is_empty());
+                    }
+                    handle.close().unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_ack_for_an_early_completion_cannot_displace_a_newer_turn() {
+        for managed in [false, true] {
+            let (handle, updates, frames, writes) = controlled_runtime_frames(adapter());
+            let request = runtime_prompt(&handle, &writes, managed.then(crate::model::RunId::new));
+            feed_frames(
+                &handle,
+                &frames,
+                vec![
+                    turn_frame("thread-exact", "new", "completed"),
+                    turn_frame("thread-exact", "newer", "inProgress"),
+                    command_frame("thread-exact", "newer"),
+                    approval_frame("newer-approval", "thread-exact", "newer"),
+                ],
+            );
+            let before = handle.snapshot(None).unwrap();
+            updates.try_iter().for_each(drop);
+            feed_frames(
+                &handle,
+                &frames,
+                vec![
+                    json!({"id":request["id"],"result":{"turn":{"id":"new","status":"inProgress"}}}),
+                ],
+            );
+            let after = handle.snapshot(None).unwrap();
+            assert!(after.busy);
+            assert_eq!(after.requests, before.requests);
+            assert_eq!(after.items, before.items);
+            assert_eq!(after.outcome, before.outcome);
+            assert_eq!(after.turn_generation, before.turn_generation);
+            assert!(!updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:new")));
+            // Settle only this fixture's surviving turn after every ownership
+            // assertion. Production close must not wait for an interruption
+            // reply that the transport-free fixture can never deliver.
+            feed_frames(
+                &handle,
+                &frames,
+                vec![turn_frame("thread-exact", "newer", "completed")],
+            );
+            assert!(!handle.snapshot(None).unwrap().busy);
+            handle.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn pending_completion_receipts_fail_explicitly_at_their_bounds() {
+        let mut pending = adapter();
+        pending
+            .command(Command::Prompt {
+                text: "pending".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        for _ in 0..16 {
+            pending
+                .receive(turn_frame("thread-exact", "same", "completed"))
+                .unwrap();
+        }
+        for index in 0..7 {
+            pending
+                .receive(turn_frame(
+                    "thread-exact",
+                    &format!("other-{index}"),
+                    "completed",
+                ))
+                .unwrap();
+        }
+        let revision = pending.lifecycle_revision;
+        assert!(
+            pending
+                .receive(turn_frame("thread-exact", "ninth", "completed"))
+                .unwrap_err()
+                .contains("correlation capacity")
+        );
+        assert_eq!(pending.lifecycle_revision, revision);
+        let mut oversized = adapter();
+        oversized
+            .command(Command::Prompt {
+                text: "pending".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        assert!(
+            oversized
+                .receive(turn_frame(
+                    "thread-exact",
+                    &"x".repeat(crate::agent_execution::MAX_RESULT_BYTES + 1),
+                    "completed"
+                ))
+                .unwrap_err()
+                .contains("correlation capacity")
+        );
+        let mut error_bound = adapter();
+        let prompt = error_bound
+            .command(Command::Prompt {
+                text: "pending".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let mut failed = turn_frame("thread-exact", "same", "failed");
+        failed["params"]["turn"]["error"] = json!({"message":"first exact failure"});
+        error_bound.receive(failed.clone()).unwrap();
+        failed["params"]["turn"]["error"] =
+            json!({"message":"x".repeat(crate::agent_execution::MAX_RESULT_BYTES)});
+        assert!(
+            error_bound
+                .receive(failed)
+                .unwrap_err()
+                .contains("correlation capacity")
+        );
+        let step = error_bound.receive(json!({"id":prompt.writes[0]["id"],"result":{"turn":{"id":"same","status":"inProgress"}}})).unwrap();
+        assert!(step.events.iter().any(|event| matches!(event, Event::Error { message, fatal: false } if message == "first exact failure")));
+    }
+
+    #[test]
+    fn invalid_completion_scope_cannot_gain_authority_from_a_later_exact_ack() {
+        for invalid in [
+            "missing-thread",
+            "empty-thread",
+            "foreign-thread",
+            "missing-turn",
+            "empty-turn",
+        ] {
+            let mut adapter = adapter();
+            let submitted = adapter
+                .command(Command::Prompt {
+                    text: "pending".into(),
+                    attachments: Vec::new(),
+                    mode: PromptMode::Send,
+                })
+                .unwrap();
+            let mut completion = turn_frame("thread-exact", "new", "failed");
+            match invalid {
+                "missing-thread" => {
+                    completion["params"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("threadId");
+                }
+                "empty-thread" => completion["params"]["threadId"] = json!(""),
+                "foreign-thread" => completion["params"]["threadId"] = json!("foreign"),
+                "missing-turn" => {
+                    completion["params"]["turn"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("id");
+                }
+                "empty-turn" => completion["params"]["turn"]["id"] = json!(""),
+                _ => unreachable!(),
+            }
+            if matches!(invalid, "empty-thread" | "foreign-thread") {
+                assert!(adapter.receive(completion).unwrap().events.is_empty());
+            } else {
+                assert!(adapter.receive(completion).is_err());
+            }
+            let acknowledged = adapter.receive(json!({"id":submitted.writes[0]["id"],"result":{"turn":{"id":"new","status":"inProgress"}}})).unwrap();
+            assert!(
+                adapter.busy,
+                "invalid scope {invalid} must not leave a terminal receipt"
+            );
+            assert_eq!(adapter.turn.as_deref(), Some("new"));
+            assert!(!acknowledged.events.iter().any(|event| matches!(
+                event,
+                Event::TurnFinished { .. } | Event::PastTurnFinished { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn old_codex_completion_cannot_settle_new_work_in_runtime_or_store() {
+        use crate::notifications::Kind;
+        for (status, outcome) in [
+            ("completed", Kind::Succeeded),
+            ("failed", Kind::Failed),
+            ("interrupted", Kind::Cancelled),
+        ] {
+            for known_turn in [false, true] {
+                let mut adapter = adapter();
+                let sent = adapter
+                    .command(Command::Prompt {
+                        text: "old prompt".into(),
+                        attachments: Vec::new(),
+                        mode: PromptMode::Send,
+                    })
+                    .unwrap();
+                let newer = if known_turn {
+                    turn_frame("thread-exact", "new", "inProgress")
+                } else {
+                    json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})
+                };
+                let mut old_completion = turn_frame("thread-exact", "old", status);
+                old_completion["params"]["turn"]["error"] = json!({"message":"old failure"});
+                let (handle, updates, frames, writes) = controlled_runtime_frames(adapter);
+                for batch in [
+                    vec![
+                        turn_frame("thread-exact", "old", "inProgress"),
+                        turn_frame("thread-exact", "old", "completed"),
+                        newer,
+                        command_frame("thread-exact", "new"),
+                        approval_frame("new-approval", "thread-exact", "new"),
+                    ],
+                    vec![
+                        json!({"id":sent.writes[0]["id"],"result":{"turn":{"id":"old","status":"inProgress","items":[]}}}),
+                        old_completion,
+                    ],
+                    // Cleanup follows the assertions below. Make an
+                    // unidentified surviving turn explicit, then finish
+                    // that exact fixture turn through the real adapter.
+                    vec![
+                        turn_frame("thread-exact", "new", "inProgress"),
+                        turn_frame("thread-exact", "new", "completed"),
+                    ],
+                ] {
+                    frames.send(batch).unwrap();
+                }
+                handle.command(Command::Compact).unwrap();
+                let before = handle.snapshot(None).unwrap();
+                assert!(before.busy);
+                assert_eq!(before.items[0].content.status(), Some(ToolStatus::Running));
+                updates.try_iter().for_each(drop);
+                handle.command(Command::Compact).unwrap();
+                let after = handle.snapshot(None).unwrap();
+                assert_eq!(after.requests, before.requests);
+                assert_eq!(
+                    after.items, before.items,
+                    "SQLite must retain the running tool and its output"
+                );
+                assert_eq!(after.turn_generation, before.turn_generation);
+                assert_eq!(after.outcome, before.outcome);
+                assert_eq!(after.error, before.error);
+                assert_eq!(after.finished_at, before.finished_at);
+                assert_eq!(after.waiting, before.waiting);
+                assert!(after.busy);
+                assert_eq!(after.activity(), crate::agent::ActivityState::Waiting);
+                let updates = updates.try_iter().collect::<Vec<_>>();
+                assert!(updates.iter().any(|update| matches!(update, chat::runtime::Update::PastAttention(evidence) if evidence.key == "codex:thread-exact:old" && evidence.kind == outcome)));
+                assert!(!updates.iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:old")));
+                writes.try_iter().for_each(drop);
+                handle
+                    .command(Command::Answer {
+                        request_id: rpc_id(&json!("new-approval")).unwrap(),
+                        action: "decision-0".into(),
+                        answers: Vec::new(),
+                    })
+                    .unwrap();
+                let response = writes
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .unwrap();
+                assert_eq!(response["id"], json!("new-approval"));
+                assert_eq!(response["result"], json!({"decision":"accept"}));
+                assert!(
+                    writes.try_recv().is_err(),
+                    "only the original approval is answered"
+                );
+                handle.command(Command::Compact).unwrap();
+                assert!(!handle.snapshot(None).unwrap().busy);
+                handle.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn old_codex_completion_after_new_turn_settles_keeps_current_outcome() {
+        use crate::notifications::Kind;
+        for (status, outcome) in [("failed", Kind::Failed), ("interrupted", Kind::Cancelled)] {
+            for late_ack in [false, true] {
+                let mut adapter = adapter();
+                let pending = late_ack.then(|| {
+                    adapter
+                        .command(Command::Prompt {
+                            text: "old prompt".into(),
+                            attachments: Vec::new(),
+                            mode: PromptMode::Send,
+                        })
+                        .unwrap()
+                });
+                let (handle, updates, frames, _) = controlled_runtime_frames(adapter);
+                feed_frames(
+                    &handle,
+                    &frames,
+                    vec![
+                        turn_frame("thread-exact", "old", "inProgress"),
+                        turn_frame("thread-exact", "new", "inProgress"),
+                        turn_frame("thread-exact", "new", "completed"),
+                    ],
+                );
+                let before = handle.snapshot(None).unwrap();
+                assert!(!before.busy);
+                assert_eq!(
+                    before.outcome,
+                    Some(crate::agent::ActivityOutcome::Succeeded)
+                );
+                updates.try_iter().for_each(drop);
+                let mut batch = Vec::new();
+                if let Some(pending) = pending {
+                    batch.push(json!({"id":pending.writes[0]["id"],"result":{"turn":{"id":"old","status":"inProgress"}}}));
+                }
+                let mut completion = turn_frame("thread-exact", "old", status);
+                completion["params"]["turn"]["error"] = json!({"message":"old failure"});
+                batch.push(completion);
+                feed_frames(&handle, &frames, batch);
+                let after = handle.snapshot(None).unwrap();
+                assert!(!after.busy);
+                assert_eq!(after.outcome, before.outcome);
+                assert_eq!(after.error, before.error);
+                assert_eq!(after.finished_at, before.finished_at);
+                assert_eq!(after.turn_generation, before.turn_generation);
+                assert_eq!(after.requests, before.requests);
+                let updates = updates.try_iter().collect::<Vec<_>>();
+                assert!(updates.iter().any(|update| matches!(update, chat::runtime::Update::PastAttention(evidence) if evidence.key == "codex:thread-exact:old" && evidence.kind == outcome)));
+                assert!(!updates.iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:old")));
+                handle.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn codex_current_completion_after_idle_status_keeps_its_failure_reason() {
+        use crate::notifications::Kind;
+        let (handle, updates, frames, _) = controlled_runtime_frames(adapter());
+        feed_frames(
+            &handle,
+            &frames,
+            vec![
+                turn_frame("thread-exact", "current", "inProgress"),
+                json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}}),
+            ],
+        );
+        assert!(!handle.snapshot(None).unwrap().busy);
+        updates.try_iter().for_each(drop);
+        let mut completion = turn_frame("thread-exact", "current", "failed");
+        completion["params"]["turn"]["error"] = json!({"message":"current failure"});
+        feed_frames(&handle, &frames, vec![completion]);
+        let after = handle.snapshot(None).unwrap();
+        assert_eq!(after.error.as_deref(), Some("current failure"));
+        assert_eq!(
+            after.outcome,
+            Some(crate::agent::ActivityOutcome::Failed {
+                reason: "current failure".into()
+            })
+        );
+        assert!(updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(evidence) if evidence.key == "codex:thread-exact:current" && evidence.kind == Kind::Failed)));
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn unidentified_codex_activity_cannot_restore_an_old_owner_after_idle() {
+        use crate::notifications::Kind;
+        for attach in [false, true] {
+            let mut adapter = adapter();
+            if attach {
+                adapter
+                    .pending
+                    .insert(rpc_id(&json!("reattach")).unwrap(), Pending::Attach);
+            }
+            let (handle, updates, frames, _) = controlled_runtime_frames(adapter);
+            let mut batch = vec![
+                turn_frame("thread-exact", "old", "inProgress"),
+                turn_frame("thread-exact", "old", "completed"),
+            ];
+            batch.push(if attach {
+                json!({"id":"reattach","result":{"thread":{"id":"thread-exact","status":{"type":"active"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})
+            } else {
+                json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"active"}}})
+            });
+            batch.push(json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}}));
+            feed_frames(&handle, &frames, batch);
+            let before = handle.snapshot(None).unwrap();
+            assert!(!before.busy);
+            updates.try_iter().for_each(drop);
+            let mut completion = turn_frame("thread-exact", "old", "failed");
+            completion["params"]["turn"]["error"] = json!({"message":"old failure"});
+            feed_frames(&handle, &frames, vec![completion]);
+            let after = handle.snapshot(None).unwrap();
+            assert_eq!(after.outcome, before.outcome);
+            assert_eq!(after.error, before.error);
+            assert_eq!(after.turn_generation, before.turn_generation);
+            assert_eq!(after.finished_at, before.finished_at);
+            let evidence = updates.try_iter().collect::<Vec<_>>();
+            assert!(evidence.iter().any(|update| matches!(update, chat::runtime::Update::PastAttention(attention) if attention.key == "codex:thread-exact:old" && attention.kind == Kind::Failed)));
+            assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::Attention(attention) if attention.key == "codex:thread-exact:old")));
+            // A real known start establishes fresh authority after the unknown
+            // activity; the refusal is not a permanent inability to finish.
+            feed_frames(
+                &handle,
+                &frames,
+                vec![turn_frame("thread-exact", "new", "inProgress")],
+            );
+            let started = handle.snapshot(None).unwrap();
+            assert!(started.busy);
+            assert_eq!(started.outcome, None);
+            assert!(started.turn_generation > after.turn_generation);
+            updates.try_iter().for_each(drop);
+            feed_frames(
+                &handle,
+                &frames,
+                vec![turn_frame("thread-exact", "new", "completed")],
+            );
+            assert_eq!(
+                handle.snapshot(None).unwrap().outcome,
+                Some(crate::agent::ActivityOutcome::Succeeded)
+            );
+            assert!(updates.try_iter().any(|update| matches!(update, chat::runtime::Update::Attention(attention) if attention.key == "codex:thread-exact:new" && attention.kind == Kind::Succeeded)));
+            handle.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn past_managed_codex_failure_keeps_its_result_without_replacing_current_error() {
+        use crate::agent_execution::{State, Update};
+        for acknowledged in [false, true] {
+            for settled in [false, true] {
+                let (handle, updates, frames, writes) = controlled_runtime_frames(adapter());
+                let run = crate::model::RunId::new();
+                let request = runtime_prompt(&handle, &writes, Some(run));
+                let ack = json!({"id":request["id"],"result":{"turn":{"id":"old","status":"inProgress"}}});
+                if acknowledged {
+                    feed_frames(&handle, &frames, vec![ack.clone()]);
+                }
+                let mut newer = vec![
+                    turn_frame("thread-exact", "old", "inProgress"),
+                    turn_frame("thread-exact", "new", "inProgress"),
+                ];
+                if settled {
+                    newer.push(turn_frame("thread-exact", "new", "completed"));
+                }
+                feed_frames(&handle, &frames, newer);
+                let before = handle.snapshot(None).unwrap();
+                assert_eq!(before.busy, !settled);
+                assert_eq!(
+                    before.outcome,
+                    settled.then_some(crate::agent::ActivityOutcome::Succeeded)
+                );
+                updates.try_iter().for_each(drop);
+                let mut completion = turn_frame("thread-exact", "old", "failed");
+                completion["params"]["turn"]["error"] = json!({"message":"old accepted failure"});
+                completion["params"]["turn"]["items"] =
+                    json!([{"id":"old-answer","type":"agentMessage","text":"old result"}]);
+                feed_frames(&handle, &frames, vec![completion]);
+                if !acknowledged {
+                    feed_frames(&handle, &frames, vec![ack]);
+                }
+                let after = handle.snapshot(None).unwrap();
+                assert_eq!(after.error, before.error);
+                assert_eq!(after.detail, before.detail);
+                assert_eq!(after.outcome, before.outcome);
+                assert_eq!(after.busy, before.busy);
+                assert_eq!(after.finished_at, before.finished_at);
+                assert_eq!(after.turn_generation, before.turn_generation);
+                let evidence = updates.try_iter().collect::<Vec<_>>();
+                let finished = evidence
+                    .iter()
+                    .filter_map(|update| match update {
+                        chat::runtime::Update::Execution {
+                            run: actual,
+                            update: Update::Finished { state, result },
+                        } if *actual == run => Some((state, result)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(finished.len(), 1);
+                assert_eq!(*finished[0].0, State::Failed);
+                assert_eq!(finished[0].1.text, "old result");
+                assert_eq!(
+                    finished[0].1.diagnostic.as_deref(),
+                    Some("old accepted failure")
+                );
+                assert!(!evidence.iter().any(|update| matches!(update, chat::runtime::Update::Attention(attention) if attention.key == "codex:thread-exact:old")));
+                if !settled {
+                    feed_frames(
+                        &handle,
+                        &frames,
+                        vec![turn_frame("thread-exact", "new", "completed")],
+                    );
+                }
+                handle.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ended_parent_retires_only_its_decisions_through_runtime_and_store() {
+        for status in ["failed", "interrupted"] {
+            let mut parent = adapter();
+            let mut child = adapter();
+            child.thread = Some("child-exact".into());
+            child.is_child = true;
+            parent
+                .children
+                .insert("child-exact".into(), Box::new(child));
+            let optional = json!({"id":"optional","method":"item/tool/requestUserInput","params":{"threadId":"thread-exact","turnId":"parent","isBlocking":false,"questions":[{"id":"scope","header":"Scope","question":"Which?","options":[{"label":"One"}]}]}});
+            let mut blocking = optional.clone();
+            blocking["id"] = json!("blocking");
+            blocking["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("isBlocking");
+            let mut child_optional = optional.clone();
+            child_optional["id"] = json!("child-optional");
+            child_optional["params"]["threadId"] = json!("child-exact");
+            child_optional["params"]["turnId"] = json!("child-turn");
+            let mut unknown_scope = approval_frame("unknown-scope", "thread-exact", "parent");
+            unknown_scope["params"]
+                .as_object_mut()
+                .unwrap()
+                .remove("turnId");
+            let (handle, _) = runtime_frames(
+                parent,
+                vec![
+                    vec![
+                        turn_frame("thread-exact", "parent", "inProgress"),
+                        json!({"method":"thread/started","params":{"thread":{"id":"child-exact","parentThreadId":"thread-exact","status":"running"}}}),
+                        turn_frame("child-exact", "child-turn", "inProgress"),
+                        command_frame("child-exact", "child-turn"),
+                        approval_frame("parent-approval", "thread-exact", "parent"),
+                        approval_frame("child-approval", "child-exact", "child-turn"),
+                        approval_frame("other-turn", "thread-exact", "other"),
+                        unknown_scope,
+                        optional,
+                        blocking,
+                        child_optional,
+                    ],
+                    vec![turn_frame("thread-exact", "parent", status)],
+                    vec![
+                        approval_frame("child-ended", "child-exact", "child-turn"),
+                        turn_frame("child-exact", "child-turn", "failed"),
+                    ],
+                    vec![json!({"method":"thread/closed","params":{"threadId":"child-exact"}})],
+                    vec![
+                        json!({"method":"serverRequest/resolved","params":{"threadId":"thread-exact","requestId":"optional"}}),
+                    ],
+                    vec![
+                        json!({"method":"serverRequest/resolved","params":{"threadId":"thread-exact","requestId":"unknown-scope"}}),
+                        json!({"method":"serverRequest/resolved","params":{"threadId":"thread-exact","requestId":"other-turn"}}),
+                    ],
+                ],
+            );
+            handle.command(Command::Compact).unwrap();
+            handle.command(Command::Compact).unwrap();
+            let after = handle.snapshot(None).unwrap();
+            let ids = after
+                .requests
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>();
+            assert!(!ids.contains(&"\"parent-approval\""));
+            assert!(
+                !ids.contains(&"\"blocking\""),
+                "a missing blocking flag defaults to blocking"
+            );
+            for id in [
+                "child-approval",
+                "other-turn",
+                "unknown-scope",
+                "optional",
+                "child-optional",
+            ] {
+                assert!(
+                    ids.contains(&rpc_id(&json!(id)).unwrap().as_str()),
+                    "surviving request {id} was lost"
+                );
+            }
+            assert!(!after.busy);
+            let child = after
+                .subagents
+                .iter()
+                .find(|child| child.id == "child-exact")
+                .unwrap();
+            assert!(child.background);
+            assert_eq!(child.status, ToolStatus::Running);
+            assert_eq!(child.items[0].content.status(), Some(ToolStatus::Running));
+            handle
+                .command(Command::Answer {
+                    request_id: rpc_id(&json!("child-approval")).unwrap(),
+                    action: "decision-0".into(),
+                    answers: Vec::new(),
+                })
+                .unwrap();
+            assert!(
+                !handle
+                    .snapshot(None)
+                    .unwrap()
+                    .requests
+                    .iter()
+                    .any(|request| request.id == rpc_id(&json!("child-approval")).unwrap())
+            );
+            handle.command(Command::Compact).unwrap();
+            let child_ended = handle.snapshot(None).unwrap();
+            assert!(
+                !child_ended
+                    .requests
+                    .iter()
+                    .any(|request| request.id == rpc_id(&json!("child-ended")).unwrap())
+            );
+            assert_eq!(child_ended.requests.len(), 4);
+            assert!(
+                child_ended
+                    .requests
+                    .iter()
+                    .any(|request| request.id == rpc_id(&json!("optional")).unwrap())
+            );
+            handle.command(Command::Compact).unwrap();
+            let child_closed = handle.snapshot(None).unwrap();
+            assert!(
+                !child_closed
+                    .requests
+                    .iter()
+                    .any(|request| request.id == rpc_id(&json!("child-optional")).unwrap())
+            );
+            assert_eq!(child_closed.requests.len(), 3);
+            handle.command(Command::Compact).unwrap();
+            assert_eq!(handle.snapshot(None).unwrap().requests.len(), 2);
+            handle.command(Command::Compact).unwrap();
+            assert!(handle.snapshot(None).unwrap().requests.is_empty());
+            handle.close().unwrap();
         }
     }
 

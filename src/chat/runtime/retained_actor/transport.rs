@@ -107,6 +107,8 @@ pub(crate) struct Resident {
     pub waiting: bool,
     pub working: bool,
     pub activity: crate::agent::ActivityState,
+    #[serde(default)]
+    pub outcome: Option<crate::agent::ActivityOutcome>,
 
     pub usage: chat::Usage,
     pub native_continuity: chat::NativeContinuity,
@@ -196,6 +198,7 @@ struct Pending {
     payload: Value,
     bytes: usize,
     reply: Option<crossbeam_channel::Sender<Result<(), Rejection>>>,
+    dispatched: bool,
 }
 struct Remote {
     close_only: bool,
@@ -332,7 +335,7 @@ impl RemoteActor {
             waiting: false,
             working: false,
             activity: crate::agent::ActivityState::Idle,
-
+            outcome: None,
             usage: Default::default(),
             native_continuity: Default::default(),
             requests: Vec::new(),
@@ -1052,6 +1055,7 @@ impl RemoteActor {
                         break;
                     }
                     let actor = Self(inner);
+                    actor.dispatch_queued_input();
                     let desired = actor
                         .0
                         .desired_visible
@@ -1151,10 +1155,11 @@ impl RemoteActor {
                 updates.push(Update::Observed { generation });
                 updates.push(Update::Presentation);
             }
-            if resident.activity != state.activity {
+            if resident.activity != state.activity || resident.outcome != state.outcome {
                 updates.push(Update::Activity {
                     state: resident.activity,
                     generation,
+                    outcome: resident.outcome.clone(),
                 });
             }
             if resident.ready && !state.ready {
@@ -1199,6 +1204,7 @@ impl RemoteActor {
     }
     fn publish_closed_inner(&self, snapshot: Snapshot, resident: Option<Resident>) {
         let _publication = self.0.publication.lock().unwrap_or_else(|p| p.into_inner());
+        let outcome = snapshot.outcome.clone();
         *self
             .0
             .final_snapshot
@@ -1217,6 +1223,7 @@ impl RemoteActor {
             *state = Arc::new(resident);
         }
         let state = Arc::make_mut(&mut state);
+        state.outcome = outcome;
         state.completed = true;
         state.owns_work = false;
         state.idle = false;
@@ -1265,6 +1272,7 @@ impl RemoteActor {
         (self.0.notify)(Update::Activity {
             state: crate::agent::ActivityState::Unknown,
             generation,
+            outcome: self.state().outcome.clone(),
         });
         (self.0.notify)(Update::Observed { generation });
         (self.0.notify)(Update::Presentation);
@@ -1354,6 +1362,21 @@ impl RemoteActor {
             decline_only: false,
         })
     }
+    /// Register the stable envelope now; the existing observer performs its
+    /// first exchange, so no IPC input worker waits on a retained helper.
+    pub fn enqueue_deferred(
+        &self,
+        command: Command,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        self.enqueue_payload_inner(
+            InputPayload::Command {
+                run: None,
+                command,
+                decline_only: false,
+            },
+            false,
+        )
+    }
     /// Preserve the actor's refusal-only check across the process boundary.
     pub fn decline_answer(&self, command: Command) -> Result<(), String> {
         self.enqueue_payload(InputPayload::Command {
@@ -1380,6 +1403,13 @@ impl RemoteActor {
     fn enqueue_payload(
         &self,
         payload: InputPayload,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        self.enqueue_payload_inner(payload, true)
+    }
+    fn enqueue_payload_inner(
+        &self,
+        payload: InputPayload,
+        dispatch_now: bool,
     ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
         if self.0.close_only {
             return Err(close_only_refusal());
@@ -1468,14 +1498,36 @@ impl RemoteActor {
                 payload: payload.clone(),
                 bytes: bytes.len(),
                 reply: Some(reply),
+                dispatched: dispatch_now,
             });
         }
         // Preserve the exact identity and envelope before crossing the socket.
         // An ambiguous write keeps the receipt pending and fences new input.
-        if let Ok(receipt) = self.call::<InputReceipt>("input", json!([identity, payload])) {
-            self.apply_receipts(&[receipt]);
+        if dispatch_now {
+            if let Ok(receipt) = self.call::<InputReceipt>("input", json!([identity, payload])) {
+                self.apply_receipts(&[receipt]);
+            }
         }
         Ok(response)
+    }
+    fn dispatch_queued_input(&self) {
+        let next = {
+            let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+            pending
+                .iter_mut()
+                .find(|pending| !pending.dispatched)
+                .map(|pending| {
+                    // Mark before the socket: an ambiguous first exchange must
+                    // retain this envelope and never cause automatic replay.
+                    pending.dispatched = true;
+                    (pending.identity.clone(), pending.payload.clone())
+                })
+        };
+        if let Some((identity, payload)) = next {
+            if let Ok(receipt) = self.call::<InputReceipt>("input", json!([identity, payload])) {
+                self.apply_receipts(&[receipt]);
+            }
+        }
     }
     /// Explicit retransmission of the exact protocol envelope. Existing helper
     /// receipts return the original outcome without invoking the adapter again.
@@ -1491,9 +1543,14 @@ impl RemoteActor {
             .pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .iter()
+            .iter_mut()
             .find(|pending| &pending.identity == identity)
-            .map(|pending| pending.payload.clone())
+            .map(|pending| {
+                // An explicit exchange also claims any unsent deferred
+                // envelope; the observer must not automatically send it again.
+                pending.dispatched = true;
+                pending.payload.clone()
+            })
             .ok_or("The original input envelope is unavailable; never reconstruct it")?;
         let receipt = self.call("input", json!([identity, payload]))?;
         self.apply_receipts(std::slice::from_ref(&receipt));
@@ -1725,6 +1782,9 @@ impl RemoteActor {
     }
     pub fn close(&self) -> Result<(), String> {
         self.close_method("close", Value::Null)
+    }
+    pub fn close_until(&self, deadline: Instant) -> Result<(), String> {
+        self.publish_close_result(self.call_until("close", Value::Null, deadline))
     }
 }
 impl chat::protocol::LaunchCleanup for RemoteActor {
@@ -2109,6 +2169,7 @@ impl Server {
         let usage = state.usage.clone();
         let requests = state.requests.clone();
         let sampled_activity = state.activity();
+        let outcome = state.outcome.clone();
         let prompt_eligible =
             super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
         use crate::notifications::Kind;
@@ -2179,6 +2240,7 @@ impl Server {
             waiting,
             working,
             activity,
+            outcome,
             usage,
             requests,
             notification_content,
@@ -2691,6 +2753,10 @@ impl Server {
             "text_copy" => {
                 let (source, offset) = decode!((chat::TextCopySource, u64));
                 value!(self.actor.text_copy(&source, offset)?)
+            }
+            "provider_exit_output" => {
+                let (log_id, offset) = decode!((String, u64));
+                value!(self.actor.provider_exit_output(&log_id, offset)?)
             }
             "file_query" => {
                 let (command,) = decode!((Command,));
@@ -3288,6 +3354,260 @@ fn terminal_endpoint_error(error: &str, holder_current: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_two_optional_outcome_preserves_legacy_json_and_ownership() {
+        assert_eq!(PROTOCOL, 2);
+        let actor = RemoteActor::fixture();
+        let identity = actor.identity();
+        let source = actor.0.source.clone();
+        let before = actor.state();
+        let close = serde_json::to_value(&before.close).unwrap();
+        let mut legacy = serde_json::to_value(before.as_ref()).unwrap();
+        legacy.as_object_mut().unwrap().remove("outcome");
+        legacy["changed"] = json!(before.changed + 1);
+        let resident: Resident = serde_json::from_value(legacy).unwrap();
+        assert!(resident.outcome.is_none());
+        assert!(actor.publish_resident(resident));
+        let accepted = actor.state();
+        assert!(!accepted.completed);
+        assert!(accepted.owns_work);
+        assert_eq!(serde_json::to_value(&accepted.close).unwrap(), close);
+        assert_eq!(actor.identity(), identity);
+        assert_eq!(actor.0.source, source);
+        assert!(actor.0.final_snapshot.lock().unwrap().is_none());
+
+        #[derive(Deserialize)]
+        struct LegacyResident {
+            completed: bool,
+            owns_work: bool,
+            close: CloseObservation,
+        }
+        let mut current = serde_json::to_value(accepted.as_ref()).unwrap();
+        current["outcome"] = json!({"Failed":{"reason":"display evidence only"}});
+        let old_reader: LegacyResident = serde_json::from_value(current).unwrap();
+        assert!(!old_reader.completed);
+        assert!(old_reader.owns_work);
+        assert_eq!(serde_json::to_value(old_reader.close).unwrap(), close);
+
+        let old_update = r#"{"Activity":{"state":"Idle","generation":7}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Update>(old_update).unwrap(),
+            Update::Activity {
+                generation: 7,
+                outcome: None,
+                ..
+            }
+        ));
+        #[derive(Deserialize)]
+        enum LegacyUpdate {
+            Activity {
+                state: crate::agent::ActivityState,
+                generation: u64,
+            },
+        }
+        let current = Update::Activity {
+            state: crate::agent::ActivityState::Idle,
+            generation: 7,
+            outcome: Some(crate::agent::ActivityOutcome::Cancelled),
+        };
+        let old_reader: LegacyUpdate =
+            serde_json::from_value(serde_json::to_value(current).unwrap()).unwrap();
+        assert!(matches!(
+            old_reader,
+            LegacyUpdate::Activity {
+                state: crate::agent::ActivityState::Idle,
+                generation: 7,
+            }
+        ));
+    }
+
+    #[test]
+    fn older_protocol_two_unknown_output_rpc_is_an_explicit_error_without_retry() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("old-helper.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        let identity = actor.identity();
+        let source = actor.0.source.clone();
+        let proof = actor.0.proof.clone();
+        let epoch = actor.0.epoch;
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.proof, proof);
+            assert_eq!(request.epoch, Some(epoch));
+            assert_eq!(request.method, "provider_exit_output");
+            assert_eq!(request.args, json!(["original-log", 4]));
+            send(
+                &control,
+                &Err::<Value, _>("Unknown retained actor method/version".to_owned()),
+                TIMEOUT,
+            )
+            .unwrap();
+            listener
+        });
+        let result = actor.call::<(Vec<u8>, Option<u64>, u64)>(
+            "provider_exit_output",
+            json!(["original-log", 4]),
+        );
+        assert_eq!(result.unwrap_err(), "Unknown retained actor method/version");
+        let listener = peer.join().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert!(actor.pending_inputs().is_empty());
+        assert_eq!(actor.identity(), identity);
+        assert_eq!(actor.0.source, source);
+        assert!(!actor.state().completed);
+        assert!(actor.state().owns_work);
+    }
+
+    #[test]
+    fn deferred_first_exchange_retains_its_exact_envelope_after_a_lost_reply() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("lost-input-reply.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        let reply = actor
+            .enqueue_deferred(Command::SetFastMode { enabled: true })
+            .unwrap();
+        let identity = actor.pending_inputs().into_iter().next().unwrap();
+        let pending = actor.0.pending.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].dispatched);
+        let payload = pending[0].payload.clone();
+        drop(pending);
+        let expected = identity.clone();
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "input");
+            assert_eq!(request.args, json!([expected, payload]));
+            drop(control); // Provider consumption is deliberately unconfirmed.
+            listener
+        });
+        actor.dispatch_queued_input();
+        let listener = peer.join().unwrap();
+        actor.dispatch_queued_input();
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(actor.pending_inputs(), vec![identity]);
+        assert!(reply.try_recv().is_err());
+        assert!(
+            actor
+                .enqueue_deferred(Command::SetFastMode { enabled: false })
+                .err()
+                .unwrap()
+                .contains("before admitting another input")
+        );
+        assert!(!actor.state().completed);
+        assert!(actor.state().owns_work);
+    }
+
+    #[test]
+    fn explicit_retry_claims_the_unsent_deferred_envelope_without_an_observer_replay() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("explicit-first-exchange.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        let _reply = actor
+            .enqueue_deferred(Command::SetFastMode { enabled: true })
+            .unwrap();
+        let identity = actor.pending_inputs().into_iter().next().unwrap();
+        let expected = identity.clone();
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            let (seen, _): (InputIdentity, Value) = serde_json::from_value(request.args).unwrap();
+            assert_eq!(request.method, "input");
+            assert_eq!(seen, expected);
+            send(
+                &control,
+                &Ok::<Value, String>(
+                    serde_json::to_value(InputReceipt {
+                        identity: seen,
+                        state: InputState::Accepted,
+                    })
+                    .unwrap(),
+                ),
+                TIMEOUT,
+            )
+            .unwrap();
+            listener
+        });
+        let receipt = actor.retry_input(&identity).unwrap();
+        assert_eq!(receipt.identity, identity);
+        assert!(matches!(receipt.state, InputState::Accepted));
+        let listener = peer.join().unwrap();
+        actor.dispatch_queued_input();
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(actor.pending_inputs(), vec![identity]);
+    }
+
+    #[test]
+    fn provider_output_rpc_keeps_attachment_source_and_close_only_fences() {
+        let mut fixture = resident_fixture();
+        let server = &mut fixture.server;
+        let identity = server.identity.clone();
+        let source = server.source.clone();
+        let proof = server.proof.clone();
+        let epoch = server.epoch;
+        for stale_epoch in [true, false] {
+            let mut request = Invocation {
+                proof: proof.clone(),
+                epoch: Some(epoch),
+                method: "provider_exit_output".into(),
+                args: json!("must not decode"),
+            };
+            if stale_epoch {
+                request.epoch = Some(uuid::Uuid::new_v4());
+            } else {
+                request.proof.host_incarnation = crate::model::HostIncarnation::new("foreign");
+            }
+            assert!(server.invoke(request).unwrap_err().contains("superseded"));
+        }
+        let mut foreign = source.clone();
+        foreign.id = crate::model::TerminalId::new();
+        assert!(
+            server
+                .invoke(Invocation {
+                    proof: proof.clone(),
+                    epoch: None,
+                    method: "attach_close".into(),
+                    args: json!([foreign, identity.record]),
+                })
+                .unwrap_err()
+                .contains("source/account identity")
+        );
+        server.close_only = true;
+        assert_eq!(
+            server
+                .invoke(Invocation {
+                    proof,
+                    epoch: Some(epoch),
+                    method: "provider_exit_output".into(),
+                    args: json!(["original-log", 0]),
+                })
+                .unwrap_err(),
+            close_only_refusal()
+        );
+        assert_eq!(server.identity, identity);
+        assert_eq!(server.source, source);
+        assert_eq!(server.epoch, epoch);
+        assert!(!server.actor.is_completed());
+        assert!(server.actor.owns_work());
+        assert!(server.closed_snapshot.is_none());
+    }
 
     #[test]
     fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
@@ -5192,6 +5512,7 @@ exec /bin/sleep 60
             Update::Activity {
                 state: next.activity,
                 generation: next.generation,
+                outcome: next.outcome.clone(),
             },
             Update::Ready,
             Update::PromptAvailable,

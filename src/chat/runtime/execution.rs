@@ -27,6 +27,9 @@ struct Capture {
 }
 
 impl Tracker {
+    pub fn has_pending(&self) -> bool {
+        !self.runs.is_empty()
+    }
     pub fn active(&self) -> Option<RunId> {
         self.active
     }
@@ -48,7 +51,27 @@ impl Tracker {
         ))
     }
 
-    pub fn ended(&mut self, cancelled: bool, usage: Usage) -> Vec<(RunId, Update)> {
+    pub fn ended(
+        &mut self,
+        cancelled: bool,
+        status: Option<std::process::ExitStatus>,
+        diagnostic: Option<&str>,
+        usage: Usage,
+    ) -> Vec<(RunId, Update)> {
+        let state = if cancelled {
+            State::Cancelled
+        } else if status.is_some_and(|status| status.success()) {
+            State::Interrupted
+        } else if status.is_some() {
+            State::Failed
+        } else {
+            State::Interrupted
+        };
+        let reason = if cancelled {
+            "The agent was stopped before its provider reported a final result".to_owned()
+        } else {
+            exit_reason(status, diagnostic)
+        };
         let runs = self.runs.keys().copied().collect::<Vec<_>>();
         let mut updates = Vec::new();
         for run in runs {
@@ -58,27 +81,10 @@ impl Tracker {
             if let Some(capture) = self.runs.get_mut(&run)
                 && let Some(result) = &mut capture.result
             {
-                result.diagnostic = Some(
-                    if cancelled {
-                        "The agent was closed before its provider reported a final result"
-                    } else {
-                        "The provider exited before reporting this prompt's final result"
-                    }
-                    .into(),
-                );
+                result.diagnostic = Some(reason.clone());
             }
             if let Some(result) = self.runs.remove(&run).and_then(|capture| capture.result) {
-                updates.push((
-                    run,
-                    Update::Finished {
-                        state: if cancelled {
-                            State::Cancelled
-                        } else {
-                            State::Interrupted
-                        },
-                        result,
-                    },
-                ));
+                updates.push((run, Update::Finished { state, result }));
             }
         }
         updates
@@ -216,6 +222,32 @@ impl Capture {
     }
 }
 
+pub(super) fn exit_reason(
+    status: Option<std::process::ExitStatus>,
+    diagnostic: Option<&str>,
+) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let status = match status {
+        Some(status) if status.signal().is_some() => {
+            format!("Provider exited with signal {}", status.signal().unwrap())
+        }
+        Some(status) if !status.success() => format!(
+            "Provider exited with status {}",
+            status.code().unwrap_or_default()
+        ),
+        Some(_) => {
+            "Provider exited with status 0 before reporting this prompt's final result".into()
+        }
+        None => "The provider exited before reporting this prompt's final result".into(),
+    };
+    let reason = match diagnostic.filter(|message| !message.is_empty()) {
+        Some(message) if message.starts_with(&status) => message.to_owned(),
+        Some(message) => format!("{status}: {message}"),
+        None => status,
+    };
+    bounded(&reason, crate::agent_execution::MAX_DIAGNOSTIC_BYTES).to_owned()
+}
+
 fn bounded(text: &str, limit: usize) -> &str {
     let mut end = text.len().min(limit);
     while !text.is_char_boundary(end) {
@@ -235,6 +267,69 @@ mod tests {
             thinking: false,
             delta: delta.into(),
         }
+    }
+
+    #[test]
+    fn provider_exit_outcomes_preserve_stop_status_and_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        for (stop, status, expected, reason) in [
+            (true, 3 << 8, State::Cancelled, "stopped"),
+            (false, 0, State::Interrupted, "before reporting"),
+            (false, 3 << 8, State::Failed, "status 3"),
+            (false, 9, State::Failed, "signal 9"),
+        ] {
+            let mut tracker = Tracker::default();
+            let run = RunId::new();
+            tracker.start(run, "request".into()).unwrap();
+            // Many tool calls must never imply provider-reported success.
+            for index in 0..300 {
+                tracker.observe(
+                    run,
+                    &Event::Item(crate::chat::Item {
+                        id: format!("tool-{index}"),
+                        role: Role::Assistant,
+                        started_at: None,
+                        at: None,
+                        content: ItemContent::Tool {
+                            name: "Bash".into(),
+                            input: "true".into(),
+                            output: "done".into(),
+                            status: crate::chat::ToolStatus::Succeeded,
+                        },
+                    }),
+                );
+            }
+            let updates = tracker.ended(
+                stop,
+                Some(std::process::ExitStatus::from_raw(status)),
+                None,
+                Usage::default(),
+            );
+            let Update::Finished { state, result } = &updates[0].1 else {
+                panic!("missing outcome")
+            };
+            assert_eq!(*state, expected);
+            assert!(result.diagnostic.as_ref().unwrap().contains(reason));
+        }
+    }
+
+    #[test]
+    fn missing_exact_exit_status_keeps_diagnostics_without_inventing_failure() {
+        let mut tracker = Tracker::default();
+        let run = RunId::new();
+        tracker.start(run, "request".into()).unwrap();
+        let updates = tracker.ended(false, None, Some("writer disappeared"), Usage::default());
+        let Update::Finished { state, result } = &updates[0].1 else {
+            panic!("missing interrupted outcome")
+        };
+        assert_eq!(*state, State::Interrupted);
+        assert!(
+            result
+                .diagnostic
+                .as_ref()
+                .unwrap()
+                .contains("writer disappeared")
+        );
     }
 
     #[test]
