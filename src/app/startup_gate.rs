@@ -198,6 +198,10 @@ impl Cagents {
             .iter()
             .filter(|card| card.existence.is_open())
         {
+            if self.shared_views.quarantined.contains(&card.id) {
+                failures.push(card.id);
+                continue;
+            }
             if let CardKind::Terminal(session) = &card.kind {
                 if terminal_ended(session) || self.saved_terminal_ready(card.id) {
                     continue;
