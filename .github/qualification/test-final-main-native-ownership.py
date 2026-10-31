@@ -440,9 +440,19 @@ class AtomicOwnershipTests(unittest.TestCase):
                 errors = []
                 if point == 'mount':
                     result = h.ns['complete_arm_cleanup']
-                    with self.assertRaisesRegex(RuntimeError,'Arm cleanup failed'): result(roles,'before',errors)
+                    with self.assertRaisesRegex(AssertionError,'^Documents mount survived graceful process exit$') as caught:
+                        result(roles,'before',errors)
+                    self.assertIs(type(caught.exception),AssertionError)
+                    self.assertIs(caught.exception,h.ns['cancellation'].failure)
+                    arm_result=json.loads(h.output.files['before-cleanup.json'])
+                    self.assertIsNone(arm_result['documents_graceful'])
+                    self.assertIn('documents graceful-unmount: '+repr(caught.exception),arm_result['errors'])
+                    self.assertIn('before: documents graceful-unmount: '+repr(caught.exception),errors)
+                    self.assertIn('Documents FUSE mount remains active',arm_result['errors'])
+                    self.assertTrue(mount.mounted)
                 result = h.ns['finish_cleanup'](errors)
                 self.assertTrue(result['errors']); self.assertNotIn('cleanup-complete',h.output.files)
+                if point=='mount':self.assertIs(h.ns['cancellation'].failure,caught.exception)
 
     def test_command_creation_and_missing_window_are_retained(self):
         h = Harness(); h.creation = lambda handle:h.repeat()
