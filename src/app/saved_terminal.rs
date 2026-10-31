@@ -35,7 +35,8 @@ pub(super) enum Directory {
 enum Disposition {
     Pending,
     Dormant,
-    Unavailable,
+    /// Why the exact owner could not be verified.
+    Unavailable(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -292,6 +293,20 @@ impl Cagents {
                 && !self.shared_views.attached.contains(&card)
                 && matches!(self.cards.get(&card), Some(CardRuntime::Loading))
         })
+    }
+
+    /// Why an inspection that settled without attaching or proving absence
+    /// left this saved terminal unresolved. It is inspected again only when a
+    /// related owner is observed or the user reconnects, so it is a refusal
+    /// to report rather than a check still under way.
+    pub(super) fn saved_terminal_unavailable(&self, card: CardId) -> Option<String> {
+        if self.terminal_start_in_flight(card) {
+            return None;
+        }
+        match &self.saved_terminal_current(card)?.disposition {
+            Disposition::Unavailable(reason) => Some(reason.clone()),
+            _ => None,
+        }
     }
 
     /// Diagnostics must not reopen a User control connection for an inherited
@@ -672,7 +687,8 @@ impl Cagents {
             if let Some(entry) = self.saved_terminals.entries.get_mut(&card)
                 && entry.request == request
             {
-                entry.disposition = Disposition::Unavailable;
+                entry.disposition =
+                    Disposition::Unavailable("it changed while it was being checked".into());
             }
             return self.finish_terminal_start(card);
         }
@@ -701,13 +717,12 @@ impl Cagents {
                 let entry = self.saved_terminals.entries.get_mut(&card).unwrap();
                 entry.directory = directory;
                 let absent = result.is_ok();
-                if let Err(error) = &result {
-                    tracing::debug!(?card, %error, "saved terminal inspection refused");
-                }
-                entry.disposition = if absent {
-                    Disposition::Dormant
-                } else {
-                    Disposition::Unavailable
+                entry.disposition = match result {
+                    Ok(_) => Disposition::Dormant,
+                    Err(error) => {
+                        tracing::warn!(?card, %error, "saved terminal inspection refused");
+                        Disposition::Unavailable(error)
+                    }
                 };
                 self.lifecycle.remove(card);
                 let finished = self.finish_terminal_start(card);
@@ -758,7 +773,7 @@ impl Cagents {
         match self.saved_terminal_current(card)?.disposition {
             Disposition::Pending => Some(("Checking saved terminal", true)),
             Disposition::Dormant => None,
-            Disposition::Unavailable => Some(("Reconnect unavailable", false)),
+            Disposition::Unavailable(_) => Some(("Reconnect unavailable", false)),
         }
     }
 
@@ -791,7 +806,7 @@ impl Cagents {
                 Disposition::Dormant => {
                     "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. Resume or Restart runs the saved session only when you choose."
                 }
-                Disposition::Unavailable => {
+                Disposition::Unavailable(_) => {
                     "The existing terminal could not be verified. Reconnect to check again; the saved command has not been restarted."
                 }
             }
