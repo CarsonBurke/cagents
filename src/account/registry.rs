@@ -529,7 +529,9 @@ impl Registry {
     /// Records an existing provider home without taking ownership of it.
     /// Its canonical path, not its reported email, determines whether it is
     /// already registered: separate homes can hold the same login but have
-    /// different histories. Linking an archived home restores its row.
+    /// different histories. Repeating an unambiguous active linked home returns
+    /// its original key without changing metadata. Linking an archived home
+    /// restores its row.
     pub fn link(
         &mut self,
         provider: Provider,
@@ -545,14 +547,38 @@ impl Registry {
         if system_home
             .and_then(|home| fs::canonicalize(home).ok())
             .is_some_and(|home| home == path)
-            || self.accounts(homes).iter().any(|account| {
+        {
+            return Err("That account home is already listed".into());
+        }
+        let matching = self
+            .all_accounts(homes)
+            .into_iter()
+            .filter(|account| {
                 account.provider == provider
                     && account
                         .resolved_home()
                         .and_then(|home| fs::canonicalize(home).ok())
                         .is_some_and(|home| home == path)
             })
-        {
+            .collect::<Vec<_>>();
+        // An archive retains its registration and conversation identity too.
+        // Refuse ambiguous homes before restoring any one archived row.
+        if matching.len() > 1 {
+            return Err("That account home is already listed".into());
+        }
+        if matching.iter().any(|account| {
+            !account
+                .registry_key()
+                .is_some_and(|key| self.is_archived(key))
+        }) {
+            // A reply may have been lost after the registration committed.
+            // Recover only one exact linked home, never a System/managed home
+            // or an ambiguous active/archived registration sharing its path.
+            if let [account] = matching.as_slice()
+                && let AccountHome::Linked { key, .. } = &account.home
+            {
+                return Ok(*key);
+            }
             return Err("That account home is already listed".into());
         }
         if let Some(existing) = self.accounts.iter().find(|account| {
@@ -1495,10 +1521,206 @@ mod tests {
                 Some(&homes),
                 2
             ),
-            Err("That account home is already listed".into())
+            Ok(key)
         );
         registry.unregister(key).unwrap();
         assert!(history.is_file());
+    }
+
+    #[test]
+    fn repeating_a_link_recovers_its_key_without_rewriting_registry_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("selected");
+        let other = directory.path().join("other");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&other).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let other = fs::canonicalize(other).unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("managed"));
+        let key = Uuid::new_v4();
+        let account = Account::linked(Provider::Codex, key, home.clone());
+        let (before, ()) = store
+            .update(|registry| {
+                assert_eq!(
+                    registry.link(Provider::Codex, key, home.clone(), None, Some(&homes), 7),
+                    Ok(key)
+                );
+                registry.set_label(&account, Some("Selected home".into()));
+                registry.observe_identity(
+                    key,
+                    &Identity {
+                        email: Some("selected@example.test".into()),
+                        organization: Some("Fixture organization".into()),
+                        plan: None,
+                    },
+                );
+                registry.set_default(&account);
+                registry.set_project_default(directory.path(), &account);
+                registry.begin(Provider::Claude, Uuid::new_v4(), 8);
+            })
+            .unwrap();
+        let bytes = fs::read(store.path()).unwrap();
+        // The first response was lost: repeat explicitly with a fresh request
+        // key, as the real Link callers do. No transport/provider is exercised.
+        let requested = Uuid::new_v4();
+        let (after, result) = store
+            .update(|registry| {
+                registry.link(
+                    Provider::Codex,
+                    requested,
+                    home.clone(),
+                    None,
+                    Some(&homes),
+                    99,
+                )
+            })
+            .unwrap();
+        assert_eq!(result, Ok(key));
+        assert_eq!(after, before);
+        assert_eq!(fs::read(store.path()).unwrap(), bytes);
+        assert_eq!(after.revision(), before.revision());
+        assert_eq!(after.registered().len(), 1);
+        assert!(after.find(requested).is_none());
+        assert_eq!(after.find(key).unwrap().added_at, 7);
+        assert_eq!(after.label(&account), Some("Selected home"));
+        assert_eq!(
+            after.default_account(Provider::Codex, Some(&homes)),
+            account
+        );
+        assert_eq!(
+            after.project_default_account(directory.path(), Provider::Codex, Some(&homes)),
+            account
+        );
+
+        // Identity alone cannot merge a different home. It remains a separate
+        // registration with the independently requested key.
+        let other_key = Uuid::new_v4();
+        let (after, result) = store
+            .update(|registry| {
+                let result = registry.link(
+                    Provider::Codex,
+                    other_key,
+                    other.clone(),
+                    None,
+                    Some(&homes),
+                    100,
+                );
+                registry.observe_identity(other_key, &before.find(key).unwrap().identity());
+                result
+            })
+            .unwrap();
+        assert_eq!(result, Ok(other_key));
+        assert_eq!(after.registered().len(), 2);
+        assert_eq!(after.find(key), before.find(key));
+        assert_eq!(
+            after.default_account(Provider::Codex, Some(&homes)),
+            account
+        );
+    }
+
+    #[test]
+    fn link_recovery_refuses_conflicting_home_kinds_and_ambiguous_registrations() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("selected");
+        fs::create_dir(&home).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let key = Uuid::new_v4();
+        let mut registry = Registry::default();
+        registry
+            .link(Provider::Codex, key, home.clone(), None, None, 1)
+            .unwrap();
+        let original = registry.clone();
+        let listed: Result<Uuid, String> = Err("That account home is already listed".into());
+        assert_eq!(
+            registry.link(
+                Provider::Codex,
+                Uuid::new_v4(),
+                home.clone(),
+                Some(&home),
+                None,
+                2
+            ),
+            listed
+        );
+        assert_eq!(
+            registry, original,
+            "System conflict wins over linked recovery"
+        );
+
+        // A stored linked path can alias a managed home. Retain the managed
+        // registration's existing refusal even when the linked row is first.
+        let homes = Homes::at(directory.path().join("managed"));
+        let managed_key = Uuid::new_v4();
+        let managed_home = homes.path(Provider::Codex, managed_key);
+        fs::create_dir_all(&managed_home).unwrap();
+        registry.accounts[0].linked_home = Some(managed_home.clone());
+        registry.accounts.push(Registered {
+            key: managed_key,
+            provider: Provider::Codex,
+            linked_home: None,
+            label: None,
+            email: None,
+            organization: None,
+            added_at: 2,
+        });
+        let before = registry.clone();
+        assert_eq!(
+            registry.link(
+                Provider::Codex,
+                Uuid::new_v4(),
+                managed_home,
+                None,
+                Some(&homes),
+                3
+            ),
+            listed
+        );
+        assert_eq!(registry, before);
+
+        // Multiple linked registrations must not choose the first row as the
+        // recovered identity, even when both registrations are archived.
+        for (first_archived, duplicate_archived) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            registry = original.clone();
+            let duplicate_key = Uuid::new_v4();
+            let mut duplicate = registry.accounts[0].clone();
+            duplicate.key = duplicate_key;
+            registry.accounts.push(duplicate);
+            if first_archived {
+                registry.archived.push(key);
+            }
+            if duplicate_archived {
+                registry.archived.push(duplicate_key);
+            }
+            let before = registry.clone();
+            assert_eq!(
+                registry.link(Provider::Codex, Uuid::new_v4(), home.clone(), None, None, 4),
+                listed
+            );
+            assert_eq!(registry, before);
+        }
+
+        registry = original.clone();
+        registry.archived.push(key);
+        let before = registry.clone();
+        assert_eq!(
+            registry.link(Provider::Codex, Uuid::new_v4(), home.clone(), None, None, 5),
+            Ok(key)
+        );
+        let mut restored = before;
+        restored.archived.clear();
+        assert_eq!(
+            registry, restored,
+            "archive restoration keeps all row metadata"
+        );
+        let other_provider_key = Uuid::new_v4();
+        assert_eq!(
+            registry.link(Provider::Claude, other_provider_key, home, None, None, 6),
+            Ok(other_provider_key),
+            "path uniqueness remains scoped to the chosen provider"
+        );
     }
 
     #[test]
