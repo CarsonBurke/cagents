@@ -1,0 +1,20 @@
+{
+  "kind": "FROZEN_CODE_REVIEW_PENDING_NOT_SUBMITTABLE",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "351392ffb7f52e47974d43f7207d338a1efd63929f0a92a258ad2462d72f3533",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "execution_authorized": false,
+  "review_ABI": "Top head/tree must be productc28; controller Git identity separate. Lead later binds genuine actual-code review externally; only grant5NULL in final handoff."
+}

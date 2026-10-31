@@ -1,0 +1,178 @@
+{
+  "schema": "pr1549-c28-ui4-controller-task-data-v1",
+  "product_PR_reference": 1549,
+  "boundary": "ui",
+  "source": {
+    "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+    "parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main"
+  },
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "selected_names": [
+    "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+    "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+    "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+    "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches"
+  ],
+  "selected_parents": [
+    {
+      "name": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 1232,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "9dbbc868112ef82ac846736945be0e1e9669816a163a0d35f8c808bc5fa5ddae",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 1345,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "394ae3ff757fddae7fb3e8b89440bc24d266c93b21e5475d6debe0ced4a53607",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 849,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "cff24a3f52f99d09c4e388873b6c5c688eed9a362e84b70b9260c0b6d9eebd42",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 917,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "e567025e78ab9bc15c36acb6089c8edb4b274636d33b93117dc62e1aa3a47e1f",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+        "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+        "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+        "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 600
+    }
+  ],
+  "planned_phase_order": [
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3",
+    "parent-ui-lib-4"
+  ],
+  "runtime_admission": {
+    "state": "PR1549_C28_UI4_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "kind": "AUTHOR_SELECTED_SOURCE_MAP_NOT_INDEPENDENT_REVIEW",
+  "product": {
+    "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+    "parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main"
+  },
+  "actual_product_Git_entries": 2223,
+  "direct_parent_changed_paths": [
+    "src/app/search_ui.rs"
+  ],
+  "direct_parent_unchanged_entries": 2222,
+  "feature_paths_against_main": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "src/app.rs",
+    "src/app/chrome_ui.rs",
+    "src/app/git_ui.rs",
+    "src/app/palette_ui.rs",
+    "src/app/search_ui.rs",
+    "src/app/settings_ui.rs",
+    "src/fs_safety.rs",
+    "src/git_watch.rs",
+    "src/modules.rs",
+    "src/project_search.rs",
+    "src/project_search/ignore_policy.rs",
+    "src/project_search/traversal.rs",
+    "src/repository_widget.rs",
+    "src/settings.rs",
+    "src/ui_controls.rs",
+    "src/workspace_widget.rs"
+  ],
+  "outside18_entries_exact_main": 2205,
+  "selected_parents": [
+    {
+      "name": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 1232,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "9dbbc868112ef82ac846736945be0e1e9669816a163a0d35f8c808bc5fa5ddae",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 1345,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "394ae3ff757fddae7fb3e8b89440bc24d266c93b21e5475d6debe0ced4a53607",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 849,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "cff24a3f52f99d09c4e388873b6c5c688eed9a362e84b70b9260c0b6d9eebd42",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    },
+    {
+      "name": "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+      "source": "src/app/search_ui.rs",
+      "source_sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "line": 917,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "body_sha256": "e567025e78ab9bc15c36acb6089c8edb4b274636d33b93117dc62e1aa3a47e1f",
+      "seconds": 90,
+      "expected_stdout_child_results": 0
+    }
+  ],
+  "fixture_limits": "Existing Cagents/sidebar reducer fixtures drop operational Tasks; two real production widget Tree pointer fixtures use headless renderer, actual bounds/layout/update and retained state. Corrected mutable-default State setups preserve assertions/controls. No native window/OS input/focus/worker/provider proof.",
+  "actual_compiled_inventory_N": null,
+  "results": null,
+  "execution_authorized": false
+}
