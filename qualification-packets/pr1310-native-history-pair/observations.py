@@ -17,10 +17,10 @@ BUILDER_PAIR = {
     "after": "efa9288b3fd79a7214307a11b1c6d50c6cde3630",
 }
 ADAPTERS = {
-    "before": ("146ad67b926672367817d06897e4cb9f55176bbd",
-               "c61e06cd488a6801863cc48d2de429c8f993ba9d"),
-    "after": ("3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce",
-              "124bd8583a75133bb4ed564ef829a154d123c4ed"),
+    "before": ("4ad36779cf830b36a5248cf76d4150d122884dda",
+               "f68427879b413b261ad8c5da27faff042cccef20"),
+    "after": ("02802c8a563f48758f346fa9a0c633bbcee5abf9",
+              "f92373909001e423c999a57f8ceaaaff7b7869c5"),
 }
 SEARCH = "Message, author or SHA — Enter to search"
 LIMIT = ("Search reached its limit; more matches may exist. "

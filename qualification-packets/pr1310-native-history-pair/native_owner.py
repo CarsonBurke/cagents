@@ -28,8 +28,8 @@ import uuid
 CUSTODY_SHA = "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
 BUILDER_SHA = "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01"
 ARMS = {
-    "before": ("146ad67b926672367817d06897e4cb9f55176bbd", "c61e06cd488a6801863cc48d2de429c8f993ba9d"),
-    "after": ("3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce", "124bd8583a75133bb4ed564ef829a154d123c4ed"),
+    "before": ("4ad36779cf830b36a5248cf76d4150d122884dda", "f68427879b413b261ad8c5da27faff042cccef20"),
+    "after": ("02802c8a563f48758f346fa9a0c633bbcee5abf9", "f92373909001e423c999a57f8ceaaaff7b7869c5"),
 }
 PRIVATE_KEYS = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
                 "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "TMPDIR")
@@ -50,12 +50,12 @@ CARGO_LOCK_SHA = "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c38
 INSTANCE_SHA = "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d"
 APPEARANCE_SOURCES = {
     "before": {
-        "src/app/native_history_fixture.rs": "0ff94685448c72a2c8ea17c2f2bec1e2df48d25fd283c7f343d85bd42313c8b2",
+        "src/app/native_history_fixture.rs": "96e29a5da5bccbf8d8f2d7d46bc9f2c49464c28dc9d01cb6557e858fc8fca766",
         "src/app.rs": "4f9dd1ec708bd22240f9a7524bfb81e7dcff620e669d0e8e2eae9877c2a39303",
         "src/bin/cagents-ui.rs": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
     },
     "after": {
-        "src/app/native_history_fixture.rs": "198181e520a79307caf7e996c9436759c1acdd07c8b1fb2612708ceda17a869d",
+        "src/app/native_history_fixture.rs": "b505b6bdd6865c57a9f99db14a7fcf1df604b6d467f537443939a31d71780aff",
         "src/app.rs": "0ae1279e13f26a40bc8e62c33ac316328b139c927f7c09006f50a79e640c5ff8",
         "src/bin/cagents-ui.rs": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
     },
@@ -1382,12 +1382,12 @@ class NativeHistoryOwner:
 
     def _history_appearance(self, binding, record, expected_generation):
         names = {"record_version", "record", "observer_instance", "observation_generation", "pid",
-                 "window_id_kind", "window_id", "window_open_source", "product_version",
+                 "window_id_kind", "window_id", "window_open_source", "window_open_generation", "product_version",
                  "compiled_source_sha256", "data", "theme_kind", "theme_is_dark",
                  "theme_is_high_contrast", "theme_is_exact_dark_class", "applied_ui_scale",
                  "applied_ui_scale_bits", "applied_ui_scale_source", "native_scale",
                  "native_scale_bits", "native_scale_source", "native_scale_generation",
-                 "state", "observation_boundary"}
+                 "native_scale_query_request", "state", "observation_boundary"}
         require(isinstance(record, dict) and set(record) == names
                 and type(record.get("record_version")) is int and record["record_version"] == 1
                 and record.get("record") == "history-native-appearance"
@@ -1398,6 +1398,9 @@ class NativeHistoryOwner:
         instance = record["observer_instance"]
         require(str(uuid.UUID(instance)) == instance and uuid.UUID(instance).int != 0,
                 "appearance observer UUID invalid")
+        require(type(record["window_open_generation"]) is int
+                and 1 <= record["window_open_generation"] <= 0xffffffffffffffff,
+                "invalid original Opened generation")
         require(record["window_id_kind"] == "iced_main_window_debug"
                 and record["window_open_source"] == "original_window_opened_event"
                 and isinstance(record["window_id"], str) and 0 < len(record["window_id"]) <= 64
@@ -1416,15 +1419,28 @@ class NativeHistoryOwner:
         require(record["applied_ui_scale_source"] == "Core::scale_factor_as_returned_by_Shell",
                 "applied scale source changed")
         self._history_float(record["applied_ui_scale"], record["applied_ui_scale_bits"])
-        require(type(record["native_scale_generation"]) is int and record["native_scale_generation"] >= 0,
+        require(type(record["native_scale_generation"]) is int
+                and 0 <= record["native_scale_generation"] <= 0xffffffffffffffff,
                 "invalid native scale generation")
-        if record["native_scale"] is None:
-            require(record["native_scale_bits"] is None and record["native_scale_source"] == "unknown"
-                    and record["native_scale_generation"] == 0, "unknown native scale promoted")
+        source, query = record["native_scale_source"], record["native_scale_query_request"]
+        require(source in ("unknown", "rescaled_event", "window_scale_factor_query"),
+                "unknown native scale provenance enum")
+        if source == "window_scale_factor_query":
+            require(type(query) is str and re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", query) is not None
+                and str(uuid.UUID(query)) == query and uuid.UUID(query).int != 0,
+                "native scale query lacks canonical nonnil request UUID")
+        else:
+            require(query is None, "non-query native provenance carries a request UUID")
+        if source == "unknown":
+            # Closed clears the factor/source but preserves the saturating u64
+            # native counter. A later real Opened can therefore log unknown/N.
+            require(record["native_scale"] is None and record["native_scale_bits"] is None,
+                    "unknown native scale promoted to a configured/default value")
         else:
             self._history_float(record["native_scale"], record["native_scale_bits"])
-            require(record["native_scale_source"] == "rescaled_event"
-                    and record["native_scale_generation"] > 0, "native factor lacks real Rescaled provenance")
+            require(record["native_scale_generation"] > 0,
+                    "known native factor lacks accepted producer generation")
         state = record["state"]
         require(isinstance(state, dict) and set(state) ==
                 {"workspace_generation", "source_generation", "inspector_open", "history"}
@@ -1492,11 +1508,33 @@ class NativeHistoryOwner:
                     prior = appearances[-1]
                     require((record["observer_instance"], record["window_id"]) ==
                             (prior["observer_instance"], prior["window_id"]), "multiple observer/main generations")
+                    require(record["window_open_generation"] >= prior["window_open_generation"],
+                            "original Opened lifecycle regressed")
                     require(record["native_scale_generation"] >= prior["native_scale_generation"],
                             "native scale generation regressed")
-                    if record["native_scale_generation"] == prior["native_scale_generation"]:
-                        require(record["native_scale_bits"] == prior["native_scale_bits"],
-                                "same native generation has conflicting factors")
+                    same_open = (record["window_open_generation"] == prior["window_open_generation"]
+                                 and record["window_open_generation"] < 0xffffffffffffffff)
+                    # Lifecycle/native counters saturate in the actual producer.
+                    # Do not infer a unique lifecycle from their saturated value.
+                    if same_open:
+                        before = (prior["native_scale_bits"], prior["native_scale_source"],
+                                  prior["native_scale_query_request"])
+                        after = (record["native_scale_bits"], record["native_scale_source"],
+                                 record["native_scale_query_request"])
+                        if record["native_scale_generation"] == prior["native_scale_generation"] < 0xffffffffffffffff:
+                            require(after == before, "same native generation has conflicting provenance")
+                        require(not (prior["native_scale"] is not None and record["native_scale"] is None),
+                                "native factor reset without a later original Opened")
+                        if record["native_scale_source"] == "unknown":
+                            require(prior["native_scale_source"] == "unknown"
+                                    and record["native_scale_generation"] == prior["native_scale_generation"],
+                                    "unknown factor advanced without a later original Opened")
+                        if record["native_scale_source"] == "window_scale_factor_query":
+                            require(prior["native_scale_source"] != "rescaled_event",
+                                    "query source cannot displace Rescaled within the same Opened")
+                            if prior["native_scale_source"] == "window_scale_factor_query":
+                                require(after == before and record["native_scale_generation"] == prior["native_scale_generation"],
+                                        "one-shot query provenance changed within original Opened")
                 appearances.append(record)
             elif "iced_wgpu::window::compositor: Selected:" in line:
                 match = re.fullmatch(prefix + r"iced_wgpu::window::compositor: Selected: AdapterInfo \{", line)
@@ -1524,7 +1562,8 @@ class NativeHistoryOwner:
         while True:
             raw = self._read_history_log(binding)
             appearances, adapters, pending = self._history_log_observers(binding, raw)
-            if appearances and adapters and not pending:
+            if (appearances and adapters and not pending
+                    and appearances[-1]["native_scale"] is not None):
                 break
             # No new input/replay/repair. An incomplete concurrent append and
             # missing records can only become ready inside the SAME deadline.
@@ -1543,12 +1582,14 @@ class NativeHistoryOwner:
                 "actual applied theme differs from exact Dark lane")
         stable_appearance = (binding.generation, binding.ui_pid, binding.xid,
                             appearance["observer_instance"], appearance["window_id"],
+                            appearance["window_open_generation"],
                             appearance["applied_ui_scale_bits"], theme,
                             appearance["observation_generation"],
                             json.dumps(appearance["state"], allow_nan=False,
                                        sort_keys=True, separators=(",", ":")))
         native = (appearance["native_scale"], appearance["native_scale_bits"],
-                  appearance["native_scale_source"], appearance["native_scale_generation"])
+                  appearance["native_scale_source"], appearance["native_scale_generation"],
+                  appearance["native_scale_query_request"])
         evidence = {"generation": binding.generation, "pid": binding.ui_pid, "xid": binding.xid,
                     "geometry": geometry, "requested_theme": "dark", "configured_fixture_scale": 1.0,
                     "requested_backend": "wgpu/gl/software", "renderer_observed": adapter,

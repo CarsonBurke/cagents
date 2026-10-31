@@ -11,16 +11,17 @@
     "qualification-packets/pr1310-native-history-pair/plan.json",
     "qualification-packets/pr1310-native-history-pair/native_owner.py",
     "qualification-packets/pr1310-native-history-pair/owner-contract.json",
-    "qualification-packets/pr1310-native-history-pair/AX-CONTRACT.md"
+    "qualification-packets/pr1310-native-history-pair/AX-CONTRACT.md",
+    "qualification-packets/pr1310-native-history-pair/test_initial_native_scale_consumer.py"
   ],
   "sources": {
     "before": {
-      "head": "146ad67b926672367817d06897e4cb9f55176bbd",
-      "tree": "c61e06cd488a6801863cc48d2de429c8f993ba9d",
+      "head": "4ad36779cf830b36a5248cf76d4150d122884dda",
+      "tree": "f68427879b413b261ad8c5da27faff042cccef20",
       "paths": {
         "src/app/native_history_fixture.rs": {
-          "sha256": "0ff94685448c72a2c8ea17c2f2bec1e2df48d25fd283c7f343d85bd42313c8b2",
-          "bytes": 30416
+          "sha256": "96e29a5da5bccbf8d8f2d7d46bc9f2c49464c28dc9d01cb6557e858fc8fca766",
+          "bytes": 42052
         },
         "src/app.rs": {
           "sha256": "4f9dd1ec708bd22240f9a7524bfb81e7dcff620e669d0e8e2eae9877c2a39303",
@@ -69,18 +70,42 @@
         "src/instance.rs": {
           "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
           "bytes": 119199
+        },
+        "Cargo.toml": {
+          "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+          "bytes": 13087
+        },
+        "vendor/iced-runtime/src/window.rs": {
+          "sha256": "3216ceb9ab68d074d5418125a14425fa4a82f61e637dce84fdd8de5f621aef90",
+          "bytes": 19574
+        },
+        "qualification-packets/pr1310-native-history-before/README.md": {
+          "sha256": "60fe7d1b7659db92175b1769c36e67acdbaa4cda07abeb2b7de7192e5fdf0bb0",
+          "bytes": 11363
+        },
+        "vendor/libcosmic/src/app/mod.rs": {
+          "sha256": "50bc446b69f9b11dc2a80fb0df8545df6a4732fa49793efef33087c9e69aae31",
+          "bytes": 33003
+        },
+        "vendor/iced-winit/src/lib.rs": {
+          "sha256": "9593b024fed4754465801bcbd0a96153b83740ed2a61b4277f1664ee3907e1ee",
+          "bytes": 110487
+        },
+        "qualification-packets/pr1310-native-history-before/source-contract.json": {
+          "sha256": "bed9963de11cd8f75f15c000c5407aa349cbfa6022858f81bd5318cffd5c6e82",
+          "bytes": 10773
         }
       },
       "native": "UNRUN",
       "matched_executables": null
     },
     "after": {
-      "head": "3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce",
-      "tree": "124bd8583a75133bb4ed564ef829a154d123c4ed",
+      "head": "02802c8a563f48758f346fa9a0c633bbcee5abf9",
+      "tree": "f92373909001e423c999a57f8ceaaaff7b7869c5",
       "paths": {
         "src/app/native_history_fixture.rs": {
-          "sha256": "198181e520a79307caf7e996c9436759c1acdd07c8b1fb2612708ceda17a869d",
-          "bytes": 29982
+          "sha256": "b505b6bdd6865c57a9f99db14a7fcf1df604b6d467f537443939a31d71780aff",
+          "bytes": 41618
         },
         "src/app.rs": {
           "sha256": "0ae1279e13f26a40bc8e62c33ac316328b139c927f7c09006f50a79e640c5ff8",
@@ -129,6 +154,30 @@
         "src/instance.rs": {
           "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
           "bytes": 119199
+        },
+        "Cargo.toml": {
+          "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+          "bytes": 13087
+        },
+        "vendor/iced-runtime/src/window.rs": {
+          "sha256": "3216ceb9ab68d074d5418125a14425fa4a82f61e637dce84fdd8de5f621aef90",
+          "bytes": 19574
+        },
+        "qualification-packets/pr1310-native-history-after/source-contract.json": {
+          "sha256": "a84a0fe6579cc81ec4f7b9728d3796cfe54ce3d1b41ae60e0bccc3634c112bc8",
+          "bytes": 8184
+        },
+        "vendor/libcosmic/src/app/mod.rs": {
+          "sha256": "50bc446b69f9b11dc2a80fb0df8545df6a4732fa49793efef33087c9e69aae31",
+          "bytes": 33003
+        },
+        "vendor/iced-winit/src/lib.rs": {
+          "sha256": "9593b024fed4754465801bcbd0a96153b83740ed2a61b4277f1664ee3907e1ee",
+          "bytes": 110487
+        },
+        "qualification-packets/pr1310-native-history-after/README.md": {
+          "sha256": "f6f80b3e3d247f621bf0677f62589a6bd7aff8b1445ea3ffc264c172434f162d",
+          "bytes": 12469
         }
       },
       "native": "UNRUN",
@@ -537,5 +586,124 @@
     "physical_native_resource_separation": "All physical settlement/census/FD/TERM policy code, normal_close_succeeded calculation, driver/appearance/AX/source pins and C HOLD are unchanged. Inference cannot replace raw UI/AX status, physical facts, managed proof or resource acceptance.",
     "old_wrapper": "Blocked264bcbe1 remains historical unchanged; a mandatory NEW UI-wait wrapper is not required for this separately conditioned source-policy route. No wrapper restarted or replaced.",
     "execution": "Source only; functions/imports/cases/tests/native/actual chain/flow UNKNOWN/UNRUN."
+  },
+  "initial_native_scale_consumer_binding": {
+    "schema": "pr1310-initial-native-scale-consumer-binding-v1",
+    "parent": "b756e6f9165f6bf164b8acad1c77cdab34d3fd07",
+    "producer_arms": {
+      "before": {
+        "head": "4ad36779cf830b36a5248cf76d4150d122884dda",
+        "tree": "f68427879b413b261ad8c5da27faff042cccef20",
+        "source_pins": {
+          "src/app.rs": {
+            "sha256": "4f9dd1ec708bd22240f9a7524bfb81e7dcff620e669d0e8e2eae9877c2a39303",
+            "bytes": 1379227
+          },
+          "src/bin/cagents-ui.rs": {
+            "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
+            "bytes": 25035
+          },
+          "Cargo.toml": {
+            "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+            "bytes": 13087
+          },
+          "vendor/iced-runtime/src/window.rs": {
+            "sha256": "3216ceb9ab68d074d5418125a14425fa4a82f61e637dce84fdd8de5f621aef90",
+            "bytes": 19574
+          },
+          "qualification-packets/pr1310-native-history-before/README.md": {
+            "sha256": "60fe7d1b7659db92175b1769c36e67acdbaa4cda07abeb2b7de7192e5fdf0bb0",
+            "bytes": 11363
+          },
+          "vendor/libcosmic/src/app/mod.rs": {
+            "sha256": "50bc446b69f9b11dc2a80fb0df8545df6a4732fa49793efef33087c9e69aae31",
+            "bytes": 33003
+          },
+          "vendor/iced-winit/src/lib.rs": {
+            "sha256": "9593b024fed4754465801bcbd0a96153b83740ed2a61b4277f1664ee3907e1ee",
+            "bytes": 110487
+          },
+          "src/app/native_history_fixture.rs": {
+            "sha256": "96e29a5da5bccbf8d8f2d7d46bc9f2c49464c28dc9d01cb6557e858fc8fca766",
+            "bytes": 42052
+          },
+          "qualification-packets/pr1310-native-history-before/source-contract.json": {
+            "sha256": "bed9963de11cd8f75f15c000c5407aa349cbfa6022858f81bd5318cffd5c6e82",
+            "bytes": 10773
+          }
+        }
+      },
+      "after": {
+        "head": "02802c8a563f48758f346fa9a0c633bbcee5abf9",
+        "tree": "f92373909001e423c999a57f8ceaaaff7b7869c5",
+        "source_pins": {
+          "src/app.rs": {
+            "sha256": "0ae1279e13f26a40bc8e62c33ac316328b139c927f7c09006f50a79e640c5ff8",
+            "bytes": 1436245
+          },
+          "src/bin/cagents-ui.rs": {
+            "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
+            "bytes": 25035
+          },
+          "Cargo.toml": {
+            "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+            "bytes": 13087
+          },
+          "vendor/iced-runtime/src/window.rs": {
+            "sha256": "3216ceb9ab68d074d5418125a14425fa4a82f61e637dce84fdd8de5f621aef90",
+            "bytes": 19574
+          },
+          "qualification-packets/pr1310-native-history-after/source-contract.json": {
+            "sha256": "a84a0fe6579cc81ec4f7b9728d3796cfe54ce3d1b41ae60e0bccc3634c112bc8",
+            "bytes": 8184
+          },
+          "vendor/libcosmic/src/app/mod.rs": {
+            "sha256": "50bc446b69f9b11dc2a80fb0df8545df6a4732fa49793efef33087c9e69aae31",
+            "bytes": 33003
+          },
+          "vendor/iced-winit/src/lib.rs": {
+            "sha256": "9593b024fed4754465801bcbd0a96153b83740ed2a61b4277f1664ee3907e1ee",
+            "bytes": 110487
+          },
+          "src/app/native_history_fixture.rs": {
+            "sha256": "b505b6bdd6865c57a9f99db14a7fcf1df604b6d467f537443939a31d71780aff",
+            "bytes": 41618
+          },
+          "qualification-packets/pr1310-native-history-after/README.md": {
+            "sha256": "f6f80b3e3d247f621bf0677f62589a6bd7aff8b1445ea3ffc264c172434f162d",
+            "bytes": 12469
+          }
+        }
+      }
+    },
+    "producer_author_receipt": {
+      "path": "/tmp/coord-b9-1310-initial-native-scale-evidence/source-receipt.json",
+      "sha256": "d5c1620769dc6b6ca095df550079f0f274bf387a0e2e2f7f8a93dc4256255dca"
+    },
+    "producer_independent_review": {
+      "path": "/tmp/coord-b9-pr1310-initial-native-scale-independent-review.json",
+      "sha256": "b32e9add1fc5f86369ca1eaf87341cbb8c18ebf271dccedd1fbf0abfc6ff7e23"
+    },
+    "consumer_source_scope": "Only ARMS/APPEARANCE_SOURCES, exact strict appearance schema/provenance/stream consistency, capture-key lifecycle/query fields and source metadata. No driver interaction/AX/physical/application/launch/custody changes.",
+    "schema_delta": [
+      "window_open_generation: nonbool u64 >0",
+      "native_scale_query_request: canonical nonnil UUID only for query source, null otherwise",
+      "native_scale_source enum unknown/rescaled_event/window_scale_factor_query"
+    ],
+    "counters": "Native counter is nonbool bounded u64>=0 and persists across Closed/reopen. Known factor requires counter>0; unknown keeps None/bitsNone even at nonzero counter. Opened is positive saturating u64; no comparison assumes counters can increase after saturation.",
+    "stream_constraints": "One existing observer/main identity and contiguous bounded observation records. Open/native counters never regress. Within same nonsaturated Opened, unchanged nonsaturated native counter means identical factor/source/query; known factor cannot reset to unknown, query cannot displace Rescaled or change its issued token. A later Opened permits unknown factor with the retained counter.",
+    "capture_equality": "Existing actual semantic state + observation generation retained; opened generation and query UUID added to actual frame/native key. Raw log offsets/times remain excluded.",
+    "provenance_limit": "These are actual producer log claims under source binding, NOT API execution/issued-request/present acknowledgement. Saturating lifecycle counters cannot establish unique further lifecycles. Unknown/no reply is never a default/configured factor.",
+    "source_oracles": {
+      "path": "qualification-packets/pr1310-native-history-pair/test_initial_native_scale_consumer.py",
+      "parents": 5,
+      "subcases_nonadditive": true,
+      "status": "AUTHORED_UNRUN; AST parse only; no module/function/case execution",
+      "actual_body_selection": "Future explicit pure run selects owning parser methods, FrameObservation and exact actual capture-key assignments by AST with owner SHA; no full owner import/constructor/old pure3 harness"
+    },
+    "unchanged_worker": "Existing feb4 worker remains independently bound b756; NOT repinned, no worker source edited",
+    "historical_pure3": "Original07b three-PASS receipt remains historical for unchanged selected bodies only. Modified appearance/scanner/key consumer and new4 oracles have NO pass transfer.",
+    "all_actual_chain_build_Open_query_Rescaled_logs_frames_UX": "UNRUN/NULL; not a runnable or admitted packet",
+    "readiness_scope_addition": "Root-authorized existing read-only frame loop waits for latest complete valid appearance native_scale nonnull + adapter + no partial tail, using unchanged original check/pause/deadline. Never older-known selection, input/API reissue, repair or factor fallback."
   }
 }

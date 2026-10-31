@@ -4,7 +4,7 @@
   },
   "allowed_preparation_checks": "Only source/metadata-Git/hash/AST/JSON/conservation; no owner import/call, fixture workload, native modules, tool versions, probes, builds or tests executed.",
   "appearance_consumer": {
-    "appearance": "Exact version1 JSON keys, duplicate/nonfinite refusal; actual PID/source/build/version/manifest/dataset, one nonnil observer/main identity, contiguous1..256 records, positive actual Core scale/f32 bits and native Rescaled provenance when present. All complete records validated, not just last.",
+    "appearance": "Exact version1 JSON with original opened generation + source-specific query UUID, duplicate/nonfinite refusal; actual PID/source/build/data, bounded u64 lifecycle/native counters and actual Core scale. Known native factor needs real Rescaled or accepted one-shot window scale-factor query provenance; unknown remains None even when a reopen preserves nonzero native counter. Every complete record checked.",
     "authored_negative_cases_UNRUN": [
       "missing genuine build binding/evidence",
       "empty/partial append readiness until original deadline",
@@ -22,7 +22,7 @@
     "composition": "8ba8d6424cd769b3285ba166c198ae470a04bb5e",
     "equality": "Actual geometry + full adapter fingerprint + observer/main identity + applied Core scale bits + actual native factor/provenance + validated producer observation_generation + canonical complete parsed semantic state (history/head/rows/loading/selection/inspector/workspace/source). A->B and A->B->A cross-capture transitions fail equality. Only raw log offsets/read timestamps/unrelated log growth are excluded and retained separately.",
     "formatter": "Pinned no-ANSI tracing-subscriber Full timestamp/level/target and message-first tracing fields. No generalized logger fallback; unexpected spans/format are HOLD.",
-    "freshness": "Deduplicated view state and adapter selection are NOT per-capture/present acknowledgements. Native factor remains null without actual matching Rescaled.",
+    "freshness": "Deduplicated view-state/selected adapter NOT per-capture/present/API acknowledgements. Native factor remains None without actual matching Rescaled or accepted exact one-shot original-window query. Lifecycle/query identity is capture-critical; configured1 is never substituted.",
     "log_reader": "Retained original ui.log FD/inode, actual matched UI generation. Fresh original cancel/deadline/source fences before/after bounded pread chunks. Append-only verified prefix; original appended bytes/offset/hash/read metadata go to original evidence ledger. No path reopening or repair.",
     "package_provenance_limit": "Observed cached source bytes/hash + actual Cargo.lock versions. .cargo-checksum.json absent for wgpu-types28; package archive and matched-build input provenance NOT independently established here, mandatory original build evidence remains NULL.",
     "readiness": "Zero records or incomplete trailing concurrent append read-only polls inside SAME original absolute deadline. Complete malformed records, rewrite/truncation, conflicting identities/sources/data, stopped/capped producer or ambiguous selection are sticky HOLD. Incomplete at deadline is HOLD.",
@@ -84,12 +84,12 @@
   },
   "arms": {
     "after": {
-      "head": "3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce",
-      "tree": "124bd8583a75133bb4ed564ef829a154d123c4ed"
+      "head": "02802c8a563f48758f346fa9a0c633bbcee5abf9",
+      "tree": "f92373909001e423c999a57f8ceaaaff7b7869c5"
     },
     "before": {
-      "head": "146ad67b926672367817d06897e4cb9f55176bbd",
-      "tree": "c61e06cd488a6801863cc48d2de429c8f993ba9d"
+      "head": "4ad36779cf830b36a5248cf76d4150d122884dda",
+      "tree": "f68427879b413b261ad8c5da27faff042cccef20"
     }
   },
   "base": {
@@ -316,7 +316,126 @@
       "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01"
     }
   },
-  "native_owner_sha256": "e2e4a520087bf95c902646b4dbe6b69531944bb3cfad5fc8ddc1d3f77aab9fd8",
+  "initial_native_scale_consumer_binding": {
+    "all_actual_chain_build_Open_query_Rescaled_logs_frames_UX": "UNRUN/NULL; not a runnable or admitted packet",
+    "capture_equality": "Existing actual semantic state + observation generation retained; opened generation and query UUID added to actual frame/native key. Raw log offsets/times remain excluded.",
+    "consumer_source_scope": "Only ARMS/APPEARANCE_SOURCES, exact strict appearance schema/provenance/stream consistency, capture-key lifecycle/query fields and source metadata. No driver interaction/AX/physical/application/launch/custody changes.",
+    "counters": "Native counter is nonbool bounded u64>=0 and persists across Closed/reopen. Known factor requires counter>0; unknown keeps None/bitsNone even at nonzero counter. Opened is positive saturating u64; no comparison assumes counters can increase after saturation.",
+    "historical_pure3": "Original07b three-PASS receipt remains historical for unchanged selected bodies only. Modified appearance/scanner/key consumer and new4 oracles have NO pass transfer.",
+    "parent": "b756e6f9165f6bf164b8acad1c77cdab34d3fd07",
+    "producer_arms": {
+      "after": {
+        "head": "02802c8a563f48758f346fa9a0c633bbcee5abf9",
+        "source_pins": {
+          "Cargo.toml": {
+            "bytes": 13087,
+            "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+          },
+          "qualification-packets/pr1310-native-history-after/README.md": {
+            "bytes": 12469,
+            "sha256": "f6f80b3e3d247f621bf0677f62589a6bd7aff8b1445ea3ffc264c172434f162d"
+          },
+          "qualification-packets/pr1310-native-history-after/source-contract.json": {
+            "bytes": 8184,
+            "sha256": "a84a0fe6579cc81ec4f7b9728d3796cfe54ce3d1b41ae60e0bccc3634c112bc8"
+          },
+          "src/app.rs": {
+            "bytes": 1436245,
+            "sha256": "0ae1279e13f26a40bc8e62c33ac316328b139c927f7c09006f50a79e640c5ff8"
+          },
+          "src/app/native_history_fixture.rs": {
+            "bytes": 41618,
+            "sha256": "b505b6bdd6865c57a9f99db14a7fcf1df604b6d467f537443939a31d71780aff"
+          },
+          "src/bin/cagents-ui.rs": {
+            "bytes": 25035,
+            "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37"
+          },
+          "vendor/iced-runtime/src/window.rs": {
+            "bytes": 19574,
+            "sha256": "3216ceb9ab68d074d5418125a14425fa4a82f61e637dce84fdd8de5f621aef90"
+          },
+          "vendor/iced-winit/src/lib.rs": {
+            "bytes": 110487,
+            "sha256": "9593b024fed4754465801bcbd0a96153b83740ed2a61b4277f1664ee3907e1ee"
+          },
+          "vendor/libcosmic/src/app/mod.rs": {
+            "bytes": 33003,
+            "sha256": "50bc446b69f9b11dc2a80fb0df8545df6a4732fa49793efef33087c9e69aae31"
+          }
+        },
+        "tree": "f92373909001e423c999a57f8ceaaaff7b7869c5"
+      },
+      "before": {
+        "head": "4ad36779cf830b36a5248cf76d4150d122884dda",
+        "source_pins": {
+          "Cargo.toml": {
+            "bytes": 13087,
+            "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+          },
+          "qualification-packets/pr1310-native-history-before/README.md": {
+            "bytes": 11363,
+            "sha256": "60fe7d1b7659db92175b1769c36e67acdbaa4cda07abeb2b7de7192e5fdf0bb0"
+          },
+          "qualification-packets/pr1310-native-history-before/source-contract.json": {
+            "bytes": 10773,
+            "sha256": "bed9963de11cd8f75f15c000c5407aa349cbfa6022858f81bd5318cffd5c6e82"
+          },
+          "src/app.rs": {
+            "bytes": 1379227,
+            "sha256": "4f9dd1ec708bd22240f9a7524bfb81e7dcff620e669d0e8e2eae9877c2a39303"
+          },
+          "src/app/native_history_fixture.rs": {
+            "bytes": 42052,
+            "sha256": "96e29a5da5bccbf8d8f2d7d46bc9f2c49464c28dc9d01cb6557e858fc8fca766"
+          },
+          "src/bin/cagents-ui.rs": {
+            "bytes": 25035,
+            "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37"
+          },
+          "vendor/iced-runtime/src/window.rs": {
+            "bytes": 19574,
+            "sha256": "3216ceb9ab68d074d5418125a14425fa4a82f61e637dce84fdd8de5f621aef90"
+          },
+          "vendor/iced-winit/src/lib.rs": {
+            "bytes": 110487,
+            "sha256": "9593b024fed4754465801bcbd0a96153b83740ed2a61b4277f1664ee3907e1ee"
+          },
+          "vendor/libcosmic/src/app/mod.rs": {
+            "bytes": 33003,
+            "sha256": "50bc446b69f9b11dc2a80fb0df8545df6a4732fa49793efef33087c9e69aae31"
+          }
+        },
+        "tree": "f68427879b413b261ad8c5da27faff042cccef20"
+      }
+    },
+    "producer_author_receipt": {
+      "path": "/tmp/coord-b9-1310-initial-native-scale-evidence/source-receipt.json",
+      "sha256": "d5c1620769dc6b6ca095df550079f0f274bf387a0e2e2f7f8a93dc4256255dca"
+    },
+    "producer_independent_review": {
+      "path": "/tmp/coord-b9-pr1310-initial-native-scale-independent-review.json",
+      "sha256": "b32e9add1fc5f86369ca1eaf87341cbb8c18ebf271dccedd1fbf0abfc6ff7e23"
+    },
+    "provenance_limit": "These are actual producer log claims under source binding, NOT API execution/issued-request/present acknowledgement. Saturating lifecycle counters cannot establish unique further lifecycles. Unknown/no reply is never a default/configured factor.",
+    "readiness_scope_addition": "Root-authorized existing read-only frame loop waits for latest complete valid appearance native_scale nonnull + adapter + no partial tail, using unchanged original check/pause/deadline. Never older-known selection, input/API reissue, repair or factor fallback.",
+    "schema": "pr1310-initial-native-scale-consumer-binding-v1",
+    "schema_delta": [
+      "window_open_generation: nonbool u64 >0",
+      "native_scale_query_request: canonical nonnil UUID only for query source, null otherwise",
+      "native_scale_source enum unknown/rescaled_event/window_scale_factor_query"
+    ],
+    "source_oracles": {
+      "actual_body_selection": "Future explicit pure run selects owning parser methods, FrameObservation and exact actual capture-key assignments by AST with owner SHA; no full owner import/constructor/old pure3 harness",
+      "parents": 5,
+      "path": "qualification-packets/pr1310-native-history-pair/test_initial_native_scale_consumer.py",
+      "status": "AUTHORED_UNRUN; AST parse only; no module/function/case execution",
+      "subcases_nonadditive": true
+    },
+    "stream_constraints": "One existing observer/main identity and contiguous bounded observation records. Open/native counters never regress. Within same nonsaturated Opened, unchanged nonsaturated native counter means identical factor/source/query; known factor cannot reset to unknown, query cannot displace Rescaled or change its issued token. A later Opened permits unknown factor with the retained counter.",
+    "unchanged_worker": "Existing feb4 worker remains independently bound b756; NOT repinned, no worker source edited"
+  },
+  "native_owner_sha256": "a11744d28b08b3c1b28ce3a79fd0bd783012f5510894d36065cc00603605af1e",
   "physical_evidence_successor": {
     "C_boundary": "ABSENT_EXTERNAL/HOLD: original entry-owned C descriptor is not supplied to this library. No number/JSON/closed flag establishes C ownership, acquisition, release or acceptance.",
     "acquisitions": "Every locally returned regular/input/raw FD is retained before metadata; prepare root_fd keeps its EXISTING one _retain_raw record. Final-census opens are additional distinct real acquisitions. Original FD numbers remain recorded after published-node pop. Any attempted/returned/ambiguous close is sticky; no double close/numeric retry. Memory snapshots survive negative paths.",
@@ -380,7 +499,7 @@
     },
     "actual_theme_scale_observer": {
       "actual_paired_log_records": null,
-      "native_factor": "None until actual matching Rescaled; UNKNOWN remains a qualification gate",
+      "native_factor": "None until actual matching Rescaled or accepted one-shot window_scale_factor_query; source-only producer/consumer support is not actual readback.",
       "status": "IMPLEMENTED_SOURCE_UNRUN"
     },
     "all_runtime_native_UX_images_performance_results": "UNRUN; no qualification transferred from source or prior unit packet",
