@@ -7386,7 +7386,7 @@ impl Cagents {
         let Some(card) = self.card_state(target.card).cloned() else {
             return false;
         };
-        let title = self.card_display_title(&card);
+        let title = self.card_display_title(&card).to_owned();
         let pending = self.chat_ui.terminal_returns.get_mut(&target).unwrap();
         pending.close_owner = Some(ReturnCloseOwner {
             id: uuid::Uuid::new_v4(),
@@ -13528,7 +13528,7 @@ impl Cagents {
             source,
             handle,
             presentation: card.kind.clone(),
-            title: self.card_display_title(card),
+            title: self.card_display_title(card).to_owned(),
             origin,
             save_caller: crate::control::CallerContext::capture(),
         };
