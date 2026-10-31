@@ -387,10 +387,11 @@ impl Account {
     /// The system accounts, which every installation reports on whether or
     /// not it added any account of its own. Omp brokers its own accounts,
     /// which are found in its usage record rather than listed here.
-    pub fn system_accounts() -> [Self; 2] {
+    pub fn system_accounts() -> [Self; 3] {
         [
             Self::system(Provider::Claude),
             Self::system(Provider::Codex),
+            Self::system(Provider::Antigravity),
         ]
     }
 

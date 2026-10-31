@@ -6925,7 +6925,13 @@ impl Cagents {
         match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(_)) => true,
             Some(CardKind::Terminal(session)) => {
-                session.agent_resume_recipe().is_some() || observed_launch(session).is_some()
+                // Antigravity's terminal never says which conversation it runs.
+                let antigravity = |recipe: &LaunchRecipe| {
+                    Provider::recognize_launch(recipe) == Some(Provider::Antigravity)
+                };
+                !antigravity(&session.launch)
+                    && (session.agent_resume_recipe().is_some()
+                        || observed_launch(session).is_some_and(|recipe| !antigravity(&recipe)))
             }
             _ => false,
         }
