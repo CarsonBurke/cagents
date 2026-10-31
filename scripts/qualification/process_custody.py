@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 MAX_CHILDREN = 4096
 MAX_THREADS = 512
+METADATA_EXIT_GRACE_MS = 100
 
 def require(value, message):
     if not value: raise RuntimeError(message)
@@ -49,11 +50,13 @@ class Custody:
         self.launches = 0
         self.closed = False
 
-    def exited(self, node):
+    def exited(self, node, *, wait_until=None):
         if node.get('settled'): return True
         poller = select.poll()
         poller.register(node['pidfd'], select.POLLIN)
-        events = poller.poll(0)
+        timeout_ms = 0 if wait_until is None else min(METADATA_EXIT_GRACE_MS,
+            max(0, int((wait_until - time.monotonic()) * 1000)))
+        events = poller.poll(timeout_ms)
         require(not any(flags & select.POLLNVAL for _, flags in events), 'Owned pidfd became invalid')
         return any(flags & select.POLLIN for _, flags in events)
 
@@ -229,15 +232,20 @@ class Custody:
 
     def exact_matches(self, executable):
         matches = []
+        metadata_exit_deadline = None
         for node in self.nodes.values():
             if self.reap(node): continue
             try:
                 current = self.current(node, executable=True)
             except OSError as error:
                 if error.errno not in (errno.ENOENT, errno.ESRCH): raise
-                # Procfs may disappear after the live check. Only the original
-                # pidfd's positive exit permits omitting this live candidate.
-                require(self.exited(node), 'Owned metadata vanished without original pidfd exit')
+                # Procfs may disappear before the original pidfd becomes ready.
+                # All missing-node observations share one bounded grace budget;
+                # only positive original-fd exit permits omitting a candidate.
+                if metadata_exit_deadline is None:
+                    metadata_exit_deadline = time.monotonic() + METADATA_EXIT_GRACE_MS / 1000
+                require(self.exited(node, wait_until=metadata_exit_deadline),
+                        'Owned metadata vanished without original pidfd exit')
                 self.reap(node)  # Keep inventory and any remaining reaping obligation.
                 continue
             if current.get('executable') == executable:
