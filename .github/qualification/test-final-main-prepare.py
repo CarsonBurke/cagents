@@ -135,6 +135,15 @@ class Harness:
         self.record['original_children_member'] = dict(path='preparation/original-children.json',sha256=self.api['digest'](raw),bytes=len(raw))
         return self.record
 
+    def synchronize_algorithm_child(self, index):
+        # Internal consistency of HYPOTHETICAL data only, never a genuine
+        # child/provenance receipt. Let the intended later argv guard decide.
+        summary = self.record['original_children']
+        summary['children'][index]['argv'] = copy.deepcopy(self.record['commands'][index]['argv'])
+        raw = self.api['encoded'](summary) + b'\n'
+        self.record['original_children_member'] = dict(path='preparation/original-children.json',
+            sha256=self.api['digest'](raw),bytes=len(raw))
+
     def verify(self):
         self.api['verify_data'](self.record,self.plan,dict(sha='4'*40,tree='5'*40),'6'*64,'7'*64,self.refs)
         self.api['verify_inventory_bytes'](self.record,self.raw_inventories,self.refs)
@@ -241,7 +250,16 @@ class PreparationAlgorithms(unittest.TestCase):
                 if case == 'helper': arm['helper'] = '/tmp/h2018.algorithm/before-fixture'
                 if case == 'fixture-link': h.record['commands'][7]['argv'][-1] = 'native=/algorithm-only/wrong'
                 if case == 'file-set': arm['files']['fixture']['path'] = '/algorithm-only/wrong-fixture'
-                with self.assertRaises(ValueError): h.verify()
+                if case in ('command-argv','fixture-link'):
+                    h.synchronize_algorithm_child(4 if case == 'command-argv' else 7)
+                    self.assertIsNone(h.api['verify_data'](h.record,h.plan,
+                        dict(sha='4'*40,tree='5'*40),'6'*64,'7'*64,h.refs))
+                    self.assertEqual(h.api['verify_inventory_bytes'](h.record,h.raw_inventories,h.refs),h.inventories)
+                    reason = 'prepared-command-argv' if case == 'command-argv' else 'prepared-helper'
+                    with self.assertRaisesRegex(ValueError,'^' + reason + '$'):
+                        h.api['verify_artifacts'](h.record,h.compiled,'/algorithm-only/control/fixture.rs')
+                else:
+                    with self.assertRaises(ValueError): h.verify()
 
     def test_final_private_environment_preserves_authority_and_cargo_homes_without_secret_values(self):
         h = Harness()
@@ -346,6 +364,7 @@ class OwnershipHarness:
         self.on_wait = lambda process:None
         api = pure_namespace()
         def create(argv, **options):
+            assert self.cancel.depth > 0, 'Actual Popen creation must be inside cancellation deferral'
             assert options['start_new_session'] is True and 'preexec_fn' not in options
             process = OwnedHandle(self,100+len(self.handles),options)
             self.handles.append(process)
