@@ -82,6 +82,21 @@ fn results_id() -> widget::Id {
     widget::Id::new("project-search.results")
 }
 
+fn retry_control(state: &State, enabled: bool) -> Element<'_, Message> {
+    let retry: Element<'_, Message> = crate::ui_controls::button::quiet("Retry search")
+        .on_press_maybe(
+            (enabled
+                && state.error.is_some()
+                && state.root.is_some()
+                && !state.options.query.is_empty())
+            .then_some(Message::ProjectSearch(Action::Retry(state.generation))),
+        )
+        .into();
+    // A press belongs to the rendered query, even if another error replaces
+    // this button before release. No named button state survives keyed diff.
+    iced::widget::keyed::Column::with_children([(state.generation, retry)]).into()
+}
+
 impl Cagents {
     pub(super) fn rebind_project_search(&mut self) -> Task<Message> {
         let root = self.sidebar_state.active_worktree().cloned();
@@ -159,7 +174,10 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                return self.schedule_project_search();
+                return Task::batch([
+                    self.schedule_project_search(),
+                    iced::widget::operation::focus(query_id()).map(cosmic::Action::App),
+                ]);
             }
             Action::Query(value) => self.search_ui.options.query = value,
             Action::Include(value) => self.search_ui.options.include = value,
@@ -487,12 +505,7 @@ impl Cagents {
         };
         controls = controls.push(design::caption(notice));
         if state.error.is_some() {
-            controls = controls.push(
-                crate::ui_controls::button::quiet("Retry search").on_press_maybe(
-                    (enabled && state.root.is_some() && !state.options.query.is_empty())
-                        .then_some(Message::ProjectSearch(Action::Retry(generation))),
-                ),
-            );
+            controls = controls.push(retry_control(state, enabled));
         }
         let page = state.selected / PAGE_SIZE;
         let start = page * PAGE_SIZE;
@@ -777,6 +790,20 @@ mod tests {
         renderer: &cosmic::Renderer,
         event: iced::mouse::Event,
     ) -> Vec<Message> {
+        pointer_step(
+            result_row(state, &state.matches[0], 0, true),
+            tree,
+            renderer,
+            event,
+        )
+    }
+
+    fn pointer_step(
+        mut row: Element<'_, Message>,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        event: iced::mouse::Event,
+    ) -> Vec<Message> {
         use iced::advanced::{Layout, Shell, clipboard, layout, widget::Operation};
         use iced::{Event, Rectangle, Size, mouse};
         struct ButtonBounds(Option<Rectangle>);
@@ -793,7 +820,6 @@ mod tests {
                 assert!(self.0.replace(bounds).is_none(), "one actual result button");
             }
         }
-        let mut row = result_row(state, &state.matches[0], 0, true);
         tree.diff(row.as_widget_mut());
         let viewport = Rectangle::with_size(Size::new(350.0, design::DENSE_ROW_HEIGHT));
         let node = row.as_widget_mut().layout(
@@ -804,7 +830,7 @@ mod tests {
         let mut bounds = ButtonBounds(None);
         row.as_widget_mut()
             .operate(tree, Layout::new(&node), renderer, &mut bounds);
-        let bounds = bounds.0.expect("production result has a focusable button");
+        let bounds = bounds.0.expect("production control has a focusable button");
         let mut messages = Vec::new();
         row.as_widget_mut().update(
             tree,
@@ -817,6 +843,79 @@ mod tests {
             &viewport,
         );
         messages
+    }
+
+    #[test]
+    fn retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering() {
+        use iced::advanced::widget::Tree;
+        use iced::mouse::{Button, Event};
+        let renderer = super::super::tests::headless_renderer();
+        for replace in [false, true] {
+            let model = sidebar::tests::panel_model();
+            let sidebar = sidebar::tests::panel_state(&model);
+            let mut state = State {
+                root: sidebar.active_worktree().cloned(),
+                generation: 41,
+                options: Options {
+                    query: "needle".into(),
+                    ..Options::default()
+                },
+                error: Some("original error".into()),
+                ..State::default()
+            };
+            let control = retry_control(&state, true);
+            let mut tree = Tree::new(control.as_widget());
+            drop(control);
+            assert!(
+                pointer_step(
+                    retry_control(&state, true),
+                    &mut tree,
+                    &renderer,
+                    Event::ButtonPressed(Button::Left)
+                )
+                .is_empty()
+            );
+            state.error = Some("new diagnostic".into());
+            if replace {
+                state.generation += 1;
+            }
+            let released = pointer_step(
+                retry_control(&state, true),
+                &mut tree,
+                &renderer,
+                Event::ButtonReleased(Button::Left),
+            );
+            if replace {
+                assert!(
+                    released.is_empty(),
+                    "held press cannot activate a replacement query"
+                );
+                assert!(
+                    pointer_step(
+                        retry_control(&state, true),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonPressed(Button::Left)
+                    )
+                    .is_empty()
+                );
+                assert!(matches!(
+                    pointer_step(
+                        retry_control(&state, true),
+                        &mut tree,
+                        &renderer,
+                        Event::ButtonReleased(Button::Left)
+                    )
+                    .as_slice(),
+                    [Message::ProjectSearch(Action::Retry(42))]
+                ));
+            } else {
+                assert!(matches!(
+                    released.as_slice(),
+                    [Message::ProjectSearch(Action::Retry(41))]
+                ));
+            }
+        }
     }
 
     #[test]
