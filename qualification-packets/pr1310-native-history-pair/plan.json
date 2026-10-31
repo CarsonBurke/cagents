@@ -10,7 +10,8 @@
     "qualification-packets/pr1310-native-history-pair/root-interface.md",
     "qualification-packets/pr1310-native-history-pair/plan.json",
     "qualification-packets/pr1310-native-history-pair/native_owner.py",
-    "qualification-packets/pr1310-native-history-pair/owner-contract.json"
+    "qualification-packets/pr1310-native-history-pair/owner-contract.json",
+    "qualification-packets/pr1310-native-history-pair/AX-CONTRACT.md"
   ],
   "sources": {
     "before": {
@@ -412,5 +413,54 @@
       ],
       "execution": "UNRUN; no parser case executed"
     }
+  },
+  "source_only_AX_composition": {
+    "schema": "pr1310-finite-AX-owner-normal-composition-v1",
+    "normal_merge": {
+      "head": "d4623626a6941f37cf3816fbee601f873fedda76",
+      "tree": "07cddf615022831de8909010e93acc0709fbc424",
+      "parents": [
+        "07b98f1b97fd98487fa5261fe895c59c42cc5c5a",
+        "9b0d9baf7c7effd1a9fa1979fac1fe9837928e1b"
+      ],
+      "conflicts": false,
+      "manual_code_resolution": false
+    },
+    "owner_component": {
+      "head": "07b98f1b97fd98487fa5261fe895c59c42cc5c5a",
+      "tree": "f95c4a1dc3822f8285aa0621bc4491e5aad970d7",
+      "native_owner_sha256": "c5802e1b721694106ed26f94caa2e5dfca0782324a5a539dd506512a4acf53da",
+      "preservation": "Entire native_owner.py and owner-contract.json BYTE_EXACT07b; all observation/parser/effect/status/custody/physical gates unchanged"
+    },
+    "AX_component": {
+      "head": "9b0d9baf7c7effd1a9fa1979fac1fe9837928e1b",
+      "tree": "97a8df133500d2424763c20784e22be300ce16b3",
+      "parent": "f86fbeaf50b38260e575e59e122d1f77932038fd",
+      "history_driver_sha256": "0bd819fce05fc0559da8b874a190e666f5cc19ce768af4e23ee21690deaa27ce",
+      "AX_contract_sha256": "c047ac4f1856295107d3d478bb6e17751e27995a5caa96b087469c81e44b035f",
+      "author_receipt": {
+        "path": "/tmp/coord-b9-1310-native-AX-caps-evidence/source-receipt.json",
+        "sha256": "50edc1a510935e91b46bc7bd063e56edc9008da6d95fe116f4dfa3189981a814"
+      },
+      "independent_source_review": "PENDING separate task_source_fix; NOT source-clear by composition",
+      "semantics": "Existing finite AX timeout setter/getters/data caps only; not hard whole-call bound, import/bootstrap/reentry/writer/status closure or native qualification"
+    },
+    "historical_components": "Existing appearance_renderer_consumer driver_source=f86 and owner-contract scopes describe historical component conservation. Current merged History driver is exact9b0d; historical pins are not silently repurposed as current assembled review.",
+    "retained_actual_pure3": {
+      "path": "/tmp/coord-b9-1310-07b-actual-pure-unit-receipt.json",
+      "sha256": "c2cf21abab6d858a36d18ef603d546ca1de29b405db26e278ba995b7e168d25c",
+      "scope": "Original actual3 AST-selected parser/equality parents passed once on07b. Owner bytes unchanged here; no rerun, no AX/native/whole-flow qualification or execution admission."
+    },
+    "remaining_holds": [
+      "Separate AX nonauthor source review pending",
+      "Fresh assembled-scope source review required",
+      "No actual original entry/resource/User/native admission",
+      "UI original-wait retained-owner seam blocked",
+      "Upstream unpublished pidfd-acquisition/negative final-owner gap unimplemented",
+      "Actual entry-owned C descriptor acquisition/custody/close absent; no synthetic FD or JSON proof",
+      "Unknown UI/AX descendant status, proposed normal-service TERM and physical policy remain HOLD",
+      "Actual resolved/matched build provenance, generated Git data, imports/AX/bootstrap and native observations/frames/UX/performance all UNRUN"
+    ],
+    "runtime": "NULL/UNRUN; no source publication or resource grant"
   }
 }

@@ -156,3 +156,26 @@ This source-only successor derives the canonical closing offset from the exact
 parsed eleven-field grammar plus its brace and makes actual producer state
 transitions capture-critical. No whole-evidence equality or parser fallback was
 introduced. No pure parser case, owner function or runtime was executed.
+
+## Source-only AX composition
+
+The current packet normally composes frozen owner07b98f1b with AX component
+9b0d9baf (sole f86 parent). `native_owner.py`, its contract, observations and
+historical root interface remain exact07b. The driver and AX-CONTRACT.md are
+exact9b0d; no manual code resolution was needed. Earlier statements about the
+f86 driver being unchanged describe the appearance-consumer checkpoint, not
+this subsequently composed AX driver. Plan metadata identifies both scopes.
+
+The AX component bounds its supported timeout-setter path and returned data;
+it does not claim a hard bound on entire compound public calls/import/bootstrap.
+Its separate independent source review is still PENDING. This composition has
+no assembled/native PASS. Original07b's three actual AST-selected pure parents
+remain historical, unchanged-owner body evidence only; they were not rerun and
+do not qualify AX or whole flow. Both original negative reviews are retained.
+
+Actual original entry/resource/User admission, matched builds/data, UI-wait
+retained-owner seam, unpublished upstream FD-acquisition gap and original
+entry-owned C descriptor remain absent/HOLD. No physical/status/TERM acceptance
+policy was changed. Native imports/calls/input/frames/UX and performance remain
+UNRUN. Fresh assembled-source review and actual future authenticated admission
+are separate requirements; no runtime action or publication follows this merge.
