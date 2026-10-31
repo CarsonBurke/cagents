@@ -298,6 +298,38 @@ impl Cagents {
         self.reconcile_workspace_model()
     }
 
+    /// Refusing publication does not retire an already accepted conversation.
+    /// Capture the original scoped Insert before retiring its pending overlay;
+    /// an unrelated callback cannot protect or republish a different pane.
+    pub(super) fn refuse_shared_view_edit(&mut self, scope: &Scope, operation: uuid::Uuid) {
+        let Some((_, owner, change)) = self
+            .shared_views
+            .pending
+            .iter()
+            .find(|(id, _, _)| *id == operation)
+        else {
+            return;
+        };
+        if owner != scope {
+            return;
+        }
+        if let Change::Insert { pane, .. } = change
+            && matches!(pane.kind, CardKind::Chat(_))
+        {
+            let card = pane.id;
+            // A newer canonical owner or retirement has its own authority.
+            // An old Insert refusal must not reclassify that newer source.
+            if !self.workspace_model.views.iter().any(|view| {
+                view.panes.iter().any(|pane| pane.id == card) || view.retired.contains(&card)
+            }) && (self.retain_chat_after_creation_refusal(card, scope)
+                || self.retain_draft_after_creation_refusal(card, scope))
+            {
+                self.retain_local_pane(card);
+            }
+        }
+        self.shared_views.refused(operation);
+    }
+
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
         self.shared_views.retained.insert(id);
         Arc::make_mut(&mut self.durable).local_only_cards.insert(id);
@@ -819,6 +851,7 @@ impl Cagents {
     pub(super) fn publish_new_managed_pane(&mut self, scope: Scope, card: CardId) {
         if !self.shared_views.initialized.contains(&scope)
             || self.shared_views.blocked.contains(&scope)
+            || matches!(&scope, Scope::Channel(id) if self.channel_ui.was_deleted(*id) || self.channel_ui.is_deleting(*id))
             || self.workspace_model.views.iter().any(|view| {
                 view.panes.iter().any(|pane| pane.id == card) || view.retired.contains(&card)
             })
@@ -849,12 +882,86 @@ impl Cagents {
         self.shared_views
             .pending
             .push((operation, scope.clone(), change.clone()));
+        if matches!(change, Change::Insert { ref pane, .. } if matches!(pane.kind, CardKind::Chat(_)))
+        {
+            self.shared_views.attached.insert(card);
+        }
         self.publish_model_edit(ModelEdit::ChangeView {
             scope,
             expected_revision: revision,
             operation,
             change,
         });
+    }
+
+    /// Passive retention preserves work, but cannot authorize a provider start
+    /// after another client retired the pane or the registry refused creation.
+    pub(super) fn shared_chat_creation_revoked(&self, card: CardId, scope: Option<&Scope>) -> bool {
+        // A pane kept here after its creation was refused starts in this
+        // window alone, while the scope it was created in is still shared.
+        if self.shared_views.retained.contains(&card)
+            && !scope.is_some_and(|scope| {
+                self.workspace_model
+                    .views
+                    .iter()
+                    .any(|view| &view.scope == scope)
+            })
+        {
+            return true;
+        }
+        let mut owners = self
+            .workspace_model
+            .views
+            .iter()
+            .filter(|view| view.panes.iter().any(|pane| pane.id == card));
+        if let Some(owner) = owners.next() {
+            // A transfer retires the source while preserving the exact current
+            // destination. Only that unique owner can override old tombstones.
+            return owners.next().is_some()
+                || Some(&owner.scope) != scope
+                || owner.retired.contains(&card);
+        }
+        self.workspace_model
+            .views
+            .iter()
+            .any(|view| view.retired.contains(&card))
+    }
+
+    /// An automatic empty composer has no shared descriptor yet. Once it has
+    /// work, establish its one creation intent before an empty snapshot can
+    /// mistake that unpublished source for a pane removed by another window.
+    /// Already published, restored, refused and locally retained cards never
+    /// gain fresh creation authority from absence in a snapshot.
+    fn publish_unpublished_local_chats(&mut self) {
+        let candidates = self
+            .durable
+            .cards
+            .iter()
+            .filter_map(|card| {
+                if !card.existence.is_open()
+                    || !matches!(card.kind, CardKind::Chat(_))
+                    || self.shared_views.attached.contains(&card.id)
+                    || self.shared_views.retained.contains(&card.id)
+                    || self.chat_is_unused_default(card.id)
+                {
+                    return None;
+                }
+                let scope = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&card.id))
+                    .map(|channel| Scope::Channel(channel.id))
+                    .or_else(|| {
+                        self.card_worktree(card)
+                            .and_then(|path| self.worktree_view_scope(path))
+                    })?;
+                Some((scope, card.id))
+            })
+            .collect::<Vec<_>>();
+        for (scope, card) in candidates {
+            self.publish_new_managed_pane(scope, card);
+        }
     }
 
     pub(super) fn publish_view_changes(&mut self) {
@@ -963,6 +1070,12 @@ impl Cagents {
                         panes: legacy.clone(),
                         closed,
                     });
+                    self.shared_views.attached.extend(
+                        legacy
+                            .iter()
+                            .filter(|pane| matches!(pane.kind, CardKind::Chat(_)))
+                            .map(|pane| pane.id),
+                    );
                     self.shared_views.baseline.insert(scope.clone(), legacy);
                 }
                 continue;
@@ -981,6 +1094,11 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
+                if let Change::Insert { pane, .. } = &change
+                    && matches!(pane.kind, CardKind::Chat(_))
+                {
+                    self.shared_views.attached.insert(pane.id);
+                }
                 let operation = match &change {
                     Change::Insert { pane, .. }
                         if self.durable.pending_terminal_creations.contains(&pane.id) =>
@@ -1149,6 +1267,7 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        self.publish_unpublished_local_chats();
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
         self.retarget_transferred_pane_updates(None);
@@ -1522,12 +1641,30 @@ impl Cagents {
             {
                 continue;
             }
+            // A refused first publication keeps its chat, started or not,
+            // local until the user closes it. Persisted local-only custody
+            // survives UI reopen, but never overrides canonical retirement.
+            if self.shared_views.retained.contains(&id)
+                && self
+                    .card_state(id)
+                    .is_some_and(|card| matches!(&card.kind, CardKind::Chat(_)))
+                && !self
+                    .workspace_model
+                    .views
+                    .iter()
+                    .any(|view| view.retired.contains(&id))
+            {
+                continue;
+            }
             let (pending, saved_copy) = self.preserve_pending_shared_upgrade(id);
             tasks.push(pending);
             retained_upgrades.extend(saved_copy);
             if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
                 || self.shared_chat_has_local_work(id)
             {
+                // Each later read finds the same local pane absent again;
+                // only the read that first kept it here reports a close.
+                let newly_local = !self.shared_views.retained.contains(&id);
                 self.retain_local_pane(id);
                 if view.retired.contains(&id)
                     && !self.chat_start_pending(id)
@@ -1540,9 +1677,15 @@ impl Cagents {
                     }
                     self.sync_closed_chat_draft(id);
                 }
-                self.status = Some(TransientNotice::warning(
-                    "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it.",
-                ));
+                // Only a canonical removal retires a pane. One merely absent
+                // was never shared, so nothing else closed it.
+                if newly_local {
+                    self.status = Some(TransientNotice::warning(if view.retired.contains(&id) {
+                        "A pane was closed in another client. Its unsaved edits are retained here; save or discard them before closing it."
+                    } else {
+                        "A pane is not in the shared workspace, so it is kept only in this window with its unsaved edits."
+                    }));
+                }
                 continue;
             }
             self.detach_shared_pane(id);
@@ -5036,6 +5179,457 @@ mod tests {
         assert!(!app.shared_views.defaults.contains_key(&id));
         assert!(app.terminal_starts.lock().unwrap().contains_key(&id));
     }
+    fn unpublished_default_chat() -> (
+        Cagents,
+        ChannelId,
+        CardId,
+        super::super::chat_ui::Target,
+        async_channel::Receiver<ModelEdit>,
+    ) {
+        let (mut app, channel, _, _) = fixture();
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        app.workspace_model.views = vec![View::empty(channel)];
+        let (sender, receiver) = async_channel::unbounded();
+        app.workspace_model_tx = sender;
+        drop(app.add_default_pane(PathBuf::from("/repo"), settings::DefaultPane::NativeChat));
+        let card = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("native default draft");
+        };
+        let target = runtime.target;
+        assert!(app.chat_is_unused_default(card));
+        assert!(app.local_view_panes(&Scope::Channel(channel)).is_empty());
+        while receiver.try_recv().is_ok() {}
+        (app, channel, card, target, receiver)
+    }
+
+    fn compose_default_chat(app: &mut Cagents, target: super::super::chat_ui::Target) {
+        drop(app.handle_chat_ui(super::super::chat_ui::Action::Composer(
+            target,
+            iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Paste(
+                Arc::new("first message".into()),
+            )),
+        )));
+    }
+
+    #[test]
+    fn used_default_chat_reserves_one_insert_before_empty_view_projection() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        // An untouched automatic composer remains local and ephemeral.
+        drop(app.reconcile_shared_views());
+        assert!(receiver.try_recv().is_err());
+        compose_default_chat(&mut app, target);
+        for _ in 0..3 {
+            drop(app.reconcile_shared_views());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.workspace.card(card).is_some());
+            assert!(!app.durable.local_only_cards.contains(&card));
+            assert!(!app.shared_views.retained.contains(&card));
+        }
+        let edits = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        let [(operation, pane)]: [(uuid::Uuid, Pane); 1] = edits
+            .iter()
+            .filter_map(|edit| match edit {
+                ModelEdit::ChangeView {
+                    operation,
+                    change: Change::Insert { pane, .. },
+                    ..
+                } if pane.id == card => Some((*operation, pane.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let mut accepted = View::empty(channel);
+        accepted.revision = 1;
+        accepted.panes.push(pane.clone());
+        app.workspace_model.views = vec![accepted];
+        app.acknowledge_view_edit(Scope::Channel(channel), Some(operation));
+        drop(app.reconcile_shared_views());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(app.local_view_cards(&Scope::Channel(channel)), vec![card]);
+        let saved = app.persistent_workspace();
+        let restored = State::for_workspace(&saved);
+        assert!(restored.attached.contains(&card));
+        assert!(!saved.local_only_cards.contains(&card));
+        assert!(
+            matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(session) if session.is_unstarted())
+        );
+    }
+
+    fn first_start_save_completion(save: Task<Message>) -> super::super::chat_ui::Action {
+        std::thread::spawn(move || {
+            use cosmic::iced::futures::StreamExt;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut stream = cosmic::iced::runtime::task::into_stream(save).unwrap();
+                    while let Some(action) =
+                        tokio::time::timeout(Duration::from_secs(5), stream.next())
+                            .await
+                            .unwrap()
+                    {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(
+                                action @ super::super::chat_ui::Action::DraftStartCheckpointed(
+                                    _,
+                                    _,
+                                    _,
+                                ),
+                            ),
+                        )) = action
+                        {
+                            return action;
+                        }
+                    }
+                    panic!("checkpoint receipt");
+                })
+        })
+        .join()
+        .unwrap()
+    }
+
+    #[test]
+    fn first_start_empty_view_does_not_convert_creation_to_local_only() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("first-send-view"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        compose_default_chat(&mut app, target);
+        // First publish A, then Send, then an empty snapshot while the save
+        // receipt is waiting. This used to project A over the new runtime B.
+        drop(app.reconcile_shared_views());
+        let source = match &app.card_state(card).unwrap().kind {
+            CardKind::Chat(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+            target,
+            crate::chat::PromptMode::Send,
+        ));
+        assert!(app.chat_start_pending(card));
+        drop(app.reconcile_shared_views());
+        assert!(!app.durable.local_only_cards.contains(&card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let completion = first_start_save_completion(save);
+        assert!(matches!(
+            &completion,
+            super::super::chat_ui::Action::DraftStartCheckpointed(_, _, Ok(()))
+        ));
+        // Only the save Task ran. Drop the returned provider Task unpolled.
+        let provider = app.handle_chat_ui(completion);
+        let candidate = match &app.card_state(card).unwrap().kind {
+            CardKind::Chat(session) => session.clone(),
+            _ => unreachable!(),
+        };
+        assert_ne!(source.id, candidate.id);
+        drop(app.reconcile_shared_views());
+        assert!(
+            matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.session.id == candidate.id)
+        );
+        assert!(!app.durable.local_only_cards.contains(&card));
+        assert!(
+            app.local_view_cards(&Scope::Channel(channel))
+                .contains(&card)
+        );
+        let edits = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            edits
+                .iter()
+                .filter(|edit| matches!(edit,
+            ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card))
+                .count(),
+            1
+        );
+        assert!(edits.iter().any(|edit| matches!(edit,
+            ModelEdit::ChangeView { change: Change::Update { before, pane }, .. }
+                if pane.id == card && before.kind == CardKind::Chat(source.clone()) && pane.kind == CardKind::Chat(candidate.clone()))));
+        drop(provider);
+    }
+
+    #[test]
+    fn first_start_receipt_starts_a_refused_creation_locally_but_never_a_retired_one() {
+        for case in ["refused", "refused-scope-gone", "retired"] {
+            let (mut app, _, card, target, receiver) = unpublished_default_chat();
+            let directory = tempfile::tempdir().unwrap();
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("first-send-revoked"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            compose_default_chat(&mut app, target);
+            drop(app.reconcile_shared_views());
+            let operation = std::iter::from_fn(|| receiver.try_recv().ok())
+                .find_map(|edit| match edit {
+                    ModelEdit::ChangeView {
+                        operation,
+                        change: Change::Insert { pane, .. },
+                        ..
+                    } if pane.id == card => Some(operation),
+                    _ => None,
+                })
+                .unwrap();
+            let draft = match &app.card_state(card).unwrap().kind {
+                CardKind::Chat(session) => session.id,
+                _ => unreachable!(),
+            };
+            let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+                target,
+                crate::chat::PromptMode::Send,
+            ));
+            assert!(app.chat_start_pending(card));
+            match case {
+                "retired" => app.workspace_model.views[0].retired.push(card),
+                _ => app.shared_views.refused(operation),
+            }
+            drop(app.reconcile_shared_views());
+            assert!(app.durable.local_only_cards.contains(&card), "{case}");
+            if case == "refused-scope-gone" {
+                app.workspace_model.views.clear();
+            }
+            let completion = first_start_save_completion(save);
+            assert!(matches!(
+                &completion,
+                super::super::chat_ui::Action::DraftStartCheckpointed(_, _, Ok(()))
+            ));
+            let start = app.handle_chat_ui(completion);
+            let saved = app.persistent_workspace();
+            assert!(saved.local_only_cards.contains(&card), "{case}");
+            if case == "refused" {
+                // Kept in this window, its one Send starts here and nowhere
+                // else; the provider Task is dropped unpolled.
+                assert!(start.units() > 0, "{case}");
+                assert!(app.chat_start_pending(card), "{case}");
+                assert!(
+                    matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(session) if session.id != draft)
+                );
+            } else {
+                // handle_chat_ui batches even an empty result; its stream may
+                // exist without containing any work. No provider future is queued.
+                assert_eq!(
+                    start.units(),
+                    0,
+                    "{case}: revoked creation must queue no provider work"
+                );
+                assert!(!app.chat_start_pending(card));
+                assert!(
+                    matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(session) if session.id == draft)
+                );
+                assert_eq!(
+                    saved.chat_drafts.get(&card).map(String::as_str),
+                    Some("first message")
+                );
+            }
+            drop(start);
+            assert!(
+                !std::iter::from_fn(|| receiver.try_recv().ok()).any(|edit| matches!(edit,
+                    ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)),
+                "{case}: a revoked or local creation must not be recreated"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_canonical_removal_reports_a_pane_closed_in_another_client() {
+        for retired in [false, true] {
+            let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+            compose_default_chat(&mut app, target);
+            drop(app.reconcile_shared_views());
+            let (operation, pane) = std::iter::from_fn(|| receiver.try_recv().ok())
+                .find_map(|edit| match edit {
+                    ModelEdit::ChangeView {
+                        operation,
+                        change: Change::Insert { pane, .. },
+                        ..
+                    } if pane.id == card => Some((operation, pane)),
+                    _ => None,
+                })
+                .unwrap();
+            let mut accepted = View::empty(channel);
+            accepted.revision = 1;
+            accepted.panes.push(pane);
+            app.workspace_model.views = vec![accepted];
+            app.acknowledge_view_edit(Scope::Channel(channel), Some(operation));
+            drop(app.reconcile_shared_views());
+            assert!(app.status.is_none());
+            // Another client removes the shared pane, or a later snapshot
+            // simply lacks it, while this window still has its draft.
+            let view = &mut app.workspace_model.views[0];
+            view.panes.clear();
+            view.revision += 1;
+            if retired {
+                view.retired.push(card);
+            }
+            for read in 0..3 {
+                drop(app.reconcile_shared_views());
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(app.durable.local_only_cards.contains(&card));
+                if read == 0 {
+                    let notice = format!("{:?}", app.status.take().expect("one notice"));
+                    assert_eq!(
+                        notice.contains("closed in another client"),
+                        retired,
+                        "{notice}"
+                    );
+                } else {
+                    assert!(app.status.is_none(), "the notice is not repeated");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refused_draft_publication_is_kept_without_claiming_another_client_closed_it() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        drop(app.reconcile_shared_views());
+        let operation = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|edit| match edit {
+                ModelEdit::ChangeView {
+                    operation,
+                    change: Change::Insert { pane, .. },
+                    ..
+                } if pane.id == card => Some(operation),
+                _ => None,
+            })
+            .unwrap();
+        app.refuse_shared_view_edit(&Scope::Channel(channel), operation);
+        assert!(app.durable.local_only_cards.contains(&card));
+        assert!(
+            super::super::chat_ui::chat_error_for_test(&app, card)
+                .is_some_and(|error| error.contains("could not be shared"))
+        );
+        for _ in 0..3 {
+            drop(app.reconcile_shared_views());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert_eq!(app.workspace.focused(), Some(card));
+            assert!(app.status.is_none(), "nothing was closed in another client");
+        }
+        assert!(receiver.try_recv().is_err(), "a refusal is not republished");
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&card)
+                .map(String::as_str),
+            Some("first message")
+        );
+        // The kept draft still sends, in this window only.
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("refused-draft-send"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+            target,
+            crate::chat::PromptMode::Send,
+        ));
+        let start = app.handle_chat_ui(first_start_save_completion(save));
+        assert!(start.units() > 0);
+        assert!(app.chat_start_pending(card));
+        drop(start);
+        drop(app.reconcile_shared_views());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.durable.local_only_cards.contains(&card));
+        assert!(
+            !std::iter::from_fn(|| receiver.try_recv().ok()).any(|edit| matches!(edit,
+                ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card))
+        );
+    }
+
+    #[test]
+    fn transferred_native_draft_can_complete_its_first_start_checkpoint() {
+        let (mut app, channel, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        drop(app.reconcile_shared_views());
+        let pane = app
+            .local_view_panes(&Scope::Channel(channel))
+            .into_iter()
+            .find(|pane| pane.id == card)
+            .unwrap();
+        let source = app
+            .durable
+            .channels
+            .iter()
+            .find(|entry| entry.id != channel)
+            .unwrap()
+            .id;
+        let mut retired_source = View::empty(source);
+        retired_source.retired.push(card);
+        app.workspace_model.views[0].panes.push(pane);
+        app.workspace_model.views.push(retired_source);
+        app.shared_views.pending.clear();
+        drop(app.reconcile_shared_views());
+        while receiver.try_recv().is_ok() {}
+        let directory = tempfile::tempdir().unwrap();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("first-send-transferred"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let save = app.handle_chat_ui(super::super::chat_ui::Action::Submit(
+            target,
+            crate::chat::PromptMode::Send,
+        ));
+        let completion = first_start_save_completion(save);
+        assert!(matches!(
+            &completion,
+            super::super::chat_ui::Action::DraftStartCheckpointed(_, _, Ok(()))
+        ));
+        let start = app.handle_chat_ui(completion);
+        assert!(app.chat_start_pending(card));
+        assert!(start.units() > 0);
+        drop(start);
+        assert!(!app.durable.local_only_cards.contains(&card));
+        assert_eq!(app.local_view_cards(&Scope::Channel(channel)), vec![card]);
+    }
+
+    #[test]
+    fn refused_default_chat_insert_does_not_republish_on_empty_reads() {
+        let (mut app, _, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        drop(app.reconcile_shared_views());
+        let operation = std::iter::from_fn(|| receiver.try_recv().ok())
+            .find_map(|edit| match edit {
+                ModelEdit::ChangeView {
+                    operation,
+                    change: Change::Insert { pane, .. },
+                    ..
+                } if pane.id == card => Some(operation),
+                _ => None,
+            })
+            .unwrap();
+        app.shared_views.refused(operation);
+        for _ in 0..3 {
+            drop(app.reconcile_shared_views());
+        }
+        assert!(app.durable.local_only_cards.contains(&card));
+        assert!(
+            receiver.try_recv().is_err(),
+            "a refusal grants no creation retry"
+        );
+    }
+
+    #[test]
+    fn retired_default_chat_does_not_gain_creation_authority() {
+        let (mut app, _, card, target, receiver) = unpublished_default_chat();
+        compose_default_chat(&mut app, target);
+        app.workspace_model.views[0].retired.push(card);
+        drop(app.reconcile_shared_views());
+        assert!(app.durable.local_only_cards.contains(&card));
+        assert!(receiver.try_recv().is_err());
+    }
+
     #[test]
     fn edit_during_seed_is_published_before_projection() {
         let (mut app, a, _, pane) = fixture();
