@@ -31080,15 +31080,13 @@ mod tests {
         assert!(save_messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryIssuedFlush(found)) if *found == id)));
         // Observe navigation without dispatching this save: the following
         // retained-pointer control owns the stage transition.
-        let renderer = crate::app::tests::headless_renderer();
-        let mut tree = iced::advanced::widget::Tree::new(
-            f.app.shared_return_notice_view_for_test().as_widget(),
-        );
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut cache = iced::runtime::user_interface::Cache::new();
         assert!(
             send_return_control_pointer(
                 f.app.shared_return_notice_view_for_test(),
-                &mut tree,
-                &renderer,
+                &mut cache,
+                &mut renderer,
                 format!("chrome.issued.{id}.retry-issued-flush"),
                 iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)
             )
@@ -31125,8 +31123,8 @@ mod tests {
         assert!(ack_messages.iter().any(|message| matches!(message, Message::ChromeUi(Chrome::RetryIssuedAck(found)) if *found == id)));
         let released = send_return_control_pointer(
             f.app.shared_return_notice_view_for_test(),
-            &mut tree,
-            &renderer,
+            &mut cache,
+            &mut renderer,
             format!("chrome.issued.{id}.retry-issued-ack"),
             iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
         );
@@ -31137,8 +31135,8 @@ mod tests {
         assert!(
             send_return_control_pointer(
                 f.app.shared_return_notice_view_for_test(),
-                &mut tree,
-                &renderer,
+                &mut cache,
+                &mut renderer,
                 format!("chrome.issued.{id}.retry-issued-ack"),
                 iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)
             )
@@ -31146,8 +31144,8 @@ mod tests {
         );
         let fresh = send_return_control_pointer(
             f.app.shared_return_notice_view_for_test(),
-            &mut tree,
-            &renderer,
+            &mut cache,
+            &mut renderer,
             format!("chrome.issued.{id}.retry-issued-ack"),
             iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
         );
@@ -31655,15 +31653,18 @@ mod tests {
         backwards: bool,
     ) -> Vec<Message> {
         use iced::advanced::{
-            Layout, Shell, clipboard, layout,
-            widget::{Operation, Tree, operation},
+            clipboard,
+            widget::{Operation, operation},
         };
         use iced::futures::StreamExt;
+        use iced::runtime::{UserInterface, user_interface::Cache};
         let ring = app.shared_return_notice_ring_for_test();
         assert!(
             ring.iter().any(|id| id == wanted),
             "the offered action belongs to the real Tab ring"
         );
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut cache = Cache::new();
         for _ in 0..ring.len() {
             let task = app
                 .chrome_key_event(&keyboard::Event::KeyPressed {
@@ -31680,14 +31681,11 @@ mod tests {
                     repeat: false,
                 })
                 .expect("the open Notices popup owns Tab and Shift-Tab");
-            let mut element = app.shared_return_notice_view_for_test();
-            let renderer = crate::app::tests::headless_renderer();
-            let viewport = iced::Rectangle::with_size(iced::Size::new(900.0, 1500.0));
-            let mut tree = Tree::new(element.as_widget());
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            let mut ui = UserInterface::build(
+                app.shared_return_notice_view_for_test(),
+                iced::Size::new(900.0, 1500.0),
+                std::mem::take(&mut cache),
+                &mut renderer,
             );
             if let Some(mut stream) = iced::runtime::task::into_stream(task) {
                 let executor = tokio::runtime::Builder::new_current_thread()
@@ -31699,12 +31697,7 @@ mod tests {
                         panic!("Notices keyboard navigation must only focus widgets");
                     };
                     loop {
-                        element.as_widget_mut().operate(
-                            &mut tree,
-                            Layout::new(&node),
-                            &renderer,
-                            &mut operation,
-                        );
+                        ui.operate(&renderer, operation.as_mut());
                         match operation.finish() {
                             operation::Outcome::Chain(next) => operation = next,
                             _ => break,
@@ -31717,9 +31710,7 @@ mod tests {
             let mut probe = operation::map(operation::focusable::find_focused(), move |id| {
                 *sink.lock().unwrap() = Some(id);
             });
-            element
-                .as_widget_mut()
-                .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
+            ui.operate(&renderer, &mut probe);
             let _ = probe.finish();
             let reached = found
                 .lock()
@@ -31727,12 +31718,12 @@ mod tests {
                 .as_ref()
                 .is_some_and(|id| id.to_string() == wanted);
             if !reached {
+                cache = ui.into_cache();
                 continue;
             }
             let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            let _ = ui.update(
+                &[iced::Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Enter),
                     modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
                     physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
@@ -31740,13 +31731,11 @@ mod tests {
                     modifiers: keyboard::Modifiers::empty(),
                     text: None,
                     repeat: false,
-                }),
-                Layout::new(&node),
+                })],
                 iced::mouse::Cursor::Unavailable,
-                &renderer,
+                &mut renderer,
                 &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
+                &mut messages,
             );
             return messages;
         }
@@ -31962,19 +31951,17 @@ mod tests {
 
     /// Mounts production widgets and sends Enter to their actual keyed control.
     /// No returned Task or async cleanup/recheck worker is evaluated here.
-    fn enter_mounted_return_control(mut element: Element<'_, Message>, id: String) -> Vec<Message> {
-        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
-        let renderer = crate::app::tests::headless_renderer();
-        let viewport = iced::Rectangle::with_size(iced::Size::new(900.0, 1500.0));
-        let mut tree = Tree::new(element.as_widget());
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+    fn enter_mounted_return_control(element: Element<'_, Message>, id: String) -> Vec<Message> {
+        use iced::advanced::clipboard;
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            element,
+            iced::Size::new(900.0, 1500.0),
+            Cache::new(),
+            &mut renderer,
         );
-        element.as_widget_mut().operate(
-            &mut tree,
-            Layout::new(&node),
+        ui.operate(
             &renderer,
             &mut iced::advanced::widget::operation::focusable::focus::<()>(widget::Id::new(id)),
         );
@@ -31988,27 +31975,25 @@ mod tests {
             text: None,
             repeat: false,
         };
-        element.as_widget_mut().update(
-            &mut tree,
-            &iced::Event::Keyboard(key),
-            Layout::new(&node),
+        let _ = ui.update(
+            &[iced::Event::Keyboard(key)],
             iced::mouse::Cursor::Unavailable,
-            &renderer,
+            &mut renderer,
             &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &viewport,
+            &mut messages,
         );
         messages
     }
 
     fn send_return_control_pointer(
-        mut element: Element<'_, Message>,
-        tree: &mut iced::advanced::widget::Tree,
-        renderer: &cosmic::Renderer,
+        element: Element<'_, Message>,
+        cache: &mut iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
         id: String,
         event: iced::mouse::Event,
     ) -> Vec<Message> {
-        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Operation};
+        use iced::advanced::{clipboard, widget::Operation};
+        use iced::runtime::UserInterface;
         struct Bounds {
             id: String,
             value: Option<iced::Rectangle>,
@@ -32028,31 +32013,26 @@ mod tests {
                 }
             }
         }
-        tree.diff(element.as_widget_mut());
-        let viewport = iced::Rectangle::with_size(iced::Size::new(900.0, 1500.0));
-        let node = element.as_widget_mut().layout(
-            tree,
+        let mut ui = UserInterface::build(
+            element,
+            iced::Size::new(900.0, 1500.0),
+            std::mem::take(cache),
             renderer,
-            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
         );
         let mut bounds = Bounds { id, value: None };
-        element
-            .as_widget_mut()
-            .operate(tree, Layout::new(&node), renderer, &mut bounds);
+        ui.operate(renderer, &mut bounds);
         let bounds = bounds
             .value
             .expect("the actual offered action is mounted and focusable");
         let mut messages = Vec::new();
-        element.as_widget_mut().update(
-            tree,
-            &iced::Event::Mouse(event),
-            Layout::new(&node),
+        let _ = ui.update(
+            &[iced::Event::Mouse(event)],
             iced::mouse::Cursor::Available(bounds.center()),
             renderer,
             &mut clipboard::Null,
-            &mut Shell::new(&mut messages),
-            &viewport,
+            &mut messages,
         );
+        *cache = ui.into_cache();
         messages
     }
 
@@ -32065,14 +32045,12 @@ mod tests {
         drop(f.app.update(Message::ChromeUi(
             super::super::chrome_ui::Action::ToggleNotices,
         )));
-        let renderer = crate::app::tests::headless_renderer();
-        let mut tree = iced::advanced::widget::Tree::new(
-            f.app.shared_return_notice_view_for_test().as_widget(),
-        );
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut cache = iced::runtime::user_interface::Cache::new();
         let pressed = send_return_control_pointer(
             f.app.shared_return_notice_view_for_test(),
-            &mut tree,
-            &renderer,
+            &mut cache,
+            &mut renderer,
             format!("chrome.notices.cleanup-source.{id}"),
             Event::ButtonPressed(Button::Left),
         );
@@ -32084,8 +32062,8 @@ mod tests {
         let retry_id = format!("chrome.notices.cleanup.{id}");
         let released = send_return_control_pointer(
             f.app.shared_return_notice_view_for_test(),
-            &mut tree,
-            &renderer,
+            &mut cache,
+            &mut renderer,
             retry_id.clone(),
             Event::ButtonReleased(Button::Left),
         );
@@ -32097,8 +32075,8 @@ mod tests {
         assert!(
             send_return_control_pointer(
                 f.app.shared_return_notice_view_for_test(),
-                &mut tree,
-                &renderer,
+                &mut cache,
+                &mut renderer,
                 retry_id.clone(),
                 Event::ButtonPressed(Button::Left)
             )
@@ -32106,8 +32084,8 @@ mod tests {
         );
         let fresh = send_return_control_pointer(
             f.app.shared_return_notice_view_for_test(),
-            &mut tree,
-            &renderer,
+            &mut cache,
+            &mut renderer,
             retry_id,
             Event::ButtonReleased(Button::Left),
         );
