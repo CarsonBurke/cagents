@@ -1,0 +1,176 @@
+{
+  "caller_limits": "UI owning2 consume only test-local Widget Tab/ShiftTab focus operations; production cleanup/provider/save/recheck futures remain dropped. Adapted3 use synthetic completions; typed Closed without writer leaves FlushFailed/unresolved custody. HOST fixtures may create private PTY /bin/cat/process/thread/file/scripted providers. No genuine User authority, commercial provider, physical cleanup or native proof.",
+  "graph": [
+    "host"
+  ],
+  "kind": "SOURCE_PINNED_ORDINARY_CALLER_MAP_NOT_EXECUTED_PARENT_INVENTORY",
+  "owning_passes_max": 16,
+  "parents": [
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 107,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 126,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 170,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 184,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 240,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 309,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 346,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 369,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 419,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+      "source_sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 6138,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat.rs",
+      "source_sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_PRIVATE_FRAMED_PEER",
+      "definition_line": 3078,
+      "expected_stdout_child_results": 0,
+      "name": "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+      "ordinary_source_declaration": true,
+      "source": "src/chat/client.rs",
+      "source_sha256": "2cbef29622dc3c6ee4f2af8e4d08705bed44948df90eb1a4bc6b285151ce4096"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_IN_MEMORY_CODEC",
+      "definition_line": 2866,
+      "expected_stdout_child_results": 0,
+      "name": "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+      "ordinary_source_declaration": true,
+      "source": "src/terminal/ipc.rs",
+      "source_sha256": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_PRIVATE_FRAMED_PEER",
+      "definition_line": 6084,
+      "expected_stdout_child_results": 0,
+      "name": "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+      "ordinary_source_declaration": true,
+      "source": "src/control.rs",
+      "source_sha256": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 6133,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat.rs",
+      "source_sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_PRIVATE_SCRIPTED_PROVIDER_FIXTURE",
+      "definition_line": 4981,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat.rs",
+      "source_sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d"
+    },
+    {
+      "actual_caller_runtime": null,
+      "caller_source_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+      "definition_line": 4924,
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement",
+      "ordinary_source_declaration": true,
+      "source": "src/host/chat.rs",
+      "source_sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d"
+    }
+  ],
+  "product": {
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15"
+  }
+}

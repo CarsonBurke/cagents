@@ -1,0 +1,37 @@
+{
+  "schema": "issued_return_f95_reviewed_assembled_source_publication_v1",
+  "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+  "branch": "fix/fw16-issued-return-cleanup-api",
+  "source_adoption": {
+    "path": "/tmp/fw16-backend-ec204421/issued-return-f95df2da-assembled-consumer-root-source-adoption-v1.json",
+    "sha256": "1510be9772e73e375bdeff0161f9e2f0ae215b05cb30d6b31182859f575ab402"
+  },
+  "fetch": {
+    "chunk_id": "c3b5b0",
+    "wall_time_seconds": 0.094136621,
+    "exit_code": 0,
+    "original_token_count": 31,
+    "output": "From /tmp/held-saved-scope-fw16-control/\n * branch                f95df2da80a23b2a50c8c2304e19805423ca7da3 -> FETCH_HEAD\n"
+  },
+  "push_start": {
+    "chunk_id": "2e0c8e",
+    "wall_time_seconds": 1.001382068,
+    "session_id": 26600,
+    "original_token_count": 26,
+    "output": "\n** (process:46): CRITICAL **: 09:46:31.429: store failed: Cannot create an item in a locked collection\n"
+  },
+  "push_final": {
+    "chunk_id": "83f27c",
+    "wall_time_seconds": 0.000010519,
+    "exit_code": 0,
+    "original_token_count": 38,
+    "output": "To https://github.com/CarsonBurke/cagents.git\n   615e62c0b..f95df2da8  f95df2da80a23b2a50c8c2304e19805423ca7da3 -> fix/fw16-issued-return-cleanup-api\n"
+  },
+  "readback": {
+    "ref": "refs/heads/fix/fw16-issued-return-cleanup-api",
+    "sha": "f95df2da80a23b2a50c8c2304e19805423ca7da3"
+  },
+  "scope": "Staged assembled source only; ordinary nonforce615e->f95. No PR create/body/comment retry; no Rust/native/UX/merge qualification. Full inherited55file stack vs main, three UI consumer leaves vs615e, all2228 outside entries/modes conserved.",
+  "new_execution_grant": false
+}

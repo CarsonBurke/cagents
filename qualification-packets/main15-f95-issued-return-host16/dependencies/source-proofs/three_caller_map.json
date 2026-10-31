@@ -1,0 +1,135 @@
+{
+  "caller_boundary": {
+    "actual_caller_environment": "UNKNOWN_UNREAD",
+    "fresh_assessment": "No reachable parent/helper asserts User identity, clears inherited authority/context, starts an authority proxy, invokes the genuine-User startup wrapper, or evaluates the production native-return/start/close/ACK Tasks. CallerContext capture may preserve whatever is actually inherited in a later admitted run; no actual environment was read in this review. Real scoped-auth refusal/success and physical teardown are not qualified by these mocked completions.",
+    "needed_wrapper": "NONE for these source-classified parents; no environment/context modification authorized."
+  },
+  "limits": {
+    "PR1933": "NEVER_MERGE",
+    "actions": "No source edit/build/formatter/test/import/eval/Task/native/provider/environment/authority/account/process/resource/API probe or new worker. Sole mutation is this exclusive0444 receipt.",
+    "actual_N": null,
+    "actual_artifact": null,
+    "actual_context": null,
+    "actual_grant": null,
+    "actual_inventory": null,
+    "actual_results": null,
+    "actual_run": null,
+    "compiled_tests_native": "UNRUN",
+    "kind": "Fresh three-parent caller/source preparation only; prior f95 bounded source clear is not reopened or expanded into runtime/API14/native/whole qualification.",
+    "merge_ready": false,
+    "old_results": "No old-head result/adoption, fixture name or synthetic Closed is retargeted as current execution. Original User5/native/WHOLE/qclosed/general holds remain.",
+    "qualified": false,
+    "queued": false
+  },
+  "parents": [
+    {
+      "classification": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT_AT_SOURCE_LEVEL",
+      "end_line": 24136,
+      "flow": "live_chat creates a local fixture handle; Switch Task is dropped; fixture activity observation and Wake are synchronous data; exact captured-operation Err is injected and the parent checks retained chat/activity. No real return or provider request runs.",
+      "genuine_User_required": false,
+      "reviewed_function_span_bytes": 1479,
+      "reviewed_function_span_sha256": "1e55df3b5153459b708048d2f9811f7e14c951253193c596bf4572eee742197c",
+      "selector": "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+      "source": "src/app/chat_ui.rs",
+      "start_line": 24100
+    },
+    {
+      "classification": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT_AT_SOURCE_LEVEL",
+      "end_line": 24602,
+      "flow": "unresumable_chat changes only the fixture runtime snapshot to exited/unnamed. StartFresh creates a Closing phase and a lazy handle.close future, which is dropped. native_return_operation is nil because this fixture has no Switch operation; corrected missing-context guard ignores the old Handoff Err. Injected CloseFinished then creates a new starting attempt whose real connect/start Task is also dropped.",
+      "genuine_User_required": false,
+      "reviewed_function_span_bytes": 721,
+      "reviewed_function_span_sha256": "f59adfbbcb1bc5f5b7e11e8f4fd1040b756f6443d5d843183b8a21b14ab51b24",
+      "selector": "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+      "source": "src/app/chat_ui.rs",
+      "start_line": 24587
+    },
+    {
+      "classification": "ORDINARY_INHERITED_AGENT_COMPATIBLE_COMPONENT_PARENT_AT_SOURCE_LEVEL",
+      "end_line": 24748,
+      "flow": "A local fixture live Codex chat enters real Switch and queues first Close; both production Tasks are dropped. A complete synthetic proof/terminal and nonce fixture are injected, then typed Closed is injected for its exact issued binding. No session writer exists, so the owning source asserts closed state with FlushFailed and unresolved custody. It does not execute issued cleanup, commit a durable result, ACK or physically close a CLI/provider.",
+      "genuine_User_required": false,
+      "reviewed_function_span_bytes": 2618,
+      "reviewed_function_span_sha256": "7fbea6506dcc11c5093288ba58aa5624a370a3bd661740d01fb43827761e5846",
+      "selector": "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
+      "source": "src/app/chat_ui.rs",
+      "start_line": 24692
+    }
+  ],
+  "prior_review": {
+    "bytes": 13153,
+    "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-independent-authority-caller-correction-source-review-v1.json",
+    "sha256": "1e1e872f25d98db457c3947fe6919993b13479bf24f9f7b125c33489c1118e1a"
+  },
+  "reached_helper_seams": [
+    {
+      "anchors": [
+        "src/app.rs:29458",
+        "src/app.rs:29520",
+        "src/app.rs:29527"
+      ],
+      "assessment": "context_inspector_test_app constructs default local durable/runtime state; model output is an unread unbounded queue and session is None. It does not invoke the startup/genuine-User fixture wrapper."
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:17674",
+        "src/app/chat_ui.rs:19492",
+        "src/app/chat_ui.rs:19858",
+        "src/app/chat_ui.rs:21273",
+        "src/app/chat_ui.rs:21285",
+        "src/app/chat_ui.rs:21786"
+      ],
+      "assessment": "draft_chat_for_provider/new_native_chat, composer edit, Submit, Ready and CommandFinished are reducer/fixture steps. Returned production Tasks are dropped. Starting provider work lives inside the lazy future at8640 and is not executed by these helpers."
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:21426",
+        "src/app/chat_ui.rs:21453",
+        "src/chat/client.rs:1311"
+      ],
+      "assessment": "fixture_handle supplies complete fixture proof and Snapshot data; ClientHandle::fixture uses local UnixStream pairs, a fixture retirement worker and retained local peers. It does not authenticate a forged caller to a real host or connect to an actual provider/daemon."
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:23757",
+        "src/app/chat_ui.rs:10869",
+        "src/app/chat_ui.rs:10909",
+        "src/app/chat_ui.rs:14117",
+        "src/app/chat_ui.rs:14125"
+      ],
+      "assessment": "unresumable snapshot/StartFresh are explicit component state. handle.close is inside an unpolled future. The operation lookup may return nil for the late-reply negative, which now must be ignored. Issued proof/nonce in the Codex close parent are explicit synthetic data, not caller authority."
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui/preparation.rs:1693",
+        "src/app/chat_ui.rs:8727"
+      ],
+      "assessment": "drain_fixture synchronously completes text/markdown preparation for an injected snapshot; reread_chat_activity consumes the local handle activity observation. These are component UI/data work and are not a real provider start or User-only producer."
+    }
+  ],
+  "reviewer": "/root/authority_regressions",
+  "schema": "main15-f95df2da-three-fixture-parent-caller-source-classification-addendum-v1",
+  "selection": {
+    "controller_mutation": "NONE; this addendum does not edit or authorize a packet/controller, choose an artifact or grant execution.",
+    "count": "Three actual owning parents, additive to the separate two owning parents only as UI5 source selection. Nested/injected controls are nonadditive. Any future actual test inventory/N must be observed from the admitted compiled artifact, not inferred here.",
+    "exact_selectors": [
+      "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+      "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+      "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+    ],
+    "graph": "Existing isolated UI library test graph: cargo --no-default-features --features ui --lib. app is ui-gated at src/modules.rs:18; chat::client is available for ui at src/chat.rs:19. Host runtime/native_holder/protocol are host-gated at src/chat.rs:21\u201326; no UI+host union or integrated-browser graph is needed for these three selectors.",
+    "scheduler": "DEFAULT_OUTER_RUST_SCHEDULER; no --test-threads argument or test startup/User wrapper."
+  },
+  "source": {
+    "file": "src/app/chat_ui.rs",
+    "file_blob": "77681ebe5c3050ab212be626ed487e0d63618ba9",
+    "file_bytes": 1418988,
+    "file_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "read_method": "Immutable exact-f95 Git show and text/hash reads only; no body, helper, Task or module evaluation.",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6"
+  },
+  "utc": "2026-10-31T16:30:40.213324+00:00",
+  "verdict": "ALL_THREE_SOURCE_CLASSIFIED_ORDINARY_INHERITED_AGENT_COMPONENT_TESTS; UI_LIB_ONLY; DEFAULT_OUTER_SCHEDULER; EXECUTION_UNRUN"
+}

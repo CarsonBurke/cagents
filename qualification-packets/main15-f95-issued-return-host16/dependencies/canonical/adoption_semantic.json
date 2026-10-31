@@ -1,0 +1,137 @@
+{
+  "schema": "bounded-canonical-correction-semantic-caller-review-v1",
+  "created_utc": "2026-10-31T11:19:44.241059+00:00",
+  "reviewer": {
+    "task": "/root/1945_cache_io_oracles",
+    "role": "independent semantic/caller reviewer of Root-authored canonical correction",
+    "historical_relationship": "Author of the prior source finding and earlier frozen347 packet source; did not author this correction",
+    "runtime_authority": "None"
+  },
+  "disposition": "SCOPED_SOURCE_CLEAR",
+  "scope": "Only the canonical settle_children correction against finding407384f6, natural settlement and exception semantics, and compatibility with the actual unchanged RootB phase/final handback callers. Not whole-controller approval, runnable-packet admission, broad conservation or execution/test qualification.",
+  "pins": {
+    "head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/c-unproven-adoption-policy-source-v1/freeze.json",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682"
+    },
+    "prior_negative": {
+      "path": "/tmp/startup30-adopted-signal-source-audit-hlrnp0hy/review.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8",
+      "preserved": true
+    },
+    "new_files": [
+      {
+        "path": "policy-corrections/adopted-child-settlement/settle_children.py",
+        "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+        "blob_oid": "fd31b863db8bb4ef36c3a328624e9f02e87884fa"
+      },
+      {
+        "path": "policy-corrections/adopted-child-settlement/from-347-function.diff.json",
+        "sha256": "3cdf58ec3a730e81b67d9470a63334f229e36c1621d272fba915ea02f3c911dc",
+        "blob_oid": "d10267090af89ff8111185e7b9043c3b8f956d02"
+      },
+      {
+        "path": "policy-corrections/adopted-child-settlement/README.md",
+        "sha256": "5a5ab2c919f74a054e0876a6694a58effe0a940b4839e907f37074f53ac9b7dd",
+        "blob_oid": "b425ae48245d1dc1a17fc5730cbe5119602c38ab"
+      },
+      {
+        "path": "policy-corrections/adopted-child-settlement/test_policy.py",
+        "sha256": "0a9e368a994d6c31c03b834b645055dd21ee432b8221e225bfc8c10f3fff0263",
+        "blob_oid": "32019b1a359ad734d04de7518c386f4b9bf98a95"
+      }
+    ],
+    "unchanged_runnable_driver": {
+      "path": "qualification-packets/startup30/run-packet.py",
+      "sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+      "byte_exact_to_347": true,
+      "canonical_correction_not_wired_here": true
+    },
+    "original_function": {
+      "lines": [
+        225,
+        269
+      ],
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
+    }
+  },
+  "semantic_checks": [
+    {
+      "result": "CLEAR",
+      "claim": "The exact first18 lines preserve the original three-second natural waitpid/census grace, including ChildProcessError handling and empty-census return.",
+      "anchor": "policy-corrections/adopted-child-settlement/settle_children.py:1-18",
+      "source_proof": "Exact byte comparison to frozen347 definition prefix; no execution."
+    },
+    {
+      "result": "CLEAR",
+      "claim": "The post-grace branch returns clean:false, forced:false and the actual remaining list under both observed and remaining. It opens no new pidfd, sends no signal and closes no adopted descriptor.",
+      "anchor": "policy-corrections/adopted-child-settlement/settle_children.py:19-22",
+      "source_proof": {
+        "all_call_targets": [
+          "children",
+          "os.waitpid",
+          "time.monotonic",
+          "time.sleep"
+        ],
+        "forced_assignments": "Only initial False assignment; no later mutation."
+      }
+    },
+    {
+      "result": "CLEAR",
+      "claim": "A failed children census or non-ChildProcessError wait/time operation propagates; the correction adds no catch, retry, empty-census substitution or clean result.",
+      "anchor": "policy-corrections/adopted-child-settlement/settle_children.py:6-18",
+      "limit": "Existing children() missing-process handling and natural dead-child status accounting remain unchanged; this is no new global absence/status certificate."
+    },
+    {
+      "result": "CLEAR",
+      "claim": "Natural disappearance during the retained grace still reaches the old empty-census clean/unforced result. A survivor at the deadline is left unsignaled with explicit unclean evidence.",
+      "anchor": "policy-corrections/adopted-child-settlement/settle_children.py:13-22",
+      "limit": "No runtime timing or complete namespace claim."
+    }
+  ],
+  "actual_caller_trace_when_exact_definition_is_ported": [
+    {
+      "anchor": "qualification-packets/startup30/run-packet.py:1149-1174",
+      "effect": "run catches ordinary settlement exceptions into clean:false/inspection_error; stores custody on the original phase state/result; its custody_clean assertion rejects survivors/errors. The original phase custody remains false even if later children disappear."
+    },
+    {
+      "anchor": "qualification-packets/startup30/run-packet.py:687-709",
+      "effect": "custody_clean rejects clean:false, inspection uncertainty and nonempty remaining; safe_lane_handoff requires every original phase state clean, both final passes clean, complete original waits and no sticky supervision failure. forced:false alone cannot authorize handback."
+    },
+    {
+      "anchor": "qualification-packets/startup30/run-packet.py:807-831",
+      "effect": "final_observations catches ordinary census exceptions as unclean; records a failure for an unclean result; joins both final passes with all(). An earlier false pass survives a later empty one."
+    },
+    {
+      "anchor": "qualification-packets/startup30/run-packet.py:1249-1291",
+      "effect": "Assessment exceptions with acquired C enter retain_uncertain_lane; false handoff enters it before original C fd close. Thus an acquired-C survivor/error cannot quietly close C, claim actual_release or qualify commands."
+    },
+    {
+      "anchor": "qualification-packets/startup30/run-packet.py:845-864",
+      "effect": "Existing HOLD loop retains original process/reservation and performs no workload, signals, new cleanup or close retry. Failure to write HOLD evidence is swallowed only while continuing retention, not converted into successful handback."
+    },
+    {
+      "anchor": "qualification-packets/startup30/run-packet.py:1076-1086",
+      "effect": "Prelease source failure is a distinct no-acquired-C path: it records custody, lock_acquired:false and qualified:false, then re-raises the original error. It is not a leased C release or success path; no claim that this prelease branch parks an acquired lease."
+    }
+  ],
+  "direct_original_child_conservation": {
+    "source_check_anchor": "qualification-packets/startup30/run-packet.py:76-103",
+    "phase_anchor": "qualification-packets/startup30/run-packet.py:1112-1140",
+    "original_wait_anchor": "qualification-packets/startup30/run-packet.py:46-50",
+    "result": "The whole old runnable driver is byte-identical to347. Its original direct Popen, held child_fd timeout TERM/KILL, original wait recording and descriptor-close handling are untouched by these new-only leaves. Generic adopted-child signal removal does not weaken those separate direct-owner paths.",
+    "limit": "No descendant group kill, new management permission or current runtime cleanup qualification is inferred."
+  },
+  "findings": [],
+  "remaining_delivery_requirements": [
+    "This commit is a canonical source correction only. All existing driver bytes still contain the historical settle_children; no executable packet is corrected by this commit alone.",
+    "Each future RootB/Main15/Root16 packet must port the exact definition into a separately frozen/reviewed caller composition and satisfy its own admission/source/guard checks before execution. This report grants no runtime, C release or scheduling authority.",
+    "The four authored pure tests remain UNRUN. Their executable test-admission/conservation scope is assigned to another reviewer; reading their source here is not a test PASS.",
+    "Current B347 original RAW remains pending/unchanged. Historical observed-empty A2 and accepted bounded4680 evidence are not reclassified; their raw evidence was not inspected in this correction review."
+  ],
+  "actions": "Only immutable Git/source/JSON reads, source AST/hash/byte comparison and this task-owned /tmp receipt. No candidate/donor import, invocation, compile or extracted-function test; no build/Cargo/native/provider/process/environment/target/resource/DB probes, source/Git mutation, remote/public write, grant or child worker."
+}
