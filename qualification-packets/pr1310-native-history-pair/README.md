@@ -18,8 +18,8 @@ The exact future native sources are:
 
 | Role | Head | Tree |
 | --- | --- | --- |
-| Before | 146ad67b926672367817d06897e4cb9f55176bbd | c61e06cd488a6801863cc48d2de429c8f993ba9d |
-| After | 3ba686a8bd2d9ee500885c0ec5a2c5065f1c5dce | 124bd8583a75133bb4ed564ef829a154d123c4ed |
+| Before | 4ad36779cf830b36a5248cf76d4150d122884dda | f68427879b413b261ad8c5da27faff042cccef20 |
+| After | 02802c8a563f48758f346fa9a0c633bbcee5abf9 | f92373909001e423c999a57f8ceaaaff7b7869c5 |
 
 Both include the reviewed fixture adapter and the same source builder. The
 builder's historical a322→efa source-pair fields remain unchanged provenance;
@@ -113,7 +113,7 @@ and identities separately from frame equality. It validates every completed
 version1 appearance record from the paired producers and exactly one selected
 wgpu-types28 adapter (eleven fields). Actual Dark/Core scale are readback;
 requested GL/software and configured scale1 are not observations. Native scale
-stays unknown without a real matching Rescaled. The observation is deduplicated
+stays unknown without a real matching Rescaled or accepted exact one-shot original-window scale query. The observation is deduplicated
 view state, not a compositor-present or per-capture acknowledgement.
 
 A zero-record or current incomplete append can read-only poll inside the same
@@ -246,3 +246,42 @@ normal_close_succeeded observation are unchanged. Application inference supplies
 no physical return, raw missing status, C ownership, native qualification or
 resource acceptance. All actual entry/build/config/chain/native/UX inputs and
 results remain NULL/UNRUN. No owner function or test was executed in preparation.
+
+## Initial native scale producer binding (source only)
+
+Current Before4ad36779/After02802c8a bind the independently reviewed one-shot
+`window::scale_factor` producer. Actual matching Opened/token/still-open/Rescaled
+priority guards live in the unchanged Rust producer; this packet only consumes
+its new original opened-generation and query-UUID fields. A canonical nonnil UUID
+is required only for `window_scale_factor_query`; unknown/Rescaled carry null.
+Positive finite bits/factor are required for known sources. Unknown remains
+None, including after Closed/reopen when the native counter retains its old
+nonzero value. No configured/initialized/default factor is accepted.
+
+Open/native counters follow actual nonbool saturating u64 bounds. Stream checks
+refuse backwards/contradictory same-lifecycle provenance without incorrectly
+forcing an unknown reopened counter to zero. Saturation is not unique-lifecycle
+proof. Capture equality retains semantic state/meaningful observation generation
+and now original Opened generation/query identity; raw offsets/times stay separate.
+These log claims are not an API-execution/issued-request/present acknowledgement.
+
+Five owning source-oracle parents are AUTHORED UNRUN in
+`test_initial_native_scale_consumer.py`. Their future pure selector takes the
+actual owning parser and capture-key AST with exact source SHA, not a full owner
+import or a rewritten desired implementation. Only AST/JSON parsing occurred
+here. Historical07b pure3 success does not qualify the modified consumer.
+
+All physical/FD/custody/launch/application/AX and native driver interaction bodies
+remain b756. Existing feb4 worker is still bound to b756 and is NOT retargeted.
+Actual chain/config/builds, Opened/query/Rescaled/logs, images/native flow/UX and
+entry/C/resource admission remain NULL/UNRUN. Independent consumer review is
+required; source binding is not a runnable or admitted native packet.
+
+The existing frame-readiness loop now read-only polls within its SAME original
+deadline until the latest complete valid appearance has an actual nonnull
+native factor, with adapter present and no incomplete tail. It never selects
+an older known factor over a reopened unknown, reissues a query/input or repairs
+state. Persistent unknown reaches the original HOLD deadline; no native progress
+or callback delivery guarantee is claimed. The fifth UNRUN oracle selects the
+actual readiness expression and distinguishes unknown-first/positive/latest-
+unknown without executing the loop, a clock, native API or owner entry.
