@@ -10023,10 +10023,7 @@ mod tests {
                     node.node().role() == iced_accessibility::accesskit::Role::Button
                         && node.node().label().is_some_and(|label| match step {
                             0 => label.starts_with("Choose subagent:"),
-                            1 => {
-                                label.contains("Inspect repository")
-                                    && label.ends_with(" · native-child")
-                            }
+                            1 => label == "Scout · Waiting · native-child",
                             _ => label == "Main conversation",
                         })
                 })
@@ -10043,6 +10040,21 @@ mod tests {
                     )
                 });
             if step == 1 {
+                let descriptions: Vec<_> = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .filter(|node| {
+                        node.node().role() == iced_accessibility::accesskit::Role::Button
+                            && node.node().label() == Some("Scout · Waiting · native-child")
+                    })
+                    .map(|node| node.node().description())
+                    .collect();
+                assert_eq!(
+                    descriptions,
+                    vec![Some("Task: Inspect repository")],
+                    "the task stays the exact description of one named child button"
+                );
                 assert!(
                     bounds.x0 >= 0.0 && bounds.x1 <= f64::from(size.width),
                     "actual chooser bounds {bounds:?} must fit the narrow pane"
