@@ -1,0 +1,40 @@
+{
+  "destination_common": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1862-splice/.git",
+  "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "kind": "exact_local_git_source_import_only",
+  "original_import_tool": {
+    "chunk_id": "e85da1",
+    "exit_code": 0,
+    "original_token_count": 0,
+    "output": "",
+    "wall_time_seconds": 0.443358661
+  },
+  "parents": [
+    "b8ebb9ca378eb9b006f3e47eb319625047877712"
+  ],
+  "scope": "Object import only; no checkout, product edit, build, test, runtime or context probe",
+  "source": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15",
+  "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+  "utc": "2026-10-31T16:55:38.210459+00:00",
+  "verification": {
+    "argv": [
+      "git",
+      "--no-lazy-fetch",
+      "--no-optional-locks",
+      "--no-replace-objects",
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-C",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1862-splice",
+      "show",
+      "-s",
+      "--format=%H%n%T%n%P",
+      "f95df2da80a23b2a50c8c2304e19805423ca7da3"
+    ],
+    "result": 0,
+    "stderr": "",
+    "stdout": "f95df2da80a23b2a50c8c2304e19805423ca7da3\n246ea7398afcf6e10625954296601ca3254428e6\nb8ebb9ca378eb9b006f3e47eb319625047877712\n"
+  }
+}

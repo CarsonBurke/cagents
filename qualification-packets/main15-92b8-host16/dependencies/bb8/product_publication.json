@@ -1,0 +1,39 @@
+{
+  "schema": "issued_return_bb8df653_title_ownership_reviewed_source_publication_v1",
+  "product": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+  "previous": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "branch": "fix/fw16-issued-return-cleanup-api",
+  "source_adoption": {
+    "path": "/tmp/fw16-backend-ec204421/issued-return-bb8df653-title-ownership-root-source-adoption-v1.json",
+    "sha256": "81e5631986046571b2388fef51997daab6c370964a2c3463f3e61a89b0cc7a94"
+  },
+  "fetch": {
+    "chunk_id": "396e24",
+    "wall_time_seconds": 0.074307773,
+    "exit_code": 0,
+    "original_token_count": 0,
+    "output": ""
+  },
+  "push_start": {
+    "chunk_id": "45ca56",
+    "wall_time_seconds": 1.000970203,
+    "session_id": 4090,
+    "original_token_count": 0,
+    "output": ""
+  },
+  "push_final": {
+    "chunk_id": "6e3adb",
+    "wall_time_seconds": 0.000013666,
+    "exit_code": 0,
+    "original_token_count": 64,
+    "output": "\n** (process:49): CRITICAL **: 11:13:56.365: store failed: Cannot create an item in a locked collection\nTo https://github.com/CarsonBurke/cagents.git\n   f95df2da8..bb8df6535  bb8df65354297c99228c6ff4f1aef75e9ae79b23 -> fix/fw16-issued-return-cleanup-api\n"
+  },
+  "readback": {
+    "ref": "refs/heads/fix/fw16-issued-return-cleanup-api",
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23"
+  },
+  "scope": "Two owned title expressions correct actual f95 E0308 errors. Reviewed nonforce FF existing source branch only, no PR metadata-rejection retry. Full55path inheritedstack remains; compile/test/native/WHOLE still unqualified. Root16 owns exclusive two-controller rebind and fresh independent source reviews.",
+  "runtime": "UNRUN_UNGRANTED",
+  "current_C": "cf6d3b68 SearchFront19 only"
+}

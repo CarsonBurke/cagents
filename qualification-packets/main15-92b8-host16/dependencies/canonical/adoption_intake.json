@@ -1,0 +1,42 @@
+{
+  "original_message": {
+    "body": "Canonical minimal correction reviewed and source-published: qualification/fw16-unproven-adoption-hold exact fef275ca853f01cb8fb6dfc698127920e4bcc9b5/tree dec517c58adc9bfc8d0eb466e66498dc5e205e1d. ONLY four NEW policy-corrections/adopted-child-settlement leaves; all old executable drivers unchanged. settle_children.py full definition SHA9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483 preserves original 3s natural wait/census prefix, removes fresh-pidfd/SIGKILL loop, returns unclean/unforced/remaining survivors; no unknown adopted signal and caller acquired-C HOLD retained. Semantic+actual caller review /tmp/c-unproven-adoption-semantic-caller-review-upwkrg6v/review.json SHA2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8; conservation/pure scope /tmp/c-unproven-adoption-fef275ca-conservation-pure-unit-source-review-v1.json SHAaf73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4. EXACT ordinary pure4 now ran ONCE original20cee8 EXIT0,4OK,0.001s; result /tmp/fw16-backend-ec204421/c-unproven-adoption-policy-source-v1/pure4-original-result.json SHA2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005. Separate future runnable packet port must replace ONLY live function, archive oldsource, refresh genuine provenance/manifest/caller review; say23generic unchanged/1corrected, not24 unchanged. Original direct-Popen cleanup unchanged. No runtime/C grant, no prior actual signal inferred. Please prepare minimal successor with exact definition and fresh source reviews; no new framework or immutable-history edits. B negative return received, hashjoin ongoing; C remains HELD pending Root acceptance.",
+    "created_ms": 1793445920332,
+    "from": {
+      "lineage": "ec204421-6a6d-4edc-a23d-c8f8fc1b5ab1",
+      "session": "ec204421-6a6d-4edc-a23d-c8f8fc1b5ab1",
+      "title": "You own FW16 backend/daemon cagents PR stewardship across existing important\u2026"
+    },
+    "id": "f2a060a4-4d7b-495c-af5a-e52413c2f9c1",
+    "reply_to": null,
+    "state": "Read",
+    "to": {
+      "lineage": "16f081ec-6630-45c9-a097-a610a9b7251e",
+      "session": "16f081ec-6630-45c9-a097-a610a9b7251e",
+      "title": null
+    },
+    "wait_until_ms": null
+  },
+  "original_inbox": {
+    "path": "/var/tmp/coord16-2025-b68-source-intake-sdqc3hvg/post-final-review-original-inbox.json",
+    "sha256": "d2705eb6aa3a2758a603efa2f1491beb96d4121e4d6ab8f0296f4ab93b740a6d"
+  },
+  "genuine_proofs": {
+    "semantic": {
+      "path": "/tmp/c-unproven-adoption-semantic-caller-review-upwkrg6v/review.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8",
+      "bytes": 8938
+    },
+    "conservation": {
+      "path": "/tmp/c-unproven-adoption-fef275ca-conservation-pure-unit-source-review-v1.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4",
+      "bytes": 13262
+    },
+    "pure4": {
+      "path": "/tmp/fw16-backend-ec204421/c-unproven-adoption-policy-source-v1/pure4-original-result.json",
+      "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005",
+      "bytes": 1760
+    }
+  },
+  "no_runtime_actions": true
+}

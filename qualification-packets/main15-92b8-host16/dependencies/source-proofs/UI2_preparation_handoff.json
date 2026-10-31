@@ -1,0 +1,128 @@
+{
+  "kind": "FINITE_MAIN15_P1_TASK_LOGIC_PREPARATION_NOT_FINAL_PRODUCT_BINDING",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-return-error-ui2-preparation",
+  "branch": "qualification/coord16-main15-return-error-ui2-preparation",
+  "HEAD_donor_only": "993cea26a29b5a2cd6857a959628de4e5f04c096",
+  "HEAD_tree_donor_only": "7ea6b11b3b9a18ac87828a1ee39d7e5380eb5065",
+  "donor_runner_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
+  "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-return-error-ui2-preparation/qualification-packets/main15-return-error-ui2-preparation",
+  "files": {
+    "plan.json": {
+      "bytes": 10591,
+      "sha256": "c101aa17e6beed4682d3ccc07a4baf439f32c8814237ae368af666eb65b9642c"
+    },
+    "run-packet.py": {
+      "bytes": 73536,
+      "sha256": "7bf9dba4a2653e6ffa42037660ae5c3b4d4bec9b42435b2bcf1ea3cb6edbffd2"
+    },
+    "source-preparation-proof.json": {
+      "bytes": 438689,
+      "sha256": "cb1f32b9031feb9d4caecafc690a02885b43902415ee7add9397aee3da188bc5"
+    }
+  },
+  "tracked_source_edits": [],
+  "new_uncommitted_packet_files": 3,
+  "local_commit_created": false,
+  "source_preservation": {
+    "other_top_level_definitions_byte_exact": 29,
+    "all_five_nested_byte_exact": true,
+    "canonical877byte_definition_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "full3790byte_close_block_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "execute_contracts_and_grouped_result_byte_exact": true,
+    "group_accounting_inverse_labels_counts_only": true,
+    "whole_module_inverse": "Three task functions and WT/PLAN/PLAN_SHA restore exact donor; full line forward/true-inverse fragments in source-preparation-proof.json.",
+    "compact_output_final_return_original_direct_Popen_wait_pidfd_family_HOLD_Cclose": "BYTE_EXACT"
+  },
+  "proposed_serial_phases": [
+    "cli-binary-check",
+    "host-binary-check",
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2"
+  ],
+  "proposed_caps_seconds": [
+    300,
+    450,
+    450,
+    900,
+    30,
+    90,
+    90
+  ],
+  "proposed_sum_seconds": 2310,
+  "original_workload_ceiling_seconds": 2400,
+  "steward_final_budget_acceptance": null,
+  "selected_precursor_parent_names": [
+    "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+    "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody"
+  ],
+  "precursor_reference": {
+    "branch": "fix/fw16-stale-shared-return-error-main15",
+    "head": "d26d4e9e76f73b4add0c050a2b1b8f52f820e248",
+    "original_base": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "original_base_tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "parent": "6ceaaa7a2ff588efc2655d40d8cc2a8ea27e46c4",
+    "parent_tree": "489fab66f88528745deed99468effde19284414d",
+    "tree": "1e13f499090af31858cc085c1c1955903a7b5a76",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15"
+  },
+  "genuine_source_DATA_inputs": {
+    "precursor_proposal": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-main15-lead-source-handoff-and-two-parent-qualification-proposal-v1.json",
+      "sha256": "6ea3915e9cb5af1dc38241a01d1be0daf78bf6b21ec6f513ed91b1fe40bee1f1",
+      "bytes": 17750,
+      "scope": "IMMUTABLE_PRECURSOR_SOURCE_DATA_NOT_FINAL_APPROVAL"
+    },
+    "default_scheduler_addendum": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-two-return-parent-default-scheduler-argv-correction-addendum-v1.json",
+      "sha256": "6f99e090455482aedcfb723de36682fe653d1493df0e5ad6752e66785a836edd",
+      "bytes": 4323,
+      "scope": "IMMUTABLE_PRECURSOR_SOURCE_DATA_NOT_FINAL_APPROVAL"
+    },
+    "caller_classifier": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-two-return-parent-caller-graph-source-classification-v1.json",
+      "sha256": "daee3662c177ac59f6b723cf4645d93c9a2af8ed87663be3a0bdc3416429e4bb",
+      "bytes": 13120,
+      "scope": "IMMUTABLE_PRECURSOR_SOURCE_DATA_NOT_FINAL_APPROVAL"
+    },
+    "additive_precursor_v2": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-main15-lead-source-handoff-and-two-parent-qualification-proposal-v2.json",
+      "sha256": "8a4511a9f7562980c5743d226c8f3a185d6ef957cf4d2d8309bf531bb7801705",
+      "bytes": 26503,
+      "scope": "IMMUTABLE_PRECURSOR_SOURCE_DATA_NOT_FINAL_APPROVAL"
+    }
+  },
+  "original_source_tools": {
+    "path": "/var/tmp/coord16-main15-return-error-ui2-preparation-original-tools-2a85067d.json",
+    "sha256": "91b3210f74e63a379421d88fe6d638968334060299b8928aca76e175392f1179"
+  },
+  "actual_author_utility_error_preserved": "159bb9 FileExistsError before writes, observed exit1; corrected source-author utility bf5bbd exit0. No candidate/runtime allocation existed.",
+  "instruction_variance": {
+    "filesystem_sha256": "efe6c9ee09c8c9a1fd6ff268568a1906280a1a58910b5dcc14a0668bd01d3456",
+    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+    "variance": true,
+    "index_flag": "H AGENTS.md",
+    "bytes_flags_changed_by_author": false,
+    "latest_user_AGENTS_instructions_followed": true
+  },
+  "exact_pending_final_binding_inputs": [
+    "Genuine FINAL composed product head/tree/sole parent and readable exact source objects; d26 is precursor only. Root terminal-API correction and final Main15 consumer integration remain pending; additive v2 bounds the precursor direct-Arc challenge without supplying the final tuple.",
+    "Final product source freeze with real source file/mode/blob/SHA pins, actual owning definitions/cfg/helper graph and exact source conservation. No d26 source proof transfers as final approval.",
+    "Genuine final API and Main15 consumer/directArc/caller/error/recovery reviews, bounded UX/source and conservation receipts in their actual schemas, plus authorized source publication/adoption.",
+    "Refreshed final parent caller/body classification and exact selected-name order from final source. Ordinary inherited Agent is a precursor source class; actual causal bodies/caller/authority remain unobserved.",
+    "Task-main genuine typed proof reader, final product WT/source pins/archive binding and safe archive-parent enrollment replacing the fixed preparation refusal through a source change.",
+    "Fresh frozen controller/plan identity and independent actual-code/conservation/argv review after final binding; final external handoff may leave only grant slot5 NULL.",
+    "Separate actual current EC source/resource adoption and one-use scoped grant; current physical Rust1.93/tools/target/lock/context/source cleanliness and availability remain unobserved.",
+    "Fresh actual UI lib ELF/compiler CargoJSON/inventory N and strict raw results with original waits/custody; no precomputed N or old runtime result transfer.",
+    "Native matched Before/After full-flow interaction, HOST cleanup authority/custody, realistic responsiveness and independent UX remain separate unqualified gates, not settled by these two parents."
+  ],
+  "current_final_product_proofs_runtime_inventory_results_grant": null,
+  "execution_authorized": false,
+  "queueable": false,
+  "runnable_final_packet": false,
+  "independent_final_controller_review_requested": false,
+  "writer_released_after_finite_preparation": true,
+  "stop_boundary": "No further source work until authentic final API+consumer product tuple, proofs and source adoption are routed. Existing PR1549 HOST2/UI3 and all predecessor source/data histories remain untouched."
+}

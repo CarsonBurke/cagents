@@ -1,0 +1,76 @@
+{
+  "kind": "AUTHOR_B68_TASK_SOURCE_CONSERVATION_NOT_INDEPENDENT_REVIEW",
+  "controller_base": "9ad48800282e9195118efd030ac27748ec730a1e",
+  "runner_sha256": "6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01",
+  "plan_sha256": "91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78",
+  "24_generic_byte_exact": {
+    "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+    "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+    "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+    "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+    "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+    "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+    "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+    "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+    "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+    "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+    "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+    "settle_children": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
+    "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+    "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+    "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+    "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad",
+    "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+    "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+    "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+    "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+    "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+    "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+    "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9"
+  },
+  "four_original_nested_main_byte_exact": {
+    "read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
+    "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711",
+    "context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
+    "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06"
+  },
+  "all_original_main_nested_functions_byte_exact": [
+    "read_bound",
+    "source",
+    "context",
+    "run",
+    "invoke_fixture_group"
+  ],
+  "only_changed_top_level_functions": [
+    "grouped_contracts",
+    "main"
+  ],
+  "all_other_top_level_functions_byte_exact_9ad": true,
+  "grouped_contracts_only_four_metadata_lines_added": true,
+  "grouped_contracts_remove_metadata_restores_all_prior_keys_selection_qualification_byte_exact": true,
+  "strict_grouped_result_parent_accounting_execute_helpers_binder_R1R2R3_exact": true,
+  "protected3790B_bytes_exact": true,
+  "protected3790B_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+  "original_acquire_finalization_full_summary_SHA256SUMS_compact_output_markers_return_exact_9ad": true,
+  "entire_runner_restores_9ad_by_two_task_functions_and_WT_PLAN_PLAN_SHA": true,
+  "group_data_inverse_remove_membership_policy_and_client_presence_restores_prior": true,
+  "phases_scheduler_budgets_tools_lane_context_five_absence_names_exact": true,
+  "runtime_archive_bindings": 52,
+  "source_pin_count": 13,
+  "source_mapping": "client-runtime-source-proof.json",
+  "forward": {
+    "path": "client-runtime-task.diff",
+    "sha256": "01c365991aaed424983bc0093c5e38164757490f2d5012728b60dfec25be9212"
+  },
+  "true_inverse": {
+    "path": "client-runtime-task.inverse.diff",
+    "sha256": "2b43f1951e1f753f4dc4c0fe54dc982402aba0c2346936a1a96cebaaa0d7e82a"
+  },
+  "bounded_LINE_reconstruction_exact_9ad": true,
+  "all_original_genuine_dependencies_and_raw_tools_history_preserved": true,
+  "genuineFFF2_conservation_archive_bytes": 851665,
+  "current_code_review": null,
+  "runtime_facts": null,
+  "execution_authorized": false
+}

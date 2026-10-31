@@ -1,0 +1,23 @@
+{
+  "after_sha256": "d448bd4291c5054271bdfcce37bc7cb8d29f101273491de59dae158bf5d1671d",
+  "before_sha256": "aa6f77fcdc3efb98d466c3e79b3f663ca9b2edd71f0906a6d67d7b2a3d63172c",
+  "insert_lines": [
+    "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-host16-source/qualification-packets/main15-bb8-host16/plan.json')\n",
+    "PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.\n",
+    "PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.\n",
+    "SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.\n",
+    "CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.\n",
+    "PLAN_SHA = 'da46df9225f28401f56267ca61faa6fcc896b14d24a1bb20dee0cca8fbf850d3'\n"
+  ],
+  "kind": "BOUNDED_LINE_SPLICE_TRUE_INVERSE",
+  "prefix_line_count": 22,
+  "remove_lines": [
+    "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-host16-abi-source/qualification-packets/main15-bb8-host16/plan.json')\n",
+    "PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.\n",
+    "PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.\n",
+    "SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.\n",
+    "CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.\n",
+    "PLAN_SHA = '15be44eec5bde2ec0846365fc720a1fe0c28b3c16cd7c4b0cb8eb9a05c1d4060'\n"
+  ],
+  "suffix_line_count": 1420
+}

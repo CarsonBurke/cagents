@@ -1,0 +1,44 @@
+{
+  "kind": "main15-operation-trait-physical-rust193-official-formatter-check-v1",
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15",
+  "argv": [
+    "scripts/check-format"
+  ],
+  "explicit_toolchain_selection": {
+    "PATH_prefix": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+    "PATH_remainder": "Inherited without printing",
+    "RUSTFMT": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/rustfmt",
+    "RUSTC": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/rustc",
+    "cargo_resolution": "scripts/check-format invokes cargo and rustfmt by name; physical1.93 directory is first in inherited PATH; Cargo fmt RUSTFMT explicitly pinned."
+  },
+  "environment": "Original environment inherited; only formatter/compiler paths explicitly selected. Opaque authority and all unrelated caller settings unread, unprinted and preserved. No env_clear/permission change.",
+  "start_utc": "2026-10-31T19:25:10.677333+00:00",
+  "finish_utc": "2026-10-31T19:25:18.439817+00:00",
+  "elapsed_seconds": 7.762473210925236,
+  "exit_code": 0,
+  "output": [
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-physical-rust193-official-format-stdout-v1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-physical-rust193-official-format-stderr-v1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "tracked_clean_before": true,
+  "tracked_clean_after": true,
+  "source_before_sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+  "source_after_sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+  "head_unchanged": true,
+  "tree_unchanged": true,
+  "authorization": "EC bc30ee0f requires official physical Rust1.93 scripts/check-format. Source formatter only; internal Cargo fmt/metadata and check-format helper operations permitted in this exact scope. No Cargo check/build/test or application/native execution.",
+  "original_formatter_history": "Original1e7de7 exit0 remains immutable but physical toolchain selection unestablished; separate original gap addendum69fe55e3 retained. This is a new explicit formatting-only check, not retroactive correction of original record.",
+  "runtime_results": null,
+  "test_results": null,
+  "native_results": null
+}

@@ -1,0 +1,165 @@
+{
+  "kind": "original-bb8-E0599-diagnostic-and-neighboring-operation-source-binding-addendum-v1",
+  "status": "SOURCE_ONLY_ADDITIVE_BINDING_NO_NEW_EXECUTION_OR_PRODUCT_WRITE",
+  "parent_freeze": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-single-import-source-freeze-v1.json",
+    "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd",
+    "bytes": 8301,
+    "mode": "0444"
+  },
+  "source_head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "source_tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "failed_original_source": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "created_utc": "2026-10-31T19:16:52.576233+00:00",
+  "original_log": {
+    "path": "/tmp/coord16-main15-bb8-ui5-validation-20261031T190448779446Z-2/compile-ui-lib/stdout.log",
+    "bytes": 1161417,
+    "sha256": "676039102bc5caf39549dd64eb94861d595c2f75213107f505a849e2c130c442",
+    "observed_scope": "Hash/byte-bind complete original log, inspect only compiler-message JSON line960; no whole RAW/result/artifact audit."
+  },
+  "original_error": {
+    "json_line": 960,
+    "reason": "compiler-message",
+    "level": "error",
+    "code": "E0599",
+    "primary_span": {
+      "byte_end": 1359553,
+      "byte_start": 1359547,
+      "column_end": 33,
+      "column_start": 27,
+      "expansion": null,
+      "file_name": "src/app/chat_ui.rs",
+      "is_primary": true,
+      "label": "method not found in `impl cosmic::widget::Operation`",
+      "line_end": 31723,
+      "line_start": 31723,
+      "suggested_replacement": null,
+      "suggestion_applicability": null,
+      "text": [
+        {
+          "highlight_end": 33,
+          "highlight_start": 27,
+          "text": "            let _ = probe.finish();"
+        }
+      ]
+    },
+    "exact_original_line_without_line_ending_sha256": "d20b24b266d9210defee1504ac7d8a0190b4fd8a68466ec093d8f845caf54831",
+    "original_compiler_message": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-compiler-message-line960-v1.jsonl",
+      "sha256": "38811b40038f7f11f9493614deabf5f161b1c7bd36269b6055352fc8dfa98b11",
+      "bytes": 3880,
+      "mode": "0444"
+    },
+    "extracted_rendered_block": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-rendered-v1.txt",
+      "sha256": "0e552e55a46640444803bcb89745247b767cb2b227ad87f6e7f1c3b3a5a3d135",
+      "bytes": 845,
+      "mode": "0444"
+    },
+    "rendered": "error[E0599]: no method named `finish` found for opaque type `impl cosmic::widget::Operation` in the current scope\n     --> src/app/chat_ui.rs:31723:27\n      |\n31723 |             let _ = probe.finish();\n      |                           ^^^^^^ method not found in `impl cosmic::widget::Operation`\n      |\n     ::: /home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15/vendor/iced-core/src/widget/operation.rs:75:8\n      |\n   75 |     fn finish(&self) -> Outcome<T> {\n      |        ------ the method is available for `impl cosmic::widget::Operation` here\n      |\n      = help: items from traits can only be used if the trait is in scope\nhelp: trait `Operation` which provides `finish` is implemented but not in scope; perhaps you want to import it\n      |\n14117 +     use cosmic::widget::Operation;\n      |\n\n"
+  },
+  "neighboring_source_uses": [
+    {
+      "path": "src/app.rs",
+      "function": "focused_element",
+      "byte_identical_bb8_and_92b8": true,
+      "source_function": {
+        "name": "focused_element",
+        "bytes": 2469,
+        "sha256": "4d3d0fa8f21fbedb8a9714d1a9dfa682d7d3a20f150770a8cb846ca38bc3d5b7"
+      },
+      "relevant_source": [
+        {
+          "line": 28850,
+          "source": "use cosmic::iced::advanced::widget::{Operation, operation};"
+        },
+        {
+          "line": 28880,
+          "source": "match operation.finish() {"
+        },
+        {
+          "line": 28898,
+          "source": "let _ = probe.finish();"
+        }
+      ]
+    },
+    {
+      "path": "src/app/chat_ui.rs",
+      "function": "send_return_control_pointer",
+      "byte_identical_bb8_and_92b8": true,
+      "source_function": {
+        "name": "send_return_control_pointer",
+        "bytes": 1945,
+        "sha256": "df07db22c5d41b70df57f9d8c9d3c45ebca3ce363c76a8ddb61bf0884acc71f2"
+      },
+      "relevant_source": [
+        {
+          "line": 32011,
+          "source": "use iced::advanced::{Layout, Shell, clipboard, layout, widget::Operation};"
+        },
+        {
+          "line": 32016,
+          "source": "impl Operation for Bounds {"
+        },
+        {
+          "line": 32017,
+          "source": "fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {"
+        }
+      ]
+    }
+  ],
+  "failed_helper_existing_method_calls": [
+    {
+      "line": 31659,
+      "source": "widget::{Tree, operation},"
+    },
+    {
+      "line": 31708,
+      "source": "match operation.finish() {"
+    },
+    {
+      "line": 31723,
+      "source": "let _ = probe.finish();"
+    }
+  ],
+  "unchanged_local_trait_reexport_and_definition": [
+    {
+      "path": "vendor/iced-core/src/widget.rs",
+      "bytes": 4989,
+      "sha256": "7b0db7c4bcc3cea24a4482399732b5e6b9a7cfcd5a027886d265a3fef247286a",
+      "unchanged_bb8_and_92b8": true,
+      "source": [
+        {
+          "line": 7,
+          "source": "pub use operation::Operation;"
+        }
+      ]
+    },
+    {
+      "path": "vendor/iced-core/src/widget/operation.rs",
+      "bytes": 15371,
+      "sha256": "bd70da7d8867aeab6953794e00dc8adcced21557aeffa0cb12e7952c69a06a7c",
+      "unchanged_bb8_and_92b8": true,
+      "source": [
+        {
+          "line": 21,
+          "source": "pub trait Operation<T = ()>: Send {"
+        },
+        {
+          "line": 75,
+          "source": "fn finish(&self) -> Outcome<T> {"
+        }
+      ]
+    }
+  ],
+  "source_conclusion": "The original opaque probe implements the same local widget Operation trait whose finish method is declared at75. The neighboring focused_element already imports that trait and calls both operation.finish() and probe.finish(); send_return_control_pointer independently uses the same advanced::widget::Operation import path. The92b8 change brings only this existing trait into the failed helper scope. This is source/type-diagnostic correspondence, not a new successful compilation.",
+  "sole_error_status": "Lead/B9 report exactly one original compiler error. This addendum deliberately does not re-scan every other JSON record to independently recount the whole log.",
+  "conservation": "Existing freeze, source commit, negative histories, all product files/controllers and prior receipts remain immutable. This addendum resolves only the prior NULL original CargoJSON path/hash binding.",
+  "limits": [
+    "No imports or evaluation of product/helper/test/Task; no Cargo/check/build/test/rustc/native/provider/runtime/controller/publication changes.",
+    "No compile/test/native/pass/grant result transferred to92b8. Future actual execution requires separately reviewed source/controller binding and authentic grant.",
+    "No reviewers activated; EC owns independent nonauthor semantic and conservation assignments."
+  ],
+  "runtime_results": null,
+  "execution_grant": null
+}
