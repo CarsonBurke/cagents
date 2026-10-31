@@ -6,9 +6,10 @@ use cosmic::{Core, app::cosmic::Cosmic, iced};
 
 const PRODUCT: &str = "cagents-ui";
 const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
-const CONFIRM_DAEMON_STOP: &str = "--confirm-daemon-stop";
-const STARTUP_ERROR: &str = "--startup-error";
-const STARTUP_UPDATE: &str = "--startup-update";
+use cagents::instance::{
+    CONFIRM_DAEMON_STOP_MODE as CONFIRM_DAEMON_STOP, STARTUP_ERROR_MODE as STARTUP_ERROR,
+    STARTUP_UPDATE_MODE as STARTUP_UPDATE,
+};
 /// argv has a hard size limit and a dialog cannot show a novel either.
 const MAX_REPORTED_ERROR_BYTES: usize = 2048;
 /// The internal `--confirm-daemon-stop`, `--startup-error`, `--startup-update` and
@@ -41,10 +42,10 @@ pub(crate) fn main_with_before_start(
 ) -> std::process::ExitCode {
     // SAFETY: first statement of main, before any thread exists.
     unsafe { cagents::account::detach_inherited_selections() };
-    // Before any mode dispatch: the update progress window, startup error
-    // dialog, shutdown confirmation and render helper never take the window
-    // lease, so none of them would otherwise rename itself, and each would
-    // block every window from starting while it is open. Best effort: a
+    // Before any mode dispatch. A starting window refuses beside any process
+    // still named `cagents-ui`. The helper modes never take the window lease,
+    // so they would not otherwise rename themselves, and a window refused at
+    // an update fence keeps the old name until it exits. Best effort: a
     // window repeats this when it takes the lease and reports failure there.
     let _ = cagents::instance::mark_lease_capable_process();
     // The document render helper answers before anything else exists. Its

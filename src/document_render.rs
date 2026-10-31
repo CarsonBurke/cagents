@@ -37,7 +37,7 @@ use crate::editor::{
 /// Named like the other modes cagents spawns itself with, and absent from
 /// `USAGE` for the same reason they are: it is a calling convention between
 /// two copies of one binary, not a feature anyone should hand-craft.
-const RENDER_PAGE_FLAG: &str = "--internal-render-page";
+const RENDER_PAGE_FLAG: &str = crate::instance::RENDER_PAGE_MODE;
 
 /// The helper's exit code for a document it refused deliberately.
 ///
