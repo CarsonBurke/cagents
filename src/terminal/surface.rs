@@ -58,7 +58,6 @@ impl TerminalSurface {
         self.handle.agent_activity()
     }
 
-    #[cfg(test)]
     pub(crate) fn visibility(&self) -> crate::terminal_ipc::TerminalVisibility {
         self.handle.visibility()
     }
@@ -74,6 +73,11 @@ impl TerminalSurface {
 
     pub fn host_proof(&self) -> Option<HostSessionProof> {
         self.handle.proof()
+    }
+
+    /// See [`HostedTerminalHandle::attachment_failure`].
+    pub fn attachment_failure(&self) -> Option<String> {
+        self.handle.attachment_failure()
     }
 
     pub fn acknowledge_redraw(&self, observed_generation: u64) {
