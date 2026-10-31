@@ -1,0 +1,285 @@
+{
+  "kind": "AUTHOR_PR1269_FROZEN_SINGLE_INTEGRATION_FRONTEND_NOT_REVIEW_OR_GRANT",
+  "author_role": "/root/1945_cache_io_oracles",
+  "utc": "2026-10-31T13:14:36.214138+00:00",
+  "controller": {
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source",
+    "branch": "qualification/fw16-pr1269-repository-git-source",
+    "head": "48cbe0eb879bce2ec528704a8ede9e7a33f6b368",
+    "tree": "82abcc8204f6329fd17a29d9e54105918e4707c4",
+    "parents": [
+      "c3b6b08ab17dca23848bb768493991784b02065b"
+    ],
+    "clean": true,
+    "only_changed_path_prefix": "qualification-packets/pr1269-repository-git/",
+    "changed_files": 38,
+    "outside_entries_modes_types_blobs_exact": 2224
+  },
+  "product": {
+    "head": "c3b6b08ab17dca23848bb768493991784b02065b",
+    "tree": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+    "parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-owned-hook-port",
+    "production_or_test_source_changes": false
+  },
+  "donor": {
+    "head": "25979306f6b70db86d1aeb95df2b9cbe8f4758a2",
+    "tree": "61c4dbfb92556b863f37b65616e14551f00b3303",
+    "runner": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/donor259793-run-packet.py",
+      "sha256": "76098afc1e030865ef257f62d711ca64690241e10bac2016ae58397ec416c1de",
+      "bytes": 83613
+    },
+    "scope": "Exact published three-phase skeleton; immutable donor component source, no current result transfer."
+  },
+  "pins": {
+    "run-packet.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/run-packet.py",
+      "sha256": "0cae9539cd658f2fe5cf0e5f05518bd1545803ad0e31a29b502a901ea584b10f",
+      "bytes": 83223
+    },
+    "plan.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/plan.json",
+      "sha256": "bf5397a92aa14d50daf2f6d34a4a8c024c433f12cc628d2662fea11b94e21596",
+      "bytes": 34171
+    },
+    "source-binding.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/source-binding.json",
+      "sha256": "6f5599bae5de3db7b71f1289663c86d1c16bf74f666fe1ee07c74d5603298319",
+      "bytes": 5424
+    },
+    "command-data.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/command-data.json",
+      "sha256": "3aeefc138db551fef965a7169b5d7a5606b1c635b9a5a4627f1e98169631bc44",
+      "bytes": 27444
+    },
+    "current-source-map.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/current-source-map.json",
+      "sha256": "6c8985d5ceb867d10b2161c789a10cff356d945ffdd31b55e66f770833195dda",
+      "bytes": 2354
+    },
+    "source-conservation.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/source-conservation.json",
+      "sha256": "95ac935be6f010f5b5166f99042645b6792672a6182435a177f34af3e843dfac",
+      "bytes": 6801
+    },
+    "manifest.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/manifest.json",
+      "sha256": "b2ebdf9bcf46d742a07ba74ca5008c79c484aadc2b2dce4d0fc2bd9ad01a5970",
+      "bytes": 6264
+    },
+    "execution-template.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/execution-template.json",
+      "sha256": "d8e5ef537f619619d6ede1b129382f0e36085beb2893fd217037015d81262dfc",
+      "bytes": 1401
+    },
+    "from-25979306-forward.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/from-25979306-forward.diff.json",
+      "sha256": "dc084951c5aef92a28d61fbfe33ef774755129aa427cb9491dc1c0afb7eb0ff9",
+      "bytes": 43510
+    },
+    "to-25979306-inverse.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/to-25979306-inverse.diff.json",
+      "sha256": "72479c35f0cece33cecbbf5c2376b3cf0cad8fe8b3f0f8de0469fffa33493a11",
+      "bytes": 43506
+    }
+  },
+  "genuine_dependencies": {
+    "dependencies/canonical_conservation.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_conservation.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4",
+      "bytes": 13262
+    },
+    "dependencies/canonical_function.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_function.py",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+      "bytes": 877
+    },
+    "dependencies/canonical_semantic.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_semantic.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8",
+      "bytes": 8938
+    },
+    "dependencies/donor259793-plan.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/donor259793-plan.json",
+      "sha256": "a2f9a7e957dc4aaabc3d48a1f52696ef46d106261f97181b24eaff8fdf4b73c0",
+      "bytes": 21195
+    },
+    "dependencies/donor259793-run-packet.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/donor259793-run-packet.py",
+      "sha256": "76098afc1e030865ef257f62d711ca64690241e10bac2016ae58397ec416c1de",
+      "bytes": 83613
+    },
+    "dependencies/donor259793-source-conservation.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/donor259793-source-conservation.json",
+      "sha256": "6f5e8ed839f211522a7e967826db129cf2d615425176cd04577a4cf55ea26ab5",
+      "bytes": 5310
+    },
+    "dependencies/frontend_design.txt": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/frontend_design.txt",
+      "sha256": "d90f59c2bdac2b7335e1463a11cb05dfdbe8fed4351a1178dffa1f2c37ad3288",
+      "bytes": 16735
+    },
+    "dependencies/product_freeze.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/product_freeze.json",
+      "sha256": "355bb01737a5cc7de237594202434a56c1d147794686c1c2da9ffd37095950c9",
+      "bytes": 1570
+    },
+    "dependencies/product_port_review.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/product_port_review.json",
+      "sha256": "a0aa7aad48dd56acc6f4cfad10aa638ca618723830a9a7dcc6655963db6267ae",
+      "bytes": 11048
+    },
+    "dependencies/source_inventory.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/source_inventory.json",
+      "sha256": "e51c3886eb4277d3f83efc5b68a31e16aefcb9d57e7b25e2b453a731eff3a9e9",
+      "bytes": 108415
+    },
+    "dependencies/tmpdir_design.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/tmpdir_design.json",
+      "sha256": "f2cb4a91babc230308ff67d23c946c05509ffc821ec4ba3109165901a571b5ed",
+      "bytes": 13382
+    }
+  },
+  "source_checks": {
+    "path": "/tmp/pr1269-repository-git-source-checks-uk0q0jhl/checks.json",
+    "sha256": "a135ffd99c5d9da354e84feda770dcfdbaf6f20318cf16d0b6264d055fac9bb9",
+    "bytes": 1008
+  },
+  "source_conservation": {
+    "original_functions": 32,
+    "unchanged": 27,
+    "changed": [
+      "cargo_test_artifact",
+      "execute_contracts",
+      "grouped_contracts",
+      "main",
+      "parent_accounting"
+    ],
+    "new": [
+      "task_fixture_premises",
+      "task_private_tmpdir",
+      "task_tmpdir_observation"
+    ],
+    "nested_main_unchanged": [
+      "read_bound",
+      "source",
+      "invoke_fixture_group"
+    ],
+    "nested_main_changed": [
+      "context",
+      "run"
+    ],
+    "protected3790": {
+      "byte_exact": true,
+      "bytes": 3790,
+      "sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4"
+    },
+    "canonical9004_exact": true,
+    "strict_grouped_result_exact": true,
+    "original_imports_exact": true,
+    "nested_run_normalization_reconstructs_original": true,
+    "all_direct_original_Popen_wait_timeout_pidfd_cleanup_HOLD_Cclose_logic": "UNCHANGED_EXCEPT_DECLARED_CHILD_ENV_ARGUMENT",
+    "summary_exceptions": [
+      "single task label in existing owning-qualification predicate",
+      "task-only qualified scope/non-WHOLE field/kind",
+      "declared source82 and discovered actualN compact count fields"
+    ],
+    "forward_and_inverse_reconstruct_source": true
+  },
+  "workload": {
+    "phases": 3,
+    "order": [
+      "compile-ui-repository-git",
+      "inventory-ui-repository-git",
+      "parent-ui-repository-git-all"
+    ],
+    "budgets_seconds": [
+      600,
+      30,
+      600
+    ],
+    "absolute_workload_seconds": 1230,
+    "existing_C_target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "jobs": 2,
+    "new_cache": false,
+    "helper_build": null,
+    "source_required_linux_names": 82,
+    "source_origin": "80 retained +2 new, no removal",
+    "actual_inventory_N": null,
+    "actual_counts": null,
+    "original_full_target_invocations_requested": 1,
+    "unfiltered": true,
+    "serial": true,
+    "run_args": [
+      "--test-threads=1",
+      "--nocapture",
+      "--format=pretty",
+      "--color=never"
+    ],
+    "skip_observation": "Both retained original streams, then final raw hash and semantic reread",
+    "actual_parent_waits": "No per-name waits invented; original process wait only",
+    "source_pins_Git_live_and_snapshot_verified": 16,
+    "runtime_archives_hashes_verified": 30
+  },
+  "explicit_future_private_TMPDIR_exception": {
+    "declared_parent": "/var/tmp",
+    "one_secure_fresh_root": true,
+    "owned_mode": "0700",
+    "filesystem_byte_base_maximum": 28,
+    "physical_outside_Git_ancestry_required": true,
+    "observed_creation_now": false,
+    "child_only_key": "TMPDIR",
+    "only_phase": "parent-ui-repository-git-all",
+    "compile_list_environment": "Unchanged donor inherited+compiler overrides",
+    "opaque_authority_HOME_PATH_Git_other_entries": "Preserved; no scrubbing/account/context change",
+    "original_directory_descriptor": "Open nofollow/directory, record fstat/named agreement, close exactly once before workload; original and close errors preserved, no retry",
+    "root_directory_lifetime": "Never automatically deleted, retained through original children/writers/workers and final custody, including failure/HOLD",
+    "root_identity_uncertainty": "Sticky supervision failure prevents same-C safe handback",
+    "source_socket_layout": "At most28+29=57 filesystem bytes before NUL; actual future root must satisfy check, no actual socket observed"
+  },
+  "material_limits": [
+    "All actual compile/list/full target, Git/Python/kernel prerequisites, permission discrimination and runtime resources remain UNRUN/unobserved",
+    "Source82 is not actual inventory or passed bodies",
+    "Caught nested hook injections/self-reexec remain nonadditive; successful self-child streams not separately archived",
+    "Uncapped phase log storage and unbounded positive cleanup/HOLD remain unchanged",
+    "Finite directly relevant source pins are not a full dependency manifest; exact clean product head/tree binds whole product",
+    "No UI-lib queue/sidebar/cache, cancellation gap, native UX/performance, Darwin, installed/provider or WHOLE PR qualification",
+    "No actual independent current controller review or fresh Root grant exists"
+  ],
+  "static_commands": {
+    "source_generator_first": {
+      "exit": 1,
+      "chunk": "70e0f7",
+      "scope": "Source Git read refused nonexistent guessed cancellation leaf; corrected to actual process.rs before live runner written. No candidate invocation."
+    },
+    "source_generator_current": {
+      "exit": 0,
+      "chunk": "ede908"
+    },
+    "final_source_conservation_data": {
+      "exit": 0,
+      "chunk": "41c1f2"
+    },
+    "final_source_checks": {
+      "exit": 0,
+      "chunk": "5432d0"
+    },
+    "staged_diff_check_and_normal_local_commit": {
+      "exit": 0,
+      "chunk": "6016b9",
+      "hooks_and_signing": "disabled for source commit command"
+    }
+  },
+  "candidate_import_calls_builds_tests_helpers_native_env_process_resource_account_probes": "NONE",
+  "actual_grant": null,
+  "actual_independent_current_review": null,
+  "execution": "UNRUN",
+  "admitted_or_queueable": false,
+  "pending": [
+    "Independent1335 semantic and1281 conservation reviews of this exact frozen controller tuple",
+    "Genuine current unchanged external CONTROLLER_SOURCE_CLEAR ABI receipt",
+    "Root future exact source/review/grant decision explicitly covering child TMPDIR exception",
+    "Original three-phase execution, sole RAW audit and actual C disposition when authorized"
+  ]
+}

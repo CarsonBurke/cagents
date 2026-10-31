@@ -1,0 +1,140 @@
+{
+  "all30_declared_target_names": [
+    "input-source-binding.json",
+    "input-command-data.json",
+    "input-current-source-map.json",
+    "source-archive/dependencies/canonical_conservation.json",
+    "source-archive/dependencies/canonical_function.py",
+    "source-archive/dependencies/canonical_semantic.json",
+    "source-archive/dependencies/donor259793-plan.json",
+    "source-archive/dependencies/donor259793-run-packet.py",
+    "source-archive/dependencies/donor259793-source-conservation.json",
+    "source-archive/dependencies/frontend_design.txt",
+    "source-archive/dependencies/product_freeze.json",
+    "source-archive/dependencies/product_port_review.json",
+    "source-archive/dependencies/source_inventory.json",
+    "source-archive/dependencies/tmpdir_design.json",
+    "source-archive/product-source/.cargo/config.toml",
+    "source-archive/product-source/Cargo.lock",
+    "source-archive/product-source/Cargo.toml",
+    "source-archive/product-source/build.rs",
+    "source-archive/product-source/docs/development.md",
+    "source-archive/product-source/scripts/qualification/process_custody.py",
+    "source-archive/product-source/src/fs_safety.rs",
+    "source-archive/product-source/src/lib.rs",
+    "source-archive/product-source/src/modules.rs",
+    "source-archive/product-source/src/process.rs",
+    "source-archive/product-source/src/repository.rs",
+    "source-archive/product-source/src/repository_operation_witness.rs",
+    "source-archive/product-source/src/repository_stash.rs",
+    "source-archive/product-source/tests/repository_git_contract.rs",
+    "source-archive/product-source/tests/support/owned_hook_pipe_holder.py",
+    "source-archive/product-source/tests/support/owned_hook_pipe_holder.rs"
+  ],
+  "archive_target_name_checks": {
+    "all_canonical_relative_nonempty_no_absolute_dot_dotdot": true,
+    "count": 30,
+    "flat_allowlist": [
+      "input-source-binding.json",
+      "input-command-data.json",
+      "input-current-source-map.json"
+    ],
+    "flat_count": 3,
+    "nested_allowed_prefixes": [
+      "source-archive/dependencies/",
+      "source-archive/product-source/"
+    ],
+    "nested_count": 27,
+    "nested_dependency_files": 11,
+    "nested_product_files": 16,
+    "no_collision_with_original_control_summary_log_phase_paths": true,
+    "no_target_is_another_target_parent": true,
+    "unique": true
+  },
+  "authority_and_operations": {
+    "C": "Parent says C1c005820 HELD; no grant/return/release created",
+    "candidate_import_call_runtime_test_build": "NOT_PERFORMED",
+    "edits_to_source_or_original_evidence": "NONE",
+    "new_child_or_worker": "NONE",
+    "only_new_write": "This task-owned source requirement receipt",
+    "proc_environment_target_account_resource_Git-marker_probes": "NOT_PERFORMED"
+  },
+  "confirmed_defect": {
+    "actual_attempt": "Root reports original48 EXIT1 at main1001\u2192evidence_copy missing parent. Sole ci_delivery owns its originalRAW; reviewer did not inspect or re-audit it.",
+    "donor_comparison": {
+      "archive_destinations": 43,
+      "evidence_copy_byte_contract": "Same exclusive-create/write/hash function. Donor43 flat destinations did not require archive subdirectories.",
+      "nested_destinations": 0
+    },
+    "shared_copy_anchor": "evidence_copy: path.open(xb)",
+    "source_reason": "Fresh out directory is created; executed-runner.py and plan.json are written at root. Three flat inputs are followed by27 nested source-archive destinations, but no source-archive parent is created. evidence_copy deliberately does not create parents. First nested canonical_conservation destination cannot be opened under an otherwise fresh normal out root.",
+    "task_source_anchor": "run-packet.py:997-1001"
+  },
+  "controller": {
+    "head": "48cbe0eb879bce2ec528704a8ede9e7a33f6b368",
+    "plan_sha256": "bf5397a92aa14d50daf2f6d34a4a8c024c433f12cc628d2662fea11b94e21596",
+    "runner_sha256": "0cae9539cd658f2fe5cf0e5f05518bd1545803ad0e31a29b502a901ea584b10f",
+    "tree": "82abcc8204f6329fd17a29d9e54105918e4707c4"
+  },
+  "exact10_required_parent_directories": [
+    "source-archive",
+    "source-archive/dependencies",
+    "source-archive/product-source",
+    "source-archive/product-source/.cargo",
+    "source-archive/product-source/docs",
+    "source-archive/product-source/scripts",
+    "source-archive/product-source/src",
+    "source-archive/product-source/tests",
+    "source-archive/product-source/scripts/qualification",
+    "source-archive/product-source/tests/support"
+  ],
+  "future_var_tmp_git_refusal": {
+    "assessment": "A .git file, directory or symlink at /var/tmp, /var or / must naturally refuse. The correction must not bypass/clear/remove such a marker, choose another root, or reinterpret refusal as qualification. The archive initialization fix does not establish the TMPDIR premise.",
+    "qualification": "UNRUN_UNQUALIFIED until separately admitted original evidence; no actual operand/cause inferred.",
+    "source_anchor": "task_private_tmpdir parent loop before mkdtemp, then task_tmpdir_observation full ancestry",
+    "source_order": "TMPDIR creation/check follows original archive loop; this reviewer makes no claim about actual .git state or whether that step ran in the failed attempt."
+  },
+  "other_deterministic_prephase_delta_check": {
+    "bounded_paths_checked": [
+      "New source-binding/read_bound input shapes and fixed current refs",
+      "new archive destination shape and original out/copy sequence",
+      "new fixed-parent TMPDIR observation/open/close ordering",
+      "context initial private-root observation and source baseline placement",
+      "phase-local directories preceding existing later inventory/result/premise writes"
+    ],
+    "environmental_and_future_failures": "Original source/tool/env/Git/config/permission/1230-second fit remain unobserved and can naturally refuse. No prediction of successful build/list/test is made.",
+    "result": "No second deterministic source-delta prephase defect identified in these bounded paths. This is not the previous whole-runner no-blocker conclusion, a runtime pass or a promise that future admission predicates hold."
+  },
+  "review_miss": {
+    "acknowledgment": "The previous review verified source byte hashes without checking destination parent materialization. Its source-clear disposition missed this task setup defect. Original receipt remains immutable; it does not clear the now-known failure.",
+    "prior_receipt": "/tmp/pr1269-repository-git-independent-semantic-admission-48cbe0eb-1335-v1.json",
+    "prior_sha256": "b90b386ce83d3f4209c1ade74244cfd3279ed9ca979604e9d0c615ef3f833bfb"
+  },
+  "reviewer": "/root/1335_full_output_copy_lease",
+  "schema": "pr1269-48cbe0eb-narrow-archive-parent-correction-requirement-v1",
+  "scope": "Source-only exact archive initialization/prephase requirement. No implementation, original RAW audit, old helper/whole runner re-review or runtime diagnosis.",
+  "smallest_task_local_successor_requirement": {
+    "exact_existing_children_contract": [
+      "At insertion, the fresh original out root must contain exactly executed-runner.py and plan.json, both the original regular non-symlink files just created/hashed by evidence_copy. Refuse unknown children or links.",
+      "Every required new parent directory must be absent when its creation is attempted. Create the deduplicated10 relative paths once in parent-before-child order with mode0700 and mkdir exclusive defaults; never exist_ok=True, overwrite, repair, reuse or follow a preexisting link/directory/file.",
+      "Do not create any directory outside out or any undeclared sibling. If a creation or identity/shape check fails, preserve the error and retained evidence and stop before C acquisition; do not remove or retry."
+    ],
+    "freeze_and_review": "Refresh runner/template/manifest/conservation and genuine current review pins after author implements. Retain original failed48 and its original source reviews/RAW without retargeting.",
+    "insertion_anchor": "In main immediately before original for binding,payload in archive_bytes evidence_copy loop, after the original executed-runner.py and plan.json copies. Keep that original loop and evidence_copy unchanged.",
+    "no_hidden_overwrite": "All30 targets are pairwise distinct and no target is an ancestor of another. Existing2 root files are disjoint from30 target names and10 directory names. Generic evidence_copy keeps xb exclusive creation and both hash checks. No change to original later writers is needed.",
+    "preserve_exact": [
+      "evidence_copy",
+      "shared lifecycle and canonical9004",
+      "protected3790 acquire/finalize/Cclose tail",
+      "context and task-private TMPDIR admission",
+      "original30 archive payloads/names/hashes and original copy order",
+      "all workload/skip/parser/error/return/HOLD semantics"
+    ],
+    "validate_all_before_directory_effects": [
+      "Derive names only from already hash-bound declared archive_bytes/current plan; require exactly30 unique canonical relative targets with no absolute path, empty/dot/dotdot or normalized-away component.",
+      "Require the exact3 root input names and27 current declared source-archive paths; reject file/parent collisions and collisions with reserved original runner/plan/review/control/summary/phase paths.",
+      "Derive only the exact10 ancestor paths recorded here, not a generic arbitrary recursive archive layout."
+    ]
+  },
+  "verdict": "CURRENT_SOURCE_SETUP_DEFECT_CONFIRMED_TASK_LOCAL_SUCCESSOR_REQUIRED"
+}

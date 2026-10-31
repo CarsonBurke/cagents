@@ -993,6 +993,29 @@ def main():
         assert path.is_file() and not path.is_symlink() and digest(path) == expected_sha
     out = Path('/tmp/pr1269-repository-git-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
     out.mkdir(mode=0o700)
+    assert not any(out.iterdir()), 'Fresh evidence root is not empty'
+    archive_names = [binding['name'] for binding, _payload in archive_bytes]
+    assert len(archive_names) == len(set(archive_names)) == 30
+    assert all(name and not Path(name).is_absolute() and Path(name).as_posix() == name
+               and all(part not in ('', '.', '..') for part in name.split('/')) for name in archive_names), 'Unsafe archive evidence name'
+    assert {name for name in archive_names if '/' not in name} == {
+        'input-source-binding.json', 'input-command-data.json', 'input-current-source-map.json'}
+    assert sum(name.startswith('source-archive/dependencies/') for name in archive_names) == 11
+    assert sum(name.startswith('source-archive/product-source/') for name in archive_names) == 16
+    archive_parents = {parent.as_posix() for name in archive_names
+                       for parent in Path(name).parents if parent != Path('.')}
+    assert archive_parents == {
+        'source-archive', 'source-archive/dependencies', 'source-archive/product-source',
+        'source-archive/product-source/.cargo', 'source-archive/product-source/docs',
+        'source-archive/product-source/scripts', 'source-archive/product-source/src',
+        'source-archive/product-source/tests', 'source-archive/product-source/scripts/qualification',
+        'source-archive/product-source/tests/support'}
+    assert not set(archive_names).intersection(archive_parents), 'Archive target collides with a parent'
+    for parent in sorted(archive_parents, key=lambda name: (len(Path(name).parts), name)):
+        destination = out / parent
+        destination.mkdir(mode=0o700)  # Exclusive; no reuse, repair, overwrite or fallback.
+        created = destination.lstat()
+        assert stat.S_ISDIR(created.st_mode) and created.st_uid == os.getuid() and stat.S_IMODE(created.st_mode) == 0o700
     save = lambda name, value: (out / name).write_text(json.dumps(value, indent=2) + '\n')
     # Custody and original bytes are archived before touching the lane lock.
     evidence_copy(out, 'executed-runner.py', runner_bytes, args.runner_sha256)

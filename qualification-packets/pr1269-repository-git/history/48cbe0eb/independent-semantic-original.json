@@ -1,0 +1,129 @@
+{
+  "TMPDIR_authorization_source": {
+    "actual_root_created_observed_by_reviewer": false,
+    "future_socket_root_bound": "Source-derived base<=28 and owning hook suffix29; no actual socket/path/runtime claim.",
+    "repository_doc": "docs/development.md:377-405",
+    "source_policy_scope": "Fresh short physical private root outside Git ancestry; retain until original children settle and no automatic cleanup. HOST helper recipe is an example, not new helper permission. Parent explicitly authorizes this source design: fixed/var/tmp and only full-test child TMPDIR."
+  },
+  "author_freeze": {
+    "path": "/tmp/pr1269-repository-git-source-freeze-go41n8d1/freeze.json",
+    "sha256": "48ec3dcb614a31ed1b1bd25fae3ef9a8bd212a718982941e16b705ebc576c4b3"
+  },
+  "blocking_findings": [],
+  "checks": {
+    "all16_selected_product_pins_match_current_Git_snapshots": true,
+    "all30_runtime_archive_hashes_match": true,
+    "all_bound_source_review_paths_hash_sizes_match": true,
+    "controller_head_tree_parent_exact": true,
+    "existing_source_and_fixture_binder_nested_defs_exact": true,
+    "freeze_hash_exact": true,
+    "future12argv_currentpaths_I_B_NULLslots_and_ABI": true,
+    "genuine_product_port_review_current_tuple_freeze_join": true,
+    "genuine_source_inventory_tuple_and82_unignored_ordinary_names": true,
+    "main_task_source_plan_data_joins_exact": true,
+    "one_UI_target_exact_compile_and82source_selectors": true,
+    "outer_execution_and_final_raw_reread_both_gate_skip_premises": true,
+    "phase_order_and600_30_600_absolute1230_jobs2_existingC_nohelper": true,
+    "primary_refs_all_current": true,
+    "product_tuple_matches_current_immutable_Git": true,
+    "prospective_runtime_actuals_NULL_and_unadmitted": true,
+    "protected3790_C_acquire_finalize_close_exact": true,
+    "provided_runner_plan_manifest_pins_exact": true,
+    "retained_0700_fixed_var_tmp_exception_exact_data": true,
+    "skip_sentinels_exact_owning_product_source_and_both_streams": true,
+    "source_review_ABI_original_exact": true,
+    "strict_grouped_parser_and_canonical9004_unchanged": true
+  },
+  "controller_head": "48cbe0eb879bce2ec528704a8ede9e7a33f6b368",
+  "controller_parent": "c3b6b08ab17dca23848bb768493991784b02065b",
+  "controller_tree": "82abcc8204f6329fd17a29d9e54105918e4707c4",
+  "current_source_reviews_consumed": {
+    "canonical_conservation": {
+      "bytes": 13262,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_conservation.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4"
+    },
+    "canonical_semantic": {
+      "bytes": 8938,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/canonical_semantic.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
+    },
+    "product_port_review": {
+      "bytes": 11048,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/product_port_review.json",
+      "sha256": "a0aa7aad48dd56acc6f4cfad10aa638ca618723830a9a7dcc6655963db6267ae"
+    },
+    "source_inventory": {
+      "bytes": 108415,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/source_inventory.json",
+      "sha256": "e51c3886eb4277d3f83efc5b68a31e16aefcb9d57e7b25e2b453a731eff3a9e9"
+    },
+    "tmpdir_design": {
+      "bytes": 13382,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/dependencies/tmpdir_design.json",
+      "sha256": "f2cb4a91babc230308ff67d23c946c05509ffc821ec4ba3109165901a571b5ed"
+    }
+  },
+  "future_invocation": {
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source",
+    "fresh_grant_must_cover": "One fixed/var/tmp retained private root creation and only full-test child TMPDIR exception, plus original three-phase workload.",
+    "frozen12argv_template": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1269-repository-git-source/qualification-packets/pr1269-repository-git/run-packet.py",
+      "--grant",
+      null,
+      "--runner-sha256",
+      "0cae9539cd658f2fe5cf0e5f05518bd1545803ad0e31a29b502a901ea584b10f",
+      "--controller-review",
+      null,
+      "--controller-review-sha256",
+      null
+    ],
+    "only_final_NULL_after_review_binding": 5,
+    "review_hash_slot11": "External SHA256 of these sealed bytes; bound in final/tool output, no recursive self-hash",
+    "review_path_slot9": "/tmp/pr1269-repository-git-independent-semantic-admission-48cbe0eb-1335-v1.json",
+    "status": "SOURCE_CLEAR_SEPARATE_FRESH_ROOT_GRANT_REQUIRED_NOT_SUBMITTABLE"
+  },
+  "head": "c3b6b08ab17dca23848bb768493991784b02065b",
+  "kind": "INDEPENDENT_CURRENT_TASK_SEMANTIC_ADMISSION_ABI_SOURCE_REVIEW_NOT_EXECUTION_GRANT",
+  "manifest_sha256": "b2ebdf9bcf46d742a07ba74ca5008c79c484aadc2b2dce4d0fc2bd9ad01a5970",
+  "operations_and_limits": {
+    "C_state": "Parent reports Root16 dfc7 HELD; not inspected, released or reallocated here",
+    "Root_grant_queue_execution_release_merge": "ROOT_ONLY_NONE_CREATED",
+    "candidate_import_call_run_test_compile_build_helper_native": "UNRUN_NOT_PERFORMED",
+    "current_environment_authority_process_proc_target_tool_account_permission_GitPython_resource_probes": "NOT_PERFORMED",
+    "new_workers_or_sessions": "NONE",
+    "source_Git_public_writes": "NONE",
+    "source_identity_vs_execution_identity": "Exact source pins only, not an installed/runtime/caller certificate",
+    "wholePR_native_global_custody_claim": "NONE"
+  },
+  "pin_discrepancies": {
+    "bound_references": [],
+    "primary": [],
+    "product_source": [],
+    "runtime_archives": []
+  },
+  "plan_sha256": "bf5397a92aa14d50daf2f6d34a4a8c024c433f12cc628d2662fea11b94e21596",
+  "product_parent": "42c122d4c126404ecd446717e6d79c96f36a40ea",
+  "product_pr": 1269,
+  "reviewer": "/root/1335_full_output_copy_lease",
+  "runner_sha256": "0cae9539cd658f2fe5cf0e5f05518bd1545803ad0e31a29b502a901ea584b10f",
+  "schema": "pr1269-repository-git-independent-task-semantic-admission-review-v1",
+  "scope": "Independent semantic/admission review of the actual3 new task helpers,5 changed task functions and context/run exceptions. Peer1281 owns exhaustive packet/tree conservation. Existing helper/RAW/product audits not repeated.",
+  "semantic_assessment": {
+    "cargo_test_artifact": "Requires one successful build-finished and exactly one Cargo test-profile artifact for the exact integration target/source path/manifest in the isolated UI graph. Original ELF path/hash and before/after nofollow observation limits remain explicit; no atomic PID/ELF identity or fresh-build claim.",
+    "context_and_run": "Root identity reobserved at existing context checkpoints; uncertainty records sticky supervision_failure. Only full-test phase copies env and changes TMPDIR. Compile/list use original compiler env. Original authority/HOME/PATH/Git values are not scrubbed or replaced; context records hashes/name metadata under existing model. No User-origin gate, proxy, new helper or account change.",
+    "execute_contracts": "One original unfiltered argv: ELF --test-threads=1 --nocapture --format=pretty --color=never. Original compiler/listing/full-target streams retained. Primary run failure wins; post-use observations still attempted. Strict original result parser plus both-stream skip scan precedes parent append.",
+    "grouped_contracts": "Fresh complete inventory must be exactly the frozen82-name ordinary Linux/UI source-required set; benchmarks/duplicate/missing/extra names refuse. actual_inventory_N comes from that original observed inventory, not assigned from source82 before execution.",
+    "lifetime_and_custody": "Retain root through all children/writers/workers and final custody, including error/HOLD. Later root uncertainty cannot erase sticky failures; unchanged canonical9004/HOLD and3790B acquisition/finalization/one-shot Cclose preserve bounded original local predicates. Continuous root identity, global family closure and finite release are not established.",
+    "parent_accounting": "Final raw stdout/stderr reread hashes match original phase receipts; both strict footer/name and skip-premise predicates plus historical/raw reconciliation are required. Only one group process wait is credited; requested source82/discovered actualN remain separate and early unknowns remain unknown.",
+    "summary_and_scope": "Full summary/error/ledgers/SHA256SUMS and bounded compact projection remain. Qualification is only the whole repository_git_contract target; whole_PR1269_native_UI_qualification is false. No UI-lib/sidebar/cache/cancellation/Darwin/native/performance/installed/WHOLE inference.",
+    "task_fixture_premises": "Both exact product-defined Git-unavailable and permission-premise skip byte strings refuse qualification if present in stdout or stderr. Final raw reread repeats this check; no skip-to-pass or ignored credit. Hidden successful self-reexec streams remain unarchived/nonadditive; no separate child-pass/custody claim.",
+    "task_private_tmpdir_and_observation": "One tempfile.mkdtemp under fixed /var/tmp after validating physical trusted/sticky owned/root ancestry and absence of every .git marker. Root must be absolute physical owned0700, <=28 filesystem bytes, outside Git ancestry. Open original nofollow directory descriptor, compare named/fstat identities, close exactly once with original/close errors preserved. No recursive removal/fallback root."
+  },
+  "source_binding_sha256": "6f5599bae5de3db7b71f1289663c86d1c16bf74f666fe1ee07c74d5603298319",
+  "tree": "90f4b5802add402c86fbfe7015d0cc67674d37b6",
+  "verdict": "CONTROLLER_SOURCE_CLEAR"
+}
