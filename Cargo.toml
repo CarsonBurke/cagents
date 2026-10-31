@@ -65,6 +65,8 @@ ui = [
     "image/tiff",
     "dep:imara-diff",
     "dep:jiff",
+    "dep:ignore",
+    "dep:memchr",
     "dep:libcosmic",
     "dep:lsp-types",
     "dep:mermaid-rs-renderer",
@@ -238,6 +240,8 @@ libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 # Pinned to the version `async-lsp` 0.2.4 depends on so protocol types unify.
 lsp-types = { version = "0.95", optional = true }
+ignore = { version = "0.4", optional = true }
+memchr = { version = "2.8", optional = true }
 notify = { version = "8.2", optional = true }
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
 # Binary IPC codec. The terminal snapshot protocol is a per-frame, per-cell

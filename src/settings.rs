@@ -281,6 +281,7 @@ pub struct KeyboardShortcuts {
     pub focus_pane_9: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
+    pub search_in_project: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -324,6 +325,7 @@ impl Default for KeyboardShortcuts {
             focus_pane_9: vec!["Alt+9".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
+            search_in_project: vec!["Ctrl+Alt+F".to_owned()],
         }
     }
 }
@@ -337,7 +339,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 38] {
+    pub fn actions(&self) -> [&Vec<String>; 39] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -377,6 +379,7 @@ impl KeyboardShortcuts {
             &self.focus_pane_9,
             &self.toggle_projects,
             &self.rename_pane,
+            &self.search_in_project,
         ]
     }
 
@@ -422,7 +425,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 38] = [
+const SHORTCUT_ACTIONS: [&str; 39] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -461,6 +464,7 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "focus_pane_9",
     "toggle_projects",
     "rename_pane",
+    "search_in_project",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1439,7 +1443,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 34] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1473,6 +1477,7 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
     "review_next_unviewed",
     "review_next_change",
     "review_previous_change",
+    "search_in_project",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -3663,6 +3668,25 @@ next_column = ["Alt+W", "Alt+Right"]
         settings.keyboard_shortcuts.find_in_pane.clear();
         save(&path, &settings).unwrap();
         assert_eq!(load(&path).unwrap(), settings);
+    }
+
+    #[test]
+    fn introducing_project_content_search_preserves_an_existing_custom_chord() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut settings = AppSettings::default();
+        settings.keyboard_shortcuts.new_terminal = vec!["Ctrl+Alt+F".into()];
+        let mut document = toml::Table::try_from(settings).unwrap();
+        document["keyboard_shortcuts"]
+            .as_table_mut()
+            .unwrap()
+            .remove("search_in_project");
+        fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Ctrl+Alt+F"]);
+        assert!(loaded.keyboard_shortcuts.search_in_project.is_empty());
+        save(&path, &loaded).unwrap();
+        assert_eq!(load(&path).unwrap(), loaded);
     }
 
     #[test]

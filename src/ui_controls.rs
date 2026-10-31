@@ -7,7 +7,6 @@ mod display;
 mod editable;
 pub mod field;
 mod find_options;
-pub use find_options::{FindOption, find_options};
 mod gauge;
 mod icon;
 mod icon_button;
@@ -19,6 +18,7 @@ mod shrinkable;
 mod tabs;
 
 pub use display::{badge, change_counts, comment_card};
+pub use find_options::{FindOption, find_options};
 #[cfg(test)]
 pub(crate) use gauge::activity_animates;
 pub use gauge::{
