@@ -309,6 +309,12 @@ impl Cagents {
         if find(area).is_none() {
             return Task::none();
         }
+        if area == ChangeArea::Conflict {
+            return self.open_diff_card(key, move |card| RepositoryAction::OpenFileFromBrowser {
+                card,
+                path,
+            });
+        }
         let staged = find(ChangeArea::Staged);
         let unstaged = find(ChangeArea::Unstaged)
             .or_else(|| find(ChangeArea::Untracked))
@@ -385,6 +391,10 @@ mod tests {
 
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
+            history_destination: None,
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: StatusSnapshot {
                 head: HeadState::Detached {
                     oid: "ab".repeat(20),

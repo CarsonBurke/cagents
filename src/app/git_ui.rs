@@ -2,8 +2,11 @@
 //! replace local rows, and filesystem events never schedule a GitHub process.
 use super::*;
 use crate::{git_watch, model::WorktreeId, repository::HeadState};
+use std::collections::{BTreeMap, BTreeSet};
 
-const LOCAL_WORKERS: usize = 2;
+fn local_workers() -> usize {
+    2
+}
 const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
@@ -11,6 +14,7 @@ pub struct Snapshot {
     repository: RepositoryInfo,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
     heads: HashMap<WorktreeId, GitHubRepoKey>,
+    read_failures: BTreeMap<WorktreeId, String>,
 }
 
 struct Entry {
@@ -28,6 +32,14 @@ struct Entry {
     /// rather than from any read, since the edits a partial watch still
     /// reports would otherwise postpone the scan it stands in for.
     last_full_scan: Instant,
+}
+
+impl Entry {
+    fn needs_polling(&self) -> bool {
+        self.fallback.is_some()
+            || self.read_failure.is_some()
+            || !self.snapshot.read_failures.is_empty()
+    }
 }
 
 /// The window's watcher and the channel its wakes arrive on.
@@ -51,6 +63,7 @@ pub(super) struct State {
     watch: Option<Watch>,
     entries: HashMap<ProjectId, Entry>,
     queue: VecDeque<ProjectId>,
+    activity: Vec<ProjectId>,
 }
 
 impl State {
@@ -142,11 +155,103 @@ pub enum Action {
         result: Result<(GitHubAvailability, Vec<crate::github::PullRequest>), String>,
     },
     Changed,
+    Fallback,
     Read {
         project: ProjectId,
         generation: u64,
         result: Result<(Snapshot, Option<git_watch::Project>), String>,
     },
+}
+
+fn panel_invalidation(
+    project: ProjectId,
+    change: &git_watch::Change,
+    key: &ActiveWorktreeKey,
+) -> Option<u8> {
+    (key.project_id == project
+        && (change.topology
+            || change.references
+            || change.shared_snapshot
+            || change.worktrees.contains(&key.worktree_id)))
+    .then_some(if change.metadata || change.membership {
+        3
+    } else {
+        1
+    })
+}
+
+fn materialize_reference_targets(snapshot: &Snapshot, change: &mut git_watch::Change) {
+    if change.references {
+        change.worktrees.extend(
+            snapshot
+                .worktrees
+                .iter()
+                .filter(|(record, _)| !record.bare)
+                .map(|(record, _)| record.id),
+        );
+        // Keep the cache invalidation, but consume read fan-out before splitting
+        // blocked worktrees. Otherwise the reader would expand them again.
+        change.metadata = true;
+        change.references = false;
+    }
+}
+
+fn blocked_censuses_reusable(
+    snapshot: &Snapshot,
+    blocked: &HashSet<WorktreeId>,
+    plan: Option<&git_watch::Project>,
+) -> bool {
+    blocked.iter().all(|id| {
+        snapshot
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.id == *id)
+            .and_then(|(record, _)| {
+                plan.and_then(|plan| {
+                    plan.reusable_worktree(&snapshot.repository.common_dir, record)
+                })
+            })
+            .is_some()
+    })
+}
+
+/// Index changes from an active queue wait for its final refresh. Sibling
+/// worktrees continue to update while a hook or network command is running.
+fn defer_mutating_worktrees(
+    change: &mut git_watch::Change,
+    blocked: &HashSet<WorktreeId>,
+    blocked_censuses_reusable: bool,
+) -> git_watch::Change {
+    let paths = change
+        .worktrees
+        .iter()
+        .filter(|worktree| blocked.contains(*worktree))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if !blocked.is_empty()
+        && (change.topology || (!paths.is_empty() && paths.len() == change.worktrees.len()))
+    {
+        return std::mem::take(change);
+    }
+    change.worktrees.retain(|path| !paths.contains(path));
+    let mut deferred = git_watch::Change {
+        worktrees: paths,
+        metadata: change.metadata,
+        membership: false,
+        ..git_watch::Change::default()
+    };
+    if !deferred.worktrees.is_empty() {
+        deferred.membership = change.membership;
+    }
+    if change.membership && !blocked_censuses_reusable {
+        // Building a missing census would inspect blocked worktrees too. Let
+        // sibling status reads proceed, retaining the complete re-plan for
+        // after the active mutations have finished.
+        deferred.membership = true;
+        deferred.worktrees.extend(blocked.iter().copied());
+        change.membership = false;
+    }
+    deferred
 }
 
 impl Cagents {
@@ -160,7 +265,17 @@ impl Cagents {
         };
         let project = loaded.project.id;
         let state = &mut self.refresh_ui.git;
-        if let Some(old) = state.entries.remove(&project) {
+        let old = state.entries.remove(&project);
+        let records = loaded
+            .worktrees
+            .iter()
+            .map(|(record, _)| record.clone())
+            .collect::<Vec<_>>();
+        let reusable_plan = old
+            .as_ref()
+            .and_then(|entry| entry.plan.clone())
+            .filter(|plan| plan.matches(&repository.common_dir, &records));
+        if let Some(old) = old {
             if let Some(cancel) = &old.cancellation {
                 cancel.cancel();
             }
@@ -192,9 +307,10 @@ impl Cagents {
                     repository: repository.clone(),
                     worktrees: loaded.worktrees.clone(),
                     heads: loaded.head_repositories.clone(),
+                    read_failures: BTreeMap::new(),
                 },
                 generation,
-                plan: None,
+                plan: reusable_plan.clone(),
                 archived: Vec::new(),
                 remote_started: false,
                 cancellation: None,
@@ -208,10 +324,11 @@ impl Cagents {
         state.changed(
             project,
             git_watch::Change {
-                membership: true,
+                membership: reusable_plan.is_none(),
                 ..Default::default()
             },
         );
+        self.refresh_ui.git.configure();
         self.start_git_reads()
     }
 
@@ -257,8 +374,7 @@ impl Cagents {
             .entries
             .iter()
             .filter(|(_, entry)| {
-                (entry.fallback.is_some() || entry.read_failure.is_some())
-                    && entry.last_full_scan.elapsed() >= FALLBACK_INTERVAL
+                entry.needs_polling() && entry.last_full_scan.elapsed() >= FALLBACK_INTERVAL
             })
             .map(|(&id, _)| id)
             .collect::<Vec<_>>();
@@ -279,11 +395,29 @@ impl Cagents {
                 },
             );
         }
-        self.start_git_reads()
+        let mut tasks = vec![self.start_git_reads()];
+        if self.refresh_ui.source_last_refresh.elapsed() >= FALLBACK_INTERVAL
+            && self.refresh_ui.source_cancel.is_none()
+            && let Some(key) = self
+                .sidebar_model
+                .source_control
+                .as_ref()
+                .filter(|source| {
+                    !source.busy()
+                        && !self
+                            .source_control_mutations
+                            .contains_key(&source.key.canonical_path)
+                })
+                .map(|source| source.key.clone())
+        {
+            tasks.push(self.reload_source_control(&key));
+        }
+        Task::batch(tasks)
     }
 
     pub(super) fn update_git(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::Fallback => return self.git_fallback_tick(),
             Action::Remote {
                 project,
                 generation,
@@ -352,8 +486,38 @@ impl Cagents {
                     .as_ref()
                     .map(|watch| watch.monitor.drain())
                     .unwrap_or_default();
+                let mut reload = None;
                 for (project, change) in changes {
+                    if change.metadata
+                        && self
+                            .sidebar_model
+                            .source_control
+                            .as_ref()
+                            .is_some_and(|source| source.key.project_id == project)
+                    {
+                        // Shared refs can change a future branch picker without
+                        // requiring status reads in unrelated checkouts.
+                        self.refresh_ui
+                            .source_invalidated
+                            .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
+                    }
+                    if let Some(source) = self.sidebar_model.source_control.as_ref()
+                        && let Some(invalidation) =
+                            panel_invalidation(project, &change, &source.key)
+                    {
+                        self.refresh_ui
+                            .source_invalidated
+                            .fetch_or(invalidation, std::sync::atomic::Ordering::AcqRel);
+                        if !self
+                            .source_control_mutations
+                            .contains_key(&source.key.canonical_path)
+                        {
+                            reload = Some(source.key.clone());
+                        }
+                    }
                     if let Some(error) = &change.error
+                        && error != "directory watch limit reached"
+                        && error != "submodule contents require a periodic local Git check"
                         && self
                             .refresh_ui
                             .git
@@ -366,6 +530,9 @@ impl Cagents {
                         )));
                     }
                     self.refresh_ui.git.changed(project, change);
+                }
+                if let Some(key) = reload {
+                    return Task::batch([self.reload_source_control(&key), self.start_git_reads()]);
                 }
             }
             Action::Read {
@@ -388,6 +555,15 @@ impl Cagents {
                 }
                 match result {
                     Ok((snapshot, plan)) => {
+                        if let Some((_, error)) =
+                            snapshot.read_failures.iter().find(|(id, error)| {
+                                entry.snapshot.read_failures.get(*id) != Some(*error)
+                            })
+                        {
+                            self.status = Some(TransientNotice::warning(format!(
+                                "Local Git state could not be refreshed; checking again once a minute: {error}"
+                            )));
+                        }
                         if entry.read_full_scan {
                             entry.read_failure = None;
                         }
@@ -453,7 +629,61 @@ impl Cagents {
         self.start_git_reads()
     }
 
-    fn start_git_reads(&mut self) -> Task<Message> {
+    pub(super) fn prioritize_git_watches(&mut self) {
+        let active = self.sidebar_state.active_worktree().cloned();
+        let state = &mut self.refresh_ui.git;
+        if let Some(active) = &active {
+            state
+                .activity
+                .retain(|id| *id != active.project_id && state.entries.contains_key(id));
+            state.activity.insert(0, active.project_id);
+        }
+        let mut targets = self.sidebar_state.git_watch_targets();
+        if let Some(active) = active {
+            targets.insert(0, (active.project_id, Some(active.worktree_id)));
+        }
+        let mut priority = Vec::new();
+        let mut selected = Vec::new();
+        for (project_id, worktree_id) in targets {
+            if !priority.contains(&project_id) {
+                priority.push(project_id);
+            }
+            let worktree_id = worktree_id.or_else(|| {
+                let plan = state.entries.get(&project_id)?.plan.as_ref()?;
+                plan.worktrees
+                    .iter()
+                    .find(|worktree| worktree.git_dir == plan.common_dir)
+                    .or_else(|| plan.worktrees.first())
+                    .map(|worktree| worktree.id)
+            });
+            if let Some(id) = worktree_id {
+                if !selected.contains(&id) {
+                    selected.push(id);
+                }
+            }
+        }
+        for project_id in state
+            .activity
+            .iter()
+            .copied()
+            .chain(self.sidebar_model.projects.iter().map(|project| project.id))
+        {
+            if !priority.contains(&project_id) {
+                priority.push(project_id);
+            }
+        }
+        if let Some(watch) = &state.watch {
+            watch.monitor.prioritize(priority, selected);
+        }
+    }
+
+    pub(super) fn start_git_reads(&mut self) -> Task<Message> {
+        self.prioritize_git_watches();
+        let mutating = self
+            .source_control_mutations
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let state = &mut self.refresh_ui.git;
         let mut running = state
             .entries
@@ -462,7 +692,7 @@ impl Cagents {
             .count();
         let mut tasks = Vec::new();
         let mut inspected = state.queue.len();
-        while running < LOCAL_WORKERS && inspected > 0 {
+        while running < local_workers() && inspected > 0 {
             inspected -= 1;
             let Some(project) = state.queue.pop_front() else {
                 break;
@@ -474,7 +704,25 @@ impl Cagents {
                 state.queue.push_back(project);
                 continue;
             }
-            let change = std::mem::take(&mut entry.pending);
+            let mut change = std::mem::take(&mut entry.pending);
+            let blocked = entry
+                .snapshot
+                .worktrees
+                .iter()
+                .filter(|(record, _)| mutating.contains(&record.path))
+                .map(|(record, _)| record.id)
+                .collect::<HashSet<_>>();
+            materialize_reference_targets(&entry.snapshot, &mut change);
+            let reusable =
+                blocked_censuses_reusable(&entry.snapshot, &blocked, entry.plan.as_deref());
+            let deferred = defer_mutating_worktrees(&mut change, &blocked, reusable);
+            if deferred.topology || deferred.membership || !deferred.worktrees.is_empty() {
+                entry.pending.merge(deferred);
+                state.queue.push_back(project);
+            }
+            if !change.topology && !change.membership && change.worktrees.is_empty() {
+                continue;
+            }
             entry.read_full_scan = change.topology;
             let snapshot = entry.snapshot.clone();
             let plan = entry.plan.clone();
@@ -522,12 +770,23 @@ fn read_local_with_plan(
 ) -> Result<(Snapshot, Option<git_watch::Project>), String> {
     let git = RepositoryService::system("git");
     if change.topology {
+        let previous = snapshot
+            .worktrees
+            .iter()
+            .map(|(record, status)| (record.id, (record.path.clone(), status.clone())))
+            .collect::<HashMap<_, _>>();
         snapshot.worktrees = git
             .list_worktrees(&snapshot.repository.common_dir, &cancellation)
             .map_err(|error| error.to_string())?
             .into_iter()
             .filter(|record| record.bare || worktree_ui::worktree_directory_available(&record.path))
-            .map(|record| (record, None))
+            .map(|record| {
+                let status = previous
+                    .get(&record.id)
+                    .filter(|(path, _)| path == &record.path)
+                    .and_then(|(_, status)| status.clone());
+                (record, status)
+            })
             .collect();
     }
     let mut vanished = HashSet::new();
@@ -546,8 +805,15 @@ fn read_local_with_plan(
                 vanished.insert(record.id);
                 continue;
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => {
+                tracing::warn!(worktree = %record.path.display(), %error, "local Git worktree read failed; retaining previous state");
+                snapshot
+                    .read_failures
+                    .insert(record.id, format!("{}: {error}", record.path.display()));
+                continue;
+            }
         };
+        snapshot.read_failures.remove(&record.id);
         match &current.head {
             HeadState::Branch { name, oid } => {
                 record.branch = Some(format!("refs/heads/{name}"));
@@ -566,18 +832,29 @@ fn read_local_with_plan(
             }
             HeadState::Unknown => {}
         }
-        snapshot.heads.remove(&record.id);
-        if let Some(branch) = current.branch()
-            && let Some(head) =
-                crate::github::worktree_head_repository(&record.path, branch, &cancellation)
-        {
-            snapshot.heads.insert(record.id, head);
+        let head_changed = status
+            .as_ref()
+            .is_none_or(|previous| previous.head != current.head);
+        if head_changed || change.metadata {
+            snapshot.heads.remove(&record.id);
+            if let Some(branch) = current.branch()
+                && let Some(head) =
+                    crate::github::worktree_head_repository(&record.path, branch, &cancellation)
+            {
+                snapshot.heads.insert(record.id, head);
+            }
         }
         *status = Some(current);
     }
     snapshot
         .worktrees
         .retain(|(record, _)| !vanished.contains(&record.id));
+    snapshot.read_failures.retain(|id, _| {
+        snapshot
+            .worktrees
+            .iter()
+            .any(|(record, _)| record.id == *id)
+    });
     snapshot.heads.retain(|id, _| {
         snapshot
             .worktrees
@@ -785,7 +1062,221 @@ mod tests {
             repository,
             worktrees,
             heads: HashMap::new(),
+            read_failures: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn bound_panel_invalidation_ignores_unrelated_worktrees_and_projects() {
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: WorktreeId::new(),
+            canonical_path: "/repo".into(),
+        };
+        let mut change = git_watch::Change {
+            worktrees: [key.worktree_id].into(),
+            ..Default::default()
+        };
+        assert_eq!(panel_invalidation(key.project_id, &change, &key), Some(1));
+        assert_eq!(panel_invalidation(ProjectId::new(), &change, &key), None);
+        change.worktrees = [WorktreeId::new()].into();
+        assert_eq!(panel_invalidation(key.project_id, &change, &key), None);
+        change.topology = true;
+        change.metadata = true;
+        assert_eq!(panel_invalidation(key.project_id, &change, &key), Some(3));
+    }
+
+    #[test]
+    fn unchanged_topology_reuses_watch_plan_and_index_events_refresh_membership() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let snapshot = fixture(&root);
+        let id = snapshot.worktrees[0].0.id;
+        let project = ProjectId::new();
+        let (_, plan) = read_local(
+            project,
+            snapshot.clone(),
+            git_watch::Change {
+                membership: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let plan = plan.unwrap();
+        assert!(
+            plan.matches(
+                &snapshot.repository.common_dir,
+                &snapshot
+                    .worktrees
+                    .iter()
+                    .map(|(record, _)| record.clone())
+                    .collect::<Vec<_>>()
+            )
+        );
+        fs::write(root.join("tracked.txt"), "edited\n").unwrap();
+        let (snapshot, next) = read_local_with_plan(
+            project,
+            snapshot,
+            git_watch::Change {
+                worktrees: [id].into(),
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&plan),
+        )
+        .unwrap();
+        assert!(next.is_none());
+        fs::write(root.join("new.txt"), "new\n").unwrap();
+        git(&root, &["add", "new.txt"]);
+        let (_, next) = read_local_with_plan(
+            project,
+            snapshot,
+            git_watch::Change {
+                worktrees: [id].into(),
+                metadata: true,
+                membership: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&plan),
+        )
+        .unwrap();
+        assert_ne!(
+            next.expect("index events rebuild the tracked-path census"),
+            plan
+        );
+    }
+
+    #[test]
+    fn broken_worktree_does_not_block_sibling_status_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let linked = directory.path().join("linked");
+        let snapshot = fixture(&root);
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let project = ProjectId::new();
+        let (snapshot, _) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let gitdir = RepositoryService::system("git")
+            .git_dir(&linked, &CancellationToken::default())
+            .unwrap();
+        let head = fs::read(gitdir.join("HEAD")).unwrap();
+        let (linked_record, previous_linked) = snapshot
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path == linked)
+            .unwrap();
+        let linked_id = linked_record.id;
+        let previous_linked = previous_linked.clone();
+        fs::write(gitdir.join("HEAD"), "invalid HEAD\n").unwrap();
+        fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        let changed = snapshot
+            .worktrees
+            .iter()
+            .map(|(record, _)| record.id)
+            .collect();
+        let original = snapshot.clone();
+        let (next, _) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                worktrees: changed,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(next.worktrees.len(), 2);
+        assert!(next.read_failures.contains_key(&linked_id));
+        assert_eq!(
+            next.worktrees
+                .iter()
+                .find(|(record, _)| record.id == linked_id)
+                .unwrap()
+                .1,
+            previous_linked
+        );
+        assert!(
+            next.worktrees
+                .iter()
+                .find(|(record, _)| record.path == root)
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap()
+                .dirty
+                .is_dirty()
+        );
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects.clear();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            original.repository.id,
+            "Read recovery".into(),
+            original.repository.common_dir.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        app.repository_generations.insert(project, 1);
+        app.refresh_ui.git.entries.insert(
+            project,
+            Entry {
+                snapshot: original,
+                generation: 1,
+                plan: None,
+                archived: Vec::new(),
+                remote_started: false,
+                cancellation: None,
+                pending: Default::default(),
+                fallback: None,
+                read_failure: None,
+                read_full_scan: false,
+                last_full_scan: Instant::now(),
+            },
+        );
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((next.clone(), None)),
+        }));
+        assert!(app.refresh_ui.git.entries[&project].needs_polling());
+        assert!(
+            app.refresh_ui.git.entries[&project].read_failure.is_none(),
+            "known worktree failures remain distinct from an unknown project read failure"
+        );
+        fs::write(gitdir.join("HEAD"), head).unwrap();
+        let (recovered, _) = read_local(
+            project,
+            next,
+            git_watch::Change {
+                worktrees: [linked_id].into(),
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(recovered.read_failures.is_empty());
+        drop(app.update_git(Action::Read {
+            project,
+            generation: 1,
+            result: Ok((recovered, None)),
+        }));
+        assert!(
+            !app.refresh_ui.git.entries[&project].needs_polling(),
+            "an actual partial repair clears its own retry obligation"
+        );
     }
 
     #[test]
@@ -1084,9 +1575,12 @@ mod tests {
                 .values()
                 .filter(|entry| entry.cancellation.is_some())
                 .count(),
-            LOCAL_WORKERS
+            local_workers().min(4)
         );
-        assert_eq!(app.refresh_ui.git.queue.len(), 4 - LOCAL_WORKERS);
+        assert_eq!(
+            app.refresh_ui.git.queue.len(),
+            4_usize.saturating_sub(local_workers())
+        );
         assert!(
             app.refresh_ui.projects.is_empty(),
             "fallback never schedules gh"
@@ -1352,5 +1846,183 @@ mod tests {
             state.entries[&project].read_failure.is_some(),
             "another project reconfiguring watches cannot settle a failed Git read"
         );
+    }
+    #[test]
+    fn shared_reference_reads_defer_mutating_worktrees_with_missing_current_or_stale_censuses() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let linked = directory.path().join("linked");
+        let snapshot = fixture(&root);
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let project = ProjectId::new();
+        let (snapshot, plan) = read_local(
+            project,
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                membership: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
+        let plan = plan.unwrap();
+        let active = snapshot
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path == linked)
+            .unwrap()
+            .0
+            .id;
+        let sibling = snapshot
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path == root)
+            .unwrap()
+            .0
+            .id;
+        git(&linked, &["checkout", "-b", "equal-tip-other-branch"]);
+        let (stale, no_new_plan) = read_local_with_plan(
+            project,
+            snapshot.clone(),
+            git_watch::Change {
+                worktrees: [active].into(),
+                metadata: true,
+                ..Default::default()
+            },
+            CancellationToken::default(),
+            Some(&plan),
+        )
+        .unwrap();
+        assert!(
+            no_new_plan.is_none(),
+            "a HEAD-only read leaves the prior census in place"
+        );
+        let before_record = &snapshot
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.id == active)
+            .unwrap()
+            .0;
+        let after_record = &stale
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.id == active)
+            .unwrap()
+            .0;
+        assert_eq!(before_record.head_oid, after_record.head_oid);
+        assert_ne!(before_record.branch, after_record.branch);
+        let gitdir = RepositoryService::system("git")
+            .git_dir(&linked, &CancellationToken::default())
+            .unwrap();
+        let head = fs::read(gitdir.join("HEAD")).unwrap();
+        fs::write(gitdir.join("HEAD"), "invalid HEAD\n").unwrap();
+        fs::write(root.join("tracked.txt"), "sibling changed\n").unwrap();
+        let mut completions = Vec::new();
+        for case in 0..3 {
+            let current = if case == 2 { &stale } else { &snapshot };
+            let prior = (case != 0).then_some(&plan);
+            let mut change = git_watch::Change {
+                references: true,
+                membership: true,
+                ..Default::default()
+            };
+            materialize_reference_targets(current, &mut change);
+            let blocked = HashSet::from([active]);
+            let reusable = blocked_censuses_reusable(current, &blocked, prior);
+            let deferred = defer_mutating_worktrees(&mut change, &blocked, reusable);
+            assert!(!change.references && change.metadata);
+            assert_eq!(change.membership, case == 1);
+            assert_eq!(change.worktrees, BTreeSet::from([sibling]));
+            assert_eq!(deferred.worktrees, BTreeSet::from([active]));
+            assert!(deferred.metadata && deferred.membership);
+            let (next, refreshed) = read_local_with_plan(
+                project,
+                current.clone(),
+                change,
+                CancellationToken::default(),
+                prior,
+            )
+            .unwrap();
+            assert!(next.read_failures.is_empty());
+            if case == 1 {
+                assert_eq!(
+                    refreshed.as_ref(),
+                    Some(&plan),
+                    "a reusable blocked census is copied without introducing a planning failure"
+                );
+            } else {
+                assert!(
+                    refreshed.is_none(),
+                    "missing or stale blocked censuses must not be read indirectly by planning"
+                );
+            }
+            assert!(
+                next.worktrees
+                    .iter()
+                    .find(|(record, _)| record.id == sibling)
+                    .unwrap()
+                    .1
+                    .as_ref()
+                    .unwrap()
+                    .dirty
+                    .is_dirty()
+            );
+            completions.push((next, deferred, case != 0));
+        }
+        fs::write(gitdir.join("HEAD"), head).unwrap();
+        for (snapshot, mut pending, cached) in completions {
+            let prior = cached.then_some(&plan);
+            let still_deferred = defer_mutating_worktrees(&mut pending, &HashSet::new(), true);
+            assert!(still_deferred.worktrees.is_empty());
+            let (settled, refreshed) = read_local_with_plan(
+                project,
+                snapshot,
+                pending,
+                CancellationToken::default(),
+                prior,
+            )
+            .unwrap();
+            assert!(settled.read_failures.is_empty());
+            assert!(
+                refreshed.is_some(),
+                "the final mutation completion retains the membership refresh"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_deferral_preserves_sibling_reads_and_the_final_pending_change() {
+        let active = WorktreeId::from_uuid(uuid::Uuid::from_u128(501));
+        let sibling = WorktreeId::from_uuid(uuid::Uuid::from_u128(502));
+        let mut change = git_watch::Change {
+            worktrees: BTreeSet::from([active, sibling]),
+            metadata: true,
+            membership: true,
+            ..Default::default()
+        };
+        let deferred = defer_mutating_worktrees(&mut change, &HashSet::from([active]), false);
+        assert_eq!(change.worktrees, BTreeSet::from([sibling]));
+        assert_eq!(deferred.worktrees, BTreeSet::from([active]));
+        assert!(deferred.metadata && deferred.membership);
+        let mut pending = deferred;
+        let again = defer_mutating_worktrees(&mut pending, &HashSet::from([active]), false);
+        assert!(pending.worktrees.is_empty() && !pending.membership);
+        pending.merge(again);
+        assert!(
+            defer_mutating_worktrees(&mut pending, &HashSet::new(), true)
+                .worktrees
+                .is_empty()
+        );
+        assert_eq!(pending.worktrees, BTreeSet::from([active]));
+        let mut topology = git_watch::Change {
+            topology: true,
+            ..Default::default()
+        };
+        assert!(defer_mutating_worktrees(&mut topology, &HashSet::from([active]), false).topology);
+        assert!(!topology.topology);
     }
 }
