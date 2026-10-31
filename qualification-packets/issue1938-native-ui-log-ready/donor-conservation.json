@@ -1,0 +1,137 @@
+{
+  "donor": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1775-native-controller/qualification-packets/pr1775-native",
+  "files": {
+    "controller.py": {
+      "added_functions": [
+        "X11.accounts_phase",
+        "fixture_evidence"
+      ],
+      "changed_functions": [
+        "load_launch",
+        "main"
+      ],
+      "donor_sha256": "034fc93d1be2ddf6b0bad77861937a765fc0009dd3e7a5e742ce5e09f5896cdc",
+      "exact_unchanged_functions": [
+        "require",
+        "number",
+        "exact_keys",
+        "no_duplicate_keys",
+        "below_root",
+        "private_bytes",
+        "process_cookie",
+        "Ownership.__init__",
+        "Ownership.close",
+        "Ownership.check",
+        "X11.__init__",
+        "X11.bind",
+        "X11._error",
+        "X11.close",
+        "X11.peer_check",
+        "X11.guard",
+        "X11.sync",
+        "X11.attributes",
+        "X11.tree",
+        "X11.property",
+        "X11.metadata",
+        "X11.listing",
+        "X11.selected",
+        "X11.descendant",
+        "X11.focus_check",
+        "X11.focus",
+        "X11.resize_focus",
+        "X11.input_library",
+        "X11.key_codes",
+        "X11.key",
+        "X11.pointer",
+        "X11.capture",
+        "digest_file",
+        "source_json",
+        "verified_digest",
+        "artifact",
+        "directory_identity",
+        "check_launch",
+        "window_id"
+      ],
+      "forward_reconstructs_exact_bytes": true,
+      "inverse_reconstructs_exact_donor_bytes": true,
+      "new_sha256": "b41fe9b612ed014aa52be34611f0b6fa2256e9f24fe41fa4c4a5b7d67b21b39e",
+      "patch_sha256": "d54d8ea9131a1cb1607280b84971fabe59d58be2ea74ce938650927eae734c4b",
+      "removed_functions": [
+        "X11.automation_phase"
+      ]
+    },
+    "namespace.py": {
+      "added_functions": [],
+      "changed_functions": [
+        "SceneNamespace.__init__"
+      ],
+      "donor_sha256": "eee6bf70f09010516dc66b2de110dd2a484ad2be4c24a7d3ccde66657af1afe0",
+      "exact_unchanged_functions": [
+        "require",
+        "identity",
+        "private_directory",
+        "closed_original_custody",
+        "SceneNamespace.check",
+        "SceneNamespace._check_live",
+        "SceneNamespace.environment_paths",
+        "SceneNamespace.close_original_descriptors",
+        "SceneNamespace.receipt"
+      ],
+      "forward_reconstructs_exact_bytes": true,
+      "inverse_reconstructs_exact_donor_bytes": true,
+      "new_sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2",
+      "patch_sha256": "43a64125959853b133361fc2b046957befe6235c16b6abadc60fa057f8c7d774",
+      "removed_functions": [
+        "SceneNamespace.before",
+        "SceneNamespace.archive_and_create_after"
+      ]
+    },
+    "run-native.py": {
+      "added_functions": [],
+      "changed_functions": [
+        "admission",
+        "Case.__init__",
+        "Case.start_native",
+        "Case.inputs",
+        "Case.fixture_receipts",
+        "namespace_owner",
+        "main"
+      ],
+      "donor_sha256": "c66ef8e5363dee7cf39187c717387c813c1f8c11a8a2548971d72625195be9d9",
+      "exact_unchanged_functions": [
+        "require",
+        "pairs",
+        "identity",
+        "signature",
+        "read_bytes",
+        "digest",
+        "pinned",
+        "save",
+        "field",
+        "build_path",
+        "guard",
+        "build_context",
+        "Case.event",
+        "Case.check",
+        "Case.command",
+        "Case.admit",
+        "Case.builds",
+        "Case.service",
+        "Case.cookie",
+        "Case.close",
+        "file_identity",
+        "read_bytes_prefix",
+        "live_output",
+        "manual_line",
+        "initial_registry",
+        "cancelled"
+      ],
+      "forward_reconstructs_exact_bytes": true,
+      "inverse_reconstructs_exact_donor_bytes": true,
+      "new_sha256": "e2590850758091d1689d6f26c345009e0197be61e0dd00db46f2e0d5b95d5945",
+      "patch_sha256": "3ccd2fe08d2e0d0eac227e6cd1e065a103ec78b95d8916bbb9ca6b8c37a568d0",
+      "removed_functions": []
+    }
+  },
+  "status": "AUTHOR_SOURCE_COMPARISON_NOT_INDEPENDENT_REVIEW"
+}

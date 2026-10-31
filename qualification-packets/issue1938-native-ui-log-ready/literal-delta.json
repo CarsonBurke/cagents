@@ -1,0 +1,27 @@
+{
+  "controller.py": [
+    {
+      "after": "ALLOWED_ROOT = Path('/tmp/coord16-1938-native-ui-log-corrected-1f1e78ab/owned-native')",
+      "before": "ALLOWED_ROOT = Path('/tmp/coord16-1938-native-fixed-1f1e78ab/owned-native')",
+      "name": "ALLOWED_ROOT"
+    }
+  ],
+  "namespace.py": [],
+  "run-native.py": [
+    {
+      "after": "PLAN_SHA256 = \"a41ff691d544ffc3437a923898c9862691733f4b8cd7e0ac336e794e856438d8\"",
+      "before": "PLAN_SHA256 = \"d574904b23aec7cf9601bbbe456aa0dda104ea1956f1f8ee46023a8954627da2\"",
+      "name": "PLAN_SHA256"
+    },
+    {
+      "after": "ROOT = Path(\"/tmp/coord16-1938-native-ui-log-corrected-1f1e78ab/owned-native\")",
+      "before": "ROOT = Path(\"/tmp/coord16-1938-native-fixed-1f1e78ab/owned-native\")",
+      "name": "ROOT"
+    },
+    {
+      "after": "CONTROLLER_SHA = \"6c6f29622c26657f7ca9b355383dc79a2176f92b0444e927b938ebbff17e3714\"",
+      "before": "CONTROLLER_SHA = \"b41fe9b612ed014aa52be34611f0b6fa2256e9f24fe41fa4c4a5b7d67b21b39e\"",
+      "name": "CONTROLLER_SHA"
+    }
+  ]
+}

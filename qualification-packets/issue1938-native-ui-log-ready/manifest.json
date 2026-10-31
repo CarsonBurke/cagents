@@ -1,0 +1,288 @@
+{
+  "adapter_sha256": "c5cdbf195b5b220f38c53e5ca0b4a6580adaecdb9c25489c481fe038575dff7f",
+  "assembly_preliminary_manifest": {
+    "qualification": "Only replaced ambiguous not-written wording; no code, plan, DAG or source change.",
+    "sha256": "a7f80abb1aadb4687c28ae3a809afa06e8c8b3cdbb33cdfa77f9eb44cca925c0"
+  },
+  "attempts": 0,
+  "conservation": {
+    "controller.py": {
+      "all_function_bytes_exact": true,
+      "changed_top_level_assignments": [
+        "ALLOWED_ROOT"
+      ],
+      "function_count_including_nested": 47,
+      "inverse_recovers_corrected_predecessor_complete_bytes": true,
+      "new_sha256": "6c6f29622c26657f7ca9b355383dc79a2176f92b0444e927b938ebbff17e3714",
+      "old_sha256": "a5718c503247d2f7607291b5354f3148a95cdfa1838c16f7db792242d507c639"
+    },
+    "namespace.py": {
+      "all_function_bytes_exact": true,
+      "changed_top_level_assignments": [],
+      "function_count_including_nested": 10,
+      "inverse_recovers_corrected_predecessor_complete_bytes": true,
+      "new_sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2",
+      "old_sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2"
+    },
+    "run-native.py": {
+      "all_function_bytes_exact": true,
+      "changed_top_level_assignments": [
+        "PLAN_SHA256",
+        "ROOT",
+        "CONTROLLER_SHA"
+      ],
+      "function_count_including_nested": 37,
+      "inverse_recovers_corrected_predecessor_complete_bytes": true,
+      "new_sha256": "c5cdbf195b5b220f38c53e5ca0b4a6580adaecdb9c25489c481fe038575dff7f",
+      "old_sha256": "fca6ecc5b04117688e9576c0fd1486c708a067406f6a13c55f1d2180270451cc"
+    }
+  },
+  "current_actual_facts": null,
+  "dag": {
+    "development_runner_source_hash_distinct": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+    "edges": [
+      {
+        "from": "controller.py",
+        "sha256": "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77",
+        "to": "source-binding.json"
+      },
+      {
+        "from": "controller.py",
+        "sha256": "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1",
+        "to": "phases.json"
+      },
+      {
+        "from": "adapter-plan.json",
+        "sha256": "6c6f29622c26657f7ca9b355383dc79a2176f92b0444e927b938ebbff17e3714",
+        "to": "controller.py"
+      },
+      {
+        "from": "adapter-plan.json",
+        "sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2",
+        "to": "namespace.py"
+      },
+      {
+        "from": "adapter-plan.json",
+        "sha256": "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77",
+        "to": "source-binding.json"
+      },
+      {
+        "from": "adapter-plan.json",
+        "sha256": "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1",
+        "to": "phases.json"
+      },
+      {
+        "from": "adapter-plan.json",
+        "sha256": "271df7f66ba7bae291d1e35fe9d95538a0ddbdc890dff14d01eed3c938ae9242",
+        "to": "input-contract.json"
+      },
+      {
+        "from": "run-native.py",
+        "sha256": "a41ff691d544ffc3437a923898c9862691733f4b8cd7e0ac336e794e856438d8",
+        "to": "adapter-plan.json"
+      },
+      {
+        "from": "run-native.py",
+        "sha256": "6c6f29622c26657f7ca9b355383dc79a2176f92b0444e927b938ebbff17e3714",
+        "to": "controller.py"
+      },
+      {
+        "from": "run-native.py",
+        "sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2",
+        "to": "namespace.py"
+      },
+      {
+        "from": "run-native.py",
+        "sha256": "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77",
+        "to": "source-binding.json"
+      },
+      {
+        "from": "run-native.py",
+        "sha256": "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1",
+        "to": "phases.json"
+      }
+    ],
+    "native_adapter_hash_absent_from_plan": true,
+    "order": [
+      "source-binding.json + phases.json + input-contract.json + namespace.py",
+      "controller.py (root literal, source/phase pins)",
+      "adapter-plan.json (component source hashes + null/HOLD actual facts)",
+      "run-native.py (plan/component hashes + root literal)",
+      "draft-binding.json + assembly-conservation.json + literal-delta.json + README.md + patches",
+      "manifest.json (external file index, excludes itself)"
+    ],
+    "self_cycle": false
+  },
+  "execution_authorized": false,
+  "files": {
+    "README.md": {
+      "bytes": 2654,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "48c9ba5e12b739663199c5977aac0045727c89ec82c0ad0c51a13c5ba2e406c5"
+    },
+    "adapter-plan.json": {
+      "bytes": 20226,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "a41ff691d544ffc3437a923898c9862691733f4b8cd7e0ac336e794e856438d8"
+    },
+    "assembly-conservation.json": {
+      "bytes": 4376,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "b57295ddf8184950ac041c02bc748894e9dad953ae0afd8ce1402150a4915a51"
+    },
+    "assembly-python-forward.patch": {
+      "bytes": 1638,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "7ea2c4cbb1ab312cd35001e87190339e0ef39e114f18d2539aba71c29fb489d8"
+    },
+    "assembly-python-inverse.patch": {
+      "bytes": 1638,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "9f1d64c42e2ac97239832b5be09625174d888e1059a195f5907aefa529284194"
+    },
+    "controller.py": {
+      "bytes": 67135,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "6c6f29622c26657f7ca9b355383dc79a2176f92b0444e927b938ebbff17e3714"
+    },
+    "controller.py.from-1775.patch": {
+      "bytes": 19954,
+      "mode": 420,
+      "role": "HISTORICAL_ONLY",
+      "sha256": "d54d8ea9131a1cb1607280b84971fabe59d58be2ea74ce938650927eae734c4b"
+    },
+    "donor-conservation.json": {
+      "bytes": 4079,
+      "mode": 420,
+      "role": "HISTORICAL_ONLY",
+      "sha256": "3ba51fe11bfe5e5f816919634af9083e8825e88c92b7e8b87fcfb8e2a48ea61e"
+    },
+    "draft-binding.json": {
+      "bytes": 3146,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "e052a7877204e9f7d111fb585110169c529b31d8257cdab79dc3e11c53e06131"
+    },
+    "input-contract.json": {
+      "bytes": 3343,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "271df7f66ba7bae291d1e35fe9d95538a0ddbdc890dff14d01eed3c938ae9242"
+    },
+    "literal-delta.json": {
+      "bytes": 1036,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "320765f078933cc2da0f5514b96d0023060a92c5f49ad2186c6f3c2c57f505e6"
+    },
+    "namespace.py": {
+      "bytes": 11499,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2"
+    },
+    "namespace.py.from-1775.patch": {
+      "bytes": 7857,
+      "mode": 420,
+      "role": "HISTORICAL_ONLY",
+      "sha256": "43a64125959853b133361fc2b046957befe6235c16b6abadc60fa057f8c7d774"
+    },
+    "phases.json": {
+      "bytes": 105690,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1"
+    },
+    "run-native.py": {
+      "bytes": 64501,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "c5cdbf195b5b220f38c53e5ca0b4a6580adaecdb9c25489c481fe038575dff7f"
+    },
+    "run-native.py.from-1775.patch": {
+      "bytes": 18966,
+      "mode": 420,
+      "role": "HISTORICAL_ONLY",
+      "sha256": "3ccd2fe08d2e0d0eac227e6cd1e065a103ec78b95d8916bbb9ca6b8c37a568d0"
+    },
+    "source-binding.json": {
+      "bytes": 4399,
+      "mode": 420,
+      "role": "CURRENT_SOURCE_OR_ASSEMBLY_DATA",
+      "sha256": "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77"
+    }
+  },
+  "grant": null,
+  "historical_provenance_only": {
+    "EC_return_acceptance": {
+      "path": "/tmp/fw16-backend-ec204421/root16-942d-actual-return-acceptance-v1.json",
+      "sha256": "20c79e2d74b04551bb6bf482fea17959ff130ac822cc9669395dcfa6d0794495"
+    },
+    "accepted_original_delivery": {
+      "path": "/var/tmp/coord16-C942d-original-executor-5isazpa3/accepted-original-delivery.json",
+      "sha256": "b83eb310d91f317ce3170e6f8f7781b61fbc73a053a3da9624d8f971c9d6204c"
+    },
+    "original_executor_return": {
+      "path": "/var/tmp/coord16-C942d-original-executor-5isazpa3/actual-original-executor-return.json",
+      "sha256": "d02e6db1f0c6aa1b65c8ec1fbcf3962a0cf54882d4207f95d634c97d339cd884"
+    }
+  },
+  "holds": [
+    "Pending independent exact new-root/source/hash DAG assembly review; corrected source179b alone is not this binding review.",
+    "Root/EC must supply actual current canonical checkout/control/registry/original-inode/target/lock facts and current accepted-return context; B9 later ownership may retarget.",
+    "Actual source-object presence in canonical execution common is unobserved and null; no common Git/helper call was made.",
+    "All current installed tool hashes, ancestor configuration/absence facts, natural inherited context and full global family/namespace closure facts are unobserved/null.",
+    "Fresh fixed capture root/display/clipboard/five-empty-XDG exclusivity and original source/window/frame/coordinate reviews remain runtime obligations; no observation/allocation here.",
+    "Fresh exact original scoped EC grant/current expiry/owner handoff/preflight are null; historical C942d return/acceptance cannot authorize this packet."
+  ],
+  "limits": [
+    "Source179b and synthetic helper results do not establish new binding/runtime/native UX qualification.",
+    "No current C/resource availability inferred from historical source selectors or historical C942d return.",
+    "All Root/EC actual binding/current preflight/new scope grant/native frame/evidence obligations remain pending."
+  ],
+  "not_performed": [
+    "No candidate/helper import or function calls, native/library/X11/custody execution, compilation, tests, process/proc/env/HOME/account/config/current slot/control/registry/tool/target/lock probes, fetch, queue, grant or external writes."
+  ],
+  "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-1938-native-cargo-selector/qualification-packets/issue1938-native-ui-log-ready",
+  "pair": {
+    "after": {
+      "head": "bb9524d5caba771e817e1c54d0f03c6455d913ae",
+      "tree": "a6ba27f620b9f80dd59a3be46966e36a509340f6"
+    },
+    "before": {
+      "head": "e10c855c10f58b2019887e4e864c47b59c3f8d58",
+      "tree": "8c26393b40af3f89aa22dbaffb81c315d7cabaca"
+    }
+  },
+  "performed": [
+    "Read/hash existing frozen source/artifacts only.",
+    "Created only the new assigned copied packet directory.",
+    "AST parse and exact function/assignment/inverse comparison; static JSON/DAG/null/HOLD checks."
+  ],
+  "plan_sha256": "a41ff691d544ffc3437a923898c9862691733f4b8cd7e0ac336e794e856438d8",
+  "predecessors_unmodified": true,
+  "proposed_capture_root": "/tmp/coord16-1938-native-ui-log-corrected-1f1e78ab/owned-native",
+  "scene": "claude-malformed",
+  "source_gate_reference_only": {
+    "path": "/var/tmp/coord16-1938-log-hold-independent-sui7a75a/review.json",
+    "sha256": "179b64f925160958746aaf9ca80cddf5826e96252d9fee9df10e2ee2da9fb347"
+  },
+  "startup_and_1859_not_written_by_this_task": true,
+  "static_checks": {
+    "all_Python_function_bodies_exact_count_including_nested": 94,
+    "all_indexed_file_hashes_match": true,
+    "candidate_imports_or_calls": 0,
+    "no_dependency_cycle": true,
+    "runtime_tests_or_resource_probes": 0,
+    "unchanged_admission_UNBOUND_HOLD_statically_refuses_before_component_imports_capture_root_C_or_children": true
+  },
+  "status": "UNBOUND_HOLD_SOURCE_DAG_ASSEMBLED_PENDING_NONAUTHOR_REGATE",
+  "version": 1,
+  "viewport": "narrow"
+}

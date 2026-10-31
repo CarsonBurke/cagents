@@ -1,0 +1,88 @@
+{
+  "binding_exact_keys": [
+    "side",
+    "scene",
+    "head",
+    "tree",
+    "controller_sha256",
+    "source_binding_sha256",
+    "launch_sha256",
+    "ownership_receipt_sha256",
+    "window",
+    "ui",
+    "server",
+    "ui_sha256",
+    "display",
+    "geometry",
+    "root_size",
+    "viewport",
+    "scale_factor",
+    "theme"
+  ],
+  "binding_values": "Exact original launch/ownership/cookie/source/ELF plus actual owned window, root, initial geometry, dark theme and scale_factor1.0; fixed viewport after layout.",
+  "fixture_log": "Launch pins the exclusive original private ui.log path/device/inode/uid/mode0600/link1 before the standard runner redirects UI stdout+stderr to that same inode. Both readers use bounded4MiB original-FD reads with full before/after/named identity and complete-record checks. Controller proves exact scene/phase/original work twice before either nonpointer operation. After positive family settlement the wrapper retains exact bytes and closes its original log FD before case settlement/C release. Runner stdout/stderr remain separate service evidence. Growth, replacement, partial records or any failure refuses; no retry. Any snapshot read/identity/size/write/fsync/close failure leaves the case unsettled and C retained; the original close is attempted once and its exact outcome is recorded.",
+  "frames": {
+    "client": {
+      "path": "actual private native client WebP",
+      "sha256": "actual"
+    },
+    "root": {
+      "path": "actual private native root WebP",
+      "sha256": "actual"
+    }
+  },
+  "manual_lines": [
+    {
+      "op": "capture"
+    },
+    {
+      "op": "phase",
+      "phase": "<exact next source phase>",
+      "review": "<original private in-root JSON>",
+      "review_sha256": "<actual sha256>"
+    },
+    {
+      "op": "finish"
+    }
+  ],
+  "no_workload_cli": true,
+  "output": "Original command stdout/stderr/status/waits/family, retained source/build/launch/ownership, frame hashes, per-operation evidence, source oracles and final unknown/closure/cleanliness. No automatic PASS.",
+  "pixel_rule": "Whole-frame RGB equality for pointer/hover/Tab. Initial resize and fixed F8 instead bind original scene/work and retain full unmasked RGB differences. No other exceptions.",
+  "predecessor": "Exact immediately preceding successful original phase path/SHA; no incomplete/replayed/reordered phase may be bypassed.",
+  "purpose": "Manual source-bound root/client review data, not an allocation or UX verdict",
+  "review_exact_keys": [
+    "version",
+    "phase",
+    "binding",
+    "visible_state",
+    "target",
+    "frames",
+    "predecessor",
+    "reviewed_unix_ns",
+    "review_reference"
+  ],
+  "single_gesture_seconds": 20,
+  "target_exact_keys": [
+    "role",
+    "label",
+    "subject",
+    "ordinal",
+    "occurrences",
+    "rectangle",
+    "enabled",
+    "unoccluded",
+    "scrollbar"
+  ],
+  "target_values": "Exact phase role/label/subject/ordinal/occurrences; unique actual enabled unoccluded widget rectangle for click/hover; whole actual owned window for fixed nonpointer operations. F8 target is explicitly NOT a widget.",
+  "version": 1,
+  "wrapper_argv": [
+    "/usr/bin/python3.13",
+    "-I",
+    "-B",
+    "<absolute run-native.py>",
+    "--allocation",
+    "<original allocation path>",
+    "--allocation-sha256",
+    "<actual original sha256>"
+  ]
+}

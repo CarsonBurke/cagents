@@ -1,0 +1,279 @@
+--- donor/run-native.py
++++ accounts/run-native.py
+@@ -1,8 +1,8 @@
+ #!/usr/bin/python3
+-"""One PR1775 inert native Before/After pair. Unbound source, NOT permission.
++"""One fixed issue1938 Accounts native Before/After pair. Unbound source, NOT permission.
+ 
+ There is no arbitrary command/input API. The maintained engine owns every child;
+-the frozen controller owns the fixed gestures; namespace.py owns same-path state.
++the frozen controller owns the fixed gestures; namespace.py owns separate exclusive revision-suffixed state.
+ The source plan intentionally refuses before effects until its real bindings exist.
+ """
+ import argparse
+@@ -23,9 +23,9 @@
+ import sys
+ import time
+ 
+-PLAN_SHA256 = "2330e48d12e0149a8e27a2084715a6e95c73e4cd078298b241da5db39b0acc47"
++PLAN_SHA256 = "d00a1149905f7cf74a4356909f0a015920e3a6b24d06c05baf6151f9a50ba42c"
+ HERE = Path(__file__).resolve().parent
+-ROOT = Path("/tmp/coord16-pr1775-native-fixed-574ac717/owned-native")
++ROOT = Path("/tmp/coord16-1938-native-fixed-1f1e78ab/owned-native")
+ CHECKOUT = Path("/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout")
+ COMMON = Path("/home/marvin/Documents/repositories/cagents/.worktrees/fw16-backend-control-ec204421/.git")
+ TARGET = CHECKOUT.parent / "lane-c-target"
+@@ -33,10 +33,10 @@
+ OWNER = "validation-lane-c"
+ ENGINE_SHA = "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
+ HELPER_SHA = "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74"
+-CONTROLLER_SHA = "034fc93d1be2ddf6b0bad77861937a765fc0009dd3e7a5e742ce5e09f5896cdc"
+-NAMESPACE_SHA = "eee6bf70f09010516dc66b2de110dd2a484ad2be4c24a7d3ccde66657af1afe0"
+-SOURCE_SHA = "1c6508a197bf39b4014786ecffb4753dc716685f4d31f971cccba5e2d444862d"
+-PHASES_SHA = "6cce0b3e2e4ae33013d7cba8ea0fc9f25cb75183cfcb852869309321501eef97"
++CONTROLLER_SHA = "b41fe9b612ed014aa52be34611f0b6fa2256e9f24fe41fa4c4a5b7d67b21b39e"
++NAMESPACE_SHA = "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2"
++SOURCE_SHA = "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77"
++PHASES_SHA = "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1"
+ COMPILER_BIN = Path("/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin")
+ ZIG = Path("/home/marvin/.local/share/mise/installs/zig/0.15.2/zig")
+ COMPILER_OVERLAY = {"prepend_path": [str(ZIG.parent), str(COMPILER_BIN)], "CAGENTS_ZIG": str(ZIG)}
+@@ -51,7 +51,7 @@
+                "normal_runner_warm_builds": "inherit-owned-ui-environment",
+                "account_authority": "opaque-preserved"}
+ # All other conflicting authority/application/Git routing names still refuse.
+-FORBIDDEN = frozenset(("GIT_ATTR_SOURCE",
++FORBIDDEN = frozenset(("GIT_ATTR_SOURCE", "CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE",
+     "CAGENTS_DEVELOPMENT_AUTOMATION_FIXTURE", "CAGENTS_DEVELOPMENT_NATIVE_IDENTITY_FIXTURE",
+     "CAGENTS_CHAT_STAGE_OUTPUT", "CAGENTS_UI_LAUNCH_HANDSHAKE", "CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS",
+     "CAGENTS_UI_UPDATE_GUARD_FD", "CAGENTS_DAEMON_LAUNCH_FENCE_FD",
+@@ -195,8 +195,10 @@
+     # This is deliberately before component imports, output creation, C or children.
+     require(plan["binding_status"] == "BOUND_FOR_INDEPENDENT_REVIEW" and not plan["holds"],
+             "INVALID_SOURCE_PLAN_HOLD: " + "; ".join(plan["holds"]))
+-    require(plan["scene"] == "retry" and plan["viewport"] == "wide",
+-            "This first adapter is bound only to retry-wide; other coverage is pending")
++    require(plan["scene"] == "claude-malformed" and plan["viewport"] == "narrow",
++            "This source packet is fixed to claude-malformed-narrow; no workload selector")
++    require(plan["source_objects_available_in_execution_common"] is True,
++            "Matched source import into the actual execution common remains unbound")
+     require(all(name not in FORBIDDEN and not name.startswith(("CARGO_PROFILE_", "GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+                 for name in os.environ), "Conflicting inherited route name; no environment repair")
+     require(plan["x11_routing"] == X11_ROUTING, "Owned X11 child routing policy is not bound")
+@@ -245,6 +247,9 @@
+             "Actual initial owned-slot profile incomplete; no absent fallback")
+     require(plan["control"]["metadata"] and all(k in plan["control"] for k in ("repository", "head", "tree", "identity", "common_identity")),
+             "Actual physical published control metadata incomplete")
++    require(all(plan["control"][key] == plan["frozen_control_reference"][key]
++                for key in ("repository", "head", "tree")),
++            "Only the frozen physical control359 source is accepted by this packet")
+     require(type(plan["lock_identity"]) is dict and type(plan["target_identity"]) is dict,
+             "Actual existing C lock/target identity incomplete")
+     for ref in plan["reviewed_inputs"]:
+@@ -317,7 +322,8 @@
+         self.plan, self.side = plan, side
+         self.pin = plan["pair"][side]
+         self.owner = engine["Custody"](lambda: CANCELLED)
+-        self.work = ROOT / (side + "-retry-wide" + ("-final-clean" if helper_only else ""))
++        self.work = ROOT / (side + "-" + plan["scene"] + "-" + plan["viewport"]
++                            + ("-final-clean" if helper_only else ""))
+         self.work.mkdir(mode=0o700)  # Never reuse a failed or completed case.
+         self.work_identity = identity(self.work)
+         self.number, self.commands, self.services = 0, [], []
+@@ -492,7 +498,8 @@
+         return {"pid": node["pid"], "start_ticks": node["start_ticks"], "uid": node["uid"], "executable": str(expected)}
+ 
+     def start_native(self, namespace, builds, artifacts):
+-        require(namespace.purpose == "native" and namespace.scene == "retry" and namespace.viewport == "wide",
++        require(namespace.purpose == "native" and namespace.scene == self.plan["scene"]
++                and namespace.viewport == self.plan["viewport"] and namespace.variant == self.side,
+                 "Private contract fixtures are never native authority")
+         display = self.plan["display"]
+         require(type(display) is str and re.fullmatch(r":[1-9][0-9]{0,4}", display)
+@@ -563,9 +570,9 @@
+         require(lines[0].startswith("unix:path=" + str(bus_path)) and lines[1] == str(bus.pid),
+                 "Bus did not identify its original foreground process/address")
+         ui_env = {**env, **namespace.environment_paths(), "DBUS_SESSION_BUS_ADDRESS": lines[0],
+-                  "CAGENTS_DEVELOPMENT_AUTOMATION_FIXTURE": "retry"}
++                  "CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE": self.plan["scene"]}
+         log = self.work / "ui.log"
+-        runner, _ = self.service([str(CHECKOUT / "scripts/run-development"), "--browserless", "--debug",
++        runner, runner_record = self.service([str(CHECKOUT / "scripts/run-development"), "--browserless", "--debug",
+                                   "--log-file", str(log)], "owned-development-runner", ui_env)
+         self.runner_pid = runner.pid
+         ui_path = Path(artifacts["cagents-ui"]["path"])
+@@ -592,7 +599,9 @@
+         build_ref = save(self.work / "builds.json", {"version": 1, **self.pin, "checkout": str(CHECKOUT),
+             "source_files": self.source["source_files"], "ui": ui, "ui_sha256": artifacts["cagents-ui"]["sha256"],
+             "matched_builds": builds, "original_family_settled": True})
+-        launch_ref = save(self.work / "launch.json", {"version": 1, "side": self.side, "scene": "retry", **self.pin,
++        launch_ref = save(self.work / "launch.json", {"version": 1, "side": self.side,
++            "scene": self.plan["scene"], "viewport": self.plan["viewport"], **self.pin,
++            "fixture_stdout": {"path": runner_record["stdout"], **file_identity(runner_record["stdout"])},
+             "controller_sha256": CONTROLLER_SHA, "source_binding_sha256": SOURCE_SHA,
+             "ownership_receipt_sha256": owned_ref["sha256"], "ui": ui, "server": server_cookie,
+             "ui_sha256": artifacts["cagents-ui"]["sha256"], "display": display,
+@@ -624,7 +633,7 @@
+             time.sleep(0.5)
+         require(len(windows) == 1, "No unique actual development window; no guessed window/restart")
+         window = str(windows[0]["window"])
+-        phases = json.loads(read_bytes(HERE / "phases.json"), object_pairs_hook=pairs)["scenes"]["retry"]
++        phases = json.loads(read_bytes(HERE / "phases.json"), object_pairs_hook=pairs)["scenes"][self.plan["scene"]][self.side]["phases"]
+         self.event("manual-review-ready", actual_window=windows[0], next_phase=phases[0]["phase"],
+                    protocol="capture; then phase with private original review path/hash; finish after all phases")
+         phase_index, observations = 0, 0
+@@ -642,7 +651,8 @@
+             elif action == {"op": "finish"}:
+                 require(phase_index == len(phases), "Incomplete fixed native flow; cannot finish early")
+                 self.event("observations-completed", phases=len(phases),
+-                           race_claim=False, timestamps_do_not_identify_history_rows=True)
++                           race_claim=False, logical_expiry_is_not_watchdog_timing=True,
++                           widget_focus_not_inferred_from_x_focus=True)
+                 return
+             else:
+                 require(set(action) == {"op", "phase", "review", "review_sha256"} and action["op"] == "phase"
+@@ -686,21 +696,36 @@
+         require(self.scene_started and self.settled, "Only the original settled scene log is interpreted")
+         runner = next(s for s in self.services if s["role"] == "owned-development-runner")
+         events = []
+-        with open(runner["stdout"], "rb") as source:
+-            for line in source:
+-                require(len(line) <= 16777216, "Original fixture log line exceeds bound")
+-                if line.startswith(b"AUTOMATION_NATIVE "):
+-                    events.append(json.loads(line[len(b"AUTOMATION_NATIVE "):], object_pairs_hook=pairs))
+-                    require(len(events) <= 20000, "Original synthetic receipt bound exceeded")
+-        requests = [e["request"] for e in events if e.get("event") == "actual_reducer_request_intercepted"]
+-        manual = [r for r in requests if type(r) is dict and set(r) == {"RunNow"}]
+-        # This is an observation/oracle, not a conversion into a passing native
+-        # parent or proof that a frame identifies a particular firing.
+-        reference = self.event("synthetic-fixture-log", events=events,
++        with open(runner["stdout"], "rb") as stream:
++            for line in stream:
++                require(len(line) <= 4194304, "Original fixture log line exceeds bound")
++                if line.startswith(b"ACCOUNT_NATIVE "):
++                    event = json.loads(line[len(b"ACCOUNT_NATIVE "):], object_pairs_hook=pairs)
++                    require(type(event) is dict and event.get("scene", self.plan["scene"]) == self.plan["scene"],
++                            "Original scene/event identity changed")
++                    require(event.get("event") not in ("fixture_error", "step_refused"),
++                            "Original fixture refused/stopped; no successful observation claim")
++                    events.append(event)
++                    require(len(events) <= 4096, "Original event bound exceeded")
++        specification = json.loads(read_bytes(HERE / "phases.json"), object_pairs_hook=pairs)["scenes"][self.plan["scene"]][self.side]
++        completions = [e for e in events if e.get("event") == "actual_reducer_completion"]
++        key = "source_oracle_satisfied" if self.side == "after" else "expected_before_consequence_observed"
++        require(completions and all(e.get(key) is True for e in completions),
++                "Actual fixture source oracle absent/failed")
++        require([e["kind"] for e in completions] == specification["required_completion_kinds"],
++                "Missing, duplicate or unexpected original completion")
++        states = [e for e in events if e.get("event") == "scene_state"]
++        require(states and states[-1].get("phase") in specification["terminal_states"],
++                "Incomplete source-specific native flow")
++        if specification["unavailable_control_expected"]:
++            require(states[-1].get("native_control_gap") is not None
++                    and completions[-1]["after"]["accounts_table_row"] is False,
++                    "Before missing-control consequence was not observed")
++        return self.event("original-fixture-log", events=events,
+             original_runner_stdout={"path": runner["stdout"], "sha256": digest(Path(runner["stdout"]))},
+-            run_now_requests=manual, repeated_original_request=(len(manual) >= 2 and all(r == manual[0] for r in manual)),
+-            limit="F/G IDs and full requests are in raw synthetic events; equal-minute screenshot labels do not identify them")
+-        return reference
++            side=self.side, scene=self.plan["scene"], viewport=self.plan["viewport"],
++            observed_source_oracle=key, native_UX_result="PENDING_INDEPENDENT_REVIEW",
++            limit="Before injected old-parser/callback; After actual held collectors. No provider/transport/login/watchdog or startup-readiness evidence.")
+ 
+ 
+ def file_identity(path):
+@@ -765,22 +790,14 @@
+ 
+ 
+ def namespace_owner(namespace, cases):
+-    """Select the actual original scene, never the most recent closed owner.
+-
+-    After's directories are created by Before's archive call before an After
+-    case exists. Only in that pre-workload lifetime is Before its creator.
+-    Once an After case exists, every After workload belongs to that case.
+-    """
+-    side = namespace.variant
+-    matches = [case for case in cases if case.side == side]
+-    reason = "original-" + side + "-scene-owner"
+-    if not matches and side == "after":
+-        matches = [case for case in cases if case.side == "before"]
+-        reason = "original-before-archive-creator-no-after-case-ever-started"
++    """The exact original scene owns its descriptors, including partial startup."""
++    matches = [case for case in cases if case.side == namespace.variant
++               and case.plan["scene"] == namespace.scene and case.plan["viewport"] == namespace.viewport]
+     require(len(matches) == 1 and matches[0].settled,
+-            "Original namespace owner is missing or has not positively settled")
+-    return matches[0].owner, {"namespace_variant": side, "owner_side": matches[0].side,
+-                              "reason": reason}
++            "Original namespace scene owner missing or not positively settled")
++    return matches[0].owner, {"namespace_variant":namespace.variant,"owner_side":matches[0].side,
++                              "scene":namespace.scene,"viewport":namespace.viewport,
++                              "reason":"exact-original-scene-owner-no-adoption"}
+ 
+ 
+ def main():
+@@ -822,7 +839,7 @@
+     require(identity(TARGET) == plan["target_identity"], "Original canonical target changed")
+     engine = runpy.run_path(str(Path(plan["control"]["repository"]) / "scripts/qualification/process_custody.py"))
+     namespace_module = runpy.run_path(str(HERE / "namespace.py"))
+-    cases, helpers, before_namespace, after_namespace = [], [], None, None
++    cases, helpers, namespaces = [], [], []
+     namespace_closures = []
+     error, namespaces_closed = None, False
+     clean_verified = False
+@@ -840,11 +857,8 @@
+                 if "_context" not in plan:
+                     plan["_context"] = build_context(plan)  # Never reset after transition.
+                 builds, artifacts = case.builds()
+-                if side == "before":
+-                    before_namespace = namespace_module["SceneNamespace"].before("retry", "wide")
+-                    current = before_namespace
+-                else:
+-                    current = after_namespace
++                current = namespace_module["SceneNamespace"](plan["scene"], plan["viewport"], side)
++                namespaces.append(current)
+                 case.start_native(current, builds, artifacts)
+                 case.inputs()
+             except BaseException as failure:
+@@ -868,15 +882,13 @@
+             if original_failure is not None:
+                 raise original_failure
+             expected = case.pin["head"]
+-            if side == "before":
+-                require(case.scene_started and case.settled, "No genuine Before scene owner")
+-                after_namespace = before_namespace.archive_and_create_after(case.owner)
+-            else:
+-                for namespace in (after_namespace, before_namespace):
+-                    owner, binding = namespace_owner(namespace, cases)
+-                    namespace.close_original_descriptors(owner)
+-                    namespace_closures.append(binding)
+-                namespaces_closed = True
++            # The original scene authorizes ONLY its own namespace close.
++            # No archive/reset/reuse: After later creates a different fixed root.
++            require(case.scene_started and case.settled, "No genuine original scene owner")
++            owner, binding = namespace_owner(current, cases)
++            current.close_original_descriptors(owner)
++            namespace_closures.append(binding)
++            namespaces_closed = all(n.descriptors_closed for n in namespace_module["ALL_NAMESPACES"])
+     except BaseException as failure:
+         error = {"type": type(failure).__name__, "message": str(failure)}
+         # A failed observation may still return C if every actual resource and
+@@ -895,7 +907,7 @@
+     finally:
+         families_closed = all(case.settled for case in cases + helpers) and bool(cases)
+         allocation_releasable = families_closed and namespaces_closed and clean_verified
+-        result = {"root": str(ROOT), "root_identity": plan["_root_identity"], "scene": "retry", "viewport": "wide",
++        result = {"root": str(ROOT), "root_identity": plan["_root_identity"], "scene": plan["scene"], "viewport": plan["viewport"],
+                   "adapter_sha256": plan["adapter_sha256"], "plan_sha256": PLAN_SHA256, "pair": plan["pair"],
+                   "state": "FAILED_WITH_POSITIVE_CLOSURE" if error and allocation_releasable else
+                            "NATIVE_OBSERVATIONS_COMPLETE_PENDING_RAW_UX" if allocation_releasable else "FAILED_OR_HOLD",
+@@ -908,7 +920,7 @@
+                   "final_helper_owners": [{"side": c.side, "settled": c.settled, "records": c.records} for c in helpers],
+                   "grant": plan["_grant"],
+                   "qualification": "No automatic PASS, screenshot review, responsiveness or same-batch race claim"}
+-        save(ROOT / "retry-wide-return.json", result)
++        save(ROOT / (plan["scene"] + "-" + plan["viewport"] + "-return.json"), result)
+         if allocation_releasable:
+             fcntl.flock(lock_fd, fcntl.LOCK_UN)
+             os.close(lock_fd)
