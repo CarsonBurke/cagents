@@ -1,0 +1,18 @@
+{
+  "kind": "AUTHOR_EXACT_ASSEMBLY_STATUS_CORRECTION_NOT_APPROVAL",
+  "old_controller_head": "e799278ee7bde497479966099bb51f5f0df79c56",
+  "old_runner_sha256": "351392ffb7f52e47974d43f7207d338a1efd63929f0a92a258ad2462d72f3533",
+  "negative_source_review": {
+    "path": "/var/tmp/coord16-pr1549-c28-host3-code-negative-final-4ufxi6h5/review.json",
+    "sha256": "8f8927f72338a448c610f8985f34fce4d067c99ef8c564d52e075f532a31de98"
+  },
+  "genuine_assembly_sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348",
+  "original_expected_literal": "BLOCKED",
+  "corrected_expected_literal": "BLOCKED pending separately pinned fixture-only successor",
+  "original_assembly_verdict_preserved": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED",
+  "only_semantic_change": "Strict equality to the full actual immutable status string; no proof edit, startswith or relaxed guard.",
+  "new_controller_identity": "EXTERNAL_POSTCOMMIT",
+  "new_review": null,
+  "runtime_results_grant": null,
+  "execution_authorized": false
+}

@@ -20,12 +20,12 @@ WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-se
 TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
 LOCK = TARGET.parent / 'lane-c.lock'
 TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-source/qualification-packets/pr1549-c28-ui4/plan.json')
+PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-ui4-status-source/qualification-packets/pr1549-c28-ui4/plan.json')
 PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
 PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
 SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
 CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
-PLAN_SHA = 'f555dd87cc3438f71a464a386be2e34b3447606c537a1ffd7727c2729361be30'
+PLAN_SHA = '5d10f9e0fc931868b4e0a57e8ddae5b671568d0c5a8199e10ced3b63daa45e79'
 SCOPE_PARENT = None  # No grouped contract enables the dormant donor staged-scope path.
 
 
@@ -899,7 +899,7 @@ def main():
     assert main_assembly['source']['head'] == review['parent']
     assert main_assembly['source']['parents'] == [freeze['feature_parent'], review['current_main']]
     assert main_assembly['verdict'] == 'ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED'
-    assert main_assembly['known_whole_head_blocker']['status'] == 'BLOCKED'  # Historical9e63, source cause corrected separately; no compiler pass.
+    assert main_assembly['known_whole_head_blocker']['status'] == 'BLOCKED pending separately pinned fixture-only successor'  # Historical9e63, source cause corrected separately; no compiler pass.
     assert main_assembly['parent_conservation']['actual_total_entries'] == 2223
     assert main_assembly['parent_conservation']['all2205_outside_feature_entries_exact_main'] is True
     assert main_assembly['parent_conservation']['exactly18_changed_paths_vs_main'] == freeze['feature_paths_against_main']

@@ -11,14 +11,14 @@
   "grant": null,
   "execution_authorized": false,
   "actual_runtime_facts": null,
-  "file_count_including_manifest": 83,
-  "hashed_payload_count": 82,
+  "file_count_including_manifest": 86,
+  "hashed_payload_count": 85,
   "self_index_excluded": true,
   "members": [
     {
       "path": "README.md",
-      "bytes": 3512,
-      "sha256": "54f17d20ef4242e4ad7be8d22ec8dfe91f2cccd34cd0e6385b555c6266920a71"
+      "bytes": 3879,
+      "sha256": "ec642a97a266466691066fafb8f35a0b43004f5f33f71aaa613579a55fab03cc"
     },
     {
       "path": "command-data.json",
@@ -177,8 +177,8 @@
     },
     {
       "path": "from-993-forward.diff.json",
-      "bytes": 186256,
-      "sha256": "f6da62bcaca0d512a7a16d8bfd7de2ac73a313dfe270dd962629258f4beaa7ca"
+      "bytes": 186312,
+      "sha256": "680bd8d50bd206fac005848e432715ef95dbcd9fe2d46663fe1cc1518630d6c3"
     },
     {
       "path": "instruction-source.json",
@@ -187,8 +187,8 @@
     },
     {
       "path": "invocation-template.json",
-      "bytes": 770,
-      "sha256": "60f3391c5c4700e468588534e7c0bd16de17621c6c0a98b91e7559dbdeb90218"
+      "bytes": 784,
+      "sha256": "204406048e278f2e7d24b8508f8728df3bbc0079de9a985f49c0c847f2f1b258"
     },
     {
       "path": "original-pre-freeze-source-tools.json",
@@ -197,8 +197,8 @@
     },
     {
       "path": "plan.json",
-      "bytes": 35622,
-      "sha256": "f555dd87cc3438f71a464a386be2e34b3447606c537a1ffd7727c2729361be30"
+      "bytes": 36154,
+      "sha256": "5d10f9e0fc931868b4e0a57e8ddae5b671568d0c5a8199e10ced3b63daa45e79"
     },
     {
       "path": "product-source/.cargo/config.toml",
@@ -402,8 +402,8 @@
     },
     {
       "path": "run-packet.py",
-      "bytes": 86870,
-      "sha256": "351392ffb7f52e47974d43f7207d338a1efd63929f0a92a258ad2462d72f3533"
+      "bytes": 86926,
+      "sha256": "2f9d0fcc85ad807fa8e6fddc1ba355df3d9045aeff01863b101be8b36836a6d5"
     },
     {
       "path": "selected-source-contract.json",
@@ -412,18 +412,33 @@
     },
     {
       "path": "source-binding.json",
-      "bytes": 21249,
-      "sha256": "b29c0c6251b6c59d6d208ccafc30bc443e6b496022926ef06a72e78a6bbf3047"
+      "bytes": 21480,
+      "sha256": "9a7815ce66350d2d50f3104c95f98d8574c25bf211a811e0d4b6ba7b85dbf22d"
     },
     {
       "path": "source-conservation.json",
-      "bytes": 5822,
-      "sha256": "c8f2cb979e19a5616ab7515339393de02cf034e15805ae0f2ac5394080f944b0"
+      "bytes": 6937,
+      "sha256": "92e9b91c73cf57cd4523a241375aff6469dfecffaf8aaa17bce623f6ddf503b2"
+    },
+    {
+      "path": "status-correction.json",
+      "bytes": 1045,
+      "sha256": "bf2c0ede0d5be908401090a6190914e0508c85e2657667b315b52a199abdc91f"
+    },
+    {
+      "path": "status-forward.diff.json",
+      "bytes": 122500,
+      "sha256": "63b4be1ec23985b884b559837508f1f1ed0ba090adc6a330196ece90dee759f6"
+    },
+    {
+      "path": "status-true-inverse.diff.json",
+      "bytes": 122505,
+      "sha256": "c54651a77a30df8b16d9b0ba44c29135fe7c4b6b4b9903060acdbea79d6ac6b0"
     },
     {
       "path": "to-993-true-inverse.diff.json",
-      "bytes": 186261,
-      "sha256": "bfb01000c29b0912e3b04cffce172f28d45ee856d742830f0d7278185d6c516c"
+      "bytes": 186317,
+      "sha256": "70c609526bbe0c059a54bebbfec897d67841516e54caa445942af65e74a0557d"
     }
   ],
   "limits": "Preparation supplies no runtime evidence. Original run phase/receipt fields and sole RAW can establish future bounded results. Source reviews do not qualify native UX, screenshots, performance, main or whole PR.",
