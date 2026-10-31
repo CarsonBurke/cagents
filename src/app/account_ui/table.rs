@@ -627,6 +627,7 @@ fn line<'a>(
     account: Element<'a, Message>,
     cells: Vec<(f32, Element<'a, Message>)>,
     actions: Element<'a, Message>,
+    actions_width: Length,
     height: f32,
 ) -> Element<'a, Message> {
     let mut items: Vec<Element<'a, Message>> = vec![
@@ -643,7 +644,7 @@ fn line<'a>(
     }));
     items.push(
         widget::container(actions)
-            .width(ACTIONS_WIDTH)
+            .width(actions_width)
             .align_x(iced::alignment::Horizontal::Right)
             .center_y(Length::Fill)
             .into(),
@@ -671,6 +672,7 @@ fn column_titles<'a>(layout: &Layout) -> Element<'a, Message> {
             })
             .collect(),
         iced::widget::Space::new().into(),
+        Length::Fixed(ACTIONS_WIDTH),
         design::ROW_HEIGHT,
     )
 }
@@ -759,6 +761,7 @@ fn row<'a>(
         account_cell(app, account, project),
         cells,
         actions(app, account, now, project),
+        Length::Fixed(ACTIONS_WIDTH),
         ROW_HEIGHT,
     )
 }
@@ -777,7 +780,13 @@ fn stacked_row<'a>(
             .into()
     });
     widget::column::with_children(vec![
-        line(account, Vec::new(), actions, ROW_HEIGHT),
+        line(
+            account,
+            Vec::new(),
+            actions,
+            Length::Fixed(ACTIONS_WIDTH),
+            ROW_HEIGHT,
+        ),
         widget::container(
             widget::row::with_children(figures.collect::<Vec<_>>()).spacing(COLUMN_SPACING),
         )
@@ -1246,10 +1255,9 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     let cancel: Element<'a, Message> = if login.phase == LoginPhase::CallbackBlocked {
         widget::row::with_children(vec![
             crate::ui_controls::button::quiet("Use code")
-                .on_press(Message::AccountUi(Action::Add {
-                    provider: Provider::Codex,
-                    device: true,
-                }))
+                .on_press(Message::AccountUi(Action::UseCodeForBlockedLogin(
+                    login.key,
+                )))
                 .into(),
             crate::ui_controls::icon_button(Icon::Close, "Dismiss failed sign-in")
                 .compact()
@@ -1265,12 +1273,491 @@ fn login_row<'a>(login: &'a Login) -> Element<'a, Message> {
     } else {
         iced::widget::Space::new().into()
     };
-    line(account, Vec::new(), cancel, ROW_HEIGHT)
+    // A pending login has a text action as well as an icon; it must not be
+    // squeezed into the ordinary rows' two-icon column.
+    // A retained native press belongs to the login and phase that rendered it,
+    // not whichever pending row later occupies this unkeyed table position.
+    crate::ui_controls::owned(
+        (login.key, login.phase, login.provider),
+        line(account, Vec::new(), cancel, Length::Shrink, ROW_HEIGHT),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Dispatch through the actual row, so a leftover generic Add callback
+    // cannot pass a reducer-only test of the new key-bearing action.
+    fn click_login_row(login: &Login, label: &str) -> Vec<Message> {
+        click_login_row_at_width(login, label, 1000.0).0
+    }
+
+    fn click_login_row_at_width(
+        login: &Login,
+        label: &str,
+        width: f32,
+    ) -> (Vec<Message>, [iced::Rectangle; 2]) {
+        use iced::advanced::{Layout, clipboard, layout, widget::Tree};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Rectangle, Size, mouse};
+
+        let mut element = login_row(login);
+        let mut renderer = crate::app::tests::headless_renderer();
+        let size = Size::new(width, 200.0);
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let labels = ["Use code", "Dismiss failed sign-in"];
+        let controls = labels.map(|label| {
+            let bounds = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some(label))
+                .unwrap_or_else(|| panic!("missing actual login control: {label}"))
+                .node()
+                .bounds()
+                .unwrap();
+            Rectangle {
+                x: bounds.x0 as f32,
+                y: bounds.y0 as f32,
+                width: (bounds.x1 - bounds.x0) as f32,
+                height: (bounds.y1 - bounds.y0) as f32,
+            }
+        });
+        let row = node.bounds();
+        for (name, bounds) in labels.iter().zip(controls) {
+            assert!(
+                bounds.width > 0.0 && bounds.height > 0.0,
+                "{name} needs a hit target at width {width}: {bounds:?}, row {row:?}"
+            );
+            assert!(
+                bounds.x >= row.x
+                    && bounds.y >= row.y
+                    && bounds.x + bounds.width <= row.x + row.width + 0.5
+                    && bounds.y + bounds.height <= row.y + row.height + 0.5,
+                "{name} must stay in its row at width {width}: {bounds:?}, row {row:?}"
+            );
+        }
+        assert!(
+            controls[0].x + controls[0].width <= controls[1].x,
+            "the actual login controls must not overlap at width {width}: {controls:?}"
+        );
+        let bounds = controls[labels.iter().position(|name| *name == label).unwrap()];
+        let point = bounds.center();
+        let mut ui = UserInterface::build(element, size, Cache::new(), &mut renderer);
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &[
+                Event::Mouse(mouse::Event::CursorMoved { position: point }),
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            ],
+            mouse::Cursor::Available(point),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        assert!(
+            !messages.is_empty(),
+            "actual {label} did not dispatch at width {width}: {bounds:?}, point {point:?}, row {row:?}, both {controls:?}"
+        );
+        (messages, controls)
+    }
+
+    // Carry the actual UserInterface cache across frames. A new Tree for each
+    // click cannot expose a held button press migrating to a replacement row.
+    fn cached_login_ui<'a>(
+        login: &'a Login,
+        cache: iced::runtime::user_interface::Cache,
+        renderer: &mut cosmic::Renderer,
+    ) -> iced::runtime::UserInterface<'a, Message, cosmic::Theme, cosmic::Renderer> {
+        let mut ui = iced::runtime::UserInterface::build(
+            login_row(login),
+            iced::Size::new(1000.0, 200.0),
+            cache,
+            renderer,
+        );
+        draw_login_ui(&mut ui, renderer);
+        ui
+    }
+
+    fn draw_login_ui(
+        ui: &mut iced::runtime::UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+    ) {
+        ui.draw(
+            renderer,
+            &cosmic::theme::active(),
+            &iced::advanced::renderer::Style::default(),
+            iced::mouse::Cursor::Unavailable,
+        );
+    }
+
+    fn cached_login_control(
+        ui: &iced::runtime::UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        label: &str,
+    ) -> iced::Rectangle {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        let bounds = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .find(|node| node.node().label() == Some(label))
+            .unwrap_or_else(|| panic!("missing retained login control: {label}"))
+            .node()
+            .bounds()
+            .unwrap();
+        let bounds = iced::Rectangle {
+            x: bounds.x0 as f32,
+            y: bounds.y0 as f32,
+            width: (bounds.x1 - bounds.x0) as f32,
+            height: (bounds.y1 - bounds.y0) as f32,
+        };
+        assert!(bounds.width > 0.0 && bounds.height > 0.0, "{label}");
+        bounds
+    }
+
+    fn retained_login_events(
+        ui: &mut iced::runtime::UserInterface<'_, Message, cosmic::Theme, cosmic::Renderer>,
+        renderer: &mut cosmic::Renderer,
+        point: iced::Point,
+        buttons: &[iced::mouse::Event],
+    ) -> Vec<Message> {
+        let events = std::iter::once(iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position: point,
+        }))
+        .chain(buttons.iter().cloned().map(iced::Event::Mouse))
+        .collect::<Vec<_>>();
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            &events,
+            iced::mouse::Cursor::Available(point),
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut messages,
+        );
+        draw_login_ui(ui, renderer);
+        messages
+    }
+
+    fn assert_login_control_message(messages: &[Message], label: &str, key: uuid::Uuid) {
+        match label {
+            "Use code" => assert!(matches!(messages,
+                [Message::AccountUi(Action::UseCodeForBlockedLogin(actual))] if *actual == key)),
+            "Dismiss failed sign-in" | "Cancel sign-in" => assert!(matches!(messages,
+                [Message::AccountUi(Action::CancelLogin(actual))] if *actual == key)),
+            _ => panic!("unexpected login control: {label}"),
+        }
+        // Capture only. Do not apply a login action or poll its returned future.
+    }
+
+    #[test]
+    fn replacement_login_does_not_adopt_a_retained_native_press() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        let first = blocked_login(145910);
+        let second = blocked_login(145911);
+        let mut renderer = crate::app::tests::headless_renderer();
+        for label in ["Use code", "Dismiss failed sign-in"] {
+            let mut ui = cached_login_ui(&first, Cache::new(), &mut renderer);
+            let bounds = cached_login_control(&ui, label);
+            let point = bounds.center();
+            assert!(
+                retained_login_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)],
+                )
+                .is_empty()
+            );
+            let cache = ui.into_cache();
+            let mut ui = cached_login_ui(&second, cache, &mut renderer);
+            assert_eq!(cached_login_control(&ui, label), bounds);
+            let release = retained_login_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            assert!(release.is_empty(), "a held {label} must not act for B");
+            let fresh = retained_login_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[
+                    Event::ButtonPressed(Button::Left),
+                    Event::ButtonReleased(Button::Left),
+                ],
+            );
+            assert_login_control_message(&fresh, label, second.key);
+        }
+    }
+
+    #[test]
+    fn unchanged_login_rebuild_keeps_a_valid_retained_native_press() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        let first = blocked_login(145912);
+        let mut updated = first.clone();
+        updated.attempts = 2;
+        updated.next_check = 123;
+        let mut renderer = crate::app::tests::headless_renderer();
+        for label in ["Use code", "Dismiss failed sign-in"] {
+            let mut ui = cached_login_ui(&first, Cache::new(), &mut renderer);
+            let point = cached_login_control(&ui, label).center();
+            assert!(
+                retained_login_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)],
+                )
+                .is_empty()
+            );
+            let mut ui = cached_login_ui(&updated, ui.into_cache(), &mut renderer);
+            assert!(cached_login_control(&ui, label).contains(point));
+            let release = retained_login_events(
+                &mut ui,
+                &mut renderer,
+                point,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            assert_login_control_message(&release, label, first.key);
+        }
+    }
+
+    #[test]
+    fn changed_login_phase_or_provider_retires_a_retained_native_press() {
+        use iced::mouse::{Button, Event};
+        use iced::runtime::user_interface::Cache;
+
+        let blocked = blocked_login(145913);
+        let mut waiting = blocked.clone();
+        waiting.phase = LoginPhase::Waiting;
+        let mut other_provider = blocked.clone();
+        other_provider.provider = Provider::Claude;
+        let mut renderer = crate::app::tests::headless_renderer();
+        for (first, label, second, next_label) in [
+            (
+                &waiting,
+                "Cancel sign-in",
+                &blocked,
+                "Dismiss failed sign-in",
+            ),
+            (
+                &blocked,
+                "Dismiss failed sign-in",
+                &waiting,
+                "Cancel sign-in",
+            ),
+            (&blocked, "Use code", &other_provider, "Use code"),
+            (
+                &blocked,
+                "Dismiss failed sign-in",
+                &other_provider,
+                "Dismiss failed sign-in",
+            ),
+        ] {
+            let mut ui = cached_login_ui(first, Cache::new(), &mut renderer);
+            let point = cached_login_control(&ui, label).center();
+            assert!(
+                retained_login_events(
+                    &mut ui,
+                    &mut renderer,
+                    point,
+                    &[Event::ButtonPressed(Button::Left)],
+                )
+                .is_empty()
+            );
+            let mut ui = cached_login_ui(second, ui.into_cache(), &mut renderer);
+            let next = cached_login_control(&ui, next_label).center();
+            // Release over the replacement's actual control. Cursor movement
+            // alone cannot transfer ownership of a press from the old phase.
+            let release = retained_login_events(
+                &mut ui,
+                &mut renderer,
+                next,
+                &[Event::ButtonReleased(Button::Left)],
+            );
+            assert!(release.is_empty(), "{label} must not become {next_label}");
+            let fresh = retained_login_events(
+                &mut ui,
+                &mut renderer,
+                next,
+                &[
+                    Event::ButtonPressed(Button::Left),
+                    Event::ButtonReleased(Button::Left),
+                ],
+            );
+            assert_login_control_message(&fresh, next_label, second.key);
+        }
+    }
+
+    fn blocked_login(key: u128) -> Login {
+        Login {
+            provider: Provider::Codex,
+            key: uuid::Uuid::from_u128(key),
+            home: PathBuf::from("/cagents-fixture/accounts/codex")
+                .join(uuid::Uuid::from_u128(key).to_string()),
+            phase: LoginPhase::CallbackBlocked,
+            attempts: 0,
+            next_check: 0,
+            started_at: 0,
+            recovered: false,
+        }
+    }
+
+    fn replay(app: &mut Cagents, messages: Vec<Message>) {
+        for message in messages {
+            if let Message::AccountUi(action) = message {
+                // A positive control tests entry to the existing Add route,
+                // not login execution: never poll its discovery/home future.
+                drop(app.update_account_ui(action));
+            }
+        }
+    }
+
+    #[test]
+    fn blocked_login_text_and_dismiss_controls_fit_and_dispatch_at_narrow_and_wide_widths() {
+        let login = blocked_login(145900);
+        let mut narrow: Option<[iced::Size; 2]> = None;
+        let widths = [300.0_f32, 1000.0];
+        // COSMIC exports x1 = (x + width) in f32 through accessibility.
+        // Reconstructing x1 - x0 can round differently as the row moves.
+        // Allow only coordinate roundoff, far below a pixel of compression.
+        let roundoff = 2.0 * f32::EPSILON * widths[1];
+        for width in widths {
+            let (code, bounds) = click_login_row_at_width(&login, "Use code", width);
+            assert!(matches!(code.as_slice(),
+                [Message::AccountUi(Action::UseCodeForBlockedLogin(key))] if *key == login.key));
+            let (dismiss, other_bounds) =
+                click_login_row_at_width(&login, "Dismiss failed sign-in", width);
+            assert_eq!(bounds, other_bounds);
+            assert!(matches!(dismiss.as_slice(),
+                [Message::AccountUi(Action::CancelLogin(key))] if *key == login.key));
+            let sizes = bounds.map(|bounds| bounds.size());
+            if let Some(narrow) = narrow {
+                for (label, (actual, expected)) in ["Use code", "Dismiss failed sign-in"]
+                    .into_iter()
+                    .zip(sizes.into_iter().zip(narrow))
+                {
+                    let delta = iced::Size::new(
+                        (actual.width - expected.width).abs(),
+                        (actual.height - expected.height).abs(),
+                    );
+                    assert!(
+                        delta.width <= roundoff && delta.height <= roundoff,
+                        "narrow rows must not compress {label} to make room for account text: \
+                         actual {actual:?}, narrow {expected:?}, delta {delta:?}, \
+                         maximum f32 coordinate roundoff {roundoff} at row width {width}"
+                    );
+                }
+            } else {
+                narrow = Some(sizes);
+            }
+        }
+        // Messages were captured, not applied: no login/discovery task runs.
+    }
+
+    #[test]
+    fn dismissed_blocked_row_callbacks_cannot_start_code_login_for_another_row() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.account_ui.logins.push(blocked_login(145901));
+        let key = app.account_ui.logins[0].key;
+        let code = click_login_row(&app.account_ui.logins[0], "Use code");
+        let cancel = click_login_row(&app.account_ui.logins[0], "Dismiss failed sign-in");
+        // Normal abandonment completion removes A. Retained native callbacks
+        // can arrive after this reducer and after another row/popup appears.
+        drop(app.update_account_ui(Action::LoginSettled {
+            key,
+            result: Ok(Settled::Abandoned(None)),
+        }));
+        assert!(app.account_ui.logins.is_empty());
+        app.account_ui.logins.push(blocked_login(145902));
+        let other = app.account_ui.logins[0].account();
+        app.account_ui.table.add_menu = true;
+        app.account_ui.popover = Some(other.id());
+        let registry = app.account_ui.registry.clone();
+        replay(&mut app, cancel);
+        replay(&mut app, code);
+        assert!(app.account_ui.table.add_menu);
+        assert_eq!(app.account_ui.popover, Some(other.id()));
+        assert_eq!(app.account_ui.logins.len(), 1);
+        assert_eq!(app.account_ui.logins[0].account(), other);
+        assert_eq!(app.account_ui.logins[0].phase, LoginPhase::CallbackBlocked);
+        assert_eq!(app.account_ui.registry, registry);
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn code_recovery_callback_requires_original_codex_blocked_phase() {
+        for (provider, phase) in [
+            (Provider::Codex, LoginPhase::Waiting),
+            (Provider::Codex, LoginPhase::Verifying),
+            (Provider::Codex, LoginPhase::Settling),
+            (Provider::Claude, LoginPhase::CallbackBlocked),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.account_ui.logins.push(blocked_login(145903));
+            let code = click_login_row(&app.account_ui.logins[0], "Use code");
+            app.account_ui.logins[0].provider = provider;
+            app.account_ui.logins[0].phase = phase;
+            app.account_ui.table.add_menu = true;
+            let account = app.account_ui.logins[0].account();
+            app.account_ui.popover = Some(account.id());
+            replay(&mut app, code);
+            assert!(app.account_ui.table.add_menu, "{provider:?}/{phase:?}");
+            assert_eq!(app.account_ui.popover, Some(account.id()));
+            assert_eq!(app.account_ui.logins.len(), 1);
+            assert_eq!(app.account_ui.logins[0].account(), account);
+            assert_eq!(app.account_ui.logins[0].phase, phase);
+            assert!(app.status.is_none());
+        }
+    }
+
+    #[test]
+    fn current_blocked_row_code_callback_keeps_existing_route_and_modal_gate() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap();
+        app.account_ui.homes = Some(Homes::at(directory.path()));
+        app.account_ui.store = None;
+        app.account_ui.logins.push(blocked_login(145904));
+        let account = app.account_ui.logins[0].account();
+        let code = click_login_row(&app.account_ui.logins[0], "Use code");
+        assert!(code.iter().any(|message| matches!(message,
+            Message::AccountUi(Action::UseCodeForBlockedLogin(key)) if *key == app.account_ui.logins[0].key)));
+        assert!(code.iter().all(|message| matches!(message,
+            Message::AccountUi(action) if action.blocked_while_modal())));
+        app.account_ui.table.add_menu = true;
+        app.account_ui.popover = Some(account.id());
+        replay(&mut app, code);
+        // add_account closes these synchronously before returning its future.
+        // The stale cases above preserve them; this proves a real positive
+        // routing control rather than accepting every callback as a no-op.
+        assert!(!app.account_ui.table.add_menu);
+        assert!(app.account_ui.popover.is_none());
+        assert_eq!(app.account_ui.logins.len(), 1);
+        assert_eq!(app.account_ui.logins[0].account(), account);
+        assert!(app.status.is_none());
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
 
     #[test]
     fn a_sign_in_waiting_to_be_asked_again_no_longer_points_at_its_terminal() {
