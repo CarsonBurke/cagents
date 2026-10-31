@@ -13,7 +13,7 @@ import sys
 A = '00000000-0000-4000-8000-000000002018'
 B = '00000000-0000-4000-8000-000000002019'
 BEFORE = {'sha': 'b3e036c71e83c0168b8ff7b3a1f6607caa24cced', 'tree': 'fe98f00eb1d0d90a800c1e5808a0bbc756258ab5'}
-PRODUCT = {'sha': '183a12ac10cca527cf9406440ce47cfd55934e51', 'tree': 'abc8668a1697424c2854ba71f1da9c83c692a8e9'}
+PRODUCT = {'sha': 'b855f32573bf4f37dbb9ea415550ab330a01da71', 'tree': 'cb0913dca905addb9886a97f0d93d7e90f08d680'}
 HEX = re.compile('[0-9a-f]{64}')
 OUTSIDE = ['official original artifact/download and whole-terminal provenance', 'sole independent RAW',
            'independent native UX', 'original22/100 applicability and custody', 'execution acceptance and merge decision']
