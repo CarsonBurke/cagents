@@ -25,6 +25,8 @@ mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
+#[cfg(feature = "development")]
+mod native_history_fixture;
 mod notification_ui;
 mod operation_recovery_ui;
 mod palette_ui;
@@ -5518,7 +5520,25 @@ impl Cagents {
         })
     }
 
+    /// Explicit development-only, sessionless History fixture startup. This is
+    /// called before the binary enters device/session/daemon initialization.
+    #[cfg(feature = "development")]
+    pub fn native_history_fixture_startup() -> Result<Option<Startup>, String> {
+        native_history_fixture::context().map(|context| context.map(|context| context.startup()))
+    }
+
+    fn native_history_fixture_active() -> bool {
+        #[cfg(feature = "development")]
+        return native_history_fixture::active();
+        #[cfg(not(feature = "development"))]
+        false
+    }
+
     pub fn load_startup() -> Result<Startup, String> {
+        #[cfg(feature = "development")]
+        if let Some(startup) = Self::native_history_fixture_startup()? {
+            return Ok(startup);
+        }
         #[cfg(feature = "latency-harness")]
         if crate::latency_fixture::Fixture::from_env().is_some() {
             return Ok(Startup {
@@ -14034,11 +14054,14 @@ impl Application for Cagents {
     }
 
     fn init(mut core: Core, (activation_rx, startup): Self::Flags) -> (Self, Task<Message>) {
-        if let Err(error) = crate::performance::chat_stage::initialize_from_environment() {
-            tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
+        let history_fixture = Self::native_history_fixture_active();
+        if !history_fixture {
+            if let Err(error) = crate::performance::chat_stage::initialize_from_environment() {
+                tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
                 "Could not enable opt-in chat stage measurements");
+            }
+            std::thread::spawn(chat_ui::prune_pasted_images);
         }
-        std::thread::spawn(chat_ui::prune_pasted_images);
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
@@ -14106,18 +14129,22 @@ impl Application for Cagents {
         // the whole of its life, so the observer starts with the window rather
         // than with the first card that happens to need a daemon.
         let (hosted_terminals_tx, hosted_terminals_rx) = async_channel::unbounded();
-        terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        if !history_fixture {
+            terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        }
         // The daemon owns the shared sidebar model for the same reason it owns
         // the terminal inventory: it outlives every window. Both threads start
         // with the window, so a channel created elsewhere appears without the
         // window having to do anything first.
         let (workspace_model_updates, workspace_model_rx) = async_channel::unbounded();
         let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
-        workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
-        workspace_model_sync::publish_workspace_model(
-            workspace_model_updates,
-            workspace_model_requests,
-        );
+        if !history_fixture {
+            workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
+            workspace_model_sync::publish_workspace_model(
+                workspace_model_updates,
+                workspace_model_requests,
+            );
+        }
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -14221,14 +14248,22 @@ impl Application for Cagents {
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments),
             resume_ui: resume_ui::State::default(),
-            update_ui: update_ui::State::new(),
+            update_ui: if history_fixture {
+                update_ui::State::default()
+            } else {
+                update_ui::State::new()
+            },
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
-            account_ui: account_ui::State::installation(),
+            account_ui: if history_fixture {
+                account_ui::State::default()
+            } else {
+                account_ui::State::installation()
+            },
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             channel_work: channel_work::State::default(),
@@ -14370,6 +14405,15 @@ impl Application for Cagents {
         let _ = app
             .workspace
             .resize_viewport((app.content_width() - sidebar_width - inspector_width).max(0.0));
+        #[cfg(feature = "development")]
+        if let Some(context) = native_history_fixture::context()
+            .expect("History fixture was validated before window construction")
+        {
+            let task = context
+                .install(&mut app)
+                .expect("History fixture installation refused");
+            return (app, task);
+        }
         #[cfg(feature = "latency-harness")]
         if app.latency_fixture.is_some() {
             app.cards = app
@@ -14448,6 +14492,16 @@ impl Application for Cagents {
             Message::UtilityPaneUi(message) => (*message, true),
             message => (message, false),
         };
+        let history_fixture = Self::native_history_fixture_active();
+        #[cfg(feature = "development")]
+        if history_fixture {
+            if let Some(task) = native_history_fixture::local_message(&message) {
+                return task;
+            }
+            if !native_history_fixture::admits(self, &message) {
+                return Task::none();
+            }
+        }
         let notice_control = self.notice_control_severity();
         let attention_scope_changed = matches!(
             &message,
@@ -14460,6 +14514,7 @@ impl Application for Cagents {
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
         let task = (|| {
+        if !history_fixture {
         if pane_origin && self.channel_work_is_main() {
             return Task::none();
         }
@@ -14544,6 +14599,7 @@ impl Application for Cagents {
         }
         if let Some(task) = self.intercept_channel_work_navigation(&message) {
             return task;
+        }
         }
         if !self.workspace.is_animating() && self.context_inspector_transition.is_none() {
             // Whatever this message starts is measured from now. Its first
@@ -17989,6 +18045,10 @@ impl Application for Cagents {
                 Task::batch(refreshes)
             }
         };
+        #[cfg(feature = "development")]
+        if history_fixture {
+            return native_history_fixture::after_update(self, task);
+        }
         // `status` is the shell's write channel: ninety-odd call sites raise a
         // notice by assigning it. Draining it here is what makes those notices
         // survive the next assignment instead of silently replacing each other,
@@ -18103,6 +18163,9 @@ impl Application for Cagents {
             terminal_probes,
         ])
             })();
+        if history_fixture {
+            return task;
+        }
         self.reconcile_chat_failure_presentations();
         if attention_scope_changed {
             self.notification_ui.scope_changed();
@@ -18114,6 +18177,10 @@ impl Application for Cagents {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        #[cfg(feature = "development")]
+        if Self::native_history_fixture_active() {
+            return native_history_fixture::subscription(self);
+        }
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),

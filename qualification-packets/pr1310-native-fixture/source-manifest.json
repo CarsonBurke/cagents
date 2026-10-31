@@ -1,0 +1,74 @@
+{
+  "schema": "pr1310-native-fixture-source-v1",
+  "status": "AUTHORED_SOURCE_BUILDER_UNRUN_REQUIRES_INDEPENDENT_REVIEW_AND_RUNTIME_ADMISSION",
+  "product_source": {
+    "before": {
+      "head": "a3221af83d56663f0dcbef90f67b30ad6d9fe53d",
+      "tree": "131a7c11b46d0f29b20a44672d3d46702baebc0e"
+    },
+    "after": {
+      "head": "efa9288b3fd79a7214307a11b1c6d50c6cde3630",
+      "tree": "d066bbd516236210d83218397855238099f3da22"
+    }
+  },
+  "source_members": {
+    "build.py": {
+      "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01",
+      "bytes": 18468
+    },
+    "README.md": {
+      "sha256": "ffc7f48b97dc797ccec3df0bed665190a6a9b9357980eee52db64de5761bda74",
+      "bytes": 4274
+    }
+  },
+  "frozen_root16_data": {
+    "delivery.json": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/delivery.json",
+      "sha256": "719ee08a201a8ecd8e5dc1d6fd4e152c1d82ca8638245812a6b093cf99eb93a3"
+    },
+    "data/source-contract.json": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/data/source-contract.json",
+      "sha256": "c71b45835c01bcc143d13c30a0c706cc1f7dfb964fc22a0eba4efba3e4b075f6"
+    },
+    "data/capture-matrix.json": {
+      "path": "/var/tmp/coord16-pr1310-native-data-delivery-piu00hb2/data/capture-matrix.json",
+      "sha256": "0334e30d8716bac2f6fb3303ad1707131e9e6b051cf59a3c3a0e52bcbcbdb576"
+    }
+  },
+  "dimensions": {
+    "small_mainline": 401,
+    "large_mainline": 25000,
+    "sibling_commits_per_populated_repo": 1,
+    "unborn_commits": 0,
+    "large_message_hits": 8,
+    "large_author_hits": 8,
+    "large_late_only_message_hits": 4,
+    "full_sha_literal_mainline_hits_per_populated_repo": 2,
+    "all_actual_roots_oids_and_generated_evidence": null
+  },
+  "future_argv": [
+    "python3",
+    "qualification-packets/pr1310-native-fixture/build.py",
+    "--git",
+    "CALLER_ADMITTED_ABSOLUTE_GIT",
+    "--output",
+    "NEW_PRIVATE_EMPTY_/tmp_OR_/var/tmp/pr1310-native-fixture-UNIQUE"
+  ],
+  "execution": {
+    "attempts": 0,
+    "builder": "UNRUN",
+    "generated_git_data": "UNRUN",
+    "app_launch": "UNRUN",
+    "native": "UNRUN",
+    "performance": "UNRUN",
+    "screenshots": "UNRUN",
+    "grant": null,
+    "queue_place": null
+  },
+  "limits": [
+    "No guarantee of actual search Limited/timeouts/exhaustion or full-OID resolution.",
+    "Primary Before has no search/refine/full-SHA/limit controls.",
+    "No request-release/stale-callback producer, native bootstrap/input/capture, process supervisor, provider or account fixture.",
+    "Source/AST/py_compile checks do not execute the builder, validate generated Git objects or establish runtime readiness."
+  ]
+}

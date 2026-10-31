@@ -1,0 +1,131 @@
+{
+  "base_tree": "131a7c11b46d0f29b20a44672d3d46702baebc0e",
+  "builder_assets_byte_exact_donor": {
+    "qualification-packets/pr1310-native-fixture/README.md": "ffc7f48b97dc797ccec3df0bed665190a6a9b9357980eee52db64de5761bda74",
+    "qualification-packets/pr1310-native-fixture/build.py": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01",
+    "qualification-packets/pr1310-native-fixture/source-manifest.json": "ecd10a3e272de23489472b1260a99e452b0b8ad9970ddaf249cbfc90659d09af"
+  },
+  "environment_limit": "Original launcher literal inheritance is distinct from unchanged normal main-entry detach_inherited_selections before fixture validation. Conditional provider-home/CODEX_HOME removal and unconditional CAGENTS_ACCOUNT_HOMES removal still apply. No new scrubbing/value/account/profile/model/authority-policy switch or forced variable absence/presence; no whole-HOME audit or natural-startup claim.",
+  "execution": {
+    "Git_fixture_workload": "UNRUN",
+    "compiler": "UNRUN",
+    "helpers": "UNRUN",
+    "native": "UNRUN",
+    "provider": "UNRUN",
+    "tests": "UNRUN"
+  },
+  "generated_data": null,
+  "independent_before_review": null,
+  "initial_settings": {
+    "editor_auto_save": false,
+    "inspector_width": 480,
+    "language_servers": [],
+    "session": null,
+    "settings_writer": null,
+    "sidebar_width": 320,
+    "theme": "dark",
+    "ui_scale": 1.0
+  },
+  "matched_executables": null,
+  "mechanism_donor": "9dc2a70caebbfc972e537712b9f9326843f232d0",
+  "native_controller": null,
+  "native_evidence": null,
+  "native_resource_user_admission": null,
+  "old_api_differences": {
+    "absent": [
+      "SourceControlReleased",
+      "HistoryQueryChanged",
+      "SearchHistory",
+      "typed Limited result/notice",
+      "filtered full-SHA/message/author OR search",
+      "refine/clear query controls"
+    ],
+    "completion_fences": "Original old bound key/generation/HEAD/page and error-loading guards unchanged; no stronger After claim",
+    "history_reader": "original RepositoryService::history, no query argument; fresh CancellationToken remains original; no After cancellation backport",
+    "snapshot_completion": "Result<Box<RepositorySnapshot>, String>; actual HeadState read by leaf for manifest equality, unchanged original model installation handler"
+  },
+  "old_typed_read_only_action_set": {
+    "Message": [
+      "SourceControlLoaded (exact selected key)",
+      "SourceControlHistory (exact selected key)",
+      "CommitUi",
+      "BranchUi",
+      "WindowResized",
+      "WindowScaleFactorChanged",
+      "WindowEdgeState",
+      "WindowFilled",
+      "Frame",
+      "Viewport",
+      "ToggleContextInspector",
+      "SelectContextTab(Changes)",
+      "FocusCard (selected repository runtime only)"
+    ],
+    "RepositoryAction": [
+      "FilesLoaded",
+      "FileListUnchanged",
+      "OpenCommittedFile",
+      "DiffLoaded",
+      "RetryDiff",
+      "DiffViewport",
+      "ApplyDiffMode",
+      "PreviousChange",
+      "NextChange",
+      "RevealDiffTop",
+      "ExpandDiffFold"
+    ],
+    "SidebarAction": [
+      "LoadMoreHistory",
+      "OpenCommit",
+      "CloseCommit",
+      "ShowMoreCommitFiles",
+      "OpenCommitFile",
+      "RefreshWorktree",
+      "SetChangesTab(History)",
+      "ToggleSourceControlPanel",
+      "Resize"
+    ],
+    "fixture_local_only": [
+      "StartupWindowOpened ignored, no normal readiness handshake",
+      "ResizeFinished ignored, no persistence",
+      "WindowCloseRequested/WindowClosed -> fixture exit only"
+    ]
+  },
+  "opt_in": {
+    "dataset": "CAGENTS_DEVELOPMENT_HISTORY_DATASET",
+    "datasets": [
+      "small",
+      "large",
+      "unborn"
+    ],
+    "feature": "development",
+    "manifest": "CAGENTS_DEVELOPMENT_HISTORY_FIXTURE",
+    "schema": "pr1310-public-git-fixture-v1"
+  },
+  "performance_evidence": null,
+  "remaining_limits": [
+    "No source review or execution transferred from After.",
+    "No injected query/key/result/error/row/limit, no fake native consumer.",
+    "Unsupported global keyboard/focus and all operational account/provider/session/daemon/mutation messages refused.",
+    "Only History ordinary paging/detail/immutable read flow may be qualified later; unavailable feature-only Before states remain explicitly absent.",
+    "Original supervisor custody, independent actual builder/data binding and original User/resource grant remain required.",
+    "Natural startup/login/accounts/providers/stores/daemon/IPC/fresh-daemon/migration/normal shutdown and whole-product qualification remain separate HOLD."
+  ],
+  "sole_product_base": "a3221af83d56663f0dcbef90f67b30ad6d9fe53d",
+  "source_pair": {
+    "after": "efa9288b3fd79a7214307a11b1c6d50c6cde3630",
+    "before": "a3221af83d56663f0dcbef90f67b30ad6d9fe53d"
+  },
+  "static_conservation": {
+    "default_inverse_note": "New fixture guards and init indentation differ textually; selector absence executes original operational branches and original lease/listener remain alive across blocking shared window helper. No whole-file AST identity claim.",
+    "latency_init_byte_exact": true,
+    "latency_init_sha256": "1d92de4d867e96e57e6a0355309d38c53f09ad2aa6ea431fcd7ac479ab635013",
+    "native_window_tail_sha256": "618523fc1dd90b810864cd11b46e3fc38497c755d4f84b68155c5eef811fbb26",
+    "original_App_update_match_byte_exact": true,
+    "original_match_sha256": "baf1425c2bd3092016821dc469da49e3256bdc2a522e917e98fb6b6b0e2cf1ed",
+    "original_native_window_tail_byte_exact_except_activation_plumbing": true,
+    "original_subscription_body_byte_exact": true,
+    "original_subscription_sha256": "daafd1e83d3563491afd66ac0f80e5331d8e6f7a95b03dbf66e49a6327a4094a"
+  },
+  "status": "BEFORE_SOURCE_ONLY_UNCOMPILED_UNRUN",
+  "ux_review": null
+}
