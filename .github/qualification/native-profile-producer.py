@@ -315,6 +315,7 @@ def drain_streams(poll, read, write, now, deadline, limit, total_limit, checkpoi
                 counts[name] += len(raw)
                 need(counts[name] <= limit and sum(counts.values()) <= total_limit,'producer-log-cap')
                 write(name,raw)
+        checkpoint()  # Observations can handle an exception while control is latched.
         if finished: return counts
 
 
@@ -351,6 +352,7 @@ def owner_type(preparation):
                 counts = drain_streams(poll,read,lambda name,raw:output[name].write(raw),time.monotonic,deadline,
                     caps['stream_bytes'],caps['log_bytes']-self.log_total,
                     lambda:(self.cancellation.checkpoint(),self.disk_check()))
+                self.cancellation.checkpoint()
                 code = process.wait(timeout=max(.001,deadline-time.monotonic()))
                 self.records[process].update(waited=True,exit_code=code)
                 need(code == 0,'producer-command-failed')

@@ -6,12 +6,14 @@ inventory, cache, GI, API, helper or provider boundary is executed. Fixed source
 reads below are the only real Path operations. Run only after independent review.
 """
 import ast
+from contextlib import contextmanager
 import copy
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
+import sys
 from types import SimpleNamespace
 import unittest
 
@@ -45,6 +47,20 @@ def extracted():
 def roots():
     return dict(errors=[],streams_closed=True,children=[dict(identity={'pid':123,'stamp':'algorithm-only','group':123},
         published=True,error=None,waited=True,exit_code=0)],scope='Algorithm-only root ledger; not a process witness.')
+
+
+def cancellation_types():
+    names = {'PreparationCancelled','PreparationCancellation'}
+    selected = [copy.deepcopy(node) for node in ast.parse(PREPARATION).body
+                if isinstance(node,ast.ClassDef) and node.name in names]
+    assert {node.name for node in selected} == names
+    def unavailable(*args, **kwargs):
+        raise AssertionError('No signal installation or external cancellation boundary in algorithm data')
+    api = dict(__builtins__=__builtins__,contextmanager=contextmanager,
+               sys=SimpleNamespace(exc_info=sys.exc_info),signal=SimpleNamespace(signal=unavailable),
+               need=lambda value,reason: value or unavailable(reason))
+    exec(compile(ast.Module(body=selected,type_ignores=[]),'<actual-reviewed-cancellation-classes>','exec'),api)
+    return api['PreparationCancellation'],api['PreparationCancelled']
 
 
 class Fixture:
@@ -168,10 +184,16 @@ class ProducerAlgorithms(unittest.TestCase):
                 if case=='extra':observed['after'].append(dict(path='z-extra',type='file',mode=0o644,bytes=0,sha256='d'*64))
                 if case=='hash':observed['after'][0]['sha256']='d'*64
                 if case=='mode':observed['after'][0]['mode']=0o600
-                if case=='type':observed['after'][0]=dict(path=observed['after'][0]['path'],type='symlink',mode=0o777,target='missing')
+                if case=='type':
+                    path=observed['after'][0]['path']
+                    target=next(leaf['path'] for leaf in observed['after'] if leaf['path']!=path and leaf['type']=='file')
+                    observed['after'][0]=dict(path=path,type='symlink',mode=0o777,
+                        target=posixpath.relpath(target,str(PurePosixPath(path).parent)))
+                    f.api['validate_leaves'](observed['after'],f.plan['caps'])
                 if case=='source':m['arms']['after']['source']={'sha':'d'*40,'tree':'e'*40}
                 if case=='profile-writer':m['compiler_settlement']['original_roots']['children'][0]['exit_code']=-9
-                with self.assertRaises(ValueError):f.api['verify_payload'](m,observed,f.plan)
+                with self.assertRaisesRegex(ValueError,'complete-payload-mismatch' if case=='type' else ''):
+                    f.api['verify_payload'](m,observed,f.plan)
         f=Fixture();valid=[dict(path='file',type='file',mode=0o755,bytes=0,sha256='b'*64),dict(path='link',type='symlink',mode=0o777,target='file')]
         f.api['validate_leaves'](valid,f.plan['caps'])
         for target in ('../../outside','/outside','link'):
@@ -269,6 +291,67 @@ class ProducerAlgorithms(unittest.TestCase):
         def cancel():raise Cancelled('algorithm-only first control')
         with self.assertRaises(Cancelled):
             f.api['drain_streams'](lambda:self.fail('poll after control'),lambda token:b'',lambda *args:self.fail('write after control'),lambda:0,1,10,10,cancel)
+
+    def test_recoverable_observation_control_precedes_positive_drain_and_original_wait(self):
+        Cancellation,Cancelled=cancellation_types()
+        class RecoverableObservation(Exception):pass
+        for stage in ('poll','before-original-wait'):
+            with self.subTest(stage=stage):
+                f=Fixture();cancel=Cancellation();events=[]
+                def handled_observation():
+                    try:raise RecoverableObservation('algorithm-only stale observation')
+                    except RecoverableObservation:
+                        events.append('caught-observation')
+                        cancel.request(15,None)  # Actual reviewed logic; no handler install/OS signal.
+                        self.assertFalse(cancel.delivered)
+                    return [],True
+                if stage=='poll':
+                    with self.assertRaises(Cancelled),cancel.work():
+                        f.api['drain_streams'](handled_observation,lambda token:self.fail('unexpected read'),
+                            lambda *args:self.fail('unexpected write'),lambda:0,1,10,10,cancel.checkpoint)
+                        events.append('positive-return')
+                        self.fail('Original wait must not follow a latched observation control')
+                else:
+                    class Output:
+                        def write(self, raw):raise AssertionError('unexpected write')
+                        def close(self):events.append('inert-output-close')
+                    class Process:
+                        stdout=object();stderr=object()
+                        def wait(self, **kwargs):
+                            events.append('original-wait')
+                            raise AssertionError('Original wait started with pending cancellation')
+                    process=Process()
+                    class Base:
+                        def __init__(self, control):self.cancellation=control;self.records={process:{}}
+                        def open_output(self, path):return Output()
+                        def start(self, *args, **kwargs):events.append('inert-owned-child');return process
+                    class Selector:
+                        def register(self, *args):pass
+                        def close(self):pass
+                    def completed_drain(*args):
+                        handled_observation()
+                        return dict(stdout=0,stderr=0)
+                    f.api.update(Path=PurePosixPath,subprocess=SimpleNamespace(PIPE=object()),
+                        selectors=SimpleNamespace(DefaultSelector=Selector,EVENT_READ=1),
+                        time=SimpleNamespace(monotonic=lambda:0),drain_streams=completed_drain)
+                    Owned=f.api['owner_type'](SimpleNamespace(PreparationChildren=Base))
+                    with self.assertRaises(Cancelled):
+                        Owned(cancel).logged(['algorithm-only'],'/algorithm-only',{},1,
+                            '/algorithm-only/log',f.plan['caps'],1)
+                self.assertTrue(cancel.delivered)
+                self.assertEqual(events.count('caught-observation'),1)
+                self.assertNotIn('positive-return',events)
+                self.assertNotIn('original-wait',events)
+                self.assertIsNone(cancel.failure)
+        cancel=Cancellation();original=ValueError('original terminal failure')
+        with self.assertRaises(ValueError) as caught:
+            with cancel.work():
+                try:raise original
+                finally:cancel.request(15,None)
+        self.assertIs(caught.exception,original)
+        self.assertIs(cancel.failure,original)
+        with self.assertRaises(ValueError) as caught:cancel.finish([])
+        self.assertIs(caught.exception,original)
 
     def test_source_routing_caps_and_no_desktop_consumer_or_permission_bypass(self):
         producer=(DIRECTORY.parent/'workflows/produce-native-profile-cache.yml').read_text()
