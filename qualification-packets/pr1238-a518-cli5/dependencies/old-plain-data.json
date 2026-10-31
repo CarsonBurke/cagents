@@ -1,0 +1,587 @@
+{
+  "schema": "pr1238-d5c5a352-cli5-plain-qualification-data-v1",
+  "kind": "PLAIN_JSON_DATA_ONLY_NO_EXECUTOR_NO_GRANT",
+  "status": "SOURCE_MAPPED_FUTURE_ADAPTATION_REQUIRED_ALL_EXECUTION_UNRUN",
+  "source": {
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+    "head": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+    "tree": "70cb66f47cda6d69f331c91c20b992b4b3712d73",
+    "functional_comparison_base": "d4ac772b77fe65b33abff74069b1b2c311a63b37",
+    "paths_sha256": {
+      "Cargo.toml": "294e102940eb184f4f9e9cdaedd2c200408c7837667c8889762af0008025b989",
+      "Cargo.lock": "a101bfe4db08c54bb972d7528ac5f65af0e0b7bb6bbefe0886fd63a9612e2561",
+      ".cargo/config.toml": "ae0cd2fea772a441a4864aee9e0551445e14d1ccebadfbdc6ce55d5052600a96",
+      "build.rs": "343c620c6a85a19ee187c9d5ce23f796c47aa3d10e80b445caf749c7e299083f",
+      "src/lib.rs": "55e51db076af7d6b8dcdd2fff289830ce2e728e54b1d5b784a71d0f553168326",
+      "src/modules.rs": "c9be7901ea1daeb139eaa170719179124b3f286ee6f2431507c94e5d6feef410",
+      "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+      "src/control.rs": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+      "src/model.rs": "a6b1a73d0c1a56838b8890dadf5be92fc6fde8b1d9b4ff3fa68ef1c0c1f08655",
+      "src/terminal/ipc.rs": "f525f42cd6a12909250a012b46c2ef8ad195542a0153404441826b08f3305806",
+      "src/workspace_model.rs": "0dc9e6ab4a90cf4ed9c335b76cf1cc4920aa176690f01f6f8b6b9bbef98b86a1",
+      "src/project_location.rs": "d0d57dc5354550c9d77f4c6ec9df0fa525b231f5acc51e9c4a33881e923adbcb"
+    },
+    "control_git_blob": "ce17d4791a4cfb0419279ca60cbf85d39490c8cb",
+    "owner_chain": [
+      {
+        "path": "src/lib.rs",
+        "line": 5,
+        "contract": "include!(modules.rs)"
+      },
+      {
+        "path": "src/modules.rs",
+        "line": 27,
+        "contract": "pub mod control is ungated; HOST/UI feature switches do not own these tests"
+      },
+      {
+        "path": "src/control.rs",
+        "line": 3957,
+        "contract": "#[cfg(test)] mod tests; each selected function has ordinary #[test], no ignore or feature attribute"
+      }
+    ],
+    "source_verification": "Exact committed object reads and SHA256 only; no live source/context/tool/target/authority preflight, build or runtime occurred."
+  },
+  "boundary": {
+    "feature_name": "CLI",
+    "expected_features": [],
+    "no_default_features": true,
+    "required": [
+      "isolated cagents binary check",
+      "CLI-only cagents library no-run compilation with original Cargo JSON",
+      "same emitted ELF full inventory",
+      "five separate exact libtest parents"
+    ],
+    "excluded": [
+      "HOST feature or cagentsd",
+      "UI/integrated-browser graph",
+      "all-targets/module-prefix/bare cargo test expansion",
+      "ignored tests",
+      "native UI/provider/live daemon operations",
+      "main-composition qualification"
+    ],
+    "reason": "This new channel-output behavior and its owning control::tests parents are in the shared CLI boundary. Five exact CLI parents qualify only this narrow seam."
+  },
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+      "seconds": 600,
+      "required": "Original exit 0 plus actual completed CLI binary check; no runtime or native claim."
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "cli-lib",
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "features": [],
+      "compile_argv": [
+        "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "artifact_oracle": "Original exit0; exactly one successful build-finished; unique actual compiler-artifact with root manifest_path, profile.test=true, target.kind=[lib], target.name=cagents, features exactly[], executable present. Resolve only that emitted absolute regular non-symlink ELF in the separately admitted existing target. Retain complete Cargo artifact and ELF digest; no guessed path, stale filename or foreign artifact.",
+      "inventory_argv": [
+        "${CLI_LIBTEST_ELF}",
+        "--list",
+        "--color=never"
+      ],
+      "inventory_placeholder": "CLI_LIBTEST_ELF is resolved once only from the qualifying compiler-artifact above, never shell expansion or a guessed file. This unresolved DATA template is not executable admission.",
+      "inventory_oracle": "Same-ELF digest before/after successful use; original exit0; complete named inventory plus exact totals; no duplicates; all five expected names occur once. Inventory is presence evidence and zero passes.",
+      "source_predicted_compiled_names": [
+        "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+        "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+        "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+        "control::tests::request_ids_and_remote_errors_fail_closed",
+        "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::request_ids_and_remote_errors_fail_closed",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        }
+      ]
+    }
+  ],
+  "selected_parents": [
+    {
+      "name": "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+      "source": "src/control.rs",
+      "source_sha256": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+      "line": 4518,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 6,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "New real UnixStream second-step refusal(false/true), EOF, invalid length, wrong response variant, and missing-C model cases."
+    },
+    {
+      "name": "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+      "source": "src/control.rs",
+      "source_sha256": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+      "line": 4675,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 1,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "First OpenProject refusal retains original error and sends no CreateChannel or partial context."
+    },
+    {
+      "name": "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+      "source": "src/control.rs",
+      "source_sha256": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+      "line": 4403,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 1,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "Original canonical-repository success parent; git_checkout can return early, so semantic exercise remains unproved by an ok row."
+    },
+    {
+      "name": "control::tests::request_ids_and_remote_errors_fail_closed",
+      "source": "src/control.rs",
+      "source_sha256": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+      "line": 5478,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 2,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "Original wrong request ID / correlated remote error classifier."
+    },
+    {
+      "name": "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed",
+      "source": "src/control.rs",
+      "source_sha256": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+      "line": 5527,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 2,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "Original pinned-proof mismatch / unsolicited redraw classifier."
+    }
+  ],
+  "exact_parent_argv_templates": [
+    {
+      "label": "parent-cli-lib-1",
+      "argv": [
+        "${CLI_LIBTEST_ELF}",
+        "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+      "seconds": 90
+    },
+    {
+      "label": "parent-cli-lib-2",
+      "argv": [
+        "${CLI_LIBTEST_ELF}",
+        "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+      "seconds": 90
+    },
+    {
+      "label": "parent-cli-lib-3",
+      "argv": [
+        "${CLI_LIBTEST_ELF}",
+        "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+      "seconds": 90
+    },
+    {
+      "label": "parent-cli-lib-4",
+      "argv": [
+        "${CLI_LIBTEST_ELF}",
+        "control::tests::request_ids_and_remote_errors_fail_closed",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+      "seconds": 90
+    },
+    {
+      "label": "parent-cli-lib-5",
+      "argv": [
+        "${CLI_LIBTEST_ELF}",
+        "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+        "--color=never"
+      ],
+      "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+      "seconds": 90
+    }
+  ],
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-1",
+    "parent-cli-lib-2",
+    "parent-cli-lib-3",
+    "parent-cli-lib-4",
+    "parent-cli-lib-5"
+  ],
+  "planned_counts": {
+    "binary_checks": 1,
+    "lib_compilations": 1,
+    "ELF_inventories": 1,
+    "qualifying_outer_parents": 5,
+    "unique_source_parents": 5,
+    "total_phases": 8,
+    "new_first_parent_six_cases_are_one_parent": true,
+    "expected_stdout_child_results": 0
+  },
+  "budget": {
+    "packet_absolute_workload_seconds": 2400,
+    "check_seconds": 600,
+    "compile_seconds": 900,
+    "inventory_seconds": 30,
+    "each_parent_seconds": 90,
+    "sum_of_phase_ceilings_seconds": 1980,
+    "metadata_command_seconds": 10,
+    "no_retry": true,
+    "no_budget_extension": true,
+    "serial_only": true,
+    "source_mapping_only": "Budgets are proposed data. Original inherited owner must clamp each phase to remaining packet time; no C slot, lock, target or process is allocated by this file.",
+    "failure_cleanup": "Conserved donor original direct TERM/wait3 then KILL/wait3 and adopted natural3/forced10 logic is provenance only. Timeout, forced or uncertain custody stays negative. Uncertain retention is not finite safe release and cannot manufacture a handback; no cleanup is executed or newly authorized here."
+  },
+  "result_oracles": {
+    "parent": "For each exact original stdout: one running1, one exact selected ok row, one complete ok 1P0F0I0M summary, filtered count fresh full inventory N-1; original observed wait exit0 and unchanged source/context/ELF on successful paths. Any nonzero, unknown, timeout, truncated/duplicate result or zero-test success stops. Never concatenate stderr into parent stdout or add nested case counts.",
+    "aggregate": "Five unique outer parent results only. The first parent's six variants, request classifier's two cases and proof classifier's two cases are internal, nonadditive conditions. No raw parent result currently exists.",
+    "ELF_failure_limit": "Donor checks post-use digest only after invoke returns successfully. Negative/timeout exceptions may lack post-failed-use ELF digest; do not assert unchanged ELF after failure or claim archived full ELF bytes."
+  },
+  "fixture_and_descendant_risks": {
+    "new_error_parents": "Only real private UnixStream pairs and peer threads; original peer retained until client drop then join, no daemon/provider launch or alternate peer. First parent contains six cases; lost reply half-closes write only. Two-second peer read guard is a failure bound, not absence proof.",
+    "other_classifier_parents": "Fresh one-selector ELF processes exercise private UnixStream peers and synthetic proof values. No external provider, User or caller authority is substituted.",
+    "success_parent": {
+      "status": "SEMANTIC_EXERCISE_UNMET",
+      "source_lines": [
+        4403,
+        4407,
+        4758,
+        4760,
+        4767
+      ],
+      "contract": "The existing parent calls git_checkout; Command git init --quiet is awaited. If spawning or Git init fails it returns None and the parent returns early while libtest reports ok.",
+      "required_limit": "An ok row, source availability, artifact inventory, git binary presence or unrelated Git/version success does not prove this parent exercised its success flow. No fixture-success marker or per-Git original result is supplied by this DATA file or generic CORE. Keep that semantic evidence explicitly unmet until separately established through actual source-bound owning evidence; no extra command or source patch is invented here.",
+      "filesystem_and_children": "Creates a test-owned TempDir repository; actual discovery runs foreground Git rev-parse --git-common-dir / --show-toplevel. Git hooks/config/redirect context can affect these children. The future original executor must retain custody of Cargo/rustc/build-script Git and fixture Git descendants, and preserve caller HOME/authority. No temporary HOME, fabricated User/grant, import, process probe or fixture execution occurred.",
+      "source_neighbor": "project_location::discovery_git removes its own Git route selectors, sets LC_ALL=C/core.fsmonitor=false and waits output; git_checkout itself inherits natural Git context. No blanket isolation guarantee follows."
+    },
+    "build_children": "Cargo compilation can run rustc, linkers and build.rs Git commands even though no application runtime is requested. The unchanged controller's original child/wait and sticky custody requirements must remain, with unknowns negative.",
+    "opaque_context": "No outer authority/HOME/XDG/account/profile values inspected, replaced, cleared, copied or printed by this preparation. Compiler-only donor overlays are mapping data, not current context approval."
+  },
+  "consumer_mapping": {
+    "unchanged_CLI_consumer_available": false,
+    "prior_CLI_candidates": [
+      {
+        "path": "/tmp/fw16-pr2012-9574-cli2-consumer-i3riya_y/runner.py",
+        "sha256": "554016e6f8c77f08491793012df4c8fd5b336d94a69c9e22935d6124e207e52f",
+        "limit": "Foreign hardcoded CLI2 head and two-phase check/direct-cargo-test plan; lacks this CargoJSON/direct-ELF inventory route. Not reused, repinned or executed."
+      },
+      {
+        "path": "/tmp/fw16-pr1386-3d5f1891-cli6-data/runner.py",
+        "sha256": "ca48465fa1f10760edd2c1bb51d54593fe897e5d040ff59ddfa1e1bdeedd37c2",
+        "limit": "Foreign hardcoded CLI6 source/parents and two-phase contract. Not unchanged for this task; no source/runtime review transfer."
+      }
+    ],
+    "CORE_source": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-195052-host6-control/qualification-packets/pr1239-195052/run-packet.py",
+      "sha256": "eb0aaf204d61d49b5e529ac2cc9069b58252e57f0d3b4acc135b8ff8e6b7d0b0",
+      "controller_commit": "54f49ab7dd2edd7367349f0698bae83efbd953b6",
+      "controller_tree": "b24658dcf651d94b5a0a7d11661736d6952c19f0",
+      "plan_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-195052-host6-control/qualification-packets/pr1239-195052/plan.json",
+      "plan_sha256": "3110b01d30bc6d2e4fd649dffa2adb360b7accb781137f66a01d180991c5ee32",
+      "classification": "HOST6 task-bound donor source only; not an unchanged CLI consumer and not an approved new adaptation."
+    },
+    "mechanics_compatible_without_changes": [
+      {
+        "function": "cargo_test_artifact",
+        "lines": [
+          270,
+          289
+        ],
+        "why": "Exact expected_features=[] is explicitly accepted; unique root cagents test artifact/build-finished checks are feature-neutral."
+      },
+      {
+        "function": "inventory_names",
+        "lines": [
+          292,
+          308
+        ],
+        "why": "Distinct exact selectors and full totals support five names without a cardinality constant."
+      },
+      {
+        "function": "execute_contracts",
+        "lines": [
+          401,
+          448
+        ],
+        "why": "Data-driven check/group/selectors loop yields one CLI check, compile, inventory, and five exact parents; same emitted ELF and N-1 filter oracle."
+      },
+      {
+        "function": "parent_pass",
+        "lines": [
+          311,
+          336
+        ],
+        "why": "One original outer parent with expected_stdout_child_results0 applies to every selected CLI parent; nested variants are not staged libtest children."
+      }
+    ],
+    "conservation_partition": {
+      "unchanged_top_level_helpers_count": 25,
+      "unchanged_helpers": [
+        {
+          "name": "digest",
+          "line": 32
+        },
+        {
+          "name": "now",
+          "line": 40
+        },
+        {
+          "name": "observed_wait",
+          "line": 44
+        },
+        {
+          "name": "supervision_failure",
+          "line": 51
+        },
+        {
+          "name": "bounded_capture",
+          "line": 60
+        },
+        {
+          "name": "refuse_git_routing",
+          "line": 123
+        },
+        {
+          "name": "git",
+          "line": 128
+        },
+        {
+          "name": "git_nul_fields",
+          "line": 138
+        },
+        {
+          "name": "guard_git_metadata",
+          "line": 143
+        },
+        {
+          "name": "signal_pidfd",
+          "line": 203
+        },
+        {
+          "name": "children",
+          "line": 211
+        },
+        {
+          "name": "settle_children",
+          "line": 223
+        },
+        {
+          "name": "cargo_test_artifact",
+          "line": 270
+        },
+        {
+          "name": "inventory_names",
+          "line": 292
+        },
+        {
+          "name": "parent_pass",
+          "line": 311
+        },
+        {
+          "name": "scope_observation",
+          "line": 339
+        },
+        {
+          "name": "validate_controller_review",
+          "line": 385
+        },
+        {
+          "name": "evidence_copy",
+          "line": 393
+        },
+        {
+          "name": "execute_contracts",
+          "line": 401
+        },
+        {
+          "name": "custody_clean",
+          "line": 451
+        },
+        {
+          "name": "safe_lane_handoff",
+          "line": 457
+        },
+        {
+          "name": "final_observations",
+          "line": 535
+        },
+        {
+          "name": "note_lane_cancellation",
+          "line": 562
+        },
+        {
+          "name": "require_workload_allowed",
+          "line": 568
+        },
+        {
+          "name": "retain_uncertain_lane",
+          "line": 573
+        }
+      ],
+      "unchanged_main_nested_core": [
+        "read_bound",
+        "source",
+        "context",
+        "run"
+      ],
+      "note": "The source has 27 top-level definitions: main and parent_accounting are task-adaptable, leaving 25 unchanged top-level helpers. final_observations.collect is conserved inside its enclosing helper body and is not counted a second time. read_bound/source/context/run are the four separate main-nested core definitions."
+    },
+    "required_exact_parent_accounting_literal_delta": [
+      {
+        "line": 508,
+        "old": "assert 0 <= len(parents) <= count <= 6",
+        "new": "assert 0 <= len(parents) <= count <= 5"
+      },
+      {
+        "line": 522,
+        "old": "'unrun_phase_count': 9 - len(phase_attempts)",
+        "new": "'unrun_phase_count': 8 - len(phase_attempts)"
+      },
+      {
+        "line": 527,
+        "old": "'requested_parent_count': 6",
+        "new": "'requested_parent_count': 5"
+      },
+      {
+        "line": 532,
+        "old": "'unrun_parent_count': 6 - count",
+        "new": "'unrun_parent_count': 5 - count"
+      }
+    ],
+    "counter_boundary": "Parent explicitly clarified these four cardinality literals are in the intended constants allowance, matching prior HOST9-to-HOST6 adaptation. No formulas, guards, control flow, source/custody/EOF logic or extra sixth parent may change. Without those four edits counts are wrong; with them no further feature/cardinality blocker is identified in the mapped generic mechanics.",
+    "new_task_binding_required": "New explicit source adaptation must replace only task-binding/main assertions/constants/plan and the four allowed cardinalities: PR1238/d5c5 head/tree/control hash, five exact source parents, features[], CLI binary/compile commands, eight phases, new source-binding and controller-review bytes, own output packet path. Preserve SCOPE_PARENT=None, staged observations absent, original waits, sticky failure history, original family/lock settlement and negative-path limits.",
+    "foreign_scope_limit": "The donor's dormant scope_observation and inventory-host-lib reference in parent_accounting remain unreachable for all selected string names when SCOPE_PARENT=None; they confer no HOST/native scope qualification.",
+    "approval_status": "No new controller written, imported, executed or independently approved. Existing HOST controller review is provenance only. A future adaptation needs its own exact conservation/source/fixture/context review plus separate fresh external admission; UUID syntax and old review bytes are not authority."
+  },
+  "evidence_and_admission": {
+    "actual_allocation": null,
+    "actual_grant": null,
+    "actual_C_slot": null,
+    "queue_position": null,
+    "actual_runtime": null,
+    "actual_inventory": null,
+    "actual_ELF": null,
+    "actual_parent_results": null,
+    "actual_release": null,
+    "new_controller_path": null,
+    "all_compilation_tests_native": "UNRUN",
+    "preparation_actions": "Only existing Git/source/JSON reads, file hashes, and this task-owned JSON write/seal. No target/cache/registry/tool/context/process probe, builds, tests, native/provider/helper/controller execution, Git/GitHub writes or new workers.",
+    "acceptance_limits": [
+      "No existing unchanged consumer approves this plan.",
+      "Five exact source declarations are not actual inventory or passes.",
+      "Original success fixture semantic exercise remains explicitly unmet even after a nominal libtest ok without additional owning evidence.",
+      "No HOST/native/provider/UI/performance/main-composition/whole-PR acceptance.",
+      "No foreign result, review, context, physical tool/target identity or grant is transferred.",
+      "Stop after this data handoff."
+    ]
+  }
+}

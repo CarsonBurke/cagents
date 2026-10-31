@@ -1,0 +1,58 @@
+{
+  "kind": "CLI5_A518_TASK_SOURCE_MAP_NOT_APPROVAL",
+  "product": {
+    "head": "a518258df79fb77d3023e698ad9c2e0fd99e01ef",
+    "tree": "5fa482932bd557782b1e47fd63edc6da605ed2db",
+    "parent": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result"
+  },
+  "source_paths_sha256": {
+    "Cargo.toml": "294e102940eb184f4f9e9cdaedd2c200408c7837667c8889762af0008025b989",
+    "Cargo.lock": "a101bfe4db08c54bb972d7528ac5f65af0e0b7bb6bbefe0886fd63a9612e2561",
+    ".cargo/config.toml": "ae0cd2fea772a441a4864aee9e0551445e14d1ccebadfbdc6ce55d5052600a96",
+    "build.rs": "343c620c6a85a19ee187c9d5ce23f796c47aa3d10e80b445caf749c7e299083f",
+    "src/lib.rs": "55e51db076af7d6b8dcdd2fff289830ce2e728e54b1d5b784a71d0f553168326",
+    "src/modules.rs": "c9be7901ea1daeb139eaa170719179124b3f286ee6f2431507c94e5d6feef410",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/control.rs": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+    "src/model.rs": "a6b1a73d0c1a56838b8890dadf5be92fc6fde8b1d9b4ff3fa68ef1c0c1f08655",
+    "src/terminal/ipc.rs": "f525f42cd6a12909250a012b46c2ef8ad195542a0153404441826b08f3305806",
+    "src/workspace_model.rs": "0dc9e6ab4a90cf4ed9c335b76cf1cc4920aa176690f01f6f8b6b9bbef98b86a1",
+    "src/project_location.rs": "d0d57dc5354550c9d77f4c6ec9df0fa525b231f5acc51e9c4a33881e923adbcb"
+  },
+  "selected_names": [
+    "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+    "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+    "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+    "control::tests::request_ids_and_remote_errors_fail_closed",
+    "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed"
+  ],
+  "source_review": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/product-source-review.json",
+    "sha256": "3722984c098083c3818d6de80a280a6b302348890c0a69d3c925d2653b1eee25",
+    "original_path": "/tmp/pr1238-a518258d-cli5-source-data-llleqlk2/review.json",
+    "bytes": 15918
+  },
+  "repinned_data": {
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/repinned-plain-data.json",
+    "sha256": "515be84d1f8144c3c7b196bfaceebf4695b5f19269389b10df54148e0db20c29",
+    "original_path": "/tmp/pr1238-a518258d-cli5-source-data-llleqlk2/qualification-data-plan.json",
+    "bytes": 25745
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "execution_policy": "Five serial captured-pretty/default-scheduler singleton invocations; no nocapture/thread override/helper environment",
+  "archive_parent_policy": "Task main creates only admitted safe relative parents under fresh owned evidence directory before unchanged evidence_copy",
+  "runtime": null
+}

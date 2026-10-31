@@ -1,0 +1,34 @@
+{
+  "kind": "PR1238_A518_SOURCE_BINDING_DAG_NOT_ADMISSION",
+  "ordered_layers": [
+    [
+      "genuine product freeze/review/repinned plainDATA/publication and canonical source/proof archives",
+      "product source snapshots",
+      "immutable donor source/plan/binding/conservation"
+    ],
+    [
+      "command-data.json",
+      "current-source-map.json"
+    ],
+    [
+      "source-binding.json"
+    ],
+    [
+      "plan.json"
+    ],
+    [
+      "run-packet.py PLAN_SHA literal"
+    ],
+    [
+      "invocation-template.json external runner hash"
+    ],
+    [
+      "manifest.json external index with no self hash"
+    ]
+  ],
+  "runtime_external_inputs": "Runner hash and genuine new controller review path/hash are supplied externally. Pre-review template has NULL review slots and is NOT_SUBMITTABLE. Root supplies actual review externally after freeze; only grant slot5 then NULL. No review fabricated or current commit head/tree/hash stored in its own payload.",
+  "archive_rule": "Plan archives genuine/source DATA inputs only; it does not recursively hash current plan/runner/manifest or an eventual current review. Existing task caller creates safe nested parents before unchanged evidence_copy.",
+  "readiness": "Genuine a518 source proof/publication joined; actual ELF/inventory/results/source/context/tools/resources/grant remain NULL. Fresh actual-code/conservation review and authenticated grant required.",
+  "source_only": true,
+  "execution_authorized": false
+}

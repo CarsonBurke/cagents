@@ -1,0 +1,336 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "archive_bindings": [
+    {
+      "name": "input-diagnostic_freeze",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_freeze.json",
+      "sha256": "5eba888b8a031dfcdd075a0d6bae1a7a6eeea890b8bec91e63bade78a08f0183"
+    },
+    {
+      "name": "input-diagnostic_semantic",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_semantic.json",
+      "sha256": "da302e697c254632ca1c8afa3072ff7186143f99a83d73d9912509d513305afd"
+    },
+    {
+      "name": "input-diagnostic_conservation",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_conservation.json",
+      "sha256": "202a53ecac61f7668148c26d72df1f3afe93363df2af709cb4733f0ef7308493"
+    },
+    {
+      "name": "input-diagnostic_helper_independence",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_helper_independence.json",
+      "sha256": "a00af9948c807eef537774c5b24b4345bd6813c5a229c7a8106f475e0d5b9687"
+    },
+    {
+      "name": "input-diagnostic_handoff",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_handoff.json",
+      "sha256": "7cfaee56000c53a8260bbfee025cf322fe5741fcaffd3dc441dd3552368b2dc9"
+    },
+    {
+      "name": "input-diagnostic_publication",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_publication.json",
+      "sha256": "c32b45b7f6783aa8c7076356ceae493c8e1a81215de6ced440c4ebc9f18736f4"
+    },
+    {
+      "name": "input-diagnostic_root_adoption",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_root_adoption.json",
+      "sha256": "7ebaf9b45498d52c1235d9f4605d1e3cd9f2b9b467a1d806de48a7e90b660a45"
+    },
+    {
+      "name": "input-diagnostic_assignment",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_assignment.json",
+      "sha256": "69f535367b2a7a4363e6c14da9e284c787deb7cb5239c65e720778052bd95f76"
+    },
+    {
+      "name": "input-diagnostic_proposal",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_proposal.json",
+      "sha256": "8f32011fc47b13f205dd7bf82c4e9f51e5690bc23c89847451868f091aed5421"
+    },
+    {
+      "name": "input-diagnostic_main_map",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/diagnostic_main_map.json",
+      "sha256": "ee0c0c1ed915ba1db4f69cbb81ac9408981e0fca0a4087a32870139447aeba41"
+    },
+    {
+      "name": "input-historical_2c_runner",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/historical_2c_runner.py",
+      "sha256": "97444376c1f7dc012d506432dc7210682a28da1a71815c4d120be08cbb5b8992"
+    },
+    {
+      "name": "input-historical_2c_plan",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/historical_2c_plan.json",
+      "sha256": "b413abb9059840c4ed4412508a9c4b65b998f0e662d189ec25ec87bef90780c2"
+    },
+    {
+      "name": "input-historical_b68_binding",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/historical_b68_binding.json",
+      "sha256": "800216872c2941e54905e0c1a95bca67d9118bd2a3ad0eb43b449e857ea8415d"
+    },
+    {
+      "name": "input-adoption_freeze",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_freeze.json",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682"
+    },
+    {
+      "name": "input-adoption_semantic",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_semantic.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
+    },
+    {
+      "name": "input-adoption_conservation",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_conservation.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4"
+    },
+    {
+      "name": "input-adoption_pure4_reference",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_pure4_reference.json",
+      "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005"
+    },
+    {
+      "name": "input-adoption_intake",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_intake.json",
+      "sha256": "e9aa09101ca6d215e6876de5b50c1fe1bc57bb3cc14f7bdd397b7772cd1e5843"
+    },
+    {
+      "name": "input-adoption_function",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_function.py",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+    },
+    {
+      "name": "input-adoption_old_function",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_old_function.py",
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
+    },
+    {
+      "name": "input-adoption_original_finding",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/adoption_original_finding.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
+    },
+    {
+      "name": "input-prior_ca_task_hold",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/prior_ca_task_hold.json",
+      "sha256": "e342ee5b3258889e2f258433b7cf3a47614d79e340a4313e678060b99bf53560"
+    },
+    {
+      "name": "input-prior_ca_conservation",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/prior_ca_conservation.json",
+      "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d"
+    },
+    {
+      "name": "input-prior_ca_additive_hold",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/prior_ca_additive_hold.json",
+      "sha256": "a32b9501efcfc05ba117cd89f10d903a02434943ce0ac5d70440b7ea69767ef9"
+    },
+    {
+      "name": "input-prior_ca_author_conservation",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/prior_ca_author_conservation.json",
+      "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd"
+    },
+    {
+      "name": "input-source-_cargo__config_toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-_cargo__config_toml.toml",
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+    },
+    {
+      "name": "input-source-Cargo_toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-Cargo_toml.toml",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    {
+      "name": "input-source-Cargo_lock",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-Cargo_lock.lock",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    {
+      "name": "input-source-build_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-build_rs.rs",
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+    },
+    {
+      "name": "input-source-src__lib_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__lib_rs.rs",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+    },
+    {
+      "name": "input-source-src__modules_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__modules_rs.rs",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+    },
+    {
+      "name": "input-source-src__filesystem_recovery_context_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__filesystem_recovery_context_rs.rs",
+      "sha256": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d"
+    },
+    {
+      "name": "input-source-src__fs_safety_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__fs_safety_rs.rs",
+      "sha256": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34"
+    },
+    {
+      "name": "input-source-src__fs_safety__recovery_cache_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__fs_safety__recovery_cache_rs.rs",
+      "sha256": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db"
+    },
+    {
+      "name": "input-source-src__fs_safety__recovery_placement_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__fs_safety__recovery_placement_rs.rs",
+      "sha256": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa"
+    },
+    {
+      "name": "input-source-src__fs_safety__directory_creation_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__fs_safety__directory_creation_rs.rs",
+      "sha256": "f71e11e94fce6800a8c5da6009c75faeb47f2e7875cd2fc11099f57c33119a4a"
+    },
+    {
+      "name": "input-source-src__recovery_authority_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__recovery_authority_rs.rs",
+      "sha256": "f7a4b149cade60db513a02af124117779866d21c3e7ecaf6a37ed09c3312b64e"
+    },
+    {
+      "name": "input-source-src__worktree_cleanup_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__worktree_cleanup_rs.rs",
+      "sha256": "465c2f6b5ba8c16efbf6bd5d607420a045f5f0c22230016c15d45b5970c89cc5"
+    },
+    {
+      "name": "input-source-src__secure_file_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__secure_file_rs.rs",
+      "sha256": "51bad3a87ed1fcdbaa00232695c5da9deed025f3448a928032eb4dc1a5ba51d0"
+    },
+    {
+      "name": "input-source-src__instance_rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/dependencies/source-src__instance_rs.rs",
+      "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d"
+    },
+    {
+      "name": "command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/command-data.json",
+      "sha256": "2f21d64a2821d61735f04967266d6ffe939ea471f72f68067160b35ab0eccbc6"
+    },
+    {
+      "name": "current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/current-source-map.json",
+      "sha256": "6f518ed7807433597a9162b04459ccfd49b02e8d1024cc1089a77fd8c1485cfc"
+    },
+    {
+      "name": "source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/source-binding.json",
+      "sha256": "26e92ef3c722d49f792003637effd540cead444e6451d9b7d96d83694f99ed25"
+    }
+  ],
+  "artifact_groups": [
+    {
+      "captured_success_stream_policy": {
+        "scope": "No executable helper in this exact owning source chain; no runtime child inference or credit."
+      },
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "diagnostic_seconds": 180,
+      "features": [
+        "host"
+      ],
+      "id": "host-lib",
+      "inventory_seconds": 30,
+      "manifest": "Cargo.toml",
+      "selectors": [
+        {
+          "expected_stdout_child_results": 0,
+          "name": "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation"
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation"
+        }
+      ],
+      "source_predicted_absent_names": [],
+      "source_predicted_compiled_names": [
+        "fs_safety::recovery_cache::tests::save_private_mode_failure_remains_retained_before_directory_confirmation",
+        "fs_safety::recovery_cache::tests::save_payload_placement_failure_remains_retained_before_directory_confirmation"
+      ],
+      "source_self_child_membership": [],
+      "target_kind": [
+        "lib"
+      ],
+      "target_name": "cagents"
+    }
+  ],
+  "issue": 2025,
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "limits": "Partial recovery-cache diagnostic ONLY. Original347 broad failure/context remains unresolved. No helper binding or helper/native/provider/installed/WHOLE/merge qualification. Actual source/ELF/inventory and original waits/custody required. Full ELF is not archived; per-use observations do not attest every internal operation. Original nonzero FAIL_STOP; uncertainty retains HOLD; no retry/waiver/result transfer.",
+  "packet_deadline_seconds": 810,
+  "phase_caps_sum_seconds": 810,
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "planned_phase_count": 3,
+  "planned_phase_order": [
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-recovery-cache-two"
+  ],
+  "prepared_only": true,
+  "product_head": "88b3a7ed94f14619e166710ad09608fca1c3286f",
+  "product_parent": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+  "product_pr": null,
+  "product_tree": "327355354507d895a0dc1ec8bef35012e21b3b32",
+  "readiness": false,
+  "required_absent_environment_names": [
+    "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+    "CAGENTS_RETAINED_ACTOR_FIXTURE"
+  ],
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/run-packet.py",
+  "runtime_admission": {
+    "execution_authorized": false,
+    "helper_binding": null,
+    "state": "DIAGNOSTIC_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT"
+  },
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/filesystem_recovery_context.rs": "115d2ee29cb9b508967c0ae1a187faa092f417056cd10c986eb3b1b60665977d",
+    "src/fs_safety.rs": "209143560168b7e0498e22645c1f1894b64fd19adb3652d48277fcddf1cf8a34",
+    "src/fs_safety/directory_creation.rs": "f71e11e94fce6800a8c5da6009c75faeb47f2e7875cd2fc11099f57c33119a4a",
+    "src/fs_safety/recovery_cache.rs": "f6634e353f8c260b0332fdf4e77c3c2e76d6d02877499e2d5fba1348631859db",
+    "src/fs_safety/recovery_placement.rs": "723ae5d0faf4271ffd4b38693be4bbfb72d360af16fc0c21d7d574fbd5faf5fa",
+    "src/instance.rs": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/recovery_authority.rs": "f7a4b149cade60db513a02af124117779866d21c3e7ecaf6a37ed09c3312b64e",
+    "src/secure_file.rs": "51bad3a87ed1fcdbaa00232695c5da9deed025f3448a928032eb4dc1a5ba51d0",
+    "src/worktree_cleanup.rs": "465c2f6b5ba8c16efbf6bd5d607420a045f5f0c22230016c15d45b5970c89cc5"
+  },
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/source-binding.json",
+  "source_review_sha256": "26e92ef3c722d49f792003637effd540cead444e6451d9b7d96d83694f99ed25",
+  "tool_pin_provenance": "Immutable donor source data only, no current installed-file/context observation",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-fixture-diagnostics"
+}

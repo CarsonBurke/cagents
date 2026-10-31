@@ -1,0 +1,60 @@
+{
+  "schema": "pr1238_required_git_success_fixture_source_freeze_v1",
+  "created_utc": "2026-10-31T13:37:38.188906+00:00",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+  "branch": "fix/fw16-pr1238-channel-partial-result",
+  "parent": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+  "head": "a518258df79fb77d3023e698ad9c2e0fd99e01ef",
+  "tree": "5fa482932bd557782b1e47fd63edc6da605ed2db",
+  "changed_paths": [
+    "src/control.rs"
+  ],
+  "unchanged_other_entries": 1760,
+  "control_sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+  "one_test_hunk": "diff --git a/src/control.rs b/src/control.rs\nindex ce17d4791..d250c91ee 100644\n--- a/src/control.rs\n+++ b/src/control.rs\n@@ -4403,11 +4403,8 @@ mod tests {\n     fn channel_spawn_opens_the_project_then_creates_the_channel_it_minted() {\n         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();\n         let peer_proof = proof(\"session\", \"boot\", \"incarnation\");\n-        // No usable `git` means there is no key to derive and nothing this test\n-        // can assert. Every lane that runs it has one.\n-        let Some(checkout) = git_checkout() else {\n-            return;\n-        };\n+        let checkout = git_checkout()\n+            .expect(\"the channel-spawn success contract requires a usable Git checkout\");\n         let repository = checkout.path().to_path_buf();\n         // The common Git directory, which is what a window stores for a project\n         // and therefore what the channel has to be keyed on.",
+  "purpose": "Existing success contract fails explicitly when Git fixture setup fails instead of returning unexercised ok; production and other helper callers exact.",
+  "format_validation": {
+    "repository_scripts_check_format": {
+      "chunk": "594790",
+      "exit": 127,
+      "reason": "Historical branch has no scripts/check-format; no script copied or fabricated."
+    },
+    "physical_cargo_fmt_check": {
+      "chunk": "74629f",
+      "exit": 0
+    },
+    "physical_hidden_modules_check": {
+      "chunks": [
+        "cc87a4",
+        "987f3b"
+      ],
+      "exit": 1,
+      "reason": "Preexisting broad formatting differences outside declared hunk; no rewrite."
+    },
+    "physical_control_with_children_check": {
+      "chunk": "1cbd81",
+      "exit": 1,
+      "reason": "Preexisting child module formatting differences; no rewrite."
+    },
+    "physical_control_only_check": {
+      "chunk": "358914",
+      "exit": 0,
+      "argv": [
+        "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/rustfmt",
+        "--edition",
+        "2024",
+        "--check",
+        "--config",
+        "skip_children=true",
+        "src/control.rs"
+      ]
+    },
+    "diff_check": {
+      "chunk": "2d1d14",
+      "exit": 0
+    }
+  },
+  "execution": "All Rust compile/tests/CLI/native UNRUN; source only, not wholePR readiness.",
+  "independent_review": null,
+  "public_write": null
+}

@@ -1,0 +1,7 @@
+{
+  "kind": "AST_LINE_HASH_JSON_ONLY_NO_CANDIDATE_EXECUTION",
+  "candidate_algorithms_called": false,
+  "trailing_whitespace": [],
+  "new_diff_envelopes_json_no_trailing_whitespace": true,
+  "no_current_runtime_or_authority_probe": true
+}

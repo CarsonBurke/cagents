@@ -1,0 +1,429 @@
+{
+  "kind": "BOUNDED_LINE_SOURCE_DIFF_DATA_NOT_EXECUTABLE",
+  "source_sha256": "76098afc1e030865ef257f62d711ca64690241e10bac2016ae58397ec416c1de",
+  "result_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
+  "hunks": [
+    {
+      "old_start_line0": 18,
+      "old_end_line0": 19,
+      "new_start_line0": 18,
+      "new_end_line0": 19,
+      "old_lines": [
+        "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-fixture-diagnostics')\n"
+      ],
+      "new_lines": [
+        "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result')\n"
+      ]
+    },
+    {
+      "old_start_line0": 22,
+      "old_end_line0": 23,
+      "new_start_line0": 22,
+      "new_end_line0": 23,
+      "old_lines": [
+        "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-recovery-cache-diag-host2/qualification-packets/issue2025-recovery-cache-diag-host2/plan.json')\n"
+      ],
+      "new_lines": [
+        "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/plan.json')\n"
+      ]
+    },
+    {
+      "old_start_line0": 27,
+      "old_end_line0": 28,
+      "new_start_line0": 27,
+      "new_end_line0": 28,
+      "old_lines": [
+        "PLAN_SHA = 'a2f9a7e957dc4aaabc3d48a1f52696ef46d106261f97181b24eaff8fdf4b73c0'\n"
+      ],
+      "new_lines": [
+        "PLAN_SHA = 'd5c074fbea83b6863b73ae574a8b55fb8a4425cce527c6e0f87685dbf56990e9'\n"
+      ]
+    },
+    {
+      "old_start_line0": 475,
+      "old_end_line0": 476,
+      "new_start_line0": 475,
+      "new_end_line0": 476,
+      "old_lines": [
+        "    \"\"\"One exact diagnostic contract from this original full inventory.\"\"\"\n"
+      ],
+      "new_lines": [
+        "    \"\"\"Five exact singleton contracts from this original full inventory.\"\"\"\n"
+      ]
+    },
+    {
+      "old_start_line0": 483,
+      "old_end_line0": 484,
+      "new_start_line0": 483,
+      "new_end_line0": 484,
+      "old_lines": [
+        "    assert len(names) == 2 and len(set(names)) == 2\n"
+      ],
+      "new_lines": [
+        "    assert len(names) == 5 and len(set(names)) == 5\n"
+      ]
+    },
+    {
+      "old_start_line0": 487,
+      "old_end_line0": 490,
+      "new_start_line0": 487,
+      "new_end_line0": 491,
+      "old_lines": [
+        "    return [{'label': 'parent-host-lib-recovery-cache-two', 'kind': 'diagnostic-two-exact', 'names': names,\n",
+        "             'filters': names, 'exact': True, 'seconds': group['diagnostic_seconds'],\n",
+        "             'actual_inventory_N': total, 'expected_filtered_out': total - len(names)}]\n"
+      ],
+      "new_lines": [
+        "    return [{'label': 'parent-cli-lib-' + str(index + 1), 'kind': 'cli-singleton-exact', 'names': [row['name']],\n",
+        "             'filters': [row['name']], 'exact': True, 'seconds': row['seconds'],\n",
+        "             'actual_inventory_N': total, 'expected_filtered_out': total - 1}\n",
+        "            for index, row in enumerate(group['selectors'])]\n"
+      ]
+    },
+    {
+      "old_start_line0": 565,
+      "old_end_line0": 565,
+      "new_start_line0": 566,
+      "new_end_line0": 568,
+      "old_lines": [],
+      "new_lines": [
+        "    for check in plan['binary_checks']:\n",
+        "        invoke(check['label'], [str(TOOL / 'cargo'), *check['argv'][1:]], check['seconds'])\n"
+      ]
+    },
+    {
+      "old_start_line0": 682,
+      "old_end_line0": 683,
+      "new_start_line0": 685,
+      "new_end_line0": 686,
+      "old_lines": [
+        "            assert [value['label'] for value in values] == ['parent-host-lib-recovery-cache-two']\n"
+      ],
+      "new_lines": [
+        "            assert [value['label'] for value in values] == ['parent-cli-lib-1', 'parent-cli-lib-2', 'parent-cli-lib-3', 'parent-cli-lib-4', 'parent-cli-lib-5']\n"
+      ]
+    },
+    {
+      "old_start_line0": 718,
+      "old_end_line0": 719,
+      "new_start_line0": 721,
+      "new_end_line0": 722,
+      "old_lines": [
+        "    assert len({row['phase'] for row in raw}) == len(raw) and 0 <= len(parents) <= len(attempted) <= 1\n"
+      ],
+      "new_lines": [
+        "    assert len({row['phase'] for row in raw}) == len(raw) and 0 <= len(parents) <= len(attempted) <= 5\n"
+      ]
+    },
+    {
+      "old_start_line0": 730,
+      "old_end_line0": 731,
+      "new_start_line0": 733,
+      "new_end_line0": 734,
+      "old_lines": [
+        "    expected_labels = ['parent-host-lib-recovery-cache-two']\n"
+      ],
+      "new_lines": [
+        "    expected_labels = ['parent-cli-lib-1', 'parent-cli-lib-2', 'parent-cli-lib-3', 'parent-cli-lib-4', 'parent-cli-lib-5']\n"
+      ]
+    },
+    {
+      "old_start_line0": 734,
+      "old_end_line0": 735,
+      "new_start_line0": 737,
+      "new_end_line0": 738,
+      "old_lines": [
+        "        and list(contracts) == expected_labels and len(qualified_rows) == 1)\n"
+      ],
+      "new_lines": [
+        "        and list(contracts) == expected_labels and len(qualified_rows) == 5)\n"
+      ]
+    },
+    {
+      "old_start_line0": 741,
+      "old_end_line0": 742,
+      "new_start_line0": 744,
+      "new_end_line0": 745,
+      "old_lines": [
+        "             'unknown_phase_count': len(phase_attempts) - settled_phases, 'unrun_phase_count': 3 - len(phase_attempts),\n"
+      ],
+      "new_lines": [
+        "             'unknown_phase_count': len(phase_attempts) - settled_phases, 'unrun_phase_count': 8 - len(phase_attempts),\n"
+      ]
+    },
+    {
+      "old_start_line0": 746,
+      "old_end_line0": 748,
+      "new_start_line0": 749,
+      "new_end_line0": 751,
+      "old_lines": [
+        "             'requested_test_invocation_count': 1, 'attempted_test_invocation_count': len(attempted),\n",
+        "             'qualified_test_invocation_count': len(qualified_rows), 'unrun_test_invocation_count': 1 - len(attempted),\n"
+      ],
+      "new_lines": [
+        "             'requested_test_invocation_count': 5, 'attempted_test_invocation_count': len(attempted),\n",
+        "             'qualified_test_invocation_count': len(qualified_rows), 'unrun_test_invocation_count': 5 - len(attempted),\n"
+      ]
+    },
+    {
+      "old_start_line0": 838,
+      "old_end_line0": 839,
+      "new_start_line0": 841,
+      "new_end_line0": 842,
+      "old_lines": [
+        "    assert plan['runtime_admission']['state'] == 'DIAGNOSTIC_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT'\n"
+      ],
+      "new_lines": [
+        "    assert plan['runtime_admission']['state'] == 'CLI5_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT'\n"
+      ]
+    },
+    {
+      "old_start_line0": 846,
+      "old_end_line0": 850,
+      "new_start_line0": 849,
+      "new_end_line0": 851,
+      "old_lines": [
+        "    assert review['kind'] == 'AUTHOR_ASSEMBLED_RECOVERY_CACHE_TWO_DIAGNOSTIC_BINDING_NOT_APPROVAL'\n",
+        "    assert (review['head'], review['tree'], review['parent']) == (\n",
+        "        '88b3a7ed94f14619e166710ad09608fca1c3286f', '327355354507d895a0dc1ec8bef35012e21b3b32',\n",
+        "        'b68f940d14f222fd6532129e94b2fac9f1cbda58')\n"
+      ],
+      "new_lines": [
+        "    assert review['kind'] == 'AUTHOR_ASSEMBLED_PR1238_A518_CLI5_SOURCE_BINDING_NOT_APPROVAL'\n",
+        "    assert (review['head'], review['tree'], review['parent']) == ('a518258df79fb77d3023e698ad9c2e0fd99e01ef', '5fa482932bd557782b1e47fd63edc6da605ed2db', 'd5c5a3523dfd799f96a36d21c00d778d752f7ae5')\n"
+      ]
+    },
+    {
+      "old_start_line0": 851,
+      "old_end_line0": 852,
+      "new_start_line0": 852,
+      "new_end_line0": 853,
+      "old_lines": [
+        "    assert review['product_pr'] is plan['product_pr'] is None\n"
+      ],
+      "new_lines": [
+        "    assert review['product_pr'] == plan['product_pr'] == 1238\n"
+      ]
+    },
+    {
+      "old_start_line0": 857,
+      "old_end_line0": 857,
+      "new_start_line0": 858,
+      "new_end_line0": 859,
+      "old_lines": [],
+      "new_lines": [
+        "\n"
+      ]
+    },
+    {
+      "old_start_line0": 859,
+      "old_end_line0": 905,
+      "new_start_line0": 861,
+      "new_end_line0": 885,
+      "old_lines": [
+        "    freeze = read_bound('diagnostic_freeze')\n",
+        "    semantic = read_bound('diagnostic_semantic')\n",
+        "    conservation = read_bound('diagnostic_conservation')\n",
+        "    helper = read_bound('diagnostic_helper_independence')\n",
+        "    handoff = read_bound('diagnostic_handoff')\n",
+        "    publication = read_bound('diagnostic_publication')\n",
+        "    root_adoption = read_bound('diagnostic_root_adoption')\n",
+        "    assignment = read_bound('diagnostic_assignment')\n",
+        "    proposal = read_bound('diagnostic_proposal')\n",
+        "    read_bound('diagnostic_main_map')\n",
+        "    for historical in ('historical_2c_runner', 'historical_2c_plan', 'historical_b68_binding'):\n",
+        "        read_bound(historical, False)  # Immutable provenance, not current product approval.\n",
+        "    expected_tuple = (review['head'], review['tree'], review['parent'])\n",
+        "    assert (freeze['head'], freeze['tree'], freeze['parent']) == expected_tuple\n",
+        "    assert (semantic['head'], semantic['tree'], semantic['parent']) == expected_tuple\n",
+        "    assert semantic['verdict'] == 'BOUNDED_SOURCE_CLEAR_OBSERVATION_AND_GUARD_SEMANTICS' and semantic['blocking_findings'] == []\n",
+        "    assert semantic['evidence']['author_freeze']['sha256'] == review['diagnostic_freeze']['sha256']\n",
+        "    assert conservation['verdict'] == 'SCOPED_TWO_FILE_CONSERVATION_TEST_ONLY_AND_TRUTHFUL_SCOPE_CLEAR' and conservation['blockers'] == []\n",
+        "    assert (conservation['source']['head'], conservation['source']['tree'], conservation['source']['sole_parent']) == expected_tuple\n",
+        "    assert conservation['author_receipt']['sha256'] == review['diagnostic_freeze']['sha256']\n",
+        "    assert conservation['check_count'] == len(conservation['checks']) == 59\n",
+        "    assert all(row['passed'] is True for row in conservation['checks'])\n",
+        "    assert len({row['name'] for row in conservation['checks']}) == 59\n",
+        "    assert conservation['source']['outside_mode_type_blob_entries_exact'] == 2217\n",
+        "    for row in freeze['source_pins']:\n",
+        "        assert row['current']['sha256'] == plan['source_paths_sha256'][row['repository_path']]\n",
+        "    for row in conservation['source']['pins']:\n",
+        "        assert row['current']['sha256'] == plan['source_paths_sha256'][row['path']]\n",
+        "    assert (helper['product']['head'], helper['product']['tree'], helper['product']['parent']) == expected_tuple\n",
+        "    assert helper['genuine_root_freeze']['sha256'] == review['diagnostic_freeze']['sha256']\n",
+        "    assert helper['disposition'] == 'SCOPED_SOURCE_HELPER_INDEPENDENCE_FOR_EXACT_TWO_LINUX_HOST_LIB_PARENTS'\n",
+        "    assert all(helper['controller_consequence'][key] is False for key in (\n",
+        "        'emitted_cagentsd_helper_needed_for_this_exact_pair', 'retained_actor_environment_binding_needed_for_this_exact_pair',\n",
+        "        'separate_process_helper_needed_by_traced_application_chain'))\n",
+        "    assert (handoff['product']['head'], handoff['product']['tree'], handoff['product']['parent']) == expected_tuple\n",
+        "    assert handoff['source_freeze']['sha256'] == review['diagnostic_freeze']['sha256']\n",
+        "    assert handoff['product']['public_source_write'] == 'NOT_PERFORMED'  # Original snapshot, not later publication.\n",
+        "    assert (publication['head'], publication['tree'], publication['parent']) == expected_tuple\n",
+        "    assert publication['source_handoff']['sha256'] == review['diagnostic_handoff']['sha256']\n",
+        "    assert publication['original_push']['nonforce'] is True and publication['original_push']['terminal']['exit_code'] == 0\n",
+        "    assert publication['supported_remote_readback']['data']['object']['sha'] == review['head']\n",
+        "    assert root_adoption['product'] == review['head'] and root_adoption['tree'] == review['tree'] and root_adoption['parent'] == review['parent']\n",
+        "    assert assignment['id'] == 'cf734926-9a5e-421b-8d6c-3ec1349fbc22'\n",
+        "    assert assignment['from']['session'] == 'ec204421-6a6d-4edc-a23d-c8f8fc1b5ab1'\n",
+        "    assert assignment['to']['session'] == '16f081ec-6630-45c9-a097-a610a9b7251e'\n",
+        "    assert proposal['kind'] == 'FUTURE_TWO_RECOVERY_CACHE_PARENT_DIAGNOSTIC_CONTROLLER_SOURCE_PROPOSAL_NOT_IMPLEMENTATION_OR_ADMISSION'\n"
+      ],
+      "new_lines": [
+        "    freeze = read_bound('product_freeze')\n",
+        "    product_review = read_bound('product_source_review')\n",
+        "    plain = read_bound('repinned_plain_data')\n",
+        "    publication = read_bound('publication')\n",
+        "    read_bound('old_plain_data')  # Historical DATA, not this executable contract.\n",
+        "    assert freeze['schema'] == 'pr1238_required_git_success_fixture_source_freeze_v1'\n",
+        "    assert (freeze['head'], freeze['tree'], freeze['parent']) == (review['head'], review['tree'], review['parent'])\n",
+        "    assert freeze['control_sha256'] == plan['source_paths_sha256']['src/control.rs'] == '0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5'\n",
+        "    assert product_review['schema'] == 'pr1238-required-git-fixture-independent-source-review-v1'\n",
+        "    assert product_review['verdict'] == 'BOUNDED_TEST_ONLY_SOURCE_CLEAR_AND_PLAIN_DATA_REPINNED'\n",
+        "    assert (product_review['head'], product_review['tree'], product_review['parent']) == (review['head'], review['tree'], review['parent'])\n",
+        "    assert product_review['freeze']['sha256'] == review['product_freeze']['sha256']\n",
+        "    assert product_review['source_checks']['control_sha256'] == freeze['control_sha256']\n",
+        "    assert product_review['source_checks']['all_other_entries_modes_types_oids_exact'] == freeze['unchanged_other_entries'] == 1760\n",
+        "    assert product_review['source_checks']['total_entries'] == 1761 and product_review['source_checks']['inverse_exact_control_bytes_equal_parent'] is True\n",
+        "    assert product_review['data_repin']['sha256'] == review['repinned_plain_data']['sha256']\n",
+        "    assert plain['schema'] == 'pr1238-a518258d-cli5-plain-qualification-data-v1'\n",
+        "    assert (plain['source']['head'], plain['source']['tree']) == (review['head'], review['tree'])\n",
+        "    assert plain['source']['paths_sha256'] == plan['source_paths_sha256']\n",
+        "    assert publication['schema'] == 'pr1238_a518258d_reviewed_source_publication_v1'\n",
+        "    assert (publication['head'], publication['tree'], publication['parent']) == (review['head'], review['tree'], review['parent'])\n",
+        "    assert publication['actual_normal_push']['exit'] == 0 and publication['supported_remote_readback']['object_sha'] == review['head']\n",
+        "    assert publication['independent_review']['sha256'] == review['product_source_review']['sha256']\n",
+        "    assert publication['CLI5_source_DATA']['sha256'] == review['repinned_plain_data']['sha256']\n"
+      ]
+    },
+    {
+      "old_start_line0": 947,
+      "old_end_line0": 948,
+      "new_start_line0": 927,
+      "new_end_line0": 928,
+      "old_lines": [
+        "    assert data['schema'] == 'issue2025-recovery-cache-two-partial-diagnostic-data-v1'\n"
+      ],
+      "new_lines": [
+        "    assert data['schema'] == 'pr1238-a518-cli5-controller-task-data-v1'\n"
+      ]
+    },
+    {
+      "old_start_line0": 953,
+      "old_end_line0": 953,
+      "new_start_line0": 933,
+      "new_end_line0": 934,
+      "old_lines": [],
+      "new_lines": [
+        "    assert data['binary_checks'] == plan['binary_checks'] == [{'label': 'cli-binary-check', 'argv': ['cargo', 'check', '--locked', '--no-default-features', '--bin', 'cagents'], 'seconds': 600}]\n"
+      ]
+    },
+    {
+      "old_start_line0": 954,
+      "old_end_line0": 955,
+      "new_start_line0": 935,
+      "new_end_line0": 936,
+      "old_lines": [
+        "    assert group['id'] == 'host-lib' and group['features'] == ['host'] and group['manifest'] == 'Cargo.toml'\n"
+      ],
+      "new_lines": [
+        "    assert group['id'] == 'cli-lib' and group['features'] == [] and group['manifest'] == 'Cargo.toml'\n"
+      ]
+    },
+    {
+      "old_start_line0": 956,
+      "old_end_line0": 957,
+      "new_start_line0": 937,
+      "new_end_line0": 938,
+      "old_lines": [
+        "    assert group['compile_argv'] == ['cargo', 'test', '--locked', '--no-default-features', '--features', 'host', '--lib', '--no-run', '--message-format=json']\n"
+      ],
+      "new_lines": [
+        "    assert group['compile_argv'] == ['cargo', 'test', '--locked', '--no-default-features', '--lib', '--no-run', '--message-format=json']\n"
+      ]
+    },
+    {
+      "old_start_line0": 958,
+      "old_end_line0": 961,
+      "new_start_line0": 939,
+      "new_end_line0": 941,
+      "old_lines": [
+        "    assert names == data['selected_names'] == [row['name'] for row in helper['exact_parents']] == proposal['future_product']['selector_names']\n",
+        "    assert len(set(names)) == 2 and all(row['expected_stdout_child_results'] == 0 for row in group['selectors'])\n",
+        "    assert group['source_self_child_membership'] == []\n"
+      ],
+      "new_lines": [
+        "    assert names == data['selected_names'] == [row['name'] for row in plain['artifact_groups'][0]['selectors']]\n",
+        "    assert len(names) == len(set(names)) == 5 and all(row['seconds'] == 90 and row['expected_stdout_child_results'] == 0 for row in group['selectors'])\n"
+      ]
+    },
+    {
+      "old_start_line0": 962,
+      "old_end_line0": 965,
+      "new_start_line0": 942,
+      "new_end_line0": 945,
+      "old_lines": [
+        "    assert (group['compile_seconds'], group['inventory_seconds'], group['diagnostic_seconds']) == (600, 30, 180)\n",
+        "    assert plan['planned_phase_order'] == data['planned_phase_order'] == ['compile-host-lib', 'inventory-host-lib', 'parent-host-lib-recovery-cache-two']\n",
+        "    assert plan['planned_phase_count'] == 3 and plan['packet_deadline_seconds'] == plan['phase_caps_sum_seconds'] == 810\n"
+      ],
+      "new_lines": [
+        "    assert (group['compile_seconds'], group['inventory_seconds']) == (900, 30)\n",
+        "    assert plan['planned_phase_order'] == data['planned_phase_order'] == ['cli-binary-check', 'compile-cli-lib', 'inventory-cli-lib', 'parent-cli-lib-1', 'parent-cli-lib-2', 'parent-cli-lib-3', 'parent-cli-lib-4', 'parent-cli-lib-5']\n",
+        "    assert plan['planned_phase_count'] == 8 and plan['packet_deadline_seconds'] == 2400 and plan['phase_caps_sum_seconds'] == 1980\n"
+      ]
+    },
+    {
+      "old_start_line0": 968,
+      "old_end_line0": 969,
+      "new_start_line0": 948,
+      "new_end_line0": 948,
+      "old_lines": [
+        "    assert data['original347_gate'] == 'UNRESOLVED_UNCHANGED_NOT_INVOKED_OR_SATISFIED_BY_THIS_PACKET'\n"
+      ],
+      "new_lines": []
+    },
+    {
+      "old_start_line0": 984,
+      "old_end_line0": 985,
+      "new_start_line0": 963,
+      "new_end_line0": 964,
+      "old_lines": [
+        "    out = Path('/tmp/coord16-issue2025-recovery-cache-two-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))\n"
+      ],
+      "new_lines": [
+        "    out = Path('/tmp/coord16-pr1238-a518-cli5-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))\n"
+      ]
+    },
+    {
+      "old_start_line0": 991,
+      "old_end_line0": 991,
+      "new_start_line0": 970,
+      "new_end_line0": 977,
+      "old_lines": [],
+      "new_lines": [
+        "        relative = Path(binding['name'])\n",
+        "        assert relative.parts and not relative.is_absolute() and all(part not in ('.', '..') and re.fullmatch(r'[A-Za-z0-9_.-]+', part) for part in relative.parts), 'Unsafe archive destination'\n",
+        "        archive_parent = out\n",
+        "        for component in relative.parts[:-1]:\n",
+        "            archive_parent = archive_parent / component\n",
+        "            archive_parent.mkdir(mode=0o700, exist_ok=True)\n",
+        "            assert archive_parent.is_dir() and not archive_parent.is_symlink(), 'Unsafe archive parent'\n"
+      ]
+    },
+    {
+      "old_start_line0": 1282,
+      "old_end_line0": 1284,
+      "new_start_line0": 1268,
+      "new_end_line0": 1270,
+      "old_lines": [
+        "             'owning_commands_qualified': error is None and not CANCELLATION_SIGNALS and accounting['final_group_semantics_qualified'] and len(tests) == 1 and [parent['invocation'] for parent in tests] == ['parent-host-lib-recovery-cache-two'] and [phase['label'] for phase in phases] == plan['planned_phase_order'] and actual_release,\n",
+        "             'qualified_scope': 'PARTIAL_RECOVERY_CACHE_TWO_PARENT_DIAGNOSTIC_ONLY',\n"
+      ],
+      "new_lines": [
+        "             'owning_commands_qualified': error is None and not CANCELLATION_SIGNALS and accounting['final_group_semantics_qualified'] and len(tests) == 5 and [parent['invocation'] for parent in tests] == ['parent-cli-lib-1', 'parent-cli-lib-2', 'parent-cli-lib-3', 'parent-cli-lib-4', 'parent-cli-lib-5'] and [phase['label'] for phase in phases] == plan['planned_phase_order'] and actual_release,\n",
+        "             'qualified_scope': 'PR1238_CLI5_PARTIAL_CHANNEL_RESULT_ONLY',\n"
+      ]
+    }
+  ],
+  "exact_reconstruction": true
+}

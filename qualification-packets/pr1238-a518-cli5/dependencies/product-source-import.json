@@ -1,0 +1,10 @@
+{
+  "scope": "Exact normal local Git source-object import verified; no checkout/source mutation/build/target/toolversion/runtime probe",
+  "head": "a518258df79fb77d3023e698ad9c2e0fd99e01ef",
+  "tree": "5fa482932bd557782b1e47fd63edc6da605ed2db",
+  "parent": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+  "control_sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+  "control_bytes": 247063,
+  "import_original_chunk": "8b70f2",
+  "import_exit": 0
+}

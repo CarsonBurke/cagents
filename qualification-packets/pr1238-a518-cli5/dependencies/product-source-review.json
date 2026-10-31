@@ -1,0 +1,318 @@
+{
+  "schema": "pr1238-required-git-fixture-independent-source-review-v1",
+  "created_utc": "2026-10-31T13:40:47.501325+00:00",
+  "verdict": "BOUNDED_TEST_ONLY_SOURCE_CLEAR_AND_PLAIN_DATA_REPINNED",
+  "head": "a518258df79fb77d3023e698ad9c2e0fd99e01ef",
+  "tree": "5fa482932bd557782b1e47fd63edc6da605ed2db",
+  "parent": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/pr1238-required-git-fixture-source-freeze-v1.json",
+    "sha256": "cd80f570cef41acbd189ab9a7270a1a12a203295bc132aac802cc96d87b8c867",
+    "verified_before_after": true
+  },
+  "source_checks": {
+    "exact_one_hunk": true,
+    "insertions": 2,
+    "deletions": 5,
+    "changed_path": "src/control.rs",
+    "control_blob": "d250c91ee1c8ae33c893e52bf01b5cb0b5cecd31",
+    "control_sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+    "all_other_entries_modes_types_oids_exact": 1760,
+    "total_entries": 1761,
+    "inverse_exact_control_bytes_equal_parent": true,
+    "physical_source_matches_Git_before_after": true,
+    "head_tree_tracked_clean_before_after": true
+  },
+  "semantics": {
+    "type": "Option<TempDir>::expect produces the same TempDir as the old Some binding. No import, signature, production, shared-helper or other-caller change.",
+    "negative": "A missing/nonworking Git fixture now panics/fails the owning parent rather than returning successful libtest status. No environment or authority is stripped.",
+    "ordering": "The fixture requirement precedes server-thread spawn. If it fails, the already-created UnixStream pair unwinds locally; this delta introduces no waiting peer thread.",
+    "positive": "Successful setup runs the original real canonical-repository resolution, actual framed OpenProject then CreateChannel, minted-ID/order/output assertions and original peer join unchanged.",
+    "scope": "Closes the identified source-level silent-pass gap; it is not an actual test pass or new family/child-wait qualification."
+  },
+  "data_repin": {
+    "path": "/tmp/pr1238-a518258d-cli5-source-data-llleqlk2/qualification-data-plan.json",
+    "sha256": "515be84d1f8144c3c7b196bfaceebf4695b5f19269389b10df54148e0db20c29",
+    "predecessor": "/tmp/pr1238-d5c5a352-cli5-qualification-data-plan.json",
+    "predecessor_sha256": "6674568a60b7a429f594a73554898df62582df509fe9163c727fe2c4ce22eff7",
+    "original_immutable_unchanged": true,
+    "source_pins_checked": [
+      {
+        "path": "Cargo.toml",
+        "git_blob": "e31397071241afa30de656540d614456c6a32e33",
+        "sha256": "294e102940eb184f4f9e9cdaedd2c200408c7837667c8889762af0008025b989"
+      },
+      {
+        "path": "Cargo.lock",
+        "git_blob": "e591549d5bc550aded0aea5cb49d139a3c71c507",
+        "sha256": "a101bfe4db08c54bb972d7528ac5f65af0e0b7bb6bbefe0886fd63a9612e2561"
+      },
+      {
+        "path": ".cargo/config.toml",
+        "git_blob": "26c381c4d46ced77ee6a3f219e29a3193b205a9d",
+        "sha256": "ae0cd2fea772a441a4864aee9e0551445e14d1ccebadfbdc6ce55d5052600a96"
+      },
+      {
+        "path": "build.rs",
+        "git_blob": "935672a3504690936d8802a95859c012b4709b04",
+        "sha256": "343c620c6a85a19ee187c9d5ce23f796c47aa3d10e80b445caf749c7e299083f"
+      },
+      {
+        "path": "src/lib.rs",
+        "git_blob": "02575b9f47687c692079fd9959cf8be4e5a291fb",
+        "sha256": "55e51db076af7d6b8dcdd2fff289830ce2e728e54b1d5b784a71d0f553168326"
+      },
+      {
+        "path": "src/modules.rs",
+        "git_blob": "4510cbec8ab683a45b22e376f65f91c0960e035e",
+        "sha256": "c9be7901ea1daeb139eaa170719179124b3f286ee6f2431507c94e5d6feef410"
+      },
+      {
+        "path": "src/main.rs",
+        "git_blob": "429db35e164a3306f4e91c2576f4fc352606ebce",
+        "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d"
+      },
+      {
+        "path": "src/control.rs",
+        "git_blob": "d250c91ee1c8ae33c893e52bf01b5cb0b5cecd31",
+        "sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5"
+      },
+      {
+        "path": "src/model.rs",
+        "git_blob": "19310139dd1a7ca408a1fc8b7e016d374f7456ec",
+        "sha256": "a6b1a73d0c1a56838b8890dadf5be92fc6fde8b1d9b4ff3fa68ef1c0c1f08655"
+      },
+      {
+        "path": "src/terminal/ipc.rs",
+        "git_blob": "abc95c53efd8d0ecc0e06bfd991b251583411af1",
+        "sha256": "f525f42cd6a12909250a012b46c2ef8ad195542a0153404441826b08f3305806"
+      },
+      {
+        "path": "src/workspace_model.rs",
+        "git_blob": "5b6d4b40d1c22a291ad0a28cce1ba74d5750cecb",
+        "sha256": "0dc9e6ab4a90cf4ed9c335b76cf1cc4920aa176690f01f6f8b6b9bbef98b86a1"
+      },
+      {
+        "path": "src/project_location.rs",
+        "git_blob": "443970b2ac4d2476d6f56239eaed3d8a9d591823",
+        "sha256": "d0d57dc5354550c9d77f4c6ec9df0fa525b231f5acc51e9c4a33881e923adbcb"
+      }
+    ],
+    "selected_parent_line_anchors": [
+      {
+        "name": "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+        "line": 4515
+      },
+      {
+        "name": "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+        "line": 4672
+      },
+      {
+        "name": "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+        "line": 4403
+      },
+      {
+        "name": "control::tests::request_ids_and_remote_errors_fail_closed",
+        "line": 5475
+      },
+      {
+        "name": "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed",
+        "line": 5524
+      }
+    ],
+    "json_value_changes": [
+      {
+        "path": "/schema",
+        "before": "pr1238-d5c5a352-cli5-plain-qualification-data-v1",
+        "after": "pr1238-a518258d-cli5-plain-qualification-data-v1"
+      },
+      {
+        "path": "/source/head",
+        "before": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+        "after": "a518258df79fb77d3023e698ad9c2e0fd99e01ef"
+      },
+      {
+        "path": "/source/tree",
+        "before": "70cb66f47cda6d69f331c91c20b992b4b3712d73",
+        "after": "5fa482932bd557782b1e47fd63edc6da605ed2db"
+      },
+      {
+        "path": "/source/paths_sha256/src/control.rs",
+        "before": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+        "after": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5"
+      },
+      {
+        "path": "/source/control_git_blob",
+        "before": "ce17d4791a4cfb0419279ca60cbf85d39490c8cb",
+        "after": "d250c91ee1c8ae33c893e52bf01b5cb0b5cecd31"
+      },
+      {
+        "path": "/selected_parents/0/source_sha256",
+        "before": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+        "after": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5"
+      },
+      {
+        "path": "/selected_parents/0/line",
+        "before": 4518,
+        "after": 4515
+      },
+      {
+        "path": "/selected_parents/1/source_sha256",
+        "before": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+        "after": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5"
+      },
+      {
+        "path": "/selected_parents/1/line",
+        "before": 4675,
+        "after": 4672
+      },
+      {
+        "path": "/selected_parents/2/source_sha256",
+        "before": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+        "after": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5"
+      },
+      {
+        "path": "/selected_parents/2/why",
+        "before": "Original canonical-repository success parent; git_checkout can return early, so semantic exercise remains unproved by an ok row.",
+        "after": "Original canonical-repository success parent now requires successful Git fixture setup with expect; the former silent early return is removed. Actual owning execution remains UNRUN."
+      },
+      {
+        "path": "/selected_parents/3/source_sha256",
+        "before": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+        "after": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5"
+      },
+      {
+        "path": "/selected_parents/3/line",
+        "before": 5478,
+        "after": 5475
+      },
+      {
+        "path": "/selected_parents/4/source_sha256",
+        "before": "3ad7e5f5eb762f264e8aea11da8191a35ff0a7a6ef7911893d3fbc80b2122c81",
+        "after": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5"
+      },
+      {
+        "path": "/selected_parents/4/line",
+        "before": 5527,
+        "after": 5524
+      },
+      {
+        "path": "/fixture_and_descendant_risks/success_parent/status",
+        "before": "SEMANTIC_EXERCISE_UNMET",
+        "after": "SOURCE_GIT_PREREQUISITE_FAILS_CLOSED_RUNTIME_UNRUN"
+      },
+      {
+        "path": "/fixture_and_descendant_risks/success_parent/source_lines/2",
+        "before": 4758,
+        "after": 4755
+      },
+      {
+        "path": "/fixture_and_descendant_risks/success_parent/source_lines/3",
+        "before": 4760,
+        "after": 4757
+      },
+      {
+        "path": "/fixture_and_descendant_risks/success_parent/source_lines/4",
+        "before": 4767,
+        "after": 4764
+      },
+      {
+        "path": "/fixture_and_descendant_risks/success_parent/contract",
+        "before": "The existing parent calls git_checkout; Command git init --quiet is awaited. If spawning or Git init fails it returns None and the parent returns early while libtest reports ok.",
+        "after": "The owning parent now calls git_checkout().expect before starting its peer thread. The helper still awaits Command git init --quiet; spawn/init failure returns None and now fails this selected parent instead of reporting unexercised ok. Successful setup retains the exact canonical-repository resolution and original OpenProject/CreateChannel/output assertions."
+      },
+      {
+        "path": "/fixture_and_descendant_risks/success_parent/required_limit",
+        "before": "An ok row, source availability, artifact inventory, git binary presence or unrelated Git/version success does not prove this parent exercised its success flow. No fixture-success marker or per-Git original result is supplied by this DATA file or generic CORE. Keep that semantic evidence explicitly unmet until separately established through actual source-bound owning evidence; no extra command or source patch is invented here.",
+        "after": "This source correction removes the identified silent-pass path; no actual Git fixture, libtest result, compiled inventory or ELF is supplied by this DATA. Require the exact same-artifact named singleton outcome and original exit after the real canonical-repository/peer assertions; do not infer provider, native, caller-authority or complete child-settlement evidence from this change."
+      },
+      {
+        "path": "/consumer_mapping/new_task_binding_required",
+        "before": "New explicit source adaptation must replace only task-binding/main assertions/constants/plan and the four allowed cardinalities: PR1238/d5c5 head/tree/control hash, five exact source parents, features[], CLI binary/compile commands, eight phases, new source-binding and controller-review bytes, own output packet path. Preserve SCOPE_PARENT=None, staged observations absent, original waits, sticky failure history, original family/lock settlement and negative-path limits.",
+        "after": "New explicit source adaptation must replace only task-binding/main assertions/constants/plan and the four allowed cardinalities: PR1238/a518 head/tree/control hash, five exact source parents, features[], CLI binary/compile commands, eight phases, new source-binding and controller-review bytes, own output packet path. Preserve SCOPE_PARENT=None, staged observations absent, original waits, sticky failure history, original family/lock settlement and negative-path limits."
+      },
+      {
+        "path": "/evidence_and_admission/acceptance_limits/2",
+        "before": "Original success fixture semantic exercise remains explicitly unmet even after a nominal libtest ok without additional owning evidence.",
+        "after": "The success parent now fails when its required Git fixture is unavailable; actual semantic exercise and strict original owning results remain UNRUN until separately admitted execution."
+      }
+    ],
+    "only_source_identity_lines_and_required_Git_descriptions_changed": true,
+    "inverse_serialization_reproduces_original_bytes_sha256": "6674568a60b7a429f594a73554898df62582df509fe9163c727fe2c4ce22eff7",
+    "commands_features_phase_graph_counts_budgets_oracles_and_consumer_core_unchanged": true,
+    "controller_written_or_imported": false,
+    "all_actual_admission_runtime_fields_null": true
+  },
+  "format_and_runtime_limits": {
+    "owner_receipt_reused_only": {
+      "repository_scripts_check_format": {
+        "chunk": "594790",
+        "exit": 127,
+        "reason": "Historical branch has no scripts/check-format; no script copied or fabricated."
+      },
+      "physical_cargo_fmt_check": {
+        "chunk": "74629f",
+        "exit": 0
+      },
+      "physical_hidden_modules_check": {
+        "chunks": [
+          "cc87a4",
+          "987f3b"
+        ],
+        "exit": 1,
+        "reason": "Preexisting broad formatting differences outside declared hunk; no rewrite."
+      },
+      "physical_control_with_children_check": {
+        "chunk": "1cbd81",
+        "exit": 1,
+        "reason": "Preexisting child module formatting differences; no rewrite."
+      },
+      "physical_control_only_check": {
+        "chunk": "358914",
+        "exit": 0,
+        "argv": [
+          "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/rustfmt",
+          "--edition",
+          "2024",
+          "--check",
+          "--config",
+          "skip_children=true",
+          "src/control.rs"
+        ]
+      },
+      "diff_check": {
+        "chunk": "2d1d14",
+        "exit": 0
+      }
+    },
+    "official_script": "Historical scripts/check-format absent: actual owner127 retained; no official pass.",
+    "narrow_format": "Owner physical cargo fmt check0 and control-only skip_children=true0 retained as scoped observations.",
+    "broader_format": "Owner hidden-module and control-with-children checks1 remain negative. No source rewrite, waiver or full-format pass. The exact outside-hunk conservation confirms this test change does not alter those other bytes; no baseline execution repeated.",
+    "compiler_tests_CLI_native": "ALL a518 compile/tests/CLI/native UNRUN; no grant, queue allocation, tool/target/current-context or whole-PR/main-composition qualification."
+  },
+  "publication": "Source ancestry supports ordinary nonforce FF afterRoot verifies actual remote endpoint. This is bounded source review only; no public write or merge authorization. Historical metadata rejection remains, with no alternate route.",
+  "activity": "Immutable/source/Git/hash/data reads and own sealed/tmp review/repin only. No product edits, formatter/compiler/test/helper/native/provider execution, process/environment/account/DB/cache/target/lock probes, allocation or children.",
+  "artifact_members": [
+    {
+      "path": "git-query-ledger.json",
+      "sha256": "f3d76ed6551623f8c962123d206669fda1a0cabf8fe35ff90c7b72dc98b3aad1",
+      "bytes": 12218
+    },
+    {
+      "path": "exact-test-only-source.diff",
+      "sha256": "a6dacf6588c7d22878167c8ebe4f8672c0395a6460ce0fda1307927e7445cf94",
+      "bytes": 937
+    },
+    {
+      "path": "data-plan-repin.diff",
+      "sha256": "1bfce829b7bc592575e1eed3a715b4b630b4ae126d5426594c3976e9a6c0e5d4",
+      "bytes": 10381
+    },
+    {
+      "path": "qualification-data-plan.json",
+      "sha256": "515be84d1f8144c3c7b196bfaceebf4695b5f19269389b10df54148e0db20c29",
+      "bytes": 25745
+    }
+  ]
+}

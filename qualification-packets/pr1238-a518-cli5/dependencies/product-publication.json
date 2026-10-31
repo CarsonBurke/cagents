@@ -1,0 +1,33 @@
+{
+  "schema": "pr1238_a518258d_reviewed_source_publication_v1",
+  "created_utc": "2026-10-31T13:42:34.271843+00:00",
+  "pr": "https://github.com/CarsonBurke/cagents/pull/1238",
+  "branch": "campaign/cli_contracts",
+  "head": "a518258df79fb77d3023e698ad9c2e0fd99e01ef",
+  "tree": "5fa482932bd557782b1e47fd63edc6da605ed2db",
+  "parent": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+  "actual_normal_push": {
+    "initial_chunk": "5b6fc1",
+    "session": 84330,
+    "terminal_chunk": "d4d3f1",
+    "exit": 0,
+    "nonfatal_stderr": "Cannot create an item in a locked collection; push nevertheless succeeded; no unlock/workaround."
+  },
+  "supported_remote_readback": {
+    "url": "https://api.github.com/repos/CarsonBurke/cagents/git/ref/heads/campaign/cli_contracts",
+    "object_sha": "a518258df79fb77d3023e698ad9c2e0fd99e01ef",
+    "object_type": "commit"
+  },
+  "independent_review": {
+    "path": "/tmp/pr1238-a518258d-cli5-source-data-llleqlk2/review.json",
+    "sha256": "3722984c098083c3818d6de80a280a6b302348890c0a69d3c925d2653b1eee25"
+  },
+  "CLI5_source_DATA": {
+    "path": "/tmp/pr1238-a518258d-cli5-source-data-llleqlk2/qualification-data-plan.json",
+    "sha256": "515be84d1f8144c3c7b196bfaceebf4695b5f19269389b10df54148e0db20c29"
+  },
+  "change": "One existing success parent now explicitly fails unavailable Git checkout rather than reporting unexercised pass. Production and1760otherentries unchanged.",
+  "validation": "Physical cargo fmt0/control-only rustfmt0/diff0; broad historical hidden-module formatting fails, official script absent. Current Rust compiler/tests/native UNRUN.",
+  "PR_state": "OPEN_DRAFT; no readiness/merge/automerge claim",
+  "metadata_update": "Not retried: earlier supported body update was automatically rejected; ordinary source Git push is a separately authorized supported action."
+}

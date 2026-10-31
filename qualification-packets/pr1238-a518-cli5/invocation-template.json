@@ -1,0 +1,21 @@
+{
+  "kind": "PRE_REVIEW_NOT_SUBMITTABLE_NO_RUNTIME_AUTHORITY",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "future_external_handoff": "Root binds actual final nonauthor controller review externally after freeze, leaving only grant slot5 NULL; no selfhash/review cycle.",
+  "execution_authorized": false,
+  "plan_sha256": "d5c074fbea83b6863b73ae574a8b55fb8a4425cce527c6e0f87685dbf56990e9"
+}

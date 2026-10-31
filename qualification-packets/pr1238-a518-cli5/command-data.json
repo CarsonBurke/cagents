@@ -1,0 +1,227 @@
+{
+  "schema": "pr1238-a518-cli5-controller-task-data-v1",
+  "issue": 1238,
+  "source": {
+    "head": "a518258df79fb77d3023e698ad9c2e0fd99e01ef",
+    "tree": "5fa482932bd557782b1e47fd63edc6da605ed2db",
+    "parent": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result"
+  },
+  "selected_names": [
+    "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+    "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+    "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+    "control::tests::request_ids_and_remote_errors_fail_closed",
+    "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed"
+  ],
+  "selected_parents": [
+    {
+      "name": "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+      "source": "src/control.rs",
+      "source_sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+      "line": 4515,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 6,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "New real UnixStream second-step refusal(false/true), EOF, invalid length, wrong response variant, and missing-C model cases.",
+      "body_sha256": "c88786ee72e7cee9fe580162ca33c4cc8ff11aaa2bfcce4e1fcfc42eaf9f231b"
+    },
+    {
+      "name": "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+      "source": "src/control.rs",
+      "source_sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+      "line": 4672,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 1,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "First OpenProject refusal retains original error and sends no CreateChannel or partial context.",
+      "body_sha256": "4cd1cf5957fd91460aaf1888fbbff6a3001fa6c32758019f7a92ea307cf8bdfc"
+    },
+    {
+      "name": "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+      "source": "src/control.rs",
+      "source_sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+      "line": 4403,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 1,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "Original canonical-repository success parent now requires successful Git fixture setup with expect; the former silent early return is removed. Actual owning execution remains UNRUN.",
+      "body_sha256": "97f7808070d041d7dca2f986ae1542d33a1b36cfdad538df48a1d7d57ab707df"
+    },
+    {
+      "name": "control::tests::request_ids_and_remote_errors_fail_closed",
+      "source": "src/control.rs",
+      "source_sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+      "line": 5475,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 2,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "Original wrong request ID / correlated remote error classifier.",
+      "body_sha256": "d82d021a81b23df17a69021221aa1110ef7f445753bc47571c8459a3985dd5b1"
+    },
+    {
+      "name": "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed",
+      "source": "src/control.rs",
+      "source_sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+      "line": 5524,
+      "attributes": [
+        "test"
+      ],
+      "ignored": false,
+      "cfg": [
+        "test"
+      ],
+      "outer_parent_count": 1,
+      "nested_case_count": 2,
+      "nested_cases_are_nonadditive": true,
+      "expected_stdout_child_results": 0,
+      "seconds": 90,
+      "why": "Original pinned-proof mismatch / unsolicited redraw classifier.",
+      "body_sha256": "223675ea2f42c1489010e82e1569fa7541de74684367c657b2d3a78af120e667"
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "cli-lib",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+        "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+        "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+        "control::tests::request_ids_and_remote_errors_fail_closed",
+        "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::request_ids_and_remote_errors_fail_closed",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 600
+    }
+  ],
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-1",
+    "parent-cli-lib-2",
+    "parent-cli-lib-3",
+    "parent-cli-lib-4",
+    "parent-cli-lib-5"
+  ],
+  "runtime_admission": {
+    "state": "CLI5_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "raw_plain_data_scope": "Genuine source-mapped reference only; its old execution flags/core counts/forced cleanup prose are not this controller ABI."
+}
