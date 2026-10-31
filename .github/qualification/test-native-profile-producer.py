@@ -8,6 +8,8 @@ reads below are the only real Path operations. Run only after independent review
 import ast
 from contextlib import contextmanager
 import copy
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -16,6 +18,7 @@ import re
 import sys
 from types import SimpleNamespace
 import unittest
+from urllib.parse import urlencode
 
 DIRECTORY = Path(__file__).parent
 SOURCE = (DIRECTORY/'native-profile-producer.py').read_text()
@@ -27,13 +30,15 @@ def extracted():
     names = {'need','digest','encoded','reference','admit_references','admitted_contract','validate_admission',
         'proposed_layout','run_matrix','validate_leaves','validate_coverage','validate_manifest','verify_payload',
         'compiler_json','verify_compiler_evidence','cache_key','publication_proof','positive_roots','settle_writers',
-        'drain_streams','user_context','owner_type'}
-    constants = {'PINNED_ADMISSION_INPUTS','INPUT_NAMES','FEATURES','PHASE'}
+        'drain_streams','user_context','owner_type','readback_request','selected_headers','fetch_readback',
+        'http_observation','save_declaration','complete_body_length'}
+    constants = {'PINNED_ADMISSION_INPUTS','INPUT_NAMES','FEATURES','PHASE','API_HOST','API_VERSION','SAVE_SHA','SAFE_HEADERS'}
     selected = [copy.deepcopy(node) for node in ast.parse(SOURCE).body
         if isinstance(node,ast.FunctionDef) and node.name in names
         or isinstance(node,ast.Assign) and any(isinstance(t,ast.Name) and t.id in constants for t in node.targets)]
     assert {node.name for node in selected if isinstance(node,ast.FunctionDef)} == names
-    api = dict(__builtins__=__builtins__,PurePosixPath=PurePosixPath,posixpath=posixpath,json=json,hashlib=hashlib)
+    api = dict(__builtins__=__builtins__,PurePosixPath=PurePosixPath,posixpath=posixpath,json=json,hashlib=hashlib,
+        datetime=datetime,timedelta=timedelta,parsedate_to_datetime=parsedate_to_datetime,urlencode=urlencode,re=re)
     exec(compile(ast.Module(body=selected,type_ignores=[]),'<actual-pure-producer-definitions>','exec'),api)
     prep_names = {'need','path_text','cargo_argv','select_binary','select_libraries','fixture_argv'}
     prep_selected = [copy.deepcopy(node) for node in ast.parse(PREPARATION).body
@@ -70,7 +75,10 @@ class Fixture:
         self.layout['fixture'] = '/algorithm-only/workspace/control/.github/qualification/final-main-fixture.rs'
         self.records,self.logs,self.graphs = [],{},{}
         self.context = dict(repository=self.plan['repository'],event='pull_request',branch=self.plan['branch'],
-            ref=self.plan['cache_ref'],pull_request=1933,run=123,attempt=1,job_name='algorithm-only',controller_sha='a'*40)
+            ref=self.plan['cache_ref'],pull_request=1933,run=123,attempt=1,
+            job_name=self.plan['publication_contract']['logical_job'],controller_sha='a'*40)
+        self.sources={name:dict(path='/algorithm-only/control/'+name,sha256='c'*64,bytes=17)
+                      for name in ('module','workflow','plan')}
         self.environments = {label:{'algorithm-only':label} for label in ('before','after')}
 
     def rows(self, label, graph):
@@ -113,10 +121,80 @@ class Fixture:
                 mode=mode,bytes=11,sha256='b'*64) for path,mode in paths],key=lambda value:value['path'])
         self.manifest = dict(kind='native-payload-manifest-v2',products=self.plan['products'],context=self.context,
             layout=self.layout,arms=arms,commands=self.records,fixture_sha256=self.plan['fixture_sha256'],
+            controller_sha=self.context['controller_sha'],publication_sources=self.sources,
+            plan_sha256=self.sources['plan']['sha256'],
             compiler_settlement=dict(original_roots=roots(),kernel_echild=True,no_more_spawns=True,errors=[],external_entry_wait=None))
         self.api['validate_manifest'](self.manifest,self.plan)
         self.api['verify_compiler_evidence'](self.manifest,self.graphs,self.prep)
         return self.manifest
+
+
+def http_data(f, request, phase, rows, date):
+    body=f.api['encoded'](dict(total_count=len(rows),actions_caches=rows))
+    headers=f.api['encoded'](f.api['selected_headers']([('Date',date),('X-GitHub-Request-Id','algorithm-only'),
+        ('Content-Type','application/json; charset=utf-8')]))
+    data=dict(body=body,headers=headers,observation=dict(kind='original-cache-http-observation-v1',phase=phase,
+        request=copy.deepcopy(request),status=200,complete=True,error=None,closure_errors=[],
+        observed_start='algorithm-only',observed_finish='algorithm-only'))
+    rebind_http(f,data)
+    return data
+
+
+def rebind_http(f, data):
+    for name in ('body','headers'):
+        raw=data[name]
+        data['observation'][name]=dict(path='/algorithm-only/'+data['observation']['phase']+'.'+name,
+            sha256=f.api['digest'](raw),bytes=len(raw))
+
+
+def publication_data(f):
+    raw=f.api['encoded'](f.manifest)
+    request=f.api['readback_request'](raw,f.context,f.plan,f.sources,f.layout)
+    before=http_data(f,request,'before',[],'Tue, 01 Jan 2030 00:00:00 GMT')
+    row=dict(id=999,ref=request['ref'],key=request['key'],version='algorithm-version',size_in_bytes=123,
+             created_at='2030-01-01T00:00:30Z')
+    after=http_data(f,request,'after',[row],'Tue, 01 Jan 2030 00:01:00 GMT')
+    save=f.api['save_declaration'](request,f.layout,'success','success')
+    return raw,request,before,after,save
+
+
+class HttpHarness:
+    """Inert socket/HTTP objects, retained bytes in RAM; no external factory."""
+    def __init__(self, f, request):
+        self.f,self.request=f,request;self.events=[];self.retained={};self.status=200
+        self.headers=[('Date','Tue, 01 Jan 2030 00:00:00 GMT'),('X-GitHub-Request-Id','algorithm-only'),
+                      ('Content-Type','application/json'),('Set-Cookie','must-not-retain'),('Authorization','must-not-retain')]
+        self.chunks=[f.api['encoded'](dict(total_count=0,actions_caches=[])),b'']
+        self.token='algorithm-only-readback-token';self.clock=lambda:0
+    def factory(self, timeout):
+        self.events.append(('factory',timeout));outer=self
+        class Socket:
+            def settimeout(self, value):outer.events.append(('timeout',value))
+        class Response:
+            status=outer.status
+            def getheaders(self):return outer.headers
+            def read1(self, maximum):
+                outer.events.append(('read',maximum));item=outer.chunks.pop(0)
+                if isinstance(item,BaseException):raise item
+                return item
+            def close(self):outer.events.append(('response-close',))
+        class Connection:
+            sock=Socket()
+            def connect(self):outer.events.append(('connect',))
+            def request(self, method, path, headers):
+                assert method=='GET' and path==outer.request['path']
+                assert headers['Authorization']=='Bearer '+outer.token
+                outer.events.append(('GET',path))  # Deliberately never retain token/header map.
+            def getresponse(self):return Response()
+            def close(self):outer.events.append(('connection-close',))
+        return Connection()
+    def retain(self, name, raw):
+        assert name not in self.retained
+        self.retained[name]=raw
+        return dict(path='/algorithm-only/'+name,sha256=self.f.api['digest'](raw),bytes=len(raw))
+    def fetch(self):
+        return self.f.api['fetch_readback'](self.request,self.token,'before',self.factory,self.clock,
+            lambda:'algorithm-only',self.f.plan['readback_caps'],self.retain)
 
 
 class ProducerAlgorithms(unittest.TestCase):
@@ -128,7 +206,7 @@ class ProducerAlgorithms(unittest.TestCase):
         self.assertEqual(reads,[])
         env=dict(RUNNER_ENVIRONMENT='github-hosted',GITHUB_REPOSITORY=PLAN['repository'],GITHUB_EVENT_NAME='pull_request',
             GITHUB_HEAD_REF=PLAN['branch'],GITHUB_REF=PLAN['cache_ref'],PRODUCER_PULL_REQUEST='1933',GITHUB_RUN_ID='123',
-            GITHUB_RUN_ATTEMPT='1',GITHUB_JOB='algorithm-only',PRODUCER_CONTROL_SHA='a'*40)
+            GITHUB_RUN_ATTEMPT='1',GITHUB_JOB=f.context['job_name'],PRODUCER_CONTROL_SHA='a'*40)
         self.assertEqual(f.api['user_context'](env),f.context)
         for value in ('','synthetic-authority'):
             changed=dict(env,CAGENTS_AGENT_AUTHORITY=value)
@@ -142,7 +220,8 @@ class ProducerAlgorithms(unittest.TestCase):
             quota_headroom_bytes=100*1024**3,cache_entry_limit_bytes=100*1024**3,
             tools={name:reference(name) for name in ('cargo','rustc','zig','clang','libclang')})
         contract=dict(kind='native-producer-publication-contract-v1',cache_ref=f.context['ref'],
-            save_action=f.plan['publication_contract']['cache_save_action'],official_readback='separate-original-collector',service_archive_sha256=None)
+            save_action=f.plan['publication_contract']['cache_save_action'],
+            official_readback=f.plan['publication_contract']['official_readback'],service_archive_sha256=None)
         docs=dict(policy=policy,grant=grant,preflight=facts,publication_contract=contract)
         f.api['validate_admission'](f.plan,f.context,docs,refs)  # Hypothetical valid contract, not an actual grant.
         for name,value in [('disk_free_bytes',None),('quota_headroom_bytes',0),('cache_entry_limit_bytes',None)]:
@@ -219,23 +298,24 @@ class ProducerAlgorithms(unittest.TestCase):
         for field in ('key','cache_key','sha256','P','A','proof_artifact'):
             changed=copy.deepcopy(m);changed[field]='must-not-enter-M'
             with self.assertRaisesRegex(ValueError,'M-cycle'):f.api['validate_manifest'](changed,f.plan)
-        ref=lambda name:dict(path='/algorithm-only/'+name,sha256='e'*64,bytes=17)
-        log=dict(run=f.context['run'],attempt=1,controller_sha=f.context['controller_sha'],key=key,ref=f.context['ref'],
-            started_at='2030-01-01T00:00:00Z',completed_at='2030-01-01T00:01:00Z',stdout=ref('save-out'),stderr=ref('save-err'))
-        row=dict(id=999,ref=f.context['ref'],key=key,version='algorithm-version',size_in_bytes=123,created_at='2030-01-01T00:00:30Z')
-        result=f.api['publication_proof'](raw,f.context,'success',[],[row],log,f.context['ref'])
+        raw,request,before,after,save=publication_data(f)
+        result=f.api['publication_proof'](raw,f.context,request,before,after,save,f.plan)
         self.assertIsNone(result['service_archive_sha256']);self.assertIsNone(result['external_acceptance']);self.assertFalse(result['qualified'])
+        self.assertFalse(result['publication_qualified']);self.assertIsNone(result['official_save_log'])
+        self.assertIsNone(result['proof_artifact_identity']);self.assertNotIn('save_log',result)
         for case in ('preexisting','ambiguous','ref','key','version','size','before-save','save-failed'):
-            before=[];after=[copy.deepcopy(row)];outcome='success'
-            if case=='preexisting':before=[copy.deepcopy(row)]
-            if case=='ambiguous':after.append(copy.deepcopy(row))
-            if case=='ref':after[0]['ref']='refs/pull/9999/merge'
-            if case=='key':after[0]['key']='wrong'
-            if case=='version':after[0]['version']=None
-            if case=='size':after[0].pop('size_in_bytes');after[0]['size']=123
-            if case=='before-save':after[0]['created_at']='2029-12-31T23:59:59Z'
-            if case=='save-failed':outcome='failure'
-            with self.subTest(case=case),self.assertRaises(ValueError):f.api['publication_proof'](raw,f.context,outcome,before,after,log,f.context['ref'])
+            raw,request,before,after,save=publication_data(f);rows=json.loads(after['body'])
+            if case=='preexisting':before['body']=after['body'];rebind_http(f,before)
+            if case=='ambiguous':rows['actions_caches'].append(copy.deepcopy(rows['actions_caches'][0]));rows['total_count']=2
+            if case=='ref':rows['actions_caches'][0]['ref']='refs/pull/9999/merge'
+            if case=='key':rows['actions_caches'][0]['key']='wrong'
+            if case=='version':rows['actions_caches'][0]['version']=None
+            if case=='size':rows['actions_caches'][0].pop('size_in_bytes');rows['actions_caches'][0]['size']=123
+            if case=='before-save':rows['actions_caches'][0]['created_at']='2029-12-31T23:59:58Z'
+            if case=='save-failed':save['outcome']='failure'
+            after['body']=f.api['encoded'](rows);rebind_http(f,after)
+            with self.subTest(case=case),self.assertRaises(ValueError):
+                f.api['publication_proof'](raw,f.context,request,before,after,save,f.plan)
 
     def test_scoped_kernel_wait_not_procfs_absence_controls_compiler_writer_settlement(self):
         f=Fixture()
@@ -352,6 +432,136 @@ class ProducerAlgorithms(unittest.TestCase):
         self.assertIs(cancel.failure,original)
         with self.assertRaises(ValueError) as caught:cancel.finish([])
         self.assertIs(caught.exception,original)
+
+    def test_fixed_get_retains_original_body_and_only_labeled_parsed_safe_headers(self):
+        f=Fixture();f.build();raw,request,before,after,save=publication_data(f)
+        harness=HttpHarness(f,request)
+        harness.headers.append(('Content-Length',str(len(harness.chunks[0]))))
+        observation=harness.fetch()
+        self.assertEqual([event for event in harness.events if event[0]=='GET'],[('GET',request['path'])])
+        self.assertEqual(len([event for event in harness.events if event[0]=='factory']),1)
+        self.assertEqual(harness.retained['body'],f.api['encoded'](dict(total_count=0,actions_caches=[])))
+        self.assertEqual(observation,json.loads(harness.retained['json']))
+        headers=json.loads(harness.retained['headers.json'])
+        self.assertEqual(headers['representation'],'Selected parsed fields; not raw wire header bytes.')
+        self.assertEqual(set(headers['values']),{'date','x-github-request-id','content-type','content-length'})
+        retained=b''.join(harness.retained.values())
+        self.assertNotIn(harness.token.encode(),retained);self.assertNotIn(b'must-not-retain',retained)
+        self.assertEqual(harness.events[-2:],[('response-close',),('connection-close',)])
+        rows,date=f.api['http_observation'](dict(observation=observation,body=harness.retained['body'],
+            headers=harness.retained['headers.json']),request,'before',f.plan['readback_caps'])
+        self.assertEqual(rows,[]);self.assertEqual(date.isoformat(),'2030-01-01T00:00:00+00:00')
+        self.assertIn('r123-a1-',request['key'])
+        self.assertEqual(request['url'],'https://api.github.com'+request['path'])
+        self.assertIn('ref=refs%2Fpull%2F1933%2Fmerge',request['path'])
+        self.assertNotIn('version=',request['path'])  # Absence must cover ALL versions.
+
+    def test_http_failure_partial_caps_redirects_and_endpoint_changes_never_retry(self):
+        for case in ('redirect','forbidden','server-error','partial','body-cap','duplicate-date','deadline','declared-longer-EOF'):
+            with self.subTest(case=case):
+                f=Fixture();f.build();raw,request,*rest=publication_data(f)
+                baseline=HttpHarness(f,request);baseline.fetch()
+                harness=HttpHarness(f,request)
+                if case=='redirect':harness.status=302;harness.headers.append(('Location','https://example.invalid'))
+                if case=='forbidden':harness.status=403
+                if case=='server-error':harness.status=500
+                if case=='partial':harness.chunks=[b'{partial',OSError('algorithm-only network failure')]
+                if case=='body-cap':harness.chunks=[b'x'*(f.plan['readback_caps']['body_bytes']+1)]
+                if case=='duplicate-date':harness.headers.append(('Date','Tue, 01 Jan 2030 00:00:00 GMT'))
+                if case=='declared-longer-EOF':harness.headers.append(('Content-Length',str(len(harness.chunks[0])+7)))
+                if case=='deadline':
+                    times=iter([0,100]);harness.clock=lambda:next(times)
+                if case in ('redirect','forbidden','server-error'):
+                    observation=harness.fetch()
+                    with self.assertRaisesRegex(ValueError,'readback-not-complete-success'):
+                        f.api['http_observation'](dict(observation=observation,body=harness.retained['body'],
+                            headers=harness.retained['headers.json']),request,'before',f.plan['readback_caps'])
+                else:
+                    with self.assertRaises((ValueError,OSError)):harness.fetch()
+                    observation=json.loads(harness.retained['json'])
+                    self.assertFalse(observation['complete']);self.assertIsNotNone(observation['error'])
+                self.assertEqual(len([event for event in harness.events if event[0]=='factory']),1)
+                self.assertLessEqual(len([event for event in harness.events if event[0]=='GET']),1)
+                self.assertIn(('connection-close',),harness.events)
+                if case=='partial':self.assertEqual(harness.retained['body'],b'{partial')
+                if case=='declared-longer-EOF':
+                    self.assertEqual(json.loads(harness.retained['body']),dict(total_count=0,actions_caches=[]))
+                self.assertNotIn(harness.token.encode(),b''.join(harness.retained.values()))
+        for field,value in [('method','POST'),('host','example.invalid'),('url','http://api.github.com/'),('path','/alternate')]:
+            f=Fixture();f.build();raw,request,*rest=publication_data(f);harness=HttpHarness(f,request)
+            harness.request=copy.deepcopy(request);harness.request[field]=value
+            with self.assertRaisesRegex(ValueError,'fixed-readback-request'):harness.fetch()
+            self.assertEqual(harness.events,[]);self.assertEqual(harness.retained,{})
+        f=Fixture();f.build();raw,request,*rest=publication_data(f);harness=HttpHarness(f,request);harness.token=None
+        with self.assertRaisesRegex(ValueError,'step-scoped-readback-token-required'):harness.fetch()
+        self.assertEqual(harness.events,[])
+
+    def test_complete_pages_UTC_clock_row_and_save_binding_have_independent_negative_controls(self):
+        cases=('incomplete-count','next-page','missing-row','zero-id','bool-id','empty-version','zero-size',
+               'non-UTC-created','bad-date','naive-date','reversed-date','too-early','too-late',
+               'changed-body-bytes','wrong-save-action','wrong-save-path','wrong-save-conclusion','wrong-scope','wrong-source',
+               'declared-longer','declared-shorter','length-malformed','length-overcap')
+        for case in cases:
+            with self.subTest(case=case):
+                f=Fixture();f.build();raw,request,before,after,save=publication_data(f)
+                self.assertFalse(f.api['publication_proof'](raw,f.context,request,before,after,save,f.plan)['publication_qualified'])
+                rows=json.loads(after['body']);headers=json.loads(after['headers'])
+                if case=='incomplete-count':rows['total_count']=2
+                if case=='next-page':headers['values']['link']='<https://api.github.com/next>; rel="next"'
+                if case=='missing-row':rows=dict(total_count=0,actions_caches=[])
+                if case=='zero-id':rows['actions_caches'][0]['id']=0
+                if case=='bool-id':rows['actions_caches'][0]['id']=True
+                if case=='empty-version':rows['actions_caches'][0]['version']=''
+                if case=='zero-size':rows['actions_caches'][0]['size_in_bytes']=0
+                if case=='non-UTC-created':rows['actions_caches'][0]['created_at']='2030-01-01T01:00:30+01:00'
+                if case=='bad-date':headers['values']['date']='not-a-date'
+                if case=='naive-date':headers['values']['date']='Tue, 01 Jan 2030 00:01:00'
+                if case=='reversed-date':headers['values']['date']='Mon, 31 Dec 2029 23:59:59 GMT'
+                if case=='too-early':rows['actions_caches'][0]['created_at']='2029-12-31T23:59:58Z'
+                if case=='too-late':rows['actions_caches'][0]['created_at']='2030-01-01T00:01:02Z'
+                if case=='wrong-save-action':save['action_sha']='f'*40
+                if case=='wrong-save-path':save['declared_paths'][-1]='/algorithm-only/foreign'
+                if case=='wrong-save-conclusion':save['conclusion']='failure'
+                if case=='wrong-scope':request['ref']='refs/pull/9999/merge'
+                if case=='wrong-source':request['sources']['module']['sha256']='d'*64
+                if case=='declared-longer':headers['values']['content-length']=str(len(after['body'])+1)
+                if case=='declared-shorter':headers['values']['content-length']=str(len(after['body'])-1)
+                if case=='length-malformed':headers['values']['content-length']='-1'
+                if case=='length-overcap':headers['values']['content-length']=str(f.plan['readback_caps']['body_bytes']+1)
+                after['body']=f.api['encoded'](rows);after['headers']=f.api['encoded'](headers);rebind_http(f,after)
+                if case=='changed-body-bytes':after['body']+=b' '
+                with self.assertRaises(ValueError):f.api['publication_proof'](raw,f.context,request,before,after,save,f.plan)
+        for created in ('2029-12-31T23:59:59Z','2030-01-01T00:01:01Z'):
+            f=Fixture();f.build();raw,request,before,after,save=publication_data(f)
+            rows=json.loads(after['body']);rows['actions_caches'][0]['created_at']=created
+            after['body']=f.api['encoded'](rows);rebind_http(f,after)
+            self.assertFalse(f.api['publication_proof'](raw,f.context,request,before,after,save,f.plan)['publication_qualified'])
+        f=Fixture();f.build();raw,request,before,after,save=publication_data(f)
+        headers=json.loads(after['headers']);headers['values']['content-length']=str(len(after['body']))
+        after['headers']=f.api['encoded'](headers);rebind_http(f,after)
+        self.assertFalse(f.api['publication_proof'](raw,f.context,request,before,after,save,f.plan)['publication_qualified'])
+
+    def test_publication_source_wiring_scopes_token_and_requires_pre_save_gate(self):
+        workflow=(DIRECTORY.parent/'workflows/produce-native-profile-cache.yml').read_text()
+        self.assertEqual(workflow.count('PRODUCER_READBACK_TOKEN: ${{ github.token }}'),2)
+        self.assertEqual(workflow.count('uses: actions/cache/save@'),1)
+        f=Fixture()
+        self.assertIn('uses: actions/cache/save@'+f.api['SAVE_SHA'],workflow)
+        self.assertIn('    permissions:\n      contents: read\n      actions: read',workflow)
+        self.assertNotIn('actions: write',workflow);self.assertNotIn('permissions: write-all',workflow)
+        before=workflow.index('--pre-save-readback');save=workflow.index('uses: actions/cache/save@');after=workflow.index('--post-save-readback')
+        self.assertLess(before,save);self.assertLess(save,after)
+        self.assertIn("if: ${{ success() && steps.pre_save.outcome == 'success' }}",workflow)
+        compiler=workflow[workflow.index('      - name: ORIGINAL serial'):workflow.index('      # M is immutable')]
+        self.assertNotIn('TOKEN',compiler);self.assertNotIn('github.token',compiler)
+        self.assertIn('PRODUCER_SAVE_CONCLUSION: ${{ steps.save_native.conclusion }}',workflow)
+        self.assertEqual(PLAN['readback_caps'],dict(request_seconds=60,socket_seconds=15,body_bytes=1048576,step_seconds=120))
+        main=next(node for node in ast.parse(SOURCE).body if isinstance(node,ast.FunctionDef) and node.name=='main')
+        segment=ast.get_source_segment(SOURCE,main)
+        self.assertLess(segment.index("'PRODUCER_READBACK_TOKEN' not in os.environ"),segment.index('prep_path ='))
+        self.assertLess(segment.index('admit_references(plan)'),segment.index('perform_readback('))
+        self.assertIsNone(PLAN['admission_inputs']);self.assertIn('UNSUPPLIED',PLAN['remaining_seams'][0])
+        self.assertNotIn('--post-save\'',SOURCE)  # Unsupported old save-log prototype removed.
 
     def test_source_routing_caps_and_no_desktop_consumer_or_permission_bypass(self):
         producer=(DIRECTORY.parent/'workflows/produce-native-profile-cache.yml').read_text()

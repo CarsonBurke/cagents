@@ -1,6 +1,6 @@
 {
   "kind": "prospective-original-native-producer-source-plan-v1",
-  "status": "SOURCE_ONLY_FIRST_COMPONENT_NOT_EXECUTION_READY",
+  "status": "SOURCE_ONLY_CONTINGENT_LOCAL_PUBLICATION_COMPONENT_NOT_EXECUTION_READY",
   "purpose": "original-compile-only-native-producer",
   "phase": "producer-only",
   "repository": "CarsonBurke/cagents",
@@ -62,14 +62,18 @@
     "save_outputs": [],
     "service_archive_sha256": null,
     "M": "Pre-save actual CargoJSON+source/artifacts/full target leaf manifests after original compiler/subreaper settlement. M excludes own hash/key/P/A/proof-artifact identity.",
-    "key": "native2018-v1-linux-x64-<SHA256 of immutable M bytes>; derived OUTSIDE M",
+    "key": "native2018-v1-linux-x64-r<original run>-a<attempt>-<SHA256 of immutable M bytes>; derived OUTSIDE M",
     "cache_paths": [
       "${GITHUB_WORKSPACE}/native-profile-v1/M.json",
       "${GITHUB_WORKSPACE}/native-profile-v1/before",
       "${GITHUB_WORKSPACE}/native-profile-v1/after"
     ],
-    "P": "Separate POST-save local proof artifact, never inserted into earlier immutable cache. Action success alone/pre-existing cache row is insufficient. Require uniquely matching NEW official id/ref/key/version/size_in_bytes and this-save log bindings; unavailable -> UNKNOWN/refusal.",
-    "A": "External independent original producer/publication/whole-return acceptance before consumer pin; no automatic consumer/native continuation."
+    "P": "Separate unqualified local POST-save observations: raw original before/after response bodies and accurately labeled selected parsed safe headers, exact current row and source/save declaration. official_save_log and service_archive_sha256 stay null; outcome success alone is insufficient.",
+    "A": "Independent original terminal save-log group, absence of warning/error/skip/reserve/upload/finalize failure, official proof artifact id/url/digest/download, original entry wait and whole return before acceptance. These later facts remain OUTSIDE earlier M/P/ZIP.",
+    "logical_job": "original-compile-only",
+    "official_readback": "same-original-job-fixed-get-and-external-terminal-A",
+    "readback": "One fixed HTTPS GET per before/after step, complete empty all-version prefix-filter response before sole save, exact unique full-key/ref row after. GET-only/no redirects/no retry/alternate token/endpoint. Parsed UTC HTTP Date bounds +/-1s are consistency checks, not publication qualification.",
+    "token_scope": "Contingent producer-job-only Actions read declaration; github.token passed only as PRODUCER_READBACK_TOKEN in two readback step environments. Compiler mode rejects that variable; no token retained in evidence."
   },
   "future_actual": {
     "controller": null,
@@ -90,10 +94,17 @@
   ],
   "current_consumer": "PINNED_ROLES and native_preparation.roles stay NULL; no native restore or positive admission implemented by this producer source.",
   "remaining_seams": [
-    "Admission cycle UNSOLVED: committed input digest pins require a grant whose controller_sha is that same current HEAD. Rebinding cannot simply establish a positive exact-head grant. No trust weakening or grant framework is supplied here; current pins remain NULL.",
-    "Post-save supplier UNSOLVED: current contents:read does not supply private cache actions REST access; save has no ID/version/digest outputs. Actual P path writes UNKNOWN and refuses. The pure publication prototype assumes post-terminal save logs, not an available pre-upload receipt; it is not called as a positive supplier.",
-    "Publication source successor requires separately reviewed supported pre/post HTTP metadata + declared save-step/late external-A join, not future hashes retroactively inserted into M/P. No API/token/permission change is implemented here.",
-    "Actual original external entry wait and supported diagnostic-root binding remain UNSUPPLIED; compiler ECHILD is not entry return, publisher/upload/wholejob terminality, or native closure.",
-    "Sampled free-space stops and finite file/log/inventory caps are failure controls, not a kernel filesystem quota or resource sufficiency guarantee; in-flight writes/hard termination can remain UNKNOWN."
-  ]
+    "Implemented positive producer entry UNSUPPLIED: EC contract permits a separate immutable external grant bound to frozen source, but no supported/approved hosted carrier or actual run/job binding is implemented. Committed digest/current-head selfbinding cannot simply become nonnull. Admission pins remain NULL; no label/dispatch/transport framework is added.",
+    "Local GET supplier is contingent SOURCE only. No token/permission/settings/API/cache operation occurred. P remains publication_qualified=false with official_save_log=null; supported original terminal save logs and official uploaded proof identity are external future inputs, not hashes retroactively inserted into P/M.",
+    "No independently accepted original M/P/A, full source/closure/entry wait or compatible consumer native restore is supplied. Consumer role pins stay NULL; no automatic producer-to-consumer continuation.",
+    "Actual original external entry wait and supported diagnostic-root/original-instance binding remain UNSUPPLIED; compiler ECHILD is not entry return, publisher/upload/wholejob terminality, or native closure.",
+    "Sampled free-space stops and finite file/log/inventory/request caps are failure controls, not a kernel filesystem quota or duration/resource sufficiency guarantee; in-flight I/O/hard termination can remain UNKNOWN.",
+    "Monotonic checks/socket timeouts do not preempt OS DNS or HTTP header parsing; the 120-second workflow readback-step bound is an outer failure bound only. Interruption/missing partial observations remains UNKNOWN, never publication or closure proof."
+  ],
+  "readback_caps": {
+    "request_seconds": 60,
+    "socket_seconds": 15,
+    "body_bytes": 1048576,
+    "step_seconds": 120
+  }
 }

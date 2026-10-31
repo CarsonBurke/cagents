@@ -5,7 +5,10 @@ M is pre-save payload evidence; key/P/A are external to M. External publication
 readback/entry-wait/whole-job acceptance cannot be certified by this process.
 """
 import ctypes
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -19,11 +22,16 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlencode
 
 PINNED_ADMISSION_INPUTS = None  # No actual policy change/grant/facts/contract supplied.
 INPUT_NAMES = {'policy','grant','preflight','publication_contract'}
 FEATURES = {'cli':['development'],'host':['development','host'],'ui':['development','ui']}
 PHASE = 'producer-only'
+API_HOST = 'api.github.com'
+API_VERSION = '2022-11-28'
+SAVE_SHA = '0057852bfaa89a56745cba8c7296529d2fc39830'
+SAFE_HEADERS = {'date','x-github-request-id','link','content-type','content-length','content-encoding'}
 
 
 def need(value, reason):
@@ -66,7 +74,8 @@ def validate_admission(plan, context, documents, refs):
     # These are PRE-admission contract/observation inputs, never future M/P/A.
     need(context['repository'] == plan['repository'] and context['event'] == plan['event']
          and context['branch'] == plan['branch'] and context['ref'] == plan['cache_ref']
-         and context['pull_request'] == 1933 and context['attempt'] == 1,'original-producer-context')
+         and context['pull_request'] == 1933 and context['attempt'] == 1
+         and context['job_name'] == plan['publication_contract']['logical_job'],'original-producer-context')
     policy,grant,facts,publication = [documents[name] for name in ('policy','grant','preflight','publication_contract')]
     need(policy['kind'] == 'native-producer-policy-decision-v1'
          and policy['decision'] == 'allow-one-original-compile-only-producer'
@@ -85,7 +94,7 @@ def validate_admission(plan, context, documents, refs):
     for ref in facts['tools'].values(): reference(ref)
     need(publication['kind'] == 'native-producer-publication-contract-v1'
          and publication['cache_ref'] == context['ref'] and publication['save_action'] == plan['publication_contract']['cache_save_action']
-         and publication['official_readback'] == 'separate-original-collector'
+         and publication['official_readback'] == plan['publication_contract']['official_readback']
          and publication['service_archive_sha256'] is None,'publication-contract')
 
 
@@ -237,35 +246,177 @@ def verify_compiler_evidence(manifest, graph_rows, prep):
 
 
 def cache_key(raw_manifest):
-    return 'native2018-v1-linux-x64-' + digest(raw_manifest)
+    context = json.loads(raw_manifest)['context']
+    need(all(type(context[name]) is int and context[name] > 0 for name in ('run','attempt')),'cache-key-context')
+    return 'native2018-v1-linux-x64-r' + str(context['run']) + '-a' + str(context['attempt']) + '-' + digest(raw_manifest)
 
 
-def publication_proof(manifest_raw, context, outcome, before_rows, after_rows, save_log, expected_ref):
-    # POST-TERMINAL prototype reader only, NOT a pre-upload P supplier.
-    # Current --post-save refuses and keeps P UNKNOWN.
-    # Internal binding only. Official authenticity/whole-job/entry wait and A
-    # are supplied independently; a same-looking DTO is not that authority.
+def readback_request(manifest_raw, context, plan, sources, layout):
     manifest = json.loads(manifest_raw)
-    need(manifest['kind'] == 'native-payload-manifest-v2'
-         and all(manifest['context'][key] == value for key,value in context.items())
-         and manifest['compiler_settlement']['kernel_echild'] is True
-         and manifest['compiler_settlement']['errors'] == [],'publication-M-binding')
-    need(set(save_log) == {'run','attempt','controller_sha','key','ref','started_at','completed_at','stdout','stderr'},'save-log-shape')
-    reference(save_log['stdout']); reference(save_log['stderr'])
+    validate_manifest(manifest,plan)
+    need(context['repository'] == plan['repository'] == 'CarsonBurke/cagents'
+         and context['ref'] == plan['cache_ref'] == 'refs/pull/1933/merge'
+         and context['event'] == 'pull_request' and context['pull_request'] == 1933
+         and context['attempt'] == 1 and context['branch'] == plan['branch']
+         and context['job_name'] == plan['publication_contract']['logical_job']
+         and plan['publication_contract']['cache_save_action'] == 'actions/cache/save@'+SAVE_SHA,'readback-context')
+    need(all(manifest['context'][key] == value for key,value in context.items())
+         and manifest['controller_sha'] == context['controller_sha']
+         and manifest['layout'] == layout,'publication-M-binding')
+    need(set(sources) == {'module','workflow','plan'} and manifest['publication_sources'] == sources,'readback-source')
+    for ref in sources.values(): reference(ref)
+    need(manifest['plan_sha256'] == sources['plan']['sha256'],'readback-plan-binding')
     key = cache_key(manifest_raw)
-    need(outcome == 'success','save-not-successful')
-    need(save_log['run'] == context['run'] and save_log['attempt'] == context['attempt']
-         and save_log['controller_sha'] == context['controller_sha'] and save_log['key'] == key
-         and save_log['ref'] == expected_ref and save_log['started_at'] < save_log['completed_at'],'save-log-binding')
-    rows = [row for row in after_rows if row.get('key') == key and row.get('ref') == expected_ref]
+    path = '/repos/CarsonBurke/cagents/actions/caches?' + urlencode(
+        [('ref',context['ref']),('key',key),('per_page','100')])
+    return dict(method='GET',host=API_HOST,path=path,url='https://'+API_HOST+path,
+        headers={'Accept':'application/vnd.github+json','X-GitHub-Api-Version':API_VERSION,
+                 'User-Agent':'cagents-native-profile-readback','Accept-Encoding':'identity'},
+        context=context,key=key,ref=context['ref'],M_sha256=digest(manifest_raw),M_bytes=len(manifest_raw),sources=sources)
+
+
+def selected_headers(pairs):
+    selected = {}
+    for name,value in pairs:
+        name = name.lower()
+        if name not in SAFE_HEADERS: continue
+        need(name not in selected and isinstance(value,str) and len(value) <= 4096
+             and '\r' not in value and '\n' not in value,'ambiguous-safe-header')
+        selected[name] = value
+    return dict(kind='selected-parsed-http-response-headers-v1',
+                representation='Selected parsed fields; not raw wire header bytes.',values=selected)
+
+
+def complete_body_length(values, length, caps):
+    if 'content-length' in values:
+        declared = values['content-length']
+        need(re.fullmatch(r'[0-9]{1,20}',declared) and int(declared) <= caps['body_bytes']
+             and int(declared) == length,'readback-content-length')
+
+
+def fetch_readback(request, token, phase, factory, now, stamp, caps, retain):
+    """One fixed HTTPS GET, no redirect/retry; retain partial bytes on failure.
+
+    DNS/header parsing are not preempted by monotonic Python checks; the
+    workflow cap is an outer failure bound, never successful closure evidence.
+    factory is the sole injected network boundary. Authorization is used only
+    in the request and never passed to retain or recorded in request metadata.
+    """
+    need(phase in ('before','after') and request['method'] == 'GET' and request['host'] == API_HOST
+         and request['url'] == 'https://'+API_HOST+request['path']
+         and request['path'] == '/repos/CarsonBurke/cagents/actions/caches?' + urlencode(
+             [('ref','refs/pull/1933/merge'),('key',request['key']),('per_page','100')])
+         and request['headers'] == {'Accept':'application/vnd.github+json','X-GitHub-Api-Version':API_VERSION,
+             'User-Agent':'cagents-native-profile-readback','Accept-Encoding':'identity'},'fixed-readback-request')
+    need(isinstance(token,str) and token and len(token) <= 16384 and '\r' not in token and '\n' not in token,
+         'step-scoped-readback-token-required')
+    record = dict(kind='original-cache-http-observation-v1',phase=phase,request=request,
+        status=None,complete=False,error=None,closure_errors=[],observed_start=stamp())
+    body = bytearray(); headers = selected_headers([]); connection = response = None; failure = None
+    deadline = now()+caps['request_seconds']
+    try:
+        connection = factory(caps['socket_seconds'])
+        connection.connect()
+        socket = connection.sock  # Retained original socket, no alternate connection.
+        need(socket is not None,'readback-socket')
+        remaining = deadline-now(); need(remaining > 0,'readback-deadline')
+        socket.settimeout(min(remaining,caps['socket_seconds']))
+        connection.request('GET',request['path'],headers={**request['headers'],'Authorization':'Bearer '+token})
+        response = connection.getresponse()
+        record['status'] = response.status
+        headers = selected_headers(response.getheaders())
+        while True:
+            remaining = deadline-now(); need(remaining > 0,'readback-deadline')
+            socket.settimeout(min(remaining,caps['socket_seconds']))
+            raw = response.read1(min(65536,caps['body_bytes']+1-len(body)))
+            if not raw: break
+            body.extend(raw)
+            need(len(body) <= caps['body_bytes'],'readback-body-cap')
+        complete_body_length(headers['values'],len(body),caps)
+        record['complete'] = True
+    except BaseException as error:
+        failure = error
+        record['error'] = type(error).__name__  # No credential-bearing exception text.
+    finally:
+        for owned in (response,connection):
+            if owned is not None:
+                try: owned.close()
+                except BaseException as error:
+                    record['closure_errors'].append(type(error).__name__)
+                    if failure is None: failure = error
+        record['observed_finish'] = stamp()
+        # These are genuine response BODY bytes plus explicitly PARSED safe
+        # fields, never reconstructed bytes described as raw HTTP headers.
+        try:
+            record['body'] = retain('body',bytes(body))
+            record['headers'] = retain('headers.json',encoded(headers)+b'\n')
+            retain('json',encoded(record)+b'\n')
+        except BaseException:
+            if failure is None: raise
+    if failure is not None: raise failure
+    return record
+
+
+def http_observation(data, request, phase, caps):
+    record,body,headers = data['observation'],data['body'],data['headers']
+    need(record['kind'] == 'original-cache-http-observation-v1' and record['phase'] == phase
+         and record['request'] == request and record['status'] == 200 and record['complete'] is True
+         and record['error'] is None and record['closure_errors'] == [],'readback-not-complete-success')
+    for name,raw in [('body',body),('headers',headers)]:
+        reference(record[name])
+        need(len(raw) == record[name]['bytes'] and digest(raw) == record[name]['sha256'],'readback-response-bytes')
+    need(len(body) <= caps['body_bytes'] and len(headers) <= 32768,'readback-response-cap')
+    fields = json.loads(headers)
+    need(set(fields) == {'kind','representation','values'}
+         and fields == selected_headers(list(fields['values'].items())),'readback-safe-headers')
+    values = fields['values']
+    complete_body_length(values,len(body),caps)
+    need(values.get('x-github-request-id') and values.get('content-type','').split(';')[0].strip().lower() == 'application/json'
+         and not values.get('link') and values.get('content-encoding','identity') == 'identity','readback-incomplete-page-or-format')
+    date = parsedate_to_datetime(values['date'])
+    need(date.tzinfo is not None and date.utcoffset() == timedelta(0),'readback-server-date')
+    rows = json.loads(body)
+    need(set(rows) == {'total_count','actions_caches'} and type(rows['total_count']) is int
+         and isinstance(rows['actions_caches'],list) and rows['total_count'] == len(rows['actions_caches'])
+         and rows['total_count'] <= 100,'readback-incomplete-count')
+    return rows['actions_caches'],date
+
+
+def save_declaration(request, layout, outcome, conclusion):
+    return dict(logical_job=request['context']['job_name'],step_id='save_native',action_sha=SAVE_SHA,
+        key=request['key'],declared_paths=[layout['manifest'],layout['targets']['before'],layout['targets']['after']],
+        outcome=outcome,conclusion=conclusion)
+
+
+def publication_proof(manifest_raw, context, request, before, after, save_step, plan):
+    # Local observations only. Complete original save logs/official artifact
+    # identity/entry wait/whole terminal and independent A do not yet exist here.
+    manifest = json.loads(manifest_raw)
+    need(request == readback_request(manifest_raw,context,plan,manifest['publication_sources'],manifest['layout']),
+         'publication-request-binding')
+    before_rows,before_date = http_observation(before,request,'before',plan['readback_caps'])
+    need(before_rows == [],'pre-save-not-complete-absence')
+    rows,after_date = http_observation(after,request,'after',plan['readback_caps'])
+    need(save_step == save_declaration(request,manifest['layout'],'success','success'),'save-not-successful-or-bound')
     need(len(rows) == 1,'publication-missing-or-ambiguous')
     row = rows[0]
-    need(type(row.get('id')) is int and row['id'] > 0 and row['id'] not in {value['id'] for value in before_rows}
-         and row.get('version') and type(row.get('size_in_bytes')) is int and row['size_in_bytes'] > 0
-         and save_log['started_at'] <= row['created_at'] <= save_log['completed_at'],'publication-not-this-save')
+    need(type(row.get('id')) is int and row['id'] > 0 and row.get('ref') == request['ref']
+         and row.get('key') == request['key'] and isinstance(row.get('version'),str) and row['version']
+         and type(row.get('size_in_bytes')) is int and row['size_in_bytes'] > 0,'publication-row-identity')
+    need(isinstance(row.get('created_at'),str) and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z',row['created_at']),
+         'publication-created-at-UTC')
+    created = datetime.fromisoformat(row['created_at'].replace('Z','+00:00'))
+    need(before_date <= after_date and before_date-timedelta(seconds=1) <= created <= after_date+timedelta(seconds=1),
+         'publication-server-clock-consistency')
     return dict(kind='native-cache-publication-proof-v1',M_sha256=digest(manifest_raw),context=context,
-        key=key,official_metadata={name:row[name] for name in ('id','ref','key','version','size_in_bytes','created_at')},
-        service_archive_sha256=None,save_log=save_log,external_acceptance=None,qualified=False)
+        M=dict(path=manifest['layout']['manifest'],sha256=digest(manifest_raw),bytes=len(manifest_raw)),
+        producer_context=manifest['context'],
+        key=request['key'],before=before['observation'],after=after['observation'],
+        official_metadata={name:row[name] for name in ('id','ref','key','version','size_in_bytes','created_at')},
+        server_clock_bounds=dict(before=before_date.isoformat(),after=after_date.isoformat(),tolerance_seconds=1),
+        save_step=save_step,official_save_log=None,official_save_log_reason='Original terminal save log supplied only later by external A.',
+        service_archive_sha256=None,proof_artifact_identity=None,external_entry_wait=None,external_acceptance=None,
+        publication_qualified=False,qualified=False)
 
 
 def positive_roots(summary):
@@ -432,9 +583,95 @@ def user_context(env):
         attempt=int(env['GITHUB_RUN_ATTEMPT']),job_name=env['GITHUB_JOB'],controller_sha=env['PRODUCER_CONTROL_SHA'])
 
 
+def publication_sources(control):
+    names = dict(module='.github/qualification/native-profile-producer.py',
+        workflow='.github/workflows/produce-native-profile-cache.yml',
+        plan='.github/qualification/native-profile-producer-plan.json')
+    result = {}
+    for name,relative in names.items():
+        path = control/relative
+        need(path.resolve(strict=True) == path and path.is_file(),'readback-source-alias')
+        result[name] = file_ref(path)
+    return result
+
+
+def perform_readback(control, plan, context, documents, layout, phase):
+    proof = Path(layout['proof']); manifest_path = Path(layout['manifest'])
+    for path in (control,proof,manifest_path):
+        need(path.resolve(strict=True) == path and path.stat().st_uid == os.geteuid(),'readback-owned-source')
+    raw = manifest_path.read_bytes(); manifest = json.loads(raw)
+    need(manifest['controller_tree'] == documents['grant']['controller_tree'],'readback-controller-tree')
+    request = readback_request(raw,context,plan,publication_sources(control),layout)
+    directory = proof/'publication'
+    if phase == 'before':
+        directory.mkdir(mode=0o700)  # Exclusive: no second absence check/resave.
+    need(directory.resolve(strict=True) == directory and directory.stat().st_uid == os.geteuid(),'readback-proof-root')
+    need(not any((directory/(phase+'.'+suffix)).exists() for suffix in ('body','headers.json','json')),
+         'readback-repeat-refused')
+    def retain(suffix, data):
+        path = directory/(phase+'.'+suffix)
+        with path.open('xb') as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        path.chmod(0o444)
+        return dict(path=str(path),sha256=digest(data),bytes=len(data))
+    def read_phase(label):
+        observation_path = directory/(label+'.json')
+        need(observation_path.resolve(strict=True) == observation_path,'readback-observation-alias')
+        observation = json.loads(observation_path.read_bytes())
+        payload = dict(observation=observation)
+        for name,suffix in [('body','body'),('headers','headers.json')]:
+            path = directory/(label+'.'+suffix)
+            need(path.resolve(strict=True) == path and file_ref(path) == observation[name],'readback-retained-bytes')
+            payload[name] = path.read_bytes()
+        return payload
+    def write_report(name, report):
+        path = proof/name
+        with path.open('xb') as stream:
+            stream.write(encoded(report)+b'\n'); stream.flush(); os.fsync(stream.fileno())
+        path.chmod(0o444)
+    try:
+        if phase == 'after':
+            gate_path = directory/'pre-save-gate.json'
+            need(gate_path.resolve(strict=True) == gate_path,'pre-save-gate-alias')
+            gate = json.loads(gate_path.read_bytes())
+            before = read_phase('before')
+            need(gate == dict(kind='complete-original-cache-absence-v1',request=request,
+                 observation=file_ref(directory/'before.json')),'pre-save-gate-binding')
+            rows,date = http_observation(before,request,'before',plan['readback_caps'])
+            need(rows == [],'pre-save-not-complete-absence')
+        fetch_readback(request,os.environ.get('PRODUCER_READBACK_TOKEN'),phase,
+            lambda timeout:http.client.HTTPSConnection(API_HOST,timeout=timeout),time.monotonic,
+            lambda:datetime.now(timezone.utc).isoformat(),plan['readback_caps'],retain)
+        current = read_phase(phase)
+        if phase == 'before':
+            rows,date = http_observation(current,request,phase,plan['readback_caps'])
+            need(rows == [],'pre-save-not-complete-absence')
+            path = directory/'pre-save-gate.json'
+            with path.open('xb') as stream:
+                stream.write(encoded(dict(kind='complete-original-cache-absence-v1',request=request,
+                    observation=file_ref(directory/'before.json')))+b'\n')
+                stream.flush(); os.fsync(stream.fileno())
+            path.chmod(0o444)
+        else:
+            save = save_declaration(request,layout,os.environ.get('PRODUCER_SAVE_OUTCOME'),
+                                    os.environ.get('PRODUCER_SAVE_CONCLUSION'))
+            write_report('P.json',publication_proof(raw,context,request,before,current,save,plan))
+    except BaseException as error:
+        if phase == 'after':
+            # Preserve partial/negative observations; never upgrade them to P.
+            try:
+                write_report('P-pending.json',dict(kind='native-cache-publication-pending-v1',
+                    M_sha256=digest(raw),context=context,request=request,error_type=type(error).__name__,
+                    official_save_log=None,service_archive_sha256=None,external_acceptance=None,
+                    publication_qualified=False,qualified=False))
+            except BaseException:
+                pass  # Original failure remains primary; missing report is UNKNOWN.
+        raise
+
+
 def main():
     context = user_context(dict(os.environ))
-    need(len(sys.argv) == 3 and sys.argv[1] in ('--admission-only','--produce','--post-save'),'producer-mode')
+    need(len(sys.argv) == 3 and sys.argv[1] in ('--admission-only','--produce','--pre-save-readback','--post-save-readback'),'producer-mode')
     control = Path(sys.argv[2])
     plan = json.loads((control/'.github/qualification/native-profile-producer-plan.json').read_bytes())
     # CURRENT hard refusal occurs before any metadata child, target/cache
@@ -443,15 +680,11 @@ def main():
     documents = admitted_contract(plan,context,load_ref)
     if sys.argv[1] == '--admission-only': return
     layout = proposed_layout(os.environ['GITHUB_WORKSPACE'],os.environ['RUNNER_TEMP'])
-    if sys.argv[1] == '--post-save':
-        # Save exposes no ID/version/hash outputs. Without separate original
-        # official readback, preserve UNKNOWN instead of inventing publication.
-        proof = Path(layout['proof']); raw = Path(layout['manifest']).read_bytes()
-        report = dict(kind='native-cache-publication-pending-v1',M_sha256=digest(raw),key=cache_key(raw),
-            context=context,save_outcome=os.environ.get('PRODUCER_SAVE_OUTCOME'),official_metadata=None,
-            service_archive_sha256=None,external_entry_wait=None,external_acceptance=None,qualified=False)
-        (proof/'P-pending.json').write_bytes(encoded(report)+b'\n')
-        raise ValueError('Publication UNKNOWN: original official readback and independent acceptance required')
+    layout['fixture'] = str(control/'.github/qualification/final-main-fixture.rs')
+    if sys.argv[1] in ('--pre-save-readback','--post-save-readback'):
+        return perform_readback(control,plan,context,documents,layout,
+            'before' if sys.argv[1] == '--pre-save-readback' else 'after')
+    need('PRODUCER_READBACK_TOKEN' not in os.environ,'Readback token must never enter compiler environments')
     prep_path = control/'.github/qualification/final-main-prepare.py'
     need(digest(prep_path.read_bytes()) == plan['preparation_module_sha256'],'preparation-source')
     spec = importlib.util.spec_from_file_location('reviewed_preparation',prep_path)
@@ -481,7 +714,6 @@ def main():
             owner.disk_check = disk_check  # Conservative sampled stop, not a filesystem quota guarantee.
             private = Path(tempfile.mkdtemp(prefix='p2018.',dir='/tmp')).resolve(strict=True); private.chmod(0o700)
             need(private.parent == Path('/tmp') and len(str(private)) < 30 and private.stat().st_uid == os.geteuid(),'short-owned-private-root')
-            layout['fixture'] = str(control/'.github/qualification/final-main-fixture.rs')
             need(digest(Path(layout['fixture']).read_bytes()) == plan['fixture_sha256'],'fixture-source')
             environments = {}
             for label in ('before','after'):
@@ -512,6 +744,7 @@ def main():
                 expected = context['controller_sha'] if name == 'sha' else documents['grant']['controller_tree']
                 need(raw.decode().strip() == expected,'actual-controller-source')
             need(not execute('controller','metadata',['git','status','--porcelain=v1'],str(control),None,30),'dirty-controller')
+            publication_binding = publication_sources(control)
             for label,checkout in layout['checkouts'].items():
                 for name,ref in [('sha','HEAD'),('tree','HEAD^{tree}')]:
                     raw = execute(label,'metadata',['git','rev-parse',ref],checkout,environments[label],plan['caps']['metadata_seconds'])
@@ -542,10 +775,12 @@ def main():
                 arms[label]['compile_inputs'] = inputs[label]
                 arms[label]['environment_hashes'] = prep.environment_binding(environments[label])
                 arms[label]['configuration'] = configurations[label]
+            need(publication_sources(control) == publication_binding,'publication-source-changed')
             manifest = dict(kind='native-payload-manifest-v2',products=plan['products'],context={**context,'job_id':documents['grant']['job_id']},
                 layout=layout,arms=arms,commands=records,fixture_sha256=plan['fixture_sha256'],
                 controller_sha=context['controller_sha'],controller_tree=documents['grant']['controller_tree'],
                 tool_inputs=documents['preflight']['tools'],admission_refs=plan['admission_inputs'],plan_sha256=digest((control/'.github/qualification/native-profile-producer-plan.json').read_bytes()),
+                publication_sources=publication_binding,
                 external_entry_wait=None,native_validation=False,future_freshness=False)
     except BaseException as error:
         cancel.latch(error)

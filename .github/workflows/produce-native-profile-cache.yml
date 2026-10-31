@@ -15,6 +15,10 @@ jobs:
   original-compile-only:
     # SAME approved PR merge ref. No sibling-PR cache sharing assumption.
     if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16' && github.event.pull_request.number == 1933
+    # Contingent SOURCE proposal only; no actual settings/token grant here.
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
@@ -60,9 +64,17 @@ jobs:
         run: exec python3 control/.github/qualification/native-profile-producer.py --produce "$GITHUB_WORKSPACE/control"
       # M is immutable before this save. Only normal target output plus M;
       # proof/P/A never enter the cache and no old native target is restored.
+      - name: Require complete original full-key absence immediately before save
+        id: pre_save
+        if: ${{ success() && steps.produce.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        env:
+          PRODUCER_READBACK_TOKEN: ${{ github.token }}
+        run: exec python3 control/.github/qualification/native-profile-producer.py --pre-save-readback "$GITHUB_WORKSPACE/control"
       - name: Save the exact new payload and pre-save manifest
         id: save_native
-        if: ${{ success() && steps.produce.outcome == 'success' }}
+        if: ${{ success() && steps.pre_save.outcome == 'success' }}
         timeout-minutes: 10
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
@@ -71,12 +83,15 @@ jobs:
             ${{ github.workspace }}/native-profile-v1/M.json
             ${{ github.workspace }}/native-profile-v1/before
             ${{ github.workspace }}/native-profile-v1/after
-      - name: Preserve unsupported post-save publication as UNKNOWN
-        if: ${{ !cancelled() && steps.produce.outcome == 'success' && (steps.save_native.outcome == 'success' || steps.save_native.outcome == 'failure') }}
+      - name: Retain original post-save row as unqualified local observations
+        if: ${{ !cancelled() && steps.pre_save.outcome == 'success' && (steps.save_native.outcome == 'success' || steps.save_native.outcome == 'failure') }}
+        timeout-minutes: 2
         shell: bash
         env:
+          PRODUCER_READBACK_TOKEN: ${{ github.token }}
           PRODUCER_SAVE_OUTCOME: ${{ steps.save_native.outcome }}
-        run: exec python3 control/.github/qualification/native-profile-producer.py --post-save "$GITHUB_WORKSPACE/control"
+          PRODUCER_SAVE_CONCLUSION: ${{ steps.save_native.conclusion }}
+        run: exec python3 control/.github/qualification/native-profile-producer.py --post-save-readback "$GITHUB_WORKSPACE/control"
       - name: Upload separate producer proof or explicit partial diagnostics
         if: always()
         timeout-minutes: 10
@@ -88,3 +103,5 @@ jobs:
           retention-days: 14
       # No consumer/native/test/helper execution, automatic continuation,
       # success inference from save exit, or self-certified later entry wait.
+      # Official upload id/url/digest and terminal save logs arise AFTER this
+      # immutable ZIP; only later independent external A can join them.
