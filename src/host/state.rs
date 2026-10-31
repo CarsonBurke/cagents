@@ -6258,8 +6258,8 @@ for line in sys.stdin:
 
     fn upgrade_fixture_in_fresh_process() -> bool {
         // Capability validation consults process-global retained child custody.
-        // These metadata-only fixtures need a fresh service, not another test's
-        // legitimate retained ownership. Preserve the caller's environment.
+        // Isolate retained-owner producers and metadata consumers from other
+        // tests' legitimate custody. Preserve the caller's environment.
         const SELECTOR_ENV: &str = "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR";
         let current = std::thread::current();
         let selector = current.name().expect("named test thread");
@@ -6516,6 +6516,9 @@ for line in sys.stdin:
 
     #[test]
     fn a_carried_terminal_keeps_its_process_across_an_upgrade() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::{Phase, Store};
         use std::os::fd::AsRawFd;
         // Exercise both the successful carry and failure after original adoption.
@@ -6841,12 +6844,77 @@ for line in sys.stdin:
 
     #[test]
     fn restored_shell_links_exact_old_source_and_does_not_replay_consumed_checkpoint() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::upgrade::handoff::{Checkpoint, Phase, Store, Terminal};
+        struct FixtureShellCleanup(SharedHost);
+        impl Drop for FixtureShellCleanup {
+            fn drop(&mut self) {
+                let handles = self
+                    .0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .terminals
+                    .values()
+                    .map(|record| record.handle.clone())
+                    .collect::<Vec<_>>();
+                // Only this synthetic host's admitted workers are settled. Join
+                // teardown before the private shell configuration is removed.
+                for handle in handles {
+                    let _ = handle.close_checked(true);
+                    let _ = handle.shutdown();
+                }
+            }
+        }
         let directory = tempfile::tempdir().unwrap();
         let empty_proc = directory.path().join("proc");
         fs::create_dir(&empty_proc).unwrap();
         let old = test_host().proof().clone();
-        let recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        // A user's startup scripts can start real background work. Use the
+        // close-safety fixture's private configuration pattern for this shell
+        // lineage contract, without changing the inherited authority layer.
+        let shell_home = directory.path().join("shell-home");
+        let config_home = shell_home.join(".config");
+        let cache_home = shell_home.join(".cache");
+        let data_home = shell_home.join(".local/share");
+        for path in [&config_home, &cache_home, &data_home] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(shell_home.join(".inputrc"), "").unwrap();
+        fs::write(
+            shell_home.join(".bashrc"),
+            "PS1='CAGENTS_UPGRADE_READY> '\n",
+        )
+        .unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/bash".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().to_owned(),
+            environment: BTreeMap::from([
+                ("HOME".into(), shell_home.to_string_lossy().into_owned()),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    config_home.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_CACHE_HOME".into(),
+                    cache_home.to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_DATA_HOME".into(),
+                    data_home.to_string_lossy().into_owned(),
+                ),
+                (
+                    "INPUTRC".into(),
+                    shell_home.join(".inputrc").to_string_lossy().into_owned(),
+                ),
+            ]),
+            unset_environment: ["BASH_ENV", "ENV", "PROMPT_COMMAND", "BASHOPTS", "SHELLOPTS"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        };
         let source = TerminalSession {
             owned_codex_listener: None,
             recovery_origin: None,
@@ -6879,6 +6947,7 @@ for line in sys.stdin:
         let replacement = test_host_with_incarnation("replacement-incarnation");
         let expected = (*replacement.proof).clone();
         let host = Arc::new(HostLock::new(replacement));
+        let _replacement_cleanup = FixtureShellCleanup(host.clone());
         restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
         let descriptor = host
             .lock()
@@ -6899,7 +6968,34 @@ for line in sys.stdin:
         // empty checkpoint read do not acknowledge their worker-side completion.
         // This existing synchronous observation follows them on the same FIFO.
         let restored = host.lock().unwrap().terminals[&source.id].handle.clone();
+        restored
+            .set_host_visibility(TerminalVisibility::Visible)
+            .unwrap();
         restored.observe_agent().unwrap();
+        let startup_started = Instant::now();
+        loop {
+            let snapshot = restored.snapshot();
+            let screen = snapshot
+                .lines
+                .iter()
+                .map(|line| {
+                    line.cells
+                        .iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            restored.acknowledge_redraw(snapshot.generation);
+            if screen.contains("CAGENTS_UPGRADE_READY>") {
+                break;
+            }
+            assert!(
+                startup_started.elapsed() < Duration::from_secs(10),
+                "restored controlled Bash did not reach its prompt; screen: {screen}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         // A separate idle probe can resume the shell before host preparation
         // observes it again. Retry only this exact fixture's active-shell
         // refusal; success keeps the actual preparation snapshot frozen.
@@ -6925,6 +7021,16 @@ for line in sys.stdin:
             match prepare_upgrade_with(&host, capability, || Store::open(directory.path())) {
                 Ok(counts) => {
                     assert_eq!(counts, (1, 0));
+                    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    let prepared = state
+                        .upgrade
+                        .as_ref()
+                        .expect("successful preparation stays frozen");
+                    assert_eq!(prepared.frozen.len(), 1);
+                    assert!(
+                        !prepared.frozen[0].active,
+                        "the actual retained preparation must be inactive"
+                    );
                     break;
                 }
                 Err(error) if error == expected_active => {
@@ -6953,6 +7059,7 @@ for line in sys.stdin:
         assert!(forged.validate().is_err());
         let third = test_host_with_incarnation("third-incarnation");
         let host = Arc::new(HostLock::new(third));
+        let _third_cleanup = FixtureShellCleanup(host.clone());
         restore_upgrade_from(&host, store, &empty_proc, None).unwrap();
         let third = host
             .lock()
