@@ -1,0 +1,23 @@
+{
+  "request_path": "/tmp/fw16-backend-ec204421/c-unproven-adoption-policy-source-v1/pure4-original-request.json",
+  "request_sha256": "ddba17795ef045f9e22ea5766b0797bf99b6538c29a52574b6063bfdadf162c9",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "test_policy.py"
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold/policy-corrections/adopted-child-settlement",
+  "original_tool_chunk": "20cee8",
+  "exit_code": 0,
+  "wall_time_seconds": 0.420130219,
+  "output": "....\n----------------------------------------------------------------------\nRan 4 tests in 0.001s\n\nOK\n",
+  "source_pins_after": {
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold/policy-corrections/adopted-child-settlement/README.md": "5a5ab2c919f74a054e0876a6694a58effe0a940b4839e907f37074f53ac9b7dd",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold/policy-corrections/adopted-child-settlement/from-347-function.diff.json": "3cdf58ec3a730e81b67d9470a63334f229e36c1621d272fba915ea02f3c911dc",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold/policy-corrections/adopted-child-settlement/settle_children.py": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold/policy-corrections/adopted-child-settlement/test_policy.py": "0a9e368a994d6c31c03b834b645055dd21ee432b8221e225bfc8c10f3fff0263"
+  },
+  "scope": "Exactly four pure policy regressions. No runnable packet/caller custody, actual child settlement, C/native/build/runtime qualification.",
+  "recorded_utc": "2026-10-31T11:24:53.656007+00:00"
+}

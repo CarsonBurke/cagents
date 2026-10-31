@@ -1,0 +1,94 @@
+{
+  "kind": "main15_f95_UI5_reviewed_controller_lead_scope_ABI_intake",
+  "utc": "2026-10-31T17:24:58.185485+00:00",
+  "controller": {
+    "branch": "qualification/coord16-main15-f95-return-error-ui5",
+    "head": "a7c8f4c2a9ea158e40b0c97ac2e9500f548fff29",
+    "packet": "qualification-packets/main15-f95-return-error-ui5",
+    "sole_parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "tree": "153390d555aeeff38c5f505d1c1fa4900d4807d4",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source"
+  },
+  "product": {
+    "API_base": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "sole_parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6"
+  },
+  "inputs": [
+    {
+      "scope": "reviewed_UI5_handoff",
+      "path": "/var/tmp/coord16-main15-f95-packets-lead-lzobj2ih/UI5-reviewed-handoff.json",
+      "sha256": "438e152c1b00503e6c94c65869a8c8b2960825e95479640a39cd1d76691399b6",
+      "bytes": 19691
+    },
+    {
+      "scope": "command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source/qualification-packets/main15-f95-return-error-ui5/command-data.json",
+      "sha256": "e71f07545b40bc95229545066ad01ee3e5f787c11f695bc3c6dc11e2662a46c1",
+      "bytes": 8007
+    },
+    {
+      "scope": "current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source/qualification-packets/main15-f95-return-error-ui5/current-source-map.json",
+      "sha256": "643b854ea38cf688e78b6d8a4b26abe9ae92fca45130d08f8f87e73ab7955614",
+      "bytes": 10690
+    },
+    {
+      "scope": "selected-source-contract.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source/qualification-packets/main15-f95-return-error-ui5/selected-source-contract.json",
+      "sha256": "d238fa3db9e201f7d3511afb2ee2e39df6c3b35851fb39e3fc7ea6af94ba7463",
+      "bytes": 3310
+    },
+    {
+      "scope": "reconciliation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source/qualification-packets/main15-f95-return-error-ui5/reconciliation.json",
+      "sha256": "b8163d324b945bde62501589d038a7c095769064945b6d410428fc16b4cea215",
+      "bytes": 2745
+    },
+    {
+      "scope": "invocation-template.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source/qualification-packets/main15-f95-return-error-ui5/invocation-template.json",
+      "sha256": "6edeeb4d0b7a332d20c2b72e0acd702939886a98e7a1ba8de12e4bf32160acd2",
+      "bytes": 868
+    },
+    {
+      "scope": "independent_controller_review",
+      "path": "/var/tmp/coord16-main15-f95-ui5-code-independent-7w4_645a/review.json",
+      "sha256": "3be14d4116de4e2daaab8c158741304f2d0bb697e832b5bb2c44c056fc6da58f",
+      "bytes": 18237
+    },
+    {
+      "scope": "independent_conservation_review",
+      "path": "/var/tmp/coord16-main15-f95-ui5-conservation-independent-zwrunla6/review.json",
+      "sha256": "6ee49bb2fd949b185ff99c0ff53dba726cc82025c906007c8400ed354a1dfb4e",
+      "bytes": 187845
+    }
+  ],
+  "checks": "Inert JSON/hash and source-contract joins only: exact published product and controller-parent tuples; genuine code and separate conservation review/ABI; five exact source-classified selectors/order/zero-child-result contract; distinct source adoption/current-publication roles; CLI/UI isolated checks plus UIlib; nine2130 commands within2400; default captured pretty/default outer scheduler/N-1 source contract; twelve argv slots with only genuine grant slot5NULL.",
+  "scope_disposition": "SOURCE_INTAKE_CLEAR_FOR_PROPOSED_FIVE_RETURN_COMPONENT_PARENTS_ONLY; READY_FOR_EC_ADOPTION/PUBLICATION/SEPARATE_RUNTIME_ALLOCATION",
+  "not_duplicated": "No full522-check/canonical helper/controller conservation rereview, candidate import/function/Task/algorithm/test/parser-example/formatter/Cargo/native/provider/actualenv/context/resource/runtime execution or probe.",
+  "HOST_boundary": "Separate HOST16 remains required and was not included as qualified by UI5. Both actual packets are needed for affected CLI/HOST/UI coverage.",
+  "new_peer_assessment": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-unrelated-coherent-quarantine-healthy-return-barrier-source-assessment-v1.json",
+    "sha256": "d8616c81fdab48d58b02df1301cf9833c41398aba64d3d1883d6aa29212a3876",
+    "finding": "No new source defect: coherent per-pane Q alone does not block unrelated healthy H save/ACK. Actual snapshot source refusal correctly holds ACK; accepted coherent snapshot clears health refusal and reachable H Retry saving re-enters ordered save/ACK. No source change or new blocker; combined/native oracle remains UNRUN."
+  },
+  "still_missing": {
+    "actual_grant": null,
+    "actual_artifact": null,
+    "actual_inventory": null,
+    "actual_N": null,
+    "actual_results": null,
+    "native_Before_After": null,
+    "genuine_startup_User5": "HOLD distinct from ordinary Return UI5",
+    "FULL52": "HOLD",
+    "inherited55_stack": "UNQUALIFIED",
+    "WHOLE": "HOLD",
+    "deferred_retained_helper": "UNQUALIFIED",
+    "qclosed_general_conflict": "HOLD",
+    "PR1933": "NEVER_MERGE",
+    "merge_ready": false
+  },
+  "source_workers": "Existing source authors/reviewers for product and Main15 finite tasks stopped; no new descriptor/retry/authority/permission/user-state change. Runtime/account binding remains unverified; no worker-count usage or uplift inference."
+}

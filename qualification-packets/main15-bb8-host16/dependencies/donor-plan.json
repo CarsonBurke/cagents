@@ -1,0 +1,328 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "issue": 1238,
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "limits": "Preparation supplies no runtime evidence. Only original phase/receipt fields and sole independent RAW can establish bounded results. CLI5 a518 only; no HOST/UI/native/provider/main-composition/wholePR qualification or old results transfer. Five singleton invocations, six nested variants nonadditive. Captured pretty/default scheduler supersedes archived plainDATA flags; canonical9004 supersedes obsolete forced-adoption prose. Natural opaque authority unchanged. Full ELF bytes not archived; use observations do not attest every execution. Original nonzero FAIL_STOP; evidence/control/custody uncertainty may retain C indefinitely, no cleanup deadline abandonment. Historical scripts/check-format absent and broad old formatting negatives remain; no official full-format PASS.",
+  "packet_deadline_seconds": 2400,
+  "phase_caps_sum_seconds": 1980,
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "planned_phase_count": 8,
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-1",
+    "parent-cli-lib-2",
+    "parent-cli-lib-3",
+    "parent-cli-lib-4",
+    "parent-cli-lib-5"
+  ],
+  "prepared_only": true,
+  "product_head": "a518258df79fb77d3023e698ad9c2e0fd99e01ef",
+  "product_parent": "d5c5a3523dfd799f96a36d21c00d778d752f7ae5",
+  "product_pr": 1238,
+  "product_tree": "5fa482932bd557782b1e47fd63edc6da605ed2db",
+  "readiness": false,
+  "required_absent_environment_names": [
+    "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+    "CAGENTS_RETAINED_ACTOR_FIXTURE"
+  ],
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/run-packet.py",
+  "runtime_admission": {
+    "state": "CLI5_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/source-binding.json",
+  "source_review_sha256": "12aec1cd635793e24907149e5fffebbc1b594aec652947064a82afc9c9e7e785",
+  "tool_pin_provenance": "Immutable donor source data only, no current installed-file/context observation",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1238-channel-partial-result",
+  "source_paths_sha256": {
+    "Cargo.toml": "294e102940eb184f4f9e9cdaedd2c200408c7837667c8889762af0008025b989",
+    "Cargo.lock": "a101bfe4db08c54bb972d7528ac5f65af0e0b7bb6bbefe0886fd63a9612e2561",
+    ".cargo/config.toml": "ae0cd2fea772a441a4864aee9e0551445e14d1ccebadfbdc6ce55d5052600a96",
+    "build.rs": "343c620c6a85a19ee187c9d5ce23f796c47aa3d10e80b445caf749c7e299083f",
+    "src/lib.rs": "55e51db076af7d6b8dcdd2fff289830ce2e728e54b1d5b784a71d0f553168326",
+    "src/modules.rs": "c9be7901ea1daeb139eaa170719179124b3f286ee6f2431507c94e5d6feef410",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/control.rs": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5",
+    "src/model.rs": "a6b1a73d0c1a56838b8890dadf5be92fc6fde8b1d9b4ff3fa68ef1c0c1f08655",
+    "src/terminal/ipc.rs": "f525f42cd6a12909250a012b46c2ef8ad195542a0153404441826b08f3305806",
+    "src/workspace_model.rs": "0dc9e6ab4a90cf4ed9c335b76cf1cc4920aa176690f01f6f8b6b9bbef98b86a1",
+    "src/project_location.rs": "d0d57dc5354550c9d77f4c6ec9df0fa525b231f5acc51e9c4a33881e923adbcb"
+  },
+  "artifact_groups": [
+    {
+      "id": "cli-lib",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+        "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+        "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+        "control::tests::request_ids_and_remote_errors_fail_closed",
+        "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "control::tests::channel_spawn_preserves_partial_result_after_unconfirmed_create",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::channel_spawn_project_refusal_has_no_channel_partial_result_or_retry",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::request_ids_and_remote_errors_fail_closed",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        },
+        {
+          "name": "control::tests::post_handshake_proof_changes_and_unsolicited_streams_fail_closed",
+          "expected_stdout_child_results": 0,
+          "seconds": 90
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 600
+    }
+  ],
+  "archive_bindings": [
+    {
+      "name": "source-archive/dependencies/product-freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/product-freeze.json",
+      "sha256": "cd80f570cef41acbd189ab9a7270a1a12a203295bc132aac802cc96d87b8c867"
+    },
+    {
+      "name": "source-archive/dependencies/product-source-review.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/product-source-review.json",
+      "sha256": "3722984c098083c3818d6de80a280a6b302348890c0a69d3c925d2653b1eee25"
+    },
+    {
+      "name": "source-archive/dependencies/repinned-plain-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/repinned-plain-data.json",
+      "sha256": "515be84d1f8144c3c7b196bfaceebf4695b5f19269389b10df54148e0db20c29"
+    },
+    {
+      "name": "source-archive/dependencies/old-plain-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/old-plain-data.json",
+      "sha256": "6674568a60b7a429f594a73554898df62582df509fe9163c727fe2c4ce22eff7"
+    },
+    {
+      "name": "source-archive/dependencies/product-source-import.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/product-source-import.json",
+      "sha256": "b647355e184f6b96ebf192044ad70121283e34eacf6eb3776041f341a155d8ec"
+    },
+    {
+      "name": "source-archive/dependencies/donor-run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/donor-run-packet.py",
+      "sha256": "76098afc1e030865ef257f62d711ca64690241e10bac2016ae58397ec416c1de"
+    },
+    {
+      "name": "source-archive/dependencies/donor-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/donor-plan.json",
+      "sha256": "a2f9a7e957dc4aaabc3d48a1f52696ef46d106261f97181b24eaff8fdf4b73c0"
+    },
+    {
+      "name": "source-archive/dependencies/donor-source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/donor-source-binding.json",
+      "sha256": "26e92ef3c722d49f792003637effd540cead444e6451d9b7d96d83694f99ed25"
+    },
+    {
+      "name": "source-archive/dependencies/donor-source-conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/donor-source-conservation.json",
+      "sha256": "6f5e8ed839f211522a7e967826db129cf2d615425176cd04577a4cf55ea26ab5"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_conservation.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_freeze.json",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_function.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_function.py",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_intake.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_intake.json",
+      "sha256": "e9aa09101ca6d215e6876de5b50c1fe1bc57bb3cc14f7bdd397b7772cd1e5843"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_old_function.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_old_function.py",
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_original_finding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_original_finding.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_pure4_reference.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_pure4_reference.json",
+      "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_semantic.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_semantic.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_additive_hold.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/prior_ca_additive_hold.json",
+      "sha256": "a32b9501efcfc05ba117cd89f10d903a02434943ce0ac5d70440b7ea69767ef9"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_author_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/prior_ca_author_conservation.json",
+      "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/prior_ca_conservation.json",
+      "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_task_hold.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/prior_ca_task_hold.json",
+      "sha256": "e342ee5b3258889e2f258433b7cf3a47614d79e340a4313e678060b99bf53560"
+    },
+    {
+      "name": "source-archive/command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/command-data.json",
+      "sha256": "4813b1bd3723745b48ca5a68f56106c65660d8c1ae00ff21c011334c5aafcb98"
+    },
+    {
+      "name": "source-archive/current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/current-source-map.json",
+      "sha256": "ea4fce294f3e670c9079bbdd4af239caef8dba17219d3607c8474f36eb621ba6"
+    },
+    {
+      "name": "source-archive/product-source/Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/Cargo.toml",
+      "sha256": "294e102940eb184f4f9e9cdaedd2c200408c7837667c8889762af0008025b989"
+    },
+    {
+      "name": "source-archive/product-source/Cargo.lock",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/Cargo.lock",
+      "sha256": "a101bfe4db08c54bb972d7528ac5f65af0e0b7bb6bbefe0886fd63a9612e2561"
+    },
+    {
+      "name": "source-archive/product-source/.cargo/config.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/.cargo/config.toml",
+      "sha256": "ae0cd2fea772a441a4864aee9e0551445e14d1ccebadfbdc6ce55d5052600a96"
+    },
+    {
+      "name": "source-archive/product-source/build.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/build.rs",
+      "sha256": "343c620c6a85a19ee187c9d5ce23f796c47aa3d10e80b445caf749c7e299083f"
+    },
+    {
+      "name": "source-archive/product-source/src/lib.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/src/lib.rs",
+      "sha256": "55e51db076af7d6b8dcdd2fff289830ce2e728e54b1d5b784a71d0f553168326"
+    },
+    {
+      "name": "source-archive/product-source/src/modules.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/src/modules.rs",
+      "sha256": "c9be7901ea1daeb139eaa170719179124b3f286ee6f2431507c94e5d6feef410"
+    },
+    {
+      "name": "source-archive/product-source/src/main.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/src/main.rs",
+      "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d"
+    },
+    {
+      "name": "source-archive/product-source/src/control.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/src/control.rs",
+      "sha256": "0926e6d161db94f7e25cb5835aad1d5da9b5bb4b060d6107b2477f3b6bcde3d5"
+    },
+    {
+      "name": "source-archive/product-source/src/model.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/src/model.rs",
+      "sha256": "a6b1a73d0c1a56838b8890dadf5be92fc6fde8b1d9b4ff3fa68ef1c0c1f08655"
+    },
+    {
+      "name": "source-archive/product-source/src/terminal/ipc.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/src/terminal/ipc.rs",
+      "sha256": "f525f42cd6a12909250a012b46c2ef8ad195542a0153404441826b08f3305806"
+    },
+    {
+      "name": "source-archive/product-source/src/workspace_model.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/src/workspace_model.rs",
+      "sha256": "0dc9e6ab4a90cf4ed9c335b76cf1cc4920aa176690f01f6f8b6b9bbef98b86a1"
+    },
+    {
+      "name": "source-archive/product-source/src/project_location.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/product-source/src/project_location.rs",
+      "sha256": "d0d57dc5354550c9d77f4c6ec9df0fa525b231f5acc51e9c4a33881e923adbcb"
+    },
+    {
+      "name": "source-archive/dependencies/product-publication.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/product-publication.json",
+      "sha256": "8f707bdc561e0bae5f33224c52bb4fa8c002b7ff741667ea5b6dce5afde4dc52"
+    }
+  ]
+}

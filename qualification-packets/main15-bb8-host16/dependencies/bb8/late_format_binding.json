@@ -1,0 +1,55 @@
+{
+  "format_record": {
+    "command": "scripts/check-format",
+    "meaning": "The author freeze reports original official formatter exit0 atb952be and the retained stdout/stderr bytes match the bound zero-byte files. Reviewer did not rerun formatter or inspect/evaluate its implementation. This is formatting only, not compilation/test/native success.",
+    "reported_exit": 0,
+    "retained_output_refs": [
+      {
+        "bytes": 0,
+        "mode": "0o444",
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stdout.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "bytes": 0,
+        "mode": "0o444",
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stderr.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ],
+    "tool_chunk": "b952be"
+  },
+  "late_author_freeze": {
+    "bytes": 8772,
+    "mode": "0o444",
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-source-freeze-v1.json",
+    "sha256": "8131db186b26ee8af54b1aa623799e224634bc095741805237adc1c631b32efa"
+  },
+  "limits": {
+    "PR1933": "NEVER_MERGE",
+    "Rust_UI5_User5_native_WHOLE": "UNRUN/HOLD; original f95 UI failure preserved",
+    "actions": "Read/hash late author JSON and two named retained formatter logs only; no source edits/formatter/test/build/helper/native/API/provider/authority/environment/resource execution or new worker. Sole write is this exclusive0444 evidence addendum.",
+    "actual_context_inventory_N_artifact_run_results": null,
+    "actual_grant": null,
+    "merge_ready": false,
+    "qualified": false,
+    "queued": false
+  },
+  "prior_independent_review": {
+    "bytes": 6860,
+    "mode": "0o444",
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-independent-source-review-v1.json",
+    "sha256": "dd632b6257efaac8ffd24d22abc2b52129dc24ec3572beaff6fe96022d2c8e8e"
+  },
+  "reviewer": "/root/authority_regressions",
+  "schema": "main15-bb8df653-title-source-review-late-freeze-format-binding-addendum-v1",
+  "scope": "Supersedes only the earlier receipt field saying official check-format was pending at that review time. It does not rewrite that immutable receipt or expand the exact two-expression source verdict. No additional source, API, caller partition or test semantics re-review.",
+  "source": {
+    "file_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d",
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f"
+  },
+  "utc": "2026-10-31T18:07:19.628473+00:00",
+  "verdict": "PRIOR_BOUNDED_SOURCE_CLEAR_UNCHANGED; LATE_AUTHOR_FREEZE_AND_FORMAT_RECORD_BOUND; NO_COMPILE_OR_EXECUTION_QUALIFICATION"
+}

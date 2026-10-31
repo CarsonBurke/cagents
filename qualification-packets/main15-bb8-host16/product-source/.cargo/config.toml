@@ -1,0 +1,9 @@
+[build]
+# Limit concurrent compilation on shared hosts; override with CARGO_BUILD_JOBS or -j.
+jobs = 2
+
+[env]
+# Cargo shares relocatable path-package artifacts across worktrees. Track this
+# identity in owned crates and local patches for source fidelity. Unrelated
+# external dependencies can reuse cached artifacts; dependents may rebuild.
+CAGENTS_CHECKOUT_ROOT = { value = ".", relative = true, force = true }

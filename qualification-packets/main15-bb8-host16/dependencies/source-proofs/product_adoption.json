@@ -1,0 +1,79 @@
+{
+  "schema": "issued_return_f95_assembled_consumer_root_source_adoption_v1",
+  "utc": "2026-10-31T16:46:13.915494+00:00",
+  "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+  "API_base": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+  "consumer_paths": [
+    "src/app.rs",
+    "src/app/chat_ui.rs",
+    "src/app/chrome_ui.rs"
+  ],
+  "outside_entries_and_modes_conserved": 2228,
+  "source_packet": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-main15-assembled-source-review-and-UI5-qualification-handoff-v2.json",
+    "sha256": "4df849a52f347731c626c635909815b4b9a93e00d53a458c780491403d8742ae"
+  },
+  "inputs_rehashed": [
+    {
+      "scope": "freeze",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-b8-bounded-source-correction-freeze-v1.json",
+      "sha256": "24ab6dc0d43d9ce328cf4e9cf445a9f1ea6405038a93201b175bf88d1fc84a54"
+    },
+    {
+      "scope": "authority",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-independent-authority-caller-correction-source-review-v1.json",
+      "sha256": "1e1e872f25d98db457c3947fe6919993b13479bf24f9f7b125c33489c1118e1a"
+    },
+    {
+      "scope": "UX",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-independent-b8-correction-UX-lifecycle-source-oracle-delta-review-v1.json",
+      "sha256": "b6d1243588641887cdb80632b286985eb6bbd4cb5c032f4b4568443142c8688d"
+    },
+    {
+      "scope": "conservation",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-independent-conservation-privacy-test-delta-review-v1.json",
+      "sha256": "bc758675dcc4a05c97825a721ad36bac543f913ab2935b2cebab8295bbcc0fd8"
+    },
+    {
+      "scope": "fresh_three_adapted_fixture_parent_caller_classification",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-three-fixture-parent-inherited-caller-source-classification-addendum-v1.json",
+      "sha256": "cd719e229d0b1d8687157ff9fd3c25d626ae7a2e5b905d55175e33a3a87775b3"
+    },
+    {
+      "scope": "full_inherited_scope",
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-current-main-inherited-delivery-scope-source-addendum-v1.json",
+      "sha256": "0aa37edca542f46d862ae116553bc7e4d483988319ade491cf435ba982bd2107"
+    }
+  ],
+  "root_review": "Inspected exact b8->f95 correction and assembled capture/retain/close/stage/flush/authenticated original ACK/retirement code; source reasoning and three independent reader reports only. C1 cleanup survives accepted B separately from B presentation rights; actual typed Closed is irreversible, durable flush precedes original R ACK, unresolved stages retain custody. Notices rendered and Tab-ring IDs agree.",
+  "full_delivery_vs_main": {
+    "merge_base": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "changed_paths_count": 55,
+    "status": "Inherited full stack, not a standalone three-file PR; no full-stack qualification from UI5."
+  },
+  "qualification": {
+    "UI_selectors": [
+      "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+      "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+      "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+      "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+      "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+    ],
+    "UI_parents": 5,
+    "HOST_preparation": "HOST16 remains source preparation, final head/controller review required",
+    "checks": "Separate CLI/HOST/browserlessUI boundaries",
+    "all_Rust_and_native_at_f95": "UNRUN",
+    "next": "Normal nonforce staged source publication, maintained source controller finalization/reviews; no execution grant yet"
+  },
+  "preserved_holds": [
+    "genuineUser5",
+    "FULL52",
+    "nativeBeforeAfterWebP",
+    "WHOLE",
+    "qclosed/general/conflict",
+    "1933NEVERMERGE"
+  ],
+  "merge_ready": false,
+  "new_runtime_or_lane_grant": false
+}
