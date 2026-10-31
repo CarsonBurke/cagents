@@ -1,12 +1,13 @@
 {
-  "schema": "pr1310-finite-original-arm-source-contract-v1",
-  "status": "SOURCE_CORRECTION_PENDING_REVIEW_NOT_SUBMITTABLE_ACTUAL_PARENT_ABSENT",
+  "schema": "pr1310-direct-entry-C-owner-source-contract-v2",
+  "status": "SOURCE_SLICE_IMPLEMENTED_REVIEW_PENDING_NOT_SUBMITTABLE_ACTUAL_PROVENANCE_NATIVE_GATES_UNRESOLVED",
   "worker": {
     "path": "qualification-packets/pr1310-native-entry/arm-worker.py",
-    "sha256": "efc9b6e4a6eec799ff2fa15be5fc29a60203d4ce4ea8838072ff07f241579b66",
+    "sha256": "da43b3a222671c9d87392791fbd6d006ef919481feb5c945fe9eaec03b9b8bfd",
     "invocation": "PINNED_PHYSICAL_PYTHON -I -B arm-worker.py --packet ACTUAL_PACKET --packet-sha256 ACTUAL_SHA --worker-sha256 FROZEN_WORKER_SHA --whole-deadline ORIGINAL_ABSOLUTE_DEADLINE",
     "standalone_admission": null,
-    "authority": "Actual authenticated outer Root/User instruction; no argument or JSON authenticates it."
+    "authority": "Actual authenticated outer Root/User instruction; no argument or JSON authenticates it.",
+    "execution_role": "Historical filename; SAME original external-tool entry now retains original NativeHistoryOwner AND original Cfd. No nested worker/parent/handoff required."
   },
   "immutable_dependencies": {
     "library": {
@@ -33,10 +34,40 @@
       "path": "/tmp/coord-b9-pr1310-8aa5dbbd-independent-physical-FD-review.json",
       "sha256": "aabb34bb047c39c21059dd4b644121c61b9c503f5991e4237c245a2e60592ae6",
       "scope": "8aa immutable dependency source only; not new worker/native/parent qualification."
+    },
+    "direct_entry_reference": {
+      "files": {
+        "capability.py": {
+          "path": "/var/tmp/coord16-1975-pending-env-execution-binding-vx9e5daw/capability.py",
+          "sha256": "fa6abb307570850c27bec1049d30c692f83abe40b506d93a9f0b6930aae9d748"
+        },
+        "manifest.json": {
+          "path": "/var/tmp/coord16-1975-pending-env-execution-binding-vx9e5daw/manifest.json",
+          "sha256": "2db9b0548df7c2afda04872216f0fa25425ece935996f3386e17be225bc14904"
+        },
+        "admission.json": {
+          "path": "/var/tmp/coord16-1975-pending-env-execution-binding-vx9e5daw/admission.json",
+          "sha256": "6fa65013e99d7226e5f8d03351fbab98ade374812a42d19dd49a8a3e97f4870a"
+        },
+        "original_empty_terminal_receipt": {
+          "path": "/var/tmp/coord16-1975-pending-empty-original-execution-p5l4oujh/receipt.json",
+          "sha256": "3ef793d304e6d0774f83e20426add9abcc90cef17fa969730764040482e1f05a"
+        }
+      },
+      "scope": "EMPTY historical topology SOURCE reference only, no app/UI/normal-chain/UX/native or new execution admission.",
+      "used": "Direct original entry retains original Cfd opened with NOFOLLOW+CLOEXEC; nonblocking flock. Allocation reference never authority.",
+      "NOT_copied": [
+        "c17 custody or settle_all/captured cleanup",
+        "retrying stop loop",
+        "Cclose before logs/evidence/final writer",
+        "EXECUTION_ADMITTED boolean as authority",
+        "TERM/KILL/timeout cleanup",
+        "empty0 as application/native or current C result"
+      ]
     }
   },
   "packet": {
-    "schema": "pr1310-original-arm-inputs-v1",
+    "schema": "pr1310-original-entry-inputs-v2",
     "exact_keys": [
       "schema",
       "arm",
@@ -45,7 +76,8 @@
       "custody_path",
       "sources",
       "tools",
-      "native_import_inputs"
+      "native_import_inputs",
+      "c_owner"
     ],
     "arm": "exactly before OR after; sources contains exactly this one arm",
     "root": "Already admitted fresh UID-owned0700 direct /tmp/cagents-history-<canonical UUID>, empty for original owner.",
@@ -56,36 +88,43 @@
     "tools": "Actual owner tools_shape canonical absolute path/sha256 bindings, no discovery/fallback.",
     "native_import_inputs": "Nonempty list <=4096 unique actual {path,sha256} files, opened/pinned by existing owner before imports. Presence/hashes do NOT establish complete installed closure or native authority.",
     "all_actual_runtime_input_values": null,
-    "no_sample_positive_packet": true
+    "no_sample_positive_packet": true,
+    "c_owner": {
+      "allocation_reference": "Actual external allocation canonical nonnil UUID REFERENCE only; never auth/grant by syntax.",
+      "lock_identity": "Actual reviewed existing C lock {device,inode,uid,mode,links}; integer EXPECTATIONS, never supplied FD or caller success flag. Actual values NULL here.",
+      "fixed_lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+      "fixed_target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+      "actual_identity": null
+    }
   },
   "finite_flow": [
-    "Validate isolated no-bytecode Python, original deadline <=2400 remaining, source/packet hashes and one-arm shape; install original cancellation.",
-    "Load exact source bytes only (no pycache); construct real d9ee Custody and original owner while actual main remains on stack.",
-    "Retain returned owner before private desktop preparation. Adopt ONLY exact six PRIVATE_KEYS plus four proved ENDPOINT_KEYS returned by original owner; no HOME/CODEX_HOME/opaque authority value rewrite.",
-    "Pin actual expected native input files. Refuse preinitialized GI/pyatspi/PIL. Import actual pyatspi then PIL.Image only after endpoint adoption, with original before/after deadline fences.",
-    "Read original pinned manifest/index bytes; actual Fixture.from_owned_bytes; real HistoryDriver for small,large,unborn sequentially; normal original runner for each.",
-    "After each real driver return retain original binding object/generation close intent BEFORE a single normal-close invocation. Cleanup can attempt only never-attempted bindings. Do not mark closure/death or replay an ambiguous close. Retain raw history_application_outcome records without inference.",
-    "Settle original owner; use ONE shared final/negative report-attempt ledger. Fence serialization and immediately before/after original write and flush with the SAME deadline/cancel state. Retain actual partial/called/returned facts; no report retry. Parent original Popen wait/pidfd terminal separately bounds this final writer.",
-    "Ambiguous/failed settlement or report retains SAME original owner/worker HOLD with NEW WORK stopped; no detach/unknown PID signal/close/report retry. Safe retention may outlive workload deadline and is not terminal/finite completion/PASS/C return. Actual original parent custody/review is missing; no new handoff API mandated."
+    "Original external tool -> this SAME entry. Validate exact source/packet, original unchanged deadline and cancellation. Construct d9ee Custody and original NativeHistoryOwner, retain task-local C state BEFORE one original open/nonblocking flock of existing C lock. Identity/reference are expectations/correlation only.",
+    "After actual acquired C, original owner prepares private desktop. Adopt ONLY six PRIVATE_KEYS plus four proved ENDPOINT_KEYS, then original actual native imports. No HOME/CODEX_HOME/authority/account/target/cache repair.",
+    "Actual Fixture.from_owned_bytes and actual HistoryDriver small/large/unborn, unchanged normal run-development browserless/matched3graphs. Real source/build/input provenance remains mandatory/unresolved.",
+    "Preserve original-object/generation CLOSE1 one-shot attempts and original raw application UNKNOWN/None facts; cleanup never replays an attempted binding.",
+    "Unchanged owner returns known-local finalization; original internal Popen waits, pidfd/census/FD facts remain honestly limited. No whole-family/unpublished-FD/import/UX inference.",
+    "Sole original REPORT1 attempt serializes/writes/flushes under SAME deadline/cancel fences BEFORE Cclose. Payload only contains pre-close C observations; no own future completion/close fact fabricated.",
+    "After actual returned report fences, check original owner settlement object/report ledger/known-local FD facts and held C identity; mark Cclose BEFORE one syscall. No new own output follows. Actual external tool session/chunks/terminal/streams are lead evidence, never self-wait.",
+    "Any ambiguous close/report/custody retains SAME original owner/C state under HOLD, no retries/unknown signals/detach/replacement/handoff. Original deadline bounds new work, not safe-retention latency; no terminal/PASS/logical return claimed."
   ],
   "lifetime": {
-    "worker": "One original Popen/pidfd per arm, held by missing original parent. Before terminal/physical closure precedes After target mutation/admission.",
-    "C_descriptor": "Never inherited or closed by worker. Original parent holds it through actual producer/terminal/custody/source/evidence and one-shot-close predicates.",
+    "worker": "Superseded historical nested-worker topology: ONE original external tool -> SAME source entry per arm, retaining actual native owner and original Cfd. Actual external terminal/streams are lead evidence; no new worker Popen or selfwait invented.",
+    "C_descriptor": "Implemented SOURCE slice: original task-local object retained before fixed existing lock open/flock, same entry holds original FD through known producers/finalization/sole report+flush; one-shot close afterward with no new own output. Ambiguous close retains UNKNOWN disposition/HOLD, never numeric retry.",
     "logical_allocation": "HELD until soleRAW + explicit executor return + Root acceptance; physical flock close alone is not logical return.",
     "original_budget": "One original absolute whole workload deadline from parent, max2400 seconds; no renewal per arm/dataset/import/read/capture/cleanup/report. It bounds new work, not safe-retention latency.",
     "raw_UI_unknown": "Retains None; no Cargo0/UI0 inference or native/UX PASS.",
-    "upstream_owner_gap": "d9ee unpublished-FD acquisition coverage remains unknown in owner. Known local settlement is not global/whole-family/C acceptance; original worker terminal is a separate future observation.",
-    "negative_retention": "Same original owner/resources retained for genuine uncertainty; no terminal or finite-completion claim. Actual supported original parent/C owner must retain original worker Popen, outer streams, deadline/cancel and custody with reviewed coupling. No new handoff API/carrier/positive flag is required or invented."
+    "upstream_owner_gap": "d9ee unpublished-FD acquisitions and owner native/import/whole-family gaps remain unchanged/unknown. Known local closure plus this tracked Cfd do not establish global or native qualification. External original-tool terminal is separate actual future lead evidence.",
+    "negative_retention": "SAME original main context retains original owner+C state for genuine uncertainty. No new parent/handoff API is mandatory. Safe retention is not finite completion/terminal/PASS/C return; actual supported original tool execution and reviewed final coupling remain required."
   },
   "precise_missing_supported_seams": [
     "Original producer/consumer of actual installed shell/Cargo/rustup/shim executable chain and all applicable effective ancestor/CARGO_HOME/env target/cfg runner configuration before effects. b756 only pins nonempty evidence bytes and explicitly lacks this producer.",
     "Original serial C-build producer/evidence receiver selecting actual three isolated dev-runtime matched artifacts for each arm, actual renderer package/input/version/build/wait/writer provenance. Normal runner has no build-only mode; do not fabricate prior build records or reuse changing path hashes.",
-    "Original parent actual C custody, worker Popen/pidfd supervision, bounded native import/compound AX containment, full original descendant/writer/source/context finalization, one-shot physical close and separate logical handback. No run-entry stub or ad-hoc positive schema supplied.",
+    "The direct original-entry/Cfd SOURCE slice is now implemented, superseding mandatory new-parent topology. Actual authenticated original tool execution, independently reviewed final coupling, original session/chunks/terminal/outer streams and native import/compound AX containment remain UNRUN/unsupported actual evidence. No selfwait, carrier or positive-flag replacement.",
     "Actual admitted installed Python/GI/Atspi/PIL/module input baseline; hash expectations here do not discover or qualify the transitive closure.",
     "Actual generated shared Git data, matched native executions/screenshots/readbacks and independent UX review; stale/held-page/full-reader/error/performance producers remain absent in driver."
   ],
   "runtime": {
-    "actual_parent": null,
+    "actual_parent": "SUPERSEDED_AS_MANDATORY_NESTED_TOPOLOGY; original external execution tool is the selected boundary, actual invocation remains NULL.",
     "actual_User_resource_instruction": null,
     "C_grant": null,
     "C_fd": null,
@@ -98,13 +137,15 @@
     "application": "UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW",
     "before": "UNRUN",
     "after": "UNRUN",
-    "actual_return": null
+    "actual_return": null,
+    "actual_original_external_tool": null
   },
   "source_limitations": [
     "No helper/module/function/case/test/build/tool/probe/native/provider/desktop/input/clipboard/env/account/runtime execution in authoring.",
     "Future blocking imports/kernel/library calls are cooperative in worker; actual original parent containment is missing.",
     "Normal app pre-main account detachment is unchanged and may conditionally remove provider home variables; no whole-app HOME-access/natural-startup claim.",
-    "No product/library/builder or existing driver API edits; only three new task-specific entry leaves."
+    "No product/library/builder or existing driver API edits; only three new task-specific entry leaves.",
+    "NEW source topology selection supersedes old nested-worker/parent/Cfd-never-owned requirements only. It does not grant execution or transfer old empty capability/Cargo/physical/native results."
   ],
   "source_correction": {
     "sole_parent": "0b574dbb3fef291de37e5f75227fda0823a94b76",
@@ -126,8 +167,36 @@
     "CLOSE1": "Source correction: original-object/generation attempt ledger retained before owner.close_history_root; failed/ambiguous intent cannot be replayed by cleanup. No owner/binding state fabricated.",
     "REPORT1": "Source correction: one report intent retained before first fence; same deadline/cancel fences surround serialization, write and flush. Original called/returned/partial/error state stays retained. Held never retries an attempted report or bypasses expired/cancelled admission.",
     "HOLD1": "Historical finite-completion concern remains. EC clarification bf7a1235 permits SAME original-owner retention for genuine uncertainty: deadline bounds new work, not safe-retention latency. No mandatory new finite-handoff API. Component still NOT SUBMITTABLE without actual original parent/C custody and reviewed coupling; no terminal/PASS/C return claimed.",
-    "review": "PENDING_SAME_INDEPENDENT_REVIEWER_EXACT_DELTA",
+    "review": "Historical feb4 CLOSE1/REPORT1 delta SOURCE_CLEAR, exact receipt preserved_feb4_source_clear below; new direct-entry C-owner review remains PENDING.",
     "runtime": "UNRUN; no authored functions/cases/module imports/native/effects executed.",
     "libraries_arms_driver_ABI_changed": false
+  },
+  "selected_direct_entry_source": {
+    "sole_parent": "feb4a2f722bb95f69ec2493dd3fc4a06d44ef0da",
+    "parent_tree": "21effd1a314bf415532012fb93655b279d8b9823",
+    "selection_reference": "EC8fecaecd-5328-4a35-8ffc-2fc24fceb531 via Root: prefer SINGLE original external tool->entry retaining existing owner+Cfd; source selection only.",
+    "scope": "Only current task entry leaves; no product/library/custody/driver/ARMS rewrite and no a621 adoption.",
+    "CLOSE1_REPORT1": "Exact prior helper executable bodies preserved; original final/negative shared single-report attempt semantics unchanged.",
+    "former_contracts_superseded": [
+      "Mandatory new nested worker/Popen/parent/handoff topology",
+      "Worker never owns/closes Cfd",
+      "Parent worker-wait as mandatory endpoint instead of actual original external tool terminal"
+    ],
+    "not_superseded": [
+      "Old0b negative all3findings retained",
+      "feb4 CLOSE1/REPORT1 correction history",
+      "bf7 same-owner uncertainty HOLD permitted",
+      "Original absolute deadline stops NEW WORK",
+      "Unknown raw statuses/unpublished/native/UX/source/build gates remain",
+      "Logical HELD through soleRAW + explicit executor return + Root acceptance"
+    ],
+    "evidence_order": "Original known owner finalization -> sole fenced final stdout write+flush -> one-shot actual Cclose -> no new own output; external original tool terminal/outer streams separate.",
+    "actual_execution": null,
+    "source_review": "PENDING_NEW_INDEPENDENT_DIRECT_ENTRY_COUPLING_REVIEW"
+  },
+  "preserved_feb4_source_clear": {
+    "path": "/tmp/coord-b9-pr1310-feb4a2f7-independent-arm-worker-delta-review.json",
+    "sha256": "66fd954e9782ed7b34371541b0f281d167d8db1cff07d1b1bb046e02f0117291",
+    "scope": "SOURCE_CLEAR_FOR_CLOSE1_REPORT1_DELTA_ONLY; no runtime/native/current C-owner coupling transfer."
   }
 }

@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""One PR1310 arm in its ORIGINAL future admitted parent's process family.
+"""One PR1310 arm: ORIGINAL external execution tool -> this SAME C/owner entry.
 
-This leaf implements the real worker, not the still-missing parent controller.
-Its arguments identify immutable inputs and an existing absolute deadline; they
-are not User authorization, a C allocation, or evidence of a successful build.
+The historical filename is retained; no nested worker/parent/handoff is required.
+Arguments bind inputs, allocation correlation and an original absolute deadline;
+they are not User authorization, a C allocation or successful-build evidence.
 Importing this module performs no native import, acquisition, or launch.
-NOT SUBMITTABLE: actual original parent/C custody and reviewed coupling absent.
+SOURCE ONLY / NOT SUBMITTABLE: actual chain/build/native evidence is unresolved.
 """
 
 import argparse
+import fcntl
 import hashlib
 import importlib
 import importlib.util
@@ -20,6 +21,7 @@ import signal
 import stat
 import sys
 import time
+import uuid
 
 
 LIBRARY_HEAD = "b756e6f9165f6bf164b8acad1c77cdab34d3fd07"
@@ -36,6 +38,8 @@ ENDPOINT_KEYS = ("DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "AT_SPI_BU
 MAX_PACKET = 4 * 1024 * 1024
 MAX_REPORT = 64 * 1024 * 1024
 STOP_SIGNALS = []
+C_LOCK = Path("/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock")
+C_TARGET = C_LOCK.parent / "lane-c-target"
 
 
 def require(value, reason):
@@ -57,6 +61,108 @@ def checkpoint(deadline):
     remaining = deadline - time.monotonic()
     require(remaining > 0, "original whole deadline exhausted; no renewed budget")
     return remaining
+
+
+class OriginalCDescriptor:
+    """This entry's one returned Cfd, never a caller-supplied FD or grant API."""
+
+    def __init__(self, owner, inputs, report_attempts):
+        require(set(inputs) == {"allocation_reference", "lock_identity"},
+                "unsupported original C expectation fields")
+        reference = inputs["allocation_reference"]
+        require(isinstance(reference, str) and str(uuid.UUID(reference)) == reference
+                and uuid.UUID(reference).int != 0, "canonical nonnil allocation REFERENCE required")
+        expected = inputs["lock_identity"]
+        require(set(expected) == {"device", "inode", "uid", "mode", "links"}
+                and all(type(value) is int and value >= 0 for value in expected.values())
+                and expected["inode"] > 0 and expected["links"] == 1,
+                "actual reviewed existing C lock identity absent")
+        require(all(spec["cargo_target_dir"] == str(C_TARGET) for spec in owner.sources.values()),
+                "only the original existing warm C target is supported")
+        self.owner, self.reports = owner, report_attempts
+        self.fd, self.original_identity = None, None
+        self.expected = expected
+        self.state = {"record": "pr1310-original-C-descriptor-v1", "path": str(C_LOCK),
+                      "target": str(C_TARGET), "allocation_reference": reference,
+                      "reference_semantics": "CORRELATION_ONLY_NOT_AUTHORITY",
+                      "open_called": False, "open_returned": False, "original_fd": None,
+                      "opened_identity": None, "flock_called": False, "flock_returned": False,
+                      "close_attempted": False, "close_returned": None, "close_error": None,
+                      "physical_disposition": "NO_RETURNED_FD_OBSERVED",
+                      "logical_allocation": "HELD_EXTERNAL_ROOT", "error": None}
+
+    @staticmethod
+    def identity(info):
+        return {"device": info.st_dev, "inode": info.st_ino, "uid": info.st_uid,
+                "mode": stat.S_IMODE(info.st_mode), "links": info.st_nlink}
+
+    def acquire(self, deadline):
+        require(not self.state["open_called"], "original C open cannot be replayed")
+        try:
+            checkpoint(deadline)
+            require(C_LOCK.resolve(strict=True) == C_LOCK, "original C lock route is aliased")
+            checkpoint(deadline)
+            self.state["open_called"] = True
+            self.fd = os.open(C_LOCK, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+            # Retain the returned original BEFORE fallible metadata/clock work.
+            self.state.update(open_returned=True, original_fd=self.fd,
+                              physical_disposition="ORIGINAL_FD_OPEN_LOCK_UNKNOWN")
+            checkpoint(deadline)
+            held, named = os.fstat(self.fd), C_LOCK.lstat()
+            self.original_identity = self.identity(held)
+            self.state["opened_identity"] = self.original_identity
+            require(stat.S_ISREG(held.st_mode) and stat.S_ISREG(named.st_mode)
+                    and held.st_uid == os.getuid() and not held.st_mode & 0o022
+                    and self.original_identity == self.identity(named) == self.expected,
+                    "original held C descriptor differs from reviewed existing lock")
+            checkpoint(deadline)
+            self.state["flock_called"] = True
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.state.update(flock_returned=True,
+                              physical_disposition="ORIGINAL_FD_OPEN_LOCK_ACQUIRED")
+            checkpoint(deadline)
+        except BaseException as error:
+            self.state["error"] = {"type": type(error).__name__, "reason": str(error)[:4096]}
+            raise  # No alternate lock/target, automatic close or acquisition retry.
+
+    def facts(self):
+        # Known source-owned observations only, never authority or logical return.
+        return dict(self.state)
+
+    def close_after_report(self, settlement, deadline):
+        require(not self.state["close_attempted"], "original C close must never be retried")
+        owner = self.owner
+        require(settlement is owner.final_settlement and owner.settlement_attempted
+                and owner.final_no_more_work is not None
+                and owner.physical_evidence.get("known_local_death_writer_census_FD_facts_returned") is True,
+                "original known-local owner finalization did not return")
+        require(len(self.reports) == 1 and self.reports[0]["completed"] is True
+                and self.reports[0]["write_returned"] is True
+                and self.reports[0]["flush_returned"] is True,
+                "original final stdout writer has not returned through its fences")
+        # The unchanged owner supplies KNOWN LOCAL facts, not a whole-family,
+        # unpublished-FD/native/import/UX certificate. Those HOLDs stay intact.
+        require(all(item.get("close_returned") is True for item in owner.files)
+                and all(item.get("close_returned") is True for item in owner.raw_fds),
+                "known original internal FD closure is incomplete")
+        if self.fd is None:
+            return  # No returned Cfd was observed; do not claim C closed/acquired.
+        checkpoint(deadline)
+        held, named = os.fstat(self.fd), C_LOCK.lstat()
+        require(stat.S_ISREG(held.st_mode) and self.identity(held) == self.original_identity
+                == self.identity(named) == self.expected,
+                "original C descriptor identity is unavailable/replaced before close")
+        checkpoint(deadline)
+        self.state["close_attempted"] = True
+        self.state["physical_disposition"] = "UNKNOWN_AFTER_ONE_CLOSE_ATTEMPT"
+        try:
+            os.close(self.fd)
+        except BaseException as error:
+            self.state.update(close_returned=False,
+                              close_error={"type": type(error).__name__, "reason": str(error)[:4096]})
+            raise  # Even if consumed, never retry this numeric FD or claim held/closed.
+        self.state.update(close_returned=True, physical_disposition="ORIGINAL_CLOSE_RETURNED")
+        checkpoint(deadline)
 
 
 def frozen_bytes(spelling, expected, maximum):
@@ -186,8 +292,9 @@ def emit(value, deadline, attempts, kind):
 
 def held(owner, error, deadline, close_attempts, report_attempts):
     """No detach, speculative cleanup, PID lookup, or new supervisor on unknown."""
-    # The original parent still owns this worker Popen/pidfd and C. Its source
-    # controller is a missing prerequisite, not supplied by this waiting leaf.
+    # SAME original main stack retains owner AND original C-descriptor state.
+    # Original external tool/session/streams/terminal are lead evidence, never
+    # self-waited here. This does not invent a nested worker or custody handoff.
     try:
         if not report_attempts:
             emit({"record": "pr1310-arm-retained-hold-v1", "worker_pid": os.getpid(),
@@ -228,8 +335,8 @@ def main():
     frozen_bytes(str(worker_path), arguments.worker_sha256, 1024 * 1024)
     packet = unique_json(frozen_bytes(arguments.packet, arguments.packet_sha256, MAX_PACKET))
     require(set(packet) == {"schema", "arm", "root", "library_directory", "custody_path",
-                            "sources", "tools", "native_import_inputs"}
-            and packet["schema"] == "pr1310-original-arm-inputs-v1",
+                            "sources", "tools", "native_import_inputs", "c_owner"}
+            and packet["schema"] == "pr1310-original-entry-inputs-v2",
             "unsupported actual-arm input fields")
     arm = packet["arm"]
     require(arm in ("before", "after") and set(packet["sources"]) == {arm},
@@ -254,6 +361,7 @@ def main():
                                   LIBRARY_FILES["history_driver.py"], deadline)
     checkpoint(deadline)
     owner = None
+    c_descriptor = None
     generations = []
     close_attempts, report_attempts = [], []
     flow_completed = False
@@ -264,6 +372,10 @@ def main():
             custody, cancelled, phase_deadline=deadline, whole_deadline=deadline,
             root=packet["root"], sources=packet["sources"], tools=packet["tools"],
             entry_function=main, entry_source=(str(worker_path), arguments.worker_sha256))
+        # Actual same-entry object is retained BEFORE open/flock may partially
+        # acquire. Expected identity/reference is not scheduler authorization.
+        c_descriptor = OriginalCDescriptor(owner, packet["c_owner"], report_attempts)
+        c_descriptor.acquire(deadline)
         # The ORIGINAL owner is retained before any desktop partial acquisition.
         overlay = owner.prepare_private_desktop()
         require(set(overlay) == set(PRIVATE_KEYS + ENDPOINT_KEYS),
@@ -318,23 +430,29 @@ def main():
                 close_once(owner, binding, close_attempts)
                 generations.append(owner.history_application_outcome(binding))
         settlement = owner.settle_history_services()
-        # Final report is a separate original-worker writer. Its return and
-        # process terminal/pidfd death must be observed by the missing parent;
-        # the owner's earlier local no-more-work marker does not include it.
+        control_exit = 0 if flow_completed and owner.first_failure is None else 1
+        # This SAME entry's writer is AFTER owner-local finalization and BEFORE
+        # its one-shot Cclose. No own report/output follows Cclose. The actual
+        # original external tool terminal/outer streams are separate lead facts.
         emit({"record": "pr1310-original-arm-raw-v1", "arm": arm,
               "worker_pid": os.getpid(), "library": [LIBRARY_HEAD, LIBRARY_TREE],
               "packet_sha256": arguments.packet_sha256,
               "worker_sha256": arguments.worker_sha256,
               "original_whole_deadline": deadline, "stop_signals": STOP_SIGNALS,
               "flow_method_returned": flow_completed, "generations": generations,
+              "entry_topology": "ORIGINAL_EXTERNAL_TOOL_TO_SAME_ENTRY_AND_C_OWNER",
+              "C_descriptor_before_close": None if c_descriptor is None else c_descriptor.facts(),
               "close_attempts": close_facts(close_attempts),
               "settlement": settlement, "events": owner.events,
               "logical_allocation": "HELD_EXTERNAL_ROOT",
               "application": "UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW",
-              "native": "UNQUALIFIED", "C_release": "NOT_PERFORMED_BY_WORKER"},
+              "native": "UNQUALIFIED",
+              "C_release": "CLOSE_NOT_YET_ATTEMPTED_EXTERNAL_ORIGINAL_TERMINAL_REQUIRED"},
              deadline, report_attempts, "final-raw")
         checkpoint(deadline)
-        return 0 if flow_completed and owner.first_failure is None else 1
+        if c_descriptor is not None:
+            c_descriptor.close_after_report(settlement, deadline)
+        return control_exit
     except BaseException as error:
         owner.record_history_failure(error)
         held(owner, error, deadline, close_attempts, report_attempts)

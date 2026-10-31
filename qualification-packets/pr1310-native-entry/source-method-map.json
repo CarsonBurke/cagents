@@ -1,0 +1,147 @@
+{
+  "schema": "pr1310-direct-entry-C-owner-source-method-map-v1",
+  "base": "feb4a2f722bb95f69ec2493dd3fc4a06d44ef0da",
+  "worker_sha256": "da43b3a222671c9d87392791fbd6d006ef919481feb5c945fe9eaec03b9b8bfd",
+  "source_functions": {
+    "require": {
+      "line": 45,
+      "end_line": 47
+    },
+    "cancelled": {
+      "line": 50,
+      "end_line": 51
+    },
+    "stop": {
+      "line": 54,
+      "end_line": 56
+    },
+    "checkpoint": {
+      "line": 59,
+      "end_line": 63
+    },
+    "frozen_bytes": {
+      "line": 168,
+      "end_line": 182
+    },
+    "unique_json": {
+      "line": 185,
+      "end_line": 195
+    },
+    "source_module": {
+      "line": 198,
+      "end_line": 214
+    },
+    "close_attempted": {
+      "line": 217,
+      "end_line": 219
+    },
+    "close_once": {
+      "line": 222,
+      "end_line": 240
+    },
+    "close_facts": {
+      "line": 243,
+      "end_line": 247
+    },
+    "emit": {
+      "line": 250,
+      "end_line": 290
+    },
+    "held": {
+      "line": 293,
+      "end_line": 315
+    },
+    "main": {
+      "line": 318,
+      "end_line": 458
+    }
+  },
+  "new_original_C_methods": {
+    "__init__": {
+      "line": 69,
+      "end_line": 92
+    },
+    "identity": {
+      "line": 95,
+      "end_line": 97
+    },
+    "acquire": {
+      "line": 99,
+      "end_line": 126
+    },
+    "facts": {
+      "line": 128,
+      "end_line": 130
+    },
+    "close_after_report": {
+      "line": 132,
+      "end_line": 165
+    }
+  },
+  "reference_pins": {
+    "files": {
+      "capability.py": {
+        "path": "/var/tmp/coord16-1975-pending-env-execution-binding-vx9e5daw/capability.py",
+        "sha256": "fa6abb307570850c27bec1049d30c692f83abe40b506d93a9f0b6930aae9d748"
+      },
+      "manifest.json": {
+        "path": "/var/tmp/coord16-1975-pending-env-execution-binding-vx9e5daw/manifest.json",
+        "sha256": "2db9b0548df7c2afda04872216f0fa25425ece935996f3386e17be225bc14904"
+      },
+      "admission.json": {
+        "path": "/var/tmp/coord16-1975-pending-env-execution-binding-vx9e5daw/admission.json",
+        "sha256": "6fa65013e99d7226e5f8d03351fbab98ade374812a42d19dd49a8a3e97f4870a"
+      },
+      "original_empty_terminal_receipt": {
+        "path": "/var/tmp/coord16-1975-pending-empty-original-execution-p5l4oujh/receipt.json",
+        "sha256": "3ef793d304e6d0774f83e20426add9abcc90cef17fa969730764040482e1f05a"
+      }
+    },
+    "scope": "EMPTY historical topology SOURCE reference only, no app/UI/normal-chain/UX/native or new execution admission.",
+    "used": "Direct original entry retains original Cfd opened with NOFOLLOW+CLOEXEC; nonblocking flock. Allocation reference never authority.",
+    "NOT_copied": [
+      "c17 custody or settle_all/captured cleanup",
+      "retrying stop loop",
+      "Cclose before logs/evidence/final writer",
+      "EXECUTION_ADMITTED boolean as authority",
+      "TERM/KILL/timeout cleanup",
+      "empty0 as application/native or current C result"
+    ]
+  },
+  "actual_reference_API": {
+    "Supervisor.run_capability": "323-335: original existing Cfd open/nonblocking flock; task retains stronger identity/deadline/acquisition ledger.",
+    "Supervisor.stop": "408-430: NOT copied; closes before own logs/evidence and source main retries stop.",
+    "main": "432-465: original external tool terminal topology only; no historical source-ready flag, cleanup, selfcertified empty result or c17 transfer."
+  },
+  "existing_method_conservation": {
+    "exact_prior_executable_AST_expected": [
+      "require",
+      "cancelled",
+      "stop",
+      "checkpoint",
+      "frozen_bytes",
+      "unique_json",
+      "source_module",
+      "close_attempted",
+      "close_once",
+      "close_facts",
+      "emit",
+      "held"
+    ],
+    "main_delta_only": [
+      "new packet c_owner field/schema",
+      "retain original task-local C object then acquire before desktop",
+      "capture pre-close C facts in existing report",
+      "compute control_exit before writer",
+      "one-shot Cclose AFTER sole report/flush, no new own output"
+    ],
+    "library_driver_custody_ARMS": "Exact parent blobs; no a621 adoption."
+  },
+  "close_predicate_limits": "Actual original owner.final_settlement identity and its returned known-local facts + same original report ledger returned fences. Not caller success input, global FD/custody certificate, rawUI0, native/UX result or logical return.",
+  "runtime": "UNRUN; no module/function/case/helper/probe/effect executed.",
+  "preserved_feb4_source_clear": {
+    "path": "/tmp/coord-b9-pr1310-feb4a2f7-independent-arm-worker-delta-review.json",
+    "sha256": "66fd954e9782ed7b34371541b0f281d167d8db1cff07d1b1bb046e02f0117291",
+    "scope": "SOURCE_CLEAR_FOR_CLOSE1_REPORT1_DELTA_ONLY; no runtime/native/current C-owner coupling transfer."
+  }
+}
