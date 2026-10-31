@@ -9,12 +9,13 @@
   "selector_path": ".github/qualification/pr2015/case-select.py",
   "selector_sha256": "bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d",
   "independent_review_path": ".github/qualification/pr2015/cli-cache-producer-review.json",
-  "independent_review_input": "No author clear/stub: missing genuine exact frozen runner/plan/product review refuses before output/setup/Cargo. Must copy actual independent receipt after freeze and perform final source-binding review before publication.",
+  "independent_review_input": "Genuine nonauthor process/tool/custody receipt copied byte-exact from external review at b881. Product/runner/plan ABI only; final wrapper/conservation review remains independently required. This copied receipt grants no execution/publication/allocation.",
   "source_sha256": {
     ".github/qualification/pr2015/case-select.py": "bb3f692f92a6c71a36779e1aabf0eb6e3327d07a8f4ff24d6aae13076e4cbf0d",
     ".github/qualification/pr2015/cli-cache-producer.py": "b2fda78cb29cf3a712d52f9cfbaa83c317ace3a0aa74a1da9f678b9af7f23dd6",
     ".github/qualification/pr2015/cli-cache-producer-plan.json": "c39055932062af3961999942c15df40239a761d2373472cd173a743d6c190e85",
-    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4"
+    ".github/qualification/pr2015/cache-restore-gate.py": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+    ".github/qualification/pr2015/cli-cache-producer-review.json": "6d504bf30051fc3460c03010483be3728324fabf8212e97703e6dccca643d228"
   },
   "legacy_published_source": {
     "case": "legacy-final-save-1726",
@@ -51,5 +52,6 @@
     "head": "cbce2c8af82b09008c566dd32e7a2ab545f28dcf",
     "scope": "Source-only lock-acquisition refusal could return while handoff stayed unconfirmed because HOLD was conditioned on acquired. This successor removes that condition; no runtime result.",
     "runtime_result": null
-  }
+  },
+  "independent_review_sha256": "6d504bf30051fc3460c03010483be3728324fabf8212e97703e6dccca643d228"
 }

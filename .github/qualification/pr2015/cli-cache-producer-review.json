@@ -1,0 +1,135 @@
+{
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "head": "375c37ff01aab0b226c58f547012af74e93a8643",
+  "tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+  "runner_sha256": "b2fda78cb29cf3a712d52f9cfbaa83c317ace3a0aa74a1da9f678b9af7f23dd6",
+  "plan_sha256": "c39055932062af3961999942c15df40239a761d2373472cd173a743d6c190e85",
+  "review_kind": "genuine independent bounded actual-code process/tool/custody review; Root source author; reviewer authored no candidate source",
+  "created_utc": "2026-10-31T17:46:37.447922+00:00",
+  "controller_head": "b8815783881b89476746daeacc390db9eaf0ccb2",
+  "controller_tree": "c3e1d9b152d9dc5005a71d5712b294615f16b272",
+  "controller_parent": "cbce2c8af82b09008c566dd32e7a2ab545f28dcf",
+  "control_source": {
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1921-cli-cache-producer-enumeration",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1921-cli-cache-producer-acquisition-hold-source-freeze-v1.json",
+      "sha256": "51ecc2b701aafbb9eeed7467e9c2a4cbc7b2087dcbbd4dd518814c31eebb345f"
+    },
+    "runner": {
+      "path": ".github/qualification/pr2015/cli-cache-producer.py",
+      "blob": "fd8ce08bc042118acbcf6f8e9d8e95c0af9655a7",
+      "sha256": "b2fda78cb29cf3a712d52f9cfbaa83c317ace3a0aa74a1da9f678b9af7f23dd6",
+      "bytes": 72222
+    },
+    "plan": {
+      "path": ".github/qualification/pr2015/cli-cache-producer-plan.json",
+      "blob": "b82145f09bf9cc8bbbf78141c3982c7e8d785c7c",
+      "sha256": "c39055932062af3961999942c15df40239a761d2373472cd173a743d6c190e85",
+      "bytes": 9597
+    },
+    "head_tree_clean_verified_before_after": true
+  },
+  "scope": "Actual process/tool initialization, original wait/raw evidence, partial/nonzero materialization and prelease/negative-return custody retention, three-compile/zero-parent accounting, original direct-held-pidfd and canonical9004 unsignaled settlement/positive close, source and paired Cargo artifact observations. This receipt resolves this reviewer's actual05f2/cbce blockers by exact source conservation and the final one-line correction. Selector/workflow/cache payload/enumeration/full conservation and final copied-review wrapper assembly retain their separate owners.",
+  "findings": [],
+  "correction_resolution": [
+    {
+      "finding": "P1921-TOOL-2",
+      "status": "SOURCE_RESOLVED retained exact from cbce",
+      "anchors": [
+        63,
+        73,
+        82,
+        83,
+        84,
+        122,
+        132,
+        134,
+        140,
+        148
+      ],
+      "evidence": "Per-attempt original tool request files and persistent stdout/stderr files precede each Popen; status/failure capture preserves original wait/exit and outputs before nonzero assertion. Earlier observations survive partial/late materialization failure. Default successful Git text behavior is preserved. Per-capture channels_complete:false and independent_writer_closure_proven:false prevent treating the direct read/wait as descendant writer-closure evidence. Source only; no actual tool execution or stream closure is asserted."
+    },
+    {
+      "finding": "P1921-CUSTODY-1 exception/evidence-write bypass",
+      "status": "SOURCE_RESOLVED retained exact from cbce",
+      "anchors": [
+        823,
+        869,
+        877,
+        922,
+        1192,
+        1195,
+        1214,
+        1220,
+        1224
+      ],
+      "evidence": "OWNERSHIP_INITIALIZED is set after handlers/subreaper and before first child. Shared PROCESS_PHASES retains actual phase evidence. Outer main catches post-ownership exceptions, makes two natural canonical observations, treats assessment exceptions as unconfirmed, ignores emergency-save failure, and reaches existing HOLD for unknown handoff. No new signalling authority or supervisor was added."
+    },
+    {
+      "finding": "P1921-CUSTODY-1-REMAINING normal negative return",
+      "status": "SOURCE_RESOLVED by exact b881 correction",
+      "anchor": {
+        "path": ".github/qualification/pr2015/cli-cache-producer.py",
+        "line": 1129
+      },
+      "evidence": "The sole runner change removes the acquired conjunct. A false safe_lane_handoff now enters HOLD before any fd close or normal return whether local acquisition succeeded or failed. Thus failed lock acquisition plus unknown original source wait/unclean final custody cannot escape as ordinary status1. Known-clean failed acquisition still returns negative and makes no cache/global-C qualification. Assessment exceptions with acquired false still escape to the existing guarded outer exception path."
+    }
+  ],
+  "causal_source_cases": [
+    {
+      "acquired": false,
+      "handoff_confirmed": false,
+      "required_and_source_route": "existing retain_uncertain_lane before normal return/any close"
+    },
+    {
+      "acquired": true,
+      "handoff_confirmed": false,
+      "required_and_source_route": "existing retain_uncertain_lane before original fd close"
+    },
+    {
+      "acquired": false,
+      "handoff_confirmed": true,
+      "required_and_source_route": "known-clean refusal may return1; actual_release/cache_preparation_complete remainfalse"
+    },
+    {
+      "acquired": true,
+      "handoff_confirmed": true,
+      "required_and_source_route": "existing original fd close once; only complete original successful phases and unchanged source/context can qualify preparation"
+    }
+  ],
+  "conservation_evidence": {
+    "exact_runner_delta_from_cbce": "One replacement only: if acquired and not historical_handoff_clean -> if not historical_handoff_clean; all other runner bytes exact.",
+    "plan_bytes": "Exact cbce plan; hash unchanged.",
+    "prior_positive_evidence_reused": "All unchanged process/tool/raw-capture/accounting/direct-held-fd/canonical-settlement/paired-artifact/cap source from the two immutable prior reviews retains only its scoped source conclusions. No repeated24 generic-function audit or runtime result transfer.",
+    "prior_reports": [
+      {
+        "path": "/tmp/pr1921-05f2-producer-process-tool-custody-independent-source-review-v1.json",
+        "sha256": "06454c4267b6bcc3141a642da4504db653a4e1767f984c4350471bc475238eef"
+      },
+      {
+        "path": "/tmp/pr1921-cbce-process-tool-custody-delta-independent-source-review-v1.json",
+        "sha256": "9b0743b2855450385f2d182b733a558407cb4d26e9ca3b85ef6fbbc1380ba05c"
+      }
+    ]
+  },
+  "preserved_contracts": [
+    "Three serial feature-empty CLI check/no-run integration compilation phases, zero test/inventory/installer/native/provider parent invocations or passes. Source/tool captures remain separately accounted.",
+    "600/900/900 phase caps under one2400 workload deadline; finite initial source/tool and separate finalization/job bounds retain their existing limits. No whole-job2400 claim.",
+    "Canonical9004 remains exact and unproven adopted survivors remain unsignaled. Original direct-Popen-held pidfd cleanup remains its existing source-bound contract.",
+    "Only positive original waits/evidence, clean unforced phase custody and both final custody observations permit the original fd close; unknown retains HOLD. Local fd handback does not allocate or return global C.",
+    "Original ac4 installer force branch, warm gate/no-cold-fallback and original cache-miss negative remain immutable historical facts, not amended or qualified by this producer review."
+  ],
+  "limits": [
+    "SOURCE ONLY. All actual tool/compiler/test/helper/native/cache/process results remain UNRUN/UNKNOWN. No candidate import/call, build/test, environment/authority/account/DB/process/target/resource probe occurred.",
+    "This genuine ABI may be copied unchanged as this scoped independent source review for the exact product/runner/plan. Copying it into source and refreshing dependent bindings changes the controller tree and requires the separately requested final wrapper/conservation review. It does not review that future tree.",
+    "The intentionally absent embedded genuine review at this frozen head is expected fail-closed. This receipt itself grants no publication, supported carrier, session, C, run, cache save/restore, installer parent, native or merge authority.",
+    "Case/workflow/payload/enumeration/full conservation assessments remain separately owned. No whole-controller or actual hosted eligibility claim extends beyond this stated process/tool/custody scope.",
+    "Historical05f2/cbce failures and blocked reports remain preserved; their negative dispositions are not relabelled."
+  ],
+  "validation": {
+    "source": "Exact immutable Git reads, byte-replacement proof, source AST parsing and frozen/worktree hashes only.",
+    "writes": "Only this new task-owned /tmp review receipt. No product/controller/Git/GitHub writes.",
+    "current_C": "16335727 belongs B9 SearchUI5 only; no1921 admission or allocation.",
+    "all_actuals": "UNRUN"
+  }
+}
