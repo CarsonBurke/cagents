@@ -104,12 +104,14 @@ impl Journal {
         })
     }
     pub fn continuity_loss(&self) -> Result<Option<ContinuityLoss>, String> {
+        self.require_autocommit()?;
         Ok(self.last_loss.clone())
     }
     pub fn loss(&self) -> Result<Option<String>, String> {
         Ok(self.continuity_loss()?.map(|loss| loss.reason))
     }
     pub fn record_loss(&mut self, reason: &str) -> Result<(), String> {
+        self.require_autocommit()?;
         if self.last_loss.is_none() {
             self.last_loss = Some(ContinuityLoss {
                 id: uuid::Uuid::new_v4(),
@@ -165,6 +167,7 @@ impl Journal {
         Ok(())
     }
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
+        self.require_autocommit()?;
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
         if !matches!(
@@ -317,6 +320,7 @@ impl Journal {
         Ok(())
     }
     pub fn input(&self, identity: &InputIdentity) -> Result<Option<InputReceipt>, String> {
+        self.require_autocommit()?;
         let stored: Option<(String, Vec<u8>, Vec<u8>)> = self
             .db
             .query_row(
@@ -343,6 +347,7 @@ impl Journal {
         Ok(None)
     }
     fn check_run_capacity(&self, run: crate::model::RunId) -> Result<(), String> {
+        self.require_autocommit()?;
         if self.run_ids.len() >= MAX_ENTRIES && !self.run_ids.contains(&run) {
             return Err(
                 "Retained actor run identity capacity reached; outcome continuity is unconfirmed"
@@ -352,9 +357,11 @@ impl Journal {
         Ok(())
     }
     pub fn retained_runs(&self) -> Result<Vec<crate::model::RunId>, String> {
+        self.require_autocommit()?;
         Ok(self.run_ids.iter().copied().collect())
     }
     pub fn refuse_unexecuted_run(&mut self, run: crate::model::RunId) -> Result<(), String> {
+        self.require_autocommit()?;
         self.db
             .execute("DELETE FROM retained_runs WHERE run=?1", [run.to_string()])
             .map_err(|error| error.to_string())?;
@@ -470,6 +477,7 @@ impl Journal {
         self.acknowledged_inputs.len()
     }
     pub fn acknowledged_input_page(&self) -> Result<Vec<InputReceipt>, String> {
+        self.require_autocommit()?;
         let mut page = Vec::new();
         for sequence in self.acknowledged_inputs.iter().take(64) {
             let (id, hash, state): (String, Vec<u8>, Vec<u8>) = self
@@ -502,6 +510,7 @@ impl Journal {
         &mut self,
         identities: &[InputIdentity],
     ) -> Result<(), String> {
+        self.require_autocommit()?;
         if identities.len() > 64 {
             return Err("Input retirement batch exceeds capacity".into());
         }
@@ -549,6 +558,7 @@ impl Journal {
     }
 
     pub fn retire_inputs(&mut self, through: u64) -> Result<(), String> {
+        self.require_autocommit()?;
         let mut query = self
             .db
             .prepare("SELECT state FROM inputs WHERE sequence<=?1")
@@ -581,17 +591,33 @@ impl Journal {
         self.number("outcome_ack")
     }
     pub fn latest(&self) -> Result<u64, String> {
+        self.require_autocommit()?;
         Ok(self.outcome_latest)
     }
     #[cfg(test)]
     pub fn fail_input_storage(&self) {
         self.db.execute_batch("DROP TABLE inputs").unwrap();
     }
+    #[cfg(test)]
+    pub(super) fn fail_restart_result_update(&self, id: uuid::Uuid, enabled: bool) {
+        self.db
+            .execute_batch("DROP TRIGGER IF EXISTS fixture_restart_result_update")
+            .unwrap();
+        if enabled {
+            self.db
+                .execute_batch(&format!(
+                    "CREATE TEMP TRIGGER fixture_restart_result_update BEFORE UPDATE OF state ON restarts
+                     WHEN NEW.id='{id}' BEGIN SELECT RAISE(ABORT,'fixture restart commit failure'); END;"
+                ))
+                .unwrap();
+        }
+    }
     pub fn restart(
         &self,
         id: uuid::Uuid,
         hash: &[u8; 32],
     ) -> Result<Option<super::restart::RestartState>, String> {
+        self.require_autocommit()?;
         let row: Option<(Vec<u8>, Vec<u8>)> = self
             .db
             .query_row(
@@ -610,6 +636,7 @@ impl Journal {
         .transpose()
     }
     pub fn admit_restart(&mut self, id: uuid::Uuid, hash: &[u8; 32]) -> Result<(), String> {
+        self.require_autocommit()?;
         let count: usize = self
             .db
             .query_row("SELECT COUNT(*) FROM restarts", [], |row| row.get(0))
@@ -633,21 +660,100 @@ impl Journal {
     pub fn finish_restart(
         &mut self,
         id: uuid::Uuid,
-        result: Result<crate::daemon::holder_registry::Process, super::restart::RestartFailure>,
+        hash: &[u8; 32],
+        result: &Result<crate::daemon::holder_registry::Process, super::restart::RestartFailure>,
     ) -> Result<super::restart::RestartState, String> {
-        let state = super::restart::RestartState::Acknowledged(result);
-        self.db
-            .execute(
-                "UPDATE restarts SET state=?1 WHERE id=?2",
-                params![
-                    serde_json::to_vec(&state).map_err(|error| error.to_string())?,
-                    id.to_string()
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(state)
+        use super::restart::{RestartCleanup, RestartState};
+        self.require_autocommit()?;
+        let desired = RestartState::Acknowledged(result.clone());
+        let bytes = serde_json::to_vec(&desired).map_err(|error| error.to_string())?;
+        let outcome = (|| {
+            let tx = self.db.transaction().map_err(|error| error.to_string())?;
+            let (stored_hash, prior): (Vec<u8>, Vec<u8>) = tx
+                .query_row(
+                    "SELECT hash,state FROM restarts WHERE id=?1",
+                    [id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            if stored_hash.as_slice() != hash {
+                return Err("Restart identity was already used for a different launch".into());
+            }
+            let previous: RestartState =
+                serde_json::from_slice(&prior).map_err(|error| error.to_string())?;
+            if previous != desired {
+                let allowed = match (&previous, result) {
+                    (RestartState::Accepted, _) => true,
+                    (RestartState::Acknowledged(Err(old)), Err(new)) => {
+                        old.reason == new.reason
+                            && old.cleanup == RestartCleanup::Uncertain
+                            && new.cleanup == RestartCleanup::TeardownProved
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    return Err("A different restart result is already acknowledged".into());
+                }
+                let changed = tx
+                    .execute(
+                        "UPDATE restarts SET state=?1 WHERE id=?2 AND hash=?3 AND state=?4",
+                        params![&bytes, id.to_string(), hash.as_slice(), &prior],
+                    )
+                    .map_err(|error| error.to_string())?;
+                if changed != 1 {
+                    return Err("The exact accepted restart receipt was not updated".into());
+                }
+            }
+            let (read_hash, read_state): (Vec<u8>, Vec<u8>) = tx
+                .query_row(
+                    "SELECT hash,state FROM restarts WHERE id=?1",
+                    [id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(|error| error.to_string())?;
+            let stored: RestartState =
+                serde_json::from_slice(&read_state).map_err(|error| error.to_string())?;
+            if read_hash.as_slice() != hash || stored != desired {
+                return Err("The stored restart result did not match the observed effect".into());
+            }
+            tx.commit()
+                .map_err(|error| format!("Restart receipt commit failed: {error}"))?;
+            Ok(stored)
+        })();
+        // A consumed rusqlite transaction attempts rollback on failure, but
+        // Drop discards rollback errors. Never read its uncommitted ACK as a
+        // durable receipt. Failure remains failure even if rollback succeeds.
+        if !self.db.is_autocommit() {
+            let primary = outcome
+                .as_ref()
+                .err()
+                .map(String::as_str)
+                .unwrap_or("Restart receipt transaction did not settle after commit");
+            let rollback = self.db.execute_batch("ROLLBACK");
+            if let Err(error) = rollback {
+                return Err(format!(
+                    "{primary}; restart receipt rollback is unconfirmed: {error}"
+                ));
+            }
+            if !self.db.is_autocommit() {
+                return Err(format!(
+                    "{primary}; actor journal transaction remains unconfirmed"
+                ));
+            }
+            if outcome.is_ok() {
+                return Err(primary.to_owned());
+            }
+        }
+        outcome
+    }
+    fn require_autocommit(&self) -> Result<(), String> {
+        if !self.db.is_autocommit() {
+            return Err("Actor journal transaction settlement is unconfirmed".into());
+        }
+        Ok(())
     }
     fn number(&self, key: &str) -> Result<u64, String> {
+        self.require_autocommit()?;
         match key {
             "input_sequence" => Ok(self.input_sequence),
             "outcome_ack" => Ok(self.outcome_ack),
@@ -890,13 +996,307 @@ mod tests {
         assert!(journal.restart(id, &[6; 32]).is_err());
         let process =
             crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap();
-        journal.finish_restart(id, Ok(process.clone())).unwrap();
+        journal
+            .finish_restart(id, &hash, &Ok(process.clone()))
+            .unwrap();
         assert_eq!(
             journal.restart(id, &hash).unwrap(),
             Some(super::super::restart::RestartState::Acknowledged(Ok(
                 process
             )))
         );
+    }
+    #[test]
+    fn restart_finish_requires_exact_receipt_and_only_monotonic_cleanup() {
+        use super::super::restart::{RestartCleanup, RestartFailure, RestartState};
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(dir.path(), 4096).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = [7; 32];
+        let process =
+            crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap();
+        assert!(
+            journal
+                .finish_restart(id, &hash, &Ok(process.clone()))
+                .is_err()
+        );
+        journal.admit_restart(id, &hash).unwrap();
+        assert!(
+            journal
+                .finish_restart(id, &[8; 32], &Ok(process.clone()))
+                .is_err()
+        );
+        assert_eq!(
+            journal.restart(id, &hash).unwrap(),
+            Some(RestartState::Accepted)
+        );
+        let uncertain = Err(RestartFailure {
+            reason: "original effect teardown is unconfirmed".into(),
+            cleanup: RestartCleanup::Uncertain,
+        });
+        journal.finish_restart(id, &hash, &uncertain).unwrap();
+        let proved = Err(RestartFailure {
+            reason: "original effect teardown is unconfirmed".into(),
+            cleanup: RestartCleanup::TeardownProved,
+        });
+        let expected = RestartState::Acknowledged(proved.clone());
+        assert_eq!(
+            journal.finish_restart(id, &hash, &proved).unwrap(),
+            expected
+        );
+        assert_eq!(
+            journal.finish_restart(id, &hash, &proved).unwrap(),
+            expected
+        );
+        for conflict in [
+            uncertain,
+            Err(RestartFailure {
+                reason: "another failure".into(),
+                cleanup: RestartCleanup::TeardownProved,
+            }),
+            Ok(process.clone()),
+        ] {
+            assert!(journal.finish_restart(id, &hash, &conflict).is_err());
+            assert_eq!(journal.restart(id, &hash).unwrap(), Some(expected.clone()));
+            assert!(journal.db.is_autocommit());
+        }
+        let success_id = uuid::Uuid::new_v4();
+        journal.admit_restart(success_id, &hash).unwrap();
+        let success = Ok(process.clone());
+        let expected = RestartState::Acknowledged(success.clone());
+        assert_eq!(
+            journal.finish_restart(success_id, &hash, &success).unwrap(),
+            expected
+        );
+        assert_eq!(
+            journal.finish_restart(success_id, &hash, &success).unwrap(),
+            expected
+        );
+        let mut different_process = process;
+        different_process.start = different_process.start.checked_add(1).unwrap();
+        for conflict in [Ok(different_process), proved] {
+            assert!(
+                journal
+                    .finish_restart(success_id, &hash, &conflict)
+                    .is_err()
+            );
+            assert_eq!(
+                journal.restart(success_id, &hash).unwrap(),
+                Some(expected.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn restart_finish_uses_original_json_bytes_and_preserves_malformed_receipt() {
+        use super::super::restart::RestartState;
+        for prior in [b"  \"Accepted\" \n".as_slice(), b"{malformed".as_slice()] {
+            let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut journal = Journal::with_budget(dir.path(), 4096).unwrap();
+            let id = uuid::Uuid::new_v4();
+            let hash = [13; 32];
+            let result = Ok(crate::daemon::holder_registry::Process::read(
+                std::process::id() as i32
+            )
+            .unwrap());
+            journal.admit_restart(id, &hash).unwrap();
+            journal
+                .db
+                .execute(
+                    "UPDATE restarts SET state=?1 WHERE id=?2",
+                    params![prior, id.to_string()],
+                )
+                .unwrap();
+            let finished = journal.finish_restart(id, &hash, &result);
+            if prior.starts_with(b" ") {
+                assert_eq!(finished.unwrap(), RestartState::Acknowledged(result));
+            } else {
+                assert!(finished.is_err());
+                let retained: Vec<u8> = journal
+                    .db
+                    .query_row(
+                        "SELECT state FROM restarts WHERE id=?1",
+                        [id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(retained, prior);
+            }
+            assert!(journal.db.is_autocommit());
+        }
+    }
+
+    #[test]
+    fn restart_finish_refuses_ignored_update_and_trigger_rewrite_without_losing_accepted() {
+        use super::super::restart::RestartState;
+        for body in [
+            "BEFORE UPDATE OF state ON restarts BEGIN SELECT RAISE(IGNORE); END;",
+            "AFTER UPDATE OF state ON restarts BEGIN UPDATE restarts SET hash=x'00' WHERE id=NEW.id; END;",
+        ] {
+            let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut journal = Journal::with_budget(dir.path(), 4096).unwrap();
+            let id = uuid::Uuid::new_v4();
+            let hash = [9; 32];
+            let result = Ok(crate::daemon::holder_registry::Process::read(
+                std::process::id() as i32
+            )
+            .unwrap());
+            journal.admit_restart(id, &hash).unwrap();
+            let accepted: Vec<u8> = journal
+                .db
+                .query_row(
+                    "SELECT state FROM restarts WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            journal
+                .db
+                .execute_batch(&format!("CREATE TEMP TRIGGER fixture_restart_write {body}"))
+                .unwrap();
+            assert!(journal.finish_restart(id, &hash, &result).is_err());
+            assert!(journal.db.is_autocommit());
+            let retained: Vec<u8> = journal
+                .db
+                .query_row(
+                    "SELECT state FROM restarts WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, accepted);
+            assert_eq!(
+                journal.restart(id, &hash).unwrap(),
+                Some(RestartState::Accepted)
+            );
+            journal
+                .db
+                .execute_batch("DROP TRIGGER fixture_restart_write")
+                .unwrap();
+            assert_eq!(
+                journal.finish_restart(id, &hash, &result).unwrap(),
+                RestartState::Acknowledged(result)
+            );
+        }
+    }
+
+    #[test]
+    fn restart_finish_commit_failure_rolls_back_before_exact_result_retry() {
+        use super::super::restart::RestartState;
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(dir.path(), 4096).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = [11; 32];
+        let result =
+            Ok(crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap());
+        journal.admit_restart(id, &hash).unwrap();
+        let accepted: Vec<u8> = journal
+            .db
+            .query_row(
+                "SELECT state FROM restarts WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        journal.db.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE fixture_commit_parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE fixture_commit_child(parent INTEGER REFERENCES fixture_commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+            CREATE TEMP TRIGGER fixture_restart_commit AFTER UPDATE OF state ON restarts
+            BEGIN INSERT INTO fixture_commit_child(parent) VALUES(987654321); END;").unwrap();
+        assert_eq!(
+            journal
+                .db
+                .pragma_query_value(None, "foreign_keys", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(journal.db.is_autocommit());
+        // This prefix is added only around the actual COMMIT call, after the
+        // CAS row count and stored-result readback both passed.
+        let error = journal.finish_restart(id, &hash, &result).unwrap_err();
+        assert!(
+            error.starts_with("Restart receipt commit failed:"),
+            "{error}"
+        );
+        assert!(error.contains("FOREIGN KEY constraint failed"), "{error}");
+        assert!(journal.db.is_autocommit());
+        assert_eq!(
+            journal
+                .db
+                .query_row("SELECT COUNT(*) FROM fixture_commit_child", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        let retained: Vec<u8> = journal
+            .db
+            .query_row(
+                "SELECT state FROM restarts WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, accepted);
+        assert_eq!(
+            journal.restart(id, &hash).unwrap(),
+            Some(RestartState::Accepted)
+        );
+        journal
+            .db
+            .execute_batch("DROP TRIGGER fixture_restart_commit")
+            .unwrap();
+        assert_eq!(
+            journal.finish_restart(id, &hash, &result).unwrap(),
+            RestartState::Acknowledged(result)
+        );
+    }
+
+    #[test]
+    fn active_transaction_cannot_publish_receipts_or_cached_journal_authority() {
+        use super::super::restart::RestartState;
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(dir.path(), 4096).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hash = [12; 32];
+        journal.admit_restart(id, &hash).unwrap();
+        journal.db.execute_batch("BEGIN").unwrap();
+        let state = RestartState::Acknowledged(Ok(crate::daemon::holder_registry::Process::read(
+            std::process::id() as i32,
+        )
+        .unwrap()));
+        journal
+            .db
+            .execute(
+                "UPDATE restarts SET state=?1 WHERE id=?2",
+                params![serde_json::to_vec(&state).unwrap(), id.to_string()],
+            )
+            .unwrap();
+        assert!(journal.restart(id, &hash).is_err());
+        assert!(journal.continuity_loss().is_err());
+        assert!(journal.latest().is_err());
+        assert!(journal.acknowledged().is_err());
+        assert!(journal.next_input().is_err());
+        assert!(journal.retained_runs().is_err());
+        assert!(journal.acknowledged_input_page().is_err());
+        assert!(journal.append(&Update::Presentation).is_err());
+        assert!(
+            journal
+                .record_loss("must not alter the cached loss")
+                .is_err()
+        );
+        assert!(journal.admit_restart(uuid::Uuid::new_v4(), &hash).is_err());
+        assert!(journal.last_loss.is_none());
+        // Deliberate active-transaction coverage, not a claimed injection of
+        // an actual rollback failure. Only this fixture owns the transaction.
+        journal.db.execute_batch("ROLLBACK").unwrap();
+        assert!(journal.db.is_autocommit());
+        assert_eq!(
+            journal.restart(id, &hash).unwrap(),
+            Some(RestartState::Accepted)
+        );
+        assert!(journal.continuity_loss().unwrap().is_none());
     }
     #[test]
     fn accepted_run_survives_input_ack_and_finished_delivery_until_durable_outcome_ack() {

@@ -1598,6 +1598,7 @@ struct Server {
     _directory: Option<Arc<File>>,
     mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
     closed_snapshot: Option<Arc<Snapshot>>,
+    pending_restart_commit: Option<restart::PendingRestartCommit>,
     session_stopping: bool,
     // A successful ownership handoff fences authorizing commands from the old
     // attachment. A newly authenticated attach may own the still-live actor.
@@ -1756,6 +1757,7 @@ impl Server {
             _directory: directory,
             mailbox_seal,
             closed_snapshot: None,
+            pending_restart_commit: None,
             session_stopping: false,
             attachment_preserved: false,
         })
@@ -2033,12 +2035,14 @@ impl Server {
             }
             "execution_environment" => value!(self.environment.clone()),
             "restart" => {
-                if self.session_stopping {
-                    return Err(
-                        "This actor lifetime is stopping; provider replacement is refused".into(),
-                    );
-                }
-                let request = decode!(restart::Request);
+                let request =
+                    serde_json::from_value::<restart::Request>(request.args).map_err(|error| {
+                        if self.session_stopping {
+                            restart::STOPPING.to_owned()
+                        } else {
+                            error.to_string()
+                        }
+                    })?;
                 value!(self.restart(request)?)
             }
             "state" => {
@@ -2379,6 +2383,11 @@ impl Server {
         }
     }
     fn check_retirement(&self) -> Result<(), String> {
+        if self.pending_restart_commit.is_some() {
+            return Err(
+                "Commit the exact observed restart result before retiring its helper".into(),
+            );
+        }
         if self.closed_snapshot.is_none() {
             return Err("Stop the exact retained provider before retiring its helper".into());
         }
@@ -3118,6 +3127,7 @@ mod tests {
                 _directory: None,
                 mailbox_seal: None,
                 closed_snapshot: None,
+                pending_restart_commit: None,
                 session_stopping: false,
                 attachment_preserved: false,
             },
@@ -3346,6 +3356,220 @@ done"#;
             .close_until(Instant::now() + Duration::from_secs(5))
             .unwrap();
     }
+    #[test]
+    fn observed_restart_result_survives_commit_failure_stop_and_retirement() {
+        const CHILD: &str = "CAGENTS_RESTART_RESULT_COMMIT_FIXTURE";
+        let selector = thread::current().name().unwrap().to_owned();
+        if let Some(value) = std::env::var_os(CHILD) {
+            assert_eq!(
+                value, selector,
+                "unexpected restart result fixture selector"
+            );
+        } else {
+            struct OriginalChild(Option<std::process::Child>);
+            impl Drop for OriginalChild {
+                fn drop(&mut self) {
+                    if let Some(child) = &mut self.0 {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+            let mut output = tempfile::tempdir_in("/var/tmp").unwrap();
+            output.disable_cleanup(true);
+            use std::os::unix::fs::DirBuilderExt;
+            let runtime = output.path().join("runtime");
+            let native = runtime
+                .join(crate::instance::RUNTIME_SUBDIRECTORY)
+                .join("native-holders");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&native)
+                .unwrap();
+            let stdout = output.path().join("stdout");
+            let stderr = output.path().join("stderr");
+            let mut child = OriginalChild(Some(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        &selector,
+                        "--nocapture",
+                        "--test-threads=1",
+                        "--color=never",
+                    ])
+                    .env(CHILD, &selector)
+                    .env("XDG_RUNTIME_DIR", &runtime)
+                    .stdout(std::fs::File::create(&stdout).unwrap())
+                    .stderr(std::fs::File::create(&stderr).unwrap())
+                    .spawn()
+                    .unwrap(),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+                    child.0.take();
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "restart result fixture timed out; retained at {}",
+                    output.path().display()
+                );
+                thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = std::fs::read_to_string(stdout).unwrap();
+            let stderr = std::fs::read_to_string(stderr).unwrap();
+            let named = stdout
+                .lines()
+                .filter(|line| *line == format!("test {selector} ... ok"))
+                .count();
+            let summaries = stdout
+                .lines()
+                .filter(|line| line.starts_with("test result:"))
+                .collect::<Vec<_>>();
+            assert!(
+                status.success()
+                    && named == 1
+                    && summaries.len() == 1
+                    && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "restart result fixture failed: {status}; retained at {}; stdout: {stdout}; stderr: {stderr}",
+                output.path().display()
+            );
+            output.close().unwrap();
+            return;
+        }
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let mut fixture = resident_fixture();
+        let server = &mut fixture.server;
+        let store = server.actor.0.store.clone();
+        let old_process = server.actor.provider_process().unwrap();
+        server.actor.close().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let script = r#"printf 'spawn\n' >> spawns
+while IFS= read -r frame; do
+  case "$frame" in
+    *'"type":"control_request"'*)
+      id=${frame#*'"request_id":"'}; id=${id%%'"'*}
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      ;;
+    *'"type":"user"'*) printf 'unexpected prompt\n' >> prompts ;;
+  esac
+done"#;
+        let payload = json!({"id":id,"source":server.source,"program":"/bin/sh","arguments":["-c",script],"environment":{},"working_directory":fixture._root.path(),"recovery_environment":{}});
+        let request: restart::Request = serde_json::from_value(payload.clone()).unwrap();
+        let hash = payload_digest(&serde_json::to_vec(&request).unwrap());
+        let invoke = |server: &mut Server, method: &str, args: Value| {
+            server.invoke(Invocation {
+                proof: server.proof.clone(),
+                epoch: Some(server.epoch),
+                method: method.into(),
+                args,
+            })
+        };
+        server
+            .journal
+            .lock()
+            .unwrap()
+            .fail_restart_result_update(id, true);
+        assert!(
+            invoke(server, "restart", payload.clone())
+                .unwrap_err()
+                .contains("fixture restart commit failure")
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !server.actor.0.state.lock().unwrap().ready {
+            assert!(
+                Instant::now() < deadline,
+                "replacement initialization did not finish"
+            );
+            thread::yield_now();
+        }
+        let process = server.actor.provider_process().unwrap();
+        assert_ne!(process, old_process);
+        let owner = server.actor.clone();
+        assert!(Arc::ptr_eq(&store, &server.actor.0.store));
+        assert!(server.pending_restart_commit.is_some());
+        assert_eq!(
+            server.journal.lock().unwrap().restart(id, &hash).unwrap(),
+            Some(RestartState::Accepted)
+        );
+        assert!(
+            invoke(server, "restart", payload.clone())
+                .unwrap_err()
+                .contains("fixture restart commit failure")
+        );
+        let mut different = payload.clone();
+        different["arguments"] = json!(["-c", "exit 0"]);
+        assert!(invoke(server, "restart", different).is_err());
+        let mut another = payload.clone();
+        another["id"] = json!(uuid::Uuid::new_v4());
+        assert!(invoke(server, "restart", another.clone()).is_err());
+        assert!(owner.same_actor(&server.actor));
+        let actor_id = server.identity.instance;
+        invoke(server, "fence_session_stop", json!([actor_id, 1000])).unwrap();
+        invoke(server, "close", Value::Null).unwrap();
+        let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        let native = registry::directory(Kind::Native).unwrap();
+        assert!(runtime.is_absolute() && native.starts_with(&runtime));
+        let record = &server.identity.record;
+        let receipt_stem = format!(
+            "{}-{}-{}",
+            record.terminal, record.holder.pid, record.holder.start
+        );
+        assert!(native.join(format!("{receipt_stem}.final")).is_file());
+        assert!(native.join(format!("{receipt_stem}.closed")).is_file());
+        {
+            let mut journal = server.journal.lock().unwrap();
+            let through = journal.latest().unwrap();
+            journal.ack(through).unwrap();
+            if let Some(loss) = journal.continuity_loss().unwrap() {
+                journal.ack_loss(loss.id).unwrap();
+            }
+        }
+        assert!(server.closed_snapshot.is_some());
+        assert!(
+            invoke(server, "retire", Value::Null)
+                .unwrap_err()
+                .contains("restart result")
+        );
+        assert!(server.pending_restart_commit.is_some());
+        assert!(owner.same_actor(&server.actor));
+        server
+            .journal
+            .lock()
+            .unwrap()
+            .fail_restart_result_update(id, false);
+        let receipt: RestartReceipt =
+            serde_json::from_value(invoke(server, "restart", payload.clone()).unwrap()).unwrap();
+        assert_eq!(
+            receipt.state,
+            RestartState::Acknowledged(Ok(process.clone()))
+        );
+        assert!(server.pending_restart_commit.is_none());
+        assert!(server.session_stopping && server.actor.0.stop.load(Ordering::Acquire));
+        assert!(owner.same_actor(&server.actor));
+        let repeated: RestartReceipt =
+            serde_json::from_value(invoke(server, "restart", payload).unwrap()).unwrap();
+        assert_eq!(repeated.state, RestartState::Acknowledged(Ok(process)));
+        assert!(
+            invoke(server, "restart", another)
+                .unwrap_err()
+                .contains("stopping")
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture._root.path().join("spawns")).unwrap(),
+            "spawn\n"
+        );
+        assert!(!fixture._root.path().join("prompts").exists());
+        server.check_retirement().unwrap();
+        invoke(server, "retire", Value::Null).unwrap();
+        assert!(native.join(format!("{receipt_stem}.retired")).is_file());
+    }
+
     #[test]
     fn stopped_provider_keeps_its_semantic_journal_until_outcome_and_loss_ack() {
         let mut fixture = resident_fixture();

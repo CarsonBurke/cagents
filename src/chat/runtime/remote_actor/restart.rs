@@ -21,6 +21,17 @@ pub(crate) struct RestartReceipt {
     pub id: uuid::Uuid,
     pub state: RestartState,
 }
+pub(super) const STOPPING: &str =
+    "This actor lifetime is stopping; provider replacement is refused";
+
+// This is the observed result of one effect, not permission to repeat it.
+// Keep the exact actor allocation alive until its receipt is committed.
+pub(super) struct PendingRestartCommit {
+    id: uuid::Uuid,
+    hash: [u8; 32],
+    actor: LocalHandle,
+    result: Result<Process, RestartFailure>,
+}
 #[derive(Serialize, Deserialize)]
 pub(super) struct Request {
     id: uuid::Uuid,
@@ -75,15 +86,64 @@ impl RemoteActor {
     }
 }
 impl Server {
+    fn settle_restart(
+        &mut self,
+        id: uuid::Uuid,
+        hash: &[u8; 32],
+    ) -> Result<RestartReceipt, String> {
+        let pending = self
+            .pending_restart_commit
+            .as_ref()
+            .ok_or("No observed restart result is awaiting commit")?;
+        if pending.id != id || &pending.hash != hash {
+            return Err("Another exact restart result is awaiting durable settlement".into());
+        }
+        if !pending.actor.same_actor(&self.actor) {
+            return Err("The pending restart result belongs to another actor allocation".into());
+        }
+        let mut journal = self.journal.lock().unwrap_or_else(|p| p.into_inner());
+        let result = match (&pending.result, journal.restart(id, hash)?) {
+            (Err(captured), Some(RestartState::Acknowledged(Err(stored))))
+                if captured.reason == stored.reason
+                    && captured.cleanup == RestartCleanup::Uncertain
+                    && stored.cleanup == RestartCleanup::TeardownProved =>
+            {
+                // A committed monotonic cleanup proof must never be replaced
+                // by an older captured uncertain result.
+                Err(stored)
+            }
+            _ => pending.result.clone(),
+        };
+        let state = journal.finish_restart(id, hash, &result)?;
+        drop(journal);
+        self.pending_restart_commit = None;
+        self.changed.fetch_add(1, Ordering::Release);
+        Ok(RestartReceipt { id, state })
+    }
+
     pub(super) fn restart(&mut self, request: Request) -> Result<RestartReceipt, String> {
         let hash =
             payload_digest(&serde_json::to_vec(&request).map_err(|error| error.to_string())?);
+        if self.pending_restart_commit.is_some() {
+            // Receipt settlement remains available after close/stop. It cannot
+            // invoke cleanup, admission or provider replacement.
+            return self.settle_restart(request.id, &hash);
+        }
         let previous = self
             .journal
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .restart(request.id, &hash)?;
         if let Some(mut state) = previous {
+            if self.session_stopping {
+                return match state {
+                    RestartState::Acknowledged(_) => Ok(RestartReceipt {
+                        id: request.id,
+                        state,
+                    }),
+                    RestartState::Accepted => Err(STOPPING.into()),
+                };
+            }
             if let RestartState::Acknowledged(Err(failure)) = &mut state
                 && failure.cleanup == RestartCleanup::Uncertain
                 && self.actor.is_completed()
@@ -96,17 +156,22 @@ impl Server {
                 ) && self.reap_orphans().is_ok()
                 {
                     failure.cleanup = RestartCleanup::TeardownProved;
-                    state = self
-                        .journal
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .finish_restart(request.id, Err(failure.clone()))?;
+                    self.pending_restart_commit = Some(PendingRestartCommit {
+                        id: request.id,
+                        hash,
+                        actor: self.actor.clone(),
+                        result: Err(failure.clone()),
+                    });
+                    return self.settle_restart(request.id, &hash);
                 }
             }
             return Ok(RestartReceipt {
                 id: request.id,
                 state,
             });
+        }
+        if self.session_stopping {
+            return Err(STOPPING.into());
         }
         if self.closed_snapshot.is_some() {
             return Err("This actor was explicitly closed; acknowledge final outcomes and retire it before creating a new session".into());
@@ -189,15 +254,16 @@ impl Server {
                 },
             }
         });
-        let state = self
-            .journal
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .finish_restart(id, result)?;
-        self.changed.fetch_add(1, Ordering::Release);
+        self.pending_restart_commit = Some(PendingRestartCommit {
+            id,
+            hash,
+            actor: self.actor.clone(),
+            result,
+        });
+        let receipt = self.settle_restart(id, &hash)?;
         // Keep the original approved descriptor live throughout both phases.
         drop(context);
-        Ok(RestartReceipt { id, state })
+        Ok(receipt)
     }
     fn replace_provider(&mut self, request: Request) -> Result<Process, String> {
         let context = self
