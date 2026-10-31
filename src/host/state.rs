@@ -3142,7 +3142,7 @@ fn restore_upgrade_from(
     if checkpoint
         .chats
         .iter()
-        .any(|chat| !chat.source.native_continuity.retains_provider())
+        .any(|chat| ChatRestore::of(chat) != ChatRestore::Retained)
     {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
@@ -3155,7 +3155,7 @@ fn restore_upgrade_from(
     for chat in &checkpoint.chats {
         // A private holder authenticates the exact still-running server. Its
         // presence is the purpose of adoption, not permission to relaunch it.
-        if chat.source.native_continuity.retains_provider() {
+        if ChatRestore::of(chat) == ChatRestore::Retained {
             continue;
         }
         let terminal = TerminalSession {
