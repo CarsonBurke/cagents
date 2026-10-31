@@ -162,13 +162,13 @@ impl Cagents {
                             }
                         }
                     }
-                    Some(CardRuntime::Loading)
-                        if !self.terminal_start_in_flight(card.id)
-                            && let Some(reason) =
-                                self.startup_gate.detached_reason(card.id, session) =>
-                    {
-                        failures.push(card.id);
-                        reasons.push(reason.to_owned());
+                    Some(CardRuntime::Loading) if !self.terminal_start_in_flight(card.id) => {
+                        if let Some(reason) = self.startup_gate.detached_reason(card.id, session) {
+                            failures.push(card.id);
+                            reasons.push(reason.to_owned());
+                        } else {
+                            pending = true;
+                        }
                     }
                     Some(CardRuntime::Loading) | None => pending = true,
                     Some(CardRuntime::Failed(failure)) => {
