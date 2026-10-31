@@ -294,6 +294,18 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
 }
 
 fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "development")]
+    if let Some(startup) = cagents::app::Cagents::native_history_fixture_startup()? {
+        if options.new_window
+            || options.slot.is_some()
+            || options.source.is_some()
+            || options.device.is_some()
+            || options.device_window_scoped
+        {
+            return Err("History fixture requires the default local window options".into());
+        }
+        return run_native_window(startup, None);
+    }
     let Options {
         new_window,
         slot,
@@ -349,8 +361,18 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         Ok((lease, (listener, activation_rx), restored))
     })();
     let (_application_lease, activation, restored) = startup?;
+    let activation_rx = Some(activation.1.clone());
+    let _activation = activation;
+    run_native_window(restored, activation_rx)
+}
+
+/// Shared native shell construction; both routes use the same public COSMIC
+/// window, scale, rendering and settings path. Operational guards stay in run.
+fn run_native_window(
+    restored: cagents::app::Startup,
+    activation_rx: Option<async_channel::Receiver<cagents::instance::UiActivation>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let restored = std::cell::RefCell::new(Some(restored));
-    let activation = Some(activation);
 
     // The pinned COSMIC run helper does not wire its scale_factor callback
     // into iced. Build the daemon through the public shell API so interface
@@ -365,8 +387,6 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         is_daemon: false,
         ..iced::Settings::default()
     };
-    let activation_rx = activation.as_ref().map(|(_, rx)| rx.clone());
-    let _activation = activation;
     iced::daemon(
         move || {
             let mut window_settings = iced::window::Settings {

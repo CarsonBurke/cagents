@@ -1,0 +1,52 @@
+{
+  "actual_runtime_admission": null,
+  "before_adapter": null,
+  "feature_after": "efa9288b3fd79a7214307a11b1c6d50c6cde3630",
+  "generated_data": null,
+  "limitations": [
+    "Actual User/resource grant remains external, not a caller boolean.",
+    "No HOME/CODEX_HOME/PATH/account/model/authority mutation; no broad HOME-access audit.",
+    "Manifest/path checks do not replace original supervisor filesystem custody or independent builder evidence.",
+    "Unsupported global key/focus/account/provider/operational actions are refused; no natural startup/close/save/daemon/IPC claim.",
+    "Before has no query/refine/limit controls; no Before result is fabricated or adapted.",
+    "No held callback/stale timing seam, deterministic limit, exhaustion, object singleton or performance pass is asserted."
+  ],
+  "matched_executables": null,
+  "native_controller": null,
+  "native_evidence": null,
+  "opt_in": {
+    "dataset": "CAGENTS_DEVELOPMENT_HISTORY_DATASET",
+    "datasets": [
+      "small",
+      "large",
+      "unborn"
+    ],
+    "feature": "development",
+    "manifest": "CAGENTS_DEVELOPMENT_HISTORY_FIXTURE",
+    "schema": "pr1310-public-git-fixture-v1"
+  },
+  "original_before": "a3221af83d56663f0dcbef90f67b30ad6d9fe53d",
+  "performance_evidence": null,
+  "qualification_base": "08bafae7fc2c3c89ecc07b3c831af5e9eb80f103",
+  "qualification_base_tree": "69d74e6a2494f876cef570b96062e6630a0c5a72",
+  "source_ownership": [
+    "src/app/native_history_fixture.rs",
+    "src/app.rs",
+    "src/bin/cagents-ui.rs",
+    "qualification-packets/pr1310-native-history-after/README.md",
+    "qualification-packets/pr1310-native-history-after/source-contract.json"
+  ],
+  "static_conservation": {
+    "entire_original_App_update_match_byte_exact": true,
+    "latency_init_block_byte_exact": true,
+    "latency_init_block_sha256": "1d92de4d867e96e57e6a0355309d38c53f09ad2aa6ea431fcd7ac479ab635013",
+    "native_window_tail_sha256": "618523fc1dd90b810864cd11b46e3fc38497c755d4f84b68155c5eef811fbb26",
+    "note": "Guard wrapping adds source and changes indentation in init; whole-file textual or AST identity is not claimed. Original handlers and native window construction are conserved. The original no-opt-in path executes the original operational branches.",
+    "original_App_subscription_body_byte_exact": true,
+    "original_match_sha256": "b539e06733ac17305a36c9146465faebd4fa9782ef304e5db7d63833592f78f2",
+    "shared_native_window_tail_byte_exact_except_original_activation_variable_plumbing": true,
+    "subscription_body_sha256": "daafd1e83d3563491afd66ac0f80e5331d8e6f7a95b03dbf66e49a6327a4094a"
+  },
+  "status": "SOURCE_ASSEMBLED_ONLY_UNCOMPILED_UNRUN",
+  "ux_review": null
+}
