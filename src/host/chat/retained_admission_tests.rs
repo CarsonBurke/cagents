@@ -164,6 +164,7 @@ fn start(host: &SharedHost, session: Session) -> Result<ServerResponse, Protocol
         Default::default(),
         Some(context),
         None,
+        None,
     )
 }
 

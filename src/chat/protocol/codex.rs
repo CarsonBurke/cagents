@@ -3,7 +3,7 @@
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
-use super::{Adapter, ProcessSpec, ServerIdentity, Step, TransportSpec};
+use super::{Adapter, GoalResumeAdmission, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
     self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
@@ -12,15 +12,25 @@ use crate::chat::{
 };
 use serde_json::{Value, json};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
+mod goal;
 mod images;
+
+#[cfg(test)]
+#[path = "codex/goal_tests.rs"]
+mod goal_tests;
 
 /// The Codex configuration key for a thread's reasoning effort. A launch
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
 /// Codex CLI takes it, and a new thread receives it as a `thread/start`
 /// configuration override.
 pub const REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
+const GOAL_SETTINGS_WAIT: Duration = Duration::from_secs(10);
 
 /// The shortest directory suffix that distinguishes one same-name skill from
 /// its peers. A skill can declare a name different from its directory name.
@@ -421,6 +431,12 @@ fn create_inner(
             server_identity: None,
             retained_identity,
             thread: launch.session_id.clone(),
+            goal: None,
+            goal_settings: None,
+            applied_selection: None,
+            unconfirmed_selection: None,
+            goal_resume_admission: GoalResumeAdmission::Unavailable,
+            goal_resume_pending: false,
             start,
             alias,
             cwd: launch.recipe.working_directory.clone(),
@@ -479,6 +495,11 @@ fn create_inner(
 
 #[derive(Clone)]
 enum Pending {
+    GoalSettings,
+    Goal {
+        request: chat::goal::Request,
+        explicit: bool,
+    },
     LoginRecovery {
         failure: String,
         expected: Option<crate::account::Identity>,
@@ -530,6 +551,25 @@ enum Pending {
     Fork,
 }
 
+struct GoalSettings {
+    request: chat::goal::Request,
+    explicit: bool,
+    revision: u64,
+    model: Option<String>,
+    reasoning: Option<String>,
+    acknowledged: bool,
+    deadline: Option<Instant>,
+    observed: Option<Option<String>>,
+    invalidated: bool,
+}
+
+struct PendingSelection {
+    target: (Option<String>, Option<String>),
+    /// Only this sole request's pre-enqueue rejection can retire the fence.
+    /// Compatible retries may leave an earlier queued effect, so drop the ID.
+    first_request: Option<String>,
+}
+
 fn permission_mode(approval: &Value, sandbox: &Value) -> Option<&'static str> {
     match (approval.as_str(), sandbox["type"].as_str()) {
         (Some("never"), Some("dangerFullAccess")) => Some("yolo"),
@@ -566,6 +606,16 @@ struct Codex {
     server_identity: Option<ServerIdentity>,
     retained_identity: Option<ServerIdentity>,
     thread: Option<String>,
+    goal: Option<chat::goal::State>,
+    goal_settings: Option<GoalSettings>,
+    /// One coherent actual provider selection, never a staged UI choice.
+    applied_selection: Option<(String, Option<String>)>,
+    /// Queued local effects outlive their RPC ACK and any unsent Goal intent.
+    /// An older snapshot cannot prove that a later conflicting effect settled.
+    unconfirmed_selection: Option<PendingSelection>,
+    goal_resume_admission: GoalResumeAdmission,
+    /// Keep metadata/stop controls usable while legacy restore lacks authority.
+    goal_resume_pending: bool,
     start: Value,
     alias: Option<PathBuf>,
     cwd: PathBuf,
@@ -659,6 +709,353 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    fn goal_state(&mut self) -> Result<&mut chat::goal::State, String> {
+        let thread = self
+            .thread
+            .as_ref()
+            .ok_or("The original Codex thread is unavailable")?;
+        if self.goal.is_none() {
+            self.goal =
+                Some(chat::goal::State::new(thread.clone()).map_err(|error| error.to_string())?);
+        }
+        let state = self.goal.as_mut().expect("goal state was initialized");
+        if state.snapshot().thread_id != *thread {
+            return Err("The original Codex goal thread changed".into());
+        }
+        Ok(state)
+    }
+
+    fn publish_goal(&self, step: &mut Step) {
+        if let Some(state) = &self.goal {
+            step.events.push(Event::Goal(state.snapshot()));
+        }
+    }
+
+    /// Advance admission before exposing a changed pair. Callers publish Models
+    /// before the returned Goal revision: runtime readers can sample between
+    /// Step events, and a new pair with an old revision only refuses stale work.
+    fn changing_selection(
+        &mut self,
+        model: Option<&str>,
+        reasoning: Option<&str>,
+    ) -> Result<bool, String> {
+        if (self.selected.as_deref() != model || self.reasoning.as_deref() != reasoning)
+            && let Some(state) = &mut self.goal
+        {
+            return state
+                .invalidate_idle_controls()
+                .map_err(|error| error.to_string());
+        }
+        Ok(false)
+    }
+
+    fn selection_is_applied(&self) -> bool {
+        self.unconfirmed_selection.is_none()
+            && self
+                .applied_selection
+                .as_ref()
+                .is_some_and(|(model, reasoning)| {
+                    self.selected.as_ref() == Some(model)
+                        && (self.reasoning.is_none() || &self.reasoning == reasoning)
+                })
+    }
+
+    fn selection_admission(&self) -> Result<(), String> {
+        // A settings ACK establishes Core enqueue order, not application. Do
+        // not let an earlier unacknowledged model-carrying request enqueue a
+        // conflicting override after this one. Turn also owns pricing model
+        // metadata, so conservatively wait for any pending turn/start ACK.
+        if self.pending.values().any(|pending| {
+            matches!(
+                pending,
+                Pending::GoalSettings
+                    | Pending::Turn { .. }
+                    | Pending::FastMode { model: Some(_), .. }
+            )
+        }) {
+            return Err("Codex is still accepting the previous model request. Wait for confirmation, then submit again; your input is kept.".into());
+        }
+        let target = (self.selected.clone(), self.reasoning.clone());
+        if self
+            .unconfirmed_selection
+            .as_ref()
+            .is_some_and(|pending| pending.target != target)
+        {
+            return Err("The previous Codex model change is unconfirmed. Wait for its applied settings before changing the model again; your input is kept.".into());
+        }
+        Ok(())
+    }
+
+    fn selection_enqueued(&mut self, step: &Step) {
+        self.applied_selection = None;
+        let target = (self.selected.clone(), self.reasoning.clone());
+        // Admission is checked before reservation/enqueue at every caller.
+        // Compatible repeats share one bounded fence; conflicting changes
+        // wait, since the provider may coalesce intermediate snapshots.
+        if let Some(pending) = &mut self.unconfirmed_selection {
+            debug_assert!(pending.target == target);
+            pending.first_request = None;
+        } else {
+            self.unconfirmed_selection = Some(PendingSelection {
+                target,
+                first_request: Some(
+                    step.writes.last().expect("model request was enqueued")["id"].to_string(),
+                ),
+            });
+        }
+    }
+
+    fn selection_rejected(&mut self, id: &str, frame: &Value) {
+        // The pinned settings handler validates before Core submission; its
+        // validation/decoder errors prove this exact RPC did not enqueue an
+        // effect. Internal, malformed and asynchronous Core errors do not.
+        if self
+            .unconfirmed_selection
+            .as_ref()
+            .is_some_and(|pending| pending.first_request.as_deref() == Some(id))
+            && frame.get("result").is_none()
+            && matches!(
+                frame["error"]["code"].as_i64(),
+                Some(-32600 | -32601 | -32602)
+            )
+            && frame["error"]["message"].is_string()
+        {
+            self.unconfirmed_selection = None;
+        }
+    }
+
+    fn observe_selection(&mut self, actual: Option<(String, Option<String>)>) {
+        self.applied_selection = None;
+        let Some((model, reasoning)) = actual else {
+            return;
+        };
+        if let Some(pending) = &self.unconfirmed_selection {
+            let target = &pending.target;
+            if target.0.as_ref() != Some(&model) || (target.1.is_some() && target.1 != reasoning) {
+                return;
+            }
+            self.unconfirmed_selection = None;
+        }
+        self.applied_selection = Some((model, reasoning));
+    }
+
+    fn request_goal(
+        &mut self,
+        step: &mut Step,
+        thread: &str,
+        revision: u64,
+        operation: chat::goal::Operation,
+        explicit: bool,
+    ) -> Result<(), String> {
+        if self.thread.as_deref() != Some(thread) {
+            return Err("The goal control belongs to a different Codex thread".into());
+        }
+        let (method, params) = goal::request(thread, &operation)?;
+        let selects_work = self.selection_dirty
+            && matches!(
+                operation,
+                chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume
+            );
+        let applied = self.applied_selection.clone();
+        let confirms_pending = self.unconfirmed_selection.as_ref().is_some_and(|pending| {
+            pending.target == (self.selected.clone(), self.reasoning.clone())
+        });
+        if selects_work && applied.is_none() && !confirms_pending {
+            let recovery = if self.unconfirmed_selection.is_some() {
+                "Wait for the previous change, or retry with its same model and reasoning before choosing another"
+            } else {
+                "Reconnect to confirm the original settings before requesting native Goal work"
+            };
+            return Err(format!(
+                "The original provider model settings are unconfirmed. {recovery}; your input is kept."
+            ));
+        }
+        let already_applied = self.selection_is_applied();
+        if selects_work && !already_applied {
+            self.selection_admission()?;
+        }
+        // Check transport capacity before reserving the domain's physical slot.
+        // No fallible transport allocation remains after begin_for succeeds.
+        if self.pending.len() >= MAX_PENDING || self.next_id == u64::MAX {
+            return Err("Too many outstanding Codex requests".into());
+        }
+        let request = self
+            .goal_state()?
+            .begin_for(thread, revision, operation)
+            .map_err(|error| error.to_string())?;
+        if selects_work && !already_applied {
+            // SetModel stages a choice for turn/start. Autonomous Goal work
+            // has no turn/start from this client, so apply that explicit choice
+            // to this exact provider thread before allowing the Goal mutation.
+            let revision = self.goal_state()?.snapshot().revision;
+            self.goal_settings = Some(GoalSettings {
+                request,
+                explicit,
+                revision,
+                model: self.selected.clone(),
+                reasoning: self.reasoning.clone(),
+                acknowledged: false,
+                deadline: None,
+                observed: None,
+                invalidated: false,
+            });
+            let mut settings = json!({"threadId":thread,"model":self.selected});
+            if let Some(reasoning) = &self.reasoning {
+                settings["effort"] = json!(reasoning);
+            }
+            self.call(
+                step,
+                "thread/settings/update",
+                settings,
+                Pending::GoalSettings,
+            )?;
+            // Once a changed selection can execute, the old actual pair is
+            // no longer proof. A lost application notice must not let a later
+            // request reuse it after this local Goal intent has expired.
+            self.selection_enqueued(step);
+        } else {
+            if selects_work {
+                // Providers may suppress unchanged settings notifications. A
+                // previously observed coherent selection needs no no-op RPC.
+                self.reasoning = applied.expect("work selection was checked above").1;
+                self.model_events(step);
+            }
+            self.call(step, method, params, Pending::Goal { request, explicit })?;
+        }
+        self.publish_goal(step);
+        Ok(())
+    }
+
+    fn finish_goal_settings(&mut self, step: &mut Step) -> Result<(), String> {
+        let Some(mut settings) = self.goal_settings.take() else {
+            return Ok(());
+        };
+        // The RPC acknowledgement only means Core received a queued settings
+        // operation. The applied settings notification is the work barrier.
+        if !settings.acknowledged {
+            self.goal_settings = Some(settings);
+            return Ok(());
+        }
+        settings.invalidated |= settings
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now());
+        settings.invalidated |= settings.observed.is_some() && !self.selection_is_applied();
+        let current = self.ready
+            && self.direct_input
+            && self.thread.as_deref() == Some(settings.request.thread_id())
+            && self.selected == settings.model
+            && self.reasoning == settings.reasoning
+            && self.goal.as_ref().is_some_and(|state| {
+                state.pending() == Some(&settings.request)
+                    && state.snapshot().revision == settings.revision
+            });
+        if current && !settings.invalidated {
+            let Some(reasoning) = &settings.observed else {
+                self.goal_settings = Some(settings);
+                return Ok(());
+            };
+            let (method, params) =
+                goal::request(settings.request.thread_id(), settings.request.operation())?;
+            if self
+                .call(
+                    step,
+                    method,
+                    params,
+                    Pending::Goal {
+                        request: settings.request.clone(),
+                        explicit: settings.explicit,
+                    },
+                )
+                .is_ok()
+            {
+                self.effective_model = settings.model;
+                // None is an unspecified public override, not a request to
+                // clear the effort. Show the actual retained provider choice
+                // before work instead of claiming that null reset it.
+                self.reasoning = reasoning.clone();
+                self.model_events(step);
+                return Ok(());
+            }
+        }
+        let current = if let Some(state) = &mut self.goal {
+            state
+                .complete(&settings.request, Err(chat::goal::Failure::Unavailable))
+                .map_err(|error| error.to_string())?
+        } else {
+            false
+        };
+        self.publish_goal(step);
+        if current && settings.explicit {
+            step.events.push(Event::Error {
+                message: "The selected model and reasoning could not be confirmed for native Goal work. The goal was not sent; check its current state and submit again.".into(),
+                fatal: false,
+            });
+        }
+        Ok(())
+    }
+
+    fn read_goal(&mut self, step: &mut Step) -> Result<(), String> {
+        let state = self.goal_state()?;
+        // A reconnect never replays an unresolved mutation or releases its slot.
+        if state.pending().is_some() || state.support() == chat::goal::Support::Unsupported {
+            self.publish_goal(step);
+            return Ok(());
+        }
+        let snapshot = state.snapshot();
+        self.request_goal(
+            step,
+            &snapshot.thread_id,
+            snapshot.revision,
+            chat::goal::Operation::Get,
+            false,
+        )
+    }
+
+    /// Preparing an attach is not authority: the runtime rechecks the exact
+    /// physical scope and this step's observation immediately before writing.
+    fn resume_after_goal_read(&mut self, step: &mut Step) -> Result<(), String> {
+        if !self.goal_resume_pending {
+            return Ok(());
+        }
+        let admitted = match self.goal_resume_admission {
+            GoalResumeAdmission::OriginalScope => true,
+            GoalResumeAdmission::InactiveOnly => self.goal.as_ref().is_some_and(|state| {
+                let observation = state.snapshot();
+                observation.support == chat::goal::Support::Supported
+                    && !observation.pending
+                    && !observation.uncertain
+                    && matches!(
+                        observation.read,
+                        chat::goal::ReadState::Known(None)
+                            | chat::goal::ReadState::Known(Some(chat::goal::Goal {
+                                status: chat::goal::Status::Paused | chat::goal::Status::Complete,
+                                ..
+                            }))
+                    )
+            }),
+            GoalResumeAdmission::Unavailable => false,
+        };
+        if admitted {
+            self.call(step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
+            self.goal_resume_pending = false;
+        } else {
+            let detail = if self
+                .goal
+                .as_ref()
+                .is_some_and(|state| state.support() == chat::goal::Support::Unsupported)
+            {
+                "This Codex server does not support native Goal controls; restore still needs original scope or a confirmed inactive goal"
+            } else {
+                "Codex restore needs original scope or a confirmed inactive goal; Goal status, Pause and Clear remain available"
+            };
+            step.events.push(Event::Status {
+                busy: false,
+                detail: detail.into(),
+            });
+        }
+        Ok(())
+    }
+
     fn discover_child(
         &mut self,
         id: &str,
@@ -1650,6 +2047,23 @@ impl Codex {
 }
 
 impl Adapter for Codex {
+    fn next_deadline(&self) -> Option<Instant> {
+        self.goal_settings
+            .as_ref()
+            .and_then(|settings| settings.deadline)
+    }
+    fn on_deadline(&mut self, now: Instant) -> Result<Step, String> {
+        let mut step = Step::default();
+        if let Some(settings) = &mut self.goal_settings {
+            if settings.acknowledged && settings.deadline.is_some_and(|deadline| deadline <= now) {
+                // Only the local, still-unsent Goal is retired. Its settings
+                // RPC already resolved; late provider observations cannot replay it.
+                settings.invalidated = true;
+                self.finish_goal_settings(&mut step)?;
+            }
+        }
+        Ok(step)
+    }
     fn answer_declines(&self, request_id: &str, action: &str) -> bool {
         let Some(request) = self.requests.get(request_id) else {
             return false;
@@ -1664,6 +2078,10 @@ impl Adapter for Codex {
             RequestKind::Permissions => action == "deny",
             RequestKind::Questions => false,
         }
+    }
+
+    fn set_goal_resume_admission(&mut self, admission: GoalResumeAdmission) {
+        self.goal_resume_admission = admission;
     }
 
     fn server_identity(&self) -> Option<&ServerIdentity> {
@@ -1715,15 +2133,43 @@ impl Adapter for Codex {
         let mut step = Step::default();
         self.ready = false;
         self.attached = false;
+        self.applied_selection = None;
+        self.goal_resume_pending = false;
+        if let Some(state) = &mut self.goal {
+            let thread = self
+                .thread
+                .clone()
+                .ok_or("The original Codex thread is unavailable")?;
+            state.rebind(thread).map_err(|error| error.to_string())?;
+            self.publish_goal(&mut step);
+        }
+        self.finish_goal_settings(&mut step)?;
         self.call(&mut step, "initialize", json!({"clientInfo":{"name":"cagents","title":"cagents native chat","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), Pending::Initialize)?;
         Ok(step)
     }
     fn command(&mut self, command: Command) -> Result<Step, String> {
         let mut step = Step::default();
-        if !self.ready {
+        let blocked_restore_control = self.goal_resume_pending
+            && self.server_identity.is_some()
+            && matches!(
+                &command,
+                Command::Goal {
+                    operation: chat::goal::Operation::Get
+                        | chat::goal::Operation::Pause
+                        | chat::goal::Operation::Clear,
+                    ..
+                }
+            );
+        if !self.ready && !blocked_restore_control {
             return Err("Codex native connection is not ready".into());
         }
         match command {
+            Command::Goal { thread_id, revision, operation } => {
+                if matches!(operation, chat::goal::Operation::SetObjective(_) | chat::goal::Operation::Resume) && !self.direct_input {
+                    return Err("This Codex thread does not accept new goal work".into());
+                }
+                self.request_goal(&mut step, &thread_id, revision, operation, true)?;
+            }
             Command::Prompt { text, attachments, mode } => {
                 if !self.direct_input { return Err("This Codex thread does not advertise direct input support".into()); }
                 let input = self.input(text, attachments.clone())?;
@@ -1737,9 +2183,12 @@ impl Adapter for Codex {
                     PromptMode::Send => {
                         if self.busy || self.pending.values().any(|p| matches!(p, Pending::Turn { .. })) { return Err("A Codex turn is active; explicitly steer or queue instead".into()); }
                         let mut params = json!({"threadId":self.thread,"input":input});
+                        let changes_selection = self.selection_dirty && !self.selection_is_applied();
+                        if changes_selection { self.selection_admission()?; }
                         if self.selection_dirty { params["model"] = json!(self.selected); params["effort"] = json!(self.reasoning); }
                         self.notification_revision = self.notification_revision.wrapping_add(1);
                         self.call(&mut step, "turn/start", params, Pending::Turn { revision: self.lifecycle_revision, notification_revision: self.notification_revision, model: self.selected.clone(), tier: self.service_tier.clone(), early: BTreeMap::new(), early_bytes: 0 })?;
+                        if changes_selection { self.selection_enqueued(&step); }
                         self.notification_turn = None;
                         step.notification_preview = Some(Default::default());
                         self.suggestion_turn = None;
@@ -1791,8 +2240,10 @@ impl Adapter for Codex {
                 let selected = self.models.iter().find(|m| m.id == model).ok_or("Choose a model from the Codex model catalog")?;
                 if (self.service_tier.as_deref() == Some("fast") || self.pending.values().any(|pending| matches!(pending, Pending::FastMode { enabled:true, .. }))) && !self.fast_models.contains(&model) { return Err("Turn off fast mode before selecting a Codex model that does not support it".into()); }
                 if reasoning.as_ref().is_some_and(|r| !selected.reasoning.contains(r)) { return Err("The model does not advertise this reasoning effort".into()); }
+                let changed_controls = self.changing_selection(Some(&model), reasoning.as_deref())?;
                 self.selected = Some(model); self.reasoning = reasoning; self.selection_dirty = true;
                 self.model_events(&mut step);
+                if changed_controls { self.publish_goal(&mut step); }
                 step.events.push(Event::Status { busy: self.busy, detail: "Model/reasoning selection will apply to your next new turn, not the running turn".into() });
             }
             Command::SetFastMode { enabled } => {
@@ -1810,10 +2261,15 @@ impl Adapter for Codex {
                     params["model"] = json!(self.selected);
                     params["effort"] = json!(self.reasoning);
                 }
+                let changes_selection = self.selection_dirty && !self.selection_is_applied();
+                if changes_selection { self.selection_admission()?; }
                 self.call(&mut step, "thread/settings/update", params, Pending::FastMode {
                     enabled, revision: self.service_tier_revision,
                     model: self.selection_dirty.then(|| self.selected.clone()).flatten(),
                 })?;
+                if changes_selection {
+                    self.selection_enqueued(&step);
+                }
             }
             Command::SetPermissionMode { mode } => {
                 if !self.direct_input || self.busy {
@@ -1904,8 +2360,65 @@ impl Adapter for Codex {
                 }
                 return Ok(step);
             }
+            if matches!(pending, Pending::GoalSettings) {
+                self.selection_rejected(&id, &frame);
+                let confirmed = frame.get("error").is_none()
+                    && frame.get("result").is_some_and(Value::is_object);
+                if let Some(settings) = &mut self.goal_settings {
+                    settings.acknowledged = true;
+                    settings.deadline = Some(Instant::now() + GOAL_SETTINGS_WAIT);
+                    settings.invalidated |= !confirmed;
+                }
+                self.finish_goal_settings(&mut step)?;
+                return Ok(step);
+            }
+            if let Pending::Goal { request, explicit } = pending {
+                // The exact RPC resolved (including an invalid response). Only
+                // this request can release its slot; notification epochs decide
+                // whether its observation may still be adopted.
+                let disabled = frame.get("error").is_some_and(|error| {
+                    error["code"].as_i64() == Some(-32600)
+                        && error["message"].as_str() == Some("goals feature is disabled")
+                });
+                let result = if let Some(error) = frame.get("error") {
+                    Err(if error["code"].as_i64() == Some(-32601) {
+                        chat::goal::Failure::Unsupported
+                    } else {
+                        chat::goal::Failure::Unavailable
+                    })
+                } else {
+                    frame
+                        .get("result")
+                        .ok_or(chat::goal::Failure::Unavailable)
+                        .and_then(|result| {
+                            goal::response(request.thread_id(), request.operation(), result)
+                                .map_err(|_| chat::goal::Failure::Unavailable)
+                        })
+                };
+                let current = if let Some(state) = &mut self.goal {
+                    state
+                        .complete(&request, result)
+                        .map_err(|error| error.to_string())?
+                } else {
+                    false
+                };
+                self.publish_goal(&mut step);
+                // An optional attach probe is not a user Goal request. Keep
+                // its unconfirmed state without creating an unsolicited notice.
+                if current && explicit && disabled {
+                    step.events.push(Event::Error {
+                        message: "Goals are disabled in this Codex connection. Enable Goals in the selected Codex configuration before starting a new connection. Your input is kept.".into(),
+                        fatal: false,
+                    });
+                }
+                self.resume_after_goal_read(&mut step)?;
+                return Ok(step);
+            }
             if matches!(pending, Pending::History { .. }) {
                 self.history_loading = false;
+            }
+            if matches!(pending, Pending::FastMode { model: Some(_), .. }) {
+                self.selection_rejected(&id, &frame);
             }
             if let Some(error) = frame.get("error") {
                 if let Pending::LoginRecovery {
@@ -2047,6 +2560,9 @@ impl Adapter for Codex {
                 .get("result")
                 .ok_or("Codex RPC response is missing result/error")?;
             match pending {
+                Pending::Goal { .. } | Pending::GoalSettings => {
+                    unreachable!("goal responses are handled above")
+                }
                 Pending::LoginRecovery {
                     failure,
                     expected,
@@ -2100,7 +2616,15 @@ impl Adapter for Codex {
                     step.writes
                         .push(json!({"method":"initialized","params":{}}));
                     if self.thread.is_some() {
-                        self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), Pending::Attach)?;
+                        self.goal_resume_pending = true;
+                        if self.goal_resume_admission == GoalResumeAdmission::OriginalScope {
+                            self.resume_after_goal_read(&mut step)?;
+                        } else {
+                            // Get does not load or resume an existing thread. A
+                            // missing legacy tuple must never discover its goal
+                            // by starting it first.
+                            self.read_goal(&mut step)?;
+                        }
                     } else {
                         self.call(
                             &mut step,
@@ -2118,6 +2642,7 @@ impl Adapter for Codex {
                     self.skills(&mut step)?;
                 }
                 Pending::Attach => {
+                    let model = required_model(result)?;
                     let thread = &result["thread"];
                     let id = string(thread, "id")?;
                     if self.thread.as_ref().is_some_and(|expected| expected != id) {
@@ -2133,11 +2658,18 @@ impl Adapter for Codex {
                     self.thread = Some(id.into());
                     self.attached = true;
                     self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
-                    self.selected = result["model"].as_str().map(str::to_owned);
+                    let changed_controls =
+                        self.changing_selection(Some(model), result["reasoningEffort"].as_str())?;
+                    self.selected = Some(model.to_owned());
                     self.effective_model = self.selected.clone();
                     self.service_tier = result["serviceTier"].as_str().map(str::to_owned);
                     self.service_tier_revision = self.service_tier_revision.saturating_add(1);
                     self.reasoning = result["reasoningEffort"].as_str().map(str::to_owned);
+                    let actual_selection = self
+                        .selected
+                        .clone()
+                        .map(|model| (model, self.reasoning.clone()));
+                    self.observe_selection(actual_selection);
                     self.busy = thread["status"]["type"] == "active";
                     step.events.push(Event::PermissionMode(
                         permission_mode(&result["approvalPolicy"], &result["sandbox"])
@@ -2155,6 +2687,9 @@ impl Adapter for Codex {
                     });
                     step.events.push(Event::Commands(Vec::new()));
                     self.model_events(&mut step);
+                    if changed_controls {
+                        self.publish_goal(&mut step);
+                    }
                     self.call(
                         &mut step,
                         "thread/list",
@@ -2175,6 +2710,14 @@ impl Adapter for Codex {
                         self.history(&mut step, None)?;
                     }
                     self.finish_setup(&mut step);
+                    // Optional metadata read, never a goal mutation or prompt.
+                    // Runtime admission guards the earlier native resume write.
+                    if let Err(message) = self.read_goal(&mut step) {
+                        step.events.push(Event::Error {
+                            message,
+                            fatal: false,
+                        });
+                    }
                 }
                 Pending::Models => {
                     for value in array(result, "data")? {
@@ -2725,6 +3268,37 @@ impl Adapter for Codex {
             }
             return Ok(step);
         }
+        if matches!(method, "thread/goal/updated" | "thread/goal/cleared") {
+            let Some(original) = self.thread.clone() else {
+                return Ok(step);
+            };
+            match goal::notification(&original, method, params) {
+                Ok(Some(observation)) => {
+                    self.goal_state()?
+                        .observe(&original, observation)
+                        .map_err(|error| error.to_string())?;
+                    self.publish_goal(&mut step);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    // Malformed current-thread data cannot leave an old goal
+                    // looking confirmed. Rebinding the same exact thread drops
+                    // only its observation; an unresolved physical RPC remains.
+                    self.goal_state()?
+                        .rebind(original)
+                        .map_err(|error| error.to_string())?;
+                    self.publish_goal(&mut step);
+                    step.events.push(Event::Error {
+                        message:
+                            "Codex returned an invalid goal observation; check its current state"
+                                .into(),
+                        fatal: false,
+                    });
+                }
+            }
+            self.finish_goal_settings(&mut step)?;
+            return Ok(step);
+        }
         let notification_frame_turn = params["turnId"]
             .as_str()
             .or_else(|| params["turn"]["id"].as_str())
@@ -2777,7 +3351,32 @@ impl Adapter for Codex {
                 title: params["threadName"].as_str().map(str::to_owned),
             }),
             "thread/settings/updated" => {
+                if thread.is_none() || thread != self.thread.as_deref() {
+                    return Ok(step);
+                }
                 let settings = &params["threadSettings"];
+                let actual_model = Some(required_model(settings)?);
+                let actual_reasoning = settings["effort"].as_str().map(str::to_owned);
+                let valid_reasoning = settings.get("effort").is_none_or(|effort| {
+                    effort.is_null() || effort.as_str().is_some_and(|effort| !effort.is_empty())
+                });
+                self.observe_selection(
+                    actual_model
+                        .filter(|_| valid_reasoning)
+                        .map(|model| (model.to_owned(), actual_reasoning.clone())),
+                );
+                if let Some(pending) = &mut self.goal_settings {
+                    pending.invalidated |= !valid_reasoning
+                        || (actual_model.is_some() && actual_model != pending.model.as_deref())
+                        || (pending.reasoning.is_some() && actual_reasoning != pending.reasoning);
+                    if actual_model.is_some()
+                        && actual_model == pending.model.as_deref()
+                        && valid_reasoning
+                        && self.applied_selection.is_some()
+                    {
+                        pending.observed = Some(actual_reasoning);
+                    }
+                }
                 if settings.get("model").is_some() {
                     self.effective_model = settings["model"].as_str().map(str::to_owned);
                 }
@@ -2794,14 +3393,20 @@ impl Adapter for Codex {
                 step.events
                     .push(Event::PermissionMode(mode.map(str::to_owned)));
                 if !self.selection_dirty {
-                    self.selected = params["threadSettings"]["model"]
-                        .as_str()
-                        .map(str::to_owned);
+                    let changed_controls = self.changing_selection(
+                        actual_model,
+                        params["threadSettings"]["effort"].as_str(),
+                    )?;
+                    self.selected = actual_model.map(str::to_owned);
                     self.reasoning = params["threadSettings"]["effort"]
                         .as_str()
                         .map(str::to_owned);
                     self.model_events(&mut step);
+                    if changed_controls {
+                        self.publish_goal(&mut step);
+                    }
                 }
+                self.finish_goal_settings(&mut step)?;
             }
             "turn/started" | "turn/completed" => {
                 let turn = &params["turn"];
@@ -3163,6 +3768,12 @@ impl Adapter for Codex {
                 });
             }
             "error" => {
+                if thread.is_some() && thread == self.thread.as_deref() {
+                    if let Some(settings) = &mut self.goal_settings {
+                        settings.invalidated = true;
+                    }
+                    self.finish_goal_settings(&mut step)?;
+                }
                 let message = params["error"]["message"]
                     .as_str()
                     .map(str::to_owned)
@@ -3304,9 +3915,14 @@ impl Codex {
             return Err("Codex metadata belongs to a different thread".into());
         }
         self.direct_input = thread["canAcceptDirectInput"].as_bool() == Some(true);
+        let mut changed_model = false;
+        let mut changed_controls = false;
         if !self.selection_dirty
             && let Some(model) = thread["model"].as_str().filter(|model| !model.is_empty())
         {
+            let reasoning = self.reasoning.clone();
+            changed_controls = self.changing_selection(Some(model), reasoning.as_deref())?;
+            changed_model = self.selected.as_deref() != Some(model);
             self.selected = Some(model.to_owned());
         }
         self.observe_thread_status(&thread["status"]);
@@ -3320,7 +3936,14 @@ impl Codex {
             busy: self.busy,
             detail: status_detail(&thread["status"]),
         });
-        step.events.push(Event::Capabilities(self.capabilities()));
+        if changed_model {
+            self.model_events(step);
+        } else {
+            step.events.push(Event::Capabilities(self.capabilities()));
+        }
+        if changed_controls {
+            self.publish_goal(step);
+        }
         Ok(())
     }
 }
@@ -3421,6 +4044,13 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value[key]
         .as_str()
         .ok_or_else(|| format!("Unsupported Codex frame: missing string {key}"))
+}
+fn required_model(value: &Value) -> Result<&str, String> {
+    let model = string(value, "model")?;
+    if model.trim().is_empty() {
+        return Err("Unsupported Codex frame: empty model".into());
+    }
+    Ok(model)
 }
 fn array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, String> {
     value[key]
@@ -5812,6 +6442,12 @@ mod tests {
             server_identity: None,
             retained_identity: None,
             thread: Some("thread-exact".into()),
+            goal: None,
+            goal_settings: None,
+            applied_selection: None,
+            unconfirmed_selection: None,
+            goal_resume_admission: GoalResumeAdmission::OriginalScope,
+            goal_resume_pending: false,
             start: json!({}),
             alias: None,
             cwd: PathBuf::from("/tmp"),
@@ -6151,7 +6787,7 @@ mod tests {
         parent
             .pending
             .insert(json!("attach").to_string(), Pending::Attach);
-        let attached = parent.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
+        let attached = parent.receive(json!({"id":"attach","result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"model":"model","initialTurnsPage":{"data":[],"nextCursor":null}}})).unwrap();
         let list = attached
             .writes
             .iter()
@@ -6770,7 +7406,7 @@ mod tests {
             let confirmed = adapter
                 .receive(json!({"method":"thread/settings/updated","params":{
                     "threadId":"thread-exact",
-                    "threadSettings": {"approvalPolicy":approval,"sandboxPolicy":{"type":sandbox}}
+                    "threadSettings": {"model":"model","effort":null,"approvalPolicy":approval,"sandboxPolicy":{"type":sandbox}}
                 }}))
                 .unwrap();
             assert!(
@@ -6781,7 +7417,7 @@ mod tests {
         }
         let custom = adapter.receive(json!({"method":"thread/settings/updated","params":{
             "threadId":"thread-exact",
-            "threadSettings": {"approvalPolicy":"on-failure","sandboxPolicy":{"type":"workspaceWrite"}}
+            "threadSettings": {"model":"model","effort":null,"approvalPolicy":"on-failure","sandboxPolicy":{"type":"workspaceWrite"}}
         }})).unwrap();
         assert!(custom.events.contains(&Event::PermissionMode(None)));
         adapter.busy = true;
@@ -7150,6 +7786,7 @@ mod tests {
             spec.transport,
             TransportSpec::UnixWebSocket { .. }
         ));
+        adapter.set_goal_resume_admission(GoalResumeAdmission::OriginalScope);
         let initialize = adapter.initialize().unwrap();
         let step = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":directory.path()}})).unwrap();
         let resume = step
@@ -7162,8 +7799,8 @@ mod tests {
             json!({"threadId":"thread-exact","excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}})
         );
         let wrong = adapter
-            .receive(json!({"id":resume["id"],"result":{"thread":{"id":"tree-id-not-thread"}}}));
-        assert!(wrong.is_err());
+            .receive(json!({"id":resume["id"],"result":{"thread":{"id":"tree-id-not-thread"},"model":"model"}}));
+        assert!(wrong.unwrap_err().contains("different thread"));
     }
 
     #[test]

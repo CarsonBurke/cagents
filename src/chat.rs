@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod failure;
+pub mod goal;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;
@@ -1197,6 +1198,10 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Exact-thread native goal observations; never inferred from prompt text
+    /// or a transport acknowledgement. Absent for unsupported adapters.
+    #[serde(default)]
+    pub goal: Option<goal::Snapshot>,
 }
 
 /// When a provider takes a message it is holding.
@@ -1536,6 +1541,13 @@ pub enum Command {
     ReadTextCopy {
         source: TextCopySource,
         offset: u64,
+    },
+    /// Native goal controls retain the actor publication that offered them.
+    /// The runtime separately checks original account and directory authority.
+    Goal {
+        thread_id: String,
+        revision: u64,
+        operation: goal::Operation,
     },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2410,6 +2422,8 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// Includes pending/uncertain state until the native RPC actually settles.
+    Goal(goal::Snapshot),
 }
 
 #[cfg(test)]
