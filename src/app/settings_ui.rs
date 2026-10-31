@@ -1,4 +1,5 @@
 use super::*;
+mod agents;
 use crate::settings_widgets::{Group, Setting, field as setting_field, group as settings_group};
 
 fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a, Message> {
@@ -35,12 +36,17 @@ fn monospace_font_setting<'a>(family: &str, field: SettingsField) -> Setting<'a,
     setting_field(
         "Installed monospace fonts",
         "Choose a fixed-pitch font installed on this computer.",
-        crate::ui_controls::field::select(labels, selected, move |index| {
-            Message::SettingsChanged {
+        crate::ui_controls::field::select(
+            "Installed monospace fonts",
+            format!("settings.font.{field:?}"),
+            format!("{values:?}"),
+            labels,
+            selected,
+            move |index| Message::SettingsChanged {
                 field,
                 value: values[index].clone(),
-            }
-        })
+            },
+        )
         .into(),
     )
 }
@@ -175,12 +181,19 @@ fn default_account_choice<'a>(
     setting_field(
         label,
         detail,
-        crate::ui_controls::field::select(labels, selected, move |index| {
-            Message::AccountUi(match &ids[index] {
-                Some(id) => account_ui::Action::SetDefault(id.clone()),
-                None => account_ui::Action::SetAutomatic(provider),
-            })
-        })
+        crate::ui_controls::field::select(
+            format!("{label} default account"),
+            format!("settings.default-account.{provider:?}"),
+            format!("{ids:?}"),
+            labels,
+            selected,
+            move |index| {
+                Message::AccountUi(match &ids[index] {
+                    Some(id) => account_ui::Action::SetDefault(id.clone()),
+                    None => account_ui::Action::SetAutomatic(provider),
+                })
+            },
+        )
         .into(),
     )
 }
@@ -191,6 +204,7 @@ pub(super) struct SettingsContext<'a> {
     pub feedback: Option<&'a SettingsFeedback>,
     /// Refused values, by the field that refused them.
     pub invalid: &'a HashMap<SettingsField, String>,
+    pub agent_models: Vec<(crate::agent::Provider, &'a [crate::chat::Model])>,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
@@ -204,6 +218,7 @@ fn settings_category_controls<'a>(
     let invalid = context.invalid;
     let testing_notification = context.testing_notification;
     match category {
+        SettingsCategory::Agents => agents::controls(draft, context),
         SettingsCategory::Notifications => {
             use crate::notifications::Field;
             let fields = [
@@ -592,6 +607,9 @@ fn settings_category_controls<'a>(
                         "App theme",
                         "Colors for the entire application. Terminal and syntax palettes are independent.",
                         crate::ui_controls::field::select(
+                            "App theme",
+                            "settings.app-theme",
+                            "app-theme",
                             AppTheme::ALL
                                 .iter()
                                 .map(|theme| theme.label().to_owned())
@@ -1171,6 +1189,7 @@ fn category_icon(category: SettingsCategory) -> Icon {
         SettingsCategory::NativeChat => Icon::Chat,
         SettingsCategory::Editor => Icon::TextEditor,
         SettingsCategory::Accounts => Icon::Users,
+        SettingsCategory::Agents => Icon::Chat,
         SettingsCategory::About => Icon::Info,
     }
 }
@@ -1318,9 +1337,14 @@ fn settings_layout<'a>(
                 .iter()
                 .position(|item| *item == category);
             rows.push(
-                crate::ui_controls::field::select(labels, selected, |index| {
-                    Message::SelectSettingsCategory(SettingsCategory::ALL[index])
-                })
+                crate::ui_controls::field::select(
+                    "Settings category",
+                    "settings.category",
+                    "settings-categories",
+                    labels,
+                    selected,
+                    |index| Message::SelectSettingsCategory(SettingsCategory::ALL[index]),
+                )
                 .width(Length::Fill)
                 .into(),
             );
@@ -1489,10 +1513,17 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
     setting_field(
         "Color theme",
         "Live terminal colors. Add a custom_terminal_theme table to settings.toml to create your own; application color overrides remain intact.",
-        crate::ui_controls::field::select(labels, index, move |index| Message::SettingsChanged {
-            field: SettingsField::TerminalTheme,
-            value: choices[index].1.to_owned(),
-        })
+        crate::ui_controls::field::select(
+            "Terminal color theme",
+            "settings.terminal-theme",
+            format!("{choices:?}"),
+            labels,
+            index,
+            move |index| Message::SettingsChanged {
+                field: SettingsField::TerminalTheme,
+                value: choices[index].1.to_owned(),
+            },
+        )
         .into(),
     )
 }

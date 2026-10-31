@@ -194,6 +194,7 @@ fn scope_descriptor(
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
         agent_updates: Default::default(),
+        configured_chat_drafts: HashMap::new(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
         // A projection carries no channels, so it has nothing to say about what

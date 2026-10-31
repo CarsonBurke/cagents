@@ -331,6 +331,8 @@ pub(crate) struct HostState {
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
+    /// Fresh choices own an ID and slot before a provider recipe exists.
+    pub(super) chat_preparing: BTreeMap<TerminalId, uuid::Uuid>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
     pub(super) native_actor_outcomes: Option<super::chat::retained_actor::Broker>,
@@ -456,6 +458,7 @@ impl HostState {
             chats: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
+            chat_preparing: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             native_closing: BTreeMap::new(),
             native_actor_outcomes: None,
@@ -1215,6 +1218,25 @@ impl HostState {
         self.reserve_spawn_for_view(terminal_id, None)
     }
 
+    /// Fresh native starts cannot adopt any existing or reserved identity,
+    /// including completed records retained for explicit recovery.
+    pub(super) fn contains_session_identity(&self, id: TerminalId) -> bool {
+        self.chat_preparing.contains_key(&id)
+            || self.contains_session_identity_except_preparation(id)
+    }
+
+    /// Used only after a caller proves its own exact fresh-preparation guard.
+    /// The id-only reservation grants no authority over another namespace.
+    pub(super) fn contains_session_identity_except_preparation(&self, id: TerminalId) -> bool {
+        self.terminals.contains_key(&id)
+            || self.spawning.contains(&id)
+            || self.chats.contains_key(&id)
+            || self.chat_spawning.contains_key(&id)
+            || self.chat_handoffs.contains_key(&id)
+            || self.native_closing.contains_key(&id)
+            || self.native_actor_startups.contains_key(&id)
+    }
+
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
         let record = self.terminals.remove(&terminal_id)?;
         self.notification_closed.remove(&terminal_id);
@@ -1287,7 +1309,8 @@ impl HostState {
                 true,
             ));
         }
-        if (self.chat_spawning.contains_key(&terminal_id) && !owns_transition)
+        if self.chat_preparing.contains_key(&terminal_id)
+            || (self.chat_spawning.contains_key(&terminal_id) && !owns_transition)
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()
                     && !paired.is_some_and(|terminal| {
@@ -1347,6 +1370,7 @@ impl HostState {
                 .get(id)
                 .is_some_and(|record| !record.handle.is_completed())
             || self.chat_spawning.contains_key(id)
+            || self.chat_preparing.contains_key(id)
             || self.chat_handoffs.contains_key(id)
     }
 
@@ -1731,7 +1755,8 @@ impl HostState {
     }
 
     fn inventory_count(&mut self) -> u64 {
-        let mut count = (self.spawning.len() + self.chat_spawning.len()) as u64;
+        let mut count =
+            (self.spawning.len() + self.chat_spawning.len() + self.chat_preparing.len()) as u64;
         for record in self.chats.values_mut() {
             if !record.completion_observed
                 && !record.handle.owns_work()
@@ -1844,7 +1869,10 @@ impl HostState {
         {
             return Err("Daemon inventory changed; obtain a new upgrade preflight".into());
         }
-        if !self.spawning.is_empty() || !self.chat_spawning.is_empty() {
+        if !self.spawning.is_empty()
+            || !self.chat_spawning.is_empty()
+            || !self.chat_preparing.is_empty()
+        {
             return Err(
                 "Sessions are still starting; wait for reservations to settle and retry".into(),
             );
@@ -1866,7 +1894,8 @@ impl HostState {
     ) -> ShutdownOutcome {
         let count = self.inventory_count();
         if let ShutdownOperation::Stop { require_empty, .. } = operation
-            && (!self.chat_spawning.is_empty()
+            && (!self.chat_preparing.is_empty()
+                || !self.chat_spawning.is_empty()
                 || self
                     .chats
                     .values()
@@ -2035,7 +2064,9 @@ impl HostState {
     }
 
     pub(super) fn startup_blocks_shutdown(&self) -> bool {
-        !self.startup_custody.is_empty() || self.recovery_owns_work()
+        !self.chat_preparing.is_empty()
+            || !self.startup_custody.is_empty()
+            || self.recovery_owns_work()
     }
 
     pub(crate) fn request_shutdown(&mut self) {

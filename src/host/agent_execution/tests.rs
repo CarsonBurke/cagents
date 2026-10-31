@@ -4443,3 +4443,77 @@ fn execution_gates_keep_existing_callers_after_successful_close() {
     );
     assert!(Arc::ptr_eq(&pending, &agent_gate(&host, accepted.agent.id)));
 }
+
+#[test]
+fn provider_settings_reach_cli_and_automation_processes_and_recorded_recipes() {
+    if isolated("provider_settings_reach_cli_and_automation_processes_and_recorded_recipes")
+        .is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let wrapper = root.join("bin/configured-claude");
+    install_claude(&wrapper);
+    let script = std::fs::read_to_string(&wrapper).unwrap().replace("set -eu\n", "set -eu\nprintf '%s\\n' \"$PROVIDER_FIXTURE_VALUE\" >> \"$HOME/../configured-environment\"\n");
+    std::fs::write(&wrapper, script).unwrap();
+    let configuration = crate::settings::AgentLaunchSettings {
+        model: Some("settings-model".into()),
+        effort: Some("low".into()),
+        permission_mode: Some("plan".into()),
+        executable: Some(wrapper.to_string_lossy().into_owned()),
+        arguments: vec![
+            "--append-system-prompt".into(),
+            "one argument with spaces".into(),
+        ],
+        environment: std::collections::BTreeMap::from([(
+            "PROVIDER_FIXTURE_VALUE".into(),
+            "settings environment".into(),
+        )]),
+        ..Default::default()
+    };
+    let settings = crate::settings::AppSettings {
+        agents: std::collections::BTreeMap::from([("claude".into(), configuration)]),
+        ..Default::default()
+    };
+    crate::settings::save(crate::settings::default_path().unwrap(), &settings).unwrap();
+    // This is the same submit service used by CLI agent spawn.
+    let cli = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, cli.run.id).state, State::Succeeded);
+    let automation = automation_fixture(&host, &request);
+    let scheduled = claim_fixture(&host, &automation);
+    dispatch_accepted(&host, scheduled.clone()).unwrap();
+    assert_eq!(settled(&host, scheduled.run.id).state, State::Succeeded);
+    for accepted in [cli, scheduled] {
+        let agent = registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap();
+        let Some(HostedSession::Chat(session)) = agent.session else {
+            panic!("native launch recipe missing")
+        };
+        assert_eq!(session.launch.recipe.program, wrapper.to_string_lossy());
+        let arguments = &session.launch.recipe.arguments;
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--append-system-prompt", "one argument with spaces"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "settings-model"])
+        );
+        assert_eq!(
+            session.launch.recipe.environment["PROVIDER_FIXTURE_VALUE"],
+            "settings environment"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.join("configured-environment")).unwrap(),
+        "settings environment\nsettings environment\n"
+    );
+    super::super::finish_chat_shutdown(&host).unwrap();
+}

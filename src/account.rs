@@ -258,6 +258,9 @@ pub fn is_account_namespace(provider: Provider, path: &Path) -> bool {
 /// A home the reader's own environment chose - the system account's - is
 /// never listed, so it survives into a cagents process started from there.
 pub const SELECTION_MARKER: &str = "CAGENTS_ACCOUNT_HOMES";
+/// UI classification of a recorded auth recipe, including configured wrappers.
+/// Never account ownership, read access, retirement or cleanup authority.
+pub const SIGN_IN_MARKER: &str = "CAGENTS_ACCOUNT_SIGN_IN";
 
 /// The provider home variables to drop from an inherited environment, read
 /// through `environment`: those that only record an account cagents selected

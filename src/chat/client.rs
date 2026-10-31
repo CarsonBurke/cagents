@@ -1706,6 +1706,38 @@ impl ClientHandle {
         )
     }
 
+    /// A new draft sends choices, not a local program or environment. The
+    /// authenticated daemon returns the recipe it actually resolved/issued.
+    pub fn connect_configured(
+        start: super::ConfiguredChatStart,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        start.validate()?;
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::connect_configured_on(stream, start, wake)
+    }
+
+    fn connect_configured_on(
+        stream: UnixStream,
+        start: super::ConfiguredChatStart,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        start.validate()?;
+        Self::connect_on_with_start(
+            stream,
+            None,
+            Some(start),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            wake,
+        )
+    }
+
     pub fn recover_account(
         source: Session,
         replacement: Session,
@@ -1774,7 +1806,7 @@ impl ClientHandle {
     }
 
     fn connect_on(
-        mut stream: UnixStream,
+        stream: UnixStream,
         session: Session,
         intent: Intent,
         source: Option<HostSessionProof>,
@@ -1784,16 +1816,66 @@ impl ClientHandle {
         upgrade_expected: Option<Session>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
-        let retirement = ClientRetirement::for_client(session.id)?;
+        Self::connect_on_with_start(
+            stream,
+            Some(session),
+            None,
+            intent,
+            source,
+            terminate_source,
+            selection,
+            account_recovery,
+            upgrade_expected,
+            wake,
+        )
+    }
+
+    fn connect_on_with_start(
+        mut stream: UnixStream,
+        session: Option<Session>,
+        configured: Option<super::ConfiguredChatStart>,
+        intent: Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+        selection: Option<String>,
+        account_recovery: Option<(Session, Option<u64>)>,
+        upgrade_expected: Option<Session>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        if session.is_some() == configured.is_some()
+            || (configured.is_some()
+                && (intent != Intent::Start
+                    || source.is_some()
+                    || terminate_source
+                    || selection.is_some()
+                    || account_recovery.is_some()
+                    || upgrade_expected.is_some()))
+        {
+            return Err(
+                "Fresh configured launch cannot carry a recorded source or recovery request".into(),
+            );
+        }
+        let id = configured
+            .as_ref()
+            .map(|start| start.id)
+            .or_else(|| session.as_ref().map(|session| session.id))
+            .expect("one checked start descriptor");
+        let retirement = ClientRetirement::for_client(id)?;
         if intent == Intent::RetryStart
             && (source.is_some()
                 || terminate_source
                 || selection.is_some()
                 || account_recovery.is_some()
                 || upgrade_expected.is_some()
-                || session.terminal.is_some()
-                || session.launch.session_id.is_none()
-                || session.native_continuity.retains_provider())
+                || session
+                    .as_ref()
+                    .is_none_or(|session| session.terminal.is_some())
+                || session
+                    .as_ref()
+                    .is_none_or(|session| session.launch.session_id.is_none())
+                || session
+                    .as_ref()
+                    .is_none_or(|session| session.native_continuity.retains_provider()))
         {
             return Err("Only an exact explicit history start can be retried".into());
         }
@@ -1803,7 +1885,9 @@ impl ClientHandle {
                 || terminate_source
                 || selection.is_some()
                 || account_recovery.is_some()
-                || UpgradeRecovery::candidate(&session, expected).is_none())
+                || session
+                    .as_ref()
+                    .is_none_or(|session| UpgradeRecovery::candidate(session, expected).is_none()))
         {
             return Err("The canonical chat is not an exact upgrade of the saved source".into());
         }
@@ -1841,80 +1925,98 @@ impl ClientHandle {
             return Err("Daemon returned an incomplete native chat ownership proof".into());
         }
         let mut session = session;
-        if intent == Intent::Start
+        if let Some(session) = session.as_mut()
+            && intent == Intent::Start
             && source.is_none()
             && session.terminal.is_some()
             && session.owns_codex_listener()
         {
-            // A stopped CLI has no live PTY proof. The daemon must match the
-            // retained actor and exact descriptor under this authenticated epoch.
+            // Preserve the recorded source path; fresh configured starts have
+            // no Session and never enter this recovery identity adjustment.
             session.proof = Some(proof.clone());
         }
-        let id = session.id;
+        let id = configured
+            .as_ref()
+            .map(|start| start.id)
+            .or_else(|| session.as_ref().map(|session| session.id))
+            .expect("one checked start descriptor");
+        let configured_identity = configured
+            .as_ref()
+            .map(|start| (start.provider, start.working_directory.clone()));
         let mut attach_request = 2;
         let mut upgrade_recovery = None;
-        let request = if let Some(expected) = upgrade_expected {
-            if expected.proof.as_ref() != Some(&proof) {
-                return Err("The canonical chat belongs to a different daemon".into());
-            }
-            let request_id = attach_request;
-            attach_request += 1;
-            codec
-                .write(
-                    &mut stream,
-                    &ClientEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id,
-                        proof: Some(proof.clone()),
-                        request: ClientRequest::ResolveUpgradeChat {
-                            source: session.clone(),
-                        },
-                    },
-                )
-                .map_err(|error| error.to_string())?;
-            match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
-                ServerResponse::UpgradeChatResolved { session: resolved }
-                    if resolved == expected => {}
-                _ => return Err("The daemon did not authenticate the exact canonical chat".into()),
-            }
-            upgrade_recovery = Some((session, expected.clone()));
-            ClientRequest::ChatAttach { session: expected }
-        } else if let Some((source, idle_generation)) = account_recovery {
-            let execution_environment = native_environment(&session, true);
-            ClientRequest::ChatRecoverAccount {
-                source,
-                replacement: session,
-                idle_generation,
-                execution_environment,
-            }
-        } else if let Some(token) = selection {
-            if intent != Intent::Start || terminate_source {
-                return Err("Selected conversation activation requires a non-destructive shared-server attachment".into());
-            }
-            ClientRequest::ChatStartSelected {
-                session,
-                source: source
-                    .ok_or("Selected conversation activation requires a proven source terminal")?,
-                token,
-            }
-        } else if intent == Intent::Start {
-            let execution_environment = native_environment(&session, source.is_none());
-            ClientRequest::ChatStart {
-                session,
-                source,
-                terminate_source,
-                execution_environment,
-            }
+        let request = if let Some(start) = configured {
+            ClientRequest::ChatStartConfigured { start }
         } else {
-            restore(
-                &mut stream,
-                &mut codec,
-                &mut attach_request,
-                &proof,
-                session,
-                &mut upgrade_recovery,
-                intent == Intent::RetryStart,
-            )?
+            let session = session.expect("recorded start descriptor");
+            if let Some(expected) = upgrade_expected {
+                if expected.proof.as_ref() != Some(&proof) {
+                    return Err("The canonical chat belongs to a different daemon".into());
+                }
+                let request_id = attach_request;
+                attach_request += 1;
+                codec
+                    .write(
+                        &mut stream,
+                        &ClientEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: Some(proof.clone()),
+                            request: ClientRequest::ResolveUpgradeChat {
+                                source: session.clone(),
+                            },
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
+                    ServerResponse::UpgradeChatResolved { session: resolved }
+                        if resolved == expected => {}
+                    _ => {
+                        return Err(
+                            "The daemon did not authenticate the exact canonical chat".into()
+                        );
+                    }
+                }
+                upgrade_recovery = Some((session, expected.clone()));
+                ClientRequest::ChatAttach { session: expected }
+            } else if let Some((source, idle_generation)) = account_recovery {
+                let execution_environment = native_environment(&session, true);
+                ClientRequest::ChatRecoverAccount {
+                    source,
+                    replacement: session,
+                    idle_generation,
+                    execution_environment,
+                }
+            } else if let Some(token) = selection {
+                if intent != Intent::Start || terminate_source {
+                    return Err("Selected conversation activation requires a non-destructive shared-server attachment".into());
+                }
+                ClientRequest::ChatStartSelected {
+                    session,
+                    source: source.ok_or(
+                        "Selected conversation activation requires a proven source terminal",
+                    )?,
+                    token,
+                }
+            } else if intent == Intent::Start {
+                let execution_environment = native_environment(&session, source.is_none());
+                ClientRequest::ChatStart {
+                    session,
+                    source,
+                    terminate_source,
+                    execution_environment,
+                }
+            } else {
+                restore(
+                    &mut stream,
+                    &mut codec,
+                    &mut attach_request,
+                    &proof,
+                    session,
+                    &mut upgrade_recovery,
+                    intent == Intent::RetryStart,
+                )?
+            }
         };
         codec
             .write(
@@ -1981,6 +2083,20 @@ impl ClientHandle {
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached { session, snapshot },
                 } if session.id == id && envelope.request_id == Some(attach_request) => {
+                    if configured_identity
+                        .as_ref()
+                        .is_some_and(|(provider, directory)| {
+                            session.launch.provider != *provider
+                                || session.launch.recipe.working_directory != *directory
+                                || session.proof.as_ref() != Some(&proof)
+                                || session.terminal.is_some()
+                        })
+                    {
+                        return Err(
+                            "The daemon did not issue the requested fresh conversation identity"
+                                .into(),
+                        );
+                    }
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
                     break (session, snapshot);
@@ -2916,6 +3032,101 @@ mod tests {
             .recovery,
             super::super::Recovery::Retry,
         );
+    }
+
+    #[test]
+    fn configured_start_sends_only_typed_choices_and_adopts_the_issued_recipe() {
+        use crate::agent::Provider;
+        for mismatch in ["none", "provider", "directory", "proof", "terminal", "id"] {
+            let start = super::super::ConfiguredChatStart {
+                id: TerminalId::new(),
+                provider: Provider::Claude,
+                working_directory: "/remote/project".into(),
+                account: "claude/system".parse().unwrap(),
+                model: Some("chosen-model".into()),
+                effort: None,
+                permission_mode: None,
+                automatic: true,
+            };
+            let expected = start.clone();
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let worker = thread::spawn(move || {
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                handoff_handshake(&mut server, &mut codec);
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert_eq!(request.proof, Some(handoff_proof()));
+                assert_eq!(
+                    request.request,
+                    ClientRequest::ChatStartConfigured {
+                        start: expected.clone()
+                    }
+                );
+                let mut issued = super::super::fresh_session_configured(
+                    Provider::Claude,
+                    expected.id,
+                    expected.working_directory,
+                    &crate::account::Account::system(Provider::Claude),
+                    &crate::settings::AgentLaunchSettings {
+                        permission_mode: Some("plan".into()),
+                        ..Default::default()
+                    },
+                    crate::settings::agents::LaunchDefaults::default(),
+                )
+                .unwrap();
+                issued.proof = Some(handoff_proof());
+                issued.launch.recipe.program = "/remote-only/private-wrapper".into();
+                issued.launch.recipe.arguments =
+                    vec!["--server-extra".into(), "spaced value".into()];
+                issued
+                    .launch
+                    .recipe
+                    .environment
+                    .insert("SERVER_POLICY".into(), "synthetic".into());
+                match mismatch {
+                    "provider" => issued.launch.provider = Provider::Codex,
+                    "directory" => issued.launch.recipe.working_directory = "/other".into(),
+                    "proof" => issued.proof = None,
+                    "terminal" => issued.terminal = Some(handoff_terminal()),
+                    "id" => issued.id = TerminalId::new(),
+                    _ => {}
+                }
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(request.request_id),
+                    &handoff_proof(),
+                    ServerMessage::Response {
+                        response: ServerResponse::ChatAttached {
+                            session: issued,
+                            snapshot: Snapshot::default(),
+                        },
+                    },
+                );
+            });
+            let outcome = ClientHandle::connect_configured_on(client, start, |_| {});
+            worker.join().unwrap();
+            if mismatch == "none" {
+                let handle = match outcome {
+                    Ok(handle) => handle,
+                    Err(error) => panic!("{}", error.message),
+                };
+                assert_eq!(
+                    handle.session().launch.recipe.program,
+                    "/remote-only/private-wrapper"
+                );
+                assert_eq!(
+                    handle.session().launch.recipe.environment["SERVER_POLICY"],
+                    "synthetic"
+                );
+                assert_eq!(
+                    handle.session().launch.recipe.arguments,
+                    ["--server-extra", "spaced value"]
+                );
+                drop(handle);
+            } else {
+                assert!(outcome.is_err(), "refuse mismatched issued {mismatch}");
+            }
+        }
     }
 
     #[test]
