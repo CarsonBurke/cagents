@@ -2117,7 +2117,7 @@ impl Actor {
                     );
                 }
             }
-            if stdout_eof && self.pending.is_empty() {
+            if stdout_eof && self.pending.is_empty() && !frames_ready {
                 if !self.output.is_empty() {
                     return Err("Provider ended with an incomplete JSON line".into());
                 }
@@ -7513,6 +7513,225 @@ mod tests {
             );
             descendant.reaped = true;
             assert_eq!(libc::WTERMSIG(status), libc::SIGKILL);
+        }
+    }
+
+    #[test]
+    fn stdio_eof_drains_complete_frame_backlog_before_terminal_diagnostics() {
+        struct Backlog {
+            received: Arc<std::sync::atomic::AtomicUsize>,
+            finished: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Adapter for Backlog {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![
+                        Event::Ready(true),
+                        Event::TurnStarted,
+                        Event::Status {
+                            busy: true,
+                            detail: "Working".into(),
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("unexpected backlog fixture command".into())
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                if frame == json!({}) {
+                    self.received.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Step::default());
+                }
+                if frame != json!({"done": true}) {
+                    return Err("unexpected backlog fixture frame".into());
+                }
+                self.finished.fetch_add(1, Ordering::Relaxed);
+                Ok(Step {
+                    events: vec![
+                        Event::Item(text("backlog-result", "Complete buffered answer")),
+                        Event::TurnSettled,
+                        Event::TurnFinished {
+                            key: Some("backlog-turn".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                        Event::Status {
+                            busy: false,
+                            detail: String::new(),
+                        },
+                    ],
+                    ..Default::default()
+                })
+            }
+        }
+        struct OwnedActor {
+            handle: LocalHandle,
+            gate: Option<crossbeam_channel::Sender<()>>,
+            closed: bool,
+        }
+        impl Drop for OwnedActor {
+            fn drop(&mut self) {
+                // Release the callback even if setup/assertions unwind. Preserve the
+                // exact actor and private fixture until its original join; an
+                // unresolved close intentionally HOLDs rather than detaching.
+                drop(self.gate.take());
+                while !self.closed {
+                    self.closed = self.handle.close().is_ok();
+                    if !self.closed {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        const COUNT: usize = 600;
+        const TAIL: &str = "backlog-final-stderr-marker";
+        assert!(COUNT > 2 * FRAMES_PER_POLL);
+        for (suffix, exit, terminal) in [
+            ("{\"done\":true}\n", "0", true),
+            ("{\"done\":true}\n", "7", true),
+            ("{\"done\":true}\n{\"partial\":", "0", true),
+            ("{\"done\":true}", "0", false),
+        ] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let stream = directory.path().join("stream");
+            let ready = directory.path().join("pipes-closed");
+            let payload = "{}\n".repeat(COUNT) + suffix;
+            assert!(payload.len() < libc::PIPE_BUF && payload.len() < 8192);
+            std::fs::write(&stream, payload).unwrap();
+            let spec = ProcessSpec {
+                execution: None, messages: None, unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines, program: "/bin/sh".into(),
+                arguments: vec!["-c".into(),
+                    "cat -- \"$1\" || exit 2; printf '%s\\n' 'backlog-final-stderr-marker' >&2; exec 1>&- 2>&-; : > \"$2\" || exit 2; exit \"$3\"".into(),
+                    "provider".into(), stream.to_string_lossy().into_owned(), ready.to_string_lossy().into_owned(), exit.into()],
+                working_directory: directory.path().into(), environment: BTreeMap::new(),
+            };
+            let (release, gate) = crossbeam_channel::bounded(1);
+            let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut adapter: Box<dyn Adapter> = Box::new(Backlog {
+                received: received.clone(),
+                finished: finished.clone(),
+            });
+            let mut initial = adapter.initialize().unwrap();
+            let store = preflight(&spec, &mut initial).unwrap();
+            let gate_entries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let gate_failed = Arc::new(AtomicBool::new(false));
+            let outcomes = Arc::new(Mutex::new(Vec::new()));
+            let entered = gate_entries.clone();
+            let failed = gate_failed.clone();
+            let observed = outcomes.clone();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+                if matches!(&update, Update::Ready)
+                    && entered.fetch_add(1, Ordering::AcqRel) == 0
+                    && gate.recv_timeout(Duration::from_secs(5)).is_err()
+                {
+                    failed.store(true, Ordering::Release);
+                }
+                if let Update::AttentionContext { evidence, .. } = update {
+                    observed
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(evidence);
+                }
+            })
+            .unwrap();
+            let mut owner = OwnedActor {
+                handle,
+                gate: Some(release),
+                closed: false,
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while (!ready.is_file() || gate_entries.load(Ordering::Acquire) == 0)
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(ready.is_file(), "provider did not close its real pipes");
+            assert_eq!(gate_entries.load(Ordering::Acquire), 1);
+            assert_eq!(received.load(Ordering::Relaxed), 0);
+            assert_eq!(finished.load(Ordering::Relaxed), 0);
+            // The initial Ready callback holds the actor before its first read.
+            // The bounded complete burst and closed pipes are available together.
+            // Qualification also requires the old-guard baseline to fail on the
+            // complete backlog, rather than assuming a particular read size.
+            owner.gate.take().unwrap().send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !owner.handle.is_completed() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let completed = owner.handle.is_completed();
+            let failure = owner.handle.failure();
+            let failed_gate = gate_failed.load(Ordering::Acquire);
+            let closed = owner.handle.close();
+            owner.closed = closed.is_ok();
+            assert!(
+                completed,
+                "decoder did not complete before cleanup: {suffix:?}"
+            );
+            closed.unwrap();
+            assert!(
+                !failed_gate,
+                "backlog fixture gate timed out or disconnected"
+            );
+            assert_eq!(gate_entries.load(Ordering::Acquire), 1);
+            let state = owner.handle.snapshot(None).unwrap();
+            assert_eq!(received.load(Ordering::Relaxed), COUNT);
+            assert_eq!(finished.load(Ordering::Relaxed), usize::from(terminal));
+            assert!(state.exited && !state.ready && !state.busy);
+            assert_eq!(state.items.iter().any(|item| matches!(&item.content, ItemContent::Text { text, .. } if text == "Complete buffered answer")), terminal);
+            let outcomes = outcomes.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+            if terminal {
+                assert_eq!(outcomes[0].key, "backlog-turn");
+            }
+            assert_eq!(
+                outcomes[0].kind,
+                if terminal {
+                    crate::notifications::Kind::Succeeded
+                } else {
+                    crate::notifications::Kind::Interrupted
+                }
+            );
+            if !suffix.ends_with('\n') {
+                assert!(
+                    failure
+                        .as_deref()
+                        .is_some_and(|error| error.contains("incomplete JSON line")),
+                    "{failure:?}"
+                );
+            } else if exit == "0" {
+                assert_eq!(failure, None);
+                assert_eq!(state.error, None);
+            } else {
+                assert!(
+                    failure
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Provider exited with")),
+                    "{failure:?}"
+                );
+                assert!(
+                    state
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("exit status: 7")),
+                    "{:?}",
+                    state.error
+                );
+            }
+            if failure.is_some() {
+                assert!(
+                    state
+                        .error
+                        .as_deref()
+                        .is_some_and(|error| error.contains(TAIL)),
+                    "{:?}",
+                    state.error
+                );
+            } else {
+                assert!(suffix.ends_with('\n') && exit == "0");
+            }
         }
     }
 
