@@ -1,4 +1,51 @@
 {
+  "appearance_observer": {
+    "applied_ui_scale": "actual Core::scale_factor converted exactly as Shell::scale_factor; finite positive or null for invalid; separate from native DPI",
+    "callsites": [
+      "cfg(development)+validated-fixture guard at start of App::view",
+      "existing leaf Context::install targets allocated main ID only",
+      "existing leaf subscription observes original event_window before existing message mapping"
+    ],
+    "common_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "composition_before_observer": "202f2ce9bf31e127ba58284ff007d6bc1f2cbcf1",
+    "log": {
+      "binding": [
+        "std::process::id",
+        "original opened iced window ID",
+        "observer UUID and monotonic observation generation",
+        "crate::VERSION",
+        "named literal compile-time fixture/App/bin byte SHA256 digests (no hardcoded self hash/head claim)",
+        "original manifest SHA256/dataset",
+        "actual applied theme/UI scale and optional native factor/event generation"
+      ],
+      "bytes_max": 4096,
+      "dedup": "actual appearance+bounded workspace/source/history state, no frame/camera/scroll position keys",
+      "field": "appearance_json",
+      "record": "history-native-appearance",
+      "record_version": 1,
+      "records_max": 256,
+      "target": "cagents::native_history"
+    },
+    "native_factor": "initial None; only original matching finite positive Rescaled sets Some; no native query/default/configured fallback",
+    "no_App_field_or_new_selector_or_timer": true,
+    "no_ordinary_Message_enum_change": true,
+    "observation_boundary": "view-state readback only, not compositor-present/renderer/log-sink delivery/User authority acknowledgement",
+    "observed_theme": "one cosmic::theme::active().theme_type snapshot: bounded kind, is_dark, is_high_contrast, exact ThemeType::Dark class; no configured preference completion or custom/system palette identity claim",
+    "opened_window": "original matching Window::Opened event required, not allocated Core ID/StartupWindowOpened alone; iced identity not OS drawable/mapped/present proof",
+    "runtime": {
+      "User_shared_resource_admission": null,
+      "actual_frames": null,
+      "controller_parser": null,
+      "matched_executables": null,
+      "native_Opened": null,
+      "native_Rescaled": null,
+      "original_log_records": null,
+      "performance": null,
+      "ux": null
+    },
+    "source_digest_scope": "literal compile-time included source bytes only, externally compared with frozen receipt; no whole-product/binary certification or expected self-referential hash literal",
+    "status": "SOURCE_ONLY_UNCOMPILED_UNRUN"
+  },
   "base_tree": "131a7c11b46d0f29b20a44672d3d46702baebc0e",
   "builder_assets_byte_exact_donor": {
     "qualification-packets/pr1310-native-fixture/README.md": "ffc7f48b97dc797ccec3df0bed665190a6a9b9357980eee52db64de5761bda74",

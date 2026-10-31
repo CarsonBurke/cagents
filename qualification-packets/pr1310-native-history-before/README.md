@@ -1,7 +1,8 @@
 # PR1310 Before native History adapter
 
-This is an **uncompiled, unrun Before-only source adapter**, whose sole product
-parent is original main `a3221af83d56663f0dcbef90f67b30ad6d9fe53d`. The separate
+This is an **uncompiled, unrun Before-only source adapter** retaining original
+feature base `a3221af83d56663f0dcbef90f67b30ad6d9fe53d`. Its appearance successor
+also composes the common official main change described below. The separate
 reviewed After source `9dc2a70caebbfc972e537712b9f9326843f232d0` is an immutable
 mechanism donor, not an execution or review result for this adapter. No public
 feature code or After History handler is backported. No Git dataset, controller,
@@ -106,3 +107,50 @@ old paging/detail/narrow/wide behavior. No original-global Tab/Escape shortcut,
 delayed stale callback, exhaustion, latency/resource, account/bootstrap/provider,
 storage/daemon/IPC/fresh-daemon/migration or whole-product result is established.
 Root owns separate review, publication and the complete product outcome.
+
+
+## Appearance state observer source successor
+
+This successor merges official main
+`4429728a1f179ea7f7eaca9667156553209a46ac` equally into the two native arms
+(only host/state.rs and host/chat/retained_actor_tests.rs, exact official blobs).
+The original feature/fixture heads are preserved. These are new comparison
+source revisions; no earlier source review, executable or runtime result is
+transferred to them.
+
+A development-only call at the start of the real main-window App::view reads
+one cosmic::theme::active snapshot and Core::scale_factor, the exact source of
+Shell::scale_factor. It reports the bounded actual theme class, dark/high-contrast
+flags and exact ThemeType::Dark class, without using configured preferences or
+the queued appearance Task as completion. Custom/System classes carry no exact
+palette identity claim. A private observer targets the allocated Core main ID,
+but emits nothing until an original matching Window::Opened event is received.
+That iced window ID is not an OS drawable/XID or a compositor mapping receipt.
+
+The existing fixture subscription observes original event_window before mapping
+to existing messages. Native scale begins None; only a matching original finite
+positive Window::Rescaled event sets Some. The initialized window_scale_factor,
+configured UI scale and an allocated ID never supply native-scale evidence. No
+initial native-scale query is invented: if Rescaled never arrives, native_scale
+stays null/unknown and physical-scale matching remains unqualified.
+
+Target `cagents::native_history` emits bounded `appearance_json` records, version 1,
+record kind `history-native-appearance`: original UI PID, opened iced window ID,
+observer UUID/generation, actual product version, named compile-time fixture/App/
+bin source byte digests, original validated manifest digest/dataset, actual
+applied theme/UI scale, optional native scale and its event generation, plus
+bounded actual workspace/source/history state. Source digests hash literal
+compile-time included bytes; no expected hash/current-head value is hardcoded
+inside its own input, and they are not a whole-product or binary certificate.
+The external frozen receipt supplies exact hashes for later comparison.
+
+Repeated views with the same observed state emit no new record. Records exclude
+per-frame camera/scroll positions, are capped at 4096 bytes and 256 state changes,
+and stop with one bounded diagnostic on limits/serialization failure. Actual
+recovered original UI log bytes are still required; tracing may be filtered or
+its sink unavailable. The record is view-time state readback, not paint/present,
+renderer, authority or logging-delivery acknowledgement. No new timer, synthetic
+Frame, selector, command-file control, App field or ordinary Message variant is
+added. The native owner still owns controller/parser/input/captures and genuine
+resource/User admission. All matched binaries, native scale events, frames,
+Before/After comparisons, UX and performance remain NULL/UNRUN.
