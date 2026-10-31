@@ -208,6 +208,28 @@ class PreparationAlgorithms(unittest.TestCase):
             self.assertEqual(fixture[-2:],['-L','native=' + h.inventories[label]['target'] + '/dev-runtime/build/fixture-out'])
             self.assertEqual(set(arm['files']),{'cagents','cagentsd','cagents-ui','library-cagents','library-serde_json','fixture'})
 
+    def test_canonical_JSON_roundtrip_keeps_role_objects_unordered_and_command_array_ordered(self):
+        h=Harness();h.build()
+        raw=h.api['encoded'](h.record)
+        h.record=json.loads(raw)
+        self.assertEqual(list(h.record['arms']),['after','before'])  # Sorted JSON object order is not role order.
+        h.verify()  # Actual data, pinned raw inventories, original-child and artifact readers all accept it.
+        for case in ('missing','extra','wrong-role','list','null'):
+            with self.subTest(case=case):
+                h.record=json.loads(raw)
+                h.verify()
+                if case=='missing':del h.record['arms']['before']
+                if case=='extra':h.record['arms']['extra']=copy.deepcopy(h.record['arms']['before'])
+                if case=='wrong-role':h.record['arms']['typo']=h.record['arms'].pop('before')
+                if case=='list':h.record['arms']=['before','after']
+                if case=='null':h.record['arms']=None
+                with self.assertRaisesRegex(ValueError,'^prepared-both-heads$'):
+                    h.api['verify_data'](h.record,h.plan,dict(sha='4'*40,tree='5'*40),'6'*64,'7'*64,h.refs)
+        h.record=json.loads(raw)
+        h.record['commands'][0],h.record['commands'][1]=h.record['commands'][1],h.record['commands'][0]
+        with self.assertRaisesRegex(ValueError,'^prepared-command-order$'):
+            h.api['verify_data'](h.record,h.plan,dict(sha='4'*40,tree='5'*40),'6'*64,'7'*64,h.refs)
+
     def test_actual_shaped_artifact_feature_source_target_and_library_negatives(self):
         cases = ['features','profile','source','target','manifest','duplicate','library-target','ui-library-features','package']
         for case in cases:

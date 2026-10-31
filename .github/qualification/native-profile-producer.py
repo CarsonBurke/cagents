@@ -194,7 +194,7 @@ def validate_manifest(manifest, plan):
     need(manifest['compiler_settlement']['kernel_echild'] is True
          and manifest['compiler_settlement']['errors'] == [] and manifest['compiler_settlement']['no_more_spawns'] is True
          and positive_roots(manifest['compiler_settlement']['original_roots']),'writer-unknown')
-    need(list(manifest['arms']) == ['before','after'],'manifest-roles')
+    need(type(manifest['arms']) is dict and set(manifest['arms']) == {'before','after'},'manifest-roles')
     total = 0
     for label in ('before','after'):
         arm = manifest['arms'][label]

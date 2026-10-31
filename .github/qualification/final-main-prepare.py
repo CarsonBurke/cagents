@@ -521,7 +521,8 @@ def verify_data(record, plan, control, module_sha, fixture_sha, pinned=PINNED_RO
     need(record['control'] == control and record['module_sha256'] == module_sha and record['fixture_sha256'] == fixture_sha,'prepared-controller')
     need(record['roles'] == plan['native_preparation']['roles'],'prepared-roles')
     admit_references(record['roles'],pinned)
-    need(list(record['arms']) == ['before','after'] and len(record['commands']) == 8,'prepared-both-heads')
+    need(type(record['arms']) is dict and set(record['arms']) == {'before','after'}
+         and len(record['commands']) == 8,'prepared-both-heads')
     expected = [(label,graph) for label in ('before','after') for graph in ('cli','host','ui','fixture')]
     need([(row['arm'],row['graph']) for row in record['commands']] == expected
          and all(row['exit_code'] == 0 for row in record['commands']),'prepared-command-order')

@@ -257,6 +257,31 @@ class ProducerAlgorithms(unittest.TestCase):
                 if case=='fixture':f.records[-1]['argv'][-1]='native=/algorithm-only/foreign'
                 with self.assertRaises(ValueError):f.api['verify_compiler_evidence'](f.manifest,f.graphs,f.prep)
 
+    def test_canonical_JSON_roundtrip_keeps_role_objects_unordered_and_command_array_ordered(self):
+        f=Fixture();f.build()
+        f.manifest=json.loads(f.api['encoded'](f.manifest))
+        self.assertEqual(list(f.manifest['arms']),['after','before'])  # Real canonical encoding sorts object keys.
+        f.api['validate_manifest'](f.manifest,f.plan)
+        f.api['verify_compiler_evidence'](f.manifest,f.graphs,f.prep)
+        f.api['verify_payload'](f.manifest,{label:arm['leaves'] for label,arm in f.manifest['arms'].items()},f.plan)
+        raw,request,before,after,save=publication_data(f)
+        self.assertFalse(f.api['publication_proof'](raw,f.context,request,before,after,save,f.plan)['publication_qualified'])
+        for case in ('missing','extra','wrong-role','list','null'):
+            with self.subTest(case=case):
+                value=json.loads(raw)
+                f.api['validate_manifest'](value,f.plan)
+                if case=='missing':del value['arms']['before']
+                if case=='extra':value['arms']['extra']=copy.deepcopy(value['arms']['before'])
+                if case=='wrong-role':value['arms']['typo']=value['arms'].pop('before')
+                if case=='list':value['arms']=['before','after']
+                if case=='null':value['arms']=None
+                with self.assertRaisesRegex(ValueError,'^manifest-roles$'):f.api['validate_manifest'](value,f.plan)
+        value=json.loads(raw)
+        value['commands'][0],value['commands'][1]=value['commands'][1],value['commands'][0]
+        f.api['validate_manifest'](value,f.plan)  # Object membership remains valid; ARRAY order must still fail.
+        with self.assertRaisesRegex(ValueError,'^compiler-matrix$'):
+            f.api['verify_compiler_evidence'](value,f.graphs,f.prep)
+
     def test_complete_payload_match_includes_extra_missing_content_modes_links_and_source(self):
         for case in ('missing','extra','hash','mode','type','source','profile-writer'):
             with self.subTest(case=case):

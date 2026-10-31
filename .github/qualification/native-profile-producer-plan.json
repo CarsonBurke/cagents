@@ -19,7 +19,7 @@
     }
   },
   "fixture_sha256": "6f2d6d8a04df834f8c656adca1b3d9eb0f6c5e023738d74ddac7d8efe0d72ad6",
-  "preparation_module_sha256": "8b31211c25039460b9734c78fc9dd732458b7ca2f9fd3896595733c428e3769d",
+  "preparation_module_sha256": "289d578f7465b00b182a0f18f89b6861b6aaffce34d41d78ad1ff9c73b1236a6",
   "admission_inputs": null,
   "admission_requirement": "Separate exact policy/grant and accepted preflight/publication CONTRACT. No grant now. Actual future M/cache ID/P/A are not pre-compilation inputs. Unknown required quota/tooling/storage predicates refuse before Cargo; no guessed availability.",
   "layout": {
