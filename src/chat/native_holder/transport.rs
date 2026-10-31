@@ -2030,6 +2030,7 @@ mod tests {
             record,
             recovery: decoded,
             exited,
+            directory_pin,
         } = decoded
         else {
             panic!("legacy inspection changed its JSON tag")
@@ -2037,6 +2038,7 @@ mod tests {
         assert_eq!(protocol, 2);
         assert_eq!(record.version, 3);
         assert!(record.build.is_none());
+        assert!(!directory_pin);
         assert!(!exited);
         assert_eq!(decoded.source.proof.as_ref(), Some(proof));
     }
