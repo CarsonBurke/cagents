@@ -377,6 +377,85 @@ def original_output(result, record):
     return result.stdout
 
 
+
+def runtime_match_mapping(arm, checkout, evidence_root, artifacts):
+    """Pure retained-record consistency, NOT current files or native authority.
+
+    Native matched values remain exactly path+sha256 and name ORIGINAL Cargo
+    outputs. Historical copy inode/byte/writer relations remain separate evidence.
+    Later normal-runner pin/exact_matches must still reject live artifact drift.
+    """
+    require(arm in ARMS and type(artifacts) is list and len(artifacts) == 3,
+            'Exactly three retained role records required')
+    checkout, evidence_root = Path(checkout), Path(evidence_root)
+    require(checkout.is_absolute() and evidence_root.is_absolute(), 'Absolute mapping roots required')
+    paths, incarnations, matched, copies = set(), set(), {}, {}
+
+    def canonical(value):
+        require(type(value) is str and Path(value).is_absolute() and str(Path(value)) == value
+                and '..' not in Path(value).parts, 'Noncanonical retained path')
+        require(value not in paths, 'Aliased retained role/path')
+        paths.add(value)
+        return value
+
+    def kept_identity(value):
+        require(type(value) is dict and set(value) == {'device', 'inode', 'uid', 'mode', 'links',
+                    'bytes', 'mtime_ns', 'ctime_ns'}
+                and all(type(part) is int and part >= 0 for part in value.values())
+                and value['inode'] > 0 and value['links'] > 0 and value['bytes'] > 0,
+                'Missing/invalid retained acquisition identity')
+        key = (value['device'], value['inode'])
+        require(key not in incarnations, 'Aliased retained source/copy/receipt inode')
+        incarnations.add(key)
+        return value
+
+    for graph, row in zip(commands(), artifacts):
+        role, name = graph['role'], graph['name']
+        require(type(row) is dict and row.get('role') == role and row.get('graph') == graph,
+                'Missing/duplicate/wrong role or graph')
+        cargo, copied, receipt = row.get('actual_Cargo'), row.get('immutable_copy'), row.get('copy_receipt')
+        require(all(type(value) is dict for value in (cargo, copied, receipt)), 'Incomplete retained artifact/copy/receipt')
+        runtime = canonical(cargo.get('executable'))
+        require(runtime == str(TARGET / 'dev-runtime' / name)
+                and cargo.get('manifest_path') == str(checkout / 'Cargo.toml')
+                and cargo.get('package_id') == checkout.as_uri().replace('file:', 'path+file:', 1) + '#cagents@0.1.3'
+                and cargo.get('features') == sorted(graph['features'])
+                and cargo.get('requested_profile_from_argv') == 'dev-runtime'
+                and type(cargo.get('profile')) is dict and cargo['profile'].get('test') is False
+                and type(cargo.get('fresh')) is bool
+                and cargo.get('stream') == 'ORIGINAL_COMBINED_STDOUT_STDERR',
+                'Original Cargo source/graph/profile/path contradicts role')
+        target = cargo.get('target', {})
+        require(type(target) is dict and target.get('name') == name and target.get('kind') == ['bin']
+                and target.get('crate_types') == ['bin'] and target.get('src_path') == str(checkout / graph['source']),
+                'Original bin/source target contradicts role')
+        require(copied.get('source') == runtime and canonical(copied.get('path')) == str(evidence_root / name)
+                and canonical(receipt.get('path')) == str(evidence_root / (name + '.json')),
+                'Copy source/destination or receipt path contradicts original executable')
+        source_id, copy_id, receipt_id = (kept_identity(value) for value in
+                                         (copied.get('source_identity'), copied.get('identity'), receipt.get('identity')))
+        require(type(copied.get('bytes')) is int and 0 < copied['bytes'] <= MAX_ELF
+                and source_id['bytes'] == copy_id['bytes'] == copied['bytes']
+                and source_id['mode'] & 0o111 and copy_id['mode'] == 0o700 and copy_id['links'] == 1
+                and receipt_id['mode'] == 0o600 and receipt_id['links'] == 1
+                and source_id['uid'] == copy_id['uid'] == receipt_id['uid'], 'Retained byte/owner/mode contradiction')
+        digest = copied.get('sha256')
+        require(type(digest) is str and re.fullmatch(r'[0-9a-f]{64}', digest) is not None,
+                'Missing canonical copied/source byte digest')
+        # write_copy_receipt writes the original row BEFORE adding its returned
+        # copy_receipt key. Verify that exact known writer preimage, not a fake
+        # current-file read or a self-referential receipt digest.
+        preimage = {key: value for key, value in row.items() if key != 'copy_receipt'}
+        payload = (json.dumps(preimage, sort_keys=True, allow_nan=False) + '\n').encode()
+        require(len(payload) <= MAX_CONFIG and receipt_id['bytes'] == len(payload)
+                and receipt.get('sha256') == hashlib.sha256(payload).hexdigest(), 'Retained original receipt preimage differs')
+        matched[role] = {'path': runtime, 'sha256': digest}
+        copies[role] = {'actual_Cargo': cargo, 'immutable_copy': copied, 'copy_receipt': receipt}
+    return {'matched': matched, 'copy_evidence': copies, 'source': ARMS[arm],
+            'basis': 'Retained original Cargo/copy/writer observations, NOT live runtime inode verification',
+            'current_runtime_inode_or_native_qualification': None,
+            'later_gate': 'Normal scripts/run-development plus unchanged native _pin_input/exact_matches/hash must refuse any drift; never run evidence copies'}
+
 def produce_arm(arm, checkout, evidence_root, inputs, retained, invoke, fence, failure):
     """Finite task seam; NEVER owns/spawns/signals/closes a process or Cfd.
 
@@ -450,12 +529,14 @@ def produce_arm(arm, checkout, evidence_root, inputs, retained, invoke, fence, f
             owner.save()
         source_observation(owner, arm, checkout, 'matched-build-final', fence)
         require(observe_context(checkout, env, fence) == before, 'Final build context changed')
+        mapping = runtime_match_mapping(arm, checkout, evidence_root, artifacts)
+        retained['runtime_mapping'] = mapping
         retained['status'] = 'THREE_ACTUAL_ARTIFACT_COPIES_RETURNED_NOT_NATIVE_QUALIFICATION'
         owner.save()
         return {'record': 'pr1310-matched-build-producer-observations-v1', 'arm': arm, 'source': ARMS[arm],
                 'actual_artifacts': artifacts, 'Zig_preflight': zig_proof, 'context': before,
-                'matched': {row['role']: {'path': row['immutable_copy']['path'], 'sha256': row['immutable_copy']['sha256']}
-                            for row in artifacts}, 'renderer_build': None,
+                'matched': mapping['matched'], 'copy_evidence': mapping['copy_evidence'],
+                'runtime_mapping_basis': mapping['basis'], 'renderer_build': None,
                 'known_copy_FD_ledger': ledger, 'original_owner_identity': id(owner),
                 'requested_profile': 'dev-runtime', 'native_import_chain_config_authority_qualification': None,
                 'resource_return': 'EXTERNAL_ORIGINAL_OWNER_ONLY_NO_CFD_HERE'}

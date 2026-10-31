@@ -7,7 +7,7 @@
   },
   "producer": {
     "path": "qualification-packets/pr1310-matched-build/run-arm.py",
-    "sha256": "f52e046a3bfaed0a3735e8c6fb3d50a5d08e4159123047aa2364842c69d64918",
+    "sha256": "f19275176ea578ce0efe0b92b7f2bc47180a4b5b388e9c2ae275f9a6ca8e3341",
     "API": "produce_arm(arm, checkout, evidence_root, inputs, retained, invoke, fence, failure)",
     "standalone": "ordinary Hold; no CLI/controller/supervisor/resource owner",
     "original_command_source_binding": null,
@@ -77,10 +77,15 @@
         "end_line": 377,
         "body_sha256": "4dabcf82959142f169b2866c0b037348766036306d39e5dedde560efbc564648"
       },
+      "runtime_match_mapping": {
+        "line": 381,
+        "end_line": 457,
+        "body_sha256": "a5b410a492d6b4e05a84bba69d4c5324b43c204a7ff1a7f616e157b3fe486cee"
+      },
       "produce_arm": {
-        "line": 380,
-        "end_line": 466,
-        "body_sha256": "e9fd85dd3e4c7d0f85cccd43a2bcaa3331a3c428d2bd8d3b3b209536843dc42e"
+        "line": 459,
+        "end_line": 547,
+        "body_sha256": "38fa1a7918961b3f508180f165a8c0f32e9e8aa209eb89ebe663ecbca7a9ee70"
       }
     }
   },
@@ -298,14 +303,14 @@
     "full_chain_before_native": "UNSUPPLIED: actual installed normal shell-Cargo-rustup/shim and target/ancestor/CARGO_HOME/env effective-runner source/status relation; cannot be substituted by tool hash/version banner",
     "import_closure": "UNSUPPLIED: no complete actual Python/AX/PIL/native dependency closure producer/containment supplied",
     "Cargo_fresh_reported_semantics": "Cargo reports fresh=true when the artifact was already up to date and rustc was not run; fresh=false when rustc ran. The raw boolean is preserved, not independent timing, successful native behavior or full-chain proof.",
-    "matched_evidence_copy_not_runtime_mapping": "The returned matched paths name immutable evidence copies only. Actual runtime original paths are recorded in each actual_Cargo.executable. Before native effects a future real binder must separately correlate the normal scripts/run-development UI original path/incarnation/hash with retained copy evidence and satisfy native-owner exact_matches. Never execute the copied app directly or substitute a copy path into existing native sources. No mapping/adoption implemented here."
+    "matched_runtime_path_mapping": "runtime_match_mapping returns native matched values EXACTLY {path,sha256} for actual_Cargo.executable original target/dev-runtime paths. Immutable copies and writer receipts remain separate copy_evidence and original actual_artifacts unchanged. Pure mapping checks retained graph/source/path/identity/bytes/hash/preimage consistency only, never live files. Actual later normal scripts/run-development and unchanged native _pin_input/exact_matches/hash must refuse any rebuilt/replaced artifact drift. Never execute evidence copies."
   },
   "source_oracles": {
     "path": "qualification-packets/pr1310-matched-build/test_build_source.py",
-    "sha256": "f3a31cf6e1eaa855ee5da593e556827456d1b3ba64894fbdc8bd250b6a49c17b",
-    "parents": 6,
+    "sha256": "c04802845081c5d6e93e63b519b48008528f68690d91b8cf290b52ceb8fa0bfd",
+    "parents": 8,
     "status": "AUTHORED_UNRUN_AST_PARSE_ONLY",
-    "scope": "Synthetic actual-parser/command/NULL-refusal/status selection; no copied desired selector or producer import/effect",
+    "scope": "Actual pure command/parser/NULL-refusal/status AST plus two actual retained-record runtime-mapping parents; all8 current-source parents UNRUN, historical669 pure6 not successor qualification",
     "subcases_nonadditive": true
   },
   "runtime": {
@@ -339,5 +344,34 @@
       "scope": "Immutable fb5 SOURCE negative: one P2 root-library/bin collision; not runtime failure"
     },
     "new_parent_subcases": "Same combined stream root lib before AND after actual CLI bin; library-only and duplicate bin refusal, all nonadditive"
+  },
+  "runtime_mapping_source_correction": {
+    "parent": "669bf50a99971ccbe685b990706c08d087b61c5d",
+    "parent_tree": "244183e50b07504b6686826f8b1fa7e0d789eab0",
+    "helper": "runtime_match_mapping(arm, checkout, evidence_root, artifacts)",
+    "API_scope": "Pure original-retained-observation consistency only; no verifier authority/current filesystem/process/native effects",
+    "native_matched_schema": "cli/host/ui each exactly {path: actual_Cargo.executable, sha256: immutable_copy.sha256}",
+    "copy_evidence": "Original Cargo selection + immutable_copy + copy_receipt kept separately with no mutation",
+    "constraints": [
+      "Exact3roles once, same fixed graph/bin/features/source/package/dev-runtime target paths",
+      "Copy source==Cargo original executable; unique canonical original/copy/receipt paths and retained dev/inode pairs",
+      "Typed recorded source/copy/receipt identity, executable/private modes/links/UID relation and exact byte count",
+      "Canonical source/copy byte SHA retained; exact known write_copy_receipt JSON preimage SHA/length, excluding post-write copy_receipt key",
+      "No current original runtime inode/byte proof, no filesystem reads, no direct copied-app execution; original later native gates unchanged"
+    ],
+    "actual_current_runtime_verification": null,
+    "safe_original_command_binding": null,
+    "new_owning_parents": [
+      "MatchedBuildSourceOracles.test_runtime_mapping_keeps_original_paths_and_separate_copy_evidence",
+      "MatchedBuildSourceOracles.test_runtime_mapping_refuses_missing_duplicate_alias_and_receipt_drift"
+    ],
+    "old_six_body_conservation": "All6 source-parent bodies and existing test-class helpers exact; pure selector includes actual new helper/constants only",
+    "all_current_source_oracles": "8AUTHORED_UNRUN; no module/helper/function/case/test execution",
+    "historical_pure6": {
+      "path": "/tmp/coord-b9-pr1310-669bf50a-pure6-actual-evidence/receipt.json",
+      "sha256": "64f7e25457d06f4608fc7309a61d022e7a58f72d588cd6903b6bcd7f10503848",
+      "scope": "Actual frozen669 six pure parents PASS once, not a successor/new-helper/native/build qualification; receipt preserved, no rerun"
+    },
+    "review": "PENDING_INDEPENDENT_SOURCE_REVIEW_NO_PUBLICATION_OR_GRANT"
   }
 }

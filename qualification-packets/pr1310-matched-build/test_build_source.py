@@ -12,7 +12,7 @@ import re
 from types import SimpleNamespace
 import unittest
 
-EXPECTED_SOURCE_SHA256 = 'f52e046a3bfaed0a3735e8c6fb3d50a5d08e4159123047aa2364842c69d64918'
+EXPECTED_SOURCE_SHA256 = 'f19275176ea578ce0efe0b92b7f2bc47180a4b5b388e9c2ae275f9a6ca8e3341'
 
 
 def selected_source():
@@ -20,8 +20,8 @@ def selected_source():
     if hashlib.sha256(raw).hexdigest() != EXPECTED_SOURCE_SHA256:
         raise AssertionError('Owning source changed; a fresh source review is required')
     tree = ast.parse(raw)
-    constants = {'TARGET', 'LOCK', 'TOOL', 'ZIG_VERSION', 'ORIGINAL_COMMAND_BINDING', 'MAX_LOG', 'MAX_CONFIG', 'GRAPHS'}
-    functions = {'require', 'unique_json', 'commands', 'zig_environment', 'cargo_artifact', 'original_output', 'require_original_owner'}
+    constants = {'ARMS', 'TARGET', 'LOCK', 'TOOL', 'ZIG_VERSION', 'ORIGINAL_COMMAND_BINDING', 'MAX_LOG', 'MAX_CONFIG', 'MAX_ELF', 'GRAPHS'}
+    functions = {'require', 'unique_json', 'commands', 'zig_environment', 'cargo_artifact', 'original_output', 'require_original_owner', 'runtime_match_mapping'}
     selected = []
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and node.targets[0].id in constants:
@@ -161,6 +161,89 @@ class MatchedBuildSourceOracles(unittest.TestCase):
             values = record.copy(); values[field] = bad
             with self.subTest(field=field), self.assertRaises(self.hold):
                 self.actual['original_output'](result, values)
+
+
+    def mapping_artifacts(self):
+        # Synthetic retained-writer fixtures only; never actual ELF/UID/files.
+        root = Path('/tmp/cagents-history-build-11111111-2222-4333-8444-555555555555')
+        rows = []
+        for index, graph in enumerate(self.actual['commands']()):
+            executable = str(self.actual['TARGET'] / 'dev-runtime' / graph['name'])
+            cargo = self.artifact()
+            cargo.update(target={'kind': ['bin'], 'crate_types': ['bin'], 'name': graph['name'],
+                                 'src_path': str(self.checkout / graph['source'])},
+                         features=graph['features'], executable=executable, filenames=[executable])
+            selected = self.actual['cargo_artifact'](self.stream(cargo, {'reason': 'build-finished', 'success': True}),
+                                                       self.checkout, graph)
+            source_id = dict(device=9, inode=100 + index * 3, uid=1000, mode=0o755,
+                             links=2, bytes=64 + index, mtime_ns=1, ctime_ns=1)
+            copy_id = dict(source_id, inode=101 + index * 3, mode=0o700, links=1)
+            row = {'role': graph['role'], 'graph': graph, 'original_command_record': {'synthetic': True},
+                   'actual_Cargo': selected,
+                   'immutable_copy': {'source': executable, 'source_identity': source_id,
+                       'path': str(root / graph['name']), 'identity': copy_id,
+                       'sha256': hashlib.sha256(('SYNTHETIC-' + graph['role']).encode()).hexdigest(),
+                       'bytes': source_id['bytes']}}
+            row['copy_receipt'] = {'path': str(root / (graph['name'] + '.json')),
+                                  'identity': dict(copy_id, inode=102 + index * 3, mode=0o600), 'sha256': None}
+            rows.append(row)
+        self.reseal_mapping_receipts(rows)
+        return root, rows
+
+    def reseal_mapping_receipts(self, rows):
+        # Exact known write_copy_receipt JSON preimage format, not a native file
+        # producer. Negative cases can retain a coherent receipt so a different
+        # mapping guard, rather than only this checksum, must reject them.
+        for row in rows:
+            payload = (json.dumps({key: value for key, value in row.items() if key != 'copy_receipt'},
+                                  sort_keys=True, allow_nan=False) + '\n').encode()
+            row['copy_receipt']['identity']['bytes'] = len(payload)
+            row['copy_receipt']['sha256'] = hashlib.sha256(payload).hexdigest()
+
+    def test_runtime_mapping_keeps_original_paths_and_separate_copy_evidence(self):
+        root, rows = self.mapping_artifacts()
+        before = json.dumps(rows, sort_keys=True)
+        mapped = self.actual['runtime_match_mapping']('after', self.checkout, root, rows)
+        self.assertEqual(set(mapped['matched']), {'cli', 'host', 'ui'})
+        for row in rows:
+            role = row['role']
+            self.assertEqual(mapped['matched'][role], {'path': row['actual_Cargo']['executable'],
+                                                       'sha256': row['immutable_copy']['sha256']})
+            self.assertNotEqual(mapped['matched'][role]['path'], row['immutable_copy']['path'])
+            self.assertIs(mapped['copy_evidence'][role]['immutable_copy'], row['immutable_copy'])
+            self.assertIs(mapped['copy_evidence'][role]['copy_receipt'], row['copy_receipt'])
+        self.assertEqual(json.dumps(rows, sort_keys=True), before)
+        self.assertIsNone(mapped['current_runtime_inode_or_native_qualification'])
+
+    def test_runtime_mapping_refuses_missing_duplicate_alias_and_receipt_drift(self):
+        root, pristine = self.mapping_artifacts()
+        mutations = [
+            ('missing-role', lambda rows: rows.pop()),
+            ('duplicate-role', lambda rows: rows.__setitem__(1, rows[0])),
+            ('wrong-original-executable', lambda rows: rows[0]['actual_Cargo'].__setitem__('executable', '/tmp/wrong')),
+            ('wrong-source-relation', lambda rows: rows[0]['immutable_copy'].__setitem__('source', rows[1]['actual_Cargo']['executable'])),
+            ('copy-is-runtime-path', lambda rows: rows[0]['immutable_copy'].__setitem__('path', rows[0]['actual_Cargo']['executable'])),
+            ('aliased-source-inode', lambda rows: rows[1]['immutable_copy']['source_identity'].__setitem__('inode', rows[0]['immutable_copy']['source_identity']['inode'])),
+            ('aliased-source-copy-inode', lambda rows: rows[0]['immutable_copy']['identity'].__setitem__('inode', rows[0]['immutable_copy']['source_identity']['inode'])),
+            ('wrong-source-bytes', lambda rows: rows[0]['immutable_copy']['source_identity'].__setitem__('bytes', 99)),
+            ('wrong-copy-mode', lambda rows: rows[0]['immutable_copy']['identity'].__setitem__('mode', 0o755)),
+            ('wrong-receipt-path', lambda rows: rows[0]['copy_receipt'].__setitem__('path', rows[1]['copy_receipt']['path'])),
+            ('aliased-path-spelling', lambda rows: rows[0]['immutable_copy'].__setitem__('path', str(root) + '/./cagents')),
+        ]
+        for label, mutate in mutations:
+            rows = json.loads(json.dumps(pristine))
+            mutate(rows)
+            self.reseal_mapping_receipts(rows)
+            with self.subTest(case=label), self.assertRaises(self.hold):
+                self.actual['runtime_match_mapping']('after', self.checkout, root, rows)
+        rows = json.loads(json.dumps(pristine))
+        rows[0]['copy_receipt']['sha256'] = '0' * 64
+        with self.assertRaises(self.hold):
+            self.actual['runtime_match_mapping']('after', self.checkout, root, rows)
+        rows = json.loads(json.dumps(pristine))
+        rows[0]['copy_receipt']['identity']['bytes'] += 1
+        with self.assertRaises(self.hold):
+            self.actual['runtime_match_mapping']('after', self.checkout, root, rows)
 
 
 if __name__ == '__main__':

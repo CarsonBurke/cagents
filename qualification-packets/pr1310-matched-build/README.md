@@ -91,14 +91,14 @@ per-bin JSON receipts are created exclusively with O_NOFOLLOW|O_EXCL, never
 hardlinked, overwritten, deleted or repaired. Partial failures stay retained.
 Before the next graph/arm, actual immutable copy and receipt must have returned.
 This does not make a filesystem immutable against the owning UID or establish
-complete process/native dependency closure. The returned `matched` paths name
-immutable evidence copies, not ready native-owner runtime identities. Actual
-original executable paths are in each `actual_Cargo.executable`. A future real
-binder must separately correlate the normal `scripts/run-development` original
-UI path/incarnation/hash with retained copy evidence before native effects and
-satisfy the existing native-owner `exact_matches` contract. Never execute a
-copied app directly or substitute a copy path into existing native sources; no
-runtime mapping or adoption is implemented here. Stdlib transient metadata opens and
+complete process/native dependency closure. The pure runtime mapping now names
+original `actual_Cargo.executable` paths in native `matched` values, each exactly
+`{path, sha256}`; copies and receipts stay separate evidence. Those are retained
+observations and expected hashes, **not current runtime inode/byte proof**. The
+unchanged normal `scripts/run-development` and native `_pin_input`/`exact_matches`
+checks must refuse later rebuild/replacement drift before accepting actual UI
+identity. Never execute a copied app directly or substitute a copy path into
+native matched values. Actual native admission and safe binder remain absent. Stdlib transient metadata opens and
 kernel calls remain cooperative; no global FD/resource certificate is claimed.
 
 Ancestor and CARGO_HOME config files and selected environment inputs are observed
@@ -107,7 +107,7 @@ target-specific runner semantics and the full effective Cargo configuration are
 still UNKNOWN. Physical binary hashes and a version banner cannot fill that gap.
 No full import/native/renderer/UX or later application inference is produced.
 
-The six `MatchedBuildSourceOracles` parents are AUTHORED UNRUN. They select only
+The eight current-source `MatchedBuildSourceOracles` parents are AUTHORED UNRUN. They select only
 actual pure source AST; no full producer import or effect/orchestration body is
 executed during preparation. Source/JSON/AST/hash/inverse checks are preparation
 only. Existing native scale five-oracle UNRUN and historical pure3 scope are
@@ -124,6 +124,26 @@ lib-only streams, duplicate bins, wrong selected sources/features/profile/paths,
 errors and ambiguous completion. One new CLI parent uses actual `commands()[0]`
 with both rows in the SAME original combined stream; its lib-only and duplicate
 cases are nonadditive. All original five parent bodies/UI assertions are exact.
-All six remain AUTHORED UNRUN; no executable import/function/case was run. NULL
+At that source checkpoint all six were AUTHORED UNRUN; no executable import/function/case ran during authoring. NULL
 safe-owner binding, first-effect refusal and all chain/import/resource holds are
 unchanged. A fresh focused nonauthor source review is required.
+
+## Retained runtime-path mapping (source only)
+
+`runtime_match_mapping` validates the actual producer's three retained role
+records against the fixed graphs and original Cargo target paths. It checks
+source/copy/receipt path and retained identity/byte relations, detects duplicate
+or aliased records, and verifies the exact known JSON preimage written before
+the `copy_receipt` key was added. This is a consistency check on original writer
+observations, **not** a receipt-file read, current source-inode observation,
+full-chain certificate, native result or resource authority. Existing immutable
+copy evidence and original `actual_artifacts` remain available separately.
+
+The producer uses that helper only after all actual source/copy/receipt steps
+return, and preserves its result in the original retained state. NULL command
+binding still refuses before the first effect; no owner/supervisor/canonical
+port or native files are adopted. Two new actual-helper AST oracles cover the
+mapping and specific missing/duplicate/alias/receipt contradictions. The old six
+owning parent bodies are unchanged. Their frozen669 pure6 PASS receipt is
+historical and does not qualify this successor, its new helper or the native
+flow. All eight successor parents are UNRUN. No actual tests/functions ran here.
