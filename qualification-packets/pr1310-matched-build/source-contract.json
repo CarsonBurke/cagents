@@ -1,0 +1,322 @@
+{
+  "schema": "pr1310-matched-build-producer-source-v1",
+  "status": "SOURCE_SLICE_IMPLEMENTED_ORIGINAL_COMMAND_BINDER_NULL_HOLD_NOT_STANDALONE",
+  "base": {
+    "head": "72fdc5a062e9e1f4d206ace4b3dbddb8e38921c2",
+    "tree": "38e71776882697fd141201c23e6e55ae0442d8f9"
+  },
+  "producer": {
+    "path": "qualification-packets/pr1310-matched-build/run-arm.py",
+    "sha256": "935fb054ac718f73cf5ed27e0c8d467b86df434846419d28dea02d10e1775c76",
+    "API": "produce_arm(arm, checkout, evidence_root, inputs, retained, invoke, fence, failure)",
+    "standalone": "ordinary Hold; no CLI/controller/supervisor/resource owner",
+    "original_command_source_binding": null,
+    "current_producer_methods": {
+      "require": {
+        "line": 49,
+        "end_line": 51,
+        "body_sha256": "691324beef9014abe7f2dc76479e237500a6ae24ba7ceedad609fd16fc6914b4"
+      },
+      "unique_json": {
+        "line": 54,
+        "end_line": 63,
+        "body_sha256": "fbbe4e247c75d2249451d8d290b341c5c467ad4722bcda8372a90dbd22be0554"
+      },
+      "commands": {
+        "line": 66,
+        "end_line": 72,
+        "body_sha256": "789cb329c9aed5258fe4fa99717f68516164fab3ef7ce7870361fc573f76a454"
+      },
+      "zig_environment": {
+        "line": 75,
+        "end_line": 90,
+        "body_sha256": "8b663f1b8f7955cfd38764accfc961747971ceb392d1709ec0ca6bae1f5140d6"
+      },
+      "cargo_artifact": {
+        "line": 93,
+        "end_line": 150,
+        "body_sha256": "48e4571c7d4d63cc9d2712856a5f14ccc0fcc36cb86c68bb00abff48adc6af64"
+      },
+      "identity": {
+        "line": 153,
+        "end_line": 156,
+        "body_sha256": "5ccc189f3cb22efea7bb33db65a8f71823f5c1fb4ceedaaaa8535ee44512f396"
+      },
+      "copy_elf": {
+        "line": 159,
+        "end_line": 244,
+        "body_sha256": "bd16fb0dbbdeb0b077bf564f02c278bbead235eb29ec5fe4845e568532634c25"
+      },
+      "observe_context": {
+        "line": 247,
+        "end_line": 279,
+        "body_sha256": "2fb92bab2c2ecc7f6602d0b67fe41f3d12fd0451ca99760e9632edc3ebd24e36"
+      },
+      "executable_observation": {
+        "line": 283,
+        "end_line": 299,
+        "body_sha256": "3083edeb2ce44a703427c902b42f4f76a453880204903a3a524330f2733680be"
+      },
+      "source_observation": {
+        "line": 302,
+        "end_line": 310,
+        "body_sha256": "4cbf221becfc328810c0509ed803f4a9c1828ca89802d123007995a14966c8ce"
+      },
+      "write_copy_receipt": {
+        "line": 313,
+        "end_line": 342,
+        "body_sha256": "b0e3e5d0f96b40489aa9a413f18a4b00cd636dca01ad9256622cade77c25a7e2"
+      },
+      "require_original_owner": {
+        "line": 344,
+        "end_line": 360,
+        "body_sha256": "ac893604b49a0d581643da29cea453ed81560d24b3ab081432da8a7dc45705a6"
+      },
+      "original_output": {
+        "line": 363,
+        "end_line": 375,
+        "body_sha256": "4dabcf82959142f169b2866c0b037348766036306d39e5dedde560efbc564648"
+      },
+      "produce_arm": {
+        "line": 378,
+        "end_line": 464,
+        "body_sha256": "e9fd85dd3e4c7d0f85cccd43a2bcaa3331a3c428d2bd8d3b3b209536843dc42e"
+      }
+    }
+  },
+  "arms": {
+    "before": {
+      "head": "4ad36779cf830b36a5248cf76d4150d122884dda",
+      "tree": "f68427879b413b261ad8c5da27faff042cccef20",
+      "source_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1310-before-initial-native-scale",
+      "source_pins": {
+        "scripts/run-development": {
+          "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+          "bytes": 8296
+        },
+        "Cargo.toml": {
+          "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+          "bytes": 13087
+        },
+        "Cargo.lock": {
+          "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+          "bytes": 341188
+        },
+        ".cargo/config.toml": {
+          "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+          "bytes": 412
+        },
+        "build.rs": {
+          "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+          "bytes": 4593
+        },
+        "mise.toml": {
+          "sha256": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe",
+          "bytes": 23
+        },
+        "src/main.rs": {
+          "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+          "bytes": 656
+        },
+        "src/bin/cagentsd.rs": {
+          "sha256": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+          "bytes": 4892
+        },
+        "src/bin/cagents-ui.rs": {
+          "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
+          "bytes": 25035
+        },
+        "src/app/native_history_fixture.rs": {
+          "sha256": "96e29a5da5bccbf8d8f2d7d46bc9f2c49464c28dc9d01cb6557e858fc8fca766",
+          "bytes": 42052
+        }
+      }
+    },
+    "after": {
+      "head": "02802c8a563f48758f346fa9a0c633bbcee5abf9",
+      "tree": "f92373909001e423c999a57f8ceaaaff7b7869c5",
+      "source_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1310-after-initial-native-scale",
+      "source_pins": {
+        "scripts/run-development": {
+          "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+          "bytes": 8296
+        },
+        "Cargo.toml": {
+          "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+          "bytes": 13087
+        },
+        "Cargo.lock": {
+          "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+          "bytes": 341188
+        },
+        ".cargo/config.toml": {
+          "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+          "bytes": 412
+        },
+        "build.rs": {
+          "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+          "bytes": 4593
+        },
+        "mise.toml": {
+          "sha256": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe",
+          "bytes": 23
+        },
+        "src/main.rs": {
+          "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+          "bytes": 656
+        },
+        "src/bin/cagentsd.rs": {
+          "sha256": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+          "bytes": 4892
+        },
+        "src/bin/cagents-ui.rs": {
+          "sha256": "84edf39a2c85b2acb8e2542ad3668aff64bc8cf5cca838a3cce552472fe3ee37",
+          "bytes": 25035
+        },
+        "src/app/native_history_fixture.rs": {
+          "sha256": "b505b6bdd6865c57a9f99db14a7fcf1df604b6d467f537443939a31d71780aff",
+          "bytes": 41618
+        }
+      }
+    }
+  },
+  "ordinary_runner_source": {
+    "browserless_lines": [
+      191,
+      196
+    ],
+    "Zig_preflight_lines": [
+      79,
+      166
+    ],
+    "actual_build_graphs": [
+      {
+        "role": "cli",
+        "bin": "cagents",
+        "features": [
+          "development"
+        ],
+        "seconds": 600
+      },
+      {
+        "role": "host",
+        "bin": "cagentsd",
+        "features": [
+          "development",
+          "host"
+        ],
+        "seconds": 600
+      },
+      {
+        "role": "ui",
+        "bin": "cagents-ui",
+        "features": [
+          "development",
+          "ui"
+        ],
+        "seconds": 900
+      }
+    ],
+    "all_graph_flags": [
+      "build",
+      "--locked",
+      "--profile",
+      "dev-runtime",
+      "--no-default-features"
+    ],
+    "presentation_only_addition": "--message-format=json",
+    "no_native_shortcut": "Later native launch still uses actual normal runner; this producer does not execute an app",
+    "Zig": "Actual supervised zig env must report selected absolute zig and0.15.2; verified Zig parent then physical Rust1.93 prepended before original PATH. Conflicting inherited selection refuses."
+  },
+  "lane": {
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "jobs": 2,
+    "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+    "same_original_whole_seconds": 2400,
+    "planned_command_seconds": [
+      30,
+      600,
+      600,
+      900
+    ],
+    "remaining_overhead_seconds": 270,
+    "clamping": "Original owner must clamp EVERY action to same absolute remaining; no timeout reset/extension/second arm in one new budget",
+    "availability_warmth_lock_grant": null,
+    "new_target_cache_fallback": false
+  },
+  "owner_seam": {
+    "current_binding": null,
+    "safe_binder_implementation": null,
+    "actual_User_and_C_authority": "External authenticated instruction/original context only; source paths/UUIDs/booleans cannot authenticate",
+    "current_refusal": "First require_original_owner rejects NULL before any discovery/tool/copy/source/process effect",
+    "invoke_required": "Exact source-bound SAME retained owner method; argv,label,seconds,cwd,environment; actual original result+retained record, bounded COMBINED bytes with original/cleanup exit distinction and unforced family, actual original waits/pidfds retained before fallible evidence. No newly adopted/unknown child killing.",
+    "fence_required": "Exact source-bound same owner method; actual original cancellation/remaining deadline/source/context; no reset",
+    "failure_required": "Exact source-bound same owner sticky error retention; partial acquisitions/unknown closes cannot vanish",
+    "retained_required": "The same actual original owner.value[matched_build_producer] dictionary is retained BEFORE first producer effect; acquisition returns recorded BEFORE fallible metadata. Data custody only, no authority claim.",
+    "existing_source_owner_names": [
+      "check_bindings",
+      "source_observation",
+      "paths.checkout",
+      "plan[source]",
+      "value",
+      "save"
+    ],
+    "candidate_inspected": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2002-host-driver/scripts/qualification/run-host-lane.py",
+      "sha256": "52f56a392819c2e351bdbf364f61cce8a1837540455c0e9261fc785f5c4a95f0",
+      "method": "Runner.captured477-508",
+      "scope": "SOURCE CANDIDATE ONLY; current HOST/canonical-slot plan, prior return and no environment argument/uncapped retention are not adopted",
+      "missing_safe_binding": [
+        "Explicit allowed native matched-build task/arm/source/env plan",
+        "Per-command environment support without authority scrub",
+        "Bounded output retention before consumer byte check",
+        "Finite known-original owner custody with no unknown-descendant kill",
+        "Same source/context/C admission/final return proof under future actual grant"
+      ]
+    },
+    "A2_source_reference": {
+      "head": "ce99f29e453e3bf9a60414b63344c6a81b4db870",
+      "tree": "23e9bbaa9a20c1a97b59a424a2a4622c6c3ab74b",
+      "runner_sha256": "d75906ad55d1c1a5b2beffe5987ab47a0a058796f2e9d465673d15191aec5538",
+      "review": {
+        "path": "/tmp/coord-b9-startup-recovery-checks-v2-independent-controller-review.json",
+        "sha256": "8b86356a667a3c1a9f63f985fc3c585000611e6d92952cb9ee7a07c006775c59"
+      },
+      "used": "Source reference for isolated flags/opaque context/original wait distinctions only; NO supervisor/functions copied",
+      "not_transferred": "A2 adopted-child kill path NOT copied; old empty observed lists are not new method authority. No d610/fa6 cleanup/EMPTY0 transfer."
+    }
+  },
+  "actual_producer_contract": {
+    "Cargo": "Original combined raw stream retained; JSON among human lines; exact one successful finish + one root cagents0.1.3 bin-kind/target/src/features/executable/non-test profile. Duplicate/malformed/error/unknown original exit refuses.",
+    "profile": "dev-runtime name from exact argv/source; actual JSON profile retained, not fabricated name or observed installed-chain certificate",
+    "ELF": "Actual original absolute Cargo path, owned bounded regular source including stable normal hardlink count; actual ELF x86_64 ET_EXEC/DYN header, exact bounded copy/readback hash+fsync and one-shot closes; private exclusive0700 copy",
+    "per_bin_receipt": "Exclusive0600 JSON actual selected artifact/original command/copy facts before next build; original owner retains ledger and partial errors",
+    "source_stream": "COMBINED stdout+stderr, never relabelled separate stdout",
+    "FD_limit": "Persistent source/copy/receipt acquisition records only. Stdlib metadata-read transient FDs and cooperative syscalls are not a global FD certificate. No process/C descriptor acquired/closed by this library.",
+    "context": "Bounded actual config/ancestor/CARGO_HOME identity/hash and opaque selected environment digests. Full effective config/includes/wrappers/shims/target runner resolution remains UNKNOWN.",
+    "full_chain_before_native": "UNSUPPLIED: actual installed normal shell-Cargo-rustup/shim and target/ancestor/CARGO_HOME/env effective-runner source/status relation; cannot be substituted by tool hash/version banner",
+    "import_closure": "UNSUPPLIED: no complete actual Python/AX/PIL/native dependency closure producer/containment supplied"
+  },
+  "source_oracles": {
+    "path": "qualification-packets/pr1310-matched-build/test_build_source.py",
+    "sha256": "17659f6638414b8b3ec995c6c0a1464c3f38867b163fbc457dc43613f985a27b",
+    "parents": 5,
+    "status": "AUTHORED_UNRUN_AST_PARSE_ONLY",
+    "scope": "Synthetic actual-parser/command/NULL-refusal/status selection; no copied desired selector or producer import/effect",
+    "subcases_nonadditive": true
+  },
+  "runtime": {
+    "authenticated_grant": null,
+    "actual_C_owner": null,
+    "safe_callback_binding": null,
+    "actual_discovery_builds": null,
+    "actual_ELFs_Cargo_JSON_waits_copies": null,
+    "actual_chain_effective_config": null,
+    "actual_import_native_wholeflow_UX": null,
+    "application": "UNKNOWN",
+    "resource_return": "EXTERNAL_ORIGINAL_OWNER_HOLD"
+  },
+  "conservation": "ONLY four new task leaves; every original72fd entry/library/driver/fixture/product and protected generic source entry byte exact. Original native five-oracle UNRUN/historical pure3 scope unchanged.",
+  "review": "PENDING_FRESH_NONAUTHOR_SOURCE_REVIEW_NO_PUBLICATION_OR_GRANT"
+}
