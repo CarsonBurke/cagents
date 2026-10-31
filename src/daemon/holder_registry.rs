@@ -241,12 +241,30 @@ pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
 /// Browserless and full are presentations of the same production terminal
 /// service. Development and native-provider identity stay strictly separate.
 pub(crate) fn application_matches(kind: Kind, application: &str) -> bool {
-    application_matches_for(kind, application, crate::instance::APPLICATION_ID, crate::instance::IS_DEVELOPMENT)
+    application_matches_for(
+        kind,
+        application,
+        crate::instance::APPLICATION_ID,
+        crate::instance::IS_DEVELOPMENT,
+    )
 }
-fn application_matches_for(kind: Kind, application: &str, current: &str, development: bool) -> bool {
-    application == current || (kind == Kind::Terminal && !development
-        && matches!(current, "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless")
-        && matches!(application, "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless"))
+fn application_matches_for(
+    kind: Kind,
+    application: &str,
+    current: &str,
+    development: bool,
+) -> bool {
+    application == current
+        || (kind == Kind::Terminal
+            && !development
+            && matches!(
+                current,
+                "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless"
+            )
+            && matches!(
+                application,
+                "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless"
+            ))
 }
 
 pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
@@ -345,13 +363,42 @@ mod tests {
         let browserless = "dev.cagents.Cagents.Browserless";
         let dev = "dev.cagents.Cagents.Development";
         for current in [full, browserless] {
-            for previous in [full, browserless] { assert!(application_matches_for(Kind::Terminal, previous, current, false)); }
-            for foreign in [dev, "other.application", "dev.cagents.Cagents.Browserless2"] { assert!(!application_matches_for(Kind::Terminal, foreign, current, false)); }
+            for previous in [full, browserless] {
+                assert!(application_matches_for(
+                    Kind::Terminal,
+                    previous,
+                    current,
+                    false
+                ));
+            }
+            for foreign in [dev, "other.application", "dev.cagents.Cagents.Browserless2"] {
+                assert!(!application_matches_for(
+                    Kind::Terminal,
+                    foreign,
+                    current,
+                    false
+                ));
+            }
         }
-        assert!(!application_matches_for(Kind::Native, browserless, full, false));
-        assert!(!application_matches_for(Kind::Native, full, browserless, false));
+        assert!(!application_matches_for(
+            Kind::Native,
+            browserless,
+            full,
+            false
+        ));
+        assert!(!application_matches_for(
+            Kind::Native,
+            full,
+            browserless,
+            false
+        ));
         assert!(!application_matches_for(Kind::Terminal, full, dev, true));
-        assert!(!application_matches_for(Kind::Terminal, browserless, dev, true));
+        assert!(!application_matches_for(
+            Kind::Terminal,
+            browserless,
+            dev,
+            true
+        ));
         assert!(application_matches_for(Kind::Terminal, dev, dev, true));
     }
     #[test]
