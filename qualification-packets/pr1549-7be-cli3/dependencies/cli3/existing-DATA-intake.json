@@ -1,0 +1,205 @@
+{
+  "actual_ELF": null,
+  "actual_N": null,
+  "actual_results": null,
+  "argv_reconciliation_required": {
+    "canonical_inventory": [
+      "ACTUAL_CLI_LIB_ELF",
+      "--list",
+      "--color=never"
+    ],
+    "canonical_singleton": [
+      "ACTUAL_CLI_LIB_ELF",
+      "EXACT_SELECTOR",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    "original_inventory": [
+      null,
+      "--list",
+      "--format",
+      "terse"
+    ],
+    "original_singleton": [
+      null,
+      "--exact",
+      "FULL_SELECTOR",
+      "--format",
+      "pretty"
+    ],
+    "scope": "Explicit future source-owner reconciliation only; no runtime equivalence or old N/result transfer"
+  },
+  "controller_head": null,
+  "current_reconciled_names": [
+    "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+    "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+    "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords"
+  ],
+  "exclusions": "UI5/Worker21/Front19/low-FD/manualbenchmark/ceditor/integrated/native/UX/performance/wholePR remain separate; no extra scope or merged qualification.",
+  "execution_authorized": false,
+  "future_strict_result": "Each exact parent uniquely in fresh actual inventory;1P/0F/0I/0M, actual N-1 filtered, default captured scheduler, visible nested0. Actual footer alone is not stronger body/caller evidence than observed.",
+  "grant": null,
+  "inputs": [
+    {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-7be-full-feature-qualification-source-binding-addendum-v1.json",
+      "role": "genuine current7be binding/scope addendum",
+      "sha256": "28c949506a78c96eda81a0a791c731851f6e29cc2a1c01cb1f268663262e3993"
+    },
+    {
+      "path": "/tmp/pr1549-c28-full-feature-remaining-qualification-DATA-v1.json",
+      "role": "immutable originalc28 DATA, not silently retargeted",
+      "sha256": "7190a9f8d0825b75bc5bbf1b5a6acd06c66183fe89d1bc7dfd6bb06999fe6a40"
+    }
+  ],
+  "kind": "READ_ONLY_EXISTING_CLI3_DATA_ROUTE_NO_CONTROLLER_IMPLEMENTATION_OR_NEW_SOURCE_REVIEW",
+  "maintained_source_references": [
+    {
+      "head": "993cea26a29b5a2cd6857a959628de4e5f04c096",
+      "runner_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25"
+    },
+    {
+      "head": "2461ccd81b5b6a4fe66f5d3450ecdb277d85eeb5",
+      "runner_sha256": "d5f5102077a3d4df4e4800e564da1dbc0dc2f8bbd7876d22700b4a24f62a1c01",
+      "scope": "Corrected historical/current publication reader source reference, no consumer/admission/result transfer"
+    }
+  ],
+  "original_CLI_packet_DATA": {
+    "cap_sum_seconds": 1680,
+    "id": "remaining_shared_CLI3",
+    "phases": [
+      {
+        "cap_seconds": 30,
+        "id": "source_context_prerequisites"
+      },
+      {
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--no-default-features",
+          "--bin",
+          "cagents"
+        ],
+        "cap_seconds": 480,
+        "id": "CLI_bin_check"
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--locked",
+          "--no-default-features",
+          "--lib",
+          "--no-run",
+          "--message-format=json"
+        ],
+        "cap_seconds": 900,
+        "id": "CLI_lib_JSON_compile"
+      },
+      {
+        "cap_seconds": 30,
+        "id": "fresh_CLI_ELF_inventory"
+      },
+      {
+        "cap_seconds": 180,
+        "count": 3,
+        "each_cap_seconds": 60,
+        "id": "three_ordinary_exact_parents"
+      },
+      {
+        "cap_seconds": 60,
+        "id": "post_source_original_receipts"
+      }
+    ],
+    "scope": "CLI graph only; no HOST/UI union",
+    "selectors_group": "remaining_cli3"
+  },
+  "ownership": {
+    "CLI3": "No writer claimed by this read-only DATA intake; implementation ownership/admission remains separate",
+    "Front_Editor_UI19": "B9 ONLY, assignment6116e5a4 / message e06ef9a8; new packet namespace coord-b9-pr1549-7be-front19-source",
+    "UI5": "Root16 corrected2461 source reviewed/delivered; no new code here",
+    "Worker21": "B9 ae17 source reviewed/delivered; no new code here"
+  },
+  "performed": "Saved DATA/hash/name/order/budget extraction only; no fresh duplicate review of already covered unchanged heads, source/product edits, new worktree/context, compiler/helper/candidate execution, current env/target/cache/process/account/DB probe, public write or meter/arithmetic collection.",
+  "phase_projection": {
+    "CLI_bin_check": 480,
+    "CLI_lib_CargoJSON_no_run": 900,
+    "original_DATA_total": 1680,
+    "original_ceiling": 2400,
+    "original_source_and_post_reservations": [
+      30,
+      60
+    ],
+    "reservation_limit": "Metadata reservations create no extra commands/waits or newly enforced aggregate source/finalization deadlines; original workload remaining clamps and uncertain-custody HOLD stay.",
+    "serial_command_caps_sum": 1590,
+    "serial_command_count": 6,
+    "three_singleton_caps": [
+      60,
+      60,
+      60
+    ],
+    "unique_actual_ELF_inventory": 30
+  },
+  "product": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046"
+  },
+  "queue": null,
+  "source_only_consumer_route": "CLI-only root cagents lib, features[]; original isolated CLI bincheck. Existing generic CLI lib/inventory/singleton grammar is the relevant consumer reference, not a new ABI approval. No helper/reexec/native/provider or integration graph is proposed. Actual source/caller/schema/absence binding and code review remain implementation obligations.",
+  "three_source_rows_original_DATA": [
+    {
+      "actual_N": null,
+      "definition_line": 2079,
+      "expected_singleton": {
+        "failed": 0,
+        "filtered_out": "actual_N_for_this_ELF_minus_1",
+        "ignored": 0,
+        "inline_child_results": 0,
+        "measured": 0,
+        "passed": 1
+      },
+      "graph": "cli",
+      "path": "src/fs_safety.rs",
+      "purpose": "Shared typed EMFILE/ENFILE classifier; fabricated errors, no actual FD exhaustion",
+      "selector": "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+      "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+    },
+    {
+      "actual_N": null,
+      "definition_line": 3674,
+      "expected_singleton": {
+        "failed": 0,
+        "filtered_out": "actual_N_for_this_ELF_minus_1",
+        "ignored": 0,
+        "inline_child_results": 0,
+        "measured": 0,
+        "passed": 1
+      },
+      "graph": "cli",
+      "path": "src/settings.rs",
+      "purpose": "New persisted shortcut field preserves occupied custom chord",
+      "selector": "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+      "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+    },
+    {
+      "actual_N": null,
+      "definition_line": 3628,
+      "expected_singleton": {
+        "failed": 0,
+        "filtered_out": "actual_N_for_this_ELF_minus_1",
+        "ignored": 0,
+        "inline_child_results": 0,
+        "measured": 0,
+        "passed": 1
+      },
+      "graph": "cli",
+      "path": "src/settings.rs",
+      "purpose": "Existing nearby settings migration preserves project-search versus pane-find chords",
+      "selector": "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords",
+      "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+    }
+  ],
+  "utc": "2026-10-31T17:33:30.722108+00:00"
+}

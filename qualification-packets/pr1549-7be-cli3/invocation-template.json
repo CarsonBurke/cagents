@@ -1,0 +1,38 @@
+{
+  "kind": "NOT_SUBMITTABLE_PENDING_FRESH_TWO_REVIEWS_ADOPTION_PUBLICATION_GRANT",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-cli3-source",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-cli3-source/qualification-packets/pr1549-7be-cli3/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "1a372e8225129db9a57a3f893089e6f3ecfb3c89d27108c803808311d256ea54",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "grant_value_index": 5,
+  "execution_authorized": false,
+  "independent_code_review": null,
+  "independent_conservation_review": null,
+  "controller_source_adoption": null,
+  "controller_source_publication": null,
+  "queue": null,
+  "runtime": null,
+  "review_ABI": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "runner_sha256": "1a372e8225129db9a57a3f893089e6f3ecfb3c89d27108c803808311d256ea54",
+    "plan_sha256": "8cf4be3b126e630e83f6044985916152be15c4120886f64be92d4a1299dda8e1",
+    "controller_identity": "EXTERNAL_POSTCOMMIT_REQUIRED"
+  },
+  "worktree_roles": {
+    "controller": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-cli3-source",
+    "runtime_product": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope"
+  },
+  "limits": "Grant/review NULLs are not approval; author supplies no self-clearance. Runtime product WT must be exact7be, distinct from controller packet child."
+}

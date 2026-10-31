@@ -1,0 +1,173 @@
+{
+  "schema": "pr1549-7be-cli3-controller-task-data-v1",
+  "product_PR_reference": 1549,
+  "boundary": "cli",
+  "source": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope"
+  },
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "selected_names": [
+    "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+    "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+    "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords"
+  ],
+  "selected_parents": [
+    {
+      "name": "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+      "source": "src/fs_safety.rs",
+      "definition_line": 2079,
+      "source_sha256": "23e606a5132e1f519d3c44e138e96b623f5f378824f6d2c3d37375a6561301f3",
+      "body_sha256": "7a2d879465d8fb096f0c42f74b23126b3a1babd1bf3d2d132f44868877996a66",
+      "ignored": false,
+      "seconds": 60,
+      "expected_stdout_child_results": 0,
+      "source_cases_nonadditive": true
+    },
+    {
+      "name": "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+      "source": "src/settings.rs",
+      "definition_line": 3674,
+      "source_sha256": "d9fffd9744ce76279865c1f9346e82e78c32d089b415f7830ddb06840b7a8932",
+      "body_sha256": "243f11c151b37e541631e149c461a0b074e73ca870f3bec98895a3cd494e4f0a",
+      "ignored": false,
+      "seconds": 60,
+      "expected_stdout_child_results": 0,
+      "source_cases_nonadditive": true
+    },
+    {
+      "name": "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords",
+      "source": "src/settings.rs",
+      "definition_line": 3628,
+      "source_sha256": "d9fffd9744ce76279865c1f9346e82e78c32d089b415f7830ddb06840b7a8932",
+      "body_sha256": "2469ca2b51237dff78736c50896ee96ae6f909ad71b0ee7dfd86779342afa967",
+      "ignored": false,
+      "seconds": 60,
+      "expected_stdout_child_results": 0,
+      "source_cases_nonadditive": true
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "cli-lib",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+        "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+        "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords",
+          "seconds": 60,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "check-cli",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 480
+    }
+  ],
+  "planned_phase_order": [
+    "check-cli",
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-1",
+    "parent-cli-lib-2",
+    "parent-cli-lib-3"
+  ],
+  "runtime_admission": {
+    "state": "PR1549_7BE_CLI3_SOURCE_REQUIRES_TWO_REVIEWS_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null,
+    "controller_source_adoption": null,
+    "controller_source_publication": null,
+    "queue": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "cli_source_contract": {
+    "kind": "SOURCE_ONLY_CLI3_EXACT_SELECTION_NOT_COMPILED_INVENTORY",
+    "selectors": [
+      "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+      "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+      "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords"
+    ],
+    "count": 3,
+    "features": [],
+    "UI_HOST_union": false,
+    "UI5_selected": false,
+    "worker21_selected": false,
+    "front19_selected": false,
+    "low_FD_selected": false,
+    "ignored_manual_benchmark_selected": false,
+    "expected_visible_outer_stdout_child_results": 0,
+    "scheduler_and_capture": "Captured default outer scheduler; no overrides, no helper/reexec/child mode; inline subcases nonadditive.",
+    "actual_ELF_or_N_or_results": null
+  },
+  "serial_command_caps_sum_seconds": 1590,
+  "original_DATA_total_seconds": 1680,
+  "source_and_post_reservations": [
+    30,
+    60
+  ]
+}

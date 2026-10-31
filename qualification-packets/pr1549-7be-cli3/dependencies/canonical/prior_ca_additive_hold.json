@@ -1,0 +1,65 @@
+{
+  "schema": "coord16-issue2025-b68-additive-adopted-signal-source-hold-v1",
+  "recorded_utc": "2026-10-31T11:25:31.118601+00:00",
+  "status": "SOURCE_HOLD_NO_RUNTIME_ADMISSION_OR_QUEUE",
+  "authenticated_instruction": {
+    "id": "ad6426eb-3ef7-4c7e-9d61-3813be3934ac",
+    "sender": "ec204421-6a6d-4edc-a23d-c8f8fc1b5ab1",
+    "recipient": "16f081ec-6630-45c9-a097-a610a9b7251e",
+    "original_inbox": {
+      "path": "/var/tmp/coord16-2025-b68-source-intake-sdqc3hvg/frozen-review-steering-original-inbox.json",
+      "sha256": "62a776745a345d10287f4602cb7b44b448e5dea817233ce42a5edf8eb46f7db6",
+      "bytes": 8982
+    },
+    "body": "Concrete FUTURE HELPER-LANE SOURCE HOLD from independent Root audit, not a new API requirement: /tmp/startup30-adopted-signal-source-audit-hlrnp0hy/review.json SHA407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8. Frozen copied C settle_children after3s opens fresh pidfd251 and SIGKILL254 with only PID/start/current-parent recheck; no original descendant custody or managed permission guard. forced/HOLD is post-signal. This can reach a surviving adopted helper/provider descendant in future helper-backed or broad lanes, contrary to user never kill unknown provider descendants. NO actual historical kill/violation asserted: A2 adoptedsets wereempty; currentB soleRAW will reportactuals, no reinterpretation of those results. Root owns the SMALLEST canonical fail-closed source correction: no signals to unproven adoptions, record uncertainty/unclean and retain C/HOLD; original direct-Popen timeout cleanup/waits unchanged. No new supervisor/authority framework. Keep your sourcework/historicalreviewssafe; current futureMain15/Root16 C source cannot be executed with this unguarded adopted-signal branch. I will send genuine corrected function/source proof for minimal exact port with explicit23unchanged/1corrected accounting, no claim24remainexact. This userpolicy correction supersedes internal preserve-all24 adaptation rule for this ONE reviewed function. Source-only now, no resource/probe/newgrant. CurrentB remains HELD8a680bff/abefe afteractualUIgroup101 untilsoleRAW/return/Rootacceptance. Root owns actualfailingUItest correction too; no waiver/focusassertion removal."
+  },
+  "genuine_source_audit": {
+    "path": "/tmp/startup30-adopted-signal-source-audit-hlrnp0hy/review.json",
+    "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8",
+    "bytes": 13311
+  },
+  "affected_controller": {
+    "head": "ca92176d598775acb7dd94d54df8d54dec21ea9e",
+    "tree": "43709cf57725d905d3e9b2ff7438a54ed449874e",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-client-runtime-host-source",
+    "runner_sha256": "6b2ba3083399b7c1825bc2063c1bdb6c526bfdc4741893bccc1c08478fabae01",
+    "plan_sha256": "91ab3b1ea5e230e297c52522cfcc75a3ed3a988e56fb6d92dc390a33ae5cec78",
+    "manifest_sha256": "434beb67f4ae0bd7987d7e6bdcf67b6b69f4693e42a1d15a34e56826d566d3a6"
+  },
+  "product": {
+    "head": "b68f940d14f222fd6532129e94b2fac9f1cbda58",
+    "tree": "c004d7b3eab00e166f4393eb93ec99c91484d03b",
+    "parent": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386"
+  },
+  "static_applicability": {
+    "function": "settle_children",
+    "lines": [
+      223,
+      267
+    ],
+    "bytes": 1593,
+    "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "byte_exact_to_genuine_audit_function": true,
+    "function_executed": false
+  },
+  "blocker": "Inherited post-grace adopted-child branch opens a new pidfd and signals SIGKILL with only current PID/start/parent checks. Those do not establish original descendant custody or applicable management permission; later forced/HOLD is not pre-signal authority.",
+  "historical_limits": "Source-feasible future branch only. No actual historical unknown/provider kill, signal, leak or violation is inferred. Existing accepted negatives/positive bounded returns and all original evidence remain unchanged. No duplicate RAW or live probe.",
+  "current_product_reviews": "Genuine b68 two-file fixture semantic/conservation/publication proofs remain narrow valid history; they do not clear this separate generic-controller policy blocker.",
+  "current_packet_reviews": {
+    "conservation": {
+      "path": "/var/tmp/coord16-2025-b68-conservation-independent-mgh5uanu/review.json",
+      "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d",
+      "scope": "Immutable finite conservation/data; all24 unchanged is factual history, not policy approval."
+    },
+    "task_admission_and_caller_semantics": "Reviewer informed of late HOLD; final scope receipt pending. No runtime-admitting aggregate review will be created for ca."
+  },
+  "source_and_artifacts_modified": false,
+  "runtime_or_resource_probe": false,
+  "execution_authorized": false,
+  "grant": null,
+  "queueable": false,
+  "next_source_step": "Await EC-owned genuinely reviewed minimal canonical settle_children source correction/proof; then a distinct exact minimal source port with23generic unchanged/1corrected accounting and fresh independent delta/conservation review. Preserve original direct-Popen timeout handling/waits and full finalization/3790/Cclose/HOLD/output unchanged. No duplicate correction, supervisor, API or authority framework.",
+  "old_milestones": "9ad/0fa/HOLD, ca/b68, original4098 failure/accepted return and all sealed source receipts stay immutable.",
+  "latest_C": "Last EC notice: RootB grant8a680bff/allocationabefe remains held pending original RAW/return/EC acceptance; no Root16 grant.",
+  "meter": "Sole10 sample already completed; nextnotbefore2026-10-31T12:13:57.343368UTC. No recollection in this action."
+}

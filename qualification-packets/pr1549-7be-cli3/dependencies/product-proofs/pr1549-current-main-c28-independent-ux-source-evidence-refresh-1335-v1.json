@@ -1,0 +1,233 @@
+{
+  "schema": "pr1549_current_main_c28_fixture_correction_independent_ux_source_evidence_refresh_v1",
+  "utc": "2026-10-31T15:27:23.133979+00:00",
+  "reviewer": "1335_full_output_copy_lease",
+  "author_of_product_code": false,
+  "verdict": "BOUNDED_FIXTURE_SOURCE_CAUSE_FIXED; PRODUCTION_UX_SOURCE_ASSESSMENT_RETAINED; EXECUTION_AND_NATIVE_EVIDENCE_HOLD; NOT_READY",
+  "ready": false,
+  "merge_ready": false,
+  "source": {
+    "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+    "parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-current-main-search-source-freeze-v3.json",
+      "sha256": "9c4361dead8b82c4f07aa076265fadbb800880814a5ba10bb3b97d50c10044b7",
+      "verified_before_and_after": true
+    },
+    "pins": {
+      "Cargo.lock": {
+        "sha256": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d",
+        "bytes": 341827,
+        "git_blob": "20f963235fff416f76487a8a74a9f4b1d7bb4f8d"
+      },
+      "Cargo.toml": {
+        "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac",
+        "bytes": 13215,
+        "git_blob": "5a981df1f743b2ccf624d498d24d3df120f13116"
+      },
+      "src/app.rs": {
+        "sha256": "c020d39216c6829c1416bea8ef021489d31de9dfddacb09fb07bf917c3197f55",
+        "bytes": 1378146,
+        "git_blob": "8afb92ad6021d854956b0981f6761427d5b742d6"
+      },
+      "src/app/chrome_ui.rs": {
+        "sha256": "978db2251313b3c27541a584195d0e7c7bcc3ae705d552c94eefb9d998728f44",
+        "bytes": 151643,
+        "git_blob": "045d3a144be6b5f05b1af55c0591f5154cf12a74"
+      },
+      "src/app/git_ui.rs": {
+        "sha256": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+        "bytes": 49357,
+        "git_blob": "0a11d3c861b4ef51e27ca95a1f1161c56bc36d14"
+      },
+      "src/app/palette_ui.rs": {
+        "sha256": "982b7391ba960d12d41e8c17270deb4b82e7840d4c66b365484d15934cc1c9ea",
+        "bytes": 117052,
+        "git_blob": "7c4ee36200f76d82f988afff03ad5df76b5a0e07"
+      },
+      "src/app/search_ui.rs": {
+        "sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+        "bytes": 59794,
+        "git_blob": "812b30fb212924f19957cb42b8d5ce359dd7da37"
+      },
+      "src/app/settings_ui.rs": {
+        "sha256": "ebabb40f72d28a46c3721dffeca3d237d86613accebe2af50251e53a9cce073e",
+        "bytes": 71446,
+        "git_blob": "af78586c8a9ae19c7def6ec60850e2930c5c6925"
+      },
+      "src/fs_safety.rs": {
+        "sha256": "23e606a5132e1f519d3c44e138e96b623f5f378824f6d2c3d37375a6561301f3",
+        "bytes": 84070,
+        "git_blob": "c233c929275c9e32d81e9d2dc0723633d321e415"
+      },
+      "src/git_watch.rs": {
+        "sha256": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8",
+        "bytes": 64191,
+        "git_blob": "6dad4e31b2b6aa249c7249182d480a15d480af39"
+      },
+      "src/modules.rs": {
+        "sha256": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f",
+        "bytes": 4190,
+        "git_blob": "6db64e6c78a4a733ab00ed07cb780e8bdb7b05ab"
+      },
+      "src/project_search.rs": {
+        "sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+        "bytes": 57357,
+        "git_blob": "57d7b18422355dbce3d36afdaeda1587f410b520"
+      },
+      "src/project_search/ignore_policy.rs": {
+        "sha256": "7a78519d0450b2b701fc3ff44011b25a8d800a7df6e5377273d6757dd647aeb8",
+        "bytes": 17525,
+        "git_blob": "2434b93e5ba3a42bf5532138fee63b98b855df69"
+      },
+      "src/project_search/traversal.rs": {
+        "sha256": "1aaa151e6f507f589f9072798e2a9d289dee7071de51da6690b17a803fb59aab",
+        "bytes": 22062,
+        "git_blob": "385721f63fb041b52f85059c3712a9686a040a6c"
+      },
+      "src/repository_widget.rs": {
+        "sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+        "bytes": 924940,
+        "git_blob": "5673df0f96d439d09c7d496314cbc90bcf638c78"
+      },
+      "src/settings.rs": {
+        "sha256": "d9fffd9744ce76279865c1f9346e82e78c32d089b415f7830ddb06840b7a8932",
+        "bytes": 210451,
+        "git_blob": "d47d13ec269ddfd91f014bfa09b271facb2cfb6e"
+      },
+      "src/ui_controls.rs": {
+        "sha256": "ca1dfc78cd7e4cb18e6495f62ed4565debd8354e60637be62a32a7d72361b2b7",
+        "bytes": 1043,
+        "git_blob": "590a64a8d5a89e5d8dd61409bd8e56fae64e27f0"
+      },
+      "src/workspace_widget.rs": {
+        "sha256": "4ca92f5d0698ac66bc34199f6d6fa8043788cf2fa472da1eb5ed890965efb45e",
+        "bytes": 175508,
+        "git_blob": "bc3ecfaad21d667957bfb3dd0cb4d91638f6dde2"
+      },
+      "src/ui_controls/find_options.rs": {
+        "sha256": "80b725764c0eacc95f1869768b1824eeceecb9a0fa68b3470b3867c9a34a56dd",
+        "bytes": 1360,
+        "git_blob": "3d74d35e325a4e317b08899f8b07a050c9b21da0"
+      },
+      "src/ui_controls/gauge.rs": {
+        "sha256": "72a89032143778b499b28208095186d4cdb1325ae95649fb45402c6d954bc6a6",
+        "bytes": 32270,
+        "git_blob": "15e8a2a05bc06e4d8a0f2d0f47e9618ad5ef5516"
+      },
+      "src/ui_controls/owned.rs": {
+        "sha256": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690",
+        "bytes": 9658,
+        "git_blob": "373350682c452b096cd519665493fea7b2f86c22"
+      },
+      "src/ui_controls/button.rs": {
+        "sha256": "a03038b946f946a2afdec251bb4b8b99f1e8604e05ad3cc3413c8545293fce04",
+        "bytes": 10000,
+        "git_blob": "cc36672162f69816cad210faf67508dd4999c1c0"
+      },
+      "src/app/refresh_ui.rs": {
+        "sha256": "87ce7af9d52272f62d15ccd8ed88871a8f015bd71a4fed32d6ec1347e65d4d86",
+        "bytes": 26975,
+        "git_blob": "4e0144ccbff5c1ef5c45e8c8b20496c71d621db3"
+      },
+      "src/interaction.rs": {
+        "sha256": "7881579c46f30348f5b48c30319a38a89551e2bdbc9e47eda21cf2398a11f01e",
+        "bytes": 101122,
+        "git_blob": "b72601f229f1411d9234b8f1c036ebd95d0fef6b"
+      },
+      "src/interaction/list_navigation.rs": {
+        "sha256": "fb57f16adc3d86753da9d20d01f28ef4ed5a8e470a4d06ed134123a251bc4d61",
+        "bytes": 2370,
+        "git_blob": "8d078a221497dfdd87d453a2f69d6de62c60e908"
+      }
+    }
+  },
+  "prior_review": {
+    "path": "/tmp/pr1549-current-main-9e63-independent-ux-source-evidence-review-1335-v2.json",
+    "sha256": "4d85e98f02dac7c21cd993830ed5ee5a02bf738277a3d6ee9df02dc84da06874",
+    "preservation": "Prior9e63 source/compiler-blocked receipt remains immutable; its production assembly UX/source assessment and full native matrix are retained only because this successor preserves all production bytes. Historical9e63 still contains the invalid cfg(test) constructors."
+  },
+  "correction_review": {
+    "changed_paths": [
+      "src/app/search_ui.rs"
+    ],
+    "stat": "17 insertions /24 deletions in two test-only State initializations; no other tracked path differs from9e63.",
+    "production_prefix_exact_parent": true,
+    "entire_parent_reconstructed_by_reversing_only_two_setups": true,
+    "setups": [
+      {
+        "test": "fn retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering() {",
+        "old_setup_sha256": "b2d151a1c131c14c40c749048cc91c4249019b7bb805885e899ad3bb2b77d599",
+        "new_setup_sha256": "14c14916dd053c16e7d1e5e39d0068c17bc505e0b71d7c83d36195266a10c5a6",
+        "new_line": 856
+      },
+      {
+        "test": "fn a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches() {",
+        "old_setup_sha256": "822ee1f7e3b207b98858f14b58d49ee52d5338bb70f26832a092b813450b5aa2",
+        "new_setup_sha256": "ab70f1f9a52de261cf25a658354f2f6bdff761041e45d8d2e156fc305be2c032",
+        "new_line": 924
+      }
+    ],
+    "initial_values": "Retry fixture now makes mutable State::default then assigns identical active root, generation41, query needle and original error; State default already uses Options::default, so untouched option fields remain identical. Result fixture assigns identical root, generation41 and same Match vector/line identity/snippet/highlight. No functional struct-update of State remains in these constructors.",
+    "causal_scope": "This removes the specific E0509 move-out-of-Drop source cause. It does not modify State Drop, production methods/widgets, generation ownership, root retirement, focus task, pointer delivery helper, oracle assertions, loop cases or negative/positive execution branches. Whole-file inverse equality proves all non-setup test bytes exact.",
+    "compilation_limit": "Source-cause closure only. No Rust compiler, parent inventory, component/test body or native action was executed; no assertion pass or absence of another compiler error is claimed."
+  },
+  "preserved_actual_negative": {
+    "path": "/tmp/fw16-backend-ec204421/pr1549-b7df772a-negative-ui3-root-acceptance-v1.json",
+    "sha256": "8dd3a2e63b3a6d15e2382cb7805de1556f8e445e1a0f704b9fd2305353121668",
+    "hash_verified_only_no_raw_reaudit": true,
+    "scope": "Root-attributed actual ee7 UI3: UI bin check0, cfg(test) library compile101 with nine E0509 diagnostics from two State constructors; inventory and all three UI parents UNRUN. Original negative cannot be relabeled by this correction. No result transfer to9e63 orc28."
+  },
+  "current_source_findings": {
+    "new_production_ux_blockers": [],
+    "specific_old_source_cause": "PR1549-STATE-DROP-FIXTURE-E0509 addressed in source atc28 only. Actual compilation remains UNRUN.",
+    "retained_assembly_assessment": "All Search controls/options/order/paging/query-root-target guards, visible generation-owned Retry/focus and result activation, editor protections, neighbor main activity animation exports and helpers remain exact9e63. No new production UX/source blocker was introduced by this test-only successor."
+  },
+  "current_evidence_gaps": [
+    "Actual final c28 compilation and owning parent inventory/execution are UNRUN; formatting/diff0 is attributed to author freeze, not a compiler or assertion result.",
+    "Actual native complete fullPR search flow, keyboard focus/Tab/caret, narrow overlay/paging/long paths/scrollbars, root-retirement/Retry and real held gestures remain ALL_MISSING.",
+    "Matched actual Before/After WebPs and independent native UX review are ALL_MISSING. Static component output is not native evidence.",
+    "Matched realistic worktree/results/concurrent-agents frame stalls and resource behavior are ALL_MISSING; source bounds/caches are not performance evidence."
+  ],
+  "full_pr_native_evidence_contract": {
+    "before_revision": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "after_revision": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "runner": "Actual scripts/run-development --browserless with matched CLI/daemon/UI; a later explicit runtime admission is required. No app was launched here. Embedded browser is not required for this local search task.",
+    "fixtures": "Use private reproducible local A/B worktrees with unique query tokens, ignored/hidden/binary/large files, invalid-pattern cases, over100 and over2000 matches, long common-prefix paths, UTF8 and CR/LF variants. State fixtures actually loaded into the native app can establish rendering/interaction when labeled; they do not prove physical watcher/worker causality. Static/component-rendered fixtures never count as native.",
+    "baseline_honesty": "Current main442 has no project content Search implementation. Record the same selected fixture/root, viewport and task checkpoint with its available Files/palette/pane-find UI and explicitly identify absence of project content search. Do not fabricate a pre-feature Search page or present1a7 as the fullPR main baseline. After-only subflow captures must be labeled when main has no corresponding state.",
+    "states_and_actions": [
+      "Wide entry: select worktreeA; inspect existing Files/Source control/Pull request/Details, open palette and new Search shortcut/tab, ensure query focus. Confirm old Search projects and pane Find still act independently; edit, unbind and restore only new shortcut.",
+      "Empty/no-root/remote: blank query help, choose-worktree notice and local-only remote notice; no misleading completed-result or active-worktree identity.",
+      "Populated/streaming: type tokenA, observe incremental results and completion in A; switch toB during an unfinished A query, retain query/options, require B-only results and original stale A Batch/Error/Finished refusal. Ordinary updates/other-root events must not repeatedly restart or steal focus.",
+      "Options/filtering: exercise case/whole-word/regex, include/exclude and ignored/hidden individually and in combinations; invalid regex/glob and corrected query, genuine zero matches, skipped-file notice, over2000 cap/refinement. Verify labels/counts agree with fixture and no hidden option changed.",
+      "Results/ordering: at more than100 matches, Previous/Next, keyboard Up/Down across page boundaries/wrap and Enter, pointer activation, scrolling and same-generation streamed append; no row/index retargeting. Check long paths and Unicode/long snippets retain usable file identity and visible hit at both widths.",
+      "Open: existing/new repository card, cached/deferred read, exact UTF8 native match selection, stale file changed between scan/click/load with visible reload warning, normal reopen clears stale warning. Dirty/save/pending editor remains protected and keeps content/history. Verify accepted open focus and old LSP/completion refusal without overwriting unsaved text.",
+      "Narrow overlay: open Search from keyboard/tab, filter/result scroll/next page, activate result, overlay closes and editor is visible/focused. Reopen Search, resize docked\u2194overlay/free-edge/maximized and check focus, full-height results and reachable controls.",
+      "Error/recovery: leave selected root missing beyond debounce, observe current folder error plus visible Retry; restore validB at same logical key, activate Retry without editing query/options, require freshB result and completion. Keyboard Tab/Enter Retry returns actual query caret then Up/Down/Enter opensB.",
+      "Gesture ownership: hold Retry/result press while query/root generation replaces the rendered control, release must refuse; same-generation diagnostic/stream rerender and fresh press are positive controls. Check real mouse and available touch input, hover, focus outline and no duplicate activation.",
+      "Neighbor activity/responsiveness: busy agents/terminals while searching, hover/scroll/type/resize and active-window loss/regain. Search options/editor find and main spinner slow-background/full-foreground cadence remain usable. Compare same realistic workload before/after with recorded frame/resource evidence."
+    ],
+    "after_pin_status": "Source-only final candidate c28; current compilation, owning test parents, native interaction, images and performance UNRUN. Use this exact head for later qualified captures only after real admission; source correction itself is no execution pass."
+  },
+  "root_specific_native_comparison": {
+    "before_revision": "1a7a6c5d2aa6c0ef113dd3946a9b5cafb8ad9763",
+    "after_revision": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "purpose": "Additional paired comparison for root-retirement/visible-Retry/focus/gesture fixes, because the fullPR main baseline lacks Search. Both pins must be identified; unrelated integrated-main changes are not attributed solely to the root fix.",
+    "minimum": "Record actual exact-root delivered retirement while A output is queued; original event/drain/cancellation/newgeneration/debounce/worker ordering must show old output never presents asB. Keep root absent to expose real error, restoreB, Retry without query edit, keyboard focus and held-press negative/positive controls. Screenshots alone cannot establish event/worker causality.",
+    "inherited_limits": "No new claim for missed/ambiguous notifications, physical-before-worker-open guarantee, blocked-filesystem cancellation latency or global search performance."
+  },
+  "screenshot_rules": {
+    "format": "WebP actual native captures, same viewport/scale/theme/private data and corresponding task state, with before revision and tested after head identified.",
+    "layout": "Exactly two side-by-side image columns labeled Before and After; describe state below each pair, with no third explanation/state column.",
+    "storage": "Commit images only under pr-screenshots/ on a separate <branch>-screenshots branch, retain it, embed immutable https://github.com/CarsonBurke/cagents/blob/<sha>/pr-screenshots/<name>.webp?raw=true links. Keep images off product branch and inspect for secrets.",
+    "coverage": "Entry/blank, populated/streaming/paged/capped, invalid/no-result/skipped, missing-root Retry and recovered match, accepted/stale/blocked editor open, narrow overlay and wide docked states; pair root-specific1a7 where a before Search state is required."
+  },
+  "limits": {
+    "grant": null,
+    "execution": "UNRUN; no app/build/test/import/probe executed.",
+    "actions": "Read-only immutable Git/source/JSON/hash checks plus this own new /tmp receipt only. No source/test edits, Git/GitHub writes, runtime/process/env/account/DB/target/resource probes, native primitive re-intake or new worker.",
+    "readiness": "Source-only correction and assessment do not establish UI/fullPR/native/install/current-public/merge readiness. Root alone owns later admission and qualification."
+  }
+}

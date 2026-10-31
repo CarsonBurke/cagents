@@ -1,0 +1,38 @@
+{
+  "schema": "pr1549_7be_worker21_reviewed_controller_source_publication_v1",
+  "product": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+  "controller": "ae17e43394f149fe2d6a54fb9503cbe40ff13a41",
+  "tree": "ed08c813a6cff94b9088becc4b962795a9a58b14",
+  "branch": "qualification/b9-pr1549-7be-worker21",
+  "source_adoption": {
+    "path": "/tmp/fw16-backend-ec204421/pr1549-7be-worker21-root-controller-source-adoption-v1.json",
+    "sha256": "813efcea2534213108868a393f3dc7beb6eee6197729f386d01442652ff7cba4"
+  },
+  "fetch": {
+    "chunk_id": "554e3a",
+    "wall_time_seconds": 0.055652011,
+    "exit_code": 0,
+    "original_token_count": 0,
+    "output": ""
+  },
+  "push_start": {
+    "chunk_id": "488af9",
+    "wall_time_seconds": 1.000525372,
+    "session_id": 1680,
+    "original_token_count": 26,
+    "output": "\n** (process:47): CRITICAL **: 10:48:03.249: store failed: Cannot create an item in a locked collection\n"
+  },
+  "push_final": {
+    "chunk_id": "1d5693",
+    "wall_time_seconds": 0.000012524,
+    "exit_code": 0,
+    "original_token_count": 95,
+    "output": "remote: \nremote: Create a pull request for 'qualification/b9-pr1549-7be-worker21' on GitHub by visiting:        \nremote:      https://github.com/CarsonBurke/cagents/pull/new/qualification/b9-pr1549-7be-worker21        \nremote: \nTo https://github.com/CarsonBurke/cagents.git\n * [new branch]          ae17e43394f149fe2d6a54fb9503cbe40ff13a41 -> qualification/b9-pr1549-7be-worker21\n"
+  },
+  "readback": {
+    "ref": "refs/heads/qualification/b9-pr1549-7be-worker21",
+    "head": "ae17e43394f149fe2d6a54fb9503cbe40ff13a41"
+  },
+  "runtime": "UNRUN_UNGRANTED",
+  "scope": "Source publication only, no metadata rejection retry. Worker21 UIlib compile/inventory/21 serial singleton parents2190/2400 proposed; existing defaultcapturedscheduler/freshN required. No other43/consumer/nativeUX/performance/WHOLE/merge qualification."
+}

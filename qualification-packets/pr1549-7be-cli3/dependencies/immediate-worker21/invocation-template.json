@@ -1,0 +1,34 @@
+{
+  "kind": "NOT_SUBMITTABLE_PRE_TWO_REVIEWS_ADOPTION_AND_QUEUE",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "1b6d5f5d8e09232d8812b6b34d86bb5592ee0cd226bc81f3fcb5c53626dd6647",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "grant_value_index": 5,
+  "execution_authorized": false,
+  "independent_code_review": null,
+  "independent_conservation_review": null,
+  "controller_source_adoption": null,
+  "controller_source_publication": null,
+  "queue": null,
+  "runtime": null,
+  "review_ABI": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "runner_sha256": "1b6d5f5d8e09232d8812b6b34d86bb5592ee0cd226bc81f3fcb5c53626dd6647",
+    "plan_sha256": "bece97254c6b90f47dd1955f17ecdceaae1381d820a17ec188a074ab502a8a8c",
+    "controller_identity": "EXTERNAL_POSTCOMMIT_REQUIRED"
+  },
+  "limits": "Grant syntax only is not authentication/freshness/once-use; external genuine Root admission required. Product existing adoption/publication is not controller self-adoption."
+}

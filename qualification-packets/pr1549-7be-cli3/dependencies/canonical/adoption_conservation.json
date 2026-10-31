@@ -1,0 +1,316 @@
+{
+  "schema": "canonical-unproven-adoption-policy-conservation-and-pure-unit-source-review-v1",
+  "reviewer": "/root/1954_directory_durability_bound",
+  "verdict": "BOUNDED_SOURCE_CLEAR_FOR_CONSERVATION_AND_FOUR_PURE_UNITS",
+  "findings": [],
+  "pins": {
+    "head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "parent_tree": "f7ebf371b7005f7ee7eb6de11228a26909ce4a64",
+    "actual_worktree_HEAD": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold"
+  },
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/c-unproven-adoption-policy-source-v1/freeze.json",
+    "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682",
+    "all_four_file_hashes_and_head_tree_parent_match": true
+  },
+  "files": {
+    "settle_children.py": {
+      "path": "policy-corrections/adopted-child-settlement/settle_children.py",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "fd31b863db8bb4ef36c3a328624e9f02e87884fa",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+      "bytes": 877
+    },
+    "from-347-function.diff.json": {
+      "path": "policy-corrections/adopted-child-settlement/from-347-function.diff.json",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "d10267090af89ff8111185e7b9043c3b8f956d02",
+      "sha256": "3cdf58ec3a730e81b67d9470a63334f229e36c1621d272fba915ea02f3c911dc",
+      "bytes": 1849
+    },
+    "README.md": {
+      "path": "policy-corrections/adopted-child-settlement/README.md",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "b425ae48245d1dc1a17fc5730cbe5119602c38ab",
+      "sha256": "5a5ab2c919f74a054e0876a6694a58effe0a940b4839e907f37074f53ac9b7dd",
+      "bytes": 868
+    },
+    "test_policy.py": {
+      "path": "policy-corrections/adopted-child-settlement/test_policy.py",
+      "mode": "100644",
+      "type": "blob",
+      "blob": "32019b1a359ad734d04de7518c386f4b9bf98a95",
+      "sha256": "0a9e368a994d6c31c03b834b645055dd21ee432b8221e225bfc8c10f3fff0263",
+      "bytes": 2895
+    }
+  },
+  "tree_conservation": {
+    "only_new_leaves": [
+      "policy-corrections/adopted-child-settlement/README.md",
+      "policy-corrections/adopted-child-settlement/from-347-function.diff.json",
+      "policy-corrections/adopted-child-settlement/settle_children.py",
+      "policy-corrections/adopted-child-settlement/test_policy.py"
+    ],
+    "added": 4,
+    "deleted": 0,
+    "modified_legacy_entries": 0,
+    "legacy_entries_and_modes_exact": 2294,
+    "new_tree_leaf_entries": 2298,
+    "legacy_manifest_sha256": "bff25b387f074e8b0dd660c70b45592ed59e9fa0f19224a41d443f8e947adddb",
+    "manifest_encoding": "Sorted path; compact sorted-key JSON array of path/mode/type/blob, newline terminated.",
+    "working_four_source_leaves_match_commit": {
+      "policy-corrections/adopted-child-settlement/settle_children.py": true,
+      "policy-corrections/adopted-child-settlement/from-347-function.diff.json": true,
+      "policy-corrections/adopted-child-settlement/README.md": true,
+      "policy-corrections/adopted-child-settlement/test_policy.py": true
+    }
+  },
+  "provenance": {
+    "parent_function_path": "qualification-packets/startup30/run-packet.py",
+    "parent_function_lines": [
+      225,
+      269
+    ],
+    "old_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "canonical_complete_file_and_function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "provenance_json_exact_diff_matches_recomputed_unified_diff": true,
+    "first_18_complete_lines_byte_preserved": true,
+    "preserved_prefix": "The existing natural grace/reap/census prefix, including time.monotonic()+3 and sleep(0.05), is exact source conservation; no real timing is tested.",
+    "tail_difference": "The ten-second survivor pidfd/signal/reap loop is removed. New tail reports clean=False, forced=False and remaining/observed survivors; no caller HOLD behavior is reviewed or executed here.",
+    "canonical_ast": {
+      "top_level_nodes": 1,
+      "type": "FunctionDef",
+      "name": "settle_children",
+      "lines": [
+        1,
+        22
+      ],
+      "decorators": 0,
+      "arguments": 0,
+      "structural_node_sha256": "5c7b33e3e38227d91f7b184483408c3a6fea4066f15ee5793d3a0a8b8ee9d304",
+      "node_hash_encoding": "ast.dump(FunctionDef, include_attributes=False), UTF-8 using this review parser; structural aid, not an executable signature.",
+      "calls": [
+        "time.monotonic",
+        "children",
+        "time.sleep",
+        "time.monotonic",
+        "time.monotonic",
+        "os.waitpid"
+      ]
+    }
+  },
+  "historical_24_function_copies": {
+    "count": 24,
+    "basis": "Six named function definitions in four immutable historical files. All four complete blobs and every other parent tree entry/mode remain exact.",
+    "shared_function_source_sha256": {
+      "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+      "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+      "settle_children": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+      "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+      "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+      "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a"
+    },
+    "copies": [
+      {
+        "path": "qualification-packets/startup30/dependencies/donor_runner.py",
+        "blob_unchanged": "1b5dcffadbd08f2079788d79b2b986abf0492249",
+        "function_lines": {
+          "signal_pidfd": [
+            203,
+            208
+          ],
+          "children": [
+            211,
+            220
+          ],
+          "settle_children": [
+            223,
+            267
+          ],
+          "observed_wait": [
+            44,
+            48
+          ],
+          "safe_lane_handoff": [
+            720,
+            736
+          ],
+          "final_observations": [
+            824,
+            848
+          ]
+        }
+      },
+      {
+        "path": "qualification-packets/startup30/dependencies/historical_982_run-packet.py",
+        "blob_unchanged": "c87a52a6b970496ce8ab6e2d0185c762711e390c",
+        "function_lines": {
+          "signal_pidfd": [
+            203,
+            208
+          ],
+          "children": [
+            211,
+            220
+          ],
+          "settle_children": [
+            223,
+            267
+          ],
+          "observed_wait": [
+            44,
+            48
+          ],
+          "safe_lane_handoff": [
+            691,
+            707
+          ],
+          "final_observations": [
+            805,
+            829
+          ]
+        }
+      },
+      {
+        "path": "qualification-packets/startup30/history/7e057dc0/run-packet.py",
+        "blob_unchanged": "d0d9933bfe2e6e255b4c84a7cf05ec5a646230da",
+        "function_lines": {
+          "signal_pidfd": [
+            205,
+            210
+          ],
+          "children": [
+            213,
+            222
+          ],
+          "settle_children": [
+            225,
+            269
+          ],
+          "observed_wait": [
+            46,
+            50
+          ],
+          "safe_lane_handoff": [
+            693,
+            709
+          ],
+          "final_observations": [
+            807,
+            831
+          ]
+        }
+      },
+      {
+        "path": "qualification-packets/startup30/run-packet.py",
+        "blob_unchanged": "39195ac75bc021704457e116ab79a8ce536b68a0",
+        "function_lines": {
+          "signal_pidfd": [
+            205,
+            210
+          ],
+          "children": [
+            213,
+            222
+          ],
+          "settle_children": [
+            225,
+            269
+          ],
+          "observed_wait": [
+            46,
+            50
+          ],
+          "safe_lane_handoff": [
+            693,
+            709
+          ],
+          "final_observations": [
+            807,
+            831
+          ]
+        }
+      }
+    ],
+    "qualification": "Historical source is preserved, including its unsafe adopted-survivor signal loop. This artifact does not port the correction into an execution packet or clear those historical drivers for execution."
+  },
+  "pure_unit_review": {
+    "definition_selection": "test_policy.py:8-37 reads the exact sibling source; ast.parse must yield one FunctionDef named settle_children before compile/exec installs that actual definition. It does not import the driver, copy a substitute implementation or run a controller. The pinned function has no decorator/default/annotation/top-level effect.",
+    "inert_bindings": {
+      "os": "SimpleNamespace: fake waitpid always raises ChildProcessError, WNOHANG literal; pidfd_open/close are forbidden AssertionError doubles.",
+      "time": "Fake monotonic advances a numeric clock; fake sleep changes only that number. No actual sleep.",
+      "children": "Finite list snapshots or a supplied PermissionError, never a real census.",
+      "signals": "signal_pidfd is forbidden; signal is an inert SIGKILL=9 namespace. Synthetic pid/start/state remain ordinary dictionary data."
+    },
+    "imports": "Only ast, pathlib.Path, types.SimpleNamespace and unittest. Candidate process-facing names do not reference real os/time/signal modules. Ordinary interpreter/stdlib startup and reading the pinned sibling source remain outside the meaning of process-operation-free.",
+    "tests": [
+      {
+        "name": "test_surviving_unproven_adoption_is_unsignaled_and_unclean",
+        "lines": [
+          39,
+          47
+        ]
+      },
+      {
+        "name": "test_no_remaining_children_keeps_the_existing_clean_result",
+        "lines": [
+          49,
+          52
+        ]
+      },
+      {
+        "name": "test_natural_settlement_within_grace_sends_no_signal",
+        "lines": [
+          54,
+          60
+        ]
+      },
+      {
+        "name": "test_failed_census_propagates_without_a_clean_or_signal_result",
+        "lines": [
+          62,
+          66
+        ]
+      }
+    ],
+    "meaningful_assertions": [
+      "Surviving unproven row requires unclean, unforced, exact observed/remaining evidence and no forbidden calls. Restoring the removed fresh-pidfd/signal loop would reach forbidden and fail this test.",
+      "Empty census requires the exact existing clean/unforced/empty-observed return shape and no forbidden call.",
+      "Natural nonempty-to-empty census within the fake grace requires clean/unforced with no forbidden call.",
+      "PermissionError census must propagate without a clean result and with no forbidden call."
+    ],
+    "source_reachability": "For these exact AST bytes and doubles, no actual waitpid, pidfd open, signal, close, process spawn, process census, environment/target/provider operation is reachable through the selected policy. The AST exec mechanism is not claimed as a general security sandbox for arbitrary future source.",
+    "bounded_gaps": [
+      "No real three-second timing, real process behavior, syscall failure matrix, caller C/HOLD integration or packet port is tested.",
+      "The waitpid double covers ChildProcessError, not all wait-return/error variants. These units are policy regressions, not ownership/settlement proof."
+    ]
+  },
+  "single_ordinary_future_unit_command": {
+    "argv": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "test_policy.py"
+    ],
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-c-unproven-adoption-hold/policy-corrections/adopted-child-settlement",
+    "scope": "Exactly the four unittest methods in the pinned test_policy.py, selecting only the pinned actual definition AST with the inert doubles described above. No controller/helper/provider lane.",
+    "executed": false,
+    "grant": "This source review supplies the exact narrow command requested; it neither runs it nor grants C/lane/runtime/native or packet execution."
+  },
+  "separate_owner_and_historical_limits": {
+    "policy_semantics_and_caller_HOLD": "Owned by the #1945 reviewer; not approved by this conservation/unit-scope receipt.",
+    "future_port": "Only a separately reviewed successor may port this exact function into a prospective runnable packet.",
+    "old_A2_observed_empty_positive_4680": "Unchanged; not rerun, reinterpreted or transferred.",
+    "current_B_negative_Root_RAW_pending": "Unaffected.",
+    "unknown_provider_kill": "No permission inferred; the source correction is prospective only.",
+    "new_CLI_execution_packet_carrier_framework": "NONE added by these four non-executable-mode leaves."
+  },
+  "actions": "Immutable Git/text/AST comparisons only. Candidate module was not imported; no candidate compile/exec/function/test ran. No builds/native/probes/process/syscall/env/target/provider actions, source/Git/public writes, children or sessions. Only this compact JSON receipt and SHA256 seal written.",
+  "execution": "ALL candidate execution, units, builds, runtime and native validation UNRUN"
+}

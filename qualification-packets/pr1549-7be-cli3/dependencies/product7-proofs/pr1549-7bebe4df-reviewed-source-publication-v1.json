@@ -1,0 +1,24 @@
+{
+  "schema": "pr1549_7bebe4df_reviewed_source_publication_v1",
+  "utc": "2026-10-31T16:28:21.286540+00:00",
+  "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+  "tree": "532d48f268b00fa658fea22a8418d41432879046",
+  "source_adoption": {
+    "path": "/tmp/fw16-backend-ec204421/pr1549-7bebe4df-low-fd-scope-root-source-adoption-v1.json",
+    "sha256": "3c1547c781a6a624b570035f1eceac14ab9c7ab1663d711ea0035cf23254ca7b"
+  },
+  "ordinary_nonforce_push": {
+    "start": "bc3d58",
+    "session": 81134,
+    "final": "9cab63",
+    "exit": 0,
+    "refs": [
+      "fix/fw16-pr1549-search-child-scope",
+      "fix/trashbear-project-content-search-1120"
+    ],
+    "warning": "credential store locked collection only; source push succeeded"
+  },
+  "supported_GitHub_GET": "PR1549 OPEN Draft exact7be; separate source ref exact7be verified",
+  "runtime_CI": "CurrentRust/currentScript/nativeUNRUN at publication; no oldc28result relabeling",
+  "metadata_body": "Unchanged by this publication; earlier metadata write rejection preserved/no alternate route"
+}

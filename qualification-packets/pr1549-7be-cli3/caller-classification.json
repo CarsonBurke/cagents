@@ -1,0 +1,33 @@
+{
+  "kind": "AUTHOR_SOURCE_CALLER_CLASSIFICATION_NOT_RUNTIME_ADMISSION",
+  "product": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046"
+  },
+  "selectors": [
+    "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+    "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+    "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords"
+  ],
+  "shared_root_lib_gates": "src/modules.rs unconditionally declares fs_safety and settings; their cfg(test) tests compile with features[]. CLI binary is src/main.rs -> cagents::control::run_from.",
+  "caller_authority": "Inherited opaque authority/HOME/XDG untouched by runner; no current authority values read. No selected test requires or fabricates a User role.",
+  "selected_fixtures": [
+    {
+      "selector": "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+      "behavior": "Constructs ResolveError with fabricated EMFILE/ENFILE and other codes; no actual descriptor exhaustion or resource probe."
+    },
+    {
+      "selector": "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+      "behavior": "Private TempDir settings path, serialize missing search_in_project field, load/save/reload, preserves occupied custom chord."
+    },
+    {
+      "selector": "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords",
+      "behavior": "Four nonadditive private TempDir migration cases; preserves project search/pane find/custom chords."
+    }
+  ],
+  "source_selected_subprocess_or_same_ELF_children": 0,
+  "helper_env_scrub_or_opaque_authority_override": false,
+  "actual_context": "Unknown, not probed; existing natural names-only refusal/context guards stay intact.",
+  "current_product_publication_role": "product7_publication/adoption bind7be; product_publication/adoption and base_c28_publication remain historicalc28 proof only."
+}

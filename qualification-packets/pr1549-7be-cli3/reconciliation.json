@@ -1,0 +1,53 @@
+{
+  "kind": "ADDITIVE_SOURCE_ARGV_AND_SCOPE_RECONCILIATION_NOT_RUNTIME_EQUIVALENCE",
+  "original_DATA_sha256": "7190a9f8d0825b75bc5bbf1b5a6acd06c66183fe89d1bc7dfd6bb06999fe6a40",
+  "mandatory_addendum_sha256": "28c949506a78c96eda81a0a791c731851f6e29cc2a1c01cb1f268663262e3993",
+  "original_inventory_argv": [
+    null,
+    "--list",
+    "--format",
+    "terse"
+  ],
+  "canonical_inventory_argv": [
+    "ACTUAL_CLI_LIB_ELF",
+    "--list",
+    "--color=never"
+  ],
+  "original_singleton_argv": [
+    null,
+    "--exact",
+    "FULL_SELECTOR",
+    "--format",
+    "pretty"
+  ],
+  "canonical_singleton_argv": [
+    "ACTUAL_CLI_LIB_ELF",
+    "EXACT_SELECTOR",
+    "--exact",
+    "--format=pretty",
+    "--color=never"
+  ],
+  "no_runtime_equivalence_or_old_N_claim": true,
+  "source_and_post_reservations": "Original proposed source/finalisation reservations are not newly enforced aggregate caps. Original2400 workload cap/remaining clamps and indefinite uncertain-custody HOLD unchanged.",
+  "global_config_read_scope": "Selected production worker/scanner paths may perform bounded read-only inherited global Git ignore/configuration and ancestor ignore discovery. This normal task read behavior is allowed within the existing filesystem sandbox; it is not fixture-confined. Preserve inherited HOME/XDG/opaqueauthority and current no-write policy; do not inspect/print configuration contents in preparation, rewrite HOME, read account/provider databases or claim a broader User authority. If original execution refuses or fails context/config prerequisites, preserve it without scrub/fallback/retry.",
+  "ignored_latency_probe": "project_search::tests::repository_first_result_latency NOT_SELECTED_UNQUALIFIED",
+  "affected_consumers": "ceditor and integrated UI checks remain separate UNRUN; no feature union.",
+  "selected_worker21_only": false,
+  "other27_NOT_INVOKED_UNQUALIFIED": "Historical worker21 metadata; this successor invokes only CLI3 and no other45 pending/UI/HOST/native scope.",
+  "selected_task": "CLI3_ONLY",
+  "selected_names": [
+    "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+    "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+    "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords"
+  ],
+  "phase_caps_sum_seconds": 1590,
+  "source_pre_post_finalization_reservations": {
+    "before": 30,
+    "after": 60,
+    "original_DATA_total": 1680,
+    "serial_command_total": 1590,
+    "new_aggregate_enforcement": false
+  },
+  "excluded_UI5_lowFD_manualbench": true,
+  "CLI3_existing_DATA_intake_sha256": "d6a97a68ad2cc7c77d72ce30c4aa42dc3450c4bc3f2c43f523a5f90c7f27da48"
+}

@@ -1,0 +1,110 @@
+{
+  "kind": "AUTHOR_PR1549_TASK_SOURCE_CONSERVATION_NOT_INDEPENDENT_APPROVAL",
+  "donor": {
+    "head": "993cea26a29b5a2cd6857a959628de4e5f04c096",
+    "runner_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25"
+  },
+  "runner_sha256": "2f9d0fcc85ad807fa8e6fddc1ba355df3d9045aeff01863b101be8b36836a6d5",
+  "changed_functions": [
+    "grouped_contracts",
+    "parent_accounting",
+    "main"
+  ],
+  "unchanged_top_level_count": 29,
+  "unchanged_function_sha256": {
+    "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+    "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+    "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+    "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+    "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+    "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+    "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+    "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+    "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+    "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+    "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+    "settle_children": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
+    "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+    "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+    "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+    "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad",
+    "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+    "cargo_helper_artifact": "cce4fa0819e7ce38157c45c4d8eb40df7e154d6d2fa94f3e39dfea52bd0d2712",
+    "task_elf_observation": "3cd165b37eb78c86f9bf35fe2ed7eef1401f073c3b166512763f6a7af75e2814",
+    "task_group_assets": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4",
+    "grouped_result": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115",
+    "execute_contracts": "584d6c3b8076b29a92d12454bd3c3e04b1d14abe5f46323c62cbd451151c41bc",
+    "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+    "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+    "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+    "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+    "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+    "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9"
+  },
+  "canonical9004_exact": true,
+  "canonical_definition_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+  "all_five_nested_exact": {
+    "read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
+    "source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711",
+    "context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
+    "run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06",
+    "invoke_fixture_group": "288e08759f96075a6a091c01f6626016f8ff55fda5a2033cf58c6d31537493f4"
+  },
+  "protected3790_exact": true,
+  "protected3790_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+  "compact_terminal_expression_exact": true,
+  "final_return_exact": true,
+  "strict_grouped_result_and_execute_contracts_exact": true,
+  "accounting_group_inverse_labels_cardinalities_only": true,
+  "whole_module_inverse_only_three_task_functions_and_WT_PLAN_PLAN_SHA": true,
+  "bounded_line_forward_inverse_reconstruction_exact": true,
+  "diff_envelopes": {
+    "from-993-forward.diff.json": "680bd8d50bd206fac005848e432715ef95dbcd9fe2d46663fe1cc1518630d6c3",
+    "to-993-true-inverse.diff.json": "70c609526bbe0c059a54bebbfec897d67841516e54caa445942af65e74a0557d"
+  },
+  "product_git_entries_before_packet": 2223,
+  "product_git_tree_manifest_sha256": "f787c823258c502701f0f30631385e159400d192592b06593ac1a762c471fc67",
+  "product_head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "product_tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+  "actual_product_parent": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+  "selected_source_contract_sha256": "d22fb130b1972c157dc3d8b0a36af2b0bcfab83e0fb2137b52318ed16675e2c0",
+  "instruction_source": {
+    "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+    "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+    "variance": true,
+    "index_flag": "H AGENTS.md",
+    "bytes_flags_changed_by_author": false,
+    "latest_user_AGENTS_instructions_followed": true
+  },
+  "planned_serial_phase_count": 7,
+  "requested_singleton_parents": 4,
+  "actual_runtime_inventory_N": null,
+  "actual_runtime_results": null,
+  "controller_review": null,
+  "grant": null,
+  "candidate_calls_imports_examples_algorithms_tests": "UNRUN",
+  "execution_authorized": false,
+  "source_change_limits": "Task globals, group/count metadata, main typed genuine product-proof reader/source/data/admission and summary scope only. No generic core/parser/lifecycle/helper/environment policy change.",
+  "immediate_status_successor": {
+    "predecessor_head": "e799278ee7bde497479966099bb51f5f0df79c56",
+    "predecessor_runner_sha256": "351392ffb7f52e47974d43f7207d338a1efd63929f0a92a258ad2462d72f3533",
+    "changed_function_only": "main",
+    "other31_top_level_definitions_exact": true,
+    "all_five_nested_exact": true,
+    "inverse_restores_exact_predecessor_runner": true,
+    "only_semantic_literal": "BLOCKED pending separately pinned fixture-only successor",
+    "genuine_blocked_verdict_preserved": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED",
+    "negative_review": {
+      "path": "/var/tmp/coord16-pr1549-c28-host3-code-negative-final-4ufxi6h5/review.json",
+      "sha256": "8f8927f72338a448c610f8985f34fce4d067c99ef8c564d52e075f532a31de98"
+    },
+    "all_dependency_and_product_snapshots_exact_predecessor": 69,
+    "forward_inverse": {
+      "status-forward.diff.json": "63b4be1ec23985b884b559837508f1f1ed0ba090adc6a330196ece90dee759f6",
+      "status-true-inverse.diff.json": "c54651a77a30df8b16d9b0ba44c29135fe7c4b6b4b9903060acdbea79d6ac6b0"
+    },
+    "no_runtime": true
+  }
+}
