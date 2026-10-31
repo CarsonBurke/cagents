@@ -41,6 +41,12 @@ pub(crate) fn main_with_before_start(
 ) -> std::process::ExitCode {
     // SAFETY: first statement of main, before any thread exists.
     unsafe { cagents::account::detach_inherited_selections() };
+    // Before any mode dispatch: the update progress window, startup error
+    // dialog, shutdown confirmation and render helper never take the window
+    // lease, so none of them would otherwise rename itself, and each would
+    // block every window from starting while it is open. Best effort: a
+    // window repeats this when it takes the lease and reports failure there.
+    let _ = cagents::instance::mark_lease_capable_process();
     // The document render helper answers before anything else exists. Its
     // stdout is a binary page frame, so a tracing subscriber, a panic hook
     // writing a crash record, the window lease or the launcher handshake
