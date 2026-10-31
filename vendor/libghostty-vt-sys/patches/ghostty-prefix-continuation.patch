@@ -1,0 +1,510 @@
+--- a/src/terminal/PageList.zig
++++ b/src/terminal/PageList.zig
+@@ -401,6 +401,10 @@
+ /// in the state struct.
+ page_compression: IncrementalCompressionState = .{},
+
++/// Counts actual iterator visits for complexity regressions; absent in builds.
++compression_test_visits: if (builtin.is_test) usize else void =
++    if (builtin.is_test) 0 else {},
++
+ /// Maximum size of the page allocation in bytes. This only includes pages
+ /// that are used ONLY for scrollback. If the active area is still partially
+ /// in a page that also includes scrollback, then that page is not included.
+@@ -3134,17 +3138,19 @@
+ /// the meaning of page coordinates do not require a new generation solely for
+ /// that reason.
+ ///
+-/// The only state changed here is `node.serial` and the next-generation counter
+-/// `page_serial`. Consequently, every previously captured pointer-plus-serial
++/// This updates `node.serial` and the next-generation counter `page_serial`,
++/// and discards incremental compression's borrowed continuation. Every
++/// previously captured pointer-plus-serial
+ /// pair for this node becomes invalid while new references can capture the new
+ /// generation. This does not advance `page_serial_epoch`: only `reset` starts a
+ /// new whole-list validity epoch.
+ ///
+ /// This also does not mutate the page, update tracked pins or viewport state,
+-/// adjust row or memory accounting, mark cells dirty, or notify incremental
+-/// compression. The surrounding operation remains responsible for all such
++/// adjust row or memory accounting, mark cells dirty, or change compression's
++/// activity token. The surrounding operation remains responsible for all such
+ /// bookkeeping required by its layout change.
+ pub fn invalidateNodeLayout(self: *PageList, node: *List.Node) void {
++    self.page_compression.invalidateContinuation();
+     node.serial = self.page_serial;
+     self.page_serial += 1;
+ }
+@@ -3586,6 +3592,10 @@
+             },
+         }
+
++        // This node moves from the oldest page to the active tail without
++        // destroyNode. A saved cursor could otherwise follow its reused links.
++        self.page_compression.invalidateContinuation();
++
+         // Reset our memory
+         const buf = first.restore(.discard).memory;
+         @memset(buf, 0);
+@@ -3916,12 +3926,11 @@
+
+ /// PageList-owned state for incremental compression.
+ ///
+-/// The position is stored as a page serial rather than a node pointer so it
+-/// remains safe when PageList operations destroy, replace, or reuse nodes
+-/// between steps. It also records the first serial which was unallocated at
+-/// the prior step so new nodes before a valid marker restart safely. If the
+-/// exact serial no longer exists in the cold prefix, the next step also
+-/// restarts at the first page.
++/// The cursor points directly to the next uninspected node, avoiding a prefix
++/// lookup on every step. PageList exclusively owns both nodes and traversal.
++/// Destroying or reusing a node, or invalidating its layout, clears this cursor
++/// before a later step can dereference it. Appending at the active tail keeps
++/// the cursor valid. Resize, viewport changes and reset discard all progress.
+ ///
+ /// A completed pass is followed by another pass from the oldest cold page.
+ /// Compression becomes idle only when that verification pass compresses no
+@@ -3955,14 +3964,15 @@
+     /// add extra state.
+     activity_serial: u48 = 0,
+
+-    /// Serial of the last page inspected by the traversal. This is
+-    /// intentionally an implementation detail and is reset by PageList
+-    /// operations which restart traversal progress.
+-    last_serial: ?u64 = null,
+-
+-    /// First node serial which had not been allocated at the prior step. A
+-    /// node at or above this value before the saved marker requires a restart.
+-    next_serial: u64 = 0,
++    /// Borrowed from this PageList only. Never dereference after a structural
++    /// mutation unless that mutation preserves the continuation invariant.
++    next_node: ?*List.Node = null,
++
++    /// Discard a borrowed cursor before nodes can be removed, reused, or
++    /// changed before it. Keep pass flags and the caller's activity token.
++    fn invalidateContinuation(self: *IncrementalCompressionState) void {
++        self.next_node = null;
++    }
+
+     /// Record activity without disturbing valid traversal progress.
+     fn markActivity(self: *IncrementalCompressionState) void {
+@@ -3998,6 +4008,8 @@
+     active: *List.Node,
+     viewport_first: *List.Node,
+     viewport_last: *List.Node,
++    test_visits: if (builtin.is_test) usize else void =
++        if (builtin.is_test) 0 else {},
+
+     fn init(self: *const PageList) CompressionIterator {
+         return .{
+@@ -4010,6 +4022,7 @@
+
+     fn next(self: *CompressionIterator) ?*List.Node {
+         while (self.current != self.active) {
++            if (builtin.is_test) self.test_visits += 1;
+             // The viewport is a contiguous node range. Once traversal reaches
+             // its first node, advance through the complete visible range and
+             // resume at the next offscreen page.
+@@ -4018,6 +4031,7 @@
+                     self.current != self.viewport_last)
+                 {
+                     self.current = self.current.next.?;
++                    if (builtin.is_test) self.test_visits += 1;
+                 }
+
+                 if (self.current == self.active) return null;
+@@ -4111,38 +4125,20 @@
+         return .unsupported;
+     }
+
+-    // Find the node following the exact continuation marker within the cold
+-    // prefix. A missing marker means the list changed between steps, so begin
+-    // again at the current first page. This lookup does not touch page memory.
++    // Structural mutations clear next_node before it can become stale. Only
++    // boundaries need refreshing; there is no history-sized cursor lookup.
+     var it: CompressionIterator = .init(self);
+-    if (state.last_serial) |last_serial| continuation: {
+-        while (it.next()) |node| {
+-            // A newly allocated or replacement node appeared before the
+-            // marker. Restart immediately so that node cannot be skipped.
+-            if (node.serial >= state.next_serial) break;
+-
+-            // Not a match? Keep looking
+-            if (node.serial != last_serial) continue;
+-
+-            // Match! The iterator already points to the next offscreen node.
+-            break :continuation;
+-        }
+-
+-        // Not found or otherwise invalid. Reset
+-        state.last_serial = null;
+-        it = .init(self);
++    if (state.next_node) |node| it.current = node;
++    defer {
++        if (builtin.is_test) self.compression_test_visits = it.test_visits;
+     }
+
+-    // Keep track of our next_serial
+-    state.next_serial = self.page_serial;
+-
+     // We cap the number of pages we look at to do our best to
+     // time-bound the incremental compression.
+     var inspected_pages: usize = 0;
+     while (inspected_pages < incremental_compression_max_inspected) {
+         const node = it.next() orelse break;
+
+-        state.last_serial = node.serial;
+         inspected_pages += 1;
+
+         // If this page is already compressed, ignore it.
+@@ -4154,7 +4150,8 @@
+         break;
+     }
+
+-    // If we didn't reach our active node, then we still have work to do.
++    // Save the first uninspected node rather than re-finding the last one.
++    state.next_node = it.current;
+     if (!it.done()) return .pending;
+
+     // We reached our active node. So we're done, except that we always
+@@ -4275,6 +4272,7 @@
+ /// responsible for accounting for the removed rows. This function only
+ /// updates `page_size` (byte accounting), not row accounting.
+ fn destroyNode(self: *PageList, node: *List.Node) void {
++    self.page_compression.invalidateContinuation();
+     destroyNodeExt(&self.pool, node, &self.page_size);
+ }
+
+@@ -6759,8 +6757,7 @@
+     try testing.expect(second.isCompressed());
+     try testing.expect(!s.page_compression.flags.did_compress);
+     try testing.expect(!s.page_compression.flags.verifying);
+-    try testing.expectEqual(@as(?u64, null), s.page_compression.last_serial);
+-    try testing.expectEqual(@as(u64, 0), s.page_compression.next_serial);
++    try testing.expectEqual(@as(?*List.Node, null), s.page_compression.next_node);
+ }
+
+ test "PageList owns incremental compression state" {
+@@ -6775,8 +6772,7 @@
+             .verifying = true,
+         },
+         .activity_serial = 42,
+-        .last_serial = 42,
+-        .next_serial = 43,
++        .next_node = s.pages.first.?,
+     };
+
+     s.page_compression = state;
+@@ -6837,7 +6833,7 @@
+     );
+ }
+
+-test "PageList replacements preserve compression continuation and mark activity" {
++test "PageList replacements invalidate compression continuation and mark activity" {
+     const testing = std.testing;
+
+     var s = try init(testing.allocator, 80, 24, null);
+@@ -6846,21 +6842,22 @@
+     const state: IncrementalCompressionState = .{
+         .flags = .{ .verifying = true },
+         .activity_serial = 42,
+-        .last_serial = 7,
+-        .next_serial = 8,
++        .next_node = s.pages.first.?,
+     };
+     const expected: IncrementalCompressionState = .{
+         .flags = .{ .verifying = true },
+         .activity_serial = 43,
+-        .last_serial = 7,
+-        .next_serial = 8,
+     };
+
+     s.page_compression = state;
+     const replacement = try s.increaseCapacity(s.pages.first.?, null);
+     try testing.expectEqual(expected, s.page_compression);
+
+-    s.page_compression = state;
++    s.page_compression = .{
++        .flags = .{ .verifying = true },
++        .activity_serial = 42,
++        .next_node = replacement,
++    };
+     _ = (try s.compact(replacement)).?;
+     try testing.expectEqual(expected, s.page_compression);
+ }
+@@ -6889,14 +6886,14 @@
+     const first = s.compress(.incremental);
+     try testing.expectEqual(IncrementalCompressionResult.pending, first);
+     try testing.expectEqual(
+-        expected_last.serial,
+-        s.page_compression.last_serial.?,
++        expected_last.next.?,
++        s.page_compression.next_node.?,
+     );
+
+     const second = s.compress(.incremental);
+     try testing.expectEqual(IncrementalCompressionResult.pending, second);
+     try testing.expect(s.page_compression.flags.verifying);
+-    try testing.expect(s.page_compression.last_serial == null);
++    try testing.expect(s.page_compression.next_node == null);
+
+     // The verification pass is bounded independently, too.
+     try testing.expectEqual(
+@@ -6909,6 +6906,111 @@
+     );
+ }
+
++test "PageList incremental compression bounds all cold iterator visits" {
++    const testing = std.testing;
++
++    for ([_]usize{ 16, 64, 256 }) |count| {
++        var s = try init(testing.allocator, 80, 24, null);
++        defer s.deinit();
++        try s.growColdPagesForTest(count);
++        _ = s.compress(.full);
++        try testing.expectEqual(count, s.memoryStats().compressed_pages);
++
++        var visits: usize = 0;
++        var steps: usize = 0;
++        while (true) {
++            const result = s.compress(.incremental);
++            // This counts iterator visits, including continuation positioning,
++            // not only candidates after a history-sized positioning scan.
++            try testing.expect(s.compression_test_visits <=
++                incremental_compression_max_inspected);
++            visits += s.compression_test_visits;
++            steps += 1;
++            try testing.expect(steps <= 2 * count);
++            if (result == .complete) break;
++            try testing.expectEqual(IncrementalCompressionResult.pending, result);
++        }
++        // Both the pass and verification visit every cold page exactly once.
++        try testing.expectEqual(2 * count, visits);
++        try testing.expectEqual(count, s.memoryStats().compressed_pages);
++    }
++}
++
++test "PageList deleting saved continuation without allocation clears it" {
++    const testing = std.testing;
++
++    var s = try init(testing.allocator, 80, 24, null);
++    defer s.deinit();
++    try s.growColdPagesForTest(3);
++    _ = s.compress(.incremental);
++    try testing.expect(s.page_compression.next_node != null);
++    const serial = s.page_serial;
++
++    // Remove complete pages through the actual erase path, including the
++    // saved node. No allocation/generation change may be required to free it.
++    const second = s.pages.first.?.next.?;
++    s.eraseHistory(.{ .history = .{ .y = @intCast(
++        @as(usize, s.pages.first.?.rows()) + second.rows() - 1,
++    ) } });
++    try testing.expectEqual(serial, s.page_serial);
++    try testing.expect(s.page_compression.next_node == null);
++    try testing.expectEqual(IncrementalCompressionResult.complete, s.compress(.drain));
++    try testing.expect(s.pages.first.?.isCompressed());
++}
++
++test "PageList clone reads preserve a live continuation and verification" {
++    const testing = std.testing;
++
++    var s = try init(testing.allocator, 80, 24, null);
++    defer s.deinit();
++    try s.growColdPagesForTest(3);
++    const first = s.pages.first.?;
++    first.page().getRowAndCell(0, 0).cell.* = .init('界');
++    _ = s.compress(.incremental);
++    try testing.expect(first.isCompressed());
++    const next = s.page_compression.next_node.?;
++    const activity = s.page_compression.activity_serial;
++
++    // Clone reads restore source memory, but cannot destroy its nodes. The
++    // clone owns new nodes and must never inherit the source's borrowed cursor.
++    var cloned = try s.clone(testing.allocator, .{ .top = .{ .screen = .{} } });
++    defer cloned.deinit();
++    try testing.expect(!first.isCompressed());
++    try testing.expectEqual(next, s.page_compression.next_node.?);
++    try testing.expectEqual(activity, s.page_compression.activity_serial);
++    try testing.expect(cloned.page_compression.next_node == null);
++    try testing.expectEqual(IncrementalCompressionResult.complete, s.compress(.drain));
++    try testing.expect(first.isCompressed());
++    try testing.expectEqual(@as(u21, '界'), first.page().getRowAndCell(0, 0).cell.content.codepoint);
++
++    // A read after completion leaves no dangling cursor; a newly scheduled
++    // incremental pass begins at the oldest page and reclaims it again.
++    try testing.expect(s.page_compression.next_node == null);
++    try testing.expectEqual(IncrementalCompressionResult.complete, s.compress(.drain));
++    try testing.expect(first.isCompressed());
++}
++
++test "PageList moved owner retains its own compression continuation" {
++    const testing = std.testing;
++
++    var original = try init(testing.allocator, 80, 24, null);
++    var owns_original = true;
++    errdefer if (owns_original) original.deinit();
++    try original.growColdPagesForTest(3);
++    _ = original.compress(.incremental);
++    const next = original.page_compression.next_node.?;
++
++    // Move ownership exactly as returning a PageList by value does. Never
++    // deinit the moved-from value: both nodes and their pools move together.
++    var moved = original;
++    owns_original = false;
++    original = undefined;
++    defer moved.deinit();
++    try testing.expectEqual(next, moved.page_compression.next_node.?);
++    try testing.expectEqual(IncrementalCompressionResult.complete, moved.compress(.drain));
++    try testing.expectEqual(@as(usize, 3), moved.memoryStats().compressed_pages);
++}
++
+ test "PageList incremental compression advances after failure" {
+     const testing = std.testing;
+
+@@ -6926,7 +7028,7 @@
+     try testing.expect(!first.isCompressed());
+
+     // The unsuccessful first page does not stall the pass. The next step
+-    // continues at the following serial and compresses that page.
++    // continues at the following node and compresses that page.
+     const continued = s.compress(.incremental);
+     try testing.expectEqual(IncrementalCompressionResult.pending, continued);
+     try testing.expect(second.isCompressed());
+@@ -7006,7 +7108,7 @@
+     try testing.expect(replacement.page().memory.len > std_size);
+     try testing.expect(!replacement.isCompressed());
+
+-    // The exact continuation serial disappeared with the old node. The pass
++    // Removing the old node cleared its borrowed continuation. The pass
+     // restarts at the first page and considers the oversized replacement.
+     const restarted = s.compress(.incremental);
+     try testing.expectEqual(IncrementalCompressionResult.pending, restarted);
+@@ -7093,8 +7195,8 @@
+     try testing.expectEqual(reused, (try s.grow()).?);
+     try testing.expect(reused.serial != old_serial);
+
+-    // Make the remaining old page fully historical. The continuation serial
+-    // disappeared when its node was recycled, so the pass safely restarts.
++    // Make the remaining old page fully historical. Recycling the old node
++    // cleared the borrowed continuation, so the pass safely restarts.
+     try s.growColdPagesForTest(1);
+     _ = s.compress(.incremental);
+     try testing.expectEqual(@as(usize, 1), s.memoryStats().compressed_pages);
+@@ -7141,8 +7243,7 @@
+     for (1..incremental_compression_max_inspected) |_| marker = marker.next.?;
+     s.page_compression = .{
+         .flags = .{ .verifying = true },
+-        .last_serial = marker.serial,
+-        .next_serial = s.page_serial,
++        .next_node = marker.next.?,
+     };
+
+     const activity = s.page_compression.activity_serial;
+@@ -7150,8 +7251,8 @@
+     try testing.expect(!first.isCompressed());
+     try testing.expect(activity != s.page_compression.activity_serial);
+
+-    // The changed generation is before the saved marker, so continuation must
+-    // restart and recompress it instead of reporting verification complete.
++    // Layout invalidation cleared the cursor before it could skip this page,
++    // so recompress it instead of reporting verification complete.
+     try testing.expectEqual(
+         IncrementalCompressionResult.pending,
+         s.compress(.incremental),
+@@ -7286,9 +7387,9 @@
+     try testing.expect(s.pages.first.?.isCompressed());
+     try testing.expect(s.pages.first.?.next.?.isCompressed());
+
+-    // Replace a page before the still-valid continuation marker. The list's
+-    // allocation serial changes even though the marker itself remains, so the
+-    // next step must restart and inspect the replacement.
++    // Replace a page before the continuation. Destruction clears the cursor
++    // even though its node remains live, so the next step must restart and
++    // inspect the replacement.
+     const old_first = s.pages.first.?;
+     const old_serial = old_first.serial;
+     const replacement = try s.increaseCapacity(
+@@ -7319,12 +7420,12 @@
+     const first = s.compress(.incremental);
+     try testing.expectEqual(IncrementalCompressionResult.pending, first);
+     try testing.expectEqual(
+-        expected_last.serial,
+-        s.page_compression.last_serial.?,
++        expected_last.next.?,
++        s.page_compression.next_node.?,
+     );
+
+     // Allocate a new page at the active tail between steps. It is after the
+-    // continuation marker and must not restart progress through cold history.
++    // continuation and must not restart progress through cold history.
+     const next_serial = s.page_serial;
+     while (s.page_serial == next_serial) _ = try s.grow();
+     const continued = s.compress(.incremental);
+@@ -17514,3 +17615,66 @@
+         try testing.expectEqualStrings("https://example.com", link.uri.slice(second_page.memory));
+     }
+ }
++
++
++test "PageList fresh pass reclaims a read behind the verification cursor" {
++    const testing = std.testing;
++
++    var s = try init(testing.allocator, 80, 24, null);
++    defer s.deinit();
++    try s.growColdPagesForTest(16);
++    const first = s.pages.first.?;
++    first.page().getRowAndCell(0, 0).cell.* = .init('Q');
++    try testing.expectEqual(IncrementalCompressionResult.complete, s.compress(.full));
++    try testing.expectEqual(@as(usize, 16), s.memoryStats().compressed_pages);
++    const activity = s.page_compression.activity_serial;
++
++    var steps: usize = 0;
++    while (!s.page_compression.flags.verifying) {
++        try testing.expectEqual(IncrementalCompressionResult.pending, s.compress(.incremental));
++        steps += 1;
++        try testing.expect(steps <= 16);
++    }
++    try testing.expect(!s.page_compression.flags.did_compress);
++    try testing.expectEqual(IncrementalCompressionResult.pending, s.compress(.incremental));
++    var ninth = first;
++    for (0..8) |_| ninth = ninth.next.?;
++    try testing.expectEqual(ninth, s.page_compression.next_node.?);
++    try testing.expect(s.page_compression.flags.verifying);
++    try testing.expect(!s.page_compression.flags.did_compress);
++
++    // A bounded old-row read restores only the already-verified first page.
++    // The suffix stays cold and neither activity nor traversal is invalidated.
++    try testing.expectEqual(@as(u21, 'Q'), first.page().getRowAndCell(0, 0).cell.content.codepoint);
++    try testing.expect(!first.isCompressed());
++    try testing.expectEqual(activity, s.page_compression.activity_serial);
++    try testing.expectEqual(ninth, s.page_compression.next_node.?);
++    var suffix = first.next.?;
++    const active = s.getTopLeft(.active).node;
++    while (suffix != active) : (suffix = suffix.next.?) {
++        try testing.expect(suffix.isCompressed());
++    }
++    try testing.expectEqual(IncrementalCompressionResult.complete, s.compress(.incremental));
++    try testing.expect(!first.isCompressed());
++    try testing.expectEqual(@as(usize, 15), s.memoryStats().compressed_pages);
++    try testing.expect(s.page_compression.next_node == null);
++    try testing.expectEqual(activity, s.page_compression.activity_serial);
++
++    // Rust IdleCompression remembers the intervening read and schedules this
++    // fresh bounded pass after native Complete resets its cursor. No full scan
++    // or traversal reset on every read is required.
++    var result = s.compress(.incremental);
++    try testing.expectEqual(IncrementalCompressionResult.pending, result);
++    try testing.expect(first.isCompressed());
++    steps = 1;
++    while (result == .pending) {
++        result = s.compress(.incremental);
++        steps += 1;
++        try testing.expect(steps <= 64);
++        try testing.expect(s.compression_test_visits <= incremental_compression_max_inspected);
++    }
++    try testing.expectEqual(IncrementalCompressionResult.complete, result);
++    try testing.expectEqual(@as(usize, 16), s.memoryStats().compressed_pages);
++    try testing.expect(s.page_compression.next_node == null);
++    try testing.expectEqual(activity, s.page_compression.activity_serial);
++}
