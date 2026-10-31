@@ -1,6 +1,7 @@
 """Prepared separate PR1921 hosted User CLI cache producer; no installer or test execution. No local authority stripping or execution during source preparation."""
 import argparse
 import ctypes
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -20,11 +21,15 @@ CONTROL = Path(__file__).resolve().parents[3]
 WT = TARGET = LOCK = TOOL = None  # Actual hosted paths come only from admitted runtime metadata.
 PLAN = CONTROL / '.github/qualification/pr2015/cli-cache-producer-plan.json'
 PAYLOAD_DEADLINE = None
+EVIDENCE_OUT = None
+OWNERSHIP_INITIALIZED = False
+PROCESS_PHASES = []
+TOOL_CAPTURES = []
 PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
 PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
 SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
 CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
-PLAN_SHA = '018fb6a8896a16c417cc2e0d722d29565d6ebf35d3b1d9c09899677e0e31f53d'
+PLAN_SHA = 'c39055932062af3961999942c15df40239a761d2373472cd173a743d6c190e85'
 
 
 def digest(path):
@@ -57,16 +62,31 @@ def supervision_failure(state, error, stage):
 
 def bounded_capture(argv, absolute_deadline=None, *, raw=False):
     require_workload_allowed()
-    # Source checks use the same sticky spawn/wait supervision as owning phases.
     local_deadline = time.monotonic() + 10
     if absolute_deadline is not None:
         local_deadline = min(local_deadline, absolute_deadline)
-    code, expired, process_error, child_fd, state = None, False, None, None, None
+    code, expired, child_fd, state = None, False, None, None
     launch_requested = False
+    capture = None
     try:
-        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        with contextlib.ExitStack() as stack:
+            if raw:
+                assert EVIDENCE_OUT is not None
+                number = len(TOOL_CAPTURES) + 1
+                prefix = 'tool-capture-' + str(number)
+                capture = {'id': number, 'argv': list(argv), 'pid': None, 'exit': None,
+                           'original_wait_complete': False, 'channels_complete': False,
+                           'stdout_path': str(EVIDENCE_OUT / (prefix + '.stdout')),
+                           'stderr_path': str(EVIDENCE_OUT / (prefix + '.stderr'))}
+                TOOL_CAPTURES.append(capture)
+                (EVIDENCE_OUT / (prefix + '-request.json')).write_text(json.dumps(capture, indent=2) + '\n')
+                stdout = stack.enter_context(Path(capture['stdout_path']).open('x+b'))
+                stderr = stack.enter_context(Path(capture['stderr_path']).open('x+b'))
+            else:
+                stdout = stack.enter_context(tempfile.TemporaryFile())
+                stderr = stack.enter_context(tempfile.TemporaryFile())
             remaining = local_deadline - time.monotonic()
-            assert remaining > 0, 'Source-check budget exhausted before launch'
+            assert remaining > 0, 'Source/tool budget exhausted before launch'
             require_workload_allowed()
             launch_requested = True
             child = subprocess.Popen(argv, stdout=stdout, stderr=stderr, close_fds=True, start_new_session=True)
@@ -75,6 +95,8 @@ def bounded_capture(argv, absolute_deadline=None, *, raw=False):
                      'original_wait_complete': False, 'direct_cleanup_attempted': False,
                      'supervision_error': None, 'evidence_complete': False, 'custody': None}
             PROCESS_STATES.append(state)
+            if capture is not None:
+                capture['pid'] = child.pid
             try:
                 child_fd = os.pidfd_open(child.pid)
                 try:
@@ -97,17 +119,35 @@ def bounded_capture(argv, absolute_deadline=None, *, raw=False):
             finally:
                 if child_fd is not None:
                     os.close(child_fd)
-            assert code == 0 and not expired, ('Read-only source Git failed/uncertain', code, expired)
+            # Original on-disk tool channels survive even a nonzero/partial result.
             stdout.seek(0)
             stderr.seek(0)
             output, errors = stdout.read(1024 * 1024 + 1), stderr.read(1024 * 1024 + 1)
-            assert len(output) <= 1024 * 1024 and len(errors) <= 1024 * 1024, 'Source-check output exceeded bound'
-            result = {'stdout': output.decode(), 'stderr': errors.decode(), 'exit': code} if raw else output.decode().strip()
+            if capture is not None:
+                capture.update(exit=state['exit'], original_wait_complete=state['original_wait_complete'],
+                               timed_out=expired, channels_complete=False,
+                               read_after_original_wait=state['original_wait_complete'] is True,
+                               independent_writer_closure_proven=False,
+                               stdout_observed_bytes=len(output), stderr_observed_bytes=len(errors))
+                (EVIDENCE_OUT / (prefix + '-status.json')).write_text(json.dumps(capture, indent=2) + '\n')
+            assert len(output) <= 1024 * 1024 and len(errors) <= 1024 * 1024, 'Source/tool output exceeded bound'
+            assert code == 0 and not expired, ('Read-only source/tool failed/uncertain', code, expired)
+            result = {'stdout': output.decode(), 'stderr': errors.decode(), 'exit': code,
+                      'capture_id': capture['id'], 'stdout_path': capture['stdout_path'],
+                      'stderr_path': capture['stderr_path']} if raw else output.decode().strip()
         state['evidence_complete'] = True
         return result
-    except Exception as exc:
+    except BaseException as exc:
         if launch_requested:
-            supervision_failure(state, exc, 'source')
+            supervision_failure(state, exc, 'source-tool' if raw else 'source')
+        if capture is not None:
+            capture.update(exit=state['exit'] if state else None,
+                           original_wait_complete=bool(state and state['original_wait_complete']),
+                           channels_complete=False, error=type(exc).__name__ + ': ' + str(exc))
+            try:
+                (EVIDENCE_OUT / (prefix + '-failure.json')).write_text(json.dumps(capture, indent=2) + '\n')
+            except BaseException:
+                pass
         raise
 
 
@@ -446,9 +486,12 @@ def parent_accounting(attempts, states, phases, parents, out):
              'original_wait_settled_phase_count': settled_phases,
              'unknown_phase_count': len(phase_attempts) - settled_phases,
              'unrun_phase_count': 3 - len(phase_attempts),
-             'attempted_source_check_count': len(source_attempts),
-             'original_wait_settled_source_check_count': settled_sources,
-             'unknown_source_check_count': len(source_attempts) - settled_sources,
+             'attempted_source_or_tool_capture_count': len(source_attempts),
+             'original_wait_settled_source_or_tool_capture_count': settled_sources,
+             'unknown_source_or_tool_capture_count': len(source_attempts) - settled_sources,
+             'requested_tool_capture_count': len(TOOL_CAPTURES),
+             'recorded_tool_spawn_count': sum(item['pid'] is not None for item in TOOL_CAPTURES),
+             'recorded_tool_original_wait_count': sum(item['original_wait_complete'] is True for item in TOOL_CAPTURES),
              'all_original_waits_complete': len(attempts) == len(states) and all(state['original_wait_complete'] for state in states),
              'requested_parent_count': 0, 'passed_parent_count': 0,
              'attempted_parent_count': 0, 'executed_parent_count': 0,
@@ -695,10 +738,13 @@ def warm_target(target, runner_temp, rustc):
     require(versions and all(value.get('success') is True and value.get('code') == 0 and value['stdout'] == rustc
                              for _, value in versions), 'Produced Cargo rustc output differs from active Rust1.93')
     paths = []
-    for candidate in (target / 'debug/deps').glob('libcagents-*.rmeta'):
-        payload_deadline()
-        paths.append(candidate)
-        require(len(paths) <= 128, 'Too many produced metadata candidates')
+    with os.scandir(target / 'debug/deps') as entries:
+        for entry in entries:
+            payload_deadline()
+            if not (entry.name.startswith('libcagents-') and entry.name.endswith('.rmeta')):
+                continue
+            paths.append(target / 'debug/deps' / entry.name)
+            require(len(paths) <= 128, 'Too many produced metadata candidates')
     paths.sort()
     require(0 < len(paths) <= 128, 'No bounded existing cagents root-library metadata candidates')
     accepted, rejected = [], []
@@ -774,7 +820,8 @@ def produced_payload(target, runner_temp, rustc, absolute_deadline):
 
 
 
-def main():
+def producer_main():
+    global EVIDENCE_OUT, OWNERSHIP_INITIALIZED
     hosted = hosted_context()
     parser = argparse.ArgumentParser()
     parser.add_argument('--run-binding', required=True)
@@ -819,6 +866,7 @@ def main():
     out.mkdir(mode=0o700)
     assert out.resolve(strict=True) == out and not out.is_symlink()
     save = lambda name, value: (out / name).write_text(json.dumps(value, indent=2) + '\n')
+    EVIDENCE_OUT = out
     evidence_copy(out, 'executed-runner.py', runner_bytes, args.runner_sha256)
     evidence_copy(out, 'plan.json', plan_bytes, PLAN_SHA)
     evidence_copy(out, 'controller-review.json', controller_bytes, args.controller_review_sha256)
@@ -827,6 +875,7 @@ def main():
     signal.signal(signal.SIGINT, note_lane_cancellation)
     signal.signal(signal.SIGTERM, note_lane_cancellation)
     assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0, 'Dedicated subreaper required before the first child'
+    OWNERSHIP_INITIALIZED = True
     try:
         plan = materialize_plan(template, hosted)
         assert plan['source_review_sha256'] == args.controller_review_sha256
@@ -871,7 +920,7 @@ def main():
     # Install cooperative retention before any source child or C acquisition.
     signal.signal(signal.SIGINT, note_lane_cancellation)
     signal.signal(signal.SIGTERM, note_lane_cancellation)
-    phases, tests = [], []
+    phases, tests = PROCESS_PHASES, []
     error = None
     acquired = False
     lock_fd = None
@@ -1138,6 +1187,42 @@ def main():
                           'receipt_sha256': digest(out / 'terminal-receipt.json'),
                           'checksum_sha256': digest(out / 'SHA256SUMS')}), flush=True)
     return 0 if summary['cache_preparation_complete'] else 1
+
+
+def main():
+    try:
+        return producer_main()
+    except BaseException as original_error:
+        if OWNERSHIP_INITIALIZED:
+            passes = []
+            for _ in range(2):
+                try:
+                    passes.append(settle_children())
+                except BaseException as error:
+                    passes.append({'clean': False, 'forced': False, 'inspection_error': type(error).__name__ + ': ' + str(error)})
+            custody = {'clean': all(custody_clean(row) for row in passes),
+                       'forced': any(row.get('forced') for row in passes), 'passes': passes}
+            record = {'stage': 'outer-producer-exit-guard',
+                      'error': type(original_error).__name__ + ': ' + str(original_error),
+                      'process_attempts': PROCESS_ATTEMPTS, 'process_states': PROCESS_STATES,
+                      'phases': PROCESS_PHASES, 'tool_captures': TOOL_CAPTURES,
+                      'custody': custody, 'supervision_failures': SUPERVISION_FAILURES,
+                      'cache_preparation_complete': False, 'global_C_return': 'NOT_MADE'}
+            def emergency_save(name, value):
+                assert EVIDENCE_OUT is not None
+                (EVIDENCE_OUT / name).write_text(json.dumps(value, indent=2) + '\n')
+            try:
+                emergency_save('outer-exit-failure.json', record)
+            except BaseException:
+                pass
+            # Evidence failures cannot bypass retention of an unknown original.
+            try:
+                handback_confirmed = safe_lane_handoff(PROCESS_ATTEMPTS, PROCESS_STATES, PROCESS_PHASES, custody, SUPERVISION_FAILURES)
+            except BaseException:
+                handback_confirmed = False
+            if not handback_confirmed:
+                retain_uncertain_lane(emergency_save, record)
+        raise
 
 
 if __name__ == '__main__':

@@ -161,14 +161,18 @@
     "combined_setup_deadline_seconds": 120,
     "physical_toolchain": "1.93.0",
     "host": "x86_64-unknown-linux-gnu",
-    "raw_original_stdout_stderr_exit": true
+    "raw_original_stdout_stderr_exit": true,
+    "incremental_original_channel_files_and_status": true,
+    "all_postchild_initialization_exits_guarded_for_unknown_custody": true,
+    "successful_and_partial_captures_retained_before_materialization_complete": true
   },
   "payload_validation": {
     "shape": "Existing cache gate feature-empty native library shape, new task-owned target only",
     "max_seconds": 90,
     "shared_workload_deadline_clamp": true,
     "max_metadata_candidates": 128,
-    "deadline_checked_during_enumeration_candidates_and_chunks": true
+    "deadline_checked_during_enumeration_candidates_and_chunks": true,
+    "enumeration": "Explicit os.scandir, check remaining deadline for every entry before filename filtering, cap128 matching paths before sorting"
   },
   "actual": {
     "grant": null,
@@ -185,6 +189,7 @@
     "600/900/900 phase ceilings share one2400-second workload deadline. Initial source/tool setup and finalization are separately bounded inherited stages, not a new enforced2400-second whole-job guarantee. Unknown custody holds indefinitely.",
     "Produced payload shape is read-only bounded metadata/content evidence, not Cargo freshness, successful cache publication or future cache visibility. Cache save action exit0 alone is insufficient; original official exact-key saved confirmation and later original restore plus unchanged installer gate are required.",
     "Only the samePR1921 merge ref/three ordered cache paths/key namespace are targeted. No producer-to-installer auto-chain, workflow dispatch/rerun or alternate rejected PR route.",
-    "Prepared source actual fields remain null. Runtime plan/tool observations and original artifacts are separate prospective evidence; all current workload/save/restore/qualification is UNRUN."
+    "Prepared source actual fields remain null. Runtime plan/tool observations and original artifacts are separate prospective evidence; all current workload/save/restore/qualification is UNRUN.",
+    "Incremental original tool channels persist on partial/nonzero/failing materialization. Per-capture status records direct waits and observations only; it does not independently prove descendant writer closure. Aggregate source/tool and separate recorded tool capture counts are nonparent accounting. A final outer exit guard retains unknown custody even when a failure-receipt write or handoff assessment raises."
   ]
 }
