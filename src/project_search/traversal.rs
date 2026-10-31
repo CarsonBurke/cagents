@@ -583,10 +583,16 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", TEST, "--nocapture", "--test-threads=1"]);
+        // Keep inherited caller authority while isolating the filesystem fixture.
+        for (name, _) in std::env::vars_os() {
+            if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+                command.env_remove(name);
+            }
+        }
         let mut child = OwnedChild(
-            Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-                .env_clear()
+            command
                 .env(CHILD, "1")
                 .env("HOME", directory.path())
                 .current_dir(directory.path())
