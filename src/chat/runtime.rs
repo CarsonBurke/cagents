@@ -124,8 +124,8 @@ pub(crate) enum Rejection {
     NotIdle(String),
     /// The actor never took the command, or refused it.
     Refused(String),
-    /// The actor took the command but did not answer in time; the provider
-    /// may still receive it.
+    /// The actor did not confirm the outcome, including a received failure
+    /// after Step preparation. Provider effects may already be possible.
     Unacknowledged(String),
 }
 

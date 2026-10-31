@@ -1254,6 +1254,10 @@ mod tests {
         for trigger in [
             "CREATE TRIGGER reject_refusal BEFORE UPDATE ON inputs BEGIN SELECT RAISE(ABORT,'receipt refused'); END;",
             "CREATE TRIGGER reject_refusal BEFORE DELETE ON retained_runs BEGIN SELECT RAISE(ABORT,'run release refused'); END;",
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE refusal_parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE refusal_child(id INTEGER REFERENCES refusal_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER reject_refusal AFTER UPDATE ON inputs BEGIN INSERT INTO refusal_child VALUES(1); END;",
         ] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let mut journal = Journal::with_budget(directory.path(), 4096).unwrap();

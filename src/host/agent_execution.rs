@@ -473,11 +473,13 @@ fn dispatch(
     drop(_dispatch);
     drop(_control);
     let deadline = Instant::now() + Duration::from_secs(30);
-    let initial = provider_launch_snapshot(&handle)?;
-    if initial.exited {
+    let (mut became_ready, exited) = {
+        let initial = provider_launch_snapshot(&handle)?;
+        (initial.ready, initial.exited)
+    };
+    if exited {
         return Err(before("Provider exited before accepting the prompt".into()));
     }
-    let mut became_ready = initial.ready;
     loop {
         let attempt = {
             let _control = control.read().unwrap_or_else(|p| p.into_inner());

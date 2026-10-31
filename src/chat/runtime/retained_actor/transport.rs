@@ -195,6 +195,7 @@ struct Pending {
     identity: InputIdentity,
     payload: Value,
     managed_prompt: bool,
+    receipt_invalid: bool,
     bytes: usize,
     reply: Option<crossbeam_channel::Sender<Result<(), Rejection>>>,
 }
@@ -1419,6 +1420,9 @@ impl RemoteActor {
         let response;
         {
             let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
+            if pending.iter().any(|input| input.receipt_invalid) {
+                return Err("Retained input evidence is inconsistent; resolve its original outcome before admitting another input".into());
+            }
             if pending.len() >= 65 {
                 return Err("Remote actor pending input capacity reached".into());
             }
@@ -1490,6 +1494,7 @@ impl RemoteActor {
                 identity: identity.clone(),
                 payload: payload.clone(),
                 managed_prompt,
+                receipt_invalid: false,
                 bytes: bytes.len(),
                 reply: Some(reply),
             });
@@ -1542,6 +1547,10 @@ impl RemoteActor {
                 && (!pending.managed_prompt
                     || !matches!(&receipt.state, InputState::Acknowledged(Err(_))))
             {
+                // An earlier Accepted receipt may already have cleared the
+                // socket-write uncertainty. This separate fence also covers
+                // malformed evidence for an older still-pending input.
+                pending.receipt_invalid = true;
                 if let Some(reply) = pending.reply.take() {
                     let _ = reply.send(Err(Rejection::Unacknowledged(
                         "Retained actor returned inconsistent idle-admission evidence; input ownership was preserved".into(),
@@ -1594,6 +1603,10 @@ impl RemoteActor {
             return Ok(());
         }
         let receipts: Vec<InputReceipt> = self.call("acknowledged_inputs", Value::Null)?;
+        self.apply_acknowledged_receipts(&receipts)
+    }
+
+    fn apply_acknowledged_receipts(&self, receipts: &[InputReceipt]) -> Result<(), String> {
         if receipts.len() > 64
             || receipts.iter().any(|receipt| {
                 !matches!(&receipt.state, InputState::Acknowledged(_))
@@ -1606,14 +1619,19 @@ impl RemoteActor {
         // Deliver any still-live local waiter before retirement. Older daemon
         // waiters no longer exist; observing their durable terminal outcome
         // settles metadata without reconstructing or replaying their input.
-        self.apply_receipts(&receipts);
+        self.apply_receipts(receipts);
+        let pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
         let mut retiring = self
             .0
             .retiring_inputs
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        for receipt in &receipts {
-            if !retiring.contains(&receipt.identity) {
+        for receipt in receipts {
+            if !pending
+                .iter()
+                .any(|input| input.identity == receipt.identity)
+                && !retiring.contains(&receipt.identity)
+            {
                 retiring.push(receipt.identity.clone());
             }
         }
@@ -2680,10 +2698,16 @@ impl Server {
                 match self.actor.enqueue_actor(command) {
                     Ok(reply) => self.pending.push((identity, reply, effects)),
                     Err(error) => {
-                        if let Some(run) = run {
-                            journal.finish_unexecuted(&identity, run, error, false)?;
+                        let result = if let Some(run) = run {
+                            journal.finish_unexecuted(&identity, run, error, false)
                         } else {
-                            journal.finish(&identity, InputState::Acknowledged(Err(error)))?;
+                            journal.finish(&identity, InputState::Acknowledged(Err(error)))
+                        };
+                        if let Err(error) = result {
+                            let _ = journal.record_loss(&format!(
+                                "Cannot persist retained enqueue refusal: {error}"
+                            ));
+                            return Err(error);
                         }
                     }
                 }
@@ -5703,6 +5727,15 @@ done"#;
             };
             let response = actor.enqueue(run, command).unwrap();
             let identity = actor.pending_inputs().pop().unwrap();
+            // A real helper can acknowledge queue admission before returning
+            // contradictory completion evidence. The missing fixture socket
+            // must not supply the fence this regression is meant to verify.
+            actor.apply_receipts(&[InputReceipt {
+                identity: identity.clone(),
+                state: InputState::Accepted,
+                not_idle: false,
+            }]);
+            assert!(actor.0.uncertain_input.lock().unwrap().is_none());
             actor.apply_receipts(&[InputReceipt {
                 identity: identity.clone(),
                 state,
@@ -5713,13 +5746,50 @@ done"#;
                 Err(Rejection::Unacknowledged(_))
             ));
             assert_eq!(actor.pending_inputs(), vec![identity.clone()]);
-            assert_eq!(*actor.0.uncertain_input.lock().unwrap(), Some(identity));
+            assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+            assert!(actor.0.pending.lock().unwrap()[0].receipt_invalid);
             assert!(actor.0.retiring_inputs.lock().unwrap().is_empty());
             assert!(
                 actor.enqueue(None, Command::Refresh).is_err(),
                 "uncertain input cannot be replaced"
             );
         }
+    }
+
+    #[test]
+    fn recovery_does_not_retire_a_completion_rejected_by_its_pending_owner() {
+        let actor = RemoteActor::fixture();
+        let response = actor.enqueue(None, Command::Refresh).unwrap();
+        let identity = actor.pending_inputs().pop().unwrap();
+        actor.apply_receipts(&[InputReceipt {
+            identity: identity.clone(),
+            state: InputState::Accepted,
+            not_idle: false,
+        }]);
+        let invalid = InputReceipt {
+            identity: identity.clone(),
+            state: InputState::Acknowledged(Err("claimed contention for a non-prompt".into())),
+            not_idle: true,
+        };
+        actor.apply_acknowledged_receipts(&[invalid]).unwrap();
+        assert!(matches!(
+            response.try_recv().unwrap(),
+            Err(Rejection::Unacknowledged(_))
+        ));
+        assert_eq!(actor.pending_inputs(), vec![identity.clone()]);
+        assert!(actor.0.retiring_inputs.lock().unwrap().is_empty());
+        assert!(actor.enqueue(None, Command::Refresh).is_err());
+        // An authentic ordinary terminal outcome can still settle this exact
+        // identity. It does not reconstruct or resend the provider command.
+        actor
+            .apply_acknowledged_receipts(&[InputReceipt {
+                identity: identity.clone(),
+                state: InputState::Acknowledged(Err("definitive refusal".into())),
+                not_idle: false,
+            }])
+            .unwrap();
+        assert!(actor.pending_inputs().is_empty());
+        assert_eq!(*actor.0.retiring_inputs.lock().unwrap(), vec![identity]);
     }
 
     #[test]
