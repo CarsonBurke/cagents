@@ -1388,6 +1388,10 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
     ),
 ];
 
+fn cleanup_retry_id(id: uuid::Uuid) -> String {
+    format!("chrome.notices.cleanup.{id}")
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     HoverTab(Option<CardId>),
@@ -1404,6 +1408,7 @@ pub enum Action {
     ToggleProjects,
     ToggleNewTab,
     ToggleNotices,
+    RetryCleanup(uuid::Uuid),
     ToggleAttention,
     AttentionPage(usize),
     ShowNoticesFor(CardId),
@@ -1750,6 +1755,8 @@ impl Cagents {
                 if self.refused_terminal_recovery_target().is_some() {
                     ring.push(Cow::Borrowed("session-recovery.open"));
                 }
+                ring.extend(self.chat_ui.cleanup_notices().into_iter().filter(|cleanup| cleanup.retry)
+                    .map(|cleanup| Cow::Owned(cleanup_retry_id(cleanup.id))));
                 ring
             }
         }
@@ -1822,6 +1829,13 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::RetryCleanup(id) => {
+                if self.chrome_ui.popup != Some(Popup::Notices) {
+                    return Task::none();
+                }
+                let retry = self.retry_shared_return_cleanup(id);
+                Task::batch([retry, self.refocus_notices()])
+            }
             Action::HoverTab(card) => {
                 self.chrome_ui.hovered_tab = card;
                 Task::none()
@@ -2144,7 +2158,7 @@ impl Cagents {
     }
 
     fn has_chrome_notices(&self) -> bool {
-        !self.notices.is_empty()
+        self.chat_ui.return_cleanup_unresolved() || !self.notices.is_empty()
             || self
                 .save_health
                 .as_ref()
@@ -2248,7 +2262,8 @@ impl Cagents {
         // From the log, not `self.status`: `update` drains that slot into the
         // log on every message, so reading it here would almost always see
         // `None` and fall back to a warning glyph for an error.
-        let recorded_severity = self.notices.severity().max(health_severity);
+        let cleanup_severity = self.chat_ui.return_cleanup_needs_retry().then_some(NoticeSeverity::Error);
+        let recorded_severity = self.notices.severity().max(health_severity).max(cleanup_severity);
         Some(recorded_severity.unwrap_or(NoticeSeverity::Warning))
     }
 
@@ -2473,6 +2488,32 @@ impl Cagents {
                         false,
                     ));
                 }
+                for cleanup in self.chat_ui.cleanup_notices() {
+                    let severity = if cleanup.retry {
+                        NoticeSeverity::Error
+                    } else {
+                        NoticeSeverity::Warning
+                    };
+                    let message = cleanup.message();
+                    let retry_label = cleanup.retry_label();
+                    let retry_description = cleanup.retry_description();
+                    let body = widget::column::with_children(vec![
+                        super::notice_body(message),
+                        super::notice_surface_detail(severity, cleanup.detail),
+                    ])
+                    .spacing(space::XS)
+                    .into();
+                    let retry = cleanup.retry.then(|| {
+                        super::notice_surface_action(
+                            severity,
+                            retry_label,
+                            retry_description,
+                            widget::Id::new(cleanup_retry_id(cleanup.id)),
+                            Message::ChromeUi(Action::RetryCleanup(cleanup.id)),
+                        )
+                    });
+                    notices.push(super::notice_surface(severity, body, retry, false));
+                }
                 if let Some(health) = &self.save_health {
                     notices.extend(save_health_views(
                         health,
@@ -2490,9 +2531,17 @@ impl Cagents {
                 ];
                 if !self.notices.is_empty() {
                     heading_children.push(
-                        crate::ui_controls::button::quiet("Dismiss all")
+                        crate::ui_controls::button::quiet(if self.chat_ui.return_cleanup_unresolved() {
+                            "Dismiss messages"
+                        } else {
+                            "Dismiss all"
+                        })
                             .id(widget::Id::new(NOTICES_DISMISS_ALL_ID))
-                            .name("Dismiss every application notice")
+                            .name(if self.chat_ui.return_cleanup_unresolved() {
+                                "Dismiss application messages; keep unresolved cleanup"
+                            } else {
+                                "Dismiss every application notice"
+                            })
                             .on_press(Message::DismissAllNotices)
                             .into(),
                     );

@@ -566,6 +566,8 @@ impl Cagents {
                 error,
             } => {
                 tracing::warn!(?scope, %operation, %error, "the registry refused a view edit");
+                let returned =
+                    self.refuse_native_terminal_return_operation(operation, error.clone());
                 if self.shared_views.is_requested_transfer(operation) {
                     self.reject_pane_transfer(operation, error);
                 } else {
@@ -574,7 +576,7 @@ impl Cagents {
                         "The pane change was not applied: {error}"
                     )));
                 }
-                self.reconcile_shared_views()
+                Task::batch([returned, self.reconcile_shared_views()])
             }
             ModelUpdate::NavigationFailed(error) => {
                 self.status = Some(TransientNotice::warning(format!(
