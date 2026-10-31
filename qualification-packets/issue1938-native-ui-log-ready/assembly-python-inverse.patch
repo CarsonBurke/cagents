@@ -1,0 +1,34 @@
+--- a/run-native.py
++++ b/run-native.py
+@@ -23,9 +23,9 @@
+ import sys
+ import time
+ 
+-PLAN_SHA256 = "a41ff691d544ffc3437a923898c9862691733f4b8cd7e0ac336e794e856438d8"
++PLAN_SHA256 = "d574904b23aec7cf9601bbbe456aa0dda104ea1956f1f8ee46023a8954627da2"
+ HERE = Path(__file__).resolve().parent
+-ROOT = Path("/tmp/coord16-1938-native-ui-log-corrected-1f1e78ab/owned-native")
++ROOT = Path("/tmp/coord16-1938-native-fixed-1f1e78ab/owned-native")
+ CHECKOUT = Path("/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout")
+ COMMON = Path("/home/marvin/Documents/repositories/cagents/.worktrees/fw16-backend-control-ec204421/.git")
+ TARGET = CHECKOUT.parent / "lane-c-target"
+@@ -33,7 +33,7 @@
+ OWNER = "validation-lane-c"
+ ENGINE_SHA = "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
+ HELPER_SHA = "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74"
+-CONTROLLER_SHA = "6c6f29622c26657f7ca9b355383dc79a2176f92b0444e927b938ebbff17e3714"
++CONTROLLER_SHA = "b41fe9b612ed014aa52be34611f0b6fa2256e9f24fe41fa4c4a5b7d67b21b39e"
+ NAMESPACE_SHA = "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2"
+ SOURCE_SHA = "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77"
+ PHASES_SHA = "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1"
+--- a/controller.py
++++ b/controller.py
+@@ -21,7 +21,7 @@
+ 
+ 
+ APP_ID = "dev.cagents.Cagents.Development"
+-ALLOWED_ROOT = Path('/tmp/coord16-1938-native-ui-log-corrected-1f1e78ab/owned-native')
++ALLOWED_ROOT = Path('/tmp/coord16-1938-native-fixed-1f1e78ab/owned-native')
+ MAX_WINDOWS = 4096
+ MAX_DEPTH = 16
+ 

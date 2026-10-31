@@ -1,0 +1,447 @@
+{
+  "allocation_fields": {
+    "adapter_sha256": [
+      "adapter_sha256"
+    ],
+    "after": [
+      "after"
+    ],
+    "allocation_id": [
+      "allocation_id"
+    ],
+    "before": [
+      "before"
+    ],
+    "checkout": [
+      "checkout"
+    ],
+    "expires_utc": [
+      "expires_utc"
+    ],
+    "lock": [
+      "lock"
+    ],
+    "owner": [
+      "owner"
+    ],
+    "plan_sha256": [
+      "plan_sha256"
+    ],
+    "scene": [
+      "scene"
+    ],
+    "target": [
+      "target"
+    ],
+    "viewport": [
+      "viewport"
+    ]
+  },
+  "attempts": 0,
+  "binding_facts_provenance": {
+    "capture_root_observed_or_created": false,
+    "current_global_closure": null,
+    "current_local_context": null,
+    "current_owner_or_resource_availability": null,
+    "current_physical_facts": null,
+    "historical_C942d": {
+      "EC_return_acceptance": {
+        "path": "/tmp/fw16-backend-ec204421/root16-942d-actual-return-acceptance-v1.json",
+        "sha256": "20c79e2d74b04551bb6bf482fea17959ff130ac822cc9669395dcfa6d0794495"
+      },
+      "accepted_original_delivery": {
+        "path": "/var/tmp/coord16-C942d-original-executor-5isazpa3/accepted-original-delivery.json",
+        "sha256": "b83eb310d91f317ce3170e6f8f7781b61fbc73a053a3da9624d8f971c9d6204c"
+      },
+      "original_executor_return": {
+        "path": "/var/tmp/coord16-C942d-original-executor-5isazpa3/actual-original-executor-return.json",
+        "sha256": "d02e6db1f0c6aa1b65c8ec1fbcf3962a0cf54882d4207f95d634c97d339cd884"
+      }
+    },
+    "historical_C942d_scope": "Original failed attempt retained untouched; not re-audited/reclassified here. B9 later C ownership means this is not current global/local context or a new grant.",
+    "predecessor_plan": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-1938-native-cargo-selector/qualification-packets/issue1938-native/adapter-plan.json",
+      "sha256": "d574904b23aec7cf9601bbbe456aa0dda104ea1956f1f8ee46023a8954627da2"
+    },
+    "source_only_proposed_capture_root": "/tmp/coord16-1938-native-ui-log-corrected-1f1e78ab/owned-native",
+    "status": "HISTORICAL_PROVENANCE_ONLY_NOT_CURRENT_PHYSICAL_GLOBAL_OR_LOCAL_FACTS"
+  },
+  "binding_status": "UNBOUND_HOLD",
+  "capture_root": {
+    "identity": null,
+    "previous_receipt": null
+  },
+  "cargo_home_route": {
+    "expected_cargo_home": "/home/marvin/.cargo",
+    "expected_home": "/home/marvin",
+    "policy": "opaque-HOME-equality-only"
+  },
+  "case_seconds": 3600,
+  "checkout": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout",
+  "common_git_dir": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-backend-control-ec204421/.git",
+  "compiler_environment_absent": [
+    "CARGO_HOME",
+    "RUSTC",
+    "RUSTDOC"
+  ],
+  "compiler_overlay": {
+    "CAGENTS_ZIG": "/home/marvin/.local/share/mise/installs/zig/0.15.2/zig",
+    "prepend_path": [
+      "/home/marvin/.local/share/mise/installs/zig/0.15.2",
+      "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin"
+    ]
+  },
+  "context_files": null,
+  "context_provenance": "UNOBSERVED_HOLD. Reference paths are declared scope only; null current context_files is not a verified absence. Root/EC must provide fresh exact hash/absence records before any BOUND transition.",
+  "control": {
+    "common_identity": null,
+    "head": null,
+    "identity": null,
+    "metadata": null,
+    "repository": null,
+    "tree": null
+  },
+  "coverage_backlog_not_executed_by_this_invocation": [
+    "claude-sparse-wide",
+    "claude-sparse-narrow",
+    "claude-malformed-wide",
+    "claude-delayed-wide",
+    "claude-delayed-narrow",
+    "claude-ticket-wide",
+    "claude-ticket-narrow",
+    "codex-sparse-wide",
+    "codex-sparse-narrow",
+    "codex-malformed-wide",
+    "codex-malformed-narrow",
+    "codex-delayed-wide",
+    "codex-delayed-narrow",
+    "codex-ticket-wide",
+    "codex-ticket-narrow"
+  ],
+  "coverage_obligations": {
+    "essential_controls": "Actual root/client frames must show Accounts title/provider/row/error/last check, Refresh and account/default/info controls where normally present. Review labels/occlusion; unknown does not imply signed out. Missing essential controls block UX qualification.",
+    "focus": "Native-window focus never establishes widget focus. Tab/ShiftTab and actual reviewed control behavior require independent native observation.",
+    "initial_pair": "claude-malformed-narrow only: unknown SYSTEM first failure, real visible Check now, valid current recovery and native Tab/ShiftTab observations.",
+    "other15": "All other15 scene/viewport combinations are unexecuted coverage backlog; no aggregate qualification.",
+    "responsiveness": "Timestamp captures and original per-gesture intervals may identify stalls but are not controlled before/after performance metrics or automatic UX pass.",
+    "scroll": "Source fixture has only a bounded synthetic data set. Do not invent a scrollbar/scroll action if content fits; meaningful scrolling at realistic scale remains native evidence backlog.",
+    "stale_ticket": "After original A cannot consume B; Before serial is fixture label only and observed old callback settles B. Logical120s staging is not real watchdog timing.",
+    "startup": "registry_ready=true means policy startup/registry admission gates are not exercised by these scenes."
+  },
+  "current_context_facts": {
+    "C_availability": null,
+    "HOME_or_authority": null,
+    "checkout": null,
+    "display_or_clipboard_availability": null,
+    "frame_coordinate_admission": null,
+    "global_family_closure": null,
+    "inherited_environment": null,
+    "installed_tools": null,
+    "local_accepted_return": null,
+    "lock": null,
+    "native_grant": null,
+    "physical_control": null,
+    "profile": null,
+    "registry": null,
+    "source_config_or_absence": null,
+    "source_objects": null,
+    "target": null
+  },
+  "display": ":28641",
+  "execution_authorized": false,
+  "expected_cargo_features": {
+    "cagents": [
+      "development"
+    ],
+    "cagents-ui": [
+      "development",
+      "ui"
+    ],
+    "cagentsd": [
+      "development",
+      "host"
+    ]
+  },
+  "frozen_control_reference": {
+    "common_git_dir": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-backend-control-ec204421/.git",
+    "custody_sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "head": "359829626964afc78019dd32bd435696584dbb54",
+    "helper_sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+    "repository": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2002-host-driver",
+    "role": "static source reference, not current physical metadata or permission",
+    "tree": "fbaae5cafbc422c855b4e1ac39e2c3a52d64273c"
+  },
+  "grant": null,
+  "historical_reference_tools": {
+    "paths_and_predecessor_hashes": {
+      "Xvfb": {
+        "path": "/tmp/coord16-native-xvfb-IPeg6B/extracted/usr/bin/Xvfb",
+        "sha256": "0d7c7f17ca2c114068c6fa18521690c8f495a4eed1cc96cd000939ab88b37a19"
+      },
+      "cargo": {
+        "path": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+        "sha256": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578"
+      },
+      "dbus-daemon": {
+        "path": "/usr/bin/dbus-daemon",
+        "sha256": "29d3794065ffbfd0ddee415f2c2293666f9192656f2ebb0fde18511242c967b2"
+      },
+      "dirname": {
+        "path": "/usr/bin/dirname",
+        "sha256": "34bb4003eecc1f0820c513c49895e38950e7002ab64cca7aaf0c37b6373dfaea"
+      },
+      "git": {
+        "path": "/usr/bin/git",
+        "sha256": "165edf777d5c93587be3b0829d1ff718d3dc74bd16e42a72a816606d7af640e8"
+      },
+      "libX11": {
+        "path": "/usr/lib64/libX11.so.6.4.0",
+        "sha256": "722427a92ddfded15802489c911ab210981c8aaaa6ef641f727b3c8f1f691dc8"
+      },
+      "libXtst": {
+        "path": "/usr/lib64/libXtst.so.6.1.0",
+        "sha256": "267bced39b17f900d883bea547055f4a37fcdccf2657a83a9693dcb0a60d45f8"
+      },
+      "pillow": {
+        "path": "/usr/lib64/python3.13/site-packages/PIL/ImageGrab.py",
+        "sha256": "fbd452f2a3fa9daae4e515b7d48ad15e5acf36b4e7a3e81125bd333ae8f28b8f"
+      },
+      "python3": {
+        "path": "/usr/bin/python3.13",
+        "sha256": "2168cdd7a404990b44a5a39044e8ac22c41af9080601ebdac02b87de5140c43c"
+      },
+      "readlink": {
+        "path": "/usr/bin/readlink",
+        "sha256": "824b0c93efa31b86b0a465a07342caf91455867c7d28b68faa543007553a289e"
+      },
+      "rustc": {
+        "path": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/rustc",
+        "sha256": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57"
+      },
+      "sed": {
+        "path": "/usr/bin/sed",
+        "sha256": "9168e91a1f1155afd3795f384119028f7c3170f494e4e435c3bf0b52bc4f5700"
+      },
+      "sh": {
+        "path": "/usr/bin/bash",
+        "sha256": "ebaf6e903cbf5d685121859d3e6cd0d11da1ed5075b0c1761fce6362e78a0dfc"
+      },
+      "xauth": {
+        "path": "/usr/bin/xauth",
+        "sha256": "7b328ac72390bed83de7c6ccaf7f59655bbabd0a91008b9ffca0e3ddba1a80dc"
+      },
+      "zig": {
+        "path": "/home/marvin/.local/share/mise/installs/zig/0.15.2/zig",
+        "sha256": "2858dc89dbbfdd08cceda1b841e7fd0a793a1a67b49f150bc3d0d1de44ed7f51"
+      }
+    },
+    "source_plan": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-1938-native-cargo-selector/qualification-packets/issue1938-native/adapter-plan.json",
+      "sha256": "d574904b23aec7cf9601bbbe456aa0dda104ea1956f1f8ee46023a8954627da2"
+    },
+    "status": "IMMUTABLE_PREDECESSOR_SOURCE_METADATA_ONLY_NOT_CURRENT_TOOL_FACTS"
+  },
+  "holds": [
+    "Pending independent exact new-root/source/hash DAG assembly review; corrected source179b alone is not this binding review.",
+    "Root/EC must supply actual current canonical checkout/control/registry/original-inode/target/lock facts and current accepted-return context; B9 later ownership may retarget.",
+    "Actual source-object presence in canonical execution common is unobserved and null; no common Git/helper call was made.",
+    "All current installed tool hashes, ancestor configuration/absence facts, natural inherited context and full global family/namespace closure facts are unobserved/null.",
+    "Fresh fixed capture root/display/clipboard/five-empty-XDG exclusivity and original source/window/frame/coordinate reviews remain runtime obligations; no observation/allocation here.",
+    "Fresh exact original scoped EC grant/current expiry/owner handoff/preflight are null; historical C942d return/acceptance cannot authorize this packet."
+  ],
+  "initial_checkout": {
+    "accepted_prior_return": null,
+    "checkout_identity": null,
+    "head": null,
+    "registry": null,
+    "tree": null
+  },
+  "limits": [
+    "One fixed claude-malformed-narrow pair, Before then After serially. All other15 combinations are source-plan backlog, not this invocation. Each side gets three sequential matched prebuilds once; normal runner repeats warm builds.",
+    "Separate fresh exclusive revision-suffixed XDG roots. No archive/reset/deletion/adoption. Only original matching scene Custody, after its distinct helper owner closes, authorizes its namespace FD close. All unknowns retain C.",
+    "Exactly two fixed nonpointer pixel exceptions: initial layout and F8. Both require exact original scene/work phase and fresh reviewed frames with every RGB difference retained. F8 requires existing native-window focus; original resize_focus acquires/verifies it for layout. Click/hover/Tab retain full-frame equality; no masks/ignored regions.",
+    "Native window focus is not widget focus. Tab/ShiftTab returns are observations only. Narrow scrollbar/info/default-layout evidence still needs actual reviewed frames; no absent scrollbar/control may be guessed.",
+    "Before uses original pure parsers and original callback/reducer through an explicitly injected adapter. After uses real current collectors/finishers/reducer. Neither exercises provider/transport/real home/cache/login/daemon cleanup or120s watchdog.",
+    "Fixture registry_ready=true bypasses startup/policy bootstrapping. No startup-readiness qualification from any of these8scenes.",
+    "Original statuses, partial/failed captures and receipts are retained. Planned owned SIGTERM/SIGKILL is not natural-close UX. No automatic screenshot/responsiveness/UX PASS."
+  ],
+  "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+  "lock_identity": null,
+  "owner": "validation-lane-c",
+  "pair": {
+    "after": {
+      "head": "bb9524d5caba771e817e1c54d0f03c6455d913ae",
+      "tree": "a6ba27f620b9f80dd59a3be46966e36a509340f6"
+    },
+    "before": {
+      "head": "e10c855c10f58b2019887e4e864c47b59c3f8d58",
+      "tree": "8c26393b40af3f89aa22dbaffb81c315d7cabaca"
+    }
+  },
+  "pair_seconds": 7200,
+  "proposed_capture_root": "/tmp/coord16-1938-native-ui-log-corrected-1f1e78ab/owned-native",
+  "reference_context_scope": [
+    "/.cargo/config",
+    "/.cargo/config.toml",
+    "/home/.cargo/config",
+    "/home/.cargo/config.toml",
+    "/home/marvin/.cargo/config",
+    "/home/marvin/.cargo/config.toml",
+    "/home/marvin/Documents/.cargo/config",
+    "/home/marvin/Documents/.cargo/config.toml",
+    "/home/marvin/Documents/repositories/.cargo/config",
+    "/home/marvin/Documents/repositories/.cargo/config.toml",
+    "/home/marvin/Documents/repositories/cagents/.cargo/config",
+    "/home/marvin/Documents/repositories/cagents/.cargo/config.toml",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/.cargo/config",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/.cargo/config.toml",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/rust-toolchain",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/rust-toolchain.toml",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/.cargo/config",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/.cargo/config.toml",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout/.cargo/config",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout/.cargo/config.toml",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout/rust-toolchain",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout/rust-toolchain.toml",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/rust-toolchain",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/rust-toolchain.toml",
+    "/home/marvin/Documents/repositories/cagents/rust-toolchain",
+    "/home/marvin/Documents/repositories/cagents/rust-toolchain.toml",
+    "/home/marvin/Documents/repositories/rust-toolchain",
+    "/home/marvin/Documents/repositories/rust-toolchain.toml",
+    "/home/marvin/Documents/rust-toolchain",
+    "/home/marvin/Documents/rust-toolchain.toml",
+    "/home/marvin/rust-toolchain",
+    "/home/marvin/rust-toolchain.toml",
+    "/home/rust-toolchain",
+    "/home/rust-toolchain.toml",
+    "/rust-toolchain",
+    "/rust-toolchain.toml"
+  ],
+  "reviewed_inputs": [
+    {
+      "path": "/var/tmp/coord16-1938-before-adapter-independent-source-uaw7_6bk/review.json",
+      "sha256": "4c7da90a0ffcefcd36c2c0db31abf7ee94a4631ac9467f11d246d82c3359a38b"
+    },
+    {
+      "path": "/var/tmp/coord16-1938-native-listed-independent-6hzogmut/review.json",
+      "sha256": "8c57dffb268d3daaee8caf4641185c59681dcf2157a3a06c1b0133dff1dffeeb"
+    },
+    {
+      "path": "/var/tmp/coord16-1938-log-hold-independent-sui7a75a/review.json",
+      "sha256": "179b64f925160958746aaf9ca80cddf5826e96252d9fee9df10e2ee2da9fb347"
+    }
+  ],
+  "scene": "claude-malformed",
+  "source_objects_available_in_execution_common": null,
+  "source_reference_provenance": {
+    "no_native_adapter_self_hash_in_plan": true,
+    "pair": "Unchanged source-binding exact e10c/8c26 Before -> bb9524/a6ba After; source objects not re-observed in execution common.",
+    "runner_sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+    "runner_sha256_field_status": "VALID_IMMUTABLE_DEVELOPMENT_RUNNER_SOURCE_IDENTITY_DISTINCT_FROM_NATIVE_ADAPTER",
+    "source_gate_scope": "179b source gate covers corrected log source only; no lifecycle/runtime/native/head/type qualification and no current physical facts."
+  },
+  "source_references": {
+    "after_fixture_sha256": "e202e3f5be4ccf90bca4291cf4d591d89bbfc8ca68e880b5627b36a6708dce18",
+    "after_source_review": {
+      "path": "/var/tmp/coord16-1938-native-listed-independent-6hzogmut/review.json",
+      "sha256": "8c57dffb268d3daaee8caf4641185c59681dcf2157a3a06c1b0133dff1dffeeb"
+    },
+    "before_fixture_sha256": "f56e165062bb951998fa8f4a2340076642affbaca97ca080fda62b44e3f5c82c",
+    "before_source_review": {
+      "path": "/var/tmp/coord16-1938-before-adapter-independent-source-uaw7_6bk/review.json",
+      "sha256": "4c7da90a0ffcefcd36c2c0db31abf7ee94a4631ac9467f11d246d82c3359a38b"
+    },
+    "controller_sha256": "6c6f29622c26657f7ca9b355383dc79a2176f92b0444e927b938ebbff17e3714",
+    "corrected_log_source_review": {
+      "path": "/var/tmp/coord16-1938-log-hold-independent-sui7a75a/review.json",
+      "sha256": "179b64f925160958746aaf9ca80cddf5826e96252d9fee9df10e2ee2da9fb347"
+    },
+    "custody_sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "donor_runner_sha256": "c66ef8e5363dee7cf39187c717387c813c1f8c11a8a2548971d72625195be9d9",
+    "helper_sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74",
+    "input_contract_sha256": "271df7f66ba7bae291d1e35fe9d95538a0ddbdc890dff14d01eed3c938ae9242",
+    "namespace_sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2",
+    "phases_sha256": "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1",
+    "runner_sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+    "source_binding_sha256": "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77"
+  },
+  "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+  "target_identity": null,
+  "tools": {
+    "Xvfb": {
+      "path": "/tmp/coord16-native-xvfb-IPeg6B/extracted/usr/bin/Xvfb",
+      "sha256": null
+    },
+    "cargo": {
+      "path": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+      "sha256": null
+    },
+    "dbus-daemon": {
+      "path": "/usr/bin/dbus-daemon",
+      "sha256": null
+    },
+    "dirname": {
+      "path": "/usr/bin/dirname",
+      "sha256": null
+    },
+    "git": {
+      "path": "/usr/bin/git",
+      "sha256": null
+    },
+    "libX11": {
+      "path": "/usr/lib64/libX11.so.6.4.0",
+      "sha256": null
+    },
+    "libXtst": {
+      "path": "/usr/lib64/libXtst.so.6.1.0",
+      "sha256": null
+    },
+    "pillow": {
+      "path": "/usr/lib64/python3.13/site-packages/PIL/ImageGrab.py",
+      "sha256": null
+    },
+    "python3": {
+      "path": "/usr/bin/python3.13",
+      "sha256": null
+    },
+    "readlink": {
+      "path": "/usr/bin/readlink",
+      "sha256": null
+    },
+    "rustc": {
+      "path": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/rustc",
+      "sha256": null
+    },
+    "sed": {
+      "path": "/usr/bin/sed",
+      "sha256": null
+    },
+    "sh": {
+      "path": "/usr/bin/bash",
+      "sha256": null
+    },
+    "xauth": {
+      "path": "/usr/bin/xauth",
+      "sha256": null
+    },
+    "zig": {
+      "path": "/home/marvin/.local/share/mise/installs/zig/0.15.2/zig",
+      "sha256": null
+    }
+  },
+  "version": 1,
+  "viewport": "narrow",
+  "x11_routing": {
+    "account_authority": "opaque-preserved",
+    "normal_runner_warm_builds": "inherit-owned-ui-environment",
+    "policy": "owned-x11-children-only",
+    "removed_names": [
+      "WAYLAND_DISPLAY",
+      "WAYLAND_SOCKET",
+      "XDG_ACTIVATION_TOKEN",
+      "DESKTOP_STARTUP_ID"
+    ],
+    "wrapper_and_explicit_prebuild_window_routes": "unchanged"
+  }
+}

@@ -1,0 +1,127 @@
+{
+  "historical_only_unchanged_files": [
+    "donor-conservation.json",
+    "controller.py.from-1775.patch",
+    "namespace.py.from-1775.patch",
+    "run-native.py.from-1775.patch"
+  ],
+  "predecessor_inventory": {
+    "README.md": {
+      "bytes": 3753,
+      "mode": 420,
+      "sha256": "5c6e49e55c884ec536f037cdbf83fab8cbb806713a0d90d74349586822cc9fb6"
+    },
+    "adapter-plan.json": {
+      "bytes": 24246,
+      "mode": 420,
+      "sha256": "d574904b23aec7cf9601bbbe456aa0dda104ea1956f1f8ee46023a8954627da2"
+    },
+    "controller.py": {
+      "bytes": 67124,
+      "mode": 420,
+      "sha256": "a5718c503247d2f7607291b5354f3148a95cdfa1838c16f7db792242d507c639"
+    },
+    "controller.py.from-1775.patch": {
+      "bytes": 19954,
+      "mode": 420,
+      "sha256": "d54d8ea9131a1cb1607280b84971fabe59d58be2ea74ce938650927eae734c4b"
+    },
+    "donor-conservation.json": {
+      "bytes": 4079,
+      "mode": 420,
+      "sha256": "3ba51fe11bfe5e5f816919634af9083e8825e88c92b7e8b87fcfb8e2a48ea61e"
+    },
+    "draft-binding.json": {
+      "bytes": 8949,
+      "mode": 420,
+      "sha256": "b22b1c820b064f109ca40f4c98b53a35399b079f757b06c1871d4bdef93b475d"
+    },
+    "input-contract.json": {
+      "bytes": 3343,
+      "mode": 420,
+      "sha256": "271df7f66ba7bae291d1e35fe9d95538a0ddbdc890dff14d01eed3c938ae9242"
+    },
+    "manifest.json": {
+      "bytes": 26498,
+      "mode": 420,
+      "sha256": "62047446309491f32f28cb5bed354c9db9ef21392c4868b13552977d881d617e"
+    },
+    "namespace.py": {
+      "bytes": 11499,
+      "mode": 420,
+      "sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2"
+    },
+    "namespace.py.from-1775.patch": {
+      "bytes": 7857,
+      "mode": 420,
+      "sha256": "43a64125959853b133361fc2b046957befe6235c16b6abadc60fa057f8c7d774"
+    },
+    "phases.json": {
+      "bytes": 105690,
+      "mode": 420,
+      "sha256": "2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1"
+    },
+    "run-native.py": {
+      "bytes": 64490,
+      "mode": 420,
+      "sha256": "fca6ecc5b04117688e9576c0fd1486c708a067406f6a13c55f1d2180270451cc"
+    },
+    "run-native.py.from-1775.patch": {
+      "bytes": 18966,
+      "mode": 420,
+      "sha256": "3ccd2fe08d2e0d0eac227e6cd1e065a103ec78b95d8916bbb9ca6b8c37a568d0"
+    },
+    "source-binding.json": {
+      "bytes": 4399,
+      "mode": 420,
+      "sha256": "75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77"
+    }
+  },
+  "predecessor_source_author": {
+    "path": "/var/tmp/coord16-1938-ui-log-hold-successor-9aw63et1/manifest.json",
+    "sha256": "aa8723bf78d0c6461c0cf4f95b91f8291e4d66cd94bfa34dd1a6c3a5a994dd0e"
+  },
+  "predecessor_source_gate": {
+    "path": "/var/tmp/coord16-1938-log-hold-independent-sui7a75a/review.json",
+    "sha256": "179b64f925160958746aaf9ca80cddf5826e96252d9fee9df10e2ee2da9fb347"
+  },
+  "python": {
+    "controller.py": {
+      "all_function_bytes_exact": true,
+      "changed_top_level_assignments": [
+        "ALLOWED_ROOT"
+      ],
+      "function_count_including_nested": 47,
+      "inverse_recovers_corrected_predecessor_complete_bytes": true,
+      "new_sha256": "6c6f29622c26657f7ca9b355383dc79a2176f92b0444e927b938ebbff17e3714",
+      "old_sha256": "a5718c503247d2f7607291b5354f3148a95cdfa1838c16f7db792242d507c639"
+    },
+    "namespace.py": {
+      "all_function_bytes_exact": true,
+      "changed_top_level_assignments": [],
+      "function_count_including_nested": 10,
+      "inverse_recovers_corrected_predecessor_complete_bytes": true,
+      "new_sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2",
+      "old_sha256": "20d2bb1dd58c690c6c480ca20812f342daa5de99c3896e13911341b320474ff2"
+    },
+    "run-native.py": {
+      "all_function_bytes_exact": true,
+      "changed_top_level_assignments": [
+        "PLAN_SHA256",
+        "ROOT",
+        "CONTROLLER_SHA"
+      ],
+      "function_count_including_nested": 37,
+      "inverse_recovers_corrected_predecessor_complete_bytes": true,
+      "new_sha256": "c5cdbf195b5b220f38c53e5ca0b4a6580adaecdb9c25489c481fe038575dff7f",
+      "old_sha256": "fca6ecc5b04117688e9576c0fd1486c708a067406f6a13c55f1d2180270451cc"
+    }
+  },
+  "status": "AUTHOR_STATIC_SOURCE_ONLY_NOT_INDEPENDENT_OR_RUNTIME_REVIEW",
+  "unchanged_source_and_policy_files": [
+    "namespace.py",
+    "source-binding.json",
+    "phases.json",
+    "input-contract.json"
+  ]
+}

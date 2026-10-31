@@ -1,0 +1,58 @@
+{
+  "checkout": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-checkout",
+  "common_git_dir": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-backend-control-ec204421/.git",
+  "limits": [
+    "Before is a disclosed injected original pure-parser/old-callback adapter, not old provider/transport/collector/ticket or clock qualification.",
+    "After uses actual production collectors/finishers and current reducer; all provider/auth/home/daemon transport remains synthetic.",
+    "Logical debounce/expiration stages are fixture scheduling inputs, not actual watchdog timing evidence."
+  ],
+  "sides": {
+    "after": {
+      "files": {
+        ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "mise.toml": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe",
+        "scripts/check-format-cache.py": "d722ec3c11165c22897630d0d5197afd49bd5d156c31068534c983153d3dd00b",
+        "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+        "src/account.rs": "2e19aa0f020724a784352664552eb809068ce3b9997378927f70b3474aae1a5f",
+        "src/account/claude.rs": "8690e6311aabfb8936a778ea71fe49471c80bf107db55a0bd693725d042416fd",
+        "src/account/codex.rs": "4c75e2033a9c3c30ee53d1fcf3222a045f9f7fc1c38a2121b34d0da53de131e1",
+        "src/account/probe.rs": "9fe5a07dd2fa906150029ad304da0ca60ca597f918d31f6497bd301f3bf54dcb",
+        "src/account/routing.rs": "f509865c537f7ed87f498bb86415b4c2df02924e396b3d2b3c8fa14a1c6283dc",
+        "src/account/schedule.rs": "c7848fded3282be7640410d899d9d93d6e3b5f1859e01624b4a06905bb442362",
+        "src/app.rs": "e7351e2ff3994fa61afb99d727266ab029373bebede43a4a6a1d60c44eeac769",
+        "src/app/account_ui.rs": "6cf70fd84cc43f8dec9fdb1b1423c1df594325fe572e11e26ce6ce7045bec798",
+        "src/app/account_ui/native_quota_fixture.rs": "e202e3f5be4ccf90bca4291cf4d591d89bbfc8ca68e880b5627b36a6708dce18",
+        "src/app/account_ui/table.rs": "327e914d4f9f797080681bd84a34ea63aaffb3767e6771677d9eb93f50131b4b",
+        "src/bin/cagents-ui.rs": "a424ad6fbc6d39be094a2db2d7a8988f021576f1e079d9e03adb5368622c5079"
+      },
+      "head": "bb9524d5caba771e817e1c54d0f03c6455d913ae",
+      "tree": "a6ba27f620b9f80dd59a3be46966e36a509340f6"
+    },
+    "before": {
+      "files": {
+        ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "mise.toml": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe",
+        "scripts/check-format-cache.py": "d722ec3c11165c22897630d0d5197afd49bd5d156c31068534c983153d3dd00b",
+        "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+        "src/account.rs": "2e19aa0f020724a784352664552eb809068ce3b9997378927f70b3474aae1a5f",
+        "src/account/claude.rs": "97a347af6c6693bd014224119f93d841f2e5f1dde8ecfc22e65b96142664e420",
+        "src/account/codex.rs": "c039759945be14566573d9ef810d557515b01aa826d5cc839c9a7ab4ee6ec6b1",
+        "src/account/probe.rs": "8bad2bc8bdbd9b10d00c1ba364f085bb1dd9a05cc96b307dca68ee915fd8faaa",
+        "src/account/routing.rs": "a73bd874ef23c8b4c69492c72ad902fe0efb59c7a2fb5190f13af530da52dfdb",
+        "src/account/schedule.rs": "c7848fded3282be7640410d899d9d93d6e3b5f1859e01624b4a06905bb442362",
+        "src/app.rs": "e7351e2ff3994fa61afb99d727266ab029373bebede43a4a6a1d60c44eeac769",
+        "src/app/account_ui.rs": "c6a1fc51c34cb5722de932555c71654c530f887f8468e5d626d9d27415f3a399",
+        "src/app/account_ui/native_quota_fixture.rs": "f56e165062bb951998fa8f4a2340076642affbaca97ca080fda62b44e3f5c82c",
+        "src/app/account_ui/table.rs": "419be95881155e2f615dde1bb343915676fb2e6f62281e24f1df17fbd195364e",
+        "src/bin/cagents-ui.rs": "a424ad6fbc6d39be094a2db2d7a8988f021576f1e079d9e03adb5368622c5079"
+      },
+      "head": "e10c855c10f58b2019887e4e864c47b59c3f8d58",
+      "tree": "8c26393b40af3f89aa22dbaffb81c315d7cabaca"
+    }
+  },
+  "version": 1
+}

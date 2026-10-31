@@ -1,0 +1,276 @@
+--- donor/controller.py
++++ accounts/controller.py
+@@ -21,19 +21,19 @@
+ 
+ 
+ APP_ID = "dev.cagents.Cagents.Development"
+-ALLOWED_ROOT = Path('/tmp/coord16-pr1775-native-fixed-574ac717/owned-native')
++ALLOWED_ROOT = Path('/tmp/coord16-1938-native-fixed-1f1e78ab/owned-native')
+ MAX_WINDOWS = 4096
+ MAX_DEPTH = 16
+ 
+-FORBIDDEN_NAMES = ('CAGENTS_DEVELOPMENT_AUTOMATION_FIXTURE', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'CAGENTS_DEVELOPMENT_NATIVE_IDENTITY_FIXTURE', 'CAGENTS_CHAT_STAGE_OUTPUT', 'CAGENTS_UI_LAUNCH_HANDSHAKE', 'CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS', 'CAGENTS_UI_UPDATE_GUARD_FD', 'CAGENTS_DAEMON_LAUNCH_FENCE_FD', 'CAGENTS_DEVELOPMENT_DAEMON_RECOVERY_FIXTURE', 'CAGENTS_LATENCY_OUTPUT', 'CAGENTS_INSTALL_RESULT_FD', 'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY', 'XDG_ACTIVATION_TOKEN', 'DESKTOP_STARTUP_ID', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS')
++FORBIDDEN_NAMES = ('CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE', 'CAGENTS_DEVELOPMENT_AUTOMATION_FIXTURE', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'CAGENTS_DEVELOPMENT_NATIVE_IDENTITY_FIXTURE', 'CAGENTS_CHAT_STAGE_OUTPUT', 'CAGENTS_UI_LAUNCH_HANDSHAKE', 'CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS', 'CAGENTS_UI_UPDATE_GUARD_FD', 'CAGENTS_DAEMON_LAUNCH_FENCE_FD', 'CAGENTS_DEVELOPMENT_DAEMON_RECOVERY_FIXTURE', 'CAGENTS_LATENCY_OUTPUT', 'CAGENTS_INSTALL_RESULT_FD', 'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY', 'XDG_ACTIVATION_TOKEN', 'DESKTOP_STARTUP_ID', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_CONFIG', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER', 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS')
+ FORBIDDEN_PREFIXES = ('CARGO_PROFILE_', 'GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+ 
+ 
+ 
+ SOURCE_BINDING = Path(__file__).with_name("source-binding.json")
+-SOURCE_BINDING_SHA256 = '1c6508a197bf39b4014786ecffb4753dc716685f4d31f971cccba5e2d444862d'
++SOURCE_BINDING_SHA256 = '75843169bba188989984e22d72471100a178a2f5d9c8ac4b7bd164616bdf0e77'
+ PHASE_PLAN = Path(__file__).with_name("phases.json")
+-PHASE_PLAN_SHA256 = '6cce0b3e2e4ae33013d7cba8ea0fc9f25cb75183cfcb852869309321501eef97'
++PHASE_PLAN_SHA256 = '2a09badabaabd2aa377eaefb0e4b5d029926498cf32d49f723df273e06aca2e1'
+ 
+ class Refused(Exception):
+     pass
+@@ -637,7 +637,7 @@
+                     raise
+ 
+ 
+-    def automation_phase(self, window, phase, review, review_sha256, launch, deadline):
++    def accounts_phase(self, window, phase, review, review_sha256, launch, deadline):
+         """One reviewed native gesture; returned input is never a UX/test pass."""
+         import io
+         import math
+@@ -646,15 +646,15 @@
+         from PIL import Image
+ 
+         plans = source_json(PHASE_PLAN, PHASE_PLAN_SHA256)
+-        rows = plans["scenes"][launch["scene"]]
++        rows = plans["scenes"][launch["scene"]][launch["side"]]["phases"]
+         matches = [row for row in rows if row["phase"] == phase]
+         require(len(matches) == 1, "Unsupported phase for this fixed scene")
+         spec = matches[0]
+         directory = self.owned.receipt_path.parent
+-        packet_path = directory / ("1775-phase-" + phase + ".json")
++        packet_path = directory / ("1938-phase-" + phase + ".json")
+         # This serial namespace has one operation owner. A failed/incomplete
+         # receipt blocks all later steps; no branch/replay/reset is available.
+-        lock_path = directory / "1775-input.lock"
++        lock_path = directory / "1938-input.lock"
+         import fcntl
+         lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+         try:
+@@ -665,7 +665,7 @@
+             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+             approved, review_bytes = artifact(self.owned, {"path": review, "sha256": review_sha256}, 65536)
+             exact_keys(approved, {"version", "phase", "binding", "visible_state", "target", "frames",
+-                                  "predecessor", "reviewed_unix_ns", "review_reference"}, "1775 root review")
++                                  "predecessor", "reviewed_unix_ns", "review_reference"}, "1938 root review")
+             require(type(approved["version"]) is int and approved["version"] == 1
+                     and approved["phase"] == phase and approved["visible_state"] == spec["visible_state"],
+                     "Review does not admit this exact scene/phase/state")
+@@ -677,13 +677,14 @@
+                        "source_binding_sha256", "ownership_receipt_sha256", "ui", "server", "ui_sha256", "display")}
+             require(all(binding[key] == value for key, value in common.items())
+                     and binding["launch_sha256"] == launch["_sha256"] and binding["window"] == hex(window)
++                    and binding["viewport"] == launch["viewport"]
+                     and binding["viewport"] in plans["viewport_sizes"]
+                     and type(binding["scale_factor"]) is float and binding["scale_factor"] == 1.0
+                     and binding["theme"] == "dark", "Review/source/build/owned-window binding mismatch")
+             session = {**common, "window": hex(window), "launch_sha256": launch["_sha256"],
+                        "viewport": binding["viewport"], "scale_factor": 1.0, "theme": "dark"}
+             for row in rows:
+-                prior_path = directory / ("1775-phase-" + row["phase"] + ".json")
++                prior_path = directory / ("1938-phase-" + row["phase"] + ".json")
+                 exists = prior_path.exists() or prior_path.is_symlink()
+                 require(exists == (row["index"] < spec["index"]),
+                         "Nonlinear/replayed/incomplete phase namespace; no input")
+@@ -725,13 +726,7 @@
+                     and target["enabled"] is True and target["unoccluded"] is True,
+                     "Target is not the exact source-derived control/row/ordinal")
+             label = spec["labels"][launch["side"]]
+-            if label.startswith("$history-"):
+-                state_label = "Running" if label == "$history-running" else "Succeeded"
+-                require(type(target["label"]) is str and re.fullmatch(
+-                    r"INERT · Daily public review · (?:[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}|Unavailable time) · Manual · "
+-                    + state_label, target["label"]) is not None, "Wrong actual history label")
+-            else:
+-                require(target["label"] == label, "Actual Before/After label differs from reviewed fixed phase")
++            require(target["label"] == label, "Actual side-specific Accounts label differs from fixed phase")
+ 
+             def rectangle(value):
+                 require(type(value) is list and len(value) == 4
+@@ -758,8 +753,9 @@
+                         "Scroll target must be beyond the actual thumb")
+             else:
+                 require(target["scrollbar"] is None, "Unexpected scrollbar target")
+-            if spec["operation"] == "resize":
+-                require(rect == [0, 0, geometry["width"], geometry["height"]], "Layout target is the complete owned window")
++            if spec["operation"] in ("resize", "F8", "Tab", "shift-tab"):
++                require(rect == [0, 0, geometry["width"], geometry["height"]], "Nonpointer target is the complete owned window")
++            fixture_before = fixture_evidence(self.owned, launch, spec["fixture"]) if spec["operation"] in ("resize", "F8") else None
+             exact_keys(approved["frames"], {"root", "client"}, "reviewed root/client frames")
+ 
+             def pixels(data, size):
+@@ -780,6 +776,11 @@
+             packet = {"version": 1, "phase": phase, "session": session, "binding": binding,
+                       "state": "started", "signals": [], "review": {"path": review, "sha256": review_sha256},
+                       "target": target, "before": {}, "after": {}, "operation": spec["operation"],
++                      "fixture_evidence": fixture_before,
++                      "pixel_policy": ("fixed-F8-nonpointer-original-held-work" if spec["operation"] == "F8" else
++                                       "initial-fixed-nonpointer-layout-original-scene" if spec["operation"] == "resize" else
++                                       "exact-reviewed-full-frame-pixels"),
++                      "full_frame_pixel_comparison": {},
+                       "absolute_deadline_monotonic_ns": int(deadline*1_000_000_000),
+                       "limits": "Input/capture observations only. No daemon/provider/UX pass or same-Iced-batch claim."}
+             fd = os.open(packet_path, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW|os.O_CLOEXEC, 0o600)
+@@ -806,7 +807,7 @@
+                     guard(expected_geometry)
+                     result = {}
+                     for role, whole in [("root", True), ("client", False)]:
+-                        name = "1775-"+phase+"-"+label+"-"+role+"-"+uuid.uuid4().hex[:12]+".webp"
++                        name = "1938-"+phase+"-"+label+"-"+role+"-"+uuid.uuid4().hex[:12]+".webp"
+                         result[role] = self.capture(window,name,whole)
+                     guard(expected_geometry)
+                     return result
+@@ -817,7 +818,20 @@
+                     packet["before"] = frames("fresh",geometry); save()
+                     for role,size in [("root",binding["root_size"]),("client",[geometry["width"],geometry["height"]])]:
+                         raw,_=private_bytes(below_root(packet["before"][role]["path"],self.owned.root),16777216)
+-                        require(pixels(raw,size)==reviewed_pixels[role], "Current root/client pixels changed; input refused")
++                        actual_pixels = pixels(raw,size)
++                        packet["full_frame_pixel_comparison"][role] = {
++                            "reviewed_rgb_sha256": reviewed_pixels[role], "current_rgb_sha256": actual_pixels,
++                            "equal": actual_pixels == reviewed_pixels[role], "masked": False}
++                        if spec["operation"] not in ("resize", "F8"):
++                            require(actual_pixels == reviewed_pixels[role], "Current root/client pixels changed; input refused")
++                    if spec["operation"] in ("resize", "F8"):
++                        # Both are fixed nonpointer operations. Spinner differences
++                        # are recorded above; no pointer/hover/Tab equality changes.
++                        require(fixture_evidence(self.owned, launch, spec["fixture"]) == fixture_before,
++                                "Original scene/work/phase changed before fixed operation; no retry")
++                        if spec["operation"] == "F8":
++                            self.focus_check(window)  # Window focus is not widget focus.
++                    save()
+                     guard()
+                     packet["dispatch_monotonic_ns"]=time.monotonic_ns();save()
+                     if spec["operation"] == "resize":
+@@ -828,7 +842,7 @@
+                     elif spec["operation"] == "motion":
+                         packet["returned"] = self.pointer(window,*point);after_geometry=geometry
+                     else:
+-                        require(spec["operation"] in ("Tab","shift-tab"), "No arbitrary key chord")
++                        require(spec["operation"] in ("Tab","shift-tab","F8"), "No arbitrary key chord")
+                         packet["returned"] = self.key(window,[spec["operation"]]);after_geometry=geometry
+                     packet["return_monotonic_ns"]=time.monotonic_ns();save()
+                     # One bounded rendering opportunity, not a ready-state oracle.
+@@ -841,7 +855,7 @@
+                                   error={"type":type(error).__name__,"message":str(error)},
+                                   capture_evidence=list(getattr(self,"capture_evidence",[])))
+                     try: save()
+-                    except BaseException: print("Partial1775 receipt could not be completed",file=sys.stderr,flush=True)
++                    except BaseException: print("Partial1938 receipt could not be completed",file=sys.stderr,flush=True)
+                     raise
+                 finally:
+                     for signum,handler in handlers.items(): signal.signal(signum,handler)
+@@ -913,6 +927,70 @@
+     raw,_=private_bytes(below_root(reference["path"],owned.root),maximum)
+     require(hashlib.sha256(raw).hexdigest()==reference["sha256"],"Private artifact changed")
+     return json.loads(raw,object_pairs_hook=no_duplicate_keys),raw
++
++
++def fixture_evidence(owned, launch, expected):
++    """Read the original runner's bounded log. No transport or watchdog claim."""
++    owned.check(need_ui=True)
++    ref = launch["fixture_stdout"]
++    exact_keys(ref, {"path", "device", "inode"}, "original fixture stdout")
++    path = below_root(ref["path"], owned.root)
++    raw, info = private_bytes(path, 4194304)
++    require([info.st_dev, info.st_ino] == [ref["device"], ref["inode"]],
++            "Original fixture log incarnation changed")
++    require(not raw or raw.endswith(b"\n"), "Partial original fixture log; no input/retry")
++    events = []
++    for line in raw.splitlines():
++        if line.startswith(b"ACCOUNT_NATIVE "):
++            event = json.loads(line[len(b"ACCOUNT_NATIVE "):], object_pairs_hook=no_duplicate_keys)
++            require(type(event) is dict and type(event.get("event")) is str, "Invalid original fixture event")
++            require(event.get("scene", launch["scene"]) == launch["scene"], "Original scene changed")
++            require(event["event"] not in ("fixture_error", "step_refused"), "Original fixture refused/stopped")
++            events.append(event)
++            require(len(events) <= 4096, "Original fixture event bound exceeded")
++    require(events, "No original fixture evidence")
++    admits, held, returned, phase = {}, set(), set(), None
++    held_event = "matched_quota_observed" if launch["side"] == "after" else "fixture_input_held"
++    for event in events:
++        if event["event"] == "actual_admission":
++            serial = number(event.get("serial"), "original serial")
++            require(serial not in admits and type(event.get("kind")) is str
++                    and type(event.get("owner")) is int and event["owner"] > 0
++                    and type(event.get("id")) is str and event["id"], "Invalid/duplicate original admission")
++            if launch["side"] == "before":
++                require(event.get("production_ticket_available") is False,
++                        "Before task serial must not be presented as production ticket")
++            else:
++                number(event.get("quota_observation"), "actual collector observation")
++            admits[serial] = event
++        if event["event"] == held_event:
++            serial = number(event.get("serial"), "held serial")
++            require(serial in admits and serial not in held, "Held input has no unique original admission")
++            held.add(serial)
++        if event["event"] == "actual_reducer_completion":
++            serial = number(event.get("serial"), "completed serial")
++            require(serial in admits and serial not in returned, "Completion has no unique original admission")
++            key = "source_oracle_satisfied" if launch["side"] == "after" else "expected_before_consequence_observed"
++            require(event.get(key) is True, "Original fixture source oracle failed")
++            returned.add(serial)
++        if "phase" in event:
++            require(type(event["phase"]) is str, "Invalid original fixture phase")
++            phase = event["phase"]
++    exact_keys(expected, {"phase", "held", "returned"}, "fixed nonpointer phase proof")
++    require(phase == expected["phase"], "Original fixture is not at the fixed nonpointer predecessor")
++    proof = []
++    for state in ("held", "returned"):
++        for item in expected[state]:
++            exact_keys(item, {"serial", "kind"}, "fixed original work")
++            serial = number(item["serial"], "fixed original serial")
++            require(serial in admits and admits[serial]["kind"] == item["kind"], "Wrong original work")
++            require((serial in returned) if state == "returned" else (serial in held and serial not in returned),
++                    "Original work is not in the required held/returned state")
++            proof.append({"serial":serial,"kind":item["kind"],"owner":admits[serial]["owner"],
++                          "id":admits[serial]["id"],"state":state})
++    return {"original_stdout":ref,"prefix_sha256":hashlib.sha256(raw).hexdigest(),"bytes":len(raw),
++            "scene":launch["scene"],"side":launch["side"],"phase":phase,"original_work":proof,
++            "provider_or_watchdog_evidence":False,"widget_focus_inferred":False}
+ 
+ 
+ def directory_identity(path, expected):
+@@ -981,11 +1059,12 @@
+ 
+ def load_launch(owned, path, sha):
+     launch,raw=artifact(owned,{"path":path,"sha256":sha},1048576)
+-    exact_keys(launch,{"version","side","scene","head","tree","controller_sha256","source_binding_sha256",
++    exact_keys(launch,{"version","side","scene","viewport","fixture_stdout","head","tree","controller_sha256","source_binding_sha256",
+                       "ownership_receipt_sha256","ui","server","ui_sha256","display","checkout","checkout_identity",
+                       "common_identity","admin_git_dir","admin_identity","git_metadata_sha256","source_files","build_receipt"},"1775 launch binding")
+     require(type(launch["version"]) is int and launch["version"]==1
+-            and launch["scene"] in source_json(PHASE_PLAN,PHASE_PLAN_SHA256)["scenes"],"Unsupported inert scene")
++            and launch["scene"] in source_json(PHASE_PLAN,PHASE_PLAN_SHA256)["scenes"]
++            and launch["viewport"] in ("wide", "narrow"),"Unsupported inert scene/viewport")
+     launch.update(_path=path,_sha256=sha,_bytes=raw)
+     check_launch(owned,launch)
+     return launch
+@@ -1005,7 +1084,7 @@
+         return 2
+     import time
+     deadline=time.monotonic()+20.0
+-    parser=argparse.ArgumentParser(description="Fixed1775 inert Automations input/capture only; no execution grant")
++    parser=argparse.ArgumentParser(description="Fixed1938 inert Accounts input/capture only; no execution grant")
+     for option in ("expected-root","receipt","display","xauthority","launch","launch-sha256"):
+         parser.add_argument("--"+option,required=True)
+     parser.add_argument("--window",type=window_id)
+@@ -1025,11 +1104,11 @@
+             require(args.window is not None,"Explicit actual owned UI window required")
+             connection.selected(args.window)
+             if args.command=="capture":
+-                tag="1775-observe-"+uuid.uuid4().hex[:12]
++                tag="1938-observe-"+uuid.uuid4().hex[:12]
+                 result={role:connection.capture(args.window,tag+"-"+role+".webp",whole)
+                         for role,whole in [("root",True),("client",False)]}
+             else:
+-                result=connection.automation_phase(args.window,args.phase,args.review,args.review_sha256,launch,deadline)
++                result=connection.accounts_phase(args.window,args.phase,args.review,args.review_sha256,launch,deadline)
+         if args.command!="phase":
+             check_launch(owned,launch)
+             require(time.monotonic()<deadline,"Original command deadline expired; no success conversion")

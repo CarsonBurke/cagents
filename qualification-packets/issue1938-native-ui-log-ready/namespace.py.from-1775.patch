@@ -1,0 +1,154 @@
+--- donor/namespace.py
++++ accounts/namespace.py
+@@ -1,20 +1,16 @@
+-"""Fixed PR1775 fixture namespaces; source only until the outer plan is admitted.
++"""Fixed issue1938 Accounts fixture namespaces; source only until the outer plan is admitted.
+ 
+ No command-line entry point, process launch, authority selection or cleanup.
+ The outer adapter owns admission, all original children and immutable receipts.
+ """
+-import ctypes
+-import errno
+ import hashlib
+ import os
+ from pathlib import Path
+-import re
+ import stat
+ import subprocess
+ 
+ ENGINE_SHA256 = "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
+-SCENES = frozenset(("retry", "active", "open-agent", "closed-agent", "refresh",
+-                    "paged", "read-error", "empty"))
++SCENES = frozenset(('claude-sparse', 'claude-malformed', 'claude-delayed', 'claude-ticket', 'codex-sparse', 'codex-malformed', 'codex-delayed', 'codex-ticket'))
+ VIEWPORTS = frozenset(("wide", "narrow"))
+ XDG_CHILDREN = {
+     "XDG_DATA_HOME": "data", "XDG_CONFIG_HOME": "config",
+@@ -79,38 +75,22 @@
+ 
+ 
+ class SceneNamespace:
+-    """One fixed scene's fresh Before and subsequent fresh After directories.
++    """One fixed Accounts scene and revision's fresh directory.
+ 
+     Directories and archives are retained on every failure. No operation here
+     deletes, empties, repairs, copies back or retries a namespace.
+     """
+ 
+-    def __init__(self, scene, viewport, variant, *, previous=None, private_test_parent=None):
++    def __init__(self, scene, viewport, variant):
+         require(scene in SCENES and viewport in VIEWPORTS and variant in ("before", "after"),
+-                "Only the fixed PR1775 fixture scenes and viewports are admitted")
+-        require((variant == "before") == (previous is None),
+-                "After requires the exact archived Before object")
++                "Only the fixed Accounts scenes, viewports and revision suffixes are admitted")
++        # Separate fresh roots; a suffix is a label, never revision authority.
+         parent = Path("/tmp")
+-        purpose = "native"
+-        if private_test_parent is not None:
+-            parent = Path(private_test_parent)
+-            require(parent.parent == Path("/var/tmp") and re.fullmatch(
+-                    r"coord16-1775-namespace-test-[0-9a-f]{32}", parent.name)
+-                    and parent.resolve(strict=True) == parent,
+-                    "Only a separately admitted private contract-test parent is accepted")
+-            purpose = "private-contract-fixture-not-native"
+-        if previous is not None:
+-            require(previous.scene == scene and previous.viewport == viewport
+-                    and previous.parent_path == parent and previous.purpose == purpose
+-                    and previous.archived
+-                    and previous.after is None and previous.closure is not None,
+-                    "Before has not completed its one original archive transition")
+-            previous.check(archived=True)
+         self.scene, self.viewport, self.variant = scene, viewport, variant
+-        self.parent_path, self.purpose = parent, purpose
+-        self.name = "cagents-1775-native-coord16-" + scene + "-" + viewport
++        self.parent_path, self.purpose = parent, "native"
++        self.name = "cagents-1938-native-" + scene + "-" + viewport + "-" + variant
+         self.path = parent / self.name
+-        self.archive_name = self.name + "-before-archived"
++        self.archive_name = None
+         self.parent_fd = None
+         self.parent_identity = None
+         self.root_fd = None
+@@ -128,22 +108,10 @@
+         self.close_in_progress = None
+         self.last_completed_operation = "internal-record-created"
+         self.last_authority_check = None
+-        self.previous = previous
+-        ALL_NAMESPACES.append(self)
+-        if previous is not None:
+-            previous.after = self  # Retain even a partially created After.
++        ALL_NAMESPACES.append(self)  # Also retain partially created originals.
+         self.parent_fd = os.open(parent, DIRECTORY_FLAGS)
+         self.parent_identity = identity(os.fstat(self.parent_fd))
+-        if private_test_parent is not None:
+-            private_directory(os.fstat(self.parent_fd))
+         self.last_completed_operation = "original-parent-pinned"
+-        if variant == "before":
+-            try:
+-                os.stat(self.archive_name, dir_fd=self.parent_fd, follow_symlinks=False)
+-            except FileNotFoundError:
+-                pass
+-            else:
+-                raise RuntimeError("Prior archive exists; no namespace reuse is permitted")
+         # O_EXCL directory creation is the authority: never reuse an old entry.
+         os.mkdir(self.name, 0o700, dir_fd=self.parent_fd)
+         self.last_completed_operation = "new-root-created"
+@@ -151,9 +119,6 @@
+         self.last_completed_operation = "original-root-opened"
+         private_directory(os.fstat(self.root_fd))
+         self.root_identity = identity(os.fstat(self.root_fd))
+-        if previous is not None:
+-            require(self.root_identity != previous.root_identity,
+-                    "After must have a new physical namespace")
+         for child in XDG_CHILDREN.values():
+             os.mkdir(child, 0o700, dir_fd=self.root_fd)
+             descriptor = os.open(child, DIRECTORY_FLAGS, dir_fd=self.root_fd)
+@@ -172,10 +137,6 @@
+         self.check()
+         self.initialized = True
+         self.last_completed_operation = "new-namespace-fully-initialized"
+-
+-    @classmethod
+-    def before(cls, scene, viewport, *, private_test_parent=None):
+-        return cls(scene, viewport, "before", private_test_parent=private_test_parent)
+ 
+     def check(self, *, archived=False):
+         try:
+@@ -211,37 +172,6 @@
+     def environment_paths(self):
+         self.check()
+         return {key: str(self.path / name) for key, name in XDG_CHILDREN.items()}
+-
+-    def archive_and_create_after(self, owner):
+-        require(self.variant == "before" and not self.archive_attempted
+-                and not self.archived and self.after is None,
+-                "A consumed namespace transition cannot be replayed")
+-        self.archive_attempted = True
+-        self.last_completed_operation = "archive-attempt-consumed"
+-        require(self.initialized, "Incomplete Before cannot authorize After")
+-        proof = closed_original_custody(owner, require_scene=True)
+-        self.check()
+-        libc = ctypes.CDLL(None, use_errno=True)
+-        rename = getattr(libc, "renameat2", None)
+-        require(rename is not None, "Atomic non-overwriting archive is unavailable")
+-        rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+-                           ctypes.c_char_p, ctypes.c_uint]
+-        rename.restype = ctypes.c_int
+-        result = rename(self.parent_fd, os.fsencode(self.name), self.parent_fd,
+-                        os.fsencode(self.archive_name), 1)  # RENAME_NOREPLACE
+-        if result != 0:
+-            number = ctypes.get_errno()
+-            if number == errno.EEXIST:
+-                raise RuntimeError("Archive entry exists; original state was preserved")
+-            raise OSError(number, "Atomic original namespace archive failed")
+-        # Record the actual rename before any subsequent fallible operation.
+-        self.archived = True
+-        self.closure = proof
+-        self.last_completed_operation = "original-root-renamed-without-replacement"
+-        self.check(archived=True)
+-        os.fsync(self.parent_fd)
+-        return SceneNamespace(self.scene, self.viewport, "after", previous=self,
+-                              private_test_parent=self.parent_path if self.purpose != "native" else None)
+ 
+     def close_original_descriptors(self, owner):
+         require(not self.close_attempted, "Descriptor closure is never replayed")
