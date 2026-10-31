@@ -2034,6 +2034,32 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
     launch_route("old");
     owners_untouched(&mut daemon, &mut window);
 
+    // A present marker must be valid even when selecting the live owner's
+    // own tree. Refusal must precede a success receipt or a current change.
+    let obsolete_recorded = fs::read(&obsolete).unwrap();
+    for invalid in [
+        "not JSON",
+        r#"{"version":2,"owner_version":"0.0.1"}"#,
+        r#"{"version":1,"owner_version":"../other"}"#,
+    ] {
+        fs::write(&obsolete, invalid).unwrap();
+        let output = select(running);
+        assert!(!output.status.success(), "{invalid}: {output:?}");
+        assert_eq!(current(), Path::new("versions").join(staged));
+        assert_eq!(fs::read(&obsolete).unwrap(), invalid.as_bytes());
+        assert_eq!(fs::read(&marker).unwrap(), recorded);
+        owners_untouched(&mut daemon, &mut window);
+    }
+    fs::write(&obsolete, &obsolete_recorded).unwrap();
+    fs::set_permissions(&obsolete, fs::Permissions::from_mode(0o644)).unwrap();
+    let output = select(running);
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(staged));
+    assert_eq!(fs::read(&obsolete).unwrap(), obsolete_recorded);
+    assert_eq!(fs::read(&marker).unwrap(), recorded);
+    owners_untouched(&mut daemon, &mut window);
+    fs::set_permissions(&obsolete, fs::Permissions::from_mode(0o600)).unwrap();
+
     // Withdraw: serve the version the window and daemon already run.
     let output = select(running);
     assert!(output.status.success(), "{output:?}");
@@ -2048,6 +2074,32 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
         fs::read_to_string(&obsolete).unwrap(),
         r#"{"version":1,"owner_version":"0.0.1"}"#
     );
+    // An obsolete marker may have been written by a different-protocol
+    // release. Selection validates its shape without interpreting it as this
+    // coordinator's protocol or replacing the target's recorded bytes.
+    let old_protocol = cagents::terminal_ipc::PROTOCOL_VERSION.wrapping_sub(1);
+    assert_ne!(old_protocol, cagents::terminal_ipc::PROTOCOL_VERSION);
+    let obsolete_protocol = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "owner_version": "0.0.1", "daemon_compatible": true,
+        "candidate_protocol": old_protocol,
+    }))
+    .unwrap();
+    fs::write(&obsolete, &obsolete_protocol).unwrap();
+    let output = select(running);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(running));
+    assert_eq!(fs::read(&obsolete).unwrap(), obsolete_protocol);
+    assert_eq!(fs::read(&marker).unwrap(), recorded);
+    owners_untouched(&mut daemon, &mut window);
+    fs::remove_file(&obsolete).unwrap();
+    let output = select(running);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(running));
+    assert!(!obsolete.exists(), "selection must not create a marker");
+    assert_eq!(fs::read(&marker).unwrap(), recorded);
+    owners_untouched(&mut daemon, &mut window);
+    fs::write(&obsolete, &obsolete_recorded).unwrap();
+    fs::set_permissions(&obsolete, fs::Permissions::from_mode(0o600)).unwrap();
     let withdrawn = offer(Some(&staged_ui));
     assert_eq!(withdrawn["offered"], serde_json::Value::Null, "{withdrawn}");
     assert!(
@@ -2187,7 +2239,13 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
         .unwrap(),
     )
     .unwrap();
-    refuse(select(staged), "daemon, which is no longer running");
+    let output = select(staged);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("start the original version's daemon before re-selecting"),
+        "{output:?}"
+    );
+    refuse(output, "daemon, which is no longer running");
     fs::write(&marker, &recorded).unwrap();
     let output = select(staged);
     assert!(output.status.success(), "{output:?}");
@@ -2197,9 +2255,38 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
     assert_eq!(fs::read_to_string(&old_cli).unwrap_or_default(), "");
     // With nothing running, nothing can be routed: any complete tree serves.
     window.stop_checked().unwrap();
+    let unstaged_marker = unstaged.parent().unwrap().join(".deferred-owner.json");
+    for invalid in [
+        "not JSON",
+        r#"{"version":2,"owner_version":null}"#,
+        r#"{"version":1,"owner_version":"../other"}"#,
+    ] {
+        fs::write(&unstaged_marker, invalid).unwrap();
+        fs::set_permissions(&unstaged_marker, fs::Permissions::from_mode(0o600)).unwrap();
+        let output = select("9.9.7");
+        assert!(!output.status.success(), "{invalid}: {output:?}");
+        assert_eq!(current(), Path::new("versions").join(staged));
+        assert_eq!(fs::read(&unstaged_marker).unwrap(), invalid.as_bytes());
+        assert_eq!(fs::read(&marker).unwrap(), recorded);
+        assert_eq!(fs::read(&obsolete).unwrap(), obsolete_recorded);
+    }
+    let private_marker = br#"{"version":1,"owner_version":null}"#;
+    fs::write(&unstaged_marker, private_marker).unwrap();
+    fs::set_permissions(&unstaged_marker, fs::Permissions::from_mode(0o644)).unwrap();
+    let output = select("9.9.7");
+    assert!(!output.status.success(), "{output:?}");
+    assert_eq!(current(), Path::new("versions").join(staged));
+    assert_eq!(fs::read(&unstaged_marker).unwrap(), private_marker);
+    assert_eq!(fs::read(&marker).unwrap(), recorded);
+    assert_eq!(fs::read(&obsolete).unwrap(), obsolete_recorded);
+    fs::remove_file(&unstaged_marker).unwrap();
     let output = select("9.9.7");
     assert!(output.status.success(), "{output:?}");
     assert_eq!(current(), Path::new("versions/9.9.7"));
+    assert!(
+        !unstaged_marker.exists(),
+        "selection must not create a marker"
+    );
     let output = install(&["--select", "", "--stage-only"], None);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--select requires a version"));

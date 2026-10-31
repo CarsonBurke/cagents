@@ -464,6 +464,8 @@ pub(crate) fn select_staged(
         ));
     }
     let target = selectable_root(&prefix, version_root)?;
+    // Obsolete routing may be ignored, but a present marker must be valid.
+    let marker = read_staged_owner(&target)?;
     let _jobs = crate::update::exclude_update_jobs(&prefix).map_err(|error| match error {
         crate::update::UpdateError::Busy => io::Error::other(
             "an application update is in progress; finish or cancel it, then retry; installation was not changed",
@@ -476,7 +478,7 @@ pub(crate) fn select_staged(
     {
         let running = owner_version(bin)?;
         let name = target.file_name().unwrap().to_string_lossy();
-        let marker = read_staged_owner(&target)?
+        let marker = marker
             .filter(|marker| marker.owner_version.as_deref() == Some(running))
             .ok_or_else(|| {
                 io::Error::other(format!(
@@ -488,7 +490,7 @@ pub(crate) fn select_staged(
         // live windows, where staging today would have routed to their owner.
         if marker.daemon_compatible && !daemon_running {
             return Err(io::Error::other(format!(
-                "{name} was staged to share the {running} daemon, which is no longer running; stage it again with --stage-only; installation was not changed",
+                "{name} was staged to share the {running} daemon, which is no longer running; start the original version's daemon before re-selecting {name}; installation was not changed",
             )));
         }
     }
@@ -500,8 +502,8 @@ pub(crate) fn select_staged(
     exchange_current(&prefix, &link, expected_current)
 }
 
-/// A complete version directory directly inside this installation's
-/// `versions/`, by the same rules `current` must satisfy to be served.
+/// A version directory directly inside this installation's `versions/`, with
+/// its own complete executable companion set.
 fn selectable_root(prefix: &Path, version_root: &Path) -> io::Result<std::path::PathBuf> {
     let versions = prefix.join("versions");
     let name = version_root
@@ -539,6 +541,19 @@ fn selectable_root(prefix: &Path, version_root: &Path) -> io::Result<std::path::
             "version {} belongs to another installation",
             name.to_string_lossy()
         )));
+    }
+    for name in ["cagents", "cagents-ui", "cagentsd"] {
+        let executable = target.join("bin").join(name);
+        let metadata = std::fs::metadata(&executable)?;
+        if executable.canonicalize()? != executable
+            || !metadata.is_file()
+            || metadata.mode() & 0o111 == 0
+        {
+            return Err(io::Error::other(format!(
+                "version {} does not contain its own executable bin/{name}",
+                target.file_name().unwrap().to_string_lossy()
+            )));
+        }
     }
     Ok(target)
 }
@@ -1163,6 +1178,63 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, ["current"], "no temporary link may remain");
+    }
+
+    #[test]
+    fn selection_requires_every_companion_to_be_its_exact_executable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for companion in ["cagents", "cagents-ui", "cagentsd"] {
+            for defect in [
+                "missing",
+                "nonexecutable",
+                "external-alias",
+                "internal-alias",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let prefix = root.path().canonicalize().unwrap();
+                let target = prefix.join("versions/selected");
+                let bin = target.join("bin");
+                std::fs::create_dir_all(&bin).unwrap();
+                std::fs::write(
+                    prefix.join(".cagents-install-root"),
+                    "cagents install root\n",
+                )
+                .unwrap();
+                for name in ["cagents", "cagents-ui", "cagentsd"] {
+                    let path = bin.join(name);
+                    std::fs::write(&path, b"fixture").unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
+                }
+                assert_eq!(selectable_root(&prefix, &target).unwrap(), target);
+                let path = bin.join(companion);
+                match defect {
+                    "missing" => std::fs::remove_file(&path).unwrap(),
+                    "nonexecutable" => {
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                            .unwrap();
+                    }
+                    "external-alias" | "internal-alias" => {
+                        let other = if defect == "external-alias" {
+                            prefix.join("other-executable")
+                        } else {
+                            bin.join("other-executable")
+                        };
+                        std::fs::write(&other, b"fixture").unwrap();
+                        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755))
+                            .unwrap();
+                        std::fs::remove_file(&path).unwrap();
+                        std::os::unix::fs::symlink(&other, &path).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    selectable_root(&prefix, &target).is_err(),
+                    "{companion}: {defect}"
+                );
+            }
+        }
     }
 
     #[test]
