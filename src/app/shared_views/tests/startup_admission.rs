@@ -2549,6 +2549,323 @@ fn managed_terminal_alias_retains_its_observed_end_before_the_update_acknowledge
 }
 
 #[test]
+fn stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor() {
+    use crate::{
+        app::workspace_model_sync::ModelUpdate,
+        chat::attachment_assets,
+        model::BootId,
+        persistence::{SnapshotBase, StateStore},
+    };
+    if isolated("stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor") {
+        return;
+    }
+
+    attachment_assets::with_test_image(|image| {
+        let (mut app, active, hidden, stale, identity) = cached_chat();
+        let original_kind = stale.kind.clone();
+        let closed = super::super::super::project_ui::removed_existence("saved explicit close");
+        app.card_state_mut(stale.id).unwrap().existence = closed.clone();
+        let mut canonical = stale.clone();
+        current_owner(&mut canonical);
+        let healthy = sibling_chat(&canonical, "Healthy current sibling");
+        install_held_pane(&mut app, hidden, &healthy);
+        let CardKind::Chat(stale_source) = &stale.kind else {
+            unreachable!()
+        };
+        let CardKind::Chat(canonical_source) = &canonical.kind else {
+            unreachable!()
+        };
+        let CardKind::Chat(healthy_source) = &healthy.kind else {
+            unreachable!()
+        };
+        assert_eq!(stale.id, canonical.id);
+        assert_eq!(stale_source.id, canonical_source.id);
+        assert_eq!(stale_source.launch, canonical_source.launch);
+        assert_ne!(stale_source.proof, canonical_source.proof);
+        assert!(stale_source.proof.as_ref().unwrap().is_complete());
+        assert!(canonical_source.proof.as_ref().unwrap().is_complete());
+
+        let draft = "Keep the closed source's complete draft café 🌿";
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.chat_drafts.insert(stale.id, draft.into());
+        durable
+            .chat_draft_attachments
+            .insert(stale.id, vec![image.clone()]);
+        let assert_retained = |saved: &WorkspaceState, quarantined: bool| {
+            let card = saved.cards.iter().find(|card| card.id == stale.id).unwrap();
+            assert_eq!(card.kind, original_kind);
+            assert_eq!(card.existence, closed);
+            assert_eq!(card.title, stale.title);
+            assert_eq!(card.width_fraction, stale.width_fraction);
+            assert!(!saved.local_only_cards.contains(&stale.id));
+            assert_eq!(saved.chat_drafts[&stale.id], draft);
+            assert_eq!(saved.chat_draft_attachments[&stale.id], vec![image.clone()]);
+            attachment_assets::validate(&saved.chat_draft_attachments[&stale.id][0]).unwrap();
+            assert_eq!(
+                saved.quarantined_panes,
+                if quarantined {
+                    HashMap::from([(stale.id, original_kind.clone())])
+                } else {
+                    HashMap::new()
+                }
+            );
+            let sibling = saved
+                .cards
+                .iter()
+                .find(|card| card.id == healthy.id)
+                .unwrap();
+            assert!(sibling.existence.is_open());
+            assert_eq!(sibling.kind, healthy.kind);
+        };
+        assert_retained(&app.durable, false);
+        assert!(app.durable.local_only_cards.is_empty());
+
+        // Load actual saved CLOSED A and OPEN H before connecting. This is
+        // stored payload, not a preinstalled quarantine or a local-only waiver.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stale-closed-source.sqlite3");
+        let workspace = app.durable.id;
+        let store = StateStore::open(&path, BootId::new("closed-source-save")).unwrap();
+        let first_commit = store
+            .save_workspace(
+                &app.durable,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &Default::default(),
+                },
+            )
+            .unwrap();
+        assert!(first_commit.refused.is_empty());
+        drop(store);
+        let store = StateStore::open(&path, BootId::new("closed-source-reload")).unwrap();
+        app.durable = Arc::new(store.load_workspace(workspace, None).unwrap().unwrap());
+        assert_retained(&app.durable, false);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.chat_ui = chat_ui::State::with_draft_attachments(
+            app.durable.chat_drafts.clone(),
+            app.durable.chat_draft_attachments.clone(),
+        );
+        assert_eq!(
+            app.workspace_model.identity,
+            crate::workspace_model::NO_REGISTRY
+        );
+        assert_eq!(app.durable.workspace_model_identity, Some(identity));
+        assert!(app.shared_views.quarantined.is_empty());
+        assert!(app.durable.quarantined_panes.is_empty());
+        assert!(app.durable.local_only_cards.is_empty());
+
+        let mut view = View::empty(hidden);
+        view.revision = 7;
+        view.panes = vec![canonical.clone(), healthy.clone()];
+        let mut full = model(identity, active, hidden, view);
+        full.sequence = 10;
+        full.agents = vec![
+            managed_owner(&canonical, hidden),
+            managed_owner(&healthy, hidden),
+        ];
+        assert!(full.agents.iter().all(|owner| !owner.closed));
+        let canonical_issuer = full.agents[0].session.as_ref().unwrap();
+        assert!(managed_issued_source_matches(
+            canonical_issuer,
+            &canonical.kind
+        ));
+        assert!(!managed_issued_source_matches(
+            canonical_issuer,
+            &stale.kind
+        ));
+        assert!(managed_issued_source_matches(
+            full.agents[1].session.as_ref().unwrap(),
+            &healthy.kind
+        ));
+
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        let daemon = ScriptedDaemon::with_owner(healthy_source.clone());
+        let startup = app.initialize_runtimes();
+        settle(&mut app, startup);
+        assert!(app.chat_awaiting_admission(healthy.id));
+        assert!(!app.cards.contains_key(&stale.id));
+        assert!(app.shared_views.quarantined.is_empty());
+        assert!(daemon.requests().is_empty());
+        assert!(daemon.resolutions().is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "NO_REGISTRY cannot seed saved panes"
+        );
+
+        // B has the same CardId as stale CLOSED A and a valid OPEN issuer.
+        // Connected must classify the raw saved source before its first seed.
+        let connected = app.apply_workspace_model_update(ModelUpdate::Connected(full.clone()));
+        settle(&mut app, connected);
+        assert_eq!(app.workspace_model.views, full.views);
+        assert_eq!(app.workspace_model.agents, full.agents);
+        assert_eq!(app.shared_views.snapshot_sequence, 10);
+        assert_eq!(app.shared_views.quarantined, HashSet::from([stale.id]));
+        assert_eq!(
+            app.durable.quarantined_panes,
+            HashMap::from([(stale.id, original_kind.clone())])
+        );
+        let denial = app.shared_views.quarantine_actions.get(&stale.id).unwrap();
+        assert_eq!(denial.source, original_kind);
+        let denial_nonce = denial.nonce;
+        assert_eq!(app.card_state(stale.id).unwrap().kind, original_kind);
+        assert_eq!(app.card_state(stale.id).unwrap().existence, closed);
+
+        let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        let assert_no_stale_edit = |edits: &[ModelEdit]| {
+            assert!(
+                !edits.iter().any(|edit| match edit {
+                    ModelEdit::SeedView { panes, closed, .. } => {
+                        panes.iter().any(|pane| pane.id == stale.id) || closed.contains(&stale.id)
+                    }
+                    ModelEdit::ChangeView { change, .. } => change_card(change) == Some(stale.id),
+                    _ => false,
+                }),
+                "stale A must not publish B's close or any other view intent: {edits:?}"
+            );
+        };
+        assert_no_stale_edit(&edits);
+        let seeds = edits
+            .iter()
+            .filter_map(|edit| match edit {
+                ModelEdit::SeedView {
+                    scope,
+                    panes,
+                    closed,
+                } => Some((scope.clone(), panes.clone(), closed.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let hidden_seeds = seeds
+            .iter()
+            .filter(|(scope, _, _)| *scope == Scope::Channel(hidden))
+            .collect::<Vec<_>>();
+        assert_eq!(hidden_seeds.len(), 1, "one actual healthy seed: {edits:?}");
+        assert_eq!(hidden_seeds[0].1, vec![healthy.clone()]);
+        assert!(hidden_seeds[0].2.is_empty());
+        assert!(app.shared_views.seeding.contains(&Scope::Channel(hidden)));
+        assert!(
+            !app.shared_views
+                .initialized
+                .contains(&Scope::Channel(hidden))
+        );
+        assert!(app.chat_awaiting_admission(healthy.id));
+        assert!(daemon.requests().is_empty());
+
+        // Only ACK scopes actually emitted by Connected; an invented None
+        // ACK would bypass the exact admission boundary this parent owns.
+        for (scope, panes, closed_ids) in seeds {
+            let admits_healthy = scope == Scope::Channel(hidden);
+            let still_held = !app
+                .shared_views
+                .initialized
+                .contains(&Scope::Channel(hidden));
+            if still_held {
+                assert!(app.chat_awaiting_admission(healthy.id));
+                assert!(daemon.requests().is_empty());
+            }
+            assert!(closed_ids.is_empty());
+            if !admits_healthy {
+                assert_eq!(scope, Scope::Channel(active));
+                assert!(panes.is_empty());
+            }
+            let ack = app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope,
+                operation: None,
+                model: full.clone(),
+            });
+            settle(&mut app, ack);
+            if !admits_healthy && still_held {
+                assert!(app.chat_awaiting_admission(healthy.id));
+                assert!(daemon.requests().is_empty());
+            }
+        }
+        assert!(
+            app.shared_views
+                .initialized
+                .contains(&Scope::Channel(hidden))
+        );
+        assert!(!app.shared_views.seeding.contains(&Scope::Channel(hidden)));
+        assert!(!app.chat_awaiting_admission(healthy.id));
+        assert!(!app.chat_start_pending(healthy.id));
+        assert_eq!(daemon.requests(), vec![healthy_source.clone()]);
+        assert!(daemon.resolutions().is_empty());
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&healthy.id) else {
+            panic!("the scripted ChatAttached response must own H's actual runtime");
+        };
+        assert_eq!(runtime.session, *healthy_source);
+        assert_eq!(runtime.restored_pane_ready(), Ok(true));
+        let witness = app.shared_views.validated_managed.get(&healthy.id).unwrap();
+        assert_eq!(witness.source, healthy.kind);
+        assert_eq!(witness.registry, identity);
+        assert_eq!(witness.scope, Scope::Channel(hidden));
+        assert!(!app.shared_views.validated_managed.contains_key(&stale.id));
+        assert!(!app.cards.contains_key(&stale.id));
+        assert!(!app.chat_start_pending(stale.id));
+        assert_eq!(app.shared_views.quarantined, HashSet::from([stale.id]));
+        assert_eq!(
+            app.shared_views.quarantine_actions[&stale.id].source,
+            original_kind
+        );
+        assert_eq!(
+            app.shared_views.quarantine_actions[&stale.id].nonce,
+            denial_nonce
+        );
+        // Closed quarantine alone is not an OPEN pane recovery failure.
+        assert_eq!(app.startup_pane_check(), Ok(true));
+        assert_no_stale_edit(&std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>());
+        assert!(
+            !daemon
+                .controls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| matches!(
+                    request,
+                    ClientRequest::ChatStart { .. }
+                        | ClientRequest::ChatPrepareResume { .. }
+                        | ClientRequest::ChatClose { .. }
+                        | ClientRequest::ChatCloseRetained { .. }
+                        | ClientRequest::CloseTerminalChecked { .. }
+                        | ClientRequest::ChatRecoverAccount { .. }
+                        | ClientRequest::ChatStartSelected { .. }
+                        | ClientRequest::ChatReturnTerminal { .. }
+                ))
+        );
+
+        // Captured Seed edits establish publication intent, not a Host close
+        // effect. The separate daemon record proves only scripted IPC effects.
+        let saved = app.persistent_workspace();
+        assert_retained(&saved, true);
+        let committed = store
+            .save_workspace(
+                &saved,
+                SnapshotBase {
+                    workspace: first_commit.generation,
+                    cards: &first_commit.card_generations,
+                },
+            )
+            .unwrap();
+        assert!(committed.refused.is_empty());
+        drop(store);
+        let store = StateStore::open(&path, BootId::new("closed-source-evidence-reload")).unwrap();
+        let restored = store.load_workspace(workspace, None).unwrap().unwrap();
+        assert_retained(&restored, true);
+        let history = store
+            .saved_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.card == stale.id)
+            .expect("closed stale source remains in genuine History storage");
+        assert!(!history.open);
+        assert!(history.quarantined);
+        assert_eq!(history.session, *stale_source);
+        assert_eq!(daemon.requests(), vec![healthy_source.clone()]);
+    });
+}
+
+#[test]
 fn exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract() {
     let (mut app, active, hidden, mut canonical, identity) = cached_chat();
     let saved = canonical.clone();
