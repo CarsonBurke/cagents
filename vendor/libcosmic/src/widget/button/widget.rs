@@ -637,11 +637,8 @@ impl<'a, Message: 'a + Clone> Widget<Message, crate::Theme, crate::Renderer>
         layout: Layout<'b>,
         renderer: &crate::Renderer,
         viewport: &Rectangle,
-        mut translation: Vector,
+        translation: Vector,
     ) -> Option<overlay::Element<'b, Message, crate::Theme, crate::Renderer>> {
-        let position = layout.bounds().position();
-        translation.x += position.x;
-        translation.y += position.y;
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
             layout
@@ -865,7 +862,7 @@ pub fn update<'a, Message: Clone>(
             if let Some(on_press) = on_press {
                 let state = state();
                 if state.is_focused && *key == keyboard::Key::Named(keyboard::key::Named::Enter) {
-                    state.is_pressed = true;
+                    // Keyboard activation completes here; only pointer/touch presses await release.
                     let msg = (on_press)(layout.virtual_offset(), layout.bounds());
 
                     shell.publish(msg);

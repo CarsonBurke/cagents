@@ -3245,9 +3245,27 @@ mod tests {
                         app.sidebar_state.card_attention(alias_id),
                         sidebar::AttentionSummary::default()
                     );
-                    assert!(app.shared_views.blocked.contains(&agent.placement));
+                    if control == "replaced-proof" {
+                        assert!(app.shared_views.blocked.is_empty());
+                        assert_eq!(
+                            app.shared_views.quarantined,
+                            std::collections::HashSet::from([canonical, alias_id])
+                        );
+                        let saved = app.persistent_workspace();
+                        assert_eq!(
+                            saved.chat_drafts.get(&alias_id).map(String::as_str),
+                            Some("Preserved alias draft")
+                        );
+                        assert_eq!(
+                            saved.chat_drafts.get(&canonical).map(String::as_str),
+                            Some("Preserved canonical draft")
+                        );
+                    } else {
+                        assert!(app.shared_views.blocked.contains(&agent.placement));
+                    }
                     assert!(app.card_state(alias_id).unwrap().existence.is_open());
                     assert_eq!(app.card_state(canonical).unwrap().kind, card.kind);
+                    assert_eq!(app.card_state(alias_id).unwrap().kind, card.kind);
                     assert_eq!(
                         app.workspace.focused(),
                         focus,

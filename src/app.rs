@@ -287,6 +287,8 @@ impl NoticeSeverity {
 enum NoticeKey {
     /// Opening the conversation in this card, or switching its terminal to one.
     ChatAttach(CardId),
+    /// The user's explicit verification of an unavailable saved pane.
+    SavedPaneCheck(CardId),
     /// Saving the account that one sign-in produced.
     SignIn(uuid::Uuid),
     /// Adding an existing account home from the accounts table.
@@ -2757,6 +2759,10 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::OpenTerminalOutput(_)
         | Message::NewBrowser
         | Message::RetryCard(_)
+        | Message::RecheckQuarantinedPane(_)
+        | Message::CopyQuarantinedDraft(..)
+        | Message::CopyQuarantinedAttachmentPaths(..)
+        | Message::RemoveQuarantinedPane(..)
         | Message::FocusAdjacent(_)
         | Message::FocusProjectSearch
         | Message::ToggleContextInspector
@@ -4531,6 +4537,15 @@ pub enum Message {
     #[cfg(feature = "integrated-browser")]
     BrowserImport(browser_import_ui::Action),
     RetryCard(CardId),
+    RecheckQuarantinedPane(CardId),
+    CopyQuarantinedDraft(CardId, uuid::Uuid),
+    CopyQuarantinedAttachmentPaths(CardId, uuid::Uuid),
+    RemoveQuarantinedPane(CardId, uuid::Uuid),
+    QuarantinedPaneChecked {
+        card: CardId,
+        check: shared_views::PaneRecheck,
+        result: Result<crate::workspace_model::WorkspaceModel, String>,
+    },
     /// Enter pressed on an ended terminal's final screen.
     RelaunchFromEndedScreen(CardId),
     #[cfg(feature = "integrated-browser")]
@@ -5724,6 +5739,13 @@ impl Cagents {
             if !card.existence.is_open() {
                 continue;
             }
+            if self.shared_views.quarantined.contains(&card.id)
+                || self.durable.quarantined_panes.contains_key(&card.id)
+            {
+                self.shared_views.quarantined.insert(card.id);
+                self.present_quarantined_pane(card.id);
+                continue;
+            }
             let terminal_residency =
                 restored_terminal_residency(&card.kind, card.exposure, &card.residency);
             #[cfg(feature = "integrated-browser")]
@@ -5845,6 +5867,7 @@ impl Cagents {
         explicit_retry: bool,
     ) -> Task<Message> {
         if self.shared_views.defaults.contains_key(&card)
+            || self.shared_views.quarantined.contains(&card)
             || self.durable.pending_terminal_creations.contains(&card)
             || (self.shared_views.attached.contains(&card)
                 && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
@@ -5998,6 +6021,12 @@ impl Cagents {
         result: Result<StartedTerminal, String>,
         current_operation: bool,
     ) -> Task<Message> {
+        if self.shared_views.quarantined.contains(&card) {
+            if let Ok(started) = result {
+                self.retire_terminal_surface(started.handle, false);
+            }
+            return self.finish_terminal_start(card);
+        }
         tracing::debug!(target: "cagents::pane_open", stage = "started", ?card, ok = result.is_ok());
         let accept = current_operation && can_accept_terminal_start(
             self.durable.cards.iter().find(|state| state.id == card),
@@ -6410,6 +6439,9 @@ impl Cagents {
         source: CardState,
         owner: Option<PathBuf>,
     ) -> Task<Message> {
+        if self.refuse_quarantined_pane_recreation(source.id) {
+            return Task::none();
+        }
         #[cfg(not(feature = "integrated-browser"))]
         if let CardKind::Browser(session) = &source.kind {
             return Self::open_external_url(session.current_url.clone());
@@ -6539,6 +6571,22 @@ impl Cagents {
             Task::none()
         };
         Task::batch([start, viewport, title])
+    }
+
+    fn refuse_quarantined_pane_recreation(&mut self, card: CardId) -> bool {
+        if !self.pane_is_quarantined(card) {
+            return false;
+        }
+        let message = if self
+            .card_state(card)
+            .is_some_and(|card| card.existence.is_open())
+        {
+            "This saved pane could not be verified. Use Check session again before cloning or reopening it."
+        } else {
+            "This saved pane could not be verified and cannot be reopened here. Its saved data remains stored."
+        };
+        self.status = Some(TransientNotice::warning(message));
+        true
     }
 
     fn pull_request_pane(&self, view: &crate::model::PullRequestView) -> PullRequestPane {
@@ -8551,6 +8599,9 @@ impl Cagents {
     }
 
     fn retry_card(&mut self, card: CardId) -> Task<Message> {
+        if self.shared_views.quarantined.contains(&card) {
+            return Task::none();
+        }
         // A card whose close is already accepted never starts anything again.
         if self
             .card_state(card)
@@ -10240,6 +10291,7 @@ impl Cagents {
             Some(CardRuntime::Completed) => {
                 self.ended_terminal_placeholder(id, ended_terminal(card))
             }
+            Some(CardRuntime::Failed(_)) if self.shared_views.quarantined.contains(&id) => self.quarantined_pane_view(id),
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
                     widget::column::with_children(vec![
@@ -12219,7 +12271,7 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key {
-                Some(key @ NoticeKey::ChatAttach(card))
+                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::SavedPaneCheck(card)))
                     if self
                         .card_state(card)
                         .is_none_or(|state| !state.existence.is_open()) =>
@@ -16132,6 +16184,7 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::CloseCard(id) | Message::CloseCardUnasked(id) if self.pane_is_quarantined(id) => self.dismiss_quarantined_pane(id),
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
                 self.begin_dirty_close(DirtyCloseIntent::Card(id), VecDeque::from([id]))
@@ -16521,6 +16574,7 @@ impl Application for Cagents {
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
+                if self.pane_is_quarantined(id) { return self.dismiss_quarantined_pane(id); }
                 if self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
@@ -16811,6 +16865,38 @@ impl Application for Cagents {
                 )
             }
             Message::RetryCard(card) => self.retry_card(card),
+            Message::RecheckQuarantinedPane(card) => self.recheck_quarantined_pane(card),
+            Message::CopyQuarantinedDraft(card, nonce) => {
+                if !self.quarantine_presentation_action_allowed(card, nonce) { return Task::none(); }
+                if let Some(text) = self.quarantined_pane_draft(card).filter(|text| !text.is_empty()).map(str::to_owned) {
+                    chat_ui::invalidate_copy_intent();
+                    self.status = Some(TransientNotice::success("Copied saved draft"));
+                    iced::clipboard::write(text).map(cosmic::Action::App)
+                } else { Task::none() }
+            },
+            Message::CopyQuarantinedAttachmentPaths(card, nonce) => self.copy_quarantined_attachment_paths(card, nonce),
+            Message::RemoveQuarantinedPane(card, nonce) => {
+                if !self.quarantine_presentation_action_allowed(card, nonce) { return Task::none(); }
+                self.dismiss_quarantined_pane(card)
+            }
+            Message::QuarantinedPaneChecked { card, check, result } => {
+                if self.shared_views.rechecking.get(&card) != Some(&check) { return Task::none(); }
+                self.shared_views.rechecking.remove(&card);
+                if self.workspace_model.identity != check.registry || !self.shared_views.quarantined.contains(&card)
+                    || shared_views::pane_recheck_endpoint() != check.endpoint
+                    || self.card_state(card).is_none_or(|card| card.kind != check.source) { return Task::none(); }
+                match result {
+                    Ok(model) if model.identity == self.workspace_model.identity => {
+                        let task = self.apply_workspace_model_update(workspace_model_sync::ModelUpdate::Read(model));
+                        if self.shared_views.quarantined.contains(&card) {
+                            self.status = Some(TransientNotice::warning("This saved pane is still unverified. Its session and drafts are retained.").with_key(NoticeKey::SavedPaneCheck(card)));
+                        }
+                        task
+                    }
+                    Ok(_) => { self.status = Some(TransientNotice::warning("The session owner changed. The saved pane and drafts are retained.").with_key(NoticeKey::SavedPaneCheck(card))); Task::none() }
+                    Err(error) => { self.status = Some(TransientNotice::warning("Could not check this saved session. Its pane and drafts are retained.").with_details(error).with_key(NoticeKey::SavedPaneCheck(card))); Task::none() }
+                }
+            }
             Message::RelaunchFromEndedScreen(card) => self.relaunch_from_ended_screen(card),
             #[cfg(feature = "integrated-browser")]
             Message::BrowserAddressChanged { card, value } => {
@@ -18004,11 +18090,15 @@ impl Application for Cagents {
         // The transport wording the health banner replaces may sit in either
         // part of a notice: a reworded one keeps the raw reason as detail.
         if let Some(notice) = self.status.take() {
-            if crate::daemon_health::replaces_notice(&notice.message)
-                || notice
-                    .details
-                    .as_deref()
-                    .is_some_and(crate::daemon_health::replaces_notice)
+            // A later successful background poll does not settle an explicit
+            // pane check. Keep that operation's result until it is retried,
+            // repaired or dismissed, even when transport health also reports it.
+            if !matches!(notice.key, Some(NoticeKey::SavedPaneCheck(_)))
+                && (crate::daemon_health::replaces_notice(&notice.message)
+                    || notice
+                        .details
+                        .as_deref()
+                        .is_some_and(crate::daemon_health::replaces_notice))
             {
                 // The banner speaks for this outcome now, so an earlier report
                 // under the same key would only be giving an outdated reason.
@@ -26475,6 +26565,75 @@ mod tests {
                     last_exit: None,
                 },
             }),
+        }
+    }
+
+    #[test]
+    fn quarantined_saved_panes_cannot_clone_or_reopen_with_fresh_identity() {
+        for chat in [false, true] {
+            for durable_marker in [false, true] {
+                let mut app = context_inspector_test_app(true);
+                app.context_inspector_open = false;
+                let source_id = app.workspace.focused().unwrap();
+                if chat {
+                    app.card_state_mut(source_id).unwrap().kind = CardKind::Chat(
+                        crate::chat::fresh_session(
+                            crate::agent::Provider::Claude,
+                            TerminalId::new(),
+                            PathBuf::from("/tmp"),
+                            &crate::account::Account::system(crate::agent::Provider::Claude),
+                        )
+                        .unwrap(),
+                    );
+                }
+                let source = app.card_state(source_id).unwrap().clone();
+                if durable_marker {
+                    Arc::make_mut(&mut app.durable)
+                        .quarantined_panes
+                        .insert(source_id, source.kind.clone());
+                } else {
+                    app.shared_views.quarantined.insert(source_id);
+                }
+                let original_ids = app
+                    .durable
+                    .cards
+                    .iter()
+                    .map(|card| card.id)
+                    .collect::<Vec<_>>();
+                let original_strip = app.workspace.order().collect::<Vec<_>>();
+                let original_starts = app.terminal_starts.lock().unwrap().clone();
+                drop(app.clone_focused_pane());
+                drop(app.duplicate_pane_in_scope(source.clone(), None));
+                app.recently_closed
+                    .push((source.clone(), app.active_workspace_destination()));
+                drop(app.run_workspace_command(
+                    workspace_widget::GlobalShortcut::ReopenPane,
+                    keyboard::Modifiers::empty(),
+                ));
+                assert_eq!(
+                    app.durable
+                        .cards
+                        .iter()
+                        .map(|card| card.id)
+                        .collect::<Vec<_>>(),
+                    original_ids
+                );
+                assert_eq!(app.workspace.order().collect::<Vec<_>>(), original_strip);
+                assert_eq!(app.workspace.focused(), Some(source_id));
+                assert_eq!(app.card_state(source_id).unwrap().kind, source.kind);
+                assert_eq!(*app.terminal_starts.lock().unwrap(), original_starts);
+                assert!(!app.chat_start_pending(source_id));
+                assert_eq!(
+                    app.recently_closed.len(),
+                    1,
+                    "a refusal retains the saved entry"
+                );
+                assert!(
+                    app.status
+                        .as_ref()
+                        .is_some_and(|notice| { notice.message.contains("Check session again") })
+                );
+            }
         }
     }
 
