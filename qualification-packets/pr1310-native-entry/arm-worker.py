@@ -8,6 +8,9 @@ Importing this module performs no native import, acquisition, or launch.
 SOURCE ONLY / NOT SUBMITTABLE: actual chain/build/native evidence is unresolved.
 """
 
+if not __debug__:
+    raise RuntimeError("PR1310 native entry requires nonoptimized Python; -O/-OO refused before imports/effects")
+
 import argparse
 import fcntl
 import hashlib

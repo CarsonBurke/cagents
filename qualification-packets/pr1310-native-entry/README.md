@@ -113,3 +113,19 @@ producer fields; no review certificate or runtime input is invented. Five new
 consumer source-oracle parents remain UNRUN; old pure3 results do not transfer.
 All actual chain/config/build/import/native/whole-flow/UX/FD-coverage/C grants
 remain UNKNOWN/HOLD. No actual A3 evidence or original negative is modified.
+
+## Nonoptimized entry contract
+
+The successor of exact assembled2000 adds only an ordinary module-level
+`if not __debug__: raise RuntimeError(...)` before imports/effects, plus source
+bindings. It is not an assert or caller-positive certificate. All functions,
+C/main/report/close/FD behavior and the main isolated/no-bytecode checks remain
+byte-exact2000; all4ad/028/a621 library and producer pins remain unchanged.
+
+Future outer-prefix DATA is exactly `['/usr/bin/python3', '-I', '-B', worker, ...]`,
+where `worker` is the actual frozen source operand, with no `-O`/`-OO`. This is
+source data, not a runnable/admitted invocation or current interpreter/hash/
+availability observation. No optimization experiment or authored code ran.
+Fresh narrow guard/binding review is required before public entry; all original
+chain/build/import/native/UX/FD/grant gates remain HOLD and five authored source
+oracles remain UNRUN. The old pure3 scope and old negatives are unchanged.

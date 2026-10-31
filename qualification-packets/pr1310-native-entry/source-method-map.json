@@ -1,81 +1,81 @@
 {
   "schema": "pr1310-direct-entry-C-owner-source-method-map-v1",
   "base": "feb4a2f722bb95f69ec2493dd3fc4a06d44ef0da",
-  "worker_sha256": "ad3b76dfb13f8129915d89ef3c4ecb742b56f9b15aa5447e723654f72f510518",
+  "worker_sha256": "2c053a7c0ff6c034d42b5e0c0dde2d6ed82cfaaea5a4e4f83c23e96afbeb7399",
   "source_functions": {
     "require": {
-      "line": 45,
-      "end_line": 47
+      "line": 48,
+      "end_line": 50
     },
     "cancelled": {
-      "line": 50,
-      "end_line": 51
+      "line": 53,
+      "end_line": 54
     },
     "stop": {
-      "line": 54,
-      "end_line": 56
+      "line": 57,
+      "end_line": 59
     },
     "checkpoint": {
-      "line": 59,
-      "end_line": 63
+      "line": 62,
+      "end_line": 66
     },
     "frozen_bytes": {
-      "line": 168,
-      "end_line": 182
+      "line": 171,
+      "end_line": 185
     },
     "unique_json": {
-      "line": 185,
-      "end_line": 195
+      "line": 188,
+      "end_line": 198
     },
     "source_module": {
-      "line": 198,
-      "end_line": 214
+      "line": 201,
+      "end_line": 217
     },
     "close_attempted": {
-      "line": 217,
-      "end_line": 219
+      "line": 220,
+      "end_line": 222
     },
     "close_once": {
-      "line": 222,
-      "end_line": 240
+      "line": 225,
+      "end_line": 243
     },
     "close_facts": {
-      "line": 243,
-      "end_line": 247
+      "line": 246,
+      "end_line": 250
     },
     "emit": {
-      "line": 250,
-      "end_line": 290
+      "line": 253,
+      "end_line": 293
     },
     "held": {
-      "line": 293,
-      "end_line": 315
+      "line": 296,
+      "end_line": 318
     },
     "main": {
-      "line": 318,
-      "end_line": 458
+      "line": 321,
+      "end_line": 461
     }
   },
   "new_original_C_methods": {
     "__init__": {
-      "line": 69,
-      "end_line": 92
+      "line": 72,
+      "end_line": 95
     },
     "identity": {
-      "line": 95,
-      "end_line": 97
+      "line": 98,
+      "end_line": 100
     },
     "acquire": {
-      "line": 99,
-      "end_line": 126
+      "line": 102,
+      "end_line": 129
     },
     "facts": {
-      "line": 128,
-      "end_line": 130
+      "line": 131,
+      "end_line": 133
     },
     "close_after_report": {
-      "line": 132,
-      "end_line": 165
+      "line": 135,
+      "end_line": 168
     }
   },
   "reference_pins": {
@@ -197,5 +197,29 @@
     "raw_UI_code": "None remains unknown; no inference or policy change",
     "resource_return": "HOLD until actual original execution, soleRAW, explicit executor return and Root acceptance; source binding is no availability/grant/native certificate",
     "preserved_history": "Old0b/e374/4ab5 and all prior source negatives and scoped direct-C reviews remain immutable; actualA3 evidence untouched"
+  },
+  "nonoptimized_entry_contract": {
+    "schema": "pr1310-native-entry-nonoptimized-source-contract-v1",
+    "base_assembled_head": "2000a94a516bade4699da6fa3dbc83700fc1c99a",
+    "base_assembled_tree": "acd33cdc3e6a4c0e1856e8135cf3e336838d92dd",
+    "base_source_review": {
+      "path": "/tmp/coord-b9-pr1310-2000a94a-independent-assembled-source-binding-review.json",
+      "sha256": "3a5d1c662e0391f6059650cfc0a1a996ad527b44980c17ab9efc7595a33caac8",
+      "scope": "2000 assembled source binding only; no guard successor or runtime transfer."
+    },
+    "runtime_contract": "NONOPTIMIZED_REQUIRED: ordinary module-level if not __debug__ raises RuntimeError BEFORE imports/effects. This is not assert and does not depend on caller-positive data.",
+    "source_delta_only": "One module-level guard plus exact worker hash/line map and this metadata. Every original function/Cclass/main/report/CLOSE1/FD/custody/physical/AX/library/driver body is byte-exact2000. Existing main isolated/no-bytecode require checks unchanged.",
+    "historical_current_source_binding": "Existing current_source_binding objects remain immutable2000 assembly provenance; this guard supplement describes the sole new executable delta, not an assembled self-hash.",
+    "future_outer_prefix_DATA": [
+      "/usr/bin/python3",
+      "-I",
+      "-B"
+    ],
+    "next_operand": "Actual frozen worker path from the separately admitted external source binding, followed by original arguments; no -O/-OO.",
+    "argv_scope": "SOURCE DATA ONLY; no current interpreter/path/hash/optimization/availability observation, flag stripping, environment rewrite, execution grant or runnable packet.",
+    "worker_source_sha256": "2c053a7c0ff6c034d42b5e0c0dde2d6ed82cfaaea5a4e4f83c23e96afbeb7399",
+    "review": "PENDING_FRESH_NARROW_GUARD_BINDING_REVIEW_BEFORE_PUBLIC_ENTRY",
+    "actual_runtime": null,
+    "remaining_gates": "Original chain/config/matched-build/import/native wholeflow/UX/FD coverage and grant remain HOLD; rawUI None and original negatives retained. Five source AST unit parents authored UNRUN; old three PASS scope unchanged."
   }
 }

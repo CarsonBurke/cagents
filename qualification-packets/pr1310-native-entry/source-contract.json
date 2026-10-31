@@ -3,8 +3,8 @@
   "status": "ASSEMBLED_SOURCE_BINDING_REVIEW_PENDING_NOT_SUBMITTABLE_ACTUAL_PROVENANCE_NATIVE_GATES_UNRESOLVED",
   "worker": {
     "path": "qualification-packets/pr1310-native-entry/arm-worker.py",
-    "sha256": "ad3b76dfb13f8129915d89ef3c4ecb742b56f9b15aa5447e723654f72f510518",
-    "invocation": "PINNED_PHYSICAL_PYTHON -I -B arm-worker.py --packet ACTUAL_PACKET --packet-sha256 ACTUAL_SHA --worker-sha256 FROZEN_WORKER_SHA --whole-deadline ORIGINAL_ABSOLUTE_DEADLINE",
+    "sha256": "2c053a7c0ff6c034d42b5e0c0dde2d6ed82cfaaea5a4e4f83c23e96afbeb7399",
+    "invocation": "SOURCE DATA PREFIX /usr/bin/python3 -I -B, then actual frozen worker path and original arguments; no -O/-OO, actual runtime admission unresolved.",
     "standalone_admission": null,
     "authority": "Actual authenticated outer Root/User instruction; no argument or JSON authenticates it.",
     "execution_role": "Historical filename; SAME original external-tool entry now retains original NativeHistoryOwner AND original Cfd. No nested worker/parent/handoff required."
@@ -252,5 +252,29 @@
     "raw_UI_code": "None remains unknown; no inference or policy change",
     "resource_return": "HOLD until actual original execution, soleRAW, explicit executor return and Root acceptance; source binding is no availability/grant/native certificate",
     "preserved_history": "Old0b/e374/4ab5 and all prior source negatives and scoped direct-C reviews remain immutable; actualA3 evidence untouched"
+  },
+  "nonoptimized_entry_contract": {
+    "schema": "pr1310-native-entry-nonoptimized-source-contract-v1",
+    "base_assembled_head": "2000a94a516bade4699da6fa3dbc83700fc1c99a",
+    "base_assembled_tree": "acd33cdc3e6a4c0e1856e8135cf3e336838d92dd",
+    "base_source_review": {
+      "path": "/tmp/coord-b9-pr1310-2000a94a-independent-assembled-source-binding-review.json",
+      "sha256": "3a5d1c662e0391f6059650cfc0a1a996ad527b44980c17ab9efc7595a33caac8",
+      "scope": "2000 assembled source binding only; no guard successor or runtime transfer."
+    },
+    "runtime_contract": "NONOPTIMIZED_REQUIRED: ordinary module-level if not __debug__ raises RuntimeError BEFORE imports/effects. This is not assert and does not depend on caller-positive data.",
+    "source_delta_only": "One module-level guard plus exact worker hash/line map and this metadata. Every original function/Cclass/main/report/CLOSE1/FD/custody/physical/AX/library/driver body is byte-exact2000. Existing main isolated/no-bytecode require checks unchanged.",
+    "historical_current_source_binding": "Existing current_source_binding objects remain immutable2000 assembly provenance; this guard supplement describes the sole new executable delta, not an assembled self-hash.",
+    "future_outer_prefix_DATA": [
+      "/usr/bin/python3",
+      "-I",
+      "-B"
+    ],
+    "next_operand": "Actual frozen worker path from the separately admitted external source binding, followed by original arguments; no -O/-OO.",
+    "argv_scope": "SOURCE DATA ONLY; no current interpreter/path/hash/optimization/availability observation, flag stripping, environment rewrite, execution grant or runnable packet.",
+    "worker_source_sha256": "2c053a7c0ff6c034d42b5e0c0dde2d6ed82cfaaea5a4e4f83c23e96afbeb7399",
+    "review": "PENDING_FRESH_NARROW_GUARD_BINDING_REVIEW_BEFORE_PUBLIC_ENTRY",
+    "actual_runtime": null,
+    "remaining_gates": "Original chain/config/matched-build/import/native wholeflow/UX/FD coverage and grant remain HOLD; rawUI None and original negatives retained. Five source AST unit parents authored UNRUN; old three PASS scope unchanged."
   }
 }
