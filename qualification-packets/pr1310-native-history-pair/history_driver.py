@@ -5,6 +5,7 @@ The future original owner must supply the binding in root-interface.md, then
 obtain independent review of the assembled executable BEFORE use.
 """
 
+import json
 import re
 
 from observations import (ADAPTERS, EMPTY, FIRST_PAGER, Hold, LIMIT, LOADING,
@@ -18,7 +19,22 @@ class HistoryDriver:
     atspi and image are actual pyatspi and PIL.Image modules supplied by that
     owner only after private endpoint and original-root admission. No mocks are
     supplied. A root checkpoint must fail before every effect on any unknown.
+
+    AX timeouts below cover only the real library's supported method-call
+    path. Import/bootstrap, PID lookup, compound native calls and installed C
+    build mapping still require the original entry's containment; these checks
+    are not a hard whole-call wall-time guarantee. String caps are post-return
+    checks and cannot preempt GI/libdbus allocation.
     """
+
+    _AX_MAX_CHILDREN = 999
+    _AX_MAX_NODES = 10000
+    _AX_MAX_DEPTH = 64
+    _AX_MAX_ACTIONS = 16
+    _AX_MAX_STRING_BYTES = 4096
+    _AX_MAX_QUERIES = 16
+    _AX_MAX_QUERY_CHARACTERS = 4096
+    _AX_MAX_SNAPSHOT_BYTES = 1536 * 1024
 
     def __init__(self, root, atspi, image, arm, fixture):
         require(arm in ADAPTERS, "unknown native arm")
@@ -70,51 +86,143 @@ class HistoryDriver:
             self.root.pause_history_poll(self.binding, maximum_seconds=0.05)
             self.check(operation + "-after-pause")
 
+    def _ax_call(self, operation, call):
+        # Installed pyatspi.Accessibility.setTimeout aliases Atspi.set_timeout:
+        # (normal milliseconds, startup-grace milliseconds). -1 disables the
+        # startup grace only; a nonpositive normal timeout is never supplied.
+        remaining = self.check("AX-" + operation + "-before")
+        milliseconds = min(200, int(remaining * 1000))
+        require(milliseconds >= 1, "less than one millisecond remains for AX")
+        stage = "setTimeout"
+        try:
+            self.ax.setTimeout(milliseconds, -1)
+            stage = operation
+            value = call()
+        except BaseException as native_error:
+            try:
+                self.check("AX-" + operation + "-after-error")
+            except BaseException as postcheck_error:
+                native_error.add_note(
+                    f"AX {stage} raised first; the subsequent original-root "
+                    "postcheck also failed (retained as cause). No effect "
+                    "completion or permission to retry is inferred."
+                )
+                raise native_error from postcheck_error
+            native_error.add_note(
+                f"AX {stage} raised before the original-root postcheck returned; "
+                "the failed accessor/effect is not retried."
+            )
+            raise
+        try:
+            self.check("AX-" + operation + "-after")
+        except BaseException as postcheck_error:
+            postcheck_error.add_note(
+                f"AX {operation} returned before this postcheck failed; its "
+                "result is not an admitted observation and an effect may "
+                "already have occurred. Do not retry the effect."
+            )
+            raise
+        return value
+
+    def _ax_count(self, operation, call, maximum):
+        value = self._ax_call(operation, call)
+        require(type(value) is int and 0 <= value <= maximum,
+                "invalid/oversized AX " + operation)
+        return value
+
+    def _ax_string(self, operation, call):
+        value = self._ax_call(operation, call)
+        require(isinstance(value, str)
+                and len(value) <= self._AX_MAX_STRING_BYTES
+                and len(value.encode("utf-8", errors="strict")) <= self._AX_MAX_STRING_BYTES,
+                "invalid/oversized AX " + operation)
+        return value
+
+    def _ax_name(self, node):
+        return self._ax_string("name", lambda: node.name)
+
+    def _ax_contains(self, states, state):
+        require(states is not None, "AX state set absent")
+        return self._ax_call("state-contains", lambda: states.contains(state))
+
+    def _ax_states(self, operation, node):
+        states = self._ax_call(operation, lambda: node.getState())
+        require(not self._ax_contains(states, self.ax.STATE_DEFUNCT),
+                "AX object is defunct; no complete observation")
+        return states
+
     def nodes(self):
         self.check("AX-before")
-        desktop = self.ax.Registry.getDesktop(0)
+        desktop = self._ax_call("desktop", lambda: self.ax.Registry.getDesktop(0))
         require(desktop is not None, "private accessibility desktop absent")
-        require(desktop.childCount < 1000, "accessibility desktop exceeds bound")
-        apps = [desktop.getChildAtIndex(i) for i in range(desktop.childCount)]
+        count = self._ax_count("desktop-child-count", lambda: desktop.childCount,
+                               self._AX_MAX_CHILDREN)
+        apps = [self._ax_call("desktop-child", lambda i=i: desktop.getChildAtIndex(i))
+                for i in range(count)]
         require(all(app is not None for app in apps), "changing accessibility desktop")
-        apps = [app for app in apps if app.get_process_id() == self.pid]
+        apps = [app for app in apps
+                if self._ax_call("application-pid", lambda app=app: app.get_process_id()) == self.pid]
         require(len(apps) == 1, "owned UI accessibility application absent/ambiguous")
         pending, result = [(apps[0], ())], []
         while pending:
             self.check("AX-node")
             node, path = pending.pop()
-            require(node is not None and len(result) < 10000 and node.childCount < 1000,
+            require(node is not None and len(result) < self._AX_MAX_NODES
+                    and len(path) <= self._AX_MAX_DEPTH,
                     "incomplete/oversized accessibility tree")
+            count = self._ax_count("node-child-count", lambda: node.childCount,
+                                   self._AX_MAX_CHILDREN)
             result.append((path, node))
-            pending.extend((node.getChildAtIndex(i), path + (i,))
-                           for i in reversed(range(node.childCount)))
+            require(len(result) + len(pending) + count <= self._AX_MAX_NODES
+                    and (not count or len(path) < self._AX_MAX_DEPTH),
+                    "accessibility pending tree/path exceeds bound")
+            for i in reversed(range(count)):
+                child = self._ax_call("node-child", lambda i=i: node.getChildAtIndex(i))
+                require(child is not None, "changing accessibility tree")
+                pending.append((child, path + (i,)))
         self.check("AX-after")
         return result
 
     def showing(self, node):
-        return node.getState().contains(self.ax.STATE_SHOWING)
+        states = self._ax_states("showing-state", node)
+        return self._ax_contains(states, self.ax.STATE_SHOWING)
 
     def enabled(self, node):
-        return node.getState().contains(self.ax.STATE_ENABLED)
+        states = self._ax_states("enabled-state", node)
+        return self._ax_contains(states, self.ax.STATE_ENABLED)
 
     def description(self, path, node):
         self.check("AX-description-before")
-        states = node.getState()
-        bounds = node.queryComponent().getExtents(self.ax.DESKTOP_COORDS)
+        states = self._ax_states("description-state", node)
+        component = self._ax_call("component-interface", lambda: node.queryComponent())
+        bounds = self._ax_call("component-extents",
+                               lambda: component.getExtents(self.ax.DESKTOP_COORDS))
         actions = []
-        if node.getRole() == self.ax.ROLE_PUSH_BUTTON:
-            action = node.queryAction()
-            actions = [action.getName(i) for i in range(action.nActions)]
-        value = {"path": list(path), "role": node.getRoleName(), "name": node.name,
-                 "showing": self.showing(node), "enabled": self.enabled(node),
-                 "focused": states.contains(self.ax.STATE_FOCUSED),
+        if self._ax_call("description-role", lambda: node.getRole()) == self.ax.ROLE_PUSH_BUTTON:
+            action = self._ax_call("action-interface", lambda: node.queryAction())
+            count = self._ax_count("action-count", lambda: action.nActions,
+                                   self._AX_MAX_ACTIONS)
+            actions = [self._ax_string("action-name", lambda i=i: action.getName(i))
+                       for i in range(count)]
+        value = {"path": list(path),
+                 "role": self._ax_string("role-name", lambda: node.getRoleName()),
+                 "name": self._ax_name(node),
+                 "showing": self._ax_contains(states, self.ax.STATE_SHOWING),
+                 "enabled": self._ax_contains(states, self.ax.STATE_ENABLED),
+                 "focused": self._ax_contains(states, self.ax.STATE_FOCUSED),
                  "bounds": [bounds.x, bounds.y, bounds.width, bounds.height],
                  "actions": actions}
         self.check("AX-description-after")
         return value
 
     def snapshot(self, name):
-        values = [self.description(path, node) for path, node in self.nodes()]
+        values, payload_bytes = [], 2
+        for path, node in self.nodes():
+            value = self.description(path, node)
+            payload_bytes += len(json.dumps(value, allow_nan=False).encode("utf-8")) + 2
+            require(payload_bytes <= self._AX_MAX_SNAPSHOT_BYTES,
+                    "AX snapshot exceeds incremental evidence bound")
+            values.append(value)
         self.record("accessibility", name=name, nodes=values)
         return values
 
@@ -125,14 +233,18 @@ class HistoryDriver:
         return matches[0] if matches else None
 
     def button(self, name):
-        return self.one(lambda node: node.getRole() == self.ax.ROLE_PUSH_BUTTON
-                        and node.name == name and self.enabled(node))
+        return self.one(lambda node: self._ax_call("button-role", lambda: node.getRole())
+                        == self.ax.ROLE_PUSH_BUTTON
+                        and self._ax_name(node) == name and self.enabled(node))
 
     def field(self):
         require(self.arm == "after", "Before has no History query field")
-        return self.one(lambda node: node.getRole() == self.ax.ROLE_ENTRY
-                        and node.name == SEARCH and self.enabled(node)
-                        and node.getState().contains(self.ax.STATE_EDITABLE))
+        return self.one(lambda node: self._ax_call("field-role", lambda: node.getRole())
+                        == self.ax.ROLE_ENTRY
+                        and self._ax_name(node) == SEARCH and self.enabled(node)
+                        and self._ax_contains(
+                            self._ax_states("editable-state", node),
+                            self.ax.STATE_EDITABLE))
 
     def native_focus(self):
         focus = int(self.tool(["xdotool", "getwindowfocus"]))
@@ -182,10 +294,14 @@ class HistoryDriver:
         self.native_focus()
         if keyboard:
             self.check("AX-focus-before")
-            require(target[1].queryComponent().grabFocus(), "target refused AX focus setup")
+            component = self._ax_call("focus-interface", lambda: target[1].queryComponent())
+            require(self._ax_call("grab-focus", lambda: component.grabFocus()),
+                    "target refused AX focus setup")
             self.check("AX-focus-after")
             self.poll(lambda: (current := finder()) is not None
-                      and current[1].getState().contains(self.ax.STATE_FOCUSED), "focus-readback")
+                      and self._ax_contains(
+                          self._ax_states("focus-state", current[1]),
+                          self.ax.STATE_FOCUSED), "focus-readback")
             self.native_focus()
             self.record("input", gesture="Return", target=item,
                         setup="AX grabFocus, separately disclosed; not Tab navigation")
@@ -201,13 +317,26 @@ class HistoryDriver:
         self.record("input", gesture="focus-query-pointer", target=item)
         self.tool(["xdotool", "mousemove", "--sync", *map(str, point), "click", "1"])
         self.poll(lambda: (current := self.field()) is not None
-                  and current[1].getState().contains(self.ax.STATE_FOCUSED), "query-focus")
+                  and self._ax_contains(
+                      self._ax_states("query-focus-state", current[1]),
+                      self.ax.STATE_FOCUSED), "query-focus")
 
     def query_text(self):
         target = self.field()
         require(target is not None, "query field disappeared")
         self.check("AX-query-text-before")
-        text = target[1].queryText().getText(0, -1)
+        require(len(self.fixture.queries) <= self._AX_MAX_QUERIES
+                and all(isinstance(query, str) and len(query) <= self._AX_MAX_QUERY_CHARACTERS
+                        for query in self.fixture.queries.values()),
+                "admitted query data exceeds AX readback bound")
+        maximum = max((len(query) for query in self.fixture.queries.values()), default=0)
+        interface = self._ax_call("text-interface", lambda: target[1].queryText())
+        count = self._ax_count("query-character-count", lambda: interface.characterCount, maximum)
+        text = self._ax_call("query-text", lambda: interface.getText(0, count))
+        after_count = self._ax_count("query-character-count-after",
+                                     lambda: interface.characterCount, maximum)
+        require(isinstance(text, str) and len(text) == count == after_count,
+                "AX query text changed during its bounded read")
         self.check("AX-query-text-after")
         return text
 
@@ -224,7 +353,10 @@ class HistoryDriver:
         self.poll(lambda: self.query_text() == text, "typed-query-readback")
         self.snapshot("query-draft-before-Enter")
         self.native_focus()
-        require(self.field()[1].getState().contains(self.ax.STATE_FOCUSED), "query lost focus")
+        target = self.field()
+        require(target is not None and self._ax_contains(
+            self._ax_states("submit-focus-state", target[1]),
+            self.ax.STATE_FOCUSED), "query lost focus")
         self.record("input", gesture="query-submit-physical-Return", query=text)
         self.tool(["xdotool", "key", "Return"])
         # Submission resets list/detail in product. Do not assert old selection.
@@ -235,13 +367,13 @@ class HistoryDriver:
         buttons = {}
         for path, node in nodes:
             self.check("AX-row-role")
-            if node.getRole() == self.ax.ROLE_PUSH_BUTTON:
+            if self._ax_call("row-role", lambda: node.getRole()) == self.ax.ROLE_PUSH_BUTTON:
                 buttons[path] = node
         labels_by_button = {path: [] for path in buttons}
         # Read each native name once, not once per row or per 25k data record.
         for path, node in nodes:
             self.check("AX-row-name")
-            label = node.name or ""
+            label = self._ax_name(node)
             for length in range(len(path) + 1):
                 ancestor = path[:length]
                 if ancestor in labels_by_button:
@@ -435,7 +567,7 @@ class HistoryDriver:
 
         def observed():
             nodes = self.nodes()
-            labels = [node.name for _, node in nodes if self.showing(node)]
+            labels = [self._ax_name(node) for _, node in nodes if self.showing(node)]
             rows = self.row_nodes()
             draft = self.query_text()
             row_oids = set(rows)
@@ -473,7 +605,7 @@ class HistoryDriver:
 
     def unborn(self):
         require(self.fixture.dataset == "unborn", "wrong dataset")
-        self.poll(lambda: any(node.name == UNBORN and self.showing(node)
+        self.poll(lambda: any(self._ax_name(node) == UNBORN and self.showing(node)
                               for _, node in self.nodes()), "unborn-notice")
         require(not self.row_nodes() and self.button(PAGER) is None, "unborn exposes rows/pager")
         self.visible_outcome("unborn")
@@ -481,7 +613,7 @@ class HistoryDriver:
 
     def unavailable_before(self):
         require(self.arm == "before", "wrong arm")
-        labels = [node.name for _, node in self.nodes()]
+        labels = [self._ax_name(node) for _, node in self.nodes()]
         require(SEARCH not in labels and LIMIT not in labels, "Before unexpectedly contains feature controls")
         self.record("feature-unavailable", cases=["query", "refine", "full-SHA-search", "Limited"],
                     baseline="actual ordinary History on same dataset/viewport; never simulate new UI")
