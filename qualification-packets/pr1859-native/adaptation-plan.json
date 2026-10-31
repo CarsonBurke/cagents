@@ -60,6 +60,42 @@
     ],
     "runner_warm_builds": "explicit normal workflow; no skipbuild option"
   },
+  "current_source_components": {
+    "actual_physical_tool_context_grant_facts": "NULL_HOLD",
+    "hard_engine_gate": {
+      "ENGINE_COMPANION_COMPATIBLE": false,
+      "before_effects": true,
+      "maintained_engine_companion_API": null
+    },
+    "present": [
+      "controller.py",
+      "run-native.py",
+      "namespace.py",
+      "controller-contract.json",
+      "executor-contract.json"
+    ],
+    "runtime": "ALL_UNRUN",
+    "source_review": {
+      "execution_authorized": false,
+      "references": {
+        "controller": {
+          "path": "/var/tmp/coord16-1859-controller-independent-tampyg2z/review.json",
+          "sha256": "555b3c208806fe49ecf9161e99ab048c2e49e343c7111d7a95b9ab0ad75c0c74"
+        },
+        "executor": {
+          "path": "/var/tmp/coord16-1859-build-key-independent-regate-iuhq6qvb/review.json",
+          "sha256": "7d18f5670d56171f9d91e2207a6dd5b6ac972eef14fc5b6b852257fee15835c4"
+        },
+        "prior11file_bundle": {
+          "path": "/var/tmp/coord16-1859-assembled-source-delivery-vawqnleq/manifest.json",
+          "sha256": "05e23a062730d7ed2eb16166b74f0249ae4d5559a09891ed34e78c5150ecfe4b"
+        }
+      },
+      "runtime": "ALL_UNRUN",
+      "scope": "Independent source reviews identify immutable predecessor81a7 code/11-file bundle only, not this regenerated metadata or runtime.",
+      "status": "PREDECESSOR_SOURCE_REVIEWED_CURRENT_METADATA_REGATE_PENDING"
+    }
+  },
   "custody": {
     "closure": "original Popen/waits/pidfds/family settlement; no arbitrary adoption. Timeout/cancel never success, positive cleanup unbounded. UNKNOWN retains all original ownership/descriptors/C.",
     "final_helper_only": "after genuine scene positive settlement; never authorizes scene namespace; both owners positive before C release",
@@ -75,44 +111,7 @@
       "controller/input/capture/helper children"
     ]
   },
-  "namespace": "fresh owned0700 root + data/config/cache/state/runtime; bootstrap alone creates claude/public-project/create_new0600marker. No reset/delete/archive/reuse/adopt. suffix is not revision authority.",
-  "namespaces": {
-    "after": "/tmp/cagents-1859-native-preinit-advisory-pending-narrow-after",
-    "before": "/tmp/cagents-1859-native-preinit-advisory-pending-narrow-before"
-  },
-  "no_transfer": [
-    "donor source is not qualification/grant",
-    "no firstsend1757 or EC1912 implementation ownership",
-    "no native/WebP/UX/readiness/merge claim"
-  ],
-  "one_case": "preinit-advisory-pending/narrow only; other4 scenarios backlog",
-  "opaque_authority": "natural HOME/account retained unchanged; no liveprovider/login/home/config/skills/history; only private synthetic context. Python-ISB semantics source-reviewed but actual interpreter/libraries unbound. Future ownedX11 routing exactpolicy only; no blanket envscrub/guardbypass.",
-  "pair": {
-    "after": {
-      "head": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
-      "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8"
-    },
-    "before": {
-      "head": "2587e8cf8a9b4702a925f74960d2deb2c06d3d20",
-      "tree": "0185d76c81d034850686f345cc0faae7c03b178c"
-    }
-  },
-  "refusal": "missing required bindings refuse effects in original ordering; this data cannot acquire or execute anything",
-  "remaining_bindings": {
-    "actual_allocation_grant": null,
-    "actual_build_context": null,
-    "actual_matched_artifacts": null,
-    "canonical_C_lock_target_identity": null,
-    "compiler_Zig_Python_X11_PIL_tools_and_libraries": null,
-    "execution_common_import": null,
-    "final_controller_source_gate": null,
-    "frozen_physical_control_head_tree": null,
-    "initial_owned_slot_head_tree_registry": null,
-    "latest_accepted_return": null,
-    "original_runner_UI_daemon_provider_incarnations": null,
-    "private_display_and_routing": null
-  },
-  "required_code_seams": [
+  "historical_original_DATA_required_code_seams": [
     {
       "gap": "current logs omit Starting/retiring/pending phase/providerPID; combine actual native review+original family evidence; never invent fields",
       "id": "P1",
@@ -167,7 +166,59 @@
       ]
     }
   ],
+  "historical_original_six_file_DATA_plan": {
+    "commit": "81a7e782e8544b7040e3da0a66402ca0f14aa9b3",
+    "original_six_paths": [
+      "README.md",
+      "adaptation-plan.json",
+      "phase-contract.json",
+      "source-checks.json",
+      "source-contract.json",
+      "manifest.json"
+    ],
+    "prior_manifest_sha256": "b3c0154ddc5b22fcd52a9536d238b2f4b179c998d7856fb6b5f1ab46b44c7f10",
+    "prior_source_checks_sha256": "247495fd6cf9771d412ca77480eae53d4874247c875af5c50ec316eb65b65ae2",
+    "scope": "Immutable original six-file DATA plan only; current packet also contains five later source/contract files."
+  },
+  "namespace": "fresh owned0700 root + data/config/cache/state/runtime; bootstrap alone creates claude/public-project/create_new0600marker. No reset/delete/archive/reuse/adopt. suffix is not revision authority.",
+  "namespaces": {
+    "after": "/tmp/cagents-1859-native-preinit-advisory-pending-narrow-after",
+    "before": "/tmp/cagents-1859-native-preinit-advisory-pending-narrow-before"
+  },
+  "no_transfer": [
+    "donor source is not qualification/grant",
+    "no firstsend1757 or EC1912 implementation ownership",
+    "no native/WebP/UX/readiness/merge claim"
+  ],
+  "one_case": "preinit-advisory-pending/narrow only; other4 scenarios backlog",
+  "opaque_authority": "natural HOME/account retained unchanged; no liveprovider/login/home/config/skills/history; only private synthetic context. Python-ISB semantics source-reviewed but actual interpreter/libraries unbound. Future ownedX11 routing exactpolicy only; no blanket envscrub/guardbypass.",
+  "pair": {
+    "after": {
+      "head": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
+      "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8"
+    },
+    "before": {
+      "head": "2587e8cf8a9b4702a925f74960d2deb2c06d3d20",
+      "tree": "0185d76c81d034850686f345cc0faae7c03b178c"
+    }
+  },
+  "refusal": "Unchanged executor admission first requires ENGINE_COMPANION_COMPATIBLE is True; actual False refuses before effects. All later physical/hash/context/grant bindings remain unbound; prior DATA/source reviews cannot acquire or execute anything.",
+  "remaining_bindings": {
+    "actual_allocation_grant": null,
+    "actual_build_context": null,
+    "actual_matched_artifacts": null,
+    "canonical_C_lock_target_identity": null,
+    "compiler_Zig_Python_X11_PIL_tools_and_libraries": null,
+    "current_metadata_successor_regate": null,
+    "execution_common_import": null,
+    "frozen_physical_control_head_tree": null,
+    "initial_owned_slot_head_tree_registry": null,
+    "latest_accepted_return": null,
+    "maintained_engine_companion_integration": null,
+    "original_runner_UI_daemon_provider_incarnations": null,
+    "private_display_and_routing": null
+  },
   "runtime": "ALL_UNRUN",
-  "status": "HOLD_DATA_ONLY_NO_EXECUTABLE",
+  "status": "HOLD_SOURCE_COMPONENTS_PRESENT_SOURCE_REVIEWED_RUNTIME_UNRUN",
   "version": 1
 }

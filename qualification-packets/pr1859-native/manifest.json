@@ -1,34 +1,220 @@
 {
+  "actual_physical_tool_context_grant_facts": null,
+  "attempts": 0,
   "base": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
   "branch": "qualification/coord16-pr1859-native-packet",
-  "executables": [],
-  "kind": "AUTHOR_DATA_PHASE_SOURCE_CONTRACT_PENDING_REVIEW",
+  "current_metadata_successor_regate": null,
+  "execution_authorized": false,
+  "grant": null,
+  "hard_engine_gate": {
+    "constant": "ENGINE_COMPANION_COMPATIBLE",
+    "maintained_engine_companion_API": null,
+    "must_remain_false_until_separate_reviewed_engine_integration": true,
+    "source": "run-native.py",
+    "value": false
+  },
+  "hash_dag": {
+    "acyclic": true,
+    "bound_source_edges": [
+      {
+        "from": "controller.py",
+        "sha256": "619ad94b782ca95dac7c029fbfe270e0df8fc88717159c276080325a0aa3a75a",
+        "to": "source-contract.json"
+      },
+      {
+        "from": "controller.py",
+        "sha256": "0cd33537dde2a0a8793750e9193f39994ca8da2632937d770e7edec1b6f60b8f",
+        "to": "phase-contract.json"
+      },
+      {
+        "from": "controller.py",
+        "sha256": "59fbf933257f08c9d384a84c80c988c9cffc938c0706a8a600037190036c0f9c",
+        "to": "controller-contract.json"
+      },
+      {
+        "from": "controller-contract.json",
+        "sha256": "619ad94b782ca95dac7c029fbfe270e0df8fc88717159c276080325a0aa3a75a",
+        "to": "source-contract.json"
+      },
+      {
+        "from": "controller-contract.json",
+        "sha256": "0cd33537dde2a0a8793750e9193f39994ca8da2632937d770e7edec1b6f60b8f",
+        "to": "phase-contract.json"
+      }
+    ],
+    "manifest_hashes_itself": false,
+    "manifest_is_external_index": true,
+    "metadata_source_review_references": "Immutable prior81a7 source gates/bundle only; no regenerated-current metadata claim.",
+    "unbound_runtime_edges": [
+      "run-native.py -> executor-contract.json (PLAN_SHA256=None)",
+      "run-native.py -> component contracts/source (globals=None)"
+    ]
+  },
+  "historical_original_six_file_DATA_plan": {
+    "commit": "81a7e782e8544b7040e3da0a66402ca0f14aa9b3",
+    "original_six_paths": [
+      "README.md",
+      "adaptation-plan.json",
+      "phase-contract.json",
+      "source-checks.json",
+      "source-contract.json",
+      "manifest.json"
+    ],
+    "prior_manifest_sha256": "b3c0154ddc5b22fcd52a9536d238b2f4b179c998d7856fb6b5f1ab46b44c7f10",
+    "prior_source_checks_sha256": "247495fd6cf9771d412ca77480eae53d4874247c875af5c50ec316eb65b65ae2",
+    "scope": "Immutable original six-file DATA plan only; current packet also contains five later source/contract files."
+  },
+  "kind": "CURRENT_ELEVEN_PATH_SOURCE_DATA_PACKET_PENDING_METADATA_REGATE",
+  "limits": [
+    "Existing independent source gates do not establish actual runtime/type/native/UX/cleanup or engine-companion compatibility.",
+    "No candidate imports/calls/compilation/execution or primary facts gathered.",
+    "No existing Python/namespace/input/readonly-window guard or function changed."
+  ],
+  "manifest_self": {
+    "path": "manifest.json",
+    "reason": "Excluded from payload hashing to avoid self-reference; all eleven paths represented.",
+    "role": "EXTERNAL_INDEX",
+    "sha256": null
+  },
   "members": {
     "README.md": {
-      "bytes": 5750,
-      "sha256": "87b32828735d93ceeebfb58ce34abd869f4488b5e2c8592288b7e6fef261a471"
+      "bytes": 7082,
+      "mode": 420,
+      "sha256": "f4ffb383ad96d2a2b1f73a36c5095cd2e98dd0e8ac55b2b97e3a622c68dc8de3"
     },
     "adaptation-plan.json": {
-      "bytes": 7727,
-      "sha256": "31da483f5ba5c66865c1e282c6ef53a61e91f74242b8116c560ca028a860d889"
+      "bytes": 10033,
+      "mode": 420,
+      "sha256": "b25770481cf1e674aa079e405071fb77c7251945087d3536c9e94838f7df90ed"
+    },
+    "controller-contract.json": {
+      "bytes": 37657,
+      "mode": 420,
+      "sha256": "59fbf933257f08c9d384a84c80c988c9cffc938c0706a8a600037190036c0f9c"
+    },
+    "controller.py": {
+      "bytes": 78720,
+      "mode": 420,
+      "sha256": "caaa9d47326845399e016dc3744d2c493411d1fae219abd372cc69473974d7a8"
+    },
+    "executor-contract.json": {
+      "bytes": 3127,
+      "mode": 420,
+      "sha256": "f15a84e23927bb133a17f8c7e94a847fbb68aca88b639ff16ecd0744829adf46"
+    },
+    "namespace.py": {
+      "bytes": 11413,
+      "mode": 420,
+      "sha256": "d0579b2a74a9cc93aa5a12b36f47d3411a9ff4ee2d8b453c95dea6c3ce69abc7"
     },
     "phase-contract.json": {
       "bytes": 11635,
+      "mode": 420,
       "sha256": "0cd33537dde2a0a8793750e9193f39994ca8da2632937d770e7edec1b6f60b8f"
     },
+    "run-native.py": {
+      "bytes": 73645,
+      "mode": 420,
+      "sha256": "7371225afae11775f3a999f8d522a767cf9404e6a2e94a2e1fb8155b27555002"
+    },
     "source-checks.json": {
-      "bytes": 833,
-      "sha256": "247495fd6cf9771d412ca77480eae53d4874247c875af5c50ec316eb65b65ae2"
+      "bytes": 3409,
+      "mode": 420,
+      "sha256": "6052580e89125b862ca38dc9fac171289bb327069d55bc5f3ea16938f705bb50"
     },
     "source-contract.json": {
       "bytes": 16414,
+      "mode": 420,
       "sha256": "619ad94b782ca95dac7c029fbfe270e0df8fc88717159c276080325a0aa3a75a"
     }
   },
+  "packet_paths": [
+    "README.md",
+    "adaptation-plan.json",
+    "controller-contract.json",
+    "controller.py",
+    "executor-contract.json",
+    "manifest.json",
+    "namespace.py",
+    "phase-contract.json",
+    "run-native.py",
+    "source-checks.json",
+    "source-contract.json"
+  ],
+  "pair": {
+    "after": {
+      "head": "97c1ce31ae6a6d0af25b36aca710be4fa02d5721",
+      "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8"
+    },
+    "before": {
+      "head": "2587e8cf8a9b4702a925f74960d2deb2c06d3d20",
+      "tree": "0185d76c81d034850686f345cc0faae7c03b178c"
+    }
+  },
   "physical_bindings": "NULL_HOLD",
+  "predecessor_packet_commit": "81a7e782e8544b7040e3da0a66402ca0f14aa9b3",
   "product_edits": [],
+  "product_pair_or_overlay_requalification": "NONE; source-contract bytes/2587->97 pair/only four product differences unchanged.",
+  "python_conservation": {
+    "controller.py": {
+      "FunctionDefs_including_nested": 54,
+      "all_bytes_exact": true,
+      "sha256": "caaa9d47326845399e016dc3744d2c493411d1fae219abd372cc69473974d7a8"
+    },
+    "namespace.py": {
+      "FunctionDefs_including_nested": 10,
+      "all_bytes_exact": true,
+      "sha256": "d0579b2a74a9cc93aa5a12b36f47d3411a9ff4ee2d8b453c95dea6c3ce69abc7"
+    },
+    "run-native.py": {
+      "FunctionDefs_including_nested": 39,
+      "all_bytes_exact": true,
+      "sha256": "7371225afae11775f3a999f8d522a767cf9404e6a2e94a2e1fb8155b27555002"
+    }
+  },
   "runtime": "ALL_UNRUN",
-  "source_gate": "PENDING_ROOT_REVIEW",
+  "runtime_hash_bindings": {
+    "CONTROLLER_CONTRACT_SHA": null,
+    "CONTROLLER_SHA": null,
+    "NAMESPACE_SHA": null,
+    "PHASES_SHA": null,
+    "PLAN_SHA256": null,
+    "SOURCE_SHA": null
+  },
+  "source_components_present": [
+    "controller.py",
+    "run-native.py",
+    "namespace.py"
+  ],
+  "source_contracts_present": [
+    "source-contract.json",
+    "phase-contract.json",
+    "controller-contract.json",
+    "executor-contract.json",
+    "adaptation-plan.json"
+  ],
+  "source_review": {
+    "execution_authorized": false,
+    "references": {
+      "controller": {
+        "path": "/var/tmp/coord16-1859-controller-independent-tampyg2z/review.json",
+        "sha256": "555b3c208806fe49ecf9161e99ab048c2e49e343c7111d7a95b9ab0ad75c0c74"
+      },
+      "executor": {
+        "path": "/var/tmp/coord16-1859-build-key-independent-regate-iuhq6qvb/review.json",
+        "sha256": "7d18f5670d56171f9d91e2207a6dd5b6ac972eef14fc5b6b852257fee15835c4"
+      },
+      "prior11file_bundle": {
+        "path": "/var/tmp/coord16-1859-assembled-source-delivery-vawqnleq/manifest.json",
+        "sha256": "05e23a062730d7ed2eb16166b74f0249ae4d5559a09891ed34e78c5150ecfe4b"
+      }
+    },
+    "runtime": "ALL_UNRUN",
+    "scope": "Independent source reviews identify immutable predecessor81a7 code/11-file bundle only, not this regenerated metadata or runtime.",
+    "status": "PREDECESSOR_SOURCE_REVIEWED_CURRENT_METADATA_REGATE_PENDING"
+  },
+  "status": "SOURCE_COMPONENTS_PRESENT_INDEPENDENT_SOURCE_REVIEW_ONLY_HARD_ENGINE_HOLD_RUNTIME_UNRUN",
   "tree": "1f5aebf1aa4fa991c295c02ac433493a689000f8",
+  "version": 2,
   "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1859-native-packet"
 }

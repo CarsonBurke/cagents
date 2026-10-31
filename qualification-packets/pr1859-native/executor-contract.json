@@ -1,5 +1,6 @@
 {
   "allocation_fields": null,
+  "attempts": 0,
   "binding_status": "HOLD",
   "capture_root": {
     "identity": null,
@@ -11,9 +12,31 @@
   "common_git_dir": null,
   "compiler_environment_absent": null,
   "compiler_overlay": null,
+  "component_source_review": {
+    "execution_authorized": false,
+    "references": {
+      "controller": {
+        "path": "/var/tmp/coord16-1859-controller-independent-tampyg2z/review.json",
+        "sha256": "555b3c208806fe49ecf9161e99ab048c2e49e343c7111d7a95b9ab0ad75c0c74"
+      },
+      "executor": {
+        "path": "/var/tmp/coord16-1859-build-key-independent-regate-iuhq6qvb/review.json",
+        "sha256": "7d18f5670d56171f9d91e2207a6dd5b6ac972eef14fc5b6b852257fee15835c4"
+      },
+      "prior11file_bundle": {
+        "path": "/var/tmp/coord16-1859-assembled-source-delivery-vawqnleq/manifest.json",
+        "sha256": "05e23a062730d7ed2eb16166b74f0249ae4d5559a09891ed34e78c5150ecfe4b"
+      }
+    },
+    "runtime": "ALL_UNRUN",
+    "scope": "Independent source reviews identify immutable predecessor81a7 code/11-file bundle only, not this regenerated metadata or runtime.",
+    "status": "PREDECESSOR_SOURCE_REVIEWED_CURRENT_METADATA_REGATE_PENDING"
+  },
   "context_files": null,
   "control": null,
+  "current_metadata_successor_regate": null,
   "display": null,
+  "execution_authorized": false,
   "expected_cargo_features": null,
   "frozen_control_reference": {
     "head": "359829626964afc78019dd32bd435696584dbb54",
@@ -21,9 +44,10 @@
     "role": "immutable source reference only, not current physical binding",
     "tree": "fbaae5cafbc422c855b4e1ac39e2c3a52d64273c"
   },
+  "grant": null,
   "hard_source_engine_HOLD": "ENGINE_COMPANION_COMPATIBLE=False: no effects possible, even if data/grant is later filled; needs reviewed maintained-owner source/API integration successor",
   "holds": [
-    "Executor/controller/source hashes not yet assembled or independently reviewed",
+    "Predecessor controller/executor/11-file sources independently reviewed; current documentation/metadata successor needs finite regate and runtime component/plan hash globals remain unbound.",
     "Original control/common/source import/current slot/latest accepted return unbound",
     "Actual compiler/Python/X11/library/context/display/allocation/grant unbound",
     "Maintained d9ee same-ELF retained-actor cleanup limitation requires explicit resolution or retained C"
