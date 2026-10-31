@@ -293,7 +293,9 @@ fn enroll_with(
     mut membership: impl FnMut() -> io::Result<String>,
 ) -> io::Result<()> {
     let started = Instant::now();
-    let mut child = command.spawn()?;
+    // Held until this function's final wait. A retained actor's orphan sweep
+    // must not consume the status this scope request is waiting for.
+    let (mut child, _registration) = super::adopted_orphans::spawn_owned(&mut command)?;
     loop {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
