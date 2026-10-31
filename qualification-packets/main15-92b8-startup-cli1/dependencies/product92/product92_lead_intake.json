@@ -1,0 +1,91 @@
+{
+  "kind": "main15-operation-trait-single-import-source-lead-intake-v1",
+  "created_utc": "2026-10-31T19:17:14.649442+00:00",
+  "status": "SOURCE_HANDOFF_FOR_EC_INDEPENDENT_REVIEW_NOT_SELF_INDEPENDENT_APPROVAL",
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15",
+  "branch": "fix/fw16-return-operation-trait-main15",
+  "tracked_clean": true,
+  "changed_paths": [
+    "src/app/chat_ui.rs"
+  ],
+  "exact_diff": "diff --git a/src/app/chat_ui.rs b/src/app/chat_ui.rs\nindex 8aded4804..012698f59 100644\n--- a/src/app/chat_ui.rs\n+++ b/src/app/chat_ui.rs\n@@ -31656,7 +31656,7 @@ mod tests {\n     ) -> Vec<Message> {\n         use iced::advanced::{\n             Layout, Shell, clipboard, layout,\n-            widget::{Tree, operation},\n+            widget::{Operation, Tree, operation},\n         };\n         use iced::futures::StreamExt;\n         let ring = app.shared_return_notice_ring_for_test();\n",
+  "lead_checks": {
+    "source_matches_git": true,
+    "whole_file_exact_one_helper_local_import_replacement": true,
+    "full_inverse_recovers_parent": true,
+    "prefix_before_cfg_test_module_exact": {
+      "bytes": 599012,
+      "sha256": "f699e1f107bd978d15986c9aec444b5ab1550300f23ee6c94c4657ccf9bc16b3",
+      "definition": "Bytes before #[cfg(test)] newline mod tests {"
+    },
+    "source": {
+      "bytes": 1419021,
+      "sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474"
+    },
+    "neighbor_scan": "Actual rg found prior local imports including same widget::{Operation, Tree, operation} at30024 and widget::Operation at32011; unchanged helper dynamic operation.finish at31708 and mapped probe.finish at31723. No neighboring edit proposed."
+  },
+  "author_freeze": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-single-import-source-freeze-v1.json",
+    "bytes": 8301,
+    "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd"
+  },
+  "author_referenced_files_hash_joined": [
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-function-conservation-v1.json",
+      "bytes": 148553,
+      "sha256": "d959b0214a49aaeb8493cd4d1b59c74d69f4ef3caa78b9a950c5f5bcbd80b555"
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-exact-single-import-diff-v1.patch",
+      "bytes": 480,
+      "sha256": "8bdfa3f37fa5bf5b9dd4482872bb0600676b5dd6657c889ce342184f630b7c48"
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stdout-v1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stderr-v1.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "original_error_binding": {
+    "cargo_json": {
+      "path": "/tmp/coord16-main15-bb8-ui5-validation-20261031T190448779446Z-2/compile-ui-lib/stdout.log",
+      "bytes": 1161417,
+      "sha256": "676039102bc5caf39549dd64eb94861d595c2f75213107f505a849e2c130c442"
+    },
+    "parsed_json_lines": 976,
+    "errors": [
+      {
+        "json_line": 960,
+        "reason": "compiler-message",
+        "code": "E0599",
+        "rendered": "error[E0599]: no method named `finish` found for opaque type `impl cosmic::widget::Operation` in the current scope\n     --> src/app/chat_ui.rs:31723:27\n      |\n31723 |             let _ = probe.finish();\n      |                           ^^^^^^ method not found in `impl cosmic::widget::Operation`\n      |\n     ::: /home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15/vendor/iced-core/src/widget/operation.rs:75:8\n      |\n   75 |     fn finish(&self) -> Outcome<T> {\n      |        ------ the method is available for `impl cosmic::widget::Operation` here\n      |\n      = help: items from traits can only be used if the trait is in scope\nhelp: trait `Operation` which provides `finish` is implemented but not in scope; perhaps you want to import it\n      |\n14117 +     use cosmic::widget::Operation;\n      |\n\n"
+      }
+    ],
+    "scope": "Original single compiler error and log identity only; not a duplicate whole RAW audit or reconstructed admission."
+  },
+  "independent_review_owner": "EC ec204421: nonauthor semantic + conservation readers; Main15 does not self-approve and has not activated its own independent reviewers.",
+  "runtime": {
+    "successor_compile": null,
+    "successor_tests": null,
+    "successor_native": null,
+    "prior_bb8_original": "CLI check0/UI check0/UI lib compile101; no test ELF/inventory; all five named tests UNRUN; zero qualified parents",
+    "old_grant_transfer": false,
+    "new_grant": null,
+    "publication": null
+  },
+  "holds": [
+    "Native Before/current After missing",
+    "genuine User5/full52/physical retained helper/WHOLE HOLD",
+    "No host autochain",
+    "Root16 original47 final current-product binding/freeze HOLD pending adopted published successor",
+    "No permission/account/authority/user-state changes"
+  ]
+}

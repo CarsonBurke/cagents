@@ -1,0 +1,114 @@
+{
+  "applicability": {
+    "UI5_source_classification": "The existing source-compatible classification is unaffected by this inert two-expression delta; no actual UI5 test result is supplied or transferred. Default outer Rust scheduler and all genuine User admission boundaries remain unchanged.",
+    "bounded_join": "Exact original52 caller-partition source applicability carries through these two owned-string conversions only: all other leaves are exact f95 and the rest of chat_ui.rs is byte-identical under the stated inverse. The conversions add neither a User requirement nor an Agent bypass. No 52-parent or API14 semantics re-review is performed.",
+    "original52_review": {
+      "bytes": 18095,
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-original52-caller-partition-source-applicability-addendum-v1.json",
+      "sha256": "cab3632cef6f5e0f36eea1c46e340305265039862cde1d5e0e4793b88306292d"
+    },
+    "partition": {
+      "full52_graphs": {
+        "cli": 1,
+        "host": 6,
+        "ui": 45
+      },
+      "genuine_User": 5,
+      "ordinary_inherited_Agent": 47
+    }
+  },
+  "assessment": [
+    {
+      "at": "src/app/chat_ui.rs:7389",
+      "field_at": "src/app/chat_ui.rs:597",
+      "function": "capture_shared_return_close",
+      "reason": "The display getter returns a borrowed str tied to self/card. to_owned creates the required owned String before terminal_returns.get_mut at7390. The getter borrow ends after that conversion; the retained owner no longer borrows self or the temporary cloned CardState. It captures exactly the original display title at the existing first-Close capture point and leaves subsequent source/origin/caller/Arc/full presentation fields and first-owner gates unchanged.",
+      "status": "SOURCE_CORRECT"
+    },
+    {
+      "at": "src/app/chat_ui.rs:13531",
+      "field_at": "src/app/chat_ui.rs:652",
+      "function": "capture_native_return",
+      "reason": "The full context now stores an owned String before native_returns insertion. Presentation is cloned and title copied while the current original card is immutably read; the subsequent insert need not retain a self/card borrow. No caller/source/proof/operation/Arc/native-return timing changes, and R is still captured at the same pre-Task point.",
+      "status": "SOURCE_CORRECT"
+    },
+    {
+      "at": "src/app.rs:8410",
+      "function": "card_display_title",
+      "reason": "The unchanged getter returns the current displayed title according to existing user/channel/provider/title precedence. Owning that same str preserves its UTF-8 bytes without formatting/truncating/normalizing or changing which title is selected. Notices still retain the original title through later pane/recipe/title changes; no B recapture, relabeling, control change or visible new copy is introduced.",
+      "status": "UX_MEANING_UNCHANGED"
+    },
+    {
+      "reason": "The entire-file inverse and one-leaf tree diff establish no other change, including no proof/issuer/permission/CallerContext/q/nonce/id/close/callback/disposition/flush/ACK/presentation fence or tests/helper change. String ownership is inert presentation data, not an authority carrier or a native cleanup/admission receipt.",
+      "status": "AUTHORITY_AND_LIFECYCLE_UNCHANGED"
+    }
+  ],
+  "blockers": [],
+  "checks": {
+    "independent_compilation_tests_native": "UNRUN",
+    "official_scripts_check_format": "PENDING_EXTERNAL_AUTHOR_RECEIPT_AT_REVIEW_TIME; no pass inferred.",
+    "source_type_judgment": "The two conversions supply the stated String fields and correct borrow placement. This is not a claim the entire successor compiles or all other diagnostics are absent."
+  },
+  "diagnostics": {
+    "original_findings": [
+      {
+        "message": "expected String, found &str at retained ReturnCloseOwner.title",
+        "source_at": "src/app/chat_ui.rs:7399",
+        "stderr_lines": "1782\u20131791"
+      },
+      {
+        "message": "expected String, found &str at NativeReturnContext.title",
+        "source_at": "src/app/chat_ui.rs:13531",
+        "stderr_lines": "1793\u20131802"
+      }
+    ],
+    "original_run_limit": "Parent reports f95 CLI0/UI101 with all five tests UNRUN. This note does not rerun or independently audit that qualification attempt, nor relabel its failure.",
+    "read_scope": "Only retained original E0308 blocks at lines1782\u20131802; no sole RAW/full-run/artifact audit.",
+    "source": {
+      "bytes": 75183,
+      "path": "/tmp/coord16-main15-f95-return-error-ui5-validation-20261031T175953074655Z-2/ui-binary-check/stderr.log",
+      "sha256": "8ca0519ec3be43e7b084e1e84b6fd714a8b12626caff2aa171db028696f3fd32"
+    }
+  },
+  "limits": {
+    "actions": "No product/worktree/refs/public edits; no imports/eval/helper/Task/native/Cargo/tests/check/rustc/formatter/provider, actual env/authority/account/model/process/resource/target/cache probes or new worker. Sole mutation is this exclusive0444 review receipt.",
+    "actual_N": null,
+    "actual_artifact": null,
+    "actual_context": null,
+    "actual_grant": null,
+    "actual_inventory": null,
+    "actual_results": null,
+    "actual_run": null,
+    "holds": "User5/FULL52/native/WHOLE/qclosed/general and physical deferred neighbor remain unchanged; PR1933 NEVER_MERGE.",
+    "merge_ready": false,
+    "original_history": "f95 compile failure and tests UNRUN remain historical at exact f95; no old test/native/adoption result is retargeted to bb8. Source clear does not grant execution/resources/publication/merge.",
+    "qualified": false,
+    "queued": false,
+    "source_only": true
+  },
+  "reviewer": "/root/authority_regressions",
+  "schema": "main15-bb8df653-return-title-ownership-independent-source-delta-review-v1",
+  "source": {
+    "blob": "8aded4804a4055f04fadba8054fd26e42eeeba75",
+    "bytes": 1419010,
+    "changed_paths": [
+      "src/app/chat_ui.rs"
+    ],
+    "entry_counts": {
+      "current": 2231,
+      "outside_changed_leaf_equal": 2230,
+      "parent": 2231
+    },
+    "file": "src/app/chat_ui.rs",
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "method": "Immutable Git show/diff/tree and inert JSON/hash reads. Exact two-expression inverse compared bytes only; no reviewed code/helper/Task evaluation.",
+    "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent_file_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+    "parent_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d",
+    "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+    "two_literal_inverse_recovers_entire_f95_chat_ui_source": true
+  },
+  "utc": "2026-10-31T18:06:51.343576+00:00",
+  "verdict": "CLEAR_FOR_EXACT_TWO_TITLE_OWNERSHIP_EXPRESSIONS_AT_SOURCE_LEVEL; NO_NEW_CORRECTNESS_CALLER_OR_UX_SOURCE_BLOCKER; COMPILE_TEST_NATIVE_UNRUN"
+}

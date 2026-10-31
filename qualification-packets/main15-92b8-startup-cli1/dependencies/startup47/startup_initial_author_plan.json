@@ -1,0 +1,336 @@
+{
+  "UI40_source_decision_PENDING": {
+    "aggregate_or_per_parent_UNRUN": "Old shared300 does not establish47x60 or any current per-parent runtime. No new UI cap is admitted by this map.",
+    "new60_proposal_math_only": {
+      "withUIcheck450_compile600_inventory30": {
+        "UI18": 2160,
+        "UI20": 2280,
+        "UI22": 2400
+      }
+    },
+    "no_UI_runner_edits": true,
+    "original40_order": [
+      "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+      "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+      "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+      "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+      "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+      "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+      "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+      "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+      "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+      "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+      "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+      "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+      "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+      "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+      "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+      "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+      "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+      "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+      "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+      "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+      "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+      "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+      "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+      "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+      "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+      "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+      "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+      "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+      "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+      "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+      "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+      "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+      "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+      "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+      "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+      "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+      "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+      "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+      "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat"
+    ],
+    "original_group_execution_seconds": 300,
+    "pending_EC_question": "faadeeb2: explicit new per-singleton UI60 and20/20 or18/22 versus retained300 with smaller packets. No unauthorized timeout shrink/timefit guess."
+  },
+  "actual_tools_context_N_ELFs": null,
+  "budget_reconciliation": "Old47 had9 grouped phases2310=3*600+3*30+60+60+300. CLI same singleton60; HOST assigns full old group60 maximum to each of6 separate invocations, expanding aggregate execution allowance60->360, never claiming unchanged old per-parent scheduling. Current canonical captured/default singleton ABI replaces old grouped shape; no old count/pass transfer. Check caps300/480 are existing maintained same-boundary source-data precedent, not observed fit.",
+  "full47_source_completion": false,
+  "genuine_User5_DEFERRED_UNQUALIFIED": [
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:2552",
+      "graph": "ui",
+      "isolated_call_line": 2559,
+      "name": "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+      "selection_partition": "Root35"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:3167",
+      "explicit_Authority_assertion_lines": [
+        3168,
+        3173
+      ],
+      "graph": "ui",
+      "isolated_call_line": 3174,
+      "name": "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:3181",
+      "explicit_Authority_assertion_lines": [
+        3182,
+        3187
+      ],
+      "graph": "ui",
+      "isolated_call_line": 3188,
+      "name": "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:3436",
+      "explicit_Authority_assertion_lines": [
+        3437,
+        3442
+      ],
+      "graph": "ui",
+      "isolated_call_line": 3443,
+      "name": "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "selection_partition": "Main15_remaining17"
+    },
+    {
+      "at": "src/app/shared_views/tests/startup_admission.rs:1097",
+      "graph": "ui",
+      "isolated_call_line": 1106,
+      "name": "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+      "selection_partition": "Main15_remaining17"
+    }
+  ],
+  "grant": null,
+  "implementation_profiles_authorized_now": {
+    "CLI1": {
+      "check": {
+        "bin": "cagents",
+        "features": [],
+        "seconds": 300
+      },
+      "compile": 600,
+      "inventory": 30,
+      "owning_parents": 1,
+      "packet": "qualification-packets/main15-bb8-startup-cli1",
+      "phase_count": 4,
+      "singleton_caps": [
+        60
+      ],
+      "sum": 990,
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-startup-cli1-source"
+    },
+    "HOST6": {
+      "check": {
+        "bin": "cagentsd",
+        "features": [
+          "host"
+        ],
+        "seconds": 480
+      },
+      "compile": 600,
+      "inventory": 30,
+      "owning_parents": 6,
+      "packet": "qualification-packets/main15-bb8-startup-host6",
+      "phase_count": 9,
+      "singleton_caps": [
+        60,
+        60,
+        60,
+        60,
+        60,
+        60
+      ],
+      "sum": 1470,
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-startup-host6-source"
+    }
+  },
+  "kind": "SOURCE_PLANNING_EXACT_STARTUP47_INPUT_ORDER_BUDGET_MAP_NOT_EXECUTION_OR_SOURCE_APPROVAL",
+  "known_caller_classes": "Only original315693dc ordinary inherited-Agent compatible source paths. No current authority/context observation or User admission. f95 applicability and bb8 two-title join are separate source roles, not new full caller/API audit.",
+  "old47_results_not_transferred": true,
+  "ordinary47_exact_unique_union": [
+    "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+    "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+    "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+    "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+    "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+    "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+    "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement",
+    "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+    "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+    "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+    "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+    "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+    "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+    "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+    "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+    "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+    "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+    "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+    "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+    "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+    "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+    "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+    "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+    "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+    "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+    "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+    "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+    "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+    "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+    "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+    "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+    "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+    "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+    "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+    "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+    "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+    "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+    "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+    "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+    "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+    "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+    "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+    "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+    "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+    "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+    "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+    "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat"
+  ],
+  "original_absolute_workload_cap": 2400,
+  "original_group_contracts": {
+    "cli-lib": {
+      "OLD_group_count": 1,
+      "OLD_group_execution": {
+        "label": "parent-cli-lib-exact",
+        "seconds": 60
+      },
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "original_order": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals"
+      ]
+    },
+    "host-lib": {
+      "OLD_group_count": 6,
+      "OLD_group_execution": {
+        "label": "parent-host-lib-exact",
+        "seconds": 60
+      },
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "original_order": [
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+        "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+        "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+        "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+        "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
+      ]
+    },
+    "ui-lib": {
+      "OLD_group_count": 40,
+      "OLD_group_execution": {
+        "label": "parent-ui-lib-exact",
+        "seconds": 300
+      },
+      "compile_seconds": 600,
+      "inventory_seconds": 30,
+      "original_order": [
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+        "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+        "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+        "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+        "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+        "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+        "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+        "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+        "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+        "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat"
+      ]
+    }
+  },
+  "preserve": "Maintained current1b12/855a canonical9004, generic29/allnested/main5+generic2, full3790/parser/execute/source-context/Popen/heldpidfd/originalwait/family/stickyFAIL/HOLD/Cclose/compacttail. Only task group/accounting/main/globals/typed data/proofs/paths/inverses adapt where necessary.",
+  "product": {
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f"
+  },
+  "queue": null,
+  "refs": {
+    "bb8_inert_caller_join": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-independent-source-review-v1.json",
+      "sha256": "dd632b6257efaac8ffd24d22abc2b52129dc24ec3572beaff6fe96022d2c8e8e"
+    },
+    "classifier": {
+      "path": "/tmp/aeb1345d-52-parent-caller-admission-source-classification-v1.json",
+      "sha256": "315693dcdebbb93dee644e5fb05c192acfe6e6ad44a225d3ea128ad2b8f6a258"
+    },
+    "current_Root_adoption": {
+      "path": "/tmp/fw16-backend-ec204421/issued-return-bb8df653-title-ownership-root-source-adoption-v1.json",
+      "sha256": "81e5631986046571b2388fef51997daab6c370964a2c3463f3e61a89b0cc7a94"
+    },
+    "current_publication": {
+      "path": "/tmp/fw16-backend-ec204421/issued-return-bb8df653-title-ownership-reviewed-source-publication-v1.json",
+      "sha256": "8d14ce129c0833d55f7fba198f84839cab095ae9ec8ee270c31a2e8bc1400141"
+    },
+    "f95_applicability": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-original52-caller-partition-source-applicability-addendum-v1.json",
+      "sha256": "cab3632cef6f5e0f36eea1c46e340305265039862cde1d5e0e4793b88306292d"
+    },
+    "lead_intake": {
+      "path": "/var/tmp/coord16-bb8-startup47-lead-2h2u3a0q/intake.json",
+      "sha256": "780d208401e793c756defe3605d81a1dd6722a246d92ac1d2ae99fe1ec4c1fdc"
+    },
+    "old47_Root_adoption": {
+      "path": "/tmp/fw16-backend-ec204421/startup-Agent47-1d3e5c21-root-source-adoption-join-v1.json",
+      "sha256": "741b03cde68e0203b3ee08b0cb4fae241d1a73afe1a2a140b318969e92333fbd"
+    },
+    "old47_plan": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/plan.json",
+      "sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043"
+    },
+    "selection52": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-final-owning-test-parent-selection-refresh-v2.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef"
+    }
+  },
+  "runtime_results": null,
+  "search_output_limit": "First filename search af1ad2 was overbroad and truncated; no file contents/resources/native evidence were inspected by that filename listing. Subsequent exact file refs were hashed/parsed; truncated displays are not asserted complete.",
+  "source_proofs_and_template_guards": "Current product and distinct controller identities; templateABI derives canonical plan; entire nested current caller contract equals standalone. Safe nested archive parents unchanged. Current bb8 adoption/publication separate from f95/API/main and historical7bfcPOSTRUN role."
+}

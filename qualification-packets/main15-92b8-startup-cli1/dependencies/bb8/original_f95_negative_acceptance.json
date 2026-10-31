@@ -1,0 +1,232 @@
+{
+  "schema": "main15_f95_ui5_8e36e360_compile_negative_root_acceptance_v1",
+  "utc": "2026-10-31T18:09:49.933002+00:00",
+  "allocation": "8e36e360-c2e0-45c1-96a4-63684b72753f",
+  "grant": "6ac5dfc9-faa6-4117-88f7-65cce37da2de",
+  "actual_executor_return": {
+    "path": "/tmp/coord-b9-main15-f95-ui5-8e36e360-actual-executor-return.json",
+    "sha256": "98435d4c5f369737073a902dadcf20116c0e13442a59023597ba849b0c6ba85d"
+  },
+  "sole_independent_raw": {
+    "path": "/tmp/coord-b9-main15-f95-ui5-8e36e360-sole-raw-review.json",
+    "sha256": "277439bc17723dc6e62cc0f30dcfb255c337e73e10a5cfff741912aae710b7ac",
+    "verdict": "ORIGINAL_MAIN15_UI5_COMPILE_NEGATIVE_VERIFIED"
+  },
+  "product_head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+  "product_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+  "controller_head": "a7c8f4c2a9ea158e40b0c97ac2e9500f548fff29",
+  "controller_tree": "153390d555aeeff38c5f505d1c1fa4900d4807d4",
+  "original_tool": {
+    "exit_code": 1,
+    "path": "/tmp/coord-b9-main15-f95-ui5-8e36e360-original-tools/whole-original-tool-stream.json",
+    "record_count": 2,
+    "session": 68470,
+    "sha256": "a5b5a084d519d8ea0e00f06595e6b4b328264eaf02995d7cb2253203f151a62e",
+    "start_chunk": "8a2cad",
+    "terminal_chunk": "2abb73"
+  },
+  "evidence": {
+    "actual_files_including_manifest": 112,
+    "all_manifest_hashes_match": true,
+    "archive_bindings_verified": 90,
+    "controller_Git_bindings_verified": 92,
+    "entire_actual_file_index_sha256": "fa0746c86431cffa993c6b6e2f92f2e1e718cf5c84c901352eb81c1b466abd95",
+    "evidence_directory": "/tmp/coord16-main15-f95-return-error-ui5-validation-20261031T175953074655Z-2",
+    "genuine_executed_controller_ABI_3be14_pins_match": true,
+    "index_encoding": "SHA256 UTF-8 sorted path/bytes/sha256 JSON rows,sort_keys=True,comma/colon separators.",
+    "manifest_members": 111,
+    "missing_extra_duplicate_symlink_members": [],
+    "no_broad_source_or_canonical_semantic_rereview": true,
+    "product_source_Git_bindings_verified": 44,
+    "sha256sums_sha256": "430e8a5cca0a812453a6aa9d6ffe860ac308b9e64f6912b982b3c0e816076015",
+    "summary_sha256": "a53769a62dfae43adb705a912c27d18b74afb844be32db085394ea879627a155"
+  },
+  "root_rehashed": {
+    "manifest_members": 111,
+    "files": 112,
+    "full_actual_index_sha256": "fa0746c86431cffa993c6b6e2f92f2e1e718cf5c84c901352eb81c1b466abd95",
+    "transport_files": 7
+  },
+  "accepted_actual_result": {
+    "actual_ELF_inventory_tests": {
+      "UI_test_ELF_record": null,
+      "actual_inventory_N": null,
+      "actual_test_invocations": 0,
+      "inventory_reached": false,
+      "no_inventory_or_test_ELF_or_pass_invented": true,
+      "planned_parent_count": 5,
+      "qualified_parents": 0,
+      "test_pass_fail_ignore_counts": null,
+      "unrun_planned_names": [
+        "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+        "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+        "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+        "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+        "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+      ]
+    },
+    "all_five_component_parents": "UNRUN",
+    "attempted_phases": 2,
+    "compiler_failure": {
+      "causal_boundary": "Production browserless UI binary check fails while compiling cagents lib: two chat_ui title initializers require owned String but receive &str. This is before UI cfg(test) library compilation and all component tests.",
+      "coded_error_codes": {
+        "E0308": 2
+      },
+      "coded_error_count": 2,
+      "command": [
+        "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin/cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "diagnostics": [
+        {
+          "code": "E0308",
+          "message": "mismatched types",
+          "primary_source_arrow": "--> src/app/chat_ui.rs:7399:13",
+          "source_diagnostic": [
+            "error[E0308]: mismatched types",
+            "    --> src/app/chat_ui.rs:7399:13",
+            "     |",
+            "7399 |             title,",
+            "     |             ^^^^^ expected `String`, found `&str`",
+            "     |",
+            "help: try using a conversion method",
+            "     |",
+            "7399 |             title: title.to_string(),",
+            "     |             ++++++      ++++++++++++",
+            ""
+          ],
+          "stderr_log_line": 1782
+        },
+        {
+          "code": "E0308",
+          "message": "mismatched types",
+          "primary_source_arrow": "--> src/app/chat_ui.rs:13531:20",
+          "source_diagnostic": [
+            "error[E0308]: mismatched types",
+            "     --> src/app/chat_ui.rs:13531:20",
+            "      |",
+            "13531 |             title: self.card_display_title(card),",
+            "      |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `String`, found `&str`",
+            "      |",
+            "help: try using a conversion method",
+            "      |",
+            "13531 |             title: self.card_display_title(card).to_string(),",
+            "      |                                                 ++++++++++++",
+            ""
+          ],
+          "stderr_log_line": 1793
+        }
+      ],
+      "exit": 101,
+      "footer": "error: could not compile `cagents` (lib) due to 2 previous errors; 10 warnings emitted",
+      "no_auth_environment_or_resource_cause_inferred": true,
+      "not_a_fixture_assertion_failure": true,
+      "plain_error_footer_count": 1,
+      "stderr_bytes": 75183,
+      "stderr_lines": 1839,
+      "stderr_sha256": "8ca0519ec3be43e7b084e1e84b6fd714a8b12626caff2aa171db028696f3fd32",
+      "stdout_bytes": 0
+    },
+    "original_phase_exits": [
+      0,
+      101
+    ],
+    "packet_error": "RuntimeError: Actual nonzero phase exit: ui-binary-check: 101",
+    "phases": [
+      {
+        "exit": 0,
+        "finished": "2026-10-31T18:00:05.147751+00:00",
+        "label": "cli-binary-check",
+        "pid": 86,
+        "seconds": 11.91200814594049,
+        "started": "2026-10-31T17:59:53.357662+00:00",
+        "stderr_sha256": "33d66c0ca765c08456ca502cf4c97757e8765a2aa8e8a6d91878c7d77daaeb44",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "exit": 101,
+        "finished": "2026-10-31T18:00:44.797160+00:00",
+        "label": "ui-binary-check",
+        "pid": 252,
+        "seconds": 39.52698808303103,
+        "started": "2026-10-31T18:00:05.394969+00:00",
+        "stderr_sha256": "8ca0519ec3be43e7b084e1e84b6fd714a8b12626caff2aa171db028696f3fd32",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    ],
+    "planned_phases": 9,
+    "qualified_parent_count": 0,
+    "unrun_phases": 7
+  },
+  "recorded_custody": {
+    "cancellation_signals": 0,
+    "controller_attempts": 92,
+    "direct_cleanup_attempts": 0,
+    "evidence_complete": 92,
+    "final_censuses_clean_unforced": 2,
+    "held_pidfd_original_wait_path_source_bound": true,
+    "independent_live_kernel_pidfd_or_global_confirmation": false,
+    "ordered_attempt_state_identity_join": true,
+    "phase_censuses_clean_unforced": 2,
+    "phase_children": 2,
+    "recorded_adopted_descendant_observations": 0,
+    "recorded_original_Popen_waits_settled": 92,
+    "source_children": 90,
+    "supervision_failures": 0,
+    "unique_attempt_records": 92,
+    "unknown_recorded_waits": 0
+  },
+  "recorded_close_and_writers": {
+    "actual_release_field": true,
+    "current_physical_flock_or_global_writer_absence_proven": false,
+    "historical_handoff_clean": true,
+    "lease_grant_matches": true,
+    "lease_sha256": "1799f404c00a4be4caef7f7517bcec8ed926ed026cd115bf34378718509aebeb",
+    "lock_close_error": null,
+    "lock_unlocked": false,
+    "one_shot_original_C_fd_close_return_recorded": true,
+    "recorded_local_writer_or_wait_blockers": [],
+    "recorded_order": "Original waits/evidence, strict raw reread, final source/context and both local final custody observations precede one-shot Cfd close; summary/manifest/compact/EVIDENCE/release output precede outer terminal exit1.",
+    "source_order_lines": {
+      "Cfd_close": 1309,
+      "compact_terminal": 1346,
+      "manifest_write": 1343,
+      "return_result": 1368,
+      "summary_write": 1341
+    }
+  },
+  "original_source_reference_limitation": {
+    "actual_artifact_path": null,
+    "bounded_search": "No direct archive binding hash or literal reference found in declared JSON archives, retained plan/review/runner, or already provided proof-chain JSON files. No unrelated/private path search.",
+    "effect": "No Main15 lead-scope review transfer or behavioral qualification claimed. Executed controller/code ABI3be14, all declared archives and product pins are independently bound; this reference limit does not make the verified local original negative/wait/close records positive or unknown.",
+    "no_join_or_clearance_invented": true,
+    "routing": "Reported to Root, which separately routed a request for an exact existing artifact path. Any later acknowledgement is separate from this sealed original.",
+    "status": "UNRESOLVED_HISTORICAL_SOURCE_REFERENCE",
+    "supplied_Main15_scope_ABI_sha256": "7bfc05fea563f2837ef60ac3accd162b6dac0a6c00d27fc8caef3ad449e79138"
+  },
+  "separate_postrun_scope_hash_ack": {
+    "path": "/tmp/coord-b9-main15-f95-ui5-8e36e360-postrun-supplemental-scope-hash-join.json",
+    "sha256": "3590fc4c4c76221f05d033891aeff6879758e6c968f107cd5d72c95407bb43e6",
+    "scope": "Postrun sourceowner receipt only; no originalarchive/prelaunchread/qualificationclaim"
+  },
+  "logical_C_state": "NEGATIVE_RETURN_ACCEPTED_ALLOCATION_CONSUMED_NO_NEXT_GRANT",
+  "scope": "Accept CLI0/UI101 compilernegative and scoped custody return only. Sevenlaterphases/allfiveparentsUNRUN/zero qualification. Negativeimmutable; no unchangedretry. Newproduct/controller/review/C required.",
+  "limits": [
+    "Genuine original negative, not an expected-negative PASS, fixture failure waiver or new behavioral qualification. CLI check0 alone establishes no matched application outcome.",
+    "No actual testN/ELF/library inventory/parent counts/pass invented. Allfive component fixtures are UNRUN, and no startup47/User5/FULL52/Search/oldhead/controller/grant result transfers.",
+    "Full55path/76commit inherited product stack is not reduced to a three-file feature. No current-main/wholePR/WHOLE/1749/SeedView/native/UX/installed/merge claim.",
+    "Full ELF unarchived/everyexec/embeddedidentity limitations remain; no test ELF was reached here. Recorded local waits/censuses do not establish global/kernel/namespace/359 closure or current physical availability.",
+    "Sampled source/context/tool equality does not guarantee continuous protection against transient changes.",
+    "Source/final reservations are not newly enforced aggregate caps; original workload ceiling2400 and indefinite uncertain-custody HOLD remain.",
+    "Latest user instructions and disclosed inherited filesystem/Git/prose variance are preserved without rewrite, User promotion, scrub or fallback.",
+    "No audited controller/parser/module/helper/function/case evaluation/import/execution, rerun, source fix/mutation, broad source/core review, live proc/env/account/tool/DB/resource/target/cache/lock/native probe, unknown-PID control or new descriptor/model/account."
+  ],
+  "root_intake_history": "Initial nonmutating intake expected generic qualified field. Actual schema owning_commands_qualified and qualified_test_invocation_count inspected and verified explicitly before acceptance; no originalsource/runtime change.",
+  "next_action": "Main15 two titleownership correction sourcefrozen bb8df653/reviews pending. Oldf95HOST16paused. SearchFront19 separatelyadmittednext; no grant by acceptance."
+}

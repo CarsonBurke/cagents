@@ -1,0 +1,177 @@
+{
+  "kind": "AUTHOR_FROZEN_SOURCE_SUCCESSOR_NOT_INDEPENDENT_REVIEW_OR_ADMISSION",
+  "author_role": "/root/1945_cache_io_oracles",
+  "utc": "2026-10-31T12:35:04.467802+00:00",
+  "controller": {
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source",
+    "branch": "qualification/fw16-startup-whole-focused-source",
+    "head": "1d3e5c2134aab049b451a397c8bfca8fbd96c9a9",
+    "tree": "e2924fb9c4689f2ce0e897dbe1fc7e7fb875b9be",
+    "parents": [
+      "579f9a58eee6561f6f7317284091b99f72172281"
+    ],
+    "clean": true,
+    "outside_packet_entries_and_modes_exact": 2222
+  },
+  "correction": {
+    "finding": "AGENT47-DECLARED-COUNT-1",
+    "scope": "Only four nonblank lines plus blank, a main-local adapter immediately before protected tail",
+    "original_generic_function": "BYTE_EXACT_UNCHANGED_LITERAL30",
+    "declared_count_source": "len(selected) captured from already-validated selected47 task data",
+    "semantics": "Call unchanged original function once; copy accounting dictionary with declared_requested_unique_parent_count=47; return identical raw/errors objects. No discovered/qualified/null/partial count override; no catch or altered failure return.",
+    "proposal_reviewer": "/root/1335_full_output_copy_lease",
+    "proposal_assessment": "Source-level agreement before implementation; explicitly not successor clearance or execution authority."
+  },
+  "conservation": {
+    "all_other31_top_functions": "BYTE_EXACT579",
+    "all5_nested_main_functions": "BYTE_EXACT579",
+    "entire_runner_remove_adapter": "RECONSTRUCTS_EXACT579",
+    "protected_tail_bytes": 3790,
+    "protected_tail_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "canonical_settle_children_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "parser_source_context_generic_review_ABI_helper_protocol_direct_Popen_wait_cleanup_HOLD_finalwriters_returns": "UNCHANGED",
+    "full_summary_original_error_ledgers_SHA256SUMS_compact_output": "UNCHANGED",
+    "all_other_preexisting_packet_members": "BYTE_EXACT579",
+    "five_existing_modified_members": [
+      "adoption-port.json",
+      "execution-template.json",
+      "manifest.json",
+      "run-packet.py",
+      "source-conservation.json"
+    ],
+    "nine_new_members": "Exact579 history five source/metadata snapshots plus original author freeze and independent BLOCK; exact forward/inverse JSON",
+    "changed_paths": [
+      "qualification-packets/startup30/adoption-port.json",
+      "qualification-packets/startup30/execution-template.json",
+      "qualification-packets/startup30/from-579f9a58.diff.json",
+      "qualification-packets/startup30/history/579f9a58/adoption-port.json",
+      "qualification-packets/startup30/history/579f9a58/author-freeze.json",
+      "qualification-packets/startup30/history/579f9a58/execution-template.json",
+      "qualification-packets/startup30/history/579f9a58/independent-semantic-BLOCK.json",
+      "qualification-packets/startup30/history/579f9a58/manifest.json",
+      "qualification-packets/startup30/history/579f9a58/run-packet.py",
+      "qualification-packets/startup30/history/579f9a58/source-conservation.json",
+      "qualification-packets/startup30/manifest.json",
+      "qualification-packets/startup30/run-packet.py",
+      "qualification-packets/startup30/source-conservation.json",
+      "qualification-packets/startup30/to-579f9a58.inverse.diff.json"
+    ]
+  },
+  "pins": {
+    "run-packet.py": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/run-packet.py",
+      "sha256": "93d01c01be059b8d64266afd293f176981285ac3a6255cb6b79cbe347f8bb54f",
+      "bytes": 81717
+    },
+    "plan.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/plan.json",
+      "sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
+      "bytes": 63927
+    },
+    "command-data.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/command-data.json",
+      "sha256": "18fd276bdb8496587cb21de0f03a52f1c1afc54fb54918e391f4cfe00b439355",
+      "bytes": 63269
+    },
+    "source-binding.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/source-binding.json",
+      "sha256": "92b313f6588178d976332f00fb6dbec93c776d14cc2e77347e492332c2a5c929",
+      "bytes": 11871
+    },
+    "required-source-contract.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/required-source-contract.json",
+      "sha256": "c48bd1259b424db7eaf2afbdd41c98478233ca42edb508e4eaded0f1727776b2",
+      "bytes": 39199
+    },
+    "source-conservation.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/source-conservation.json",
+      "sha256": "7aede250c645269ac4c05b1124f8c4aad1f3ed5c4956d4b779ad538910869492",
+      "bytes": 11243
+    },
+    "manifest.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/manifest.json",
+      "sha256": "bf7bd79c16b5c9c77bdc98f368f3a1db82bab30d91fb8c1049b53d33298aa10e",
+      "bytes": 26987
+    },
+    "execution-template.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/execution-template.json",
+      "sha256": "cf9782d714545ae21bcabaa70951bb4cd6800a04ecf181d8c8627d667a5adbe6",
+      "bytes": 1747
+    },
+    "adoption-port.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/adoption-port.json",
+      "sha256": "9ce7a30dc5dbee1f0c1f52b5dcd64ef3d9b1873d84e43c8cca3bd136f3ffd4df",
+      "bytes": 1621
+    },
+    "from-579f9a58.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/from-579f9a58.diff.json",
+      "sha256": "730855be531afb6b971f2ebbe7a7d5ef7b8c435f17f374761882c8c8a0b2b34e",
+      "bytes": 1087
+    },
+    "to-579f9a58.inverse.diff.json": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/to-579f9a58.inverse.diff.json",
+      "sha256": "d6450885415825d0d5ae77c60c685b4db0690bb3fa89ac98730f66c1cee961fc",
+      "bytes": 1099
+    }
+  },
+  "static_checks": {
+    "path": "/var/tmp/startup-Agent47-count-source-check-i3ntfswb/checks.json",
+    "sha256": "9b17871a3f4b752c52d6267f090573c3c7896f815029a7cd3f06a1f1cc742054",
+    "source_only_AST_JSON_hash_Git": "PASS",
+    "git_diff_check_original_exit": 0,
+    "git_cached_diff_check_original_exit": 0,
+    "member_manifest_verified": 153,
+    "runtime_archives_verified_unchanged": 87,
+    "product_source_pins_unchanged": 30
+  },
+  "product": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74"
+  },
+  "selected_partial": {
+    "distinct": 47,
+    "cli": 1,
+    "host": 6,
+    "ui": 40,
+    "full_required_source_contract": 52,
+    "five_User_only": "HOLD_UNINVOKED_UNQUALIFIED_NO_PASS_OR_SKIP_CREDIT",
+    "authority_handling": "UNCHANGED_NO_INSPECTION_OR_MUTATION",
+    "phase_count": 9,
+    "workload_seconds": 2400,
+    "phase_caps_sum_seconds": 2310,
+    "jobs": 2
+  },
+  "historical_negative": {
+    "controller": "579f9a58eee6561f6f7317284091b99f72172281",
+    "review_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/history/579f9a58/independent-semantic-BLOCK.json",
+    "review_sha256": "27e9a935d6a732aedfd1c5904582573b8a4cb19e86c607a65d78d54bb7561b8f",
+    "disposition": "Original BLOCK immutable; this source author correction does not retarget or clear it. OriginalB EXIT1 and CLI1/HOST1 only2 qualified/UI27P1F preserved unchanged."
+  },
+  "pending": [
+    "Actual new nonauthor source-review refresh by1335 and1281",
+    "Genuine current CONTROLLER_SOURCE_CLEAR review ABI and Root fresh grant",
+    "Actual inventory/execution/RAW qualification",
+    "Full52 fiveUser causal qualification/native/WHOLE readiness"
+  ],
+  "candidate_import_call_compile_tests_build_helper_native_process_env_resource_probes": "NONE",
+  "actual_grant": null,
+  "actual_execution": null,
+  "runtime": "UNRUN",
+  "admitted_or_queueable": false,
+  "source_command_receipts": {
+    "static_source_check": {
+      "original_exit": 0,
+      "chunk": "f06f0c"
+    },
+    "stage_and_diffcheck": {
+      "original_exit": 0,
+      "chunk": "55ec79"
+    },
+    "source_freeze_commit": {
+      "original_exit": 0,
+      "chunk": "e26599",
+      "hooks": "disabled_for_command",
+      "signing": "disabled_for_command"
+    }
+  }
+}

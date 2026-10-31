@@ -1,0 +1,358 @@
+{
+  "kind": "ISSUED_RETURN_CLEANUP_9C19_EXACT_HOST_API_PORT_REVIEW_V1",
+  "reviewer_relationship": "Independent nonauthor review of Root-authored port. Reviewer previously supplied source-reuse design9f55; that design and B9 historical results are not qualification. No source authored or edited in this review.",
+  "verdict": "BOUNDED_HOST_PRODUCER_PHYSICAL_CUSTODY_ACK_SOURCE_CLEAR; no new in-scope blocker found. API staging tree remains incomplete and is not whole-tree/compile/runtime ready.",
+  "identity": {
+    "reviewed_head": "9c19e1291c83c4a2f7d91fe2e6f59f4aa1d88478",
+    "tree": "69981a9496992a41050a468e953b30ee2c34424e",
+    "parent": "d26d4e9e76f73b4add0c050a2b1b8f52f820e248",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issued-return-cleanup-api",
+    "head_at_final_read": "9c19e1291c83c4a2f7d91fe2e6f59f4aa1d88478",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/issued-return-cleanup-api-source-freeze-v1.json",
+      "sha256": "e91f278e4a62560c233e8a6781957d6828f89ce8f25a765d85a12761723327b1"
+    },
+    "donor": "2bf3c76ac3d5876a7b9108303738d2fe3248f192",
+    "donor_base": "b6fa046fae7081aac229a71c333956452b5afe7b",
+    "pins": {
+      "src/chat.rs": {
+        "sha256": "bcba67f4e68578ebb07fb41d304725151a0829488151485c5a7e349377698967",
+        "blob": "b2095760cce488a12f58d264d459fdd1769a13b0",
+        "mode": "100644",
+        "bytes": 126421
+      },
+      "src/chat/client.rs": {
+        "sha256": "3182b704f28db57c99366bb239fbb55882469ea15ee9961bbdeeb252277498dd",
+        "blob": "da46bc72d069046bf333e68197f25a2e0c685da0",
+        "mode": "100644",
+        "bytes": 300010
+      },
+      "src/control.rs": {
+        "sha256": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02",
+        "blob": "118561077e7fb5d87b761b589f28d5a25c630a19",
+        "mode": "100644",
+        "bytes": 305556
+      },
+      "src/host/agent_execution/ownership.rs": {
+        "sha256": "13c718709fa9c0aaef11fa8f24921c8812fb0a80761cc65c1f95330731e81edd",
+        "blob": "e825c268994d655fa983bbdd71156da336e04333",
+        "mode": "100644",
+        "bytes": 9351
+      },
+      "src/host/agent_execution/terminals.rs": {
+        "sha256": "6ec8ed383db97bb9def9713ba1f863419ec63f29139785df1c88806b21ae7e3b",
+        "blob": "c1cce1c1eb4ec6cb93abd474172f620e0c5d89a0",
+        "mode": "100644",
+        "bytes": 9360
+      },
+      "src/host/chat.rs": {
+        "sha256": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d",
+        "blob": "b48e14a3b61e2cbd26d683d87a0e58fc04854dfd",
+        "mode": "100644",
+        "bytes": 275437
+      },
+      "src/host/chat/retained_actor_tests.rs": {
+        "sha256": "ebafa0a8c9973a26f1fd8e74bfa3757c99be8dbfbada1cb9f1b343de934fa2c6",
+        "blob": "25fc7b2059533bc3ee611611ad5205693d708277",
+        "mode": "100644",
+        "bytes": 144102
+      },
+      "src/host/chat/terminal_return_cleanup.rs": {
+        "sha256": "e6a6fc53f75abcdec789a34df1b3d3d4e27ce2b2ad0b4e120b38524237ad91b0",
+        "blob": "3e591ce063c961a6ec441029768eb7535ca9b646",
+        "mode": "100644",
+        "bytes": 16256
+      },
+      "src/host/chat/terminal_return_cleanup/tests.rs": {
+        "sha256": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6",
+        "blob": "120c762b87eaf56e57b934a4539b216aceae65bd",
+        "mode": "100644",
+        "bytes": 15386
+      },
+      "src/host/client.rs": {
+        "sha256": "e755119e5d87e02b0f09782e8c4cd887546498702bfbbea2cf58c2a7173db9ad",
+        "blob": "8f6177d570aa459d43561a0541705648993c951a",
+        "mode": "100644",
+        "bytes": 156038
+      },
+      "src/host/state.rs": {
+        "sha256": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6",
+        "blob": "2aa44f480c9d64f89b395f387775c53944789f90",
+        "mode": "100644",
+        "bytes": 337894
+      },
+      "src/host/state/update.rs": {
+        "sha256": "5fedaab89811f4ac69e683b356e1ab5380b575831f848e372ead54b20d1d8b2d",
+        "blob": "9af1374d6060115e270239976f98a251f34184db",
+        "mode": "100644",
+        "bytes": 16285
+      },
+      "src/host/worktree_removal.rs": {
+        "sha256": "80262d25b1284cc5598216a8066bcb2a1579eca4eddc69591124878daab6d6b1",
+        "blob": "96c4d376fbd4d685cc13fd82543568b82f087a87",
+        "mode": "100644",
+        "bytes": 18103
+      },
+      "src/terminal/ipc.rs": {
+        "sha256": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d",
+        "blob": "9e162c974ec742fa1761b8d0115c882bdaa5b04f",
+        "mode": "100644",
+        "bytes": 113948
+      }
+    }
+  },
+  "conservation": {
+    "exact_changed_paths": 14,
+    "outside_tracked_entries_modes_blobs_exact": 2217,
+    "base_entries": 2229,
+    "port_entries": 2231,
+    "changed_line_payloads": [
+      {
+        "path": "src/chat.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "8a11901459e059fb022d07b50cef5c90f44d5612d9ab33268ce6ad9b078328b2",
+        "donor_sha256": "8a11901459e059fb022d07b50cef5c90f44d5612d9ab33268ce6ad9b078328b2"
+      },
+      {
+        "path": "src/chat/client.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "53b92cb7edd8e17b8bd07563da87e0e1052b905e4c8db042e344ec480cae21cd",
+        "donor_sha256": "53b92cb7edd8e17b8bd07563da87e0e1052b905e4c8db042e344ec480cae21cd"
+      },
+      {
+        "path": "src/control.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "a975ebd003b901909c3737ff85485a6193da06ad5b91a26206622937ca6f01c9",
+        "donor_sha256": "a975ebd003b901909c3737ff85485a6193da06ad5b91a26206622937ca6f01c9"
+      },
+      {
+        "path": "src/host/agent_execution/ownership.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "931eb6da4c05dbf788075a584ffc1b149402757e8fb3df98097ae530d96b1174",
+        "donor_sha256": "931eb6da4c05dbf788075a584ffc1b149402757e8fb3df98097ae530d96b1174"
+      },
+      {
+        "path": "src/host/agent_execution/terminals.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "af8bf282c9cf33e0543d4fed8ebd613b6386b5cd9cbe8db580e83f276225f03c",
+        "donor_sha256": "af8bf282c9cf33e0543d4fed8ebd613b6386b5cd9cbe8db580e83f276225f03c"
+      },
+      {
+        "path": "src/host/chat.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "5c4dba8c835c6ac961d236e22ca2b9de975ee7bb1176c8461dde5435b17b0fa4",
+        "donor_sha256": "5c4dba8c835c6ac961d236e22ca2b9de975ee7bb1176c8461dde5435b17b0fa4"
+      },
+      {
+        "path": "src/host/chat/retained_actor_tests.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "8a1ade3ae88210015b472a50faadce09dfdd11453470fe3da03f62f5f863e317",
+        "donor_sha256": "8a1ade3ae88210015b472a50faadce09dfdd11453470fe3da03f62f5f863e317"
+      },
+      {
+        "path": "src/host/chat/terminal_return_cleanup.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "478567878342fbde29553b9c04e23f3c282a4fd8cbf20f3ad8fed8961ff0f6c7",
+        "donor_sha256": "478567878342fbde29553b9c04e23f3c282a4fd8cbf20f3ad8fed8961ff0f6c7"
+      },
+      {
+        "path": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "f8000e811699ce75b7507c9dd72b43f3179c3742894c757a12bd7145cebec508",
+        "donor_sha256": "f8000e811699ce75b7507c9dd72b43f3179c3742894c757a12bd7145cebec508"
+      },
+      {
+        "path": "src/host/client.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "b94fe61d7d4d00dd8b70d9c6cb9c05e466bae346744b8c65cf981c1bdca7005c",
+        "donor_sha256": "b94fe61d7d4d00dd8b70d9c6cb9c05e466bae346744b8c65cf981c1bdca7005c"
+      },
+      {
+        "path": "src/host/state.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "79b312410f7b8213fc1940c8ff48a5d4f6cefefeab6eea2c6bfccd887185b368",
+        "donor_sha256": "79b312410f7b8213fc1940c8ff48a5d4f6cefefeab6eea2c6bfccd887185b368"
+      },
+      {
+        "path": "src/host/state/update.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "45724eaa64308344b082228067bf75c1f48e874c89b3c87d635cc3aa9a0a4844",
+        "donor_sha256": "45724eaa64308344b082228067bf75c1f48e874c89b3c87d635cc3aa9a0a4844"
+      },
+      {
+        "path": "src/host/worktree_removal.rs",
+        "changed_line_payload_equal": true,
+        "port_sha256": "bf126d743b6b69c715e95a773daa96588d89cf5a5d9c561eff86fb3f5546cd66",
+        "donor_sha256": "bf126d743b6b69c715e95a773daa96588d89cf5a5d9c561eff86fb3f5546cd66"
+      },
+      {
+        "path": "src/terminal/ipc.rs",
+        "changed_line_payload_equal": false,
+        "port_sha256": "57bf317c5c1322dc5b79116115273dafec48b322fa21917808420d6c5d655ec0",
+        "donor_sha256": "fd03389e834ae435df01c0be9f4da15e7514a7e13ad5dd4b671938f455c74e47"
+      }
+    ],
+    "port_exception": "13 donor changed-line payloads are exact, including all host paths/new modules/tests. IPC is the sole nonidentical payload: current StartupState order is retained, returned-close appended, and matched prospective version129/comments applied. Detailed positional-wire/caller review belongs to peer1386, not claimed here.",
+    "protected": "Outside14 includes original UI app/chat_ui/chrome, production retained_actor/native_cleanup, worker and paired-owner physical implementations,1749/proof/Seed/Cargo. Their blob/mode entries are exactd26. All14 freeze hashes matched immutable9c19; frozen working bytes also matched at initial verification.",
+    "cleanliness": "Initial scoped freeze/source check found identical immutable bytes. No new clean-worktree or future-head approval is inferred if writer advances."
+  },
+  "reviewed_host_contracts": [
+    {
+      "anchors": [
+        "host/chat.rs:1885-1915,2095-2115,2907-2949,3070-3111",
+        "host/chat/terminal_return_cleanup.rs:103-208"
+      ],
+      "assessment": "Before stop/spawn, reserve a bounded receipt slot. Each actual return branch publishes the full returned source, current host proof, exact original TerminalHandle and optional native CloseTarget under the final publication lock before sending ChatTerminal. Existing-pair replay reuses the actual same owners, never a later inventory substitute."
+    },
+    {
+      "anchors": [
+        "host/chat/terminal_return_cleanup.rs:44-101,322-379",
+        "host/client.rs:599-621,978-993"
+      ],
+      "assessment": "Fresh active close requires the original issued token/terminal/proof/worker and exact native source/attachment/instance/pair. The production dispatcher holds the exclusive control gate through effect; old or mismatched owners refuse. Closed-original replay returns its positive cached result before consulting a successor. No ID-only attach or late close_for_terminal sweep enters this path."
+    },
+    {
+      "anchors": [
+        "host/chat/terminal_return_cleanup.rs:380-449",
+        "host/chat/paired_close.rs:12-108",
+        "terminal/worker.rs:1883-2030"
+      ],
+      "assessment": "Physical operations use retained worker/native targets only, outside HostState lock. Existing paired preflight, source/instance fences, holder receipt and durable retirement are conserved. Missing proof or failed synchronous/receipt cleanup propagates error, retaining authority rather than manufacturing success."
+    },
+    {
+      "anchors": [
+        "host/chat/terminal_return_cleanup.rs:414-449"
+      ],
+      "assessment": "Final HostState lock revalidates receipt, original worker/source/proof and pair; caches Closed before removing exact original records and retires attention with expected worker. Removed native record drops after unlock. No replacement is retired from an old receipt."
+    },
+    {
+      "anchors": [
+        "host/chat/terminal_return_cleanup.rs:210-225,248-319",
+        "host/chat.rs:3169-3182"
+      ],
+      "assessment": "Attempt unwind clears only this original active-attempt flag, retaining pending owner and explicit retry. ACK cannot consume an in-progress or unhosted-unconfirmed original. Positive ACK removes receipt into a returned Option, then caller drops it after HostState unlock. Legacy None ACK only releases replay metadata; it cannot discard private physical custody."
+    },
+    {
+      "anchors": [
+        "host/state.rs:1350-1363,1694-1704,2292-2303",
+        "host/state/update.rs:172-184",
+        "host/worktree_removal.rs:198-208"
+      ],
+      "assessment": "Pending original custody remains visible to lineage liveness and no-owned-work guards; missing/current-changed or closing owner blocks upgrade even when rows vanish. Worktree removal includes both pending terminal/native source directories. Settled ACK history is bounded and contains no worker handles."
+    },
+    {
+      "anchors": [
+        "host/agent_execution/terminals.rs:90-110,150-176",
+        "host/client.rs:293-310,426-433,502-510"
+      ],
+      "assessment": "New destructive request preserves refused-Agent classification and existing correlated Close-reply, recovery and ordinary-exit routing. Peer-owned caller/nonce-ACK transport defect is acknowledged separately; no permission expansion is approved here."
+    }
+  ],
+  "authored_test_assessment": {
+    "new_unique_owning_host_parents": 10,
+    "parents": [
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+        "definition_line": 107,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+        "definition_line": 126,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+        "definition_line": 170,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+        "definition_line": 184,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+        "definition_line": 240,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+        "definition_line": 309,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+        "definition_line": 346,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+        "definition_line": 369,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+        "definition_line": 419,
+        "source": "src/host/chat/terminal_return_cleanup/tests.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      },
+      {
+        "selector": "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+        "definition_line": 6138,
+        "source": "src/host/chat.rs",
+        "source_caller_class": "ORDINARY_INHERITED_AGENT_COMPATIBLE_SYNTHETIC_HOST_CLIENT",
+        "genuine_User_process_environment_required_by_reviewed_source": false
+      }
+    ],
+    "graph": "src/lib.rs includes modules.rs; host at modules.rs73 is featurehost; host/mod.rs chat module; chat.rs terminal_return_cleanup module has cfgtest tests. Owning library target is --no-default-features --features host --lib; UI+host union is not proposed.",
+    "caller_classification_basis": [
+      "New module fixtures construct private HostState, register synthetic client1, and create actual owned TerminalHandle workers from private TempDir recipes. They do not connect/authenticate a real User endpoint or inspect/clear inherited CAGENTS authority/HOME/PATH.",
+      "Direct close/ACK unit cases test host-owned objects, not external caller authorization. The unwind parent uses actual process_request with synthetic unbound client1 in its private HostState; source has no genuine-User process-environment absence guard. Production agent sessions remain refused by terminals::admit.",
+      "New paired parent uses existing upgrade_fixture/ActiveFixture and private host/client data, passive /bin/cat actor and terminal workers. It is not a commercial Codex process, native UI or production caller/admission oracle.",
+      "This is source caller classification only, not runtime admission. These tests create threads, PTYs/processes and fixture files; they are not inert/stdlib checks and require future coordinated execution with original custody. No environment reset, User role switch or current probe is authorized."
+    ],
+    "meaningful_oracles": [
+      "Same-ID/same-recipe successor preserves B while original nonce refuses and A custody remains pending.",
+      "Positive actual A close then installed B: lost-reply nonce replay returns cached A success without stopping/removing B; exact ACK and later unknown nonce are distinguished.",
+      "Nil/unknown/wrong-terminal nonce and changed native execution_instance refuse before original terminal close; native identity fixture is synthetic.",
+      "ACK rejects closing/stale nonce and cannot evict newer capability; natural completion requires original join/release, while absent row stays unknown.",
+      "Source capacity refusal and same-owner reuse preserve bounded slots without worker effects.",
+      "Pre-effect Attempt unwind preserves exact original custody and permits explicit retry; unhosted pending receipt blocks upgrade while settled receipt does not. This is not an executed arbitrary partial-kill/panic oracle.",
+      "Paired parent keeps original actor/pair across CLI return/replay, changes worker identity, refuses old receipt, then closes current captured pair and caches positive reply."
+    ],
+    "affected_existing_host_neighbors": [
+      "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views (same extracted helper, false branch)",
+      "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence (actual issued nonce replay and ACK assertions added)",
+      "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement (legacy None ACK signature)",
+      "host::chat::retained_actor_tests::retained_terminal_handoff_proves_original_console_cleanup (legacy None ACK signature in helper handoff branch)"
+    ],
+    "count_limits": "10 is source-defined new owning parents, not discovered inventory or passed tests. Nested fixtures, repeats, branches and process roles are nonadditive. Existing neighbors are not additional new parents.",
+    "execution": "ALL UNRUN; no historical B9 C1/C2 or donor pass transferred."
+  },
+  "remaining_blockers_and_limits": [
+    "Whole staging9c19 is not source-ready/compile-ready: unchanged UI consumers deliberately still expect old TerminalSession result/ACK signatures; Main15 must compose the typed returned session and original nonce/caller/presentation fences.",
+    "Root reports accepted peer1386 blocker at9c19: nonce ACK helper opens a fresh unauthenticated ControlClient. Root is correcting it to a caller-bound connected-client entry. This host review neither duplicates nor resolves that finding;9c19 has no overall clearance.",
+    "Some-returned integration must use issued cleanup while its captured pair is still available. First removing that pair through another close route causes require_current to refuse; absence must stay unknown. The consumer must preserve first-Close caller/intent without sequencing away its required original owner evidence.",
+    "No end-to-end original caller/nonce source, native development-runner flow, screenshots, response latency, complete host suite or physical lifecycle result is established. Eventual assembled head needs fresh owning validation and independent consumer review.",
+    "Prospective129 wire allocation/publication remains Root-owned. No current installed product or old-peer acceptance is claimed."
+  ],
+  "actions": "Read-only Git/source, freeze/prior receipt reads and this one task-owned sealed/tmp JSON only. No imports/calls/build/tests/native/helper/process/env/account/resource probes, source/Git/GitHub writes, agents or grant."
+}

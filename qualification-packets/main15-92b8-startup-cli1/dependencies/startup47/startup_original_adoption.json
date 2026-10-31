@@ -1,0 +1,65 @@
+{
+  "schema": "startup-Agent47-1d3e5c21-root-source-adoption-join-v1",
+  "utc": "2026-10-31T12:40:13.738845+00:00",
+  "controller": {
+    "head": "1d3e5c2134aab049b451a397c8bfca8fbd96c9a9",
+    "tree": "e2924fb9c4689f2ce0e897dbe1fc7e7fb875b9be",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source",
+    "branch": "qualification/fw16-startup-whole-focused-source"
+  },
+  "product": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74"
+  },
+  "genuine_source_inputs": [
+    {
+      "path": "/tmp/startup-Agent47-declared-count-successor-8ullap44/freeze.json",
+      "sha256": "15615f9f182f7593da6229f4f02f1661fa685c5b0873a1d5c47e6f72bd5cfcf5",
+      "bytes": 9164
+    },
+    {
+      "path": "/tmp/startup-Agent47-declared-count-independent-refresh-1d3e5c21-1335-v1.json",
+      "sha256": "97a0810e7794261ff40f43b9c5af5bfb7ea33cf2686aa0fea2855e96a326e159",
+      "bytes": 6586
+    },
+    {
+      "path": "/tmp/startup-Agent-safe47-1d3e5c21-independent-delta-conservation-review-v1.json",
+      "sha256": "1cfaf20456ce1eb6a73055bbac91a6625fd1edf1a7f7781b8877d19656b8625f",
+      "bytes": 16711
+    },
+    {
+      "path": "/tmp/startup-Agent-safe47-579f9a58-independent-conservation-manifest-ast-review-v1.json",
+      "sha256": "9f72c8f186e65fca4b18f9999513eacb618f2d29d8307f174f970cd43a14820a",
+      "bytes": 62291
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/579f9a58-main15-safe47-deferred5-bounded-caller-contract-lead-join-v1.json",
+      "sha256": "f85af59c242f2b2f050ca99227f96fec99a65c7642aa48938bde5d96ae9da233",
+      "bytes": 7187
+    }
+  ],
+  "decision": "SOURCE_ADOPT_EXACT_REVIEWED_CONTROLLER_ONLY_PENDING_PUBLICATION_AND_SEPARATE_ONE_USE_C_GRANT",
+  "future12argv_template": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "93d01c01be059b8d64266afd293f176981285ac3a6255cb6b79cbe347f8bb54f",
+    "--controller-review",
+    "/tmp/startup-Agent47-declared-count-independent-refresh-1d3e5c21-1335-v1.json",
+    "--controller-review-sha256",
+    "97a0810e7794261ff40f43b9c5af5bfb7ea33cf2686aa0fea2855e96a326e159"
+  ],
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source",
+  "C_logical_state": "RETURN_ACCEPTED_NO_NEW_ALLOCATION_AFTER_9995_ACCEPTANCE4b11",
+  "actual_runtime_resource_availability": "UNKNOWN_NOT_PROBED",
+  "selected_partial": "47CLI1HOST6UI40; FULL52 genuineUser5 native UX WHOLE remain HOLD; noauthorityscrub/proxy or passcredit",
+  "limits": [
+    "No current compile/test/native results yet. OriginalB negative and original579BLOCK unchanged.",
+    "Root joins genuine source reviews and currenthead/runner/plan/manifest; does not duplicate raw runtime or generic source semantic audit.",
+    "Canonical9004 no unprovenadoption signals and originalcustody/HOLD/protected3790 remain exact; separate natural runtime gates required."
+  ]
+}

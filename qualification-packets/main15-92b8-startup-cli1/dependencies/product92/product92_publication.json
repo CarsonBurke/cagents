@@ -1,0 +1,34 @@
+{
+  "compile": null,
+  "created_utc": "2026-10-31T19:33:18.817073+00:00",
+  "grant": null,
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "kind": "main15-92b8-reviewed-single-import-source-publication-v1",
+  "limits": [
+    "No old bb8 pass/grant transfer or feature readiness/merge clearance.",
+    "Fresh controller binding/review and grant required before runtime."
+  ],
+  "native": null,
+  "original_push": {
+    "closed": true,
+    "exit": 0,
+    "initial_chunk": "310ae0",
+    "session": 17044,
+    "terminal_chunk": "7221b0",
+    "warning": "Credential store locked collection warning; normal push succeeded, no credential fallback or unlock."
+  },
+  "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "ref": "refs/heads/fix/fw16-issued-return-cleanup-api",
+  "scope": "Source publication only; no PR create/body write retry after automatic rejection.",
+  "source_adoption": {
+    "path": "/tmp/fw16-backend-ec204421/main15-92b8-single-import-root-source-adoption-v1.json",
+    "sha256": "0bd78745ea46c83ba62cdd8d84efc5076a3713aa1ad4651fab3137b46e7e2195"
+  },
+  "status": "NORMAL_FAST_FORWARD_PUBLISHED_AND_SUPPORTED_GITHUB_REF_VERIFIED",
+  "supported_ref_readback": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "matches": true
+  },
+  "tests": null,
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4"
+}

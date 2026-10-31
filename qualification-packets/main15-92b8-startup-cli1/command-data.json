@@ -1,0 +1,199 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "artifact_groups": [
+    {
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 600,
+      "execution": {
+        "label": "parent-cli-lib-exact",
+        "seconds": 60
+      },
+      "features": [],
+      "id": "cli-lib",
+      "inventory_seconds": 30,
+      "manifest": "Cargo.toml",
+      "selectors": [
+        {
+          "expected_stdout_child_results": 0,
+          "name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals"
+        }
+      ],
+      "source_predicted_absent_names": [
+        "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+        "app::startup_gate::tests::retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "app::startup_gate::tests::retained_reason_fits_one_launcher_handshake_line",
+        "app::startup_gate::tests::panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "app::startup_gate::tests::settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "app::startup_gate::tests::the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "app::startup_gate::tests::inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "app::startup_gate::tests::old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "app::startup_gate::tests::current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "app::startup_gate::tests::losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "app::startup_gate::tests::cached_ready_is_revalidated_after_a_new_owner_connects",
+        "app::startup_gate::tests::delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "app::startup_gate::tests::a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "app::startup_gate::tests::a_stale_inspection_does_not_hide_a_real_save_error",
+        "app::startup_gate::attachment_tests::hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "app::startup_gate::attachment_tests::another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "app::startup_gate::attachment_tests::oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+        "app::startup_gate::attachment_tests::hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "app::startup_gate::attachment_tests::actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "app::shared_views::tests::startup_terminals::reopened_shared_window_reports_a_refused_offscreen_attach",
+        "app::shared_views::tests::startup_terminals::shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "app::shared_views::tests::startup_terminals::a_replaced_shared_session_is_qualified_again",
+        "app::shared_views::tests::startup_terminals::a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "app::shared_views::tests::startup_terminals::a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "app::shared_views::tests::startup_terminals::a_hibernated_offscreen_attachment_qualifies",
+        "app::shared_views::tests::startup_terminals::a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "app::shared_views::tests::startup_terminals::restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "app::shared_views::tests::startup_terminals::a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+        "app::shared_views::tests::startup_terminals::emitted_seed_replies_are_additive_and_apply_closed_before_panes",
+        "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+        "app::startup_gate::tests::open_quarantine_precedes_waivers_but_closed_evidence_stays_closed",
+        "app::startup_gate::tests::quarantine_waits_for_genuine_pending_and_delayed_ready_cannot_waive_it",
+        "app::shared_views::tests::startup_admission::ranked_snapshot_quarantines_raw_invalid_sibling_before_seed_projection",
+        "app::shared_views::tests::startup_admission::managed_quarantine_uses_full_ownership_proof_and_pending_sources",
+        "app::shared_views::tests::startup_admission::exact_canonical_replacement_and_valid_closed_history_keep_their_admission_contract",
+        "app::shared_views::tests::startup_admission::closed_retirement_history_still_requires_exact_proof_and_scope",
+        "app::shared_views::tests::startup_admission::verified_retirement_keeps_unsaved_work_without_manufacturing_failed_proof",
+        "app::shared_views::tests::startup_admission::persisted_open_quarantine_survives_restart_initialization_and_a_registry_without_its_issuer",
+        "app::shared_views::tests::startup_admission::stale_pane_check_cannot_settle_a_successor_or_revive_changed_evidence",
+        "session::tests::runtime_barriers_and_retry_keep_rejected_evidence_out_of_a_replaced_chat",
+        "persistence::tests::v13_quarantine_reader_admission_migration_preserves_rows_and_schema",
+        "persistence::tests::quarantine_metadata_roundtrips_defaults_only_when_absent_and_rejects_malformed_sources",
+        "persistence::tests::migration_inspection_omits_exact_quarantined_sources_and_rejects_mismatch_or_malformed_markers",
+        "persistence::tests::history_reads_quarantine_provenance_from_every_workspace_and_refuses_invalid_metadata",
+        "persistence::tests::rebased_quarantine_cannot_commit_old_evidence_over_an_explicit_chat_replacement"
+      ],
+      "source_predicted_compiled_names": [
+        "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals"
+      ],
+      "target_kind": [
+        "lib"
+      ],
+      "target_name": "cagents"
+    }
+  ],
+  "binary_checks": [
+    {
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "label": "cli-binary-check",
+      "seconds": 300
+    }
+  ],
+  "execution_authorized": false,
+  "phase_caps_sum_seconds": 990,
+  "planned_phase_count": 4,
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-exact"
+  ],
+  "readiness": false,
+  "reconciliation": {
+    "all_actual_runtime": null,
+    "canonical_group_argv": [
+      "ACTUAL_CURRENT_LIB_ELF",
+      "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    "canonical_inventory_argv": [
+      "ACTUAL_CURRENT_LIB_ELF",
+      "--list",
+      "--color=never"
+    ],
+    "command_caps_seconds": [
+      300,
+      600,
+      30,
+      60
+    ],
+    "command_caps_sum_seconds": 990,
+    "current_profile": "cli1",
+    "grouped_decision": {
+      "message": "01846f73-6a9d-47eb-b218-de105b0cb4e4",
+      "raw_input": {
+        "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-92b8-startup-cli1-source/qualification-packets/main15-92b8-startup-cli1/dependencies/startup47/startup_grouped_decision_and_UI_hold.json",
+        "sha256": "305307b81a1d702356911bb0c295852cd17cf94fff39c475efd17f735947f5a7"
+      }
+    },
+    "kind": "ADDITIVE_ORIGINAL_GROUPED_STARTUP_BUDGET_AND_CANONICAL_ARGV_RECONCILIATION_NOT_RUNTIME_EQUIVALENCE",
+    "logical_parent_outcomes_max": 1,
+    "no_runtime_equivalence_or_prior_count_result_transfer": true,
+    "old_bb8_UI_hold_history": "Original bb8 UI lib compile101 E0599 and all five Return-component parents UNRUN remain negative history. Genuine92b8 one-import source correction closes the source cause only; no compilation, current47, originalUser5 or runtime pass transfer.",
+    "original_controller": {
+      "head": "1d3e5c2134aab049b451a397c8bfca8fbd96c9a9",
+      "tree": "e2924fb9c4689f2ce0e897dbe1fc7e7fb875b9be"
+    },
+    "original_plan_sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
+    "original_three_group_execution_caps_seconds": {
+      "cli": 60,
+      "host": 60,
+      "ui": 300
+    },
+    "owning_harness_invocations": 1,
+    "product": {
+      "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+      "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+      "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+    },
+    "source_and_finalization_limit": "No aggregate source/finalization reservation is implemented. Original2400 workload cap and remaining clamps are unchanged; uncertain custody HOLD can be indefinite.",
+    "supersedes_unimplemented_author_singleton_expansion": true
+  },
+  "runtime_admission": {
+    "execution_authorized": false,
+    "helper_binding": null,
+    "state": "MAIN15_92B8_STARTUP_CLI1_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT"
+  },
+  "schema": "main15-92b8-startup-cli1-controller-task-data-v1",
+  "selected_names": [
+    "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals"
+  ],
+  "source": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+  },
+  "source_reservations": "Not command phases and not newly enforced aggregate bounds."
+}

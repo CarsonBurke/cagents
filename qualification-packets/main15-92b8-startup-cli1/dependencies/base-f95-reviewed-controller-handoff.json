@@ -1,0 +1,364 @@
+{
+  "actual_ELF_inventory_N": null,
+  "actual_owning_parent_results": null,
+  "archive_composition": {
+    "binding_records": 90,
+    "bound_current_inputs": [
+      "command-data.json",
+      "current-source-map.json",
+      "instruction-source.json",
+      "reconciliation.json",
+      "selected-source-contract.json",
+      "source-binding.json"
+    ],
+    "bound_originals": 84,
+    "materialized_runtime_archive": null,
+    "physical_dependency_files": 41,
+    "physical_source_snapshot_files": 44,
+    "physical_total": 85,
+    "source_index_present_unarchived_history": [
+      "dependencies/base-search-UI5/source-binding.json"
+    ]
+  },
+  "archive_count_clarification": "85 physical originals, 84 declared archived plus six current inputs =90 records. Historical base-search binding remains indexed/present but unarchived; current binding is declared at safe flat source-binding.json.",
+  "artifacts": {
+    "command-data.json": {
+      "bytes": 13050,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/command-data.json",
+      "sha256": "44a6d5b2724374b09a015220c2c6363ffd23a8471b6154fb18e01c72b7eea71e"
+    },
+    "current-source-map.json": {
+      "bytes": 16764,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/current-source-map.json",
+      "sha256": "6a921c93b58213e798aae7a4d36b02df953b8bf155c6c325dd2bc8e2a312589f"
+    },
+    "from-993-forward.diff.json": {
+      "bytes": 190174,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/from-993-forward.diff.json",
+      "sha256": "45b87d3df406eeeb296a223b4132d75c9bbaaf7301d7070f1db490961cf7e0a8"
+    },
+    "from-Search-UI5-b896-forward.diff.json": {
+      "bytes": 201849,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/from-Search-UI5-b896-forward.diff.json",
+      "sha256": "41eec02a63690228534819572e926d58a582f7d6a61fc976624367fde2e28b95"
+    },
+    "invocation-template.json": {
+      "bytes": 880,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/invocation-template.json",
+      "sha256": "67990eff7044df032fde1cb52a7369d0aae7898cd384fdd6dd7f272cea32b741"
+    },
+    "manifest.json": {
+      "bytes": 18543,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/manifest.json",
+      "sha256": "2293cc19a779b6409c49035aebe3b0f6442dbf7e0ca1d08c8f75bf6ea1217df1"
+    },
+    "plan.json": {
+      "bytes": 49083,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/plan.json",
+      "sha256": "0edd5020f753c30f7ab4f130ffa1fe47f13ddf99e2ab20ad1edd2a706373cc76"
+    },
+    "reconciliation.json": {
+      "bytes": 2745,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/reconciliation.json",
+      "sha256": "b8163d324b945bde62501589d038a7c095769064945b6d410428fc16b4cea215"
+    },
+    "run-packet.py": {
+      "bytes": 90535,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/run-packet.py",
+      "sha256": "471b91174f01c5d3262e8da3debb48421b4015fe6b91827620c9da40c28b7b5c"
+    },
+    "selected-source-contract.json": {
+      "bytes": 9158,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/selected-source-contract.json",
+      "sha256": "784c2102d443b2418cf9875d9f8124a688c30d66162019fd863c75d2acc96d7a"
+    },
+    "source-binding.json": {
+      "bytes": 16748,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/source-binding.json",
+      "sha256": "1f8dbef099c8583fbaa0c009a44386ccb1e2c75a9baa763d8e5593a7df7af9a1"
+    },
+    "source-conservation.json": {
+      "bytes": 7113,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/source-conservation.json",
+      "sha256": "8b8f0cb4a1090ba692f6ff0fa0300388fbaf002d8b651533f756417cb0d234c3"
+    },
+    "to-993-true-inverse.diff.json": {
+      "bytes": 190179,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/to-993-true-inverse.diff.json",
+      "sha256": "6e24c103f718b720f347fb34d387255f06d3b31f8ec945d2004bcdd0ba16ef9f"
+    },
+    "to-Search-UI5-b896-true-inverse.diff.json": {
+      "bytes": 201854,
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/to-Search-UI5-b896-true-inverse.diff.json",
+      "sha256": "907efee0dbe8fcc5224c367b28de08c5a4cdb9fbe83d4480d8c99ce0636b757f"
+    }
+  },
+  "assembled_utc": "2026-10-31T17:20:26.947005+00:00",
+  "author_freeze": {
+    "path": "/var/tmp/coord16-main15-f95-HOST16-author-freeze-qcv_d1pe/object-freeze.json",
+    "sha256": "f51f647fbcee06d99f9911302c81e46dc37e36ed65c8652f7b109296522fcafc"
+  },
+  "author_handoff": {
+    "path": "/var/tmp/coord16-main15-f95-and-search-author-final-1793466888392/handoff.json",
+    "sha256": "d37963f0f37c3f65c76770da1c8994071bdc08d2134710853f604f5356779053"
+  },
+  "author_original_tools": {
+    "path": "/var/tmp/coord16-main15-f95-and-search-author-final-1793466888392/original-tools.json",
+    "retained_original_results": 42,
+    "sha256": "773ca3e3462b49c7ac6a36a143a9c87f40d4bd5a4a1924ee3a3bd9de25bc519d"
+  },
+  "command_caps_sum_seconds": 2250,
+  "controller": {
+    "branch": "qualification/coord16-main15-f95-issued-return-host16",
+    "head": "3dd236df2ce3878ca059f6aadbb9b195d3c6fe0e",
+    "packet": "qualification-packets/main15-f95-issued-return-host16",
+    "sole_parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "tree": "fe32c7229c89b054c40d0877ed6b537fab99b1c2",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source"
+  },
+  "controller_argv_TEMPLATE_NOT_SUBMITTABLE": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source/qualification-packets/main15-f95-issued-return-host16/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "471b91174f01c5d3262e8da3debb48421b4015fe6b91827620c9da40c28b7b5c",
+    "--controller-review",
+    "/var/tmp/coord16-main15-f95-host16-code-independent-_cjr1ay1/review-final.json",
+    "--controller-review-sha256",
+    "66c29b9d50733031d2d67e8aab7fae38d97945ddd0c96364ec44e9b8ed8dafcb"
+  ],
+  "controller_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source",
+  "execution_authorized": false,
+  "file_count": 102,
+  "fixture_body_proof_limit": "Static parent declarations and caller classifications are source enrollment, not actual body execution or caller identity. A future ordinary footer supplies only its actual supported causal scope; no inference from a private guard refusal or early return.",
+  "function_conservation": {
+    "Search_successor_semantics": "Exactly historical publication -> base_c28_publication; the two current PLAN literals are dependent own-path/hash bindings, and inverse restores whole parent runner. Current7be source/publication assertions remain byte-exact.",
+    "Search_successor_versus_b896_changed_defs": [
+      "main"
+    ],
+    "f95_HOST16_versus_immediate_Search_b896_changed_defs": [
+      "grouped_contracts",
+      "parent_accounting",
+      "main"
+    ],
+    "f95_UI5_versus_immediate_Search_b896_changed_defs": [
+      "parent_accounting",
+      "main"
+    ],
+    "versus_993": "All three packets change only grouped_contracts,parent_accounting,main plus declared WT/PLAN/PLAN_SHA task bindings;29other topdefs+5nested/canonical9004/full3790/strict parser/execute/custody/compact terminal return exact."
+  },
+  "grant": null,
+  "hashed_payloads": 101,
+  "independent_code_limits": [
+    "CONTROLLER_SOURCE_CLEAR is bounded code/ABI status only, not runtime admission, capacity, current context, grant, result or C release.",
+    "Actual HOST compile artifact/fresh inventory N/results/original source/tool/context/waits/family/evidence/close remain to be established by a future separately admitted original run and genuine sole RAW.",
+    "No UI5/old52/47/User5/full55-stack/FULL52/WHOLE/live provider/native/currentCI/merge result transfer or qualification. Deferred helper neighbor remains unqualified.",
+    "No full ELF archival, every internal exec/embedded version/global kernel/namespace/manager/installed/adoption scope proof; inherited utility/negative histories remain immutable.",
+    "Fixture protocol/cleanup assertions can supply only their eventual exact parent scope, not automatic full-feature or actual production cleanup/physical custody of arbitrary sessions."
+  ],
+  "independent_conservation_review": {
+    "path": "/var/tmp/coord16-main15-f95-host16-conservation-independent-syht5nf1/review.json",
+    "sha256": "c8f93312306d90f16594b75293db34737ffb7df6c040aff4e1e92d0625982b16",
+    "verdict": "BOUNDED_CONSERVATION_DATA_SOURCE_CLEAR_EXECUTION_UNRUN"
+  },
+  "independent_controller_review": {
+    "path": "/var/tmp/coord16-main15-f95-host16-code-independent-_cjr1ay1/review-final.json",
+    "sha256": "66c29b9d50733031d2d67e8aab7fae38d97945ddd0c96364ec44e9b8ed8dafcb",
+    "verdict": "CONTROLLER_SOURCE_CLEAR"
+  },
+  "kind": "coord16_main15_f95_HOST16_reviewed_source_handoff_v1",
+  "lead_intake_hash_join": {
+    "path": "/var/tmp/coord16-main15-f95-packets-lead-lzobj2ih/intake-hash-join.json",
+    "sha256": "acdc8a75ed0604c754cd2d55c89abb3565e4a4003b2c5fbfbb7de08e6ad6b8f9"
+  },
+  "lead_join_scope": "Named artifacts and genuine review product/controller ABI only; no duplicate 540-check conservation or production source review.",
+  "next_owner_action": "EC may review/adopt exact HOST16 source and paired UI5 independently. No publication, queue position, runtime, grant or availability inferred; future one-use authenticated admission stays separate.",
+  "original_workload_cap_seconds": 2400,
+  "paired_UI5_source_handoff": {
+    "path": "/var/tmp/coord16-main15-f95-packets-lead-lzobj2ih/UI5-reviewed-handoff.json",
+    "scope": "Separate source-reviewed packet; no pass/admission/grant transfer. CLI and UI checks there, HOST check here.",
+    "sha256": "438e152c1b00503e6c94c65869a8c8b2960825e95479640a39cd1d76691399b6"
+  },
+  "parked_integration": {
+    "receipt": "/var/tmp/coord16-linear918-integration1-priority-park-xyjjpnty/wip.json",
+    "sha256": "c985958307b16a4bfb7ee7bc61715d16f40734766e64692d154b793017752166",
+    "state": "UNCHANGED_PARKED_UNFROZEN_UNREVIEWED_WIP"
+  },
+  "phase_count": 19,
+  "phase_order": [
+    "host-binary-check",
+    "compile-host-lib",
+    "inventory-host-lib",
+    "parent-host-lib-1",
+    "parent-host-lib-2",
+    "parent-host-lib-3",
+    "parent-host-lib-4",
+    "parent-host-lib-5",
+    "parent-host-lib-6",
+    "parent-host-lib-7",
+    "parent-host-lib-8",
+    "parent-host-lib-9",
+    "parent-host-lib-10",
+    "parent-host-lib-11",
+    "parent-host-lib-12",
+    "parent-host-lib-13",
+    "parent-host-lib-14",
+    "parent-host-lib-15",
+    "parent-host-lib-16"
+  ],
+  "product": {
+    "API_base": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "sole_parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6"
+  },
+  "queue": null,
+  "runtime_results": null,
+  "selectors": [
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+      "seconds": 60
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+      "seconds": 45
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+      "seconds": 15
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+      "seconds": 45
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+      "seconds": 45
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+      "seconds": 45
+    },
+    {
+      "expected_stdout_child_results": 0,
+      "name": "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement",
+      "seconds": 45
+    }
+  ],
+  "source_pin_count": 44,
+  "source_pins": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "crates/browser-import/Cargo.toml": "f5b6050089d17dbbb3f939c2dfd064c9e5b79a2c4e72d621c6d9c8083ddb0158",
+    "crates/ceditor/Cargo.toml": "ec03c70fe7f2151744e68208837dbe84e589b4940e0772c03427146be1237b76",
+    "crates/iced-contracts/Cargo.toml": "2b52fa79d91cb859f66855d5ea3ff8b01cb7ff9b0da1d12dd56daea0942c4d94",
+    "scripts/qualification/process_custody.py": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+    "scripts/run-development": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016",
+    "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+    "src/app.rs": "de2b68f872f4195e87a3cbdee1fa846ab2655726cf9e8540141ec0701f5aec4c",
+    "src/app/chat_ui.rs": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+    "src/app/chrome_ui.rs": "651091245803497ff0705a287d952b839137c4cf842675617d4752e26eb0272c",
+    "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+    "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+    "src/chat.rs": "bcba67f4e68578ebb07fb41d304725151a0829488151485c5a7e349377698967",
+    "src/chat/client.rs": "2cbef29622dc3c6ee4f2af8e4d08705bed44948df90eb1a4bc6b285151ce4096",
+    "src/chat/protocol.rs": "26e6653206834540155a97b0a7fcb5be0b76285563e9baaa2bbd7e4d094d0b30",
+    "src/chat/protocol/claude.rs": "ffa169629039fe3e5182add62d2c0e96ed997d4cee0f367ccd9d22492452c181",
+    "src/chat/runtime.rs": "47ac6594942d47d925b278511d5d9ffeafd064b240d3d6fbd8e0fe47edbb6138",
+    "src/control.rs": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02",
+    "src/host/agent_execution/ownership.rs": "13c718709fa9c0aaef11fa8f24921c8812fb0a80761cc65c1f95330731e81edd",
+    "src/host/agent_execution/terminals.rs": "6ec8ed383db97bb9def9713ba1f863419ec63f29139785df1c88806b21ae7e3b",
+    "src/host/chat.rs": "d707d06220117e02951481db2d1a9a6a3a6214287d89483a4104696bfb15972d",
+    "src/host/chat/retained_actor_tests.rs": "ebafa0a8c9973a26f1fd8e74bfa3757c99be8dbfbada1cb9f1b343de934fa2c6",
+    "src/host/chat/terminal_return_cleanup.rs": "e6a6fc53f75abcdec789a34df1b3d3d4e27ce2b2ad0b4e120b38524237ad91b0",
+    "src/host/chat/terminal_return_cleanup/tests.rs": "d8f9206af5a80fe4ed0185059ab8b1d52ddacee57769c547f9dfeb374e720ca6",
+    "src/host/client.rs": "e755119e5d87e02b0f09782e8c4cd887546498702bfbbea2cf58c2a7173db9ad",
+    "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+    "src/host/state.rs": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6",
+    "src/host/state/update.rs": "5fedaab89811f4ac69e683b356e1ab5380b575831f848e372ead54b20d1d8b2d",
+    "src/host/worktree_removal.rs": "80262d25b1284cc5598216a8066bcb2a1579eca4eddc69591124878daab6d6b1",
+    "src/interaction.rs": "7881579c46f30348f5b48c30319a38a89551e2bdbc9e47eda21cf2398a11f01e",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/model.rs": "d49a2423a6a39df38c2bf83e6186954f40fa88d8f8d0e09ba72cb793a5451dde",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/process.rs": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47",
+    "src/settings.rs": "36630b1b6d811d38cc25e7d055785bd0ff324b9ddd78e9538e81c053604ee1ba",
+    "src/terminal/ipc.rs": "d05435ee47032a8c5902cfc54e8553a19f46228b7e22e625a8ac5a27355a931d",
+    "src/terminal/mod.rs": "cb89ea3c9acd9ea48f3d7894bd05996bcb14549b30e7658c331190f14b1f4614",
+    "src/ui_controls.rs": "2ffe8c62c9ff35fc498cdf6bcc070db665cdcea0794b713b6da12d275ba323dc",
+    "src/ui_controls/button.rs": "a03038b946f946a2afdec251bb4b8b99f1e8604e05ad3cc3413c8545293fce04",
+    "src/ui_controls/owned.rs": "0740d060c31db75b3cc8888334fb17008392618e4b7844229f329f462e709690"
+  },
+  "source_readiness": "BOTH_INDEPENDENT_SOURCE_REVIEWS_CLEAR_RUNTIME_UNRUN",
+  "source_scope_and_limits": [
+    "f95 exactparentb8/API615e; full inherited55-path/76-commit stack versus main442, never narrow3-file PR or whole-stack qualification. All2231 product entries exact in each f95 controller child.",
+    "Five Return UI component parents are ordinary inherited-Agent compatible, separate from original startup47 ordinary plus5 genuine-User parents. All original startup52 outcomes remain separately unqualified atf95.",
+    "Owning UI2 consume only test-local Widget focus operations; provider/cleanup/save/recheck futures remain dropped. Adapted3 synthetic completions, typedClosed without writer gives FlushFailed/unresolved custody, no physical CLI close proof.",
+    "HOST16 follows full immutable source DATA order/caps; private PTY/bin-cat/process/thread/scripted-provider fixtures are real future work, not genuine User authority or commercial provider evidence.",
+    "UI5 nine command phases2130 includes CLI/UI checks; HOST16 nineteen commands2250 owns HOST check. Original21HOST DATA entries2340 include90 source reservations, not additional invocations or enforced finalization bounds. Both separately admitted packets are required for affected boundary coverage.",
+    "Canonical inventory--list--color=never and captured exact/defaultpretty singleton ABI is preserved; original DATAterse/nocapture suggestions stay raw history plus additive reconciliation, no runtime-equivalence/oldN/result transfer.",
+    "Deferred retained_terminal_handoff_proves_original_console_cleanup remains unqualified; no helper/envclear/reexec neighbor or User proxy/context scrub is adopted.",
+    "Current tools/source cleanliness/context/ELF/inventoryN/results/resources unknown; stale source/environment causes original failclosed/no retry. Uncertain custody retains indefinite HOLD.",
+    "Each pre-review12argv template has grant5/review9/reviewhash11 NULL and is NOT SUBMITTABLE. Root alone binds a genuine new source review externally, then onlygrant5 remains NULL. No selfhashcycle or forged review.",
+    "Search oldb896/reviews958f/dc749/f89a remain missed-publication-role source history. New2461 needs fresh delta review; no previous runtime or wholefeature approval."
+  ],
+  "whole_feature_native_UX_merge_readiness": "HOLD_UNQUALIFIED",
+  "writer_released": true
+}

@@ -1,0 +1,127 @@
+{
+  "absolute_workload_cap_seconds": 2400,
+  "all_nested_exact_sha256": {
+    "final_observations.collect": "a2d1e38e7398b37be359ac4f6ed598633710b961fa38f3c0f984c0d619dc5a0c",
+    "main.context": "805c89ac60a119fb6cd1a5445d98dcb4b60d482ef00577b167604d4052c0acfe",
+    "main.invoke_fixture_group": "288e08759f96075a6a091c01f6626016f8ff55fda5a2033cf58c6d31537493f4",
+    "main.read_bound": "df9943a2f4a6e7db2090e1e3aa1613032096c311b3dd8949814b975430fa55a3",
+    "main.run": "160b304e0d0a8bf81fb6cbada8bfda06d8fb89f1ba2fb0d588b9383e62e79d06",
+    "main.source": "218524d0b8b3f77384541bc74b4aa8f90ad8fc79cfcdd00b2a1ab6919847e711",
+    "task_elf_observation.identity": "169dac3c2df96ab6a8cffad409b59516b2ff11af96238df631bcccfcb3ff9e6c"
+  },
+  "all_runtime_N_ELF_results_grant": null,
+  "archive_composition_source_only": {
+    "binding_records": 161,
+    "bound_current_inputs": [
+      "command-data.json",
+      "current-source-map.json",
+      "instruction-source.json",
+      "reconciliation.json",
+      "selected-source-contract.json",
+      "source-binding.json"
+    ],
+    "bound_physical": 155,
+    "materialized_runtime_archive": null,
+    "physical_dependency_and_snapshot_files": 157,
+    "unarchived_indexed_physical_paths": [
+      "dependencies/base-f95-source-conservation.json",
+      "dependencies/base-search-UI5/source-binding.json"
+    ]
+  },
+  "bounded_full_forward_and_true_inverse_reconstruction_exact": true,
+  "canonical9004_exact": true,
+  "changed_top_level_definitions": [
+    "grouped_contracts",
+    "parent_accounting",
+    "main"
+  ],
+  "command_caps_seconds": [
+    300,
+    600,
+    30,
+    60
+  ],
+  "command_caps_sum": 990,
+  "command_phase_count": 4,
+  "compact_terminal_and_final_return_exact": true,
+  "controller_review": null,
+  "donor": {
+    "head": "855a41f9dbb35bc3f33aafc1d4a84c235177faa0",
+    "packet": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-host16-abi-source/qualification-packets/main15-bb8-host16",
+    "plan_sha256": "15be44eec5bde2ec0846365fc720a1fe0c28b3c16cd7c4b0cb8eb9a05c1d4060",
+    "runner_sha256": "aa6f77fcdc3efb98d466c3e79b3f663ca9b2edd71f0906a6d67d7b2a3d63172c"
+  },
+  "execution_authorized": false,
+  "forward_sha256": "4dc085552ccfd87e32717441db448a5ec1fb5db435ce9d922ba6094f62282249",
+  "generic_nested_count": 2,
+  "group_contract": {
+    "expected_stdout_child_results": 0,
+    "group_seconds": 60,
+    "logical_ordinary_parent_names_max": 1,
+    "owning_harness_invocations_max": 1,
+    "parent_PID_wait_ELF_receipts": null
+  },
+  "instruction_source": {
+    "bytes_flags_changed_by_author": false,
+    "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+    "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+    "index_flag": "H AGENTS.md",
+    "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+    "latest_user_AGENTS_instructions_followed": true,
+    "variance": true
+  },
+  "kind": "AUTHOR_STARTUP47_PARTIAL_CLI1_SOURCE_CONSERVATION_NOT_INDEPENDENT_APPROVAL",
+  "limits": "Static author checks only. Old1d3 source histories, bb8 preparation HOLD and preliminary singleton proposal remain immutable and superseded by authenticated grouped/current92b8 decisions. One-import source correction is not compilation; no current47/User5/native/whole-stack qualification or resource admission.",
+  "main_nested_count": 5,
+  "metadata_author_assertions": {
+    "map_nested_contract_equals_exact_standalone_current_contract": true,
+    "own_PLAN_runner_archive_cwd_geometry": true,
+    "template_review_ABI_derived_from_plan_current_product": true
+  },
+  "nested_function_count_total": 7,
+  "product": {
+    "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15"
+  },
+  "product_entries_before_packet": 2231,
+  "protected3790_exact": true,
+  "protected3790_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+  "readiness": false,
+  "source_pin_count": 57,
+  "strict_grouped_result_execute_contracts_exact": true,
+  "true_inverse_sha256": "ba41a901057378a937515e69d13e4765da05ef490594d9226c3a250b9627cf27",
+  "unchanged_function_sha256": {
+    "bounded_capture": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911",
+    "cargo_helper_artifact": "cce4fa0819e7ce38157c45c4d8eb40df7e154d6d2fa94f3e39dfea52bd0d2712",
+    "cargo_test_artifact": "f9fb6c51e35ec5e930f6d4f3d1adc5aa15a8743f81d05ec8ed21a1a532da8285",
+    "children": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+    "custody_clean": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b",
+    "digest": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9",
+    "evidence_copy": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8",
+    "execute_contracts": "584d6c3b8076b29a92d12454bd3c3e04b1d14abe5f46323c62cbd451151c41bc",
+    "final_observations": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+    "git": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd",
+    "git_nul_fields": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf",
+    "grouped_result": "915552830e227e6adc9826359ef80485fbf6e59f3d4f32311d17f687ba8c3115",
+    "guard_git_metadata": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193",
+    "inventory_names": "c6cef656175adeddd1c2b2c5ca63b5449ec7c25eda343d9d6c9e4bc1b8e00f9f",
+    "note_lane_cancellation": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726",
+    "now": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2",
+    "observed_wait": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+    "parent_pass": "6aeaf986fe5d058f4364b562dc0ce6eea4c4ba248f1f69333e90022bc021a972",
+    "refuse_git_routing": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04",
+    "require_workload_allowed": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9",
+    "retain_uncertain_lane": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9",
+    "safe_lane_handoff": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+    "scope_observation": "fe5e76a1aa37dff346451b689338b73c99fc8a0f9d13fdbf42ddbbe6baffc387",
+    "settle_children": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "signal_pidfd": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+    "supervision_failure": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e",
+    "task_elf_observation": "3cd165b37eb78c86f9bf35fe2ed7eef1401f073c3b166512763f6a7af75e2814",
+    "task_group_assets": "1e4c5b94bec3e25343fcdedb4cb4255a2b937bfd6f8b0acec506915c052ac1a4",
+    "validate_controller_review": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
+  },
+  "unchanged_top_level_count": 29
+}
