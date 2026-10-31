@@ -93,8 +93,8 @@ fn retry_control(state: &State, enabled: bool) -> Element<'_, Message> {
         )
         .into();
     // A press belongs to the rendered query, even if another error replaces
-    // this button before release. No named button state survives keyed diff.
-    iced::widget::keyed::Column::with_children([(state.generation, retry)]).into()
+    // this button before release. Recreate its child state when that owner changes.
+    crate::ui_controls::owned(state.generation, retry)
 }
 
 impl Cagents {
