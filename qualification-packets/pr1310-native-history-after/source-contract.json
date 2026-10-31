@@ -5,7 +5,7 @@
   "generated_data": null,
   "limitations": [
     "Actual User/resource grant remains external, not a caller boolean.",
-    "No HOME/CODEX_HOME/PATH/account/model/authority mutation; no broad HOME-access audit.",
+    "Original launcher preserves literal inherited HOME/CODEX_HOME/PATH/opaque authority at launch; this fixture adds no environment scrubbing. Existing pre-main account::detach_inherited_selections still runs before fixture validation: it may remove CODEX_HOME/other provider-home variables on exact inherited-selection marker match or managed accounts/<provider>/<UUID> namespace shape, and always removes CAGENTS_ACCOUNT_HOMES. No value/account/profile/model/authority-policy switch or forced variable absence/presence is introduced; no whole-HOME audit or natural-startup qualification is claimed.",
     "Manifest/path checks do not replace original supervisor filesystem custody or independent builder evidence.",
     "Unsupported global key/focus/account/provider/operational actions are refused; no natural startup/close/save/daemon/IPC claim.",
     "Before has no query/refine/limit controls; no Before result is fabricated or adapted.",

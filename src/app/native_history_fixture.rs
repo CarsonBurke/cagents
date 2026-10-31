@@ -111,8 +111,12 @@ fn read_context() -> Result<Option<Context>, String> {
         Some("unborn") => ("unborn", "unborn", 0),
         _ => return Err("History fixture dataset must be small, large or unborn".into()),
     };
-    // These are opt-in conflict checks, not an environment scrub. Inherited
-    // authority, HOME, CODEX_HOME, PATH and credentials remain untouched.
+    // These opt-in conflict checks add no environment scrubbing. The original
+    // launcher's literal inheritance is distinct from normal pre-main account
+    // selection detachment: it may remove CODEX_HOME/other selected provider
+    // homes and always CAGENTS_ACCOUNT_HOMES before these checks. That existing
+    // policy is unchanged; no value/account/profile is switched or variable
+    // presence/absence forced for this fixture. This is not a HOME-access audit.
     if std::env::vars_os().any(|(name, _)| {
         name.to_str().is_some_and(|name| {
             name.starts_with("GIT_")

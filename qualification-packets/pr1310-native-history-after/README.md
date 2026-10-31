@@ -13,9 +13,18 @@ After separate resource/User admission and matched-executable qualification,
 use the ordinary browserless development runner. Its `development,ui` feature
 selection includes this leaf without `latency-harness` or a feature override.
 The registered original supervisor must preserve literal inherited HOME,
-CODEX_HOME, PATH and opaque authority. This fixture changes none of them.
-Only independently admitted private application XDG/TMP state may be provisioned
-by that original owner; this is not a whole-application HOME-access audit.
+CODEX_HOME, PATH and opaque authority when launching the process. This launcher
+requirement does not promise that every variable survives normal app startup:
+`cagents-ui::main_with_before_start` still calls the existing
+`account::detach_inherited_selections` before fixture validation. That policy
+can remove CODEX_HOME and other provider-home variables when their values match
+the exact inherited-selection marker or the managed
+`accounts/<provider>/<UUID>` namespace shape; it always removes
+`CAGENTS_ACCOUNT_HOMES`. This fixture adds no environment scrubbing, changes no
+value/account/profile/model/authority policy, and does not force a variable's
+presence or absence to satisfy admission. Only independently admitted private
+application XDG/TMP state may be provisioned by the original owner. This is
+neither a whole-application HOME-access audit nor natural-startup qualification.
 
 Supply both explicit selectors to the future app process:
 
@@ -42,7 +51,9 @@ necessary. No Git workload or helper is executed by context validation.
 Missing/partial/invalid selectors, conflicting CAGENTS fixture/latency settings,
 inherited GIT_* options and nondefault window/device/source arguments refuse
 this route. Absence of both selectors reads no fixture files and preserves
-ordinary startup. No environment variable is removed to make a refusal pass.
+ordinary startup. The fixture's conflict checks remove no environment variable
+to make a refusal pass; the earlier normal account-selection detachment above
+still applies unchanged.
 
 ## Actual source route
 
