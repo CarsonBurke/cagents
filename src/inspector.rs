@@ -93,6 +93,23 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         layout::Node::with_children(size, vec![background, foreground])
     }
 
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        if let Some(foreground) = layout.children().nth(1) {
+            self.foreground.as_widget().drag_destinations(
+                &tree.children[1],
+                foreground.with_virtual_offset(layout.virtual_offset()),
+                renderer,
+                destinations,
+            );
+        }
+    }
+
     fn operate(
         &mut self,
         tree: &mut Tree,
@@ -103,7 +120,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
         if let Some(foreground) = layout.children().nth(1) {
             self.foreground.as_widget_mut().operate(
                 &mut tree.children[1],
-                foreground,
+                foreground.with_virtual_offset(layout.virtual_offset()),
                 renderer,
                 operation,
             );
@@ -125,7 +142,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             self.foreground.as_widget_mut().update(
                 &mut tree.children[1],
                 event,
-                foreground,
+                foreground.with_virtual_offset(layout.virtual_offset()),
                 cursor,
                 renderer,
                 clipboard,
@@ -149,7 +166,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             .map_or_else(mouse::Interaction::default, |foreground| {
                 self.foreground.as_widget().mouse_interaction(
                     &tree.children[1],
-                    foreground,
+                    foreground.with_virtual_offset(layout.virtual_offset()),
                     cursor,
                     viewport,
                     renderer,
@@ -176,7 +193,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             renderer,
             theme,
             style,
-            background,
+            background.with_virtual_offset(layout.virtual_offset()),
             mouse::Cursor::Unavailable,
             viewport,
         );
@@ -186,7 +203,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
                 renderer,
                 theme,
                 style,
-                foreground,
+                foreground.with_virtual_offset(layout.virtual_offset()),
                 cursor,
                 viewport,
             );
@@ -215,7 +232,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             .as_widget_mut()
             .overlay(
                 &mut background_tree[0],
-                background_layout,
+                background_layout.with_virtual_offset(layout.virtual_offset()),
                 renderer,
                 viewport,
                 translation,
@@ -223,7 +240,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             .map(|overlay| overlay::Element::new(Box::new(Inert { overlay })));
         let foreground = self.foreground.as_widget_mut().overlay(
             &mut foreground_tree[0],
-            foreground_layout,
+            foreground_layout.with_virtual_offset(layout.virtual_offset()),
             renderer,
             viewport,
             translation,
@@ -246,9 +263,11 @@ impl<Message> Widget<Message, Theme, Renderer> for ModalOverlay<'_, Message> {
             .children()
             .nth(1)
             .map_or_else(iced_accessibility::A11yTree::default, |foreground| {
-                self.foreground
-                    .as_widget()
-                    .a11y_nodes(foreground, &state.children[1], cursor)
+                self.foreground.as_widget().a11y_nodes(
+                    foreground.with_virtual_offset(layout.virtual_offset()),
+                    &state.children[1],
+                    cursor,
+                )
             })
     }
 }
@@ -2003,6 +2022,81 @@ mod tests {
         id::Id,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn modal_keeps_only_foreground_native_bounds_and_action_anchors_in_scroll_coordinates() {
+        use crate::workspace_widget::forwarding_test::{native_button, native_controls, renderer};
+        use cosmic::iced::{Point, Vector};
+        use iced_accessibility::accesskit::Rect;
+
+        let renderer = renderer();
+        let size = Size::new(100.0, 60.0);
+        let mut widget = Element::new(ModalOverlay::new(
+            native_button("Background", size),
+            native_button("Foreground", size),
+        ));
+        let mut tree = Tree::new(&widget);
+        let node = widget
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, size))
+            .move_to(Point::new(20.0, 30.0));
+        let offset = Vector::new(4.0, -20.0);
+        assert_eq!(
+            native_controls(&mut widget, &mut tree, &node, offset, &renderer),
+            vec![(
+                "Foreground".to_owned(),
+                Rect::new(16.0, 50.0, 116.0, 110.0),
+                vec![(
+                    "Foreground",
+                    offset,
+                    Rectangle::new(Point::new(20.0, 30.0), size)
+                )],
+            )]
+        );
+    }
+
+    #[test]
+    fn modal_forwards_drop_targets_only_from_the_foreground() {
+        use crate::workspace_widget::forwarding_test::{leaf, renderer};
+        use cosmic::iced::{Point, Vector, advanced::clipboard::DndDestinationRectangles};
+        let renderer = renderer();
+        let target = Rectangle::new(Point::ORIGIN, Size::new(80.0, 40.0));
+        let (background, background_visits) = leaf::<()>(Size::new(100.0, 60.0), vec![(1, target)]);
+        let (foreground, foreground_visits) =
+            leaf::<()>(Size::new(100.0, 60.0), vec![(2, target), (3, target)]);
+        let mut widget = Element::new(ModalOverlay::new(background, foreground));
+        let mut tree = Tree::new(&widget);
+        let node = widget
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+            )
+            .move_to(Point::new(20.0, 30.0));
+        let offset = Vector::new(4.0, -20.0);
+        let mut destinations = DndDestinationRectangles::new();
+        widget.as_widget().drag_destinations(
+            &tree,
+            Layout::new(&node).with_virtual_offset(offset),
+            &renderer,
+            &mut destinations,
+        );
+        let actual: Vec<_> = destinations
+            .into_native_rectangles()
+            .into_iter()
+            .map(|destination| {
+                (
+                    destination.id,
+                    destination.rectangle.x,
+                    destination.rectangle.y,
+                )
+            })
+            .collect();
+        assert_eq!(actual, vec![(3, 20.0, 30.0), (2, 20.0, 30.0)]);
+        assert!(background_visits.offsets("drag").is_empty());
+        assert_eq!(foreground_visits.offsets("drag"), vec![offset]);
+    }
 
     fn terminal_card() -> CardState {
         let launch = LaunchRecipe {
