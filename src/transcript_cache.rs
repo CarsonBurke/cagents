@@ -458,3 +458,71 @@ mod tests {
         assert!(unrelated.path().join("keep").exists());
     }
 }
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn usage_counts_only_owned_cache_direct_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let external = outside.path().join("private-payload");
+        fs::write(&external, b"outside private bytes").unwrap();
+        let cache = root
+            .path()
+            .join(format!("chat-{}", uuid::Uuid::from_u128(1)));
+        let empty = root
+            .path()
+            .join(format!("chat-{}", uuid::Uuid::from_u128(2)));
+        fs::create_dir(&cache).unwrap();
+        fs::create_dir(&empty).unwrap();
+        fs::write(cache.join("transcript.sqlite"), b"abc").unwrap();
+        fs::write(cache.join("actor-journal.sqlite"), b"12345").unwrap();
+        fs::create_dir(cache.join("nested")).unwrap();
+        fs::write(
+            cache.join("nested/not-direct"),
+            b"not part of the byte total",
+        )
+        .unwrap();
+        symlink(&external, cache.join("linked-file")).unwrap();
+        symlink(
+            outside.path(),
+            root.path()
+                .join(format!("chat-{}", uuid::Uuid::from_u128(3))),
+        )
+        .unwrap();
+        let ordinary_file = root
+            .path()
+            .join(format!("chat-{}", uuid::Uuid::from_u128(4)));
+        fs::write(&ordinary_file, b"not a cache directory").unwrap();
+        let invalid = root.path().join("chat-not-a-uuid");
+        fs::create_dir(&invalid).unwrap();
+        fs::write(invalid.join("ignored"), b"not a cache").unwrap();
+        let unrelated = root.path().join("unrelated");
+        fs::create_dir(&unrelated).unwrap();
+        fs::write(unrelated.join("ignored"), b"not a cache").unwrap();
+
+        let observed = usage(root.path()).unwrap();
+        assert_eq!(observed.count, 2);
+        assert_eq!(observed.bytes, 8);
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 6);
+        assert_eq!(fs::read_dir(&cache).unwrap().count(), 4);
+        assert_eq!(fs::read_dir(&empty).unwrap().count(), 0);
+        assert_eq!(fs::read(cache.join("transcript.sqlite")).unwrap(), b"abc");
+        assert_eq!(
+            fs::read(cache.join("actor-journal.sqlite")).unwrap(),
+            b"12345"
+        );
+        assert_eq!(fs::read(&external).unwrap(), b"outside private bytes");
+        assert_eq!(fs::read_link(cache.join("linked-file")).unwrap(), external);
+        let missing = root.path().join("missing");
+        let absent = usage(&missing).unwrap();
+        assert_eq!(absent.count, 0);
+        assert_eq!(absent.bytes, 0);
+        assert!(!missing.exists());
+        assert!(usage(&ordinary_file).is_err());
+        assert_eq!(fs::read(&ordinary_file).unwrap(), b"not a cache directory");
+    }
+}
