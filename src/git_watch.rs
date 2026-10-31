@@ -751,7 +751,7 @@ impl Registrations {
             })
             .map(|(&id, _)| id)
             .collect::<BTreeSet<_>>();
-        for (&id, project) in &ordered {
+        for (&id, project) in ordered.iter().copied() {
             if let Some(reason) = &project.polling {
                 registrations.failures.insert(id, reason.clone());
             }
@@ -771,7 +771,7 @@ impl Registrations {
                 .iter()
                 .filter(|id| seen.insert(**id))
                 .filter_map(|selected| {
-                    ordered.iter().find_map(|(&id, project)| {
+                    ordered.iter().copied().find_map(|(&id, project)| {
                         let worktree = project
                             .worktrees
                             .iter()
@@ -826,7 +826,7 @@ impl Registrations {
                     registrations.exhausted(id);
                 }
             }
-            for (&id, project) in &ordered {
+            for (&id, project) in ordered.iter().copied() {
                 if !hot.contains(&id) {
                     for (path, mode) in project.metadata_paths() {
                         let _ =
@@ -836,7 +836,7 @@ impl Registrations {
             }
         }
         let mut roots: BTreeMap<&Path, Vec<(ProjectId, &Worktree)>> = BTreeMap::new();
-        for (&id, project) in &ordered {
+        for (&id, project) in ordered.iter().copied() {
             for worktree in &project.worktrees {
                 roots
                     .entry(&worktree.root)
