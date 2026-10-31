@@ -15028,6 +15028,9 @@ impl Application for Cagents {
                         }
                         self.sidebar_model
                             .apply_project_order(&self.durable.project_order);
+                        if self.remember_sidebar_project_order() {
+                            self.persist();
+                        }
                         self.sync_worktree_operation_rows();
                         self.sidebar_model.data_state = SidebarDataState::Ready;
                         let pr_enrichment =

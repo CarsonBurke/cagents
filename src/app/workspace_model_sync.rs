@@ -1359,6 +1359,9 @@ impl Cagents {
         );
         self.sidebar_model
             .apply_project_order(&self.durable.project_order);
+        if self.remember_sidebar_project_order() {
+            self.persist();
+        }
         self.sidebar_model.data_state = SidebarDataState::Ready;
         Adoption::Opening(self.project_load_task(
             shared.repository.clone(),
@@ -1417,6 +1420,30 @@ impl Cagents {
                             .is_ok_and(|canonical| canonical == repository)
             })
             .map(|project| project.id)
+    }
+
+    /// Append first-seen projects in the order already presented to the user.
+    /// Existing ranks, including a user's custom order, remain unchanged.
+    pub(super) fn remember_sidebar_project_order(&mut self) -> bool {
+        let mut known = self
+            .durable
+            .project_order
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let missing = self
+            .sidebar_model
+            .projects
+            .iter()
+            .filter_map(|project| known.insert(project.id).then_some(project.id))
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return false;
+        }
+        Arc::make_mut(&mut self.durable)
+            .project_order
+            .extend(missing);
+        true
     }
 
     /// Keeps the durable channels in the registry's ascending rank order.
@@ -2071,7 +2098,22 @@ mod tests {
         let mut session = app.session.take().unwrap();
         session.shutdown();
         assert_eq!(session.last_error(), None);
-        let (mut restored, _) = crate::session::SessionRuntime::open(&database, boot).unwrap();
+        let (mut restored, workspace) =
+            crate::session::SessionRuntime::open(&database, boot).unwrap();
+        let workspace = workspace.expect("device adoption saved its sidebar rank");
+        assert_eq!(workspace.project_order, vec![id]);
+        // The first save advances the new card's generation; restore resets
+        // runtime placement, while preserving the existing work.
+        let mut restored_cards = cards;
+        for card in &mut restored_cards {
+            assert_eq!(card.generation, 0, "the fixture starts unsaved");
+            card.generation = 1;
+            card.exposure = Exposure::Offscreen;
+            card.residency = Residency::Cold;
+        }
+        assert_eq!(workspace.cards, restored_cards);
+        assert_eq!(workspace.focused, focus);
+        assert_eq!(workspace.active_channel, active);
         let (projects, _) = restored.take_catalog();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].id, id);
@@ -3881,6 +3923,138 @@ mod tests {
         assert_eq!(project.kind, ProjectKind::Folder);
         assert!(project.worktrees.is_empty());
         assert!(app.durable.cards.is_empty());
+    }
+
+    #[test]
+    fn adopted_projects_append_to_durable_order_and_restore_after_shuffled_loading() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("project-order.sqlite3");
+        let boot = crate::model::BootId::new("project-order-adoption");
+        let (session, _) = crate::session::SessionRuntime::open(&database, boot.clone()).unwrap();
+        app.session = Some(session);
+        let mut checkouts = Vec::new();
+        let mut adopt = |app: &mut Cagents, name: &str, ordinal| {
+            let checkout =
+                git_checkout().expect("Git initialization must succeed for this fixture");
+            let repository = canonical_repository(&checkout.path().join(".git"))
+                .expect("the fixture has its own Git repository");
+            checkouts.push(checkout);
+            let shared = ModelProject {
+                repository,
+                name: name.into(),
+                kind: ProjectKind::Git,
+                ordinal,
+            };
+            app.workspace_model.projects.push(shared.clone());
+            let Adoption::Opening(task) = app.adopt_shared_project(&shared) else {
+                panic!("new shared Git repository must be read");
+            };
+            let message = first_message(task).expect("actual repository load completion");
+            assert!(matches!(
+                &message,
+                Message::RepositoryLoaded {
+                    result: Ok(_),
+                    open_cards: false,
+                    ..
+                }
+            ));
+            drop(app.update(message));
+            let project = app
+                .sidebar_model
+                .projects
+                .iter()
+                .find(|project| project.repository == shared.repository)
+                .expect("the accepted repository is visible");
+            assert_eq!(project.kind, ProjectKind::Git);
+            project.id
+        };
+        let existing = adopt(&mut app, "existing", 1);
+        let absent = ProjectId::new();
+        let mut expected = vec![absent, existing];
+        Arc::make_mut(&mut app.durable).project_order = expected.clone();
+        for (index, name) in ["zeta", "alpha", "middle"].into_iter().enumerate() {
+            let id = adopt(&mut app, name, (index + 2) as u32);
+            expected.push(id);
+            assert_eq!(app.durable.project_order, expected);
+            assert_eq!(
+                app.durable
+                    .project_order
+                    .iter()
+                    .filter(|id| **id == absent)
+                    .count(),
+                1
+            );
+            assert!(
+                app.durable.cards.is_empty(),
+                "quiet adoption creates no pane"
+            );
+            assert_eq!(
+                app.active_workspace, None,
+                "quiet adoption does not select a repository"
+            );
+            assert_eq!(app.workspace.focused(), None);
+        }
+        // No manual persist/snapshot here: reopen the completed adoption order
+        // after shutdown drains the load-completion path's writer, distinguishing
+        // a remembered in-memory order from a durable one.
+        let mut session = app.session.take().unwrap();
+        session.shutdown();
+        assert_eq!(session.last_error(), None);
+        let (session, saved) = crate::session::SessionRuntime::open(&database, boot).unwrap();
+        let saved = saved.expect("adoption saved a workspace without opening a pane");
+        assert_eq!(saved.id, app.durable.id);
+        assert_eq!(saved.project_order, expected);
+        assert!(saved.cards.is_empty());
+        assert_eq!(saved.focused, None);
+        app.durable = Arc::new(saved);
+        app.session = Some(session);
+
+        // A saved project absent during those adoptions keeps its custom rank
+        // when its real repository load eventually arrives with that same ID.
+        let returning = git_checkout().expect("Git initialization must succeed for this fixture");
+        let repository = canonical_repository(&returning.path().join(".git"))
+            .expect("the returning fixture has its own Git repository");
+        let task = app.project_load_task(repository, Some(absent), false, Some(ProjectKind::Git));
+        let message = first_message(task).expect("returning repository load completion");
+        assert!(matches!(
+            &message,
+            Message::RepositoryLoaded {
+                result: Ok(_),
+                open_cards: false,
+                ..
+            }
+        ));
+        drop(app.update(message));
+        assert!(app.sidebar_model.project(absent).is_some());
+        assert_eq!(app.durable.project_order, expected);
+        assert!(app.durable.cards.is_empty());
+        assert_eq!(app.active_workspace, None);
+        assert_eq!(app.workspace.focused(), None);
+
+        let mut restored = app.sidebar_model.clone();
+        restored.projects.reverse();
+        restored.apply_project_order(&app.durable.project_order);
+        assert_eq!(
+            restored
+                .projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let before = app.durable.clone();
+        assert!(
+            !app.remember_sidebar_project_order(),
+            "a refresh must not append duplicates"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &app.durable),
+            "unchanged order does not clone the workspace"
+        );
+        let mut session = app.session.take().unwrap();
+        session.shutdown();
+        assert_eq!(session.last_error(), None);
     }
 
     #[test]
