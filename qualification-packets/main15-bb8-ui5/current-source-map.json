@@ -66,7 +66,7 @@
         "name": "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
         "ordinary_source_declaration": true,
         "source": "src/app/chat_ui.rs",
-        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+        "source_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d"
       },
       {
         "actual_caller_runtime": null,
@@ -76,7 +76,7 @@
         "name": "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
         "ordinary_source_declaration": true,
         "source": "src/app/chat_ui.rs",
-        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+        "source_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d"
       },
       {
         "actual_caller_runtime": null,
@@ -86,7 +86,7 @@
         "name": "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
         "ordinary_source_declaration": true,
         "source": "src/app/chat_ui.rs",
-        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+        "source_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d"
       },
       {
         "actual_caller_runtime": null,
@@ -96,7 +96,7 @@
         "name": "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
         "ordinary_source_declaration": true,
         "source": "src/app/chat_ui.rs",
-        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+        "source_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d"
       },
       {
         "actual_caller_runtime": null,
@@ -106,14 +106,14 @@
         "name": "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
         "ordinary_source_declaration": true,
         "source": "src/app/chat_ui.rs",
-        "source_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+        "source_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d"
       }
     ],
     "product": {
-      "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
-      "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
-      "tree": "246ea7398afcf6e10625954296601ca3254428e6",
-      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15"
+      "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+      "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+      "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15"
     }
   },
   "source_paths_sha256": {

@@ -1,6 +1,6 @@
 {
   "after_sha256": "153bc925907ccd722407140f96b93b3d5bec53e11dd1b05ba114417cf799ab38",
-  "before_sha256": "d7bc8f0531dc5381eb145d32e1ac6b053c80862128ee0ded0147d952980d5d26",
+  "before_sha256": "ce31b5d5864098da4df423b100a22dc5c0e3d8441ad8ace35ac41cc97d055915",
   "insert_lines": [
     "WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope')\n",
     "TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')\n",
@@ -1357,12 +1357,12 @@
     "TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')\n",
     "LOCK = TARGET.parent / 'lane-c.lock'\n",
     "TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')\n",
-    "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-ui5-source/qualification-packets/main15-bb8-ui5/plan.json')\n",
+    "PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-ui5-abi-source/qualification-packets/main15-bb8-ui5/plan.json')\n",
     "PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.\n",
     "PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.\n",
     "SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.\n",
     "CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.\n",
-    "PLAN_SHA = '356ae7484226d4f494766970186a6b5187c68d39b5d6756b5746465a581c72f4'\n",
+    "PLAN_SHA = '6e24a3ff2cd4a224bb13aac9a5172487c5faae5f763421b90c4d7790ca5522d7'\n",
     "SCOPE_PARENT = None  # No grouped contract enables the dormant donor staged-scope path.\n",
     "\n",
     "\n",
