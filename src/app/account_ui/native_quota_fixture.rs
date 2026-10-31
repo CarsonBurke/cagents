@@ -16,6 +16,8 @@ const SCENES: &[&str] = &[
     "codex-delayed",
     "claude-ticket",
     "codex-ticket",
+    "claude-startup",
+    "codex-startup",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +26,7 @@ enum Scenario {
     Malformed,
     Delayed,
     Ticket,
+    Startup,
 }
 
 pub(in crate::app) struct Context {
@@ -106,6 +109,7 @@ pub(in crate::app) fn context() -> Result<Option<Context>, String> {
         "malformed" => Scenario::Malformed,
         "delayed" => Scenario::Delayed,
         "ticket" => Scenario::Ticket,
+        "startup" => Scenario::Startup,
         _ => unreachable!(),
     };
     Ok(Some(Context {
@@ -211,6 +215,20 @@ pub(in crate::app) struct Fixture {
     phase: &'static str,
     works: Vec<Work>,
     error: Option<String>,
+    startup: Option<Startup>,
+}
+
+struct StartupAdmission {
+    id: AccountId,
+    owner: u64,
+    trigger: Trigger,
+}
+
+struct Startup {
+    original_accounts: Vec<(AccountId, u64)>,
+    original_revision: u64,
+    trigger: Option<Trigger>,
+    admissions: Vec<StartupAdmission>,
 }
 
 /// Internal in-process gate notification only; no wire, commands or arbitrary
@@ -241,6 +259,9 @@ fn fail(app: &mut Cagents, message: &str) {
 }
 
 pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Message> {
+    if context.scenario == Scenario::Startup {
+        return install_startup(app, context);
+    }
     let system = Account {
         provider: context.provider,
         home: account::AccountHome::SystemAt {
@@ -314,6 +335,7 @@ pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Messa
         phase: "initial-synthetic-old-callback",
         works: Vec::new(),
         error: None,
+        startup: None,
     });
     app.account_ui = state;
     app.active_workspace = Some(
@@ -362,6 +384,12 @@ pub(in crate::app) fn admission_time(
     let Some(f) = app.account_ui.native_fixture.as_mut() else {
         return Some(now);
     };
+    if let Some(startup) = f.startup.as_mut() {
+        // Forward every real old scheduling trigger. There is deliberately no
+        // readiness gate or quota-scene Manual-only filter in this adapter.
+        startup.trigger = Some(trigger);
+        return f.error.is_none().then_some(now);
+    }
     let initial = f.works.is_empty();
     if f.error.is_some()
         || f.next.is_none()
@@ -378,6 +406,320 @@ pub(in crate::app) fn admission_time(
     f.logical_now = time;
     app.account_ui.now_ms = time;
     Some(time)
+}
+
+fn startup_accounts(app: &Cagents) -> Vec<(AccountId, u64)> {
+    app.account_ui
+        .accounts
+        .iter()
+        .map(|row| (row.id.clone(), row.owner))
+        .collect()
+}
+
+fn startup_effects(app: &Cagents) -> serde_json::Value {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    let startup = f.startup.as_ref().unwrap();
+    let rows: Vec<_> = app
+        .account_ui
+        .accounts
+        .iter()
+        .map(|row| {
+            serde_json::json!({"id":row.id,"owner":row.owner,"present":row.present,
+            "in_flight":row.schedule.in_flight(app.account_ui.now_ms),
+            "manual_ready":row.schedule.manual_ready(app.account_ui.now_ms),
+            "queued":format!("{:?}",row.queued),
+            "sign_in_preparing":app.account_ui.preparing_logins.contains(&row.owner),
+            "sign_in_terminal":row.sign_in_terminal.is_some()})
+        })
+        .collect();
+    let admissions: Vec<_> = startup
+        .admissions
+        .iter()
+        .enumerate()
+        .map(|(serial, admission)| {
+            serde_json::json!({"diagnostic_serial":serial,"id":admission.id,"owner":admission.owner,
+            "trigger":format!("{:?}",admission.trigger),"production_ticket_available":false})
+        })
+        .collect();
+    serde_json::json!({"variant":"before","readiness_gate_available":false,"registry_ready":null,
+        "production_ticket_available":false,"production_ticket_status":"production-ticket-unavailable",
+        "serial_namespace":"fixture-diagnostic-only; no production admission identity",
+        "selected_account":f.system.id(),"untouched_account":f.source.id(),
+        "registry_revision":app.account_ui.registry.revision(),
+        "original_registry_revision":startup.original_revision,
+        "account_count":app.account_ui.accounts.len(),"original_account_count":startup.original_accounts.len(),
+        "original_ids_and_owners_conserved":startup_accounts(app)==startup.original_accounts,
+        "rows":rows,"admissions":admissions,
+        "store_present":app.account_ui.store.is_some(),"cache_present":app.account_ui.cache.is_some(),
+        "terminal_cards":app.durable.cards.iter().filter(|card| matches!(&card.kind, CardKind::Terminal(_))).count(),
+        "retry_isolated_eligibility_proof":false,"provider_outcome":null,"qualified":false})
+}
+
+fn startup_receipt(app: &Cagents, event: &str) {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    receipt(
+        serde_json::json!({"event":event,"scene":f.context.scene,"phase":f.phase,"error":f.error,
+        "effects":startup_effects(app),"boundary":"synthetic callbacks and actual OLD reducer scheduling only",
+        "input_origin_requires_native_controller_evidence":true,
+        "operational_tasks_polled":false,"provider_executed":false,"qualified":false}),
+    );
+}
+
+fn install_startup(app: &mut Cagents, context: Context) -> Task<Message> {
+    // Match After's exact synthetic metadata, not the real installed accounts.
+    let mut state = State::default();
+    for provider in Account::PROVIDERS {
+        state.remote_system_homes.insert(
+            provider,
+            context
+                .root
+                .join(format!("synthetic-{}-never-read", provider.executable())),
+        );
+    }
+    state.sync_accounts();
+    let system = state
+        .account(&Account::system(context.provider).id())
+        .unwrap()
+        .account
+        .clone();
+    let other = match context.provider {
+        Provider::Claude => Provider::Codex,
+        Provider::Codex => Provider::Claude,
+        _ => unreachable!("two explicit startup scenes"),
+    };
+    let source = state
+        .account(&Account::system(other).id())
+        .unwrap()
+        .account
+        .clone();
+    let original_accounts = state
+        .accounts
+        .iter()
+        .map(|row| (row.id.clone(), row.owner))
+        .collect();
+    let original_revision = state.registry.revision();
+    let restored = state
+        .accounts
+        .iter()
+        .map(|row| Restored {
+            id: row.id.clone(),
+            present: true,
+            entry: None,
+        })
+        .collect();
+    let now = now_ms();
+    state.native_fixture = Some(Fixture {
+        context,
+        system,
+        source,
+        baseline: now,
+        logical_now: now,
+        next: None,
+        phase: "startup-before-installed",
+        works: Vec::new(),
+        error: None,
+        startup: Some(Startup {
+            original_accounts,
+            original_revision,
+            trigger: None,
+            admissions: Vec::new(),
+        }),
+    });
+    app.account_ui = state;
+    app.active_workspace = Some(
+        app.account_ui
+            .native_fixture
+            .as_ref()
+            .unwrap()
+            .context
+            .root
+            .join("public-project"),
+    );
+    app.refresh_ui.focused = false;
+    app.settings.show_status_bar = false;
+    app.context_inspector_open = false;
+    drop(app.update_account_ui(Action::Loaded(Loaded {
+        registry: Err("INERT startup registry unavailable".into()),
+        restored,
+        catalogs: BTreeMap::new(),
+        installed: Account::PROVIDERS.into_iter().map(|p| (p, true)).collect(),
+        provisional: false,
+    })));
+    if let Some(notice) = app.status.take() {
+        app.notices.record(notice);
+    }
+    app.notices.record(TransientNotice::warning("INERT startup policy · synthetic metadata · F8 stages failed read/retry · no provider or sign-in execution"));
+    let open = app.open_utility_card(CardKind::Accounts);
+    app.refresh_sidebar_channels();
+    app.synchronize_sidebar_selection();
+    let sidebar = sidebar::effective_width(app.projects_sidebar_mode(), app.settings.sidebar_width);
+    let _ = app
+        .workspace
+        .resize_viewport((app.content_width() - sidebar).max(0.0));
+    startup_receipt(app, "startup_before_installed");
+    let theme = app.settings.app_theme.resolve(app.core.system_theme());
+    Task::batch([open, app.sync_chrome(), cosmic::command::set_theme(theme)])
+}
+
+fn start_startup(app: &mut Cagents, account: Account, id: AccountId, owner: u64) -> Task<Message> {
+    let current = app.account_ui.account(&id).is_some_and(|row| {
+        row.account == account
+            && row.owner == owner
+            && row.schedule.in_flight(app.account_ui.now_ms)
+    });
+    let f = app.account_ui.native_fixture.as_mut().unwrap();
+    let startup = f.startup.as_mut().unwrap();
+    let Some(trigger) = startup.trigger.take() else {
+        fail(
+            app,
+            "Before startup admission lacks its actual old scheduling trigger",
+        );
+        return Task::none();
+    };
+    if !current
+        || startup.admissions.len() >= 8
+        || !startup
+            .original_accounts
+            .iter()
+            .any(|(row, original_owner)| *row == id && *original_owner == owner)
+    {
+        fail(
+            app,
+            "Before startup admission escaped the bounded original rows",
+        );
+        return Task::none();
+    }
+    // These are diagnostic list positions, not fabricated production tickets.
+    startup
+        .admissions
+        .push(StartupAdmission { id, owner, trigger });
+    startup_receipt(app, "startup_before_actual_old_schedule_admission");
+    // Do not construct or poll the old callback adapter, provider or collector.
+    Task::none()
+}
+
+fn startup_action(app: &mut Cagents, action: Action) -> Task<Message> {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    if f.error.is_some() {
+        return Task::none();
+    }
+    let event = match &action {
+        Action::Refresh(id) | Action::SignIn(id) | Action::SignInWithCode(id) => {
+            if *id != f.system.id() {
+                fail(
+                    app,
+                    "Before startup native action targeted the wrong original row",
+                );
+                return Task::none();
+            }
+            match &action {
+                Action::Refresh(_) => "startup_before_refresh_callback_if_actually_delivered",
+                Action::SignIn(_) => "startup_before_signin_preparation_callback",
+                _ => "startup_before_signin_with_code_preparation_callback",
+            }
+        }
+        Action::Tick | Action::Popover(_) => "startup_before_scheduling_callback",
+        _ => unreachable!("finite old startup callbacks only"),
+    };
+    // Preserve the exact native callback variant. A disabled Check now has no
+    // callback; never synthesize a successful Refresh or LoginReady instead.
+    drop(app.update_account_ui(action));
+    startup_receipt(app, event);
+    Task::none()
+}
+
+fn advance_startup(app: &mut Cagents) {
+    let f = app.account_ui.native_fixture.as_ref().unwrap();
+    if f.error.is_some() {
+        return;
+    }
+    match f.phase {
+        "startup-before-installed" => {
+            if !app.refresh_ui.focused {
+                fail(app, "Before startup needs actual native window focus first");
+                return;
+            }
+            let id = f.system.id();
+            drop(app.update_account_ui(Action::RegistryLoaded(Err(
+                "INERT registry retry unavailable".into(),
+            ))));
+            drop(app.accounts_focus_changed(true, true));
+            drop(app.update_account_ui(Action::Tick));
+            drop(app.update_account_ui(Action::Popover(Some(id))));
+            drop(app.update_account_ui(Action::Popover(None)));
+            let f = app.account_ui.native_fixture.as_ref().unwrap();
+            let startup = f.startup.as_ref().unwrap();
+            let observed = startup_accounts(app) == startup.original_accounts
+                && startup.admissions.len() == startup.original_accounts.len()
+                && startup
+                    .admissions
+                    .iter()
+                    .all(|admission| admission.trigger == Trigger::Focus)
+                && startup.original_accounts.iter().all(|(id, owner)| {
+                    startup
+                        .admissions
+                        .iter()
+                        .filter(|admission| admission.id == *id && admission.owner == *owner)
+                        .count()
+                        == 1
+                })
+                && app.account_ui.accounts.iter().all(|row| {
+                    row.schedule.in_flight(app.account_ui.now_ms)
+                        && !row.schedule.manual_ready(app.account_ui.now_ms)
+                });
+            if observed {
+                app.account_ui.native_fixture.as_mut().unwrap().phase =
+                    "startup-before-existing-inflight";
+            } else {
+                fail(
+                    app,
+                    "Before startup no longer matches bounded automatic in-flight consequence",
+                );
+            }
+            startup_receipt(
+                app,
+                "startup_before_failed_read_existing_inflight_check_disabled",
+            );
+        }
+        "startup-before-existing-inflight" => {
+            let count = app.account_ui.accounts.len();
+            let admissions = f.startup.as_ref().unwrap().admissions.len();
+            let revision = app
+                .account_ui
+                .registry
+                .revision()
+                .checked_add(1)
+                .expect("finite fixture revision");
+            let mut value =
+                serde_json::to_value(&app.account_ui.registry).expect("typed old fixture registry");
+            value["revision"] = serde_json::json!(revision);
+            let registry: Registry =
+                serde_json::from_value(value).expect("same old policy, later revision");
+            drop(app.update_account_ui(Action::RegistryLoaded(Ok(registry))));
+            let f = app.account_ui.native_fixture.as_ref().unwrap();
+            let startup = f.startup.as_ref().unwrap();
+            if app.account_ui.accounts.len() == count
+                && startup_accounts(app) == startup.original_accounts
+                && app.account_ui.registry.revision() == revision
+                && startup.admissions.len() == admissions
+            {
+                app.account_ui.native_fixture.as_mut().unwrap().phase =
+                    "startup-before-complete-existing-inflight";
+            } else {
+                fail(
+                    app,
+                    "Before same-count callback changed the bounded old row/admission facts",
+                );
+            }
+            // Both rows were already in flight. This cannot independently
+            // prove or refute eligibility-release behavior after a retry.
+            startup_receipt(
+                app,
+                "startup_before_same_count_retry_existing_inflight_not_isolated_release_proof",
+            );
+        }
+        _ => startup_receipt(app, "startup_before_step_refused"),
+    }
 }
 
 enum Frames {
@@ -516,6 +858,14 @@ pub(in crate::app) fn start(
     id: AccountId,
     owner: u64,
 ) -> Task<Message> {
+    if app
+        .account_ui
+        .native_fixture
+        .as_ref()
+        .is_some_and(|f| f.startup.is_some())
+    {
+        return start_startup(app, account, id, owner);
+    }
     let f = app.account_ui.native_fixture.as_mut().unwrap();
     if account != f.system || f.works.len() >= 3 {
         fail(
@@ -682,6 +1032,15 @@ fn release(app: &mut Cagents, kind: Kind) {
 }
 
 fn advance(app: &mut Cagents) {
+    if app
+        .account_ui
+        .native_fixture
+        .as_ref()
+        .is_some_and(|f| f.startup.is_some())
+    {
+        advance_startup(app);
+        return;
+    }
     let f = app.account_ui.native_fixture.as_ref().unwrap();
     if f.error.is_some() {
         return;
@@ -832,6 +1191,7 @@ fn completed(app: &mut Cagents, serial: usize, outcome: &Outcome, before: &serde
                 Scenario::Sparse | Scenario::Malformed => Kind::Sparse,
                 Scenario::Delayed => Kind::Delayed,
                 Scenario::Ticket => Kind::OldA,
+                Scenario::Startup => unreachable!("startup constructs no completion adapter"),
             });
         }
         Kind::Sparse => {
@@ -859,12 +1219,34 @@ pub(in crate::app) fn update(app: &mut Cagents, message: Message) -> Task<Messag
         Message::UtilityPaneUi(message) => *message,
         message => message,
     };
+    let startup = app
+        .account_ui
+        .native_fixture
+        .as_ref()
+        .is_some_and(|f| f.startup.is_some());
     if let Message::AccountUi(Action::Refresh(id)) = &message {
         receipt(serde_json::json!({"event":"refresh_callback","id":id,
             "phase":app.account_ui.native_fixture.as_ref().unwrap().phase,
             "input_origin_requires_native_controller_evidence":true}));
     }
     let task = match message {
+        Message::AccountUi(
+            action @ (Action::Refresh(_)
+            | Action::SignIn(_)
+            | Action::SignInWithCode(_)
+            | Action::Popover(_)
+            | Action::Tick),
+        ) if startup => startup_action(app, action),
+        Message::AccountUi(Action::Probed { .. } | Action::LoginReady { .. })
+        | Message::AccountNativeFixture(_)
+            if startup =>
+        {
+            fail(
+                app,
+                "Before startup constructs no provider/login/completion outcome",
+            );
+            Task::none()
+        }
         Message::AccountNativeFixture(Event::InputHeld(serial)) => {
             let f = app.account_ui.native_fixture.as_mut().unwrap();
             if let Some(work) = f.works.get_mut(serial) {
@@ -1006,7 +1388,12 @@ pub(in crate::app) fn update(app: &mut Cagents, message: Message) -> Task<Messag
         Message::RefreshUi(refresh_ui::Action::Focused(window, focused))
             if app.core.main_window_id() == Some(window) =>
         {
+            let regained = focused && !app.refresh_ui.focused;
             app.refresh_ui.focused = focused;
+            if startup {
+                drop(app.accounts_focus_changed(focused, regained));
+                startup_receipt(app, "startup_before_window_focus");
+            }
             Task::none()
         }
         Message::WindowCloseRequested(window) if app.core.main_window_id() == Some(window) => {
