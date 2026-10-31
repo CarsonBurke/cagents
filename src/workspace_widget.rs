@@ -1362,6 +1362,52 @@ struct VirtualCard<'a, Message> {
 }
 
 impl<Message> VirtualCard<'_, Message> {
+    fn a11y_nodes(
+        &self,
+        state: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) -> iced_accessibility::A11yTree {
+        // Accessibility traversal has no renderer translation. Its caller has
+        // already put this layout in screen space and consumed that offset.
+        // Retained/overscan and travelling destination panes remain mounted,
+        // but their bodies are not exposed before they actually enter view.
+        let slot = Rectangle {
+            width: self.width,
+            ..layout.bounds()
+        };
+        let Some(clip) = slot
+            .intersection(viewport)
+            .filter(|clip| clip.width > 0.0 && clip.height > 0.0)
+        else {
+            return iced_accessibility::A11yTree::default();
+        };
+        let mut accessible = self.content.as_widget().a11y_nodes(layout, state, cursor);
+        for roots in [true, false] {
+            let nodes = if roots {
+                accessible.root_mut()
+            } else {
+                accessible.children_mut()
+            };
+            for accessible_node in nodes {
+                let node = accessible_node.node_mut();
+                if let Some(bounds) = node.bounds() {
+                    let x0 = bounds.x0.max(f64::from(clip.x));
+                    let y0 = bounds.y0.max(f64::from(clip.y));
+                    let x1 = bounds.x1.min(f64::from(clip.x + clip.width));
+                    let y1 = bounds.y1.min(f64::from(clip.y + clip.height));
+                    if x1 <= x0 || y1 <= y0 {
+                        node.set_hidden();
+                    } else {
+                        node.set_bounds(iced_accessibility::accesskit::Rect::new(x0, y0, x1, y1));
+                    }
+                }
+            }
+        }
+        accessible
+    }
+
     /// The part of `viewport` this card may draw in and take pointer input
     /// from. An opening card is laid out wider than its slot, and what lies
     /// past the slot's edge belongs to its neighbour.
@@ -1390,6 +1436,7 @@ impl<Message> VirtualCard<'_, Message> {
 
 struct VirtualStrip<'a, Message> {
     total_width: f32,
+    viewport_width: f32,
     retained: Arc<HashMap<CardId, usize>>,
     focused: Option<CardId>,
     cards: Vec<VirtualCard<'a, Message>>,
@@ -1408,9 +1455,17 @@ impl<'a, Message> VirtualStrip<'a, Message> {
         );
         Self {
             total_width: projection.total_width,
+            viewport_width: projection.viewport_width,
             retained,
             focused,
             cards,
+        }
+    }
+
+    fn a11y_viewport(&self, layout: Layout<'_>) -> Rectangle {
+        Rectangle {
+            width: self.viewport_width.min(layout.bounds().width).max(0.0),
+            ..layout.bounds()
         }
     }
 }
@@ -1598,12 +1653,36 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let a11y_viewport = self.a11y_viewport(layout);
         for ((card, state), child_layout) in self
             .cards
             .iter_mut()
             .zip(&mut tree.children)
             .zip(layout.children())
         {
+            let a11y_target_visible = if let Event::A11y(target, _) = event {
+                let accessible = card.a11y_nodes(
+                    state,
+                    child_layout
+                        .translated(-layout.virtual_offset())
+                        .with_virtual_offset(Vector::ZERO),
+                    mouse::Cursor::Unavailable,
+                    &a11y_viewport,
+                );
+                let target = iced_accessibility::A11yId::from(target.clone());
+                Some(
+                    accessible
+                        .root()
+                        .iter()
+                        .chain(accessible.children())
+                        .any(|node| {
+                            iced_accessibility::IdEq::eq(node.id(), &target)
+                                && !node.node().is_hidden()
+                        }),
+                )
+            } else {
+                None
+            };
             let viewport = &card.viewport(child_layout.bounds(), viewport);
             let cursor = card.cursor(viewport, cursor);
             // A pane the camera is travelling to already holds the keyboard
@@ -1611,7 +1690,7 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
             // had arrived: keys typed during the journey reach it, and it
             // sizes itself before it is seen. Panes merely parked in the
             // overscan still get pointer events alone.
-            if card.on_screen
+            let normally_delivered = card.on_screen
                 || child_layout.bounds().intersects(viewport)
                 || matches!(
                     event,
@@ -1621,8 +1700,8 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
                             | mouse::Event::ButtonPressed(_)
                             | mouse::Event::ButtonReleased(_)
                     )
-                )
-            {
+                );
+            if a11y_target_visible.unwrap_or(normally_delivered) {
                 card.content.as_widget_mut().update(
                     state,
                     event,
@@ -1741,16 +1820,20 @@ impl<Message> Widget<Message, Theme, Renderer> for VirtualStrip<'_, Message> {
         state: &Tree,
         cursor: mouse::Cursor,
     ) -> iced_accessibility::A11yTree {
+        let viewport = self.a11y_viewport(layout);
         iced_accessibility::A11yTree::join(
             self.cards
                 .iter()
                 .zip(&state.children)
                 .zip(layout.children())
                 .map(|((card, child_state), child_layout)| {
-                    card.content.as_widget().a11y_nodes(
-                        child_layout.with_virtual_offset(layout.virtual_offset()),
+                    card.a11y_nodes(
                         child_state,
+                        child_layout
+                            .translated(-layout.virtual_offset())
+                            .with_virtual_offset(Vector::ZERO),
                         cursor,
+                        &viewport,
                     )
                 }),
         )
@@ -2622,6 +2705,7 @@ mod tests {
                 .on_action(|_| ());
             VirtualStrip {
                 total_width: 320.0,
+                viewport_width: 320.0,
                 retained: retained.clone(),
                 focused: Some(ids[0]),
                 cards: vec![VirtualCard {
@@ -2701,6 +2785,7 @@ mod tests {
         let make = |indices: &[usize], focused: usize| -> Element<'_, ()> {
             VirtualStrip {
                 total_width: 640.0,
+                viewport_width: 640.0,
                 retained: retained.clone(),
                 focused: Some(ids[focused]),
                 cards: indices
@@ -4026,6 +4111,7 @@ mod tests {
         let retained = Arc::new(HashMap::from([(first, 0), (second, 1)]));
         let make_strip = |retained, id, node| VirtualStrip {
             total_width: 200.0,
+            viewport_width: 200.0,
             retained,
             focused: Some(id),
             cards: vec![VirtualCard {
@@ -4088,6 +4174,7 @@ mod tests {
         let cards = [CardId::new(), CardId::new()];
         let strip = VirtualStrip {
             total_width: 200.0,
+            viewport_width: 200.0,
             focused: Some(cards[0]),
             retained: Arc::new(
                 cards
@@ -4107,7 +4194,7 @@ mod tests {
                     on_screen: true,
                     content: CardSurface::new(Element::new(AccessibleProbe {
                         node: index as u64 + 1,
-                        expected_virtual_offset: Vector::new(32.0, 0.0),
+                        expected_virtual_offset: Vector::ZERO,
                     }))
                     .into(),
                 })
@@ -4192,7 +4279,7 @@ mod tests {
     }
 
     #[test]
-    fn composed_workspace_view_exposes_every_mounted_card_to_a_screen_reader() {
+    fn composed_workspace_view_exposes_only_visible_card_bodies_to_a_screen_reader() {
         use cosmic::iced::advanced::renderer::Headless;
         use iced_accessibility::A11yId;
 
@@ -4267,10 +4354,18 @@ mod tests {
             !accessible.root().is_empty(),
             "the workspace must reach a screen reader through every wrapper the view builds"
         );
+        let visible = |id: CardId| {
+            projection.mounted.iter().any(|card| {
+                card.id == id
+                    && card.start - projection.offset < VIEWPORT_WIDTH
+                    && card.end() - projection.offset > 0.0
+            })
+        };
         for id in &mounted {
-            assert!(
+            assert_eq!(
                 accessible.contains(&A11yId::from(probe_id(*id))),
-                "mounted card {id} is missing from the accessibility tree"
+                visible(*id),
+                "only the visible body of mounted card {id} belongs in the accessibility tree"
             );
         }
         assert_eq!(
@@ -4278,9 +4373,374 @@ mod tests {
                 .iter()
                 .filter(|id| accessible.contains(&A11yId::from(probe_id(**id))))
                 .count(),
-            mounted.len(),
-            "the accessibility tree must expose the mounted cards and nothing else"
+            mounted.iter().filter(|id| visible(**id)).count(),
+            "retaining a body must not make it visible to a screen reader"
         );
+    }
+
+    struct A11yWorkspaceFixture {
+        element: Element<'static, u8>,
+        tree: Tree,
+        node: layout::Node,
+        renderer: Renderer,
+        scroll_id: widget::Id,
+        buttons: Vec<widget::Id>,
+        late_buttons: Vec<widget::Id>,
+        editors: Vec<widget::Id>,
+    }
+
+    impl A11yWorkspaceFixture {
+        fn new(slots: &[(f32, f32, f32)], total_width: f32) -> Self {
+            let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+            let ids: Vec<_> = slots.iter().map(|_| CardId::new()).collect();
+            let buttons: Vec<_> = slots.iter().map(|_| widget::Id::unique()).collect();
+            let late_buttons: Vec<_> = slots.iter().map(|_| widget::Id::unique()).collect();
+            let editors: Vec<_> = slots.iter().map(|_| widget::Id::unique()).collect();
+            let cards = slots
+                .iter()
+                .enumerate()
+                .map(|(index, &(x, width, content_width))| {
+                    let content = widget::Column::new()
+                        .push(
+                            widget::Row::new()
+                                .push(
+                                    cosmic::widget::button::text("Accounts")
+                                        .name(format!("action-{index}"))
+                                        .id(buttons[index].clone())
+                                        .width(100.0)
+                                        .on_press(index as u8),
+                                )
+                                .push(widget::Space::with_width(100.0))
+                                .push(
+                                    cosmic::widget::button::text("Add account")
+                                        .name(format!("late-action-{index}"))
+                                        .id(late_buttons[index].clone())
+                                        .width(100.0)
+                                        .on_press(10 + index as u8),
+                                ),
+                        )
+                        .push(
+                            cosmic::widget::text(format!("native-body-{index}"))
+                                .width(Length::Fill),
+                        )
+                        .push(
+                            crate::ui_controls::editable::TextInput::new(
+                                format!("draft-{index}"),
+                                format!("retained-{index}"),
+                            )
+                            .id(editors[index].clone())
+                            .on_input(move |_| 20 + index as u8),
+                        )
+                        .width(Length::Fill);
+                    VirtualCard {
+                        id: ids[index],
+                        x,
+                        width,
+                        content_width,
+                        // Include a travelling focus destination, not merely
+                        // the projection's current geometric visible band.
+                        on_screen: true,
+                        content: CardSurface::new(content.into()).into(),
+                    }
+                })
+                .collect();
+            let strip = VirtualStrip {
+                total_width,
+                viewport_width: 320.0,
+                retained: Arc::new(ids.iter().enumerate().map(|(i, id)| (*id, i)).collect()),
+                focused: ids.last().copied(),
+                cards,
+            };
+            let scroll_id = widget::Id::unique();
+            let mut element: Element<'static, u8> = widget::scrollable(strip)
+                .direction(widget::scrollable::Direction::Horizontal(
+                    widget::scrollable::Scrollbar::hidden(),
+                ))
+                .id(scroll_id.clone())
+                .width(320.0)
+                .height(180.0)
+                .into();
+            let mut tree = Tree::new(&element);
+            let node = element
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(320.0, 180.0)),
+                )
+                .move_to(Point::new(260.0, 44.0));
+            Self {
+                element,
+                tree,
+                node,
+                renderer,
+                scroll_id,
+                buttons,
+                late_buttons,
+                editors,
+            }
+        }
+
+        fn scroll(&mut self, x: f32) {
+            use cosmic::iced::advanced::widget::operation;
+            self.element.as_widget_mut().operate(
+                &mut self.tree,
+                Layout::new(&self.node),
+                &self.renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    self.scroll_id.clone(),
+                    operation::scrollable::AbsoluteOffset {
+                        x: Some(x),
+                        y: None,
+                    },
+                ),
+            );
+        }
+
+        fn accessible(&self) -> iced_accessibility::A11yTree {
+            self.element.as_widget().a11y_nodes(
+                Layout::new(&self.node),
+                &self.tree,
+                mouse::Cursor::Unavailable,
+            )
+        }
+
+        fn dispatch(
+            &mut self,
+            id: widget::Id,
+            action: iced_accessibility::accesskit::Action,
+        ) -> Vec<u8> {
+            use iced_accessibility::{
+                A11yId,
+                accesskit::{ActionRequest, TreeId},
+            };
+            let mut messages = Vec::new();
+            self.element.as_widget_mut().update(
+                &mut self.tree,
+                &Event::A11y(
+                    id.clone(),
+                    ActionRequest {
+                        action,
+                        target_tree: TreeId::ROOT,
+                        target_node: A11yId::from(id).into(),
+                        data: None,
+                    },
+                ),
+                Layout::new(&self.node),
+                mouse::Cursor::Unavailable,
+                &self.renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &self.node.bounds(),
+            );
+            messages
+        }
+    }
+
+    fn a11y_node<'a>(
+        tree: &'a iced_accessibility::A11yTree,
+        id: &widget::Id,
+    ) -> Option<&'a iced_accessibility::A11yNode> {
+        let id = iced_accessibility::A11yId::from(id.clone());
+        tree.root()
+            .iter()
+            .chain(tree.children())
+            .find(|node| iced_accessibility::IdEq::eq(node.id(), &id))
+    }
+
+    #[test]
+    fn workspace_a11y_camera_moves_real_button_text_and_editable_bounds_once() {
+        let mut fixture = A11yWorkspaceFixture::new(
+            &[
+                (0.0, 320.0, 320.0),
+                (479.0, 320.0, 320.0),
+                (1437.0, 320.0, 320.0),
+            ],
+            2000.0,
+        );
+        for (index, camera) in [(1, 479.0), (2, 1437.0)] {
+            fixture.scroll(camera);
+            let tree = fixture.accessible();
+            for id in [&fixture.buttons[index], &fixture.editors[index]] {
+                let node = a11y_node(&tree, id).unwrap().node();
+                assert!(!node.is_hidden());
+                assert_eq!(node.bounds().unwrap().x0, 260.0);
+            }
+            let label = format!("native-body-{index}");
+            let native_text = tree
+                .root()
+                .iter()
+                .chain(tree.children())
+                .find(|node| node.node().label() == Some(label.as_str()))
+                .unwrap()
+                .node();
+            assert_eq!(native_text.bounds().unwrap().x0, 260.0);
+            assert!(!native_text.is_hidden());
+        }
+    }
+
+    #[test]
+    fn workspace_a11y_culls_travelling_bodies_and_preserves_focus_on_return() {
+        use cosmic::iced::advanced::widget::operation;
+        use iced_accessibility::accesskit::Action;
+        let mut fixture = A11yWorkspaceFixture::new(
+            &[
+                (0.0, 320.0, 320.0),
+                (479.0, 320.0, 320.0),
+                (1437.0, 320.0, 320.0),
+            ],
+            2000.0,
+        );
+        fixture.scroll(479.0);
+        let before = fixture.accessible();
+        assert!(a11y_node(&before, &fixture.buttons[0]).is_none());
+        assert!(a11y_node(&before, &fixture.buttons[2]).is_none());
+        let original_editor = a11y_node(&before, &fixture.editors[1])
+            .unwrap()
+            .id()
+            .clone();
+        fixture.element.as_widget_mut().operate(
+            &mut fixture.tree,
+            Layout::new(&fixture.node),
+            &fixture.renderer,
+            &mut operation::focusable::focus::<()>(fixture.editors[1].clone()),
+        );
+        fixture.scroll(1437.0);
+        assert!(a11y_node(&fixture.accessible(), &fixture.editors[1]).is_none());
+        assert!(
+            fixture
+                .dispatch(fixture.buttons[1].clone(), Action::Click)
+                .is_empty()
+        );
+        assert_eq!(
+            fixture.dispatch(fixture.buttons[2].clone(), Action::Click),
+            [2]
+        );
+        fixture.scroll(479.0);
+        let returned = fixture.accessible();
+        let editor = a11y_node(&returned, &fixture.editors[1]).unwrap();
+        assert!(iced_accessibility::IdEq::eq(editor.id(), &original_editor));
+        assert_eq!(editor.node().value(), Some("retained-1"));
+        let mut focused = FocusedWidgets::default();
+        fixture.element.as_widget_mut().operate(
+            &mut fixture.tree,
+            Layout::new(&fixture.node),
+            &fixture.renderer,
+            &mut focused,
+        );
+        assert_eq!(focused.0, [fixture.editors[1].clone()]);
+    }
+
+    #[test]
+    fn workspace_a11y_opening_slot_clips_controls_and_rejects_stale_actions() {
+        use iced_accessibility::accesskit::Action;
+        let mut fixture =
+            A11yWorkspaceFixture::new(&[(0.0, 120.0, 320.0), (120.0, 320.0, 320.0)], 600.0);
+        fixture.scroll(80.0);
+        let tree = fixture.accessible();
+        let partial = a11y_node(&tree, &fixture.buttons[0]).unwrap().node();
+        assert!(!partial.is_hidden());
+        let bounds = partial.bounds().unwrap();
+        assert_eq!((bounds.x0, bounds.x1), (260.0, 280.0));
+        assert!(
+            a11y_node(&tree, &fixture.late_buttons[0])
+                .unwrap()
+                .node()
+                .is_hidden()
+        );
+        let editor = a11y_node(&tree, &fixture.editors[0])
+            .unwrap()
+            .node()
+            .bounds()
+            .unwrap();
+        assert_eq!((editor.x0, editor.x1), (260.0, 300.0));
+        assert!(
+            fixture
+                .dispatch(fixture.late_buttons[0].clone(), Action::Click)
+                .is_empty()
+        );
+        assert_eq!(
+            fixture.dispatch(fixture.buttons[0].clone(), Action::Click),
+            [0]
+        );
+        assert_eq!(
+            fixture.dispatch(fixture.buttons[1].clone(), Action::Click),
+            [1]
+        );
+    }
+
+    #[test]
+    fn workspace_a11y_outer_camera_preserves_nested_editable_scroll_translation() {
+        use cosmic::iced::advanced::widget::operation;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let editor = widget::Id::unique();
+        let inner_id = widget::Id::unique();
+        let outer_id = widget::Id::unique();
+        let card_id = CardId::new();
+        let inner = widget::scrollable(
+            widget::Column::new()
+                .push(widget::Space::with_height(80.0))
+                .push(
+                    crate::ui_controls::editable::TextInput::new("nested draft", "kept")
+                        .id(editor.clone())
+                        .on_input(|_| 1_u8),
+                )
+                .push(widget::Space::with_height(400.0)),
+        )
+        .id(inner_id.clone())
+        .width(Length::Fill)
+        .height(Length::Fill);
+        let strip = VirtualStrip {
+            total_width: 1000.0,
+            viewport_width: 320.0,
+            retained: Arc::new(HashMap::from([(card_id, 0)])),
+            focused: Some(card_id),
+            cards: vec![VirtualCard {
+                id: card_id,
+                x: 479.0,
+                width: 320.0,
+                content_width: 320.0,
+                on_screen: true,
+                content: CardSurface::new(inner.into()).into(),
+            }],
+        };
+        let mut element: Element<'_, u8> = widget::scrollable(strip)
+            .direction(widget::scrollable::Direction::Horizontal(
+                widget::scrollable::Scrollbar::hidden(),
+            ))
+            .id(outer_id.clone())
+            .width(320.0)
+            .height(180.0)
+            .into();
+        let mut tree = Tree::new(&element);
+        let node = element
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(320.0, 180.0)),
+            )
+            .move_to(Point::new(260.0, 44.0));
+        for (id, x, y) in [(outer_id, Some(479.0), None), (inner_id, None, Some(40.0))] {
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut operation::scrollable::scroll_to::<()>(
+                    id,
+                    operation::scrollable::AbsoluteOffset { x, y },
+                ),
+            );
+        }
+        let accessible =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let field = a11y_node(&accessible, &editor).unwrap().node();
+        assert!(!field.is_hidden());
+        let bounds = field.bounds().unwrap();
+        assert_eq!((bounds.x0, bounds.y0), (260.0, 84.0));
+        assert_eq!(field.value(), Some("kept"));
     }
 
     #[test]
