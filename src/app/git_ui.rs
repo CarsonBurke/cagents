@@ -295,10 +295,8 @@ impl Cagents {
                 self.refresh_ui.projects.remove(&project);
                 let (availability, archived) = result
                     .unwrap_or_else(|detail| (GitHubAvailability::Failed { detail }, Vec::new()));
-                self.refresh_ui.finished(
-                    project,
-                    !matches!(availability, GitHubAvailability::Failed { .. }),
-                );
+                self.refresh_ui
+                    .finished(project, availability.refresh_succeeded());
                 if matches!(availability, GitHubAvailability::Ready { .. })
                     && let Some(entry) = self.refresh_ui.git.entries.get_mut(&project)
                 {
@@ -681,7 +679,16 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = ()> + Sen
 }
 
 impl Cagents {
+    pub(super) fn github_project_polling_ready(&self, project: ProjectId) -> bool {
+        self.review_repositories
+            .get(&project)
+            .is_none_or(|repository| crate::github::polling::ready(&repository.host, false))
+    }
+
     pub(super) fn github_read_task(&mut self, project: ProjectId) -> Task<Message> {
+        if !self.github_project_polling_ready(project) {
+            return Task::none();
+        }
         let Some(entry) = self.refresh_ui.git.entries.get_mut(&project) else {
             // Initial loads and explicit retries still discover the project;
             // subsequent remote ticks need no local census.
