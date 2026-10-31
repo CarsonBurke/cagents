@@ -4,7 +4,7 @@
     "head": "993cea26a29b5a2cd6857a959628de4e5f04c096",
     "runner_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25"
   },
-  "runner_sha256": "86dfd54444633796a4888d3e57e1168dedf2ea49ba25ab0c50e392fab23c0929",
+  "runner_sha256": "975423ef69ae9a1cbff786a49df6bb08ac140f1db65e648967527e70ea98bf12",
   "changed_functions": [
     "grouped_contracts",
     "parent_accounting",
@@ -60,8 +60,8 @@
   "whole_module_inverse_only_three_task_functions_and_WT_PLAN_PLAN_SHA": true,
   "bounded_line_forward_inverse_reconstruction_exact": true,
   "diff_envelopes": {
-    "from-993-forward.diff.json": "a6885b4bf8277b949c7a90d7a284055dab153150185dedad3a489ef266d30a22",
-    "to-993-true-inverse.diff.json": "d330f36c90b439856caf276b66a97f4f97e8445f6f237f593310cdac599ed8bf"
+    "from-993-forward.diff.json": "264b6dec3ece789ebc68aa43fdfb91575cd38158d5f33e37f79baf52bcc45d0d",
+    "to-993-true-inverse.diff.json": "936eb8d601384216ba3ebd7fe75c7f3d7a71385f8fa71d8a447108e7710d2d9a"
   },
   "product_git_entries_before_packet": 2223,
   "product_git_tree_manifest_sha256": "f787c823258c502701f0f30631385e159400d192592b06593ac1a762c471fc67",
@@ -86,5 +86,25 @@
   "grant": null,
   "candidate_calls_imports_examples_algorithms_tests": "UNRUN",
   "execution_authorized": false,
-  "source_change_limits": "Task globals, group/count metadata, main typed genuine product-proof reader/source/data/admission and summary scope only. No generic core/parser/lifecycle/helper/environment policy change."
+  "source_change_limits": "Task globals, group/count metadata, main typed genuine product-proof reader/source/data/admission and summary scope only. No generic core/parser/lifecycle/helper/environment policy change.",
+  "immediate_status_successor": {
+    "predecessor_head": "5278f4c5611e678bcfe7d3674cddabbe21bb7f62",
+    "predecessor_runner_sha256": "86dfd54444633796a4888d3e57e1168dedf2ea49ba25ab0c50e392fab23c0929",
+    "changed_function_only": "main",
+    "other31_top_level_definitions_exact": true,
+    "all_five_nested_exact": true,
+    "inverse_restores_exact_predecessor_runner": true,
+    "only_semantic_literal": "BLOCKED pending separately pinned fixture-only successor",
+    "genuine_blocked_verdict_preserved": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED",
+    "negative_review": {
+      "path": "/var/tmp/coord16-pr1549-c28-host3-code-negative-final-4ufxi6h5/review.json",
+      "sha256": "8f8927f72338a448c610f8985f34fce4d067c99ef8c564d52e075f532a31de98"
+    },
+    "all_dependency_and_product_snapshots_exact_predecessor": 63,
+    "forward_inverse": {
+      "status-forward.diff.json": "97d429f6789d4ad226b2384ae36cbbfcc33e06339ff4b8e0e84a7236a7eda4fd",
+      "status-true-inverse.diff.json": "8bab4beee9c1a3e9491ef6bd86ab4006b32da94c0a49c0eab268efd757ef7c09"
+    },
+    "no_runtime": true
+  }
 }

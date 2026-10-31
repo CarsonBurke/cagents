@@ -82,200 +82,200 @@
     "published_source_branch": "fix/fw16-pr1549-search-current-main"
   },
   "product_adoption": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/product-adoption.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/product-adoption.json",
     "sha256": "36686d074bef22212398582de92ed3aab456713d5f1584e4c90179e0ac547a2a",
     "bytes": 3792,
     "original_path": "/tmp/fw16-backend-ec204421/pr1549-c28-current-main-root-source-adoption-v1.json"
   },
   "product_freeze": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-current-main-search-source-freeze-v3.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-current-main-search-source-freeze-v3.json",
     "sha256": "9c4361dead8b82c4f07aa076265fadbb800880814a5ba10bb3b97d50c10044b7",
     "bytes": 7046,
     "original_path": "/tmp/fw16-backend-ec204421/pr1549-current-main-search-source-freeze-v3.json"
   },
   "product_correctness": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-c28e76c7-drop-state-fixture-correction-independent-source-review-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-c28e76c7-drop-state-fixture-correction-independent-source-review-v1.json",
     "sha256": "30a8b6cd3d357d5812f62b5f0a40e1200c423a85b9a3bd23609eafe4d3d73edf",
     "bytes": 7745,
     "original_path": "/tmp/pr1549-c28e76c7-drop-state-fixture-correction-independent-source-review-v1.json"
   },
   "product_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-c28e76c7-two-fixture-correction-independent-conservation-review-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-c28e76c7-two-fixture-correction-independent-conservation-review-v1.json",
     "sha256": "283ea3f460f4ff0ec7c07692c2e63339f9c8e90ba66b6717950c8c8f1e8c0202",
     "bytes": 7790,
     "original_path": "/tmp/pr1549-c28e76c7-two-fixture-correction-independent-conservation-review-v1.json"
   },
   "product_ux_source": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-current-main-c28-independent-ux-source-evidence-refresh-1335-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-current-main-c28-independent-ux-source-evidence-refresh-1335-v1.json",
     "sha256": "9ef393cd5fff6ae7824fbf84f3f283ec756d83e98a5c998f85f4edd4bfa45bd9",
     "bytes": 17609,
     "original_path": "/tmp/pr1549-current-main-c28-independent-ux-source-evidence-refresh-1335-v1.json"
   },
   "product_main_assembly": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json",
     "sha256": "273ab11bc7d5d3ce8bf72ed883b9a41c4cf869c88d66a45c71393a32e4b0e348",
     "bytes": 23588,
     "original_path": "/tmp/pr1549-9e63cde8-current-main-actual-assembly-conservation-review-v1.json"
   },
   "prior_ee7_UI_negative": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-b7df772a-negative-ui3-root-acceptance-v1.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/pr1549-b7df772a-negative-ui3-root-acceptance-v1.json",
     "sha256": "8dd3a2e63b3a6d15e2382cb7805de1556f8e445e1a0f704b9fd2305353121668",
     "bytes": 11083,
     "original_path": "/tmp/fw16-backend-ec204421/pr1549-b7df772a-negative-ui3-root-acceptance-v1.json"
   },
   "product_publication": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/product-publication.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/product-proofs/product-publication.json",
     "sha256": "cb42afaf0caf230f28286cd2adac98cb5fc8b57e530bc91f2a35b411e5b474e0",
     "bytes": 1323,
     "original_path": "/tmp/fw16-backend-ec204421/pr1549-c28-current-main-reviewed-source-publication-v1.json"
   },
   "author_source_import": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/author-source-import.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/author-source-import.json",
     "sha256": "57588c30249b0eb7a0f84bbf8dcf1c51a8a867869ef2edcc268ace3d5e39d51d",
     "bytes": 1314,
     "original_path": "/var/tmp/coord16-pr1549-c28-author-source-import-record.json"
   },
   "donor_run_packet_py": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/donor-run-packet.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/donor-run-packet.py",
     "sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
     "bytes": 82880,
     "source_commit": "993cea26a29b5a2cd6857a959628de4e5f04c096"
   },
   "prior_ee7_controller_run_packet_py": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/prior-ee7-controller/run-packet.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/prior-ee7-controller/run-packet.py",
     "sha256": "546c0a252fe1461c2a2f1d8262a511750cd1f31bb830ccb822dce3a4f21048fd",
     "bytes": 85170,
     "source_commit": "50283578eee10f358b3f59a212e620d51247504c",
     "scope": "Prior exact source component only; no runtime result transfer"
   },
   "donor_plan_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/donor-plan.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/donor-plan.json",
     "sha256": "d5c074fbea83b6863b73ae574a8b55fb8a4425cce527c6e0f87685dbf56990e9",
     "bytes": 19053,
     "source_commit": "993cea26a29b5a2cd6857a959628de4e5f04c096"
   },
   "prior_ee7_controller_plan_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/prior-ee7-controller/plan.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/prior-ee7-controller/plan.json",
     "sha256": "6b1abe40fa0787e15bc46c8254541f65cd18da411376f6c449d3d8122991631d",
     "bytes": 21642,
     "source_commit": "50283578eee10f358b3f59a212e620d51247504c",
     "scope": "Prior exact source component only; no runtime result transfer"
   },
   "donor_source_binding_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/donor-source-binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/donor-source-binding.json",
     "sha256": "12aec1cd635793e24907149e5fffebbc1b594aec652947064a82afc9c9e7e785",
     "bytes": 13594,
     "source_commit": "993cea26a29b5a2cd6857a959628de4e5f04c096"
   },
   "prior_ee7_controller_source_binding_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/prior-ee7-controller/source-binding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/prior-ee7-controller/source-binding.json",
     "sha256": "e970b092b2c98af6b27165b5f6ea443fa9884b0cd38fde56dea637bb4d389af2",
     "bytes": 17233,
     "source_commit": "50283578eee10f358b3f59a212e620d51247504c",
     "scope": "Prior exact source component only; no runtime result transfer"
   },
   "donor_source_conservation_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/donor-source-conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/donor-source-conservation.json",
     "sha256": "628dd034d9038b882f0213db0fd098086474d244714bb362d14e34ccdcbb8595",
     "bytes": 6013,
     "source_commit": "993cea26a29b5a2cd6857a959628de4e5f04c096"
   },
   "prior_ee7_controller_source_conservation_json": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/prior-ee7-controller/source-conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/prior-ee7-controller/source-conservation.json",
     "sha256": "f95b91db907cc99a843663de28fe09345b16abee63127780fd7e056103c1996b",
     "bytes": 5967,
     "source_commit": "50283578eee10f358b3f59a212e620d51247504c",
     "scope": "Prior exact source component only; no runtime result transfer"
   },
   "adoption_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_conservation.json",
     "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4",
     "bytes": 13262,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_conservation.json"
   },
   "adoption_freeze": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_freeze.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_freeze.json",
     "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682",
     "bytes": 2591,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_freeze.json"
   },
   "adoption_function": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_function.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_function.py",
     "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
     "bytes": 877,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_function.py"
   },
   "adoption_intake": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_intake.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_intake.json",
     "sha256": "e9aa09101ca6d215e6876de5b50c1fe1bc57bb3cc14f7bdd397b7772cd1e5843",
     "bytes": 3200,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_intake.json"
   },
   "adoption_old_function": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_old_function.py",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_old_function.py",
     "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
     "bytes": 1593,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_old_function.py"
   },
   "adoption_original_finding": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_original_finding.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_original_finding.json",
     "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8",
     "bytes": 13311,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_original_finding.json"
   },
   "adoption_pure4_reference": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_pure4_reference.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_pure4_reference.json",
     "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005",
     "bytes": 1760,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_pure4_reference.json"
   },
   "adoption_semantic": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_semantic.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/adoption_semantic.json",
     "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8",
     "bytes": 8938,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/adoption_semantic.json"
   },
   "prior_ca_additive_hold": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/prior_ca_additive_hold.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/prior_ca_additive_hold.json",
     "sha256": "a32b9501efcfc05ba117cd89f10d903a02434943ce0ac5d70440b7ea69767ef9",
     "bytes": 5709,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/prior_ca_additive_hold.json"
   },
   "prior_ca_author_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/prior_ca_author_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/prior_ca_author_conservation.json",
     "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd",
     "bytes": 4605,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/prior_ca_author_conservation.json"
   },
   "prior_ca_conservation": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/prior_ca_conservation.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/prior_ca_conservation.json",
     "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d",
     "bytes": 73422,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/prior_ca_conservation.json"
   },
   "prior_ca_task_hold": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/prior_ca_task_hold.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/dependencies/canonical/prior_ca_task_hold.json",
     "sha256": "e342ee5b3258889e2f258433b7cf3a47614d79e340a4313e678060b99bf53560",
     "bytes": 5835,
     "original_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1238-a518-cli5-source/qualification-packets/pr1238-a518-cli5/dependencies/canonical/prior_ca_task_hold.json"
   },
   "command_data": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/command-data.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/command-data.json",
     "sha256": "a1fd509114689ba1ab70543bf53e3fa0de2b4132bb683218cda60fc89a37855f",
     "bytes": 5478
   },
   "current_source_map": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/current-source-map.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/current-source-map.json",
     "sha256": "044ec0e2f9f3b20ff42e948e31e436bb597d57d52e2d45c62f0ae49a6f75b786",
     "bytes": 7646
   },
   "instruction_source": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/instruction-source.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/instruction-source.json",
     "sha256": "399f888da8d60f7825a6671ef1e995baba2309749c3bffca56315ab2166e4e93",
     "bytes": 394
   },
   "selected_source_contract": {
-    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-source/qualification-packets/pr1549-c28-host3/selected-source-contract.json",
+    "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-c28-host3-status-source/qualification-packets/pr1549-c28-host3/selected-source-contract.json",
     "sha256": "6f57e9064a4e3e23488416686aafb6d3355f0c98a8c63942117cb6dc82213321",
     "bytes": 3082
   }
