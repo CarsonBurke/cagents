@@ -1,0 +1,193 @@
+{
+  "kind": "92b8-operation-trait-single-import-independent-semantic-caller-ux-source-review/v1",
+  "verdict": "SOURCE_CLEAR",
+  "scope": "Exact helper-local cfg(test) Operation import and original E0599 applicability only; not whole55 stack, complete tree conservation, compile readiness or native qualification.",
+  "reviewer": "/root/1239_provider_stream_order_review",
+  "relationship": "Independent nonauthor reviewer. Main15 authored92b8 and its freeze/addendum; this reviewer authored neither candidate code nor author source-conservation artifacts. Other reviewer1892 owns independent tree conservation.",
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "parent_tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+  "source_repository": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15",
+  "inputs": [
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-single-import-source-freeze-v1.json",
+      "bytes": 8301,
+      "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd",
+      "expected_pin_match": true
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-diagnostic-neighbor-source-binding-addendum-v1.json",
+      "bytes": 7259,
+      "sha256": "92832731f3d2f00142e8d3473f1f85a5578c6166f5a2fa12eada0f18b265d4fe",
+      "expected_pin_match": true
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-main15-operation-trait-single-import-source-lead-intake-v1.json",
+      "bytes": 5375,
+      "sha256": "1f0dc2be5b7100c2703c984b8f7e2d87eb218d818b9ed42a0acd345e719e7534",
+      "expected_pin_match": true
+    }
+  ],
+  "source_pins": [
+    {
+      "path": "src/app/chat_ui.rs",
+      "bytes": 1419021,
+      "sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+      "entry": "100644 blob 012698f59a96bfb0639bd95a710646ea829afcda\tsrc/app/chat_ui.rs",
+      "equal_parent": false
+    },
+    {
+      "path": "src/app.rs",
+      "bytes": 1390648,
+      "sha256": "de2b68f872f4195e87a3cbdee1fa846ab2655726cf9e8540141ec0701f5aec4c",
+      "entry": "100644 blob be8e325257d237b5bd13ae14890591fea3b0ab0e\tsrc/app.rs",
+      "equal_parent": true
+    },
+    {
+      "path": "vendor/iced-core/src/widget.rs",
+      "bytes": 4989,
+      "sha256": "7b0db7c4bcc3cea24a4482399732b5e6b9a7cfcd5a027886d265a3fef247286a",
+      "entry": "100644 blob b1e027acce9839add4aad0b21fdbd4ab6524a677\tvendor/iced-core/src/widget.rs",
+      "equal_parent": true
+    },
+    {
+      "path": "vendor/iced-core/src/widget/operation.rs",
+      "bytes": 15371,
+      "sha256": "bd70da7d8867aeab6953794e00dc8adcced21557aeffa0cb12e7952c69a06a7c",
+      "entry": "100644 blob 40f010649d4541241b0fe7b9be43df626037fe66\tvendor/iced-core/src/widget/operation.rs",
+      "equal_parent": true
+    },
+    {
+      "path": "vendor/libcosmic/src/widget/mod.rs",
+      "bytes": 8798,
+      "sha256": "2cb107e887d4b04f8de89c546c302c58394b28432d4fe3512f6355682de1c6a1",
+      "entry": "100644 blob ed6f55d7f95ea814e4537a18699ff5411bcfbfe7\tvendor/libcosmic/src/widget/mod.rs",
+      "equal_parent": true
+    },
+    {
+      "path": "vendor/libcosmic/src/lib.rs",
+      "bytes": 6277,
+      "sha256": "80cb836ba7b40802774d44b51d70611225641bc045f106348b144e904c7fd752",
+      "entry": "100644 blob c44700e578692c31510652cab94c3e95140d5e1e\tvendor/libcosmic/src/lib.rs",
+      "equal_parent": true
+    },
+    {
+      "path": "vendor/libcosmic/Cargo.toml",
+      "bytes": 7397,
+      "sha256": "8fc4ff842d4c9d41334bfabc0828065c50797841904f1a2f856a1c62e4b2507f",
+      "entry": "100644 blob 834c239999d61b36a55526819752cf6cd02bc1d6\tvendor/libcosmic/Cargo.toml",
+      "equal_parent": true
+    },
+    {
+      "path": "Cargo.toml",
+      "bytes": 13087,
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "entry": "100644 blob 3c67491c83a0077d18b41a73ff5850488ebdf0f5\tCargo.toml",
+      "equal_parent": true
+    }
+  ],
+  "actual_delta": {
+    "changed_paths": [
+      "src/app/chat_ui.rs"
+    ],
+    "diff": "diff --git a/src/app/chat_ui.rs b/src/app/chat_ui.rs\nindex 8aded4804..012698f59 100644\n--- a/src/app/chat_ui.rs\n+++ b/src/app/chat_ui.rs\n@@ -31656,7 +31656,7 @@ mod tests {\n     ) -> Vec<Message> {\n         use iced::advanced::{\n             Layout, Shell, clipboard, layout,\n-            widget::{Tree, operation},\n+            widget::{Operation, Tree, operation},\n         };\n         use iced::futures::StreamExt;\n         let ring = app.shared_return_notice_ring_for_test();\n",
+    "helper_local_import_line": 31659,
+    "helper_start_line": 31652,
+    "unchanged_probe_finish_line": 31723,
+    "exact_helper_one_import_substitution": true,
+    "entire_chat_ui_file_equal_except_that_substitution": true,
+    "inverse_recovers_parent_file": true,
+    "production_prefix_before_cfg_test_bytes": 599012,
+    "production_prefix_sha256": "f699e1f107bd978d15986c9aec444b5ab1550300f23ee6c94c4657ccf9bc16b3",
+    "production_prefix_equal": true
+  },
+  "diagnostic_binding": {
+    "scope": "Independently read only known original compiler-message line960 and extracted rendered block, not all compiler messages/RAW/runtime. Complete original log SHA is an input/addendum claim, not recomputed or used as successor evidence here.",
+    "original_log_path": "/tmp/coord16-main15-bb8-ui5-validation-20261031T190448779446Z-2/compile-ui-lib/stdout.log",
+    "json_line": 960,
+    "original_raw_line_without_line_ending_sha256": "d20b24b266d9210defee1504ac7d8a0190b4fd8a68466ec093d8f845caf54831",
+    "matches_addendum_original_line": true,
+    "extracted_message": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-compiler-message-line960-v1.jsonl",
+      "sha256": "38811b40038f7f11f9493614deabf5f161b1c7bd36269b6055352fc8dfa98b11",
+      "byte_exact_json_record_match_to_original_line960": true
+    },
+    "rendered_block": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-rendered-v1.txt",
+      "sha256": "0e552e55a46640444803bcb89745247b767cb2b227ad87f6e7f1c3b3a5a3d135",
+      "equals_original_message_rendered": true
+    },
+    "code": "E0599",
+    "primary": {
+      "byte_end": 1359553,
+      "byte_start": 1359547,
+      "column_end": 33,
+      "column_start": 27,
+      "expansion": null,
+      "file_name": "src/app/chat_ui.rs",
+      "is_primary": true,
+      "label": "method not found in `impl cosmic::widget::Operation`",
+      "line_end": 31723,
+      "line_start": 31723,
+      "suggested_replacement": null,
+      "suggestion_applicability": null,
+      "text": [
+        {
+          "highlight_end": 33,
+          "highlight_start": 27,
+          "text": "            let _ = probe.finish();"
+        }
+      ]
+    },
+    "compiler_help": "Operation provides finish, is implemented for impl cosmic::widget::Operation, and is not in this helper scope. Source change adds precisely that trait via the existing iced::advanced::widget path."
+  },
+  "semantic_findings": [
+    {
+      "verdict": "CLEAR",
+      "anchor": "src/app/chat_ui.rs:31659,31717,31723",
+      "reason": "The opaque probe returned by operation::map implements Operation<()>; trait methods need the trait in scope. Importing Operation resolves the exact missing-method source cause without changing probe creation, receiver, borrow form, traversal, map closure or finish expression. This is a source/diagnostic conclusion, not a successful compiler observation."
+    },
+    {
+      "verdict": "CLEAR",
+      "anchor": "vendor/iced-core/src/widget/operation.rs:21,75,251,403",
+      "reason": "Operation::finish takes &self; map returns impl Operation<B> and its finish dispatches the inner Outcome then invokes the mapping closure for Some. Keeping probe.finish is meaningful: that closure stores the focused id in found, which the existing reached assertion reads. Import neither replaces it with a no-op nor weakens the focus oracle."
+    },
+    {
+      "verdict": "CLEAR",
+      "anchor": "vendor/iced-core/src/widget.rs:7; vendor/libcosmic/src/widget/mod.rs:97; vendor/libcosmic/src/lib.rs:151; Cargo.toml:334-340",
+      "reason": "Tracked widget module reexports operation::Operation; cosmic::widget reexports iced_core::widget::Operation; cosmic reexports iced; the shared libcosmic Git source is patched to local iced_core. These and the compiler source location bind the diagnosed trait to the local definition. The external iced advanced reexport implementation itself was not fetched/read from a cache; the actual used import path is additionally source-grounded by unchanged neighbors."
+    },
+    {
+      "verdict": "CLEAR",
+      "anchor": "src/app.rs:28850,28880,28891,28898; src/app/chat_ui.rs:30024,32011",
+      "reason": "focused_element already imports Operation with operation and performs the same map(find_focused)->operate->probe.finish callback sequence; neighboring pointer helper imports advanced::widget::Operation. The exact local import style is established and does not add a new receiver adapter or Task executor."
+    },
+    {
+      "verdict": "CLEAR",
+      "anchor": "src/app/chat_ui.rs:14116,31649-31765",
+      "reason": "The new use is inside the existing cfg(test) helper. Its intended keyboard/Task restrictions, actual Tab traversal and Enter event, message outputs, assertions and loops remain source-identical. No production receiver/Task/focus/caller/proof/nonce/cleanup body is changed by a lexical import."
+    }
+  ],
+  "caller_and_ux_applicability": {
+    "caller": "No connection/authentication, inherited authority, managed proof, issuer/receipt or caller admission code changes; importing the trait adds no User/Agent authority and admits no Tasks/provider/native evaluation. Existing helper may evaluate its already-present Widget focus actions only; no new Task construction, returned cleanup/save/provider Task evaluation or broader execution permission follows.",
+    "visible_surface": "Production bytes before cfg(test) are exact, and the entire changed file is exact except this local import. The product-visible flow therefore needs no new screenshot solely for this source fix; prior missing native/UX evidence remains missing. This source review does not establish that existing keyboard/native flows work.",
+    "regression_assertions": "All helper message/focus assertions and caller test bodies remain unchanged by the exact replacement. The fix restores the intended static method availability rather than changing expected outcomes."
+  },
+  "findings": [],
+  "validation": {
+    "successor_compile": "UNRUN",
+    "successor_tests": "UNRUN",
+    "successor_native": "UNRUN",
+    "original_bb8": "Preserve accepted original negative9475: UI lib compile101, no usable test ELF/inventory, all five named parents UNRUN. No pass/result transfer.",
+    "author_reported_format": "Freeze reports scripts/check-format0 and git diff --check0; not rerun and not treated as compilation.",
+    "current_C": "da76 installer only, unchanged",
+    "actual_grant": null
+  },
+  "limits": [
+    "Clears only exact92b8 helper-local source correction. Does not promise no other compiler errors or typecheck/test success.",
+    "No whole55/RAW audit; no independent2231-entry conservation claim; reviewer1892 owns that separate scope.",
+    "No source edits outside this task-owned tmp receipt, candidate imports/Task evaluation, builds/tests/native/provider/helpers, environment/account/authority/cache/target/process/resource probes, Git/network/API/publication writes, peer messages or children.",
+    "Original bb8 negative and missing User5/native/WHOLE/physical custody evidence remain immutable. No grant, runtime admission, controller binding, publication, readiness or merge approval."
+  ]
+}

@@ -1,0 +1,99 @@
+{
+  "kind": "independent_f95_b8_correction_UX_lifecycle_oracle_source_delta_review",
+  "status": "CLEAR_BOUNDED_SOURCE_DELTA_PRIOR_TWO_BLOCKERS_CLOSED",
+  "qualification": false,
+  "scope": "Only the exact b8-to-f95 correction for retained first C1 after B, issued popup keyboard reachability, and the directly changed meaningful component oracles. No broad redesign, API physical review, source adoption or execution.",
+  "source": {
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "parent_tree": "a4bed73ab90387d45052999f1f762545726eae04",
+    "inspected_correction_paths": [
+      "src/app/chat_ui.rs",
+      "src/app/chrome_ui.rs"
+    ],
+    "source_sha256_independently_read_from_immutable_git": {
+      "src/app/chat_ui.rs": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+      "src/app/chrome_ui.rs": "651091245803497ff0705a287d952b839137c4cf842675617d4752e26eb0272c"
+    },
+    "app_rs": "Immutable blob be8e325257d237b5bd13ae14890591fea3b0ab0e is equal at f95 and b8. Existing save/ACK reducers were not rewritten by this correction.",
+    "freeze": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-b8-bounded-source-correction-freeze-v1.json",
+      "sha256": "24ab6dc0d43d9ce328cf4e9cf445a9f1ea6405038a93201b175bf88d1fc84a54",
+      "bytes": 14616,
+      "mode": "0444",
+      "read_and_hash_verified": true
+    },
+    "preceding_negative": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b8ebb9ca-independent-assembled-UX-lifecycle-source-oracle-review-v1.json",
+      "sha256": "fe12f34e555ae6aae84815ce23934310e622d4f4a10b867b4c8fd06f351f2a35",
+      "disposition": "Both named primary-flow blockers are closed at source level in f95. That negative remains an accurate immutable review of b8."
+    }
+  },
+  "blocker_closures": [
+    {
+      "id": "B8-UX-FIRST-SUCCESS-AFTER-B-LOSES-C1-ACTION",
+      "status": "CLOSED_AT_SOURCE_LEVEL",
+      "production_anchors": [
+        "chat_ui.rs:13638-13655 valid/first/current-operation/nonce checks distinguish first_bound from current presentation.",
+        "chat_ui.rs:13664-13687 still makes conversion current-only but carries the already-captured queued owner for first_bound independently of presentation matching.",
+        "chat_ui.rs:13385-13400 gives Held queued custody a distinct ContinueClose purpose and explains the earlier original Close; it does not invent a new D.",
+        "chat_ui.rs:13459-13466 maps Held/CloseFailed queued rows to their original owner UUID; :7495-7508 routes that owner to ContinueClose only in Held.",
+        "chat_ui.rs:13734-13741 accepts ContinueClose only for Held with an actual queued owner, then :13826-13840 retains the queued-q refusal and already-closed/stage guards."
+      ],
+      "assessment": "First valid Some after accepted B no longer loses the actionable immutable C1. B's loss of presentation equality prevents conversion/removal rights while the captured original Close remains usable. The original row may still be suppressed to avoid duplication because the issued row now carries the actual guarded continuation.",
+      "meaningful_authored_oracle": [
+        "issued_first_some_after_replacement_controls runs under the existing stale owning parent (:32332-32334). It iterates shared and nonshared capture, starts a connected non-exited handle via actual App.update Switch, observes the real operation and optional shared origin, captures C1 then C2 and checks distinct R/C1/C2 plus exact original presentation/Arc (:31759-31819).",
+        "It injects missing/nil/wrong-target Err negatives while the actual operation remains pending and asserts no original first-error/C1/phase/ledger/issued mutation (:31820-31867).",
+        "The nonshared variant first captures origin None, then uses the normal model ViewApplied reducer before the later recipe-B Read; it does not rewrite captured origin or install q. B is projected with the existing normal View.apply/Read helper, then the FIRST valid Ok arrives with no prior matching Err (:31869-31891).",
+        "The record must be Held, linked, unrepresented, not closed and free of Return error, with the complete tuple/source/presentation/Arc/R/C1 unchanged. No generic handoff descriptor is installed (:31892-31923).",
+        "Production Tab/Shift-Tab navigation reaches the mounted ContinueClose control, which emits RetryCleanup for original C1. App.update makes Closing with the same owner; busy control disappears. Injected typed Closed leaves B open/exact, order/focus and original readable runtime/draft unchanged and enters FlushFailed because this component has no writer (:31924-31959)."
+      ],
+      "limits": "This is a meaningful source regression design, not an executed test or physical cleanup proof. It checks current B/presentation and normal Read routing; it does not separately assert a byte-for-byte raw stored snapshot after cleanup or zero queued ModelEdit messages. Preservation of the raw B source in this narrow delta is additionally supported by the unchanged current-presentation fence and absence of a conversion/publication path for current=false. No universal same-process backend-B preservation is claimed."
+    },
+    {
+      "id": "B8-UX-ISSUED-ACTIONS-MISSING-FROM-POPUP-TAB-RING",
+      "status": "CLOSED_AT_SOURCE_LEVEL",
+      "production_anchors": [
+        "chat_ui.rs:13339-13343 IssuedNotice.action_id derives the exact current UUID/purpose control ID.",
+        "chrome_ui.rs:1792-1796 extends Popup::Notices from issued_return_notices filtered rows using that same action_id.",
+        "chrome_ui.rs:2605-2655 renders the same filtered issued rows/actions using action_id and complete owned button keyed by notice UUID, operation, attempt and purpose.",
+        "chat_ui.rs:13487-13498 still hides or disables queued q rows before either ring or view sees an offered issued action."
+      ],
+      "assessment": "The owned popup Tab ring and mounted issued action now use the same filtered rows and ID derivation. Close, ContinueClose, RetryClose, RetryFlush and RetryAck are traversable in source; busy and blocked rows contribute no action. Existing popup ownership/refocus logic therefore no longer skips all issued controls.",
+      "meaningful_authored_oracle": [
+        "tab_mounted_return_control checks ring membership, sends real Tab or Shift-Tab to chrome_key_event, consumes only returned widget focus operations against the mounted production view, probes the actually focused ID, and sends Enter only once that target is reached (:31649-31754). This removes the old direct-ID-focus substitution.",
+        "The orphan Close is reached forward (:31008-31015), issued RetryClose backward (:31034-31041), Retry saving forward (:31075-31082), Retry confirmation backward (:31120-31125), and queued ContinueClose in both traversal directions through the shared/nonshared loop (:31924-31933).",
+        "Busy issued controls are absent after actual action reducer transitions (:31017-31021 and :31942-31947); the queued-q control remains absent (:31443-31455).",
+        "The retained pointer tree still holds a save-retry press across ACK purpose change, rejects the old release, then accepts a fresh press (:31083-31156). Existing q verification-to-cleanup retained-press controls remain outside the correction unchanged."
+      ],
+      "limits": "This helper is authored source and UNRUN. It mounts a fresh tree per traversal step and does not replace actual native focus/tab behavior or demonstrate focus continuity across an async native redraw. It evaluates only widget operations when later run; cleanup/save/provider Tasks remain dropped."
+    }
+  ],
+  "supplied_client_refusal_oracle": {
+    "status": "MEANINGFUL_COMPONENT_SOURCE_CONTROL_NOW_CONNECTED_TO_OWNING_REDUCER",
+    "anchors": [
+      "chat_ui.rs:30766-30903 issued_request_component returns the exact supplied returned tuple and actual supplied-client typed close result; the synthetic peer still checks Authenticate, exact nonce request/refusal and wrong endpoint zero request.",
+      "chat_ui.rs:31259-31304 captures that real component refusal result and feeds it to the owning IssuedCloseFinished callback instead of an unrelated synthetic Unknown.",
+      "chat_ui.rs:31305-31329 asserts the original tuple/source/C1/error, navigates the mounted RetryClose through Shift-Tab and Enter, and checks a fresh attempt with unchanged C1."
+    ],
+    "assessment": "The source oracle now causally connects a framed component refusal to the actual reducer and reachable retry control. It preserves the original receipt and caller/error custody. It remains a supplied synthetic client/peer and manually delivered callback, not execution of the production async captured-caller Task or physical Host cleanup."
+  },
+  "adjacent_delta_assessment": {
+    "severity": "The previously nonblocking warning-row/error-anchor discrepancy is corrected in source: chrome_ui.rs:2326-2335 filters the coarse retry flag against actual displayed retry/blocked/error rows. An otherwise warning-only Held row no longer invents an Error anchor.",
+    "stale_error": "native_result_error at chat_ui.rs:13604-13613 now rejects missing/nil operation before mutation. The new missing/nil/wrong-target controls observe the still-genuine pending operation; authority correctness review remains separately owned.",
+    "no_new_delta_blocker_found": true,
+    "boundaries": "This correction does not change the API/Host implementation, protected q/recheck/proof classifiers, original source/presentation fences, deliberate orphan D guard, or app.rs save/ACK reducer. The complete previous whole-source review is not repeated or replaced."
+  },
+  "remaining_limits_and_required_evidence": [
+    "No compilation, Rust tests, Task, formatter, helper, native app, provider or physical cleanup ran during this review. The author freeze's formatting results are input metadata, not typecheck or runtime credit.",
+    "All named source controls, including widget-operation traversal, remain UNRUN. Synthetic saved-barrier helpers still manually select Flushing and inject completion; no real durable writer or original-R worker ACK completion is established.",
+    "The new raw-model sequence asserts non-q accepted B and presentation/open/order/focus/draft retention. A separately explicit raw snapshot equality/zero outgoing-edit assertion would strengthen this oracle; the source fence is unchanged and this is not an additional bounded source blocker.",
+    "Normal shared/nonshared no-Close Return through actual save/ACK, queued first-C1 after B, deliberate orphan close, refusal/retry, save/confirmation retry and WindowClose -> Cancel -> Notices need actual native exercise at the corrected head.",
+    "Native keyboard Tab/Shift-Tab/Enter, focus after stage/row changes, held gesture across changing actions, notice expiry/dismissal, and narrow/wide error states still require actual Before/After evidence. Earlier b3/3e native captures and old b8/API/component results do not transfer.",
+    "Existing q open/hidden/closed/missing recovery restrictions remain truthful refusals, not newly completed outcomes. qclosed/general/native/User5/FULL52/WHOLE holds remain, with no authority-policy waiver.",
+    "No API physical review, source adoption/publication, grant, queueability, whole-product readiness or merge claim is made. PR1933 NEVER MERGE remains."
+  ],
+  "method": "Read exact immutable f95-minus-b8 diffs, the exact source freeze and relevant immutable owning test/widget spans. Independently verify source hashes and unchanged app.rs blob. No moving worktree or unrelated redesign/API inventory.",
+  "write_scope": "This exclusive mode0444 receipt only."
+}

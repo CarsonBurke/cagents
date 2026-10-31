@@ -1,0 +1,121 @@
+{
+  "author_freeze": {
+    "path": "/tmp/startup-Agent47-declared-count-successor-8ullap44/freeze.json",
+    "sha256": "15615f9f182f7593da6229f4f02f1661fa685c5b0873a1d5c47e6f72bd5cfcf5"
+  },
+  "blocking_findings": [],
+  "checks": {
+    "adapter_precedes_C_acquire_try": true,
+    "all153_manifest_members_complete_hash_length_current_local_Git_match": true,
+    "all31_other_top_and5_nested_FunctionDefs_exact": true,
+    "all5_original579_source_metadata_archives_exact": true,
+    "all87_runtime_archive_hashes_and_original_bytes_unchanged": true,
+    "all_current_author_primary_pins_match": true,
+    "all_current_source_binding_refs_hash_length_local_Git_match": true,
+    "all_product_source_entries_unchanged": true,
+    "canonical9004_and_original_generic_accounting_body_exact": true,
+    "exact4line_adapter_only_runner_delta": true,
+    "freeze_sha256_exact": true,
+    "future12argv_current_runner_ABI_paths_nullslots": true,
+    "head_tree_parent_exact": true,
+    "original579_BLOCK_record_exact_and_archived_immutable": true,
+    "outside_packet2222_entries_modes_types_blobs_exact": true,
+    "plan_binding_task_data_current_contract_unchanged": true,
+    "protected3790_tail_fullsummary_writer_error_HOLD_return_suffix_exact": true,
+    "runner_and_manifest_expected_pins": true,
+    "runtime_actuals_NULL_no_grant_or_new_authority_handling": true,
+    "safe47_full52_User5_partition_and_HOLD_remain_current": true,
+    "single_original_call_and_main_call_after_binding": true
+  },
+  "controller_head": "1d3e5c2134aab049b451a397c8bfca8fbd96c9a9",
+  "controller_parent": "579f9a58eee6561f6f7317284091b99f72172281",
+  "controller_tree": "e2924fb9c4689f2ce0e897dbe1fc7e7fb875b9be",
+  "future_invocation": {
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source",
+    "frozen12argv_template": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source/qualification-packets/startup30/run-packet.py",
+      "--grant",
+      null,
+      "--runner-sha256",
+      "93d01c01be059b8d64266afd293f176981285ac3a6255cb6b79cbe347f8bb54f",
+      "--controller-review",
+      null,
+      "--controller-review-sha256",
+      null
+    ],
+    "only_final_remaining_NULL_slot_after_external_review_binding": 5,
+    "review_hash_slot11": "External SHA256 of these sealed bytes, supplied in tool/final binding only; not a recursive field",
+    "review_path_slot9": "/tmp/startup-Agent47-declared-count-independent-refresh-1d3e5c21-1335-v1.json",
+    "status": "SOURCE_REVIEW_CLEAR_SEPARATE_ROOT_GRANT_REQUIRED_NOT_SUBMITTABLE"
+  },
+  "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+  "kind": "INDEPENDENT_BOUNDED_CURRENT_SUCCESSOR_SOURCE_REVIEW_NOT_EXECUTION_ADMISSION",
+  "manifest_sha256": "bf7bd79c16b5c9c77bdc98f368f3a1db82bab30d91fb8c1049b53d33298aa10e",
+  "operations_and_authority": {
+    "C_allocation_grant_queue_publication_merge": "ROOT_ONLY_NONE_CREATED",
+    "candidate_import_call_test_build_compile_native": "UNRUN_NOT_PERFORMED",
+    "current_C_report": "Parent says UNALLOCATED; not probed or allocated here",
+    "new_workers_sessions": "NONE",
+    "original_Bnegative_579BLOCK_FULL52_User5_native_holds": "UNCHANGED_ORIGINAL_SCOPES_NO_RUNTIME_TRANSFER",
+    "process_environment_authority_values_tool_target_lock_resources_account_DB_probes": "NOT_PERFORMED",
+    "source_Git_public_writes": "NONE"
+  },
+  "pin_discrepancies": {
+    "archives": [],
+    "binding_refs": [],
+    "manifest_members": [],
+    "primary": []
+  },
+  "plan_sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
+  "preserved_source_scope": {
+    "FULL52_required": 52,
+    "User5": "HOLD_UNINVOKED_UNQUALIFIED_NO_ABSENCE_OR_PASS_SKIP_IGNORED_CREDIT",
+    "existing_target_jobs2_setting": true,
+    "guard_refusal_or_early_return_not_causal_body_coverage": true,
+    "helper": null,
+    "native_wholePR_global_UX": "UNQUALIFIED",
+    "nine_serial_phases_sum_seconds": 2310,
+    "no_User_absence_gate_for47": true,
+    "opaque_authority_HOME_original_fixture_context_unchanged": true,
+    "predictions_not_actual_inventory_N": true,
+    "selected47_graphs": [
+      1,
+      6,
+      40
+    ],
+    "selected_membership_predictions": [
+      1,
+      7,
+      46
+    ],
+    "workload_cap_seconds": 2400
+  },
+  "prior_genuine_review": {
+    "archived_exact": "qualification-packets/startup30/history/579f9a58/independent-semantic-BLOCK.json",
+    "original_scope_not_retargeted": true,
+    "path": "/tmp/startup-aeb-Agent-safe47-semantic-admission-review-579f9a58-1335-v1.json",
+    "sha256": "27e9a935d6a732aedfd1c5904582573b8a4cb19e86c607a65d78d54bb7561b8f",
+    "verdict": "CONTROLLER_SOURCE_BLOCKED"
+  },
+  "resolved_findings": [
+    {
+      "actual_hunk": "    parent_accounting = lambda *args, original=globals()['parent_accounting'], declared=len(selected): (\n        lambda result: ({**result[0], 'declared_requested_unique_parent_count': declared},\n                        result[1], result[2])\n    )(original(*args))",
+      "disposition": "RESOLVED_FOR_EXACT_1d3e5c21_ONLY",
+      "id": "AGENT47-DECLARED-COUNT-1",
+      "no_globals_mutation": true,
+      "no_original_function_execution_by_reviewer": true,
+      "reason": "Main-local adapter captures the original global function and already-validated len(selected)=47 before the acquire try. It calls original exactly once. The immediately invoked result lambda makes a new accounting dict with only declared_requested_unique_parent_count replaced, returns the identical raw/errors objects and adds no exception handler. All discovered/qualified/unknown/partial counts and original failure/HOLD predicates remain original.",
+      "source_anchor": "run-packet.py:1211-1214"
+    }
+  ],
+  "reviewer": "/root/1335_full_output_copy_lease",
+  "runner_sha256": "93d01c01be059b8d64266afd293f176981285ac3a6255cb6b79cbe347f8bb54f",
+  "schema": "startup-Agent47-declared-count-successor-independent-semantic-ABI-refresh-v1",
+  "scope": "Bounded exact successor refresh closing only AGENT47-DECLARED-COUNT-1, plus required current ABI/reference/hash joins. Prior independent579 semantic/admission findings and checked source scopes are preserved at their original pins; only this current corrected successor receives this verdict. No generic engine/product/canonical semantic audit repeated.",
+  "source_binding_sha256": "92b313f6588178d976332f00fb6dbec93c776d14cc2e77347e492332c2a5c929",
+  "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+  "verdict": "CONTROLLER_SOURCE_CLEAR"
+}

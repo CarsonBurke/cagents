@@ -1,0 +1,142 @@
+{
+  "schema": "main15-safe47-deferred5-bounded-caller-contract-lead-join-v1",
+  "created_utc": "2026-10-31T12:33:59.721351+00:00",
+  "request": "EC3a1cdf16 bounded actual47/5 contract/caller interpretation",
+  "controller": {
+    "head": "579f9a58eee6561f6f7317284091b99f72172281",
+    "tree": "4f1ddf27876c3ca9e77ebfb1b24070e83fd85f3f",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-whole-focused-source",
+    "freeze": {
+      "path": "/tmp/startup-aeb-Agent-safe47-author-bbcfi412/freeze.json",
+      "sha256": "8bff346f25a027c6d952a5a945b1bba65eb5e3d333d60ca8f89b1813267d9a11"
+    },
+    "source_sha256": {
+      "qualification-packets/startup30/run-packet.py": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f",
+      "qualification-packets/startup30/plan.json": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043",
+      "qualification-packets/startup30/command-data.json": "18fd276bdb8496587cb21de0f03a52f1c1afc54fb54918e391f4cfe00b439355",
+      "qualification-packets/startup30/required-source-contract.json": "c48bd1259b424db7eaf2afbdd41c98478233ca42edb508e4eaded0f1727776b2",
+      "qualification-packets/startup30/execution-template.json": "a08d481eca67e4601ec47f23e4ef69380d6c5fea31fdca467b4e5f3635744869"
+    }
+  },
+  "product": {
+    "head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "source_sha256": {
+      "src/app/shared_views/tests/startup_admission.rs": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "src/app/shared_views.rs": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "src/agent_execution.rs": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452"
+    }
+  },
+  "references": {
+    "bounded_independent_review": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/579f9a58-main15-independent-47-5-caller-source-contract-review-v1.json",
+      "sha256": "0b19eee689e1ba5f5dd1b11d28dc9b9f6d6ec8d6d877719b3e60d5b88da646ee",
+      "bytes": 18931
+    },
+    "original_author_freeze": {
+      "path": "/tmp/startup-aeb-Agent-safe47-author-bbcfi412/freeze.json",
+      "sha256": "8bff346f25a027c6d952a5a945b1bba65eb5e3d333d60ca8f89b1813267d9a11",
+      "bytes": 21717
+    },
+    "genuine_source_classifier": {
+      "path": "/tmp/aeb1345d-52-parent-caller-admission-source-classification-v1.json",
+      "sha256": "315693dcdebbb93dee644e5fb05c192acfe6e6ad44a225d3ea128ad2b8f6a258",
+      "bytes": 24100
+    },
+    "full52_source_parent_map": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-final-owning-test-parent-selection-refresh-v2.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef",
+      "bytes": 25829
+    }
+  },
+  "verdict": "BOUNDED_SOURCE_PARTITION_AND_CALLER_INTERPRETATION_CONSISTENT; NOT_WHOLE_CONTROLLER_CLEAR",
+  "lead_independent_data_and_hash_join": {
+    "verified_source_hashes": [
+      {
+        "role": "controller",
+        "path": "qualification-packets/startup30/run-packet.py",
+        "sha256": "ec0149d613f1564b764a4b544cd49eb21f380db5d43639b75463bf17c405a73f"
+      },
+      {
+        "role": "controller",
+        "path": "qualification-packets/startup30/plan.json",
+        "sha256": "46613830d27dc8298bf97f400bf056bc7a7b05ed00241ecccd3ed16fe5cc9043"
+      },
+      {
+        "role": "controller",
+        "path": "qualification-packets/startup30/command-data.json",
+        "sha256": "18fd276bdb8496587cb21de0f03a52f1c1afc54fb54918e391f4cfe00b439355"
+      },
+      {
+        "role": "controller",
+        "path": "qualification-packets/startup30/required-source-contract.json",
+        "sha256": "c48bd1259b424db7eaf2afbdd41c98478233ca42edb508e4eaded0f1727776b2"
+      },
+      {
+        "role": "controller",
+        "path": "qualification-packets/startup30/execution-template.json",
+        "sha256": "a08d481eca67e4601ec47f23e4ef69380d6c5fea31fdca467b4e5f3635744869"
+      },
+      {
+        "role": "product",
+        "path": "src/app/shared_views/tests/startup_admission.rs",
+        "sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786"
+      },
+      {
+        "role": "product",
+        "path": "src/app/shared_views.rs",
+        "sha256": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61"
+      },
+      {
+        "role": "product",
+        "path": "src/agent_execution.rs",
+        "sha256": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452"
+      }
+    ],
+    "selected_distinct": 47,
+    "selected_graph_counts": {
+      "cli-lib": 1,
+      "host-lib": 6,
+      "ui-lib": 40
+    },
+    "deferred_distinct": 5,
+    "deferred_graph": "ui-lib",
+    "intersection": 0,
+    "full_required_union": 52,
+    "exact_classifier_and_original52_map": true,
+    "plan_and_command_groups_and_assigned_selectors_match": true,
+    "no_broad_filter_or_User5_assigned_invocation": true,
+    "User5_status": "HOLD_UNQUALIFIED_NOT_INVOKED",
+    "each_deferred_invocation_causal_body_pass_credit": null,
+    "readiness": false,
+    "actual_fields_all_null": true
+  },
+  "lead_direct_read": {
+    "guard": "Immutable product startup_admission.rs20-63, five actual caller entries1097/2552/3167/3181/3436, Authority44-76 and deferred recheck Task844-882 read. Guard precedes child marker and guarded env_clear; no marker bypass or new invocation recipe.",
+    "scope": "Immutable runner485-492/586-621/936-961 actual group-derived exact selector dispatch read; three isolated feature groups and source47 assignment. This is not a whole lifecycle/accounting/controller review.",
+    "indirect_limit": "Selected stale-recheck test drops its returned Tasks and injects callbacks. Static Authority capture is not live authenticated RPC, process or native execution.",
+    "actual_authority": "UNKNOWN_UNREAD. No token/environment/context value read or inferred; opaque authority and current context preserved."
+  },
+  "known_external_review_blocker": {
+    "head": "579f9a58eee6561f6f7317284091b99f72172281",
+    "field": "declared_requested_unique_parent_count",
+    "pinned_value": 30,
+    "owner": "Root1335 reporting review and source author correction",
+    "status": "Uncorrected at immutable579f; refreshed freeze pending. Not waived or treated as corrected by this bounded clearance.",
+    "future_successor": "Needs separate exact delta/pin join; this record does not approve an unseen successor."
+  },
+  "validation_limits": {
+    "all_current_Rust": "UNRUN",
+    "User5": "UNRUN_UNQUALIFIED",
+    "native_UX_full52_WHOLE": "HOLD_UNQUALIFIED",
+    "controller_ABI_source_clear": false,
+    "actual_grant": null,
+    "source_adoption": false,
+    "queueable": false,
+    "resource_action": "NONE; C unallocated/no grant as supplied",
+    "merge_approval": false,
+    "PR1933": "NEVER_MERGE",
+    "old_head_results_transfer": false
+  },
+  "actions": "Read-only immutable source/data/hash inspection and exclusive0444 receipt only. Reused one existing reader. No authored source/function/controller import/eval/test, Cargo/rustc/ELF or process/env/authority/target/cache/resource probe, source/Git/public edit or new descriptor."
+}

@@ -1,0 +1,68 @@
+{
+  "compile": null,
+  "created_utc": "2026-10-31T19:32:34.685526+00:00",
+  "formatter": "Separate explicit physical Rust1.93 official formatter exit0 receipt4dab is adopted; original1e7 physical-toolchain gap remains immutable69fe.",
+  "grant": null,
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "holds": [
+    "Old bb8 UIlib101 and all5 parents UNRUN remain immutable.",
+    "No original pass/grant/controller transfer; future exact92b8 controllers need fresh source binding/reviews and separate grant.",
+    "Native/User5/whole-product proof remain unqualified; no feature readiness or merge clearance.",
+    "Current Cda76 installer return requires separate bounded Root acceptance; no runtime work authorized here."
+  ],
+  "inputs": [
+    {
+      "bytes": 8301,
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-single-import-source-freeze-v1.json",
+      "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd"
+    },
+    {
+      "bytes": 7259,
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-diagnostic-neighbor-source-binding-addendum-v1.json",
+      "sha256": "92832731f3d2f00142e8d3473f1f85a5578c6166f5a2fa12eada0f18b265d4fe"
+    },
+    {
+      "bytes": 5375,
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-main15-operation-trait-single-import-source-lead-intake-v1.json",
+      "sha256": "1f0dc2be5b7100c2703c984b8f7e2d87eb218d818b9ed42a0acd345e719e7534"
+    },
+    {
+      "bytes": 11908,
+      "path": "/tmp/92b8-operation-trait-single-import-independent-semantic-caller-ux-source-review-v1.json",
+      "sha256": "079eef1d3c39569141008ee704e9cdd4fefd4fab5e0850856aa6426a880921d4"
+    },
+    {
+      "bytes": 6445,
+      "path": "/tmp/main15-92b8-import-conservation-hwrwp28k/review.json",
+      "sha256": "44daf3c9ac1f71d6a4b062e56e331077eb09cf2bc9c79a8c769ec35585352a4d"
+    },
+    {
+      "bytes": 4122,
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-official-formatter-physical-toolchain-gap-addendum-v1.json",
+      "sha256": "69fe55e3b145b27d61379dc10321983bf0d7bf49b07b04c075adf5b30d3176a7"
+    },
+    {
+      "bytes": 2630,
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-physical-rust193-official-format-check-v1.json",
+      "sha256": "4dab228c1f2406792174e942b0953cfb0d07055548166578d447eb35413f0a0d"
+    },
+    {
+      "bytes": 5181,
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-main15-operation-trait-reviewed-source-assembly-handoff-v1.json",
+      "sha256": "b76ef3abaf0188ba68578feb33aa46a14fe8e439dbf4db02bb3397ee36f014b3"
+    }
+  ],
+  "kind": "main15-92b8-single-import-root-source-adoption-v1",
+  "native": null,
+  "parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "publication": null,
+  "root_checks": {
+    "exact_head_tree_parent_clean_source": true,
+    "exact_single_helper_local_import": true
+  },
+  "scope": "Only the existing cfg(test) helper Operation import resolves original E0599 source cause. Both independent nonauthor scopes clear; no production behavior or proof/caller change.",
+  "source_sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+  "status": "ADOPTED_EXACT_BOUNDED_SOURCE_ONLY_FOR_NORMAL_FAST_FORWARD_PUBLICATION",
+  "tests": null,
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4"
+}

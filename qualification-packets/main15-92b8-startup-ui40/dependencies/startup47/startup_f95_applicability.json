@@ -1,0 +1,343 @@
+{
+  "User5_admission": {
+    "causal_body": "These five differ from the separately reviewed UI5 component packet: their unchanged settle helper really polls scripted public-client startup/attach Tasks and drives owning reducer messages (378\u2013411), rather than merely dropping all futures. The existing child wrapper requires successful exact child plus 1 passed; outer compilation, refused entry, skipped body or unrelated parent footer does not establish coverage.",
+    "extra_checks": "Active mixed3168\u20133173, hidden mixed3182\u20133187 and remove3437\u20133442 also assert the genuine User Authority absence before isolated(). Stale closed2559 and mixed image1106 rely on the unchanged common guard. Authority presence/invalid presence semantics remain byte-equal at src/agent_execution.rs.",
+    "no_workaround": "No authority clearing/replacement, role override, User proxy, child-marker injection, environment recipe or new context is proposed. The existing post-guard child isolation code is source history, not an authorized Agent bypass.",
+    "status": "GENUINE_USER_REQUIRED_UNSUPPLIED",
+    "wrapper": "Entire startup_admission.rs, including ScriptedDaemon and all local helper bodies, is byte-identical cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786. isolated():20\u201363 asserts var_os(CAGENTS_AGENT_AUTHORITY).is_none() before child-marker handling, private-directory construction or its existing isolation implementation. Marker alone cannot bypass refusal."
+  },
+  "additional_graph_and_helper_conservation": {
+    "Cargo.toml": {
+      "bytes": 13087,
+      "equal_aeb": true,
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    "src/agent_execution.rs": {
+      "bytes": 25326,
+      "equal_aeb": true,
+      "sha256": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452"
+    },
+    "src/app/chat_ui/managed_image_retention_test_support.rs": {
+      "bytes": 6689,
+      "equal_aeb": true,
+      "sha256": "002326f9d31c49023f4d725c3683db76087db6d1f4df6849076f59a7ba7a7a89"
+    },
+    "src/app/startup_gate.rs": {
+      "bytes": 28748,
+      "equal_aeb": true,
+      "sha256": "23d8352efad668d26c9f953ecc077ced5a3fd186dfea6ffbbe7f00ae9911e0b0"
+    },
+    "src/modules.rs": {
+      "bytes": 4143,
+      "equal_aeb": true,
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+    }
+  },
+  "changed_reached_seams_only": [
+    {
+      "anchors": [
+        "src/app/shared_views.rs:2383",
+        "src/app/shared_views.rs:2859",
+        "src/app/workspace_model_sync.rs:569",
+        "src/app/chat_ui.rs:7184",
+        "src/app/chat_ui.rs:7693"
+      ],
+      "assessment": "New settle/refusal/projection hooks search retained native-return operations. The original52 selected bodies do not initiate a native Switch/return issuance operation; their initialized maps remain empty. These hooks therefore add no live caller/cleanup authority or genuine-User prerequisite to the old47 paths. This is a bounded reachability check, not another full return/API review.",
+      "seam": "Native Return/issued cleanup bookkeeping in ordinary reconciliation"
+    },
+    {
+      "anchors": [
+        "src/app/chat_ui.rs:8202",
+        "src/app/chat_ui.rs:8211",
+        "src/app/channel_ui.rs:11",
+        "src/control/caller_context.rs:21",
+        "src/control/caller_context.rs:51"
+      ],
+      "assessment": "begin_chat_close now captures and forwards the existing caller; q early dismissal still precedes native close/return selection. The User5 removal parent explicitly drives the q routes (startup_admission.rs:3508\u20133524), and the mixed parent refuses invalid retry/delete before effects (3135\u20133149). Ordinary source presence is preserved by authenticated close_sessions_as fallback; it is never silently changed to User. No new User-only entry assertion is introduced into old47. For actual public-client User5 fixture bodies the original genuine-User guard already dominates execution.",
+      "seam": "Captured CallerContext on close/fallback"
+    },
+    {
+      "anchors": [
+        "src/app/terminal_adoption.rs:301",
+        "src/app/chat_ui.rs:7098",
+        "src/app/chat_ui.rs:13347"
+      ],
+      "assessment": "New native-return pending and issued unresolved checks do not mint authority. With no native Return in the selected original52, they do not manufacture a new pending issuance or caller route. Existing matched proof/seed/raw admission remains separately protected; this note does not re-audit it.",
+      "seam": "Adoption and pending return guards"
+    },
+    {
+      "anchors": [
+        "src/control.rs:1336",
+        "src/control.rs:5972",
+        "src/host/state.rs:2015",
+        "src/host/state.rs:5059"
+      ],
+      "assessment": "The selected owning bodies and direct startup_state methods are byte-equal to aeb despite surrounding new API fields/variants. The new caller export/empty issued-host bookkeeping adds no User gate to those selected paths. No full API14 semantics or physical effect re-review is claimed.",
+      "seam": "Original CLI/HOST parent helpers"
+    }
+  ],
+  "direct_helper_function_conservation": [
+    {
+      "bytes": 1734,
+      "current_line": 20,
+      "equal_aeb": true,
+      "function": "isolated",
+      "path": "src/app/shared_views/tests/startup_admission.rs",
+      "sha256": "fd80ae8235a56bfaf1cd614190c2136a6a0d445d0142fbefdd4b3c01d7f38001"
+    },
+    {
+      "bytes": 114,
+      "current_line": 378,
+      "equal_aeb": true,
+      "function": "settle",
+      "path": "src/app/shared_views/tests/startup_admission.rs",
+      "sha256": "5927179543752b38fdb60ce7a4219c99f00c61fd8bd614f65066a7472d975e53"
+    },
+    {
+      "bytes": 2913,
+      "current_line": 382,
+      "equal_aeb": true,
+      "function": "settle_observing",
+      "path": "src/app/shared_views/tests/startup_admission.rs",
+      "sha256": "14c7e8efa8ae9275dc1525239d5cf228bb490693e8095034c09fc9ecb105d0d4"
+    },
+    {
+      "bytes": 2308,
+      "current_line": 448,
+      "equal_aeb": true,
+      "function": "cached_chat",
+      "path": "src/app/shared_views/tests/startup_admission.rs",
+      "sha256": "f051b26c4be594172abcf6a39361d53243dd9eca7d780ab15198768edab4836d"
+    },
+    {
+      "bytes": 7160,
+      "current_line": 2986,
+      "equal_aeb": true,
+      "function": "mixed_managed_saved_scope",
+      "path": "src/app/shared_views/tests/startup_admission.rs",
+      "sha256": "b47aaa20de82bc4caf4fa8064aa338ebd32f3f0aba30295615c410d4e3ba7ead"
+    },
+    {
+      "bytes": 9541,
+      "current_line": 29458,
+      "equal_aeb": true,
+      "function": "context_inspector_test_app",
+      "path": "src/app.rs",
+      "sha256": "0549d185d22e4c6748ed1935182eaa0acf336078fe2ba0469d08440840ee96f2"
+    },
+    {
+      "bytes": 319,
+      "current_line": 1336,
+      "equal_aeb": true,
+      "function": "startup_state",
+      "path": "src/control.rs",
+      "sha256": "738d8ee9faeca0e6c6b5b975688955d5cee292dd09bffa33000b5ae32355bb37"
+    },
+    {
+      "bytes": 417,
+      "current_line": 2015,
+      "equal_aeb": true,
+      "function": "startup_state",
+      "path": "src/host/state.rs",
+      "sha256": "848feac50f6b69c34fa7d9d1ab04f273f76e9743c1bb43ff35f29ae5fa2e74d7"
+    }
+  ],
+  "future_qualification_inputs": {
+    "full52": "Required source-selected union remains CLI1/HOST6/UI45=52, with every exact owning parent counted once. This note does not combine results from origins or retarget old outcomes. Compile and caller-source applicability alone cannot qualify FULL52.",
+    "genuine_User5": "A genuinely legitimate User producer/context and separately admitted existing UI-lib invocation, fresh compiled f95 inventory of all five exact names, and original causal child/body outcomes are missing. No such producer or caller environment was probed or constructed by this review.",
+    "graph": "Existing --lib target, --locked --no-default-features CLI; separate --features host HOST; separate --features ui UI. Cargo.toml/modules.rs remain exact. app gatedui18\u201319, host gatedhost73\u201374, persistence97\u201398, session115\u2013116; shared test modules now3409\u20133410, startup gate modules716/719. Never union ui+host.",
+    "ordinary47": "The exact47 list remains source-compatible with an otherwise legitimately admitted inherited Agent caller; retain actual inherited opaque authority. Fresh current-f95 artifact/test inventory and original exact owning outcomes in CLI1/HOST6/UI40 are still required under the existing maintained qualification process, not supplied here.",
+    "scheduler": "Default outer Rust scheduler; no --test-threads override or startup/User context wrapper for ordinary parents. Genuine User5 use only their already existing lawful guarded fixture path after legitimate admission.",
+    "separate_scopes": "The new UI5 consumer source/caller receipts remain separate. This original52 addendum creates no extra parent, combined packet, framework, authority carrier or result credit. Current native8 suppliers, physical API effect qualification, original WHOLE/qclosed/general outcomes and RootSearch/other producers are not reviewed or satisfied here."
+  },
+  "genuine_User5": [
+    {
+      "body_equal_aeb": true,
+      "caller_partition": "genuine_User",
+      "current_line": 2552,
+      "function_bytes": 14016,
+      "function_sha256": "ff1f5c88ed8ff15abe192f883a2dab750100eea73998dea8c21d71e95b98245f",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::stale_closed_managed_source_cannot_seed_close_its_current_canonical_successor",
+      "path": "src/app/shared_views/tests/startup_admission.rs"
+    },
+    {
+      "body_equal_aeb": true,
+      "caller_partition": "genuine_User",
+      "current_line": 3167,
+      "function_bytes": 461,
+      "function_sha256": "768c3b836e313a7b344906732d756478685420eed221f33c20e41e8b1e5be93c",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::active_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "path": "src/app/shared_views/tests/startup_admission.rs"
+    },
+    {
+      "body_equal_aeb": true,
+      "caller_partition": "genuine_User",
+      "current_line": 3181,
+      "function_bytes": 462,
+      "function_sha256": "f9f684a9d924521f2d57cedb4a5444bcf1b79f9a39d8cb49e02017af30aef02b",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::hidden_mixed_managed_saved_scope_recovers_healthy_panes_only",
+      "path": "src/app/shared_views/tests/startup_admission.rs"
+    },
+    {
+      "body_equal_aeb": true,
+      "caller_partition": "genuine_User",
+      "current_line": 3436,
+      "function_bytes": 5674,
+      "function_sha256": "3fa1e3927c06e699cbc0c2024f3006d4028fedaa57dbfb507cea9237c0bbb056",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::quarantined_chat_remove_routes_never_contact_or_close_the_inventory_owner",
+      "path": "src/app/shared_views/tests/startup_admission.rs"
+    },
+    {
+      "body_equal_aeb": true,
+      "caller_partition": "genuine_User",
+      "current_line": 1097,
+      "function_bytes": 16960,
+      "function_sha256": "ef0d45bdc21cd568a754522a00587922556d6b61e2762db4ab93611a852775e1",
+      "graph": "ui",
+      "name": "app::shared_views::tests::startup_admission::mixed_saved_scope_keeps_an_image_draft_through_peer_options_and_chooser_cancel",
+      "path": "src/app/shared_views/tests/startup_admission.rs"
+    }
+  ],
+  "inputs": [
+    {
+      "bytes": 24100,
+      "path": "/tmp/aeb1345d-52-parent-caller-admission-source-classification-v1.json",
+      "sha256": "315693dcdebbb93dee644e5fb05c192acfe6e6ad44a225d3ea128ad2b8f6a258"
+    },
+    {
+      "bytes": 25829,
+      "path": "/tmp/held-saved-scope-fw16-evidence/aeb1345d-final-owning-test-parent-selection-refresh-v2.json",
+      "sha256": "a9e7092ee0982f13076b94fb1cf422cac7c46dd3419df93a67c376dc5db499ef"
+    },
+    {
+      "bytes": 13153,
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-independent-authority-caller-correction-source-review-v1.json",
+      "sha256": "1e1e872f25d98db457c3947fe6919993b13479bf24f9f7b125c33489c1118e1a"
+    },
+    {
+      "bytes": 8772,
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-three-fixture-parent-inherited-caller-source-classification-addendum-v1.json",
+      "sha256": "cd719e229d0b1d8687157ff9fd3c25d626ae7a2e5b905d55175e33a3a87775b3"
+    }
+  ],
+  "limits": {
+    "PR1933": "NEVER_MERGE",
+    "User5_FULL52_native_WHOLE_qclosed_general": "HOLD / UNQUALIFIED",
+    "actions": "No source/controller/refs/public edit, test/build/Cargo/rustc/formatter, import/eval/reviewed helper/Task/native/provider/API, environment/authority/account/model/process/cache/target/resource probe, original RAW/run/artifact review or new worker. Sole write is this exclusive0444 source evidence note.",
+    "actual_N": null,
+    "actual_artifact": null,
+    "actual_caller_context": null,
+    "actual_grant": null,
+    "actual_inventory": null,
+    "actual_results": null,
+    "actual_run": null,
+    "current_Rust_native": "UNRUN",
+    "merge_ready": false,
+    "not_repeated": "Unchanged protected production, API14 physical effects and new UI5 semantics are not re-audited. All old actual results stay at their old tuples.",
+    "qualified": false,
+    "queued": false
+  },
+  "reviewer": "/root/authority_regressions",
+  "schema": "main15-f95df2da-original52-caller-partition-source-applicability-addendum-v1",
+  "selected_source_file_conservation": {
+    "src/app/shared_views.rs": {
+      "aeb_sha256": "479e109e2e905766a6ca488e4cf2e414ac2df84ece49ae5e198d28989eacfb61",
+      "f95_sha256": "d9947f67e380f6c2df5aaab1a431f8c3df396bf380abf8eb4418982902b7af7f",
+      "whole_file_equal": false
+    },
+    "src/app/shared_views/tests/startup_admission.rs": {
+      "aeb_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "f95_sha256": "cecfd16947b4a35a29e1727fdaaca4ded333da9394c42eae28ba78fb50c91786",
+      "whole_file_equal": true
+    },
+    "src/app/shared_views/tests/startup_terminals.rs": {
+      "aeb_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "f95_sha256": "9466d3a49ee881da643a31b5a890825911a7a596461da4b66a2b98e81f66e9a7",
+      "whole_file_equal": true
+    },
+    "src/app/startup_gate/attachment_tests.rs": {
+      "aeb_sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "f95_sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+      "whole_file_equal": true
+    },
+    "src/app/startup_gate/tests.rs": {
+      "aeb_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "f95_sha256": "108cc58f5ce42fb57af53a5a12231f52fe93acaea3e6fc895a3a53f3274ea60b",
+      "whole_file_equal": true
+    },
+    "src/control.rs": {
+      "aeb_sha256": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+      "f95_sha256": "d97de738f68015b2567b24b6a98805bc51d086def3f8b6f806dad87dfeacca02",
+      "whole_file_equal": false
+    },
+    "src/host/state.rs": {
+      "aeb_sha256": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "f95_sha256": "75c491970e9ca48259a9d0525a8f71650d4fd517ebac47b39eb118209d9023b6",
+      "whole_file_equal": false
+    },
+    "src/persistence.rs": {
+      "aeb_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "f95_sha256": "1d8911f339293b1cd8414c4af19d0adfb26ff000da42a8217e59b4855000e5df",
+      "whole_file_equal": true
+    },
+    "src/session.rs": {
+      "aeb_sha256": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+      "f95_sha256": "2395aad8ac72fcf7654873e8f2ce8ecc8baf6a0161f4a6e777f614e4c01e0052",
+      "whole_file_equal": true
+    }
+  },
+  "selection_join": {
+    "all52_names_equal_maintained_map": true,
+    "all52_owning_function_spans_byte_equal": true,
+    "census_sorted_JSON_sha256": "ba2241248b76c965d3eca39eedd0ca58d60ceb173b77e1e482b92b11b2e70e41",
+    "count_unit": "Actual exact owning full test parent; mode loops, helper checks, child invocations and nested controls are nonadditive.",
+    "full_graphs": {
+      "cli": 1,
+      "host": 6,
+      "ui": 45
+    },
+    "genuine_User5_graphs": {
+      "cli": 0,
+      "host": 0,
+      "ui": 5
+    },
+    "map_fields": "Root35_full_names_and_current_positions + Main15_remaining17_full_names_and_current_positions in the exact a9e7092e map; caller partitions from exact315693dc.",
+    "ordinary47_graphs": {
+      "cli": 1,
+      "host": 6,
+      "ui": 40
+    },
+    "position_only_refresh": [
+      {
+        "current_at": "src/control.rs:5972",
+        "name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+        "old_at": "src/control.rs:5943"
+      },
+      {
+        "current_at": "src/host/state.rs:5059",
+        "name": "host::state::tests::startup_state_is_answered_while_startup_recovery_refuses_other_requests",
+        "old_at": "src/host/state.rs:5037"
+      },
+      {
+        "current_at": "src/app/shared_views.rs:3488",
+        "name": "app::shared_views::tests::quarantined_terminal_refuses_the_unattached_restore_fallback",
+        "old_at": "src/app/shared_views.rs:3299"
+      }
+    ],
+    "unique_parents": 52
+  },
+  "source": {
+    "current_adoption": "Parent reports source adopted/published only; this note neither repeats that operation nor infers execution.",
+    "current_head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "current_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "from_head": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "from_tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "method": "Immutable Git object reads/diffs, inert sealed JSON, own static lexical function-span and byte/hash comparison. No reviewed code/module/helper/Task evaluation."
+  },
+  "utc": "2026-10-31T16:58:01.388969+00:00",
+  "verdict": "ORIGINAL52_SOURCE_SELECTION_AND_47_5_CALLER_PARTITION_APPLICABLE_TO_EXACT_F95; GENUINE_USER5_FULL52_NATIVE_WHOLE_HOLD; NO_EXECUTION_TRANSFER"
+}

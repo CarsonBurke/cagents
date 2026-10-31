@@ -1,0 +1,138 @@
+{
+  "schema": "main15-operation-trait-independent-conservation-review/v1",
+  "created_utc": "2026-10-31T19:22:25.316384+00:00",
+  "reviewer": "/root/1892_ready_attachment_review",
+  "verdict": "BOUNDED_CONSERVATION_CLEAR",
+  "scope": "Independent nonauthor exact-source conservation only; correctness/type resolution assigned1239. Author ledger treated as input and checked against actual Git bytes, not inherited as independent proof.",
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "sole_parent": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+  "parent_tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+  "branch": "fix/fw16-return-operation-trait-main15",
+  "source": {
+    "path": "src/app/chat_ui.rs",
+    "sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+    "bytes": 1419021,
+    "mode": "100644",
+    "git_blob": "012698f59a96bfb0639bd95a710646ea829afcda"
+  },
+  "freeze": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-single-import-source-freeze-v1.json",
+    "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd"
+  },
+  "exact_patch": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-exact-single-import-diff-v1.patch",
+    "sha256": "8bdfa3f37fa5bf5b9dd4482872bb0600676b5dd6657c889ce342184f630b7c48",
+    "bytes": 480,
+    "equals_actual_Git_diff": true,
+    "hunks": 1,
+    "strict_forward_and_inverse_bytes_exact": true
+  },
+  "tree_conservation": {
+    "parent_entries": 2231,
+    "successor_entries": 2231,
+    "changed_only": [
+      "src/app/chat_ui.rs"
+    ],
+    "outside_entries_mode_type_blob_exact": 2230,
+    "every_entry_mode_type_unchanged": true,
+    "all_outside_guard_canonical_wire_API_features_dependency_paths_exact": true
+  },
+  "same_file_conservation": {
+    "changed_function": "tab_mounted_return_control",
+    "change": "helper-local cfg(test) widget import adds Operation only",
+    "helper_before": {
+      "offset": 1356282,
+      "name": "tab_mounted_return_control",
+      "bytes": 4517,
+      "sha256": "507b05533cd308dce4bcfb054adaab158bcc553fab66da84cf704a8aacbc5dbb"
+    },
+    "helper_after": {
+      "offset": 1356282,
+      "name": "tab_mounted_return_control",
+      "bytes": 4528,
+      "sha256": "95dc043295d53527225dd674c958a6c5f05a3c003c419c617ce2f8956d92e847"
+    },
+    "whole_file_before_and_after_helper_exact": true,
+    "helper_inverse_exact": true,
+    "production_prefix_before_cfg_test_mod_bytes": 599012,
+    "production_prefix_sha256": "f699e1f107bd978d15986c9aec444b5ab1550300f23ee6c94c4657ccf9bc16b3",
+    "author_shorter598988_prefix_also_exact": true,
+    "claimed_unchanged_function_spans_directly_hash_located_unique_source_slices": 730,
+    "owning_test_parent_names_count_and_unchanged_span_membership_verified": 286,
+    "new_functions_or_tests": 0,
+    "proof_method": "Exact whole-file one-hunk inverse is decisive;730 author-listed full-function slices and286 test-parent memberships were independently joined to actual immutable source bytes. No Rust parser/compiler/helper execution."
+  },
+  "trait_dependency_source_pins_exact": {
+    "vendor/iced-core/src/widget.rs": {
+      "sha256": "7b0db7c4bcc3cea24a4482399732b5e6b9a7cfcd5a027886d265a3fef247286a",
+      "bytes": 4989
+    },
+    "vendor/iced-core/src/widget/operation.rs": {
+      "sha256": "bd70da7d8867aeab6953794e00dc8adcced21557aeffa0cb12e7952c69a06a7c",
+      "bytes": 15371
+    }
+  },
+  "source_only_original_checks": [
+    {
+      "command": "scripts/check-format",
+      "original_exit_recorded_by_freeze": 0,
+      "original_tool_chunk": "1e7de7",
+      "rerun_here": false,
+      "logs": [
+        {
+          "path": "/tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stdout-v1.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        },
+        {
+          "path": "/tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stderr-v1.log",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "bytes": 0
+        }
+      ]
+    },
+    {
+      "command": "git diff --check",
+      "original_exit_recorded_by_freeze": 0,
+      "original_tool_chunk": "84cfa0",
+      "rerun_here": false
+    }
+  ],
+  "check_evidence_limit": "Original formatter/diff exit0 and tool chunks are recorded by hashed author freeze; actual empty formatter stream bytes were verified. No formatter/build/test rerun or independent process-exit observation is inferred from empty logs.",
+  "author_ledger": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-function-conservation-v1.json",
+    "sha256": "d959b0214a49aaeb8493cd4d1b59c74d69f4ef3caa78b9a950c5f5bcbd80b555",
+    "role": "Input only; independent source-byte joins performed here."
+  },
+  "diagnostic_history": {
+    "original_freeze_NULL_unchanged": true,
+    "later_addendum": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-original-bb8-E0599-diagnostic-neighbor-source-binding-addendum-v1.json",
+      "sha256": "92832731f3d2f00142e8d3473f1f85a5578c6166f5a2fa12eada0f18b265d4fe",
+      "created_utc": "2026-10-31T19:16:52.576233+00:00"
+    },
+    "chronology_verified": true,
+    "scope": "Later additive diagnostic binding only. No original Cargo/RAW log opened or whole RAW re-audit; semantics reviewer owns diagnostic/correctness assessment."
+  },
+  "findings": [],
+  "before_after_pins": {
+    "actual_HEAD_tree_parent_branch_unchanged": true,
+    "tracked_and_untracked_status_empty": true,
+    "physical_changed_leaf_equals_Git": true,
+    "freeze_patch_and_addendum_bytes_unchanged": true
+  },
+  "runtime": {
+    "successor_compile": null,
+    "successor_test": null,
+    "successor_native": null,
+    "actual_grant": null,
+    "publication": null
+  },
+  "limits": [
+    "Old bb8 negative9475 and all five UNRUN test selections remain separate immutable history; no pass/grant transfer.",
+    "This receipt is not correctness/typecheck/UX/native/WHOLE/qclosed/return-custody approval.",
+    "No source edit, candidate evaluation/import, Cargo/test/build/formatter/helper/native/provider or environment/account/process/cache/resource/API probe or write, message or child.",
+    "Parent reports Cda76 is installer-only; no availability/allocation or grant inferred."
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "kind": "original-formatter-request-physical-toolchain-evidence-gap-addendum-v1",
+  "status": "PHYSICAL_RUST_1_93_FORMATTER_SELECTION_NOT_ESTABLISHED",
+  "head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+  "tree": "c0c42d3153033da826b05736673b38e57449bee4",
+  "parent_freeze": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/92b8ede4-return-operation-trait-single-import-source-freeze-v1.json",
+    "bytes": 8301,
+    "sha256": "8444f3bc8b2fd58dd237a113e7d8d0651becee8ab9419885a3834fd709a865dd",
+    "mode": "0444"
+  },
+  "created_utc": "2026-10-31T19:24:08.576385+00:00",
+  "actual_original_request": {
+    "tool": "tools.exec_command (within functions.exec Promise.allSettled)",
+    "arguments": {
+      "cmd": "set -C\nscripts/check-format > /tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stdout-v1.log 2> /tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stderr-v1.log",
+      "workdir": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-operation-trait-main15",
+      "max_output_tokens": 2000,
+      "yield_time_ms": 10000
+    },
+    "explicit_toolchain_argument": null,
+    "explicit_toolchain_executable_path": null,
+    "explicit_PATH_binding": null,
+    "explicit_environment_override": null,
+    "shell_argument": "omitted; no actual shell/toolchain/PATH observation is inferred from defaults"
+  },
+  "actual_original_result": {
+    "tool_chunk": "1e7de7",
+    "exit_code": 0,
+    "wall_time_seconds": 8.273683757,
+    "stdout_tool_bytes": 0,
+    "stderr_tool_bytes": 0,
+    "retained_original_output": [
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stdout-v1.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "0444"
+      },
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/main15-operation-trait-official-format-stderr-v1.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "0444"
+      }
+    ]
+  },
+  "source_binding": {
+    "formatter_time_checkout_HEAD": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "formatter_time_source_state": "Single approved helper-local Operation import applied, still uncommitted; source SHA observed before formatter and committed afterward without further product source writes.",
+    "frozen_successor_head": "92b8ede47f2a31c41628edfb9b934bdbecc262d8",
+    "frozen_successor_tree": "c0c42d3153033da826b05736673b38e57449bee4",
+    "changed_source_path": "src/app/chat_ui.rs",
+    "changed_source_sha256": "d4e2bc551f887083ab8cdc2cf80b4ca3a5998d3979bb0fbe33b3a69fe935c474",
+    "binding_limit": "Binds the retained formatter invocation to the successor source bytes, not a claim that formatter-time Git HEAD was already the successor."
+  },
+  "precise_gap": [
+    "The original invocation was scripts/check-format with no explicit Rust1.93 executable/toolchain selection or PATH binding recorded.",
+    "An inherited toolchain may have supplied the formatter, but its physical version/path/resolution was not observed. No actual Rust1.93 selection is established by the exit0 or empty output.",
+    "Repository pins, current environment/toolchain state and tool defaults are not substituted for original physical observations.",
+    "The preserved result supports official script-format exit0 on the frozen source bytes only; it does not satisfy an explicit physical Rust1.93 formatter evidence requirement."
+  ],
+  "physical_toolchain": {
+    "rust_version": null,
+    "rustfmt_path": null,
+    "rustfmt_version": null,
+    "cargo_path": null,
+    "cargo_version": null,
+    "PATH": null,
+    "selection_observed": false
+  },
+  "boundaries": [
+    "Author evidence completion only, no independent approval or waiver.",
+    "No formatter/Cargo/build/test/native/runtime rerun; no current toolchain/environment/process/resource probe.",
+    "No product/controller/old-freeze mutation or review activation. Existing runtime/results/grant remain unchanged and UNRUN/HOLD."
+  ]
+}

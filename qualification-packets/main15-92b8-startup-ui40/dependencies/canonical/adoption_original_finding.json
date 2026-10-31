@@ -1,0 +1,204 @@
+{
+  "schema": "bounded-source-custody-review-v1",
+  "created_utc": "2026-10-31T11:12:25.090022+00:00",
+  "reviewer": {
+    "task": "/root/1945_cache_io_oracles",
+    "role": "independent read-only source reviewer for the prospective adopted-child signaling branch",
+    "implementation_authorship": "No changes authored for this audit; historical packet source authorship disclosed",
+    "runtime_authority": "None; no grant, release, native qualification or running-lane decision supplied"
+  },
+  "scope": "Only RootB settle_children adopted-child signal authority, direct callers/handoff guards, immutable donor conservation, and one pinned helper-backed source reachability chain. Not a whole controller/custody review.",
+  "disposition": "SOURCE_BLOCKER_FOR_REUSE_WITH_UNPROVEN_ADOPTED_HELPER_OR_PROVIDER_DESCENDANTS",
+  "pins": {
+    "controller": {
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup30-stable-source",
+      "commit": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+      "tree": "f7ebf371b7005f7ee7eb6de11228a26909ce4a64",
+      "path": "qualification-packets/startup30/run-packet.py",
+      "blob_oid": "39195ac75bc021704457e116ab79a8ce536b68a0",
+      "sha256": "568d1be8a353cc5789bf7e76482fda9df4fbf62d3f3d4439431de7f9beff69ca",
+      "physical_source_equal_frozen_blob": true
+    },
+    "immutable_donor": {
+      "controller_commit": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+      "path": "qualification-packets/startup30/dependencies/donor_runner.py",
+      "blob_oid": "1b5dcffadbd08f2079788d79b2b986abf0492249",
+      "sha256": "f820d314bda28a4e183a50ace3b05fb4ca0506d12ebb6b41bfdb868039a497ae"
+    },
+    "custody_reference": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-issue2002-host-driver/scripts/qualification/process_custody.py",
+      "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+      "reference_only": true
+    },
+    "future_helper_plan": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-issue2025-private-roots-host-source/qualification-packets/issue2025-grouped-host/plan.json",
+      "sha256": "e4a3b455597d253bc36b9c52d698d7b7d8abca1b432d561143a75ff625f40ebc",
+      "product_head": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386",
+      "product_tree": "e183cf12a1f1546182192f29290e6ad805e913f1",
+      "group": "host-lib",
+      "filters": [
+        "upgrade",
+        "retained",
+        "restore",
+        "native_recovery"
+      ],
+      "selected_example_names": [
+        "host::chat::retained_actor_tests::committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment",
+        "host::chat::retained_actor_tests::failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment"
+      ],
+      "execution_not_inferred_from_plan": true
+    },
+    "product_source": {
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-upgrade-fixture-private-roots",
+      "commit": "0fa5f2d09a945eaeb82bc06cd898e976dcad4386",
+      "tree": "e183cf12a1f1546182192f29290e6ad805e913f1",
+      "files": [
+        {
+          "path": "src/host/chat/retained_actor_tests.rs",
+          "sha256": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658",
+          "blob_oid": "f136959230e3a02fbd95e0975401e18141bfb266"
+        },
+        {
+          "path": "src/chat/runtime/retained_actor/transport.rs",
+          "sha256": "da1229f89a0920f24a0ea72ee241ccf558e52bd4d9811ba025db014c04903054",
+          "blob_oid": "458d24d90c9c0b81c0d5935f0313b3e762606153"
+        },
+        {
+          "path": "src/host/chat.rs",
+          "sha256": "2992394628c2b27565abcfba9f9c5e33ba41597291af8fce1705e726ca14c838",
+          "blob_oid": "e2fdeae4cf08c21a52e8bba396b5a0206cc64269"
+        }
+      ]
+    }
+  },
+  "finding": {
+    "id": "ADOPTED-SIGNAL-AUTHORITY-1",
+    "severity": "Safety/source admission blocker for the prospective helper/provider lanes; no actual incident asserted",
+    "primary_anchor": "run-packet.py:225-269, specifically new pidfd251 / recheck253 / SIGKILL254",
+    "actual_guard_fields": {
+      "children": "pid, start ticks, state; current parent must equal current controller PID (213-222)",
+      "pre_signal": "New pidfd_open(current numeric PID), then any current children row with matching numeric PID and recorded start tick",
+      "not_checked": "No original PROCESS_STATES membership, original descendant Popen/retained descriptor, managed closure proof or provider permission is checked in settle_children"
+    },
+    "causal_branch": [
+      "Controller establishes PR_SET_CHILD_SUBREAPER before its source/check/test subprocesses (1075).",
+      "After original phase wait/timeout handling, run always invokes settle_children (1150); final_observations invokes it twice (807-831); prelease-error cleanup also invokes it (1080).",
+      "If a live adopted child remains after three seconds, remaining becomes observed and the next loop opens a new pidfd for every such child (241-251).",
+      "The only identity test before SIGKILL is a current child row with matching pid/start; no recorded management authority is joined (253-254).",
+      "forced becomes true before the loop; later fail/handback rejection cannot prevent or undo that signal."
+    ],
+    "why_pidfd_is_insufficient": "The newly acquired pidfd and current-parent/start checks target a present incarnation. They do not establish retained original per-descendant custody or permission to kill an unknown provider descendant. Process ancestry, empty/admitted workload intent, private fixture roots and names are not a replacement for that permission.",
+    "current_source_inheritance": "signal_pidfd, children, settle_children, observed_wait, safe_lane_handoff and final_observations are byte-exact to the pinned immutable donor snapshot. This defect is inherited by the copied controller, not introduced by the terminal error-preview correction or B9 new native producer leaves."
+  },
+  "bounded_reachability": {
+    "selected_examples": [
+      "host::chat::retained_actor_tests::committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment",
+      "host::chat::retained_actor_tests::failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment"
+    ],
+    "fixture_anchors": [
+      "retained_actor_tests.rs:39-118 launches the same-test executable as a private self-child and inherits only the opaque authority/helper exceptions; 126-130 retains original child result evidence.",
+      "retained_actor_tests.rs:146-205 installs a private fixture provider, creates a Claude session and calls start_execution; 207-210 obtains the real actor identity.",
+      "retained_actor/transport.rs:790-814 creates the helper command and setsid; 830-857 creates an original helper reaper thread and spawns the helper; 3251-3264 selects the explicit same-head test helper.",
+      "retained_actor_tests.rs:216-232 attempts managed original-owner close, but an error is only reported as cleanup unconfirmed. It is not a parent/controller permission grant.",
+      "retained_actor_tests.rs:1444-1487 writes the actual private Python provider fixture; it reads stdin repeatedly and does not exit after the successful turn.",
+      "retained_actor_tests.rs:418-426 positively requires original provider/helper termination on the intended successful path."
+    ],
+    "condition_for_generic_branch": "If an intermediary libtest/self-child/helper exits while a descendant remains alive and reaches this controller as its subreaper child, the generic current-parent/start branch admits it for SIGKILL after the grace period. Phase timeout/failed or unconfirmed fixture cleanup can leave this condition unresolved. This is source-feasible, not evidence that these tests actually left a descendant or that the current running packet did so.",
+    "normal_fixture_cleanup": "The successful owning fixture path has its own exact identity/managed close and positive owner-death assertions. Those remain the correct owner; the generic controller does not consume their proof."
+  },
+  "existing_guards_and_smallest_correction": {
+    "adequate_original_direct_path": "bounded_capture77-100 and run1114-1137 retain an original Popen and its acquired child_fd, signal only that direct pidfd on timeout, and record the original Popen.wait result via observed_wait46-50. Keep this distinct direct-owner path and sticky failure handling unchanged.",
+    "post_effect_hold": "custody_clean687-690 refuses forced/remaining/inspection uncertainty; safe_lane_handoff693-709 requires clean phase custody, both final clean passes and complete original waits/evidence; 1268-1274 enters retain_uncertain_lane before C close. retain_uncertain_lane845-864 performs no new signaling, cleanup, close retry or workload. These guards preserve HOLD but are not pre-signal authorization.",
+    "minimal_source_hunk": "In settle_children at the post-grace remaining branch (roughly241-269), do not open fresh pidfds for signaling or send TERM/KILL to generically discovered/unproven adopted children. Return explicit unclean/unknown custody with the remaining observations and no signal claimed. Existing phase/final handback checks must keep the original C/process in HOLD. Keep original direct-Popen waits and already-authorized original-owner cleanup separate and unchanged.",
+    "if_retaining_descendant_cleanup": "Only a pre-existing, retained original descendant handle joined to actual applicable management authority may enter an authorized descendant signal path. No such join currently exists in this function; PID/name/executable or reparenting alone cannot create it. This audit proposes no new supervisor, API or permission flag.",
+    "reference_module_limit": "d9ee process_custody.py pin73-101 records retained node/pidfd, UID/start, discovery parent and optional role; signal_owned171-186 uses that retained pidfd and corroborates a matched daemon. But pin also admits newly adopted children from an empty-initial subreaper, and signal_owned has no general managed-provider proof join. Copying that seam or its provenance text alone does not authorize arbitrary adopted provider descendants.",
+    "review_required": "Any correction to this protected source requires a separately frozen successor, normal independent review and actual future lane admission. No edit, grant or rerun requested or performed by this report."
+  },
+  "historical_and_runtime_limits": [
+    "Historical A2 adopted sets EMPTY/no signal and the accepted bounded positive4680 are preserved as task-provided prior evidence; their raw artifacts were not reaudited here and no contrary historical cause is asserted.",
+    "RootB is reported currently running frozen347 on compiler/private-framed tests. This report did not inspect its processes, outputs, resources or C and does not alter or adjudicate that execution.",
+    "No current observed provider identity, adopted child, live failure, native behavior, descendant kill, global absence or resource-return claim is made.",
+    "No native producer/application/AX semantics or global proof requirement was reviewed. The empty-adoption normal path is not rejected by a hypothetical global-custody requirement.",
+    "Candidate/donor/reference source was never imported, invoked or evaluated. No tests, helper, Cargo, build, native/provider execution, process/FD/environment/resource/state probe, source/Git mutation, GitHub write or extra worker was used."
+  ],
+  "conserved_function_source_comparison": [
+    {
+      "function": "signal_pidfd",
+      "byte_exact_to_immutable_donor": true,
+      "sha256": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679",
+      "runner_lines": [
+        205,
+        210
+      ],
+      "donor_lines": [
+        203,
+        208
+      ]
+    },
+    {
+      "function": "children",
+      "byte_exact_to_immutable_donor": true,
+      "sha256": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460",
+      "runner_lines": [
+        213,
+        222
+      ],
+      "donor_lines": [
+        211,
+        220
+      ]
+    },
+    {
+      "function": "settle_children",
+      "byte_exact_to_immutable_donor": true,
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+      "runner_lines": [
+        225,
+        269
+      ],
+      "donor_lines": [
+        223,
+        267
+      ]
+    },
+    {
+      "function": "observed_wait",
+      "byte_exact_to_immutable_donor": true,
+      "sha256": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0",
+      "runner_lines": [
+        46,
+        50
+      ],
+      "donor_lines": [
+        44,
+        48
+      ]
+    },
+    {
+      "function": "safe_lane_handoff",
+      "byte_exact_to_immutable_donor": true,
+      "sha256": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329",
+      "runner_lines": [
+        693,
+        709
+      ],
+      "donor_lines": [
+        720,
+        736
+      ]
+    },
+    {
+      "function": "final_observations",
+      "byte_exact_to_immutable_donor": true,
+      "sha256": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a",
+      "runner_lines": [
+        807,
+        831
+      ],
+      "donor_lines": [
+        824,
+        848
+      ]
+    }
+  ]
+}
