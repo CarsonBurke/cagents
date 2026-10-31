@@ -63,6 +63,8 @@ pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
+    /// The daemon answered this window without a shared model to give.
+    pub(super) registry_unavailable: bool,
     baseline: HashMap<Scope, Vec<Pane>>,
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
@@ -90,6 +92,13 @@ pub(super) struct State {
 }
 
 impl State {
+    /// Whether an edit to `card`'s pane is waiting for the registry.
+    pub(super) fn has_pending_update(&self, card: CardId) -> bool {
+        self.pending
+            .iter()
+            .any(|(_, _, change)| matches!(change, Change::Update { pane, .. } if pane.id == card))
+    }
+
     pub(super) fn requested_transfer_card(&self, operation: uuid::Uuid) -> Option<CardId> {
         self.requested_transfers.get(&operation).copied()
     }
@@ -340,6 +349,22 @@ impl Cagents {
         })
     }
 
+    /// Whether a shared pane is still waiting to learn the registry: none is
+    /// joined yet, and the daemon has not said it has none to give.
+    pub(super) fn shared_registry_connecting(&self) -> bool {
+        self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+            && !self.shared_views.registry_unavailable
+    }
+
+    /// Whether `card` attaches as a pane of a joined registry rather than
+    /// from this window's own saved descriptor.
+    pub(super) fn attaches_as_shared(&self, card: CardId) -> bool {
+        self.shared_views.attached.contains(&card)
+            && self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+    }
+
+    /// Whether every view this window shows has been admitted by the
+    /// registry, so its panes' records are the shared ones.
     pub(super) fn shared_views_ready_for_startup(&self) -> bool {
         if self.durable.workspace_model_identity.is_none() && self.shared_views.attached.is_empty()
         {
@@ -352,6 +377,45 @@ impl Cagents {
                     && !self.shared_views.seeding.contains(scope)
                     && !self.shared_views.blocked.contains(scope)
             })
+    }
+
+    /// A queued row may attach only after its own canonical view is admitted.
+    /// The daemon still resolves this exact terminal under its current proof;
+    /// this check never compares that proof with a cached session's old proof.
+    pub(super) fn shared_terminal_ready_for_restored_attach(
+        &self,
+        card: CardId,
+        source: &TerminalSession,
+    ) -> bool {
+        if self.shared_views.defaults.contains_key(&card)
+            || self.durable.pending_terminal_creations.contains(&card)
+        {
+            return false;
+        }
+        if !self.shared_views.attached.contains(&card) {
+            return true;
+        }
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            // A daemon whose registry store is unavailable never admits the
+            // view, so its rows attach from their own descriptors as before.
+            return self.shared_views.registry_unavailable;
+        }
+        let mut owners = self.workspace_model.views.iter().flat_map(|view| {
+            view.panes
+                .iter()
+                .filter(move |pane| pane.id == card)
+                .map(move |pane| (view, pane))
+        });
+        let Some((view, pane)) = owners.next() else {
+            return false;
+        };
+        owners.next().is_none()
+            && !view.retired.contains(&card)
+            && self.shared_views.initialized.contains(&view.scope)
+            && !self.shared_views.seeding.contains(&view.scope)
+            && !self.shared_views.blocked.contains(&view.scope)
+            && !pane.pending_terminal_start
+            && matches!(&pane.kind, CardKind::Terminal(current) if current == source)
     }
 
     fn local_view_scopes(&self) -> Vec<Scope> {
@@ -1312,6 +1376,8 @@ impl Cagents {
             }
         }
         self.reproject_notification_unread();
+        // Restored shared panes queued for an attach wait for the registry.
+        tasks.push(self.attach_next_restored_agent());
         Task::batch(tasks)
     }
 
@@ -2062,6 +2128,7 @@ mod tests {
     mod history_start;
     mod published_card_edits;
     mod startup_admission;
+    mod startup_terminals;
 
     use super::*;
     use crate::model::{

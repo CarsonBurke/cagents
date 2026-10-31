@@ -2,17 +2,22 @@
 //! have actually recovered. Opening a native surface alone cannot finish an update.
 use super::*;
 
+mod retries;
+
 #[derive(Default)]
 pub(super) struct State {
     opened: Option<Instant>,
     saving: bool,
     reported: bool,
+    /// Terminals whose attach-only startup attempts ended without settling.
+    pub(super) retries: retries::Retries,
 }
 
 impl State {
     pub(super) fn window_opened(&self) -> bool {
         self.opened.is_some()
     }
+
     #[cfg(test)]
     pub(super) fn fixture_opened() -> Self {
         Self {
@@ -56,8 +61,14 @@ impl Cagents {
         // A native window opens independently of the observer/SeedView task.
         // Wait for that actual admission boundary before judging saved chats
         // or declaring a formerly shared workspace recovered.
-        let mut pending = !self.shared_views_ready_for_startup();
+        // A daemon whose registry cannot open never admits them; the panes
+        // are still qualified from their own records, and the shared
+        // workspace is then reported as not restored.
+        let registry_unavailable =
+            self.shared_views.registry_unavailable && !self.shared_views_ready_for_startup();
+        let mut pending = !self.shared_views_ready_for_startup() && !registry_unavailable;
         let mut failures = Vec::new();
+        let mut reasons = Vec::new();
         for card in self
             .durable
             .cards
@@ -68,15 +79,49 @@ impl Cagents {
                 if terminal_ended(session) || self.saved_terminal_ready(card.id) {
                     continue;
                 }
+                if self.saved_terminal_unavailable(card.id) {
+                    match self.startup_attach_exhausted(card.id) {
+                        Some(reason) => {
+                            failures.push(card.id);
+                            reasons.push(reason.to_owned());
+                        }
+                        None => pending = true,
+                    }
+                    continue;
+                }
                 match self.cards.get(&card.id) {
-                    Some(CardRuntime::Terminal(surface))
-                        if surface.terminal_id() == session.id
-                            && session.continuity.live_proof().is_some_and(|proof| {
-                                proof.is_complete() && surface.host_proof().as_ref() == Some(&proof)
-                            })
-                            && !surface.snapshot().detached => {}
+                    Some(CardRuntime::Terminal(surface)) => {
+                        let settling = self.shared_views.has_pending_update(card.id);
+                        match terminal_surface_ready(session, surface, settling) {
+                            Ok(true) => {}
+                            Ok(false) => pending = true,
+                            Err(reason) => {
+                                failures.push(card.id);
+                                reasons.push(reason);
+                            }
+                        }
+                    }
+                    Some(CardRuntime::Loading) if !self.terminal_start_in_flight(card.id) => {
+                        if let Some(reason) = self.startup_attach_exhausted(card.id) {
+                            failures.push(card.id);
+                            reasons.push(reason.to_owned());
+                        } else {
+                            pending = true;
+                        }
+                    }
                     Some(CardRuntime::Loading) | None => pending = true,
-                    _ => failures.push(card.id),
+                    Some(CardRuntime::Failed(failure)) => {
+                        failures.push(card.id);
+                        reasons.push(failure.message().to_owned());
+                    }
+                    Some(CardRuntime::Completed) => {
+                        failures.push(card.id);
+                        reasons.push("it ended while it was reconnecting".into());
+                    }
+                    Some(_) => {
+                        failures.push(card.id);
+                        reasons.push("its pane no longer holds a terminal".into());
+                    }
                 }
                 continue;
             }
@@ -107,8 +152,12 @@ impl Cagents {
             return Ok(false);
         }
         if !failures.is_empty() {
+            let reason = reasons
+                .first()
+                .map(|reason| format!(" A terminal reported: {}.", startup_detail(reason)))
+                .unwrap_or_default();
             return Err(format!(
-                "recovery-incomplete: {} saved panes could not reconnect (panes {}). Open the affected panes and use their recovery controls. Their drafts and recovery evidence are retained; this window remains available.",
+                "recovery-incomplete: {} saved panes could not reconnect (panes {}).{reason} Open the affected panes and use their recovery controls. Their drafts and recovery evidence are retained; this window remains available.",
                 failures.len(),
                 failures
                     .iter()
@@ -118,23 +167,54 @@ impl Cagents {
                     .join(", ")
             ));
         }
+        if registry_unavailable {
+            return Err(format!(
+                "recovery-incomplete: saved panes reconnected, but the shared workspace could not be restored because {}. This window remains available with its own saved layout; the update has not been verified.",
+                crate::workspace_model::REGISTRY_UNAVAILABLE
+            ));
+        }
         Ok(true)
     }
 
     /// Qualification attaches retained owners without waking their offscreen
     /// rendering surface or replaying a terminal launch recipe.
+    ///
+    /// It runs on every check until the gate settles: a shared view projects
+    /// its panes only once the registry admits it, and can replace a pane's
+    /// session afterwards. An attempt that ends detached, or a saved pane
+    /// whose inspection could not verify its owner, is tried again until its
+    /// refusal stops changing; the check then reports it.
     pub(super) fn qualify_startup_terminals(&mut self) -> Task<Message> {
+        // Until then a shared pane's descriptor is a cache that opening the
+        // card would not attach either.
+        if !self.shared_views_ready_for_startup() && !self.shared_views.registry_unavailable {
+            return Task::none();
+        }
+        let mut inspections = Vec::new();
         for card in &self.durable.cards {
-            if card.existence.is_open()
-                && matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
-                && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
+            if !card.existence.is_open()
+                || !matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
+                || self.terminal_start_in_flight(card.id)
+                || !self.startup_attach_may_retry(card.id)
+            {
+                continue;
+            }
+            // A saved pane is checked again the way Reconnect checks it.
+            if self.saved_terminal_unavailable(card.id) {
+                inspections.push(card.id);
+            } else if matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
                 && self.saved_terminal_current(card.id).is_none()
                 && !self.restored_agent_attaches.contains(&card.id)
             {
                 self.restored_agent_attaches.push_back(card.id);
             }
         }
-        self.attach_next_restored_agent()
+        let mut tasks = inspections
+            .into_iter()
+            .map(|card| self.inspect_saved_terminal(card))
+            .collect::<Vec<_>>();
+        tasks.push(self.attach_next_restored_agent());
+        Task::batch(tasks)
     }
 
     pub(super) fn begin_startup_gate(&mut self) -> Task<Message> {
@@ -178,10 +258,12 @@ impl Cagents {
                     self.status = Some(TransientNotice::warning(reason.clone()));
                     return report(Err(reason));
                 }
-                cosmic::task::future(async {
+                let attach = self.qualify_startup_terminals();
+                let next = cosmic::task::future(async {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     Message::VerifyStartupPanes
-                })
+                });
+                Task::batch([attach, next])
             }
             Ok(true) => {
                 self.startup_gate.saving = true;
@@ -218,6 +300,63 @@ impl Cagents {
     }
 }
 
+/// Whether `surface` is attached to the exact terminal `session` names, on
+/// its current connection and under the terminal service that hosts it now:
+/// `Ok(false)` while that is still settling, or why it cannot.
+///
+/// A detached snapshot is not evidence either way: a hibernated view holds
+/// one, and so does a view just woken until its first frame. While `settling`
+/// the saved record is about to follow the registry, which catches up once
+/// this window's edit carrying the attachment is applied, so a record that
+/// names a different service is not yet a refusal.
+fn terminal_surface_ready(
+    session: &TerminalSession,
+    surface: &TerminalSurface,
+    settling: bool,
+) -> Result<bool, String> {
+    if surface.terminal_id() != session.id {
+        return Err("The terminal surface no longer matches this saved pane".to_owned());
+    }
+    // The view's own connection is still attaching or reconnecting, and
+    // reports a refusal if it gives up.
+    let Some(proof) = surface.current_attachment()? else {
+        return Ok(false);
+    };
+    if proof.is_complete() && session.continuity.live_proof().as_ref() == Some(&proof) {
+        return Ok(true);
+    }
+    if settling {
+        return Ok(false);
+    }
+    Err("The terminal attachment no longer matches this saved pane's owner".to_owned())
+}
+
+/// Leave room for the launcher's fixed prefix and pane IDs in its 4 KiB line.
+/// Stop preparing text once the bounded summary is full; retain raw diagnostics
+/// in their existing recovery presentation.
+fn startup_detail(detail: &str) -> String {
+    const LIMIT: usize = 1024;
+    let mut text = String::new();
+    let mut space = false;
+    for ch in detail.chars() {
+        if ch.is_whitespace() {
+            space = !text.is_empty();
+            continue;
+        }
+        let width = ch.len_utf8() + usize::from(space);
+        if text.len() + width > LIMIT {
+            text.push('…');
+            break;
+        }
+        if space {
+            text.push(' ');
+            space = false;
+        }
+        text.push(ch);
+    }
+    text
+}
+
 fn report(result: Result<(), String>) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || instance::report_ui_startup(&result))
@@ -227,3 +366,6 @@ fn report(result: Result<(), String>) -> Task<Message> {
         Message::StartupReported(result)
     })
 }
+
+#[cfg(test)]
+mod attachment_tests;
