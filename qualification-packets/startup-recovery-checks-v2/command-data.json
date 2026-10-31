@@ -75,5 +75,12 @@
   "actual_queue_admission_capacity_runtime": null,
   "packet_B": "DATA_ONLY_UNASSIGNED_NOT_IMPLEMENTED",
   "source_correction": "Reviewed stable match-guard syntax-only correction; no new tests or transferred A3 pass.",
-  "compact_terminal_stdout_authorization": "EC3e5b as relayed by Root; stdout only, full original summary/ledger/checksum artifacts unchanged."
+  "compact_terminal_stdout_authorization": "EC3e5b as relayed by Root; stdout only, full original summary/ledger/checksum artifacts unchanged.",
+  "outer_interpreter_argv_prefix_DATA": [
+    "/usr/bin/python3",
+    "-I",
+    "-B"
+  ],
+  "optimization_guard": "ORDINARY_IF_NOT_DEBUG_RAISE_BEFORE_IMPORTS",
+  "ordinary_guard_source_authorization": "EC5fd79181-6a7e-4ee8-a864-e0daa44c399f as relayed by Root"
 }

@@ -85,5 +85,16 @@
     "full_summary_processledger_SHA256SUMS": "Complete and write-order byteexact withA1",
     "stdout": "Compact truthful projection after persistence; no fake UI0/testcredits; exact evidence path",
     "execution": "UNRUN"
+  },
+  "ordinary_guard_source_contract": {
+    "ordinary_if_not_debug_raises_before_imports": true,
+    "asserts_preserved": true,
+    "argv_prefix_DATA": [
+      "/usr/bin/python3",
+      "-I",
+      "-B"
+    ],
+    "guard_and_flag_cases_executed": false,
+    "actual_interpreter_availability": "UNOBSERVED"
   }
 }

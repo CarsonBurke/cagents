@@ -1,6 +1,6 @@
 {
   "source_basis_4d77_runner_sha256": "cf22192079dde3c5786069a1133d595b5f55d6c2d2567b534cde52890b35755c",
-  "new_runner_sha256": "3a253b705e749fbb8e816c04beb659293ce98b3d3adf6ff7698ff7195df6f3b5",
+  "new_runner_sha256": "d75906ad55d1c1a5b2beffe5987ab47a0a058796f2e9d465673d15191aec5538",
   "edits": [
     {
       "rationale": "Exact reviewed6ceb product cwd only",
@@ -15,7 +15,7 @@
     {
       "rationale": "A2 plan hash only",
       "before": "PLAN_SHA = 'f53a1415715da6e109a905cf309be7fb2e387818b92f4120767ecb0c4fb9fc0e'",
-      "after": "PLAN_SHA = '2a8536f75fe1e4ea20d693aa2286480307a80d64f32bb86b8a0e354f66f822f0'"
+      "after": "PLAN_SHA = 'd6d580002f54f4d855dc162ca78134fb1a5771f33966de0fd39b62c797b74033'"
     },
     {
       "rationale": "Current author binding schema label",
@@ -71,6 +71,16 @@
       "rationale": "Current task docstring only",
       "before": "\"\"\"Prepared eb7 startup packet A: exactly3 isolated binary checks; independent review and fresh grant required. No tests/native qualification.\"\"\"",
       "after": "\"\"\"Prepared6ceb startup packet A2:3isolated binary checks and compact stdout; fresh review/grant required, no tests/native qualification.\"\"\""
+    },
+    {
+      "rationale": "EC5fd ordinary optimization refusal before any import/source child/resource effect; no assertion replaced",
+      "before": "import argparse\n",
+      "after": "if not __debug__:\n    raise RuntimeError('Python optimization disables required assertions; this packet refuses execution')\n\nimport argparse\n"
+    },
+    {
+      "rationale": "EC5fd frozen outer argv admission DATA prefix and ordinaryguard kind only",
+      "before": "    assert data['kind'] == 'FIXED_SOURCE_DATA_ONLY_NO_EXECUTION_OR_GRANT'",
+      "after": "    assert data['kind'] == 'FIXED_SOURCE_DATA_ONLY_NO_EXECUTION_OR_GRANT'\n    assert data['outer_interpreter_argv_prefix_DATA'] == plan['outer_interpreter_argv_prefix_DATA'] == ['/usr/bin/python3', '-I', '-B']\n    assert data['optimization_guard'] == 'ORDINARY_IF_NOT_DEBUG_RAISE_BEFORE_IMPORTS'"
     }
   ],
   "full_reverse_reconstruction_byteexact": true,

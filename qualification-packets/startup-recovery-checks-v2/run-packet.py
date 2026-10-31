@@ -1,4 +1,7 @@
 """Prepared6ceb startup packet A2:3isolated binary checks and compact stdout; fresh review/grant required, no tests/native qualification."""
+if not __debug__:
+    raise RuntimeError('Python optimization disables required assertions; this packet refuses execution')
+
 import argparse
 import ctypes
 import errno
@@ -25,7 +28,7 @@ PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never in
 PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
 SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
 CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
-PLAN_SHA = '2a8536f75fe1e4ea20d693aa2286480307a80d64f32bb86b8a0e354f66f822f0'
+PLAN_SHA = 'd6d580002f54f4d855dc162ca78134fb1a5771f33966de0fd39b62c797b74033'
 SCOPE_PARENT = None  # No selected PR1239 contract enables the dormant donor staged-scope path.
 
 
@@ -615,6 +618,8 @@ def main():
         assert hashlib.sha256(payload).hexdigest() == ref['sha256']
     assert data['schema'] == '6ceb-startup-recovery-packet-A2-three-isolated-binary-checks-v1'
     assert data['kind'] == 'FIXED_SOURCE_DATA_ONLY_NO_EXECUTION_OR_GRANT'
+    assert data['outer_interpreter_argv_prefix_DATA'] == plan['outer_interpreter_argv_prefix_DATA'] == ['/usr/bin/python3', '-I', '-B']
+    assert data['optimization_guard'] == 'ORDINARY_IF_NOT_DEBUG_RAISE_BEFORE_IMPORTS'
     assert data['head'] == review['head'] == plan['product_head'] == '6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194'
     assert data['tree'] == review['tree'] == plan['product_tree'] == '726b28c2d8d10abc2a2e8340b98e9e6015a089c4'
     assert data['parent'] == review['parent'] == plan['product_parent'] == 'eb7ff16beb8864349573231521c5d4eab5270cc6'

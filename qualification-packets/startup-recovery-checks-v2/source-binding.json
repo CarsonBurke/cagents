@@ -16,7 +16,7 @@
   },
   "command_data": {
     "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks-v2/qualification-packets/startup-recovery-checks-v2/command-data.json",
-    "sha256": "10801a6d08dab6c539de84d402702b373cc7f742de333c35dd95e9bf9a65cb2f"
+    "sha256": "2e3f6aa89e5ab3d89c7630ab9f35fb9c7dfb7ae8525ff5c94092041e6a6f389a"
   },
   "source_preflight": {
     "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks-v2/qualification-packets/startup-recovery-checks-v2/source-preflight.json",

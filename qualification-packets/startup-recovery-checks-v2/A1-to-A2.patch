@@ -1,12 +1,15 @@
 --- 4d77/run-packet.py
 +++ A2/run-packet.py
-@@ -1,4 +1,4 @@
+@@ -1,4 +1,7 @@
 -"""Prepared eb7 startup packet A: exactly3 isolated binary checks; independent review and fresh grant required. No tests/native qualification."""
 +"""Prepared6ceb startup packet A2:3isolated binary checks and compact stdout; fresh review/grant required, no tests/native qualification."""
++if not __debug__:
++    raise RuntimeError('Python optimization disables required assertions; this packet refuses execution')
++
  import argparse
  import ctypes
  import errno
-@@ -16,16 +16,16 @@
+@@ -16,16 +19,16 @@
  import time
  from datetime import datetime, timezone
  
@@ -22,11 +25,11 @@
  SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
  CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
 -PLAN_SHA = 'f53a1415715da6e109a905cf309be7fb2e387818b92f4120767ecb0c4fb9fc0e'
-+PLAN_SHA = '2a8536f75fe1e4ea20d693aa2286480307a80d64f32bb86b8a0e354f66f822f0'
++PLAN_SHA = 'd6d580002f54f4d855dc162ca78134fb1a5771f33966de0fd39b62c797b74033'
  SCOPE_PARENT = None  # No selected PR1239 contract enables the dormant donor staged-scope path.
  
  
-@@ -579,7 +579,7 @@
+@@ -579,7 +582,7 @@
      review_bytes = Path(plan['source_review']).read_bytes()
      review = json.loads(review_bytes)
      assert review['head'] == plan['product_head'] and review['tree'] == plan['product_tree']
@@ -35,7 +38,7 @@
      assert review['verdict'] == 'BOUND_EXACT_STARTUP_SOURCE_CHAIN_ONLY_NO_WHOLE_HEAD_OR_RUNTIME_APPROVAL'
      assert review['job_kind'] == plan['job_kind'] == 'A_CHECKS_ONLY'
      def read_bound(key, as_json=True):
-@@ -587,6 +587,14 @@
+@@ -587,6 +590,14 @@
          payload = Path(ref['path']).read_bytes()
          assert hashlib.sha256(payload).hexdigest() == ref['sha256'], 'Changed source/report input: ' + key
          return json.loads(payload) if as_json else payload.decode('utf-8')
@@ -50,7 +53,7 @@
      data = read_bound('command_data')
      preflight = read_bound('source_preflight')
      transport = read_bound('transport_review')
-@@ -605,11 +613,11 @@
+@@ -605,11 +616,13 @@
      for ref in review['composition_reviews']:
          payload = Path(ref['path']).read_bytes()
          assert hashlib.sha256(payload).hexdigest() == ref['sha256']
@@ -60,13 +63,15 @@
 -    assert data['head'] == review['head'] == plan['product_head'] == 'eb7ff16beb8864349573231521c5d4eab5270cc6'
 -    assert data['tree'] == review['tree'] == plan['product_tree'] == '8d60fb0154109a82861f9b595f2b7296e4f55c26'
 -    assert data['parent'] == review['parent'] == plan['product_parent'] == 'b914f9d9b55527aa1bb22d591968c58958d717ee'
++    assert data['outer_interpreter_argv_prefix_DATA'] == plan['outer_interpreter_argv_prefix_DATA'] == ['/usr/bin/python3', '-I', '-B']
++    assert data['optimization_guard'] == 'ORDINARY_IF_NOT_DEBUG_RAISE_BEFORE_IMPORTS'
 +    assert data['head'] == review['head'] == plan['product_head'] == '6ceb2e983c94c5eb3e14026fe80ca0c2cbc08194'
 +    assert data['tree'] == review['tree'] == plan['product_tree'] == '726b28c2d8d10abc2a2e8340b98e9e6015a089c4'
 +    assert data['parent'] == review['parent'] == plan['product_parent'] == 'eb7ff16beb8864349573231521c5d4eab5270cc6'
      assert data['product_cwd'] == str(WT)
      assert data['job_kind'] == 'A_CHECKS_ONLY' and data['artifact_groups'] == plan['artifact_groups'] == []
      assert data['binary_checks'] == plan['binary_checks'] == [
-@@ -622,15 +630,21 @@
+@@ -622,15 +635,21 @@
      assert data['caps_override']['authority_reference'] == 'EC53a57eea as relayed by Root task'
      assert data['packet_deadline_seconds'] == plan['packet_deadline_seconds'] == 2400
      assert plan['planned_phase_count'] == 3 and plan['planned_phase_order'] == ['cli-binary-check', 'host-binary-check', 'ui-binary-check']
@@ -92,7 +97,7 @@
      assert 'Job A: three isolated binary checks' in design
      assert donor_acceptance['decision'] == 'CLOSED_ACCEPTED_BOUNDED_EXACT_73487_HOST9_PASS'
      assert donor_acceptance['source_controller']['runner_sha256'] == donor_review['runner_sha256'] == review['donor_runner']['sha256'] == '71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829'
-@@ -905,7 +919,24 @@
+@@ -905,7 +924,24 @@
          files = sorted(path for path in out.rglob('*') if path.is_file())
          (out / 'SHA256SUMS').write_text(''.join(digest(path) + '  ' + str(path.relative_to(out)) + '\n' for path in files))
          # Root owns coordination; this runner never sends a message or starts another agent.

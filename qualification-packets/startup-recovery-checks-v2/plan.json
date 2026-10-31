@@ -36,7 +36,7 @@
   "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-stable-guard",
   "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks-v2/qualification-packets/startup-recovery-checks-v2/run-packet.py",
   "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks-v2/qualification-packets/startup-recovery-checks-v2/source-binding.json",
-  "source_review_sha256": "aaf331b1c40ce315fcf51313b7b1442a44000564dac5935dd9d280b793fdd1db",
+  "source_review_sha256": "8cb2a7f3d78040adb8af651f495eef194ec262e90d703e1c7ac416fed48fb046",
   "source_paths_sha256": {
     ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
     "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
@@ -213,7 +213,7 @@
     {
       "name": "source-input-18.json",
       "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks-v2/qualification-packets/startup-recovery-checks-v2/command-data.json",
-      "sha256": "10801a6d08dab6c539de84d402702b373cc7f742de333c35dd95e9bf9a65cb2f"
+      "sha256": "2e3f6aa89e5ab3d89c7630ab9f35fb9c7dfb7ae8525ff5c94092041e6a6f389a"
     },
     {
       "name": "source-input-19.json",
@@ -223,7 +223,7 @@
     {
       "name": "source-input-20.json",
       "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks-v2/qualification-packets/startup-recovery-checks-v2/source-binding.json",
-      "sha256": "aaf331b1c40ce315fcf51313b7b1442a44000564dac5935dd9d280b793fdd1db"
+      "sha256": "8cb2a7f3d78040adb8af651f495eef194ec262e90d703e1c7ac416fed48fb046"
     },
     {
       "name": "A2-source-input-1.json",
@@ -286,5 +286,12 @@
   "qualification_scope": "ONLY_3_ISOLATED_BINARY_CHECKS_NO_TEST_OR_NATIVE_QUALIFICATION",
   "packet_B": "UNASSIGNED_DATA_ONLY_NOT_IMPLEMENTED",
   "limits": "Packet A ONLY three isolated CLI/HOST/browserlessUI binary checks, zero tests/libtest compilations/artifacts/inventories/groups/helpers. No retained-actor/EOF test results or testcredits transfer. Current source/context/tools/resource availability and runtime outcomes UNRUN. No whole-suite/PR/main/installed/native/provider/UX/merge qualification. All original negatives, custody/359/WHOLE/nativeholds remain. Unknown/forced custody retains HOLD; original evidence and one-shot Cfd-close policy unchanged. Discrete source/context observations and grant-UUID syntax-only freshness/once-only limitation remain. A2 binds stableguard6ceb only; original A3 CLI0/HOST0/UI101 E0658 remains negative and no result/grant transfers. Compact stdout is not an artifact truncation waiver.",
-  "terminal_stdout": "Compact truthful projection only; full summary.json/processledger/SHA256SUMS remain complete, same writing order and release predicates."
+  "terminal_stdout": "Compact truthful projection only; full summary.json/processledger/SHA256SUMS remain complete, same writing order and release predicates.",
+  "outer_interpreter_argv_prefix_DATA": [
+    "/usr/bin/python3",
+    "-I",
+    "-B"
+  ],
+  "ordinary_optimization_refusal": "Before imports/effects: if not __debug__: raise RuntimeError(...). Guard is not assert; all original assertions remain.",
+  "outer_argv_admission": "Frozen source handoff must use exact /usr/bin/python3 -I -B, no -O; no interpreter/tool availability or current optimization-state probe. Opaque os.environ and authority remain inherited."
 }

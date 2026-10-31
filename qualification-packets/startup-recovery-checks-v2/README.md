@@ -28,3 +28,11 @@ review, then new authenticated exact Root/EC grant. No tool/env/process/proc/
 account/DB/target/lock/currentcontext/resource probes or code/helper imports
 occurred in preparation. Keep prior sourceobservation/grantfreshness/359/
 WHOLE/native/unknowncustody holds. No sourcepush or merge/native readiness.
+
+EC5fd ordinary optimization refusal is before imports: if not __debug__,
+raise RuntimeError. It is not an assert. All existing assertions remain.
+Frozen outer argv starts /usr/bin/python3 -I -B; no -O or postfreeze argv
+editing. This ignores interpreter config influences while retaining opaque
+os.environ/authority. No interpreter availability/hash/flag probe occurred.
+Original A3 barepython3 optimization state stays UNKNOWN; no reclassification.
+Final grant value is argv index11 (flag10), not the prior bare-python slot9.
