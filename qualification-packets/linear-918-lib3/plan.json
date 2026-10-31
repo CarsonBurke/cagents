@@ -1,0 +1,353 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "issue": null,
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "limits": "Preparation supplies no runtime evidence; only original phase/receipt fields and sole RAW establish later bounded results. Standalone CLI LIB3 only, maximum three owning passes. Integration issue_context_connections_are_pageable is UNINVOKED/UNQUALIFIED/HOLD; no actual binary stdout, Linear4/full-feature/provider/native/currentCI/merge qualification. Default captured pretty/five name-only refusals/natural authority/canonical9004/full3790 unchanged. FullELF not archived; failed invoke may bypass post-failed-use hash; no every-exec or embedded-version proof. Uncertain custody HOLD is indefinite after workload deadline.",
+  "packet_deadline_seconds": 2400,
+  "phase_caps_sum_seconds": 1500,
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "planned_phase_count": 6,
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-1",
+    "parent-cli-lib-2",
+    "parent-cli-lib-3"
+  ],
+  "prepared_only": true,
+  "product_head": "918920655d841600e1a44b66057a634940e0e132",
+  "product_parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "product_pr": null,
+  "product_tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+  "readiness": false,
+  "required_absent_environment_names": [
+    "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+    "CAGENTS_RETAINED_ACTOR_FIXTURE"
+  ],
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/run-packet.py",
+  "runtime_admission": {
+    "state": "LINEAR918_LIB3_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/source-binding.json",
+  "source_review_sha256": "88241f0f48d06b792065e27f5823b54afa107a8f4c5139bd4fd561739b3719ad",
+  "tool_pin_provenance": "Immutable donor source data only, no current installed-file/context observation",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract",
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/control.rs": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673",
+    "src/control/format.rs": "39dd6b05374050fc7e360e89ae04f3fe81c8dfb6938bd0976d77714dd27099b5",
+    "src/control/linear.rs": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e",
+    "src/control/linear_output.rs": "0063525d84429f2f7c362e908e7d505f14b813a1333490df6453d0824254554f",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/linear/api.rs": "330661d48559fecd1312b5fbc884906e19f175eb8e59d7b92cdacca325713922",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/process.rs": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47",
+    "tests/fixtures/linear-curl.sh": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee",
+    "tests/linear_cli_contract.rs": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a"
+  },
+  "artifact_groups": [
+    {
+      "id": "cli-lib",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+        "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+        "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 300
+    }
+  ],
+  "archive_bindings": [
+    {
+      "name": "source-archive/dependencies/linear-lossless-91892065-root-source-adoption-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/linear-lossless-91892065-root-source-adoption-v1.json",
+      "sha256": "735621143f9cfac9169adedd28fa5df4ea0c61b38a6fd5bcdaaf06fa3be6395e"
+    },
+    {
+      "name": "source-archive/dependencies/linear-lossless-91892065-reviewed-source-publication-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/linear-lossless-91892065-reviewed-source-publication-v1.json",
+      "sha256": "47b53631a33ea200e56cd1901864789d71233726513fc2d9e54c40871588f6e1"
+    },
+    {
+      "name": "source-archive/dependencies/linear-lossless-main442-source-freeze-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/linear-lossless-main442-source-freeze-v1.json",
+      "sha256": "62368f7df0003fb1f2e8da2e80445e03681748753feb2a89d1f2b0b86e762687"
+    },
+    {
+      "name": "source-archive/dependencies/linear-lossless-cli-stdout-successor-source-freeze-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/linear-lossless-cli-stdout-successor-source-freeze-v1.json",
+      "sha256": "b0a826ef58fa7f782b61b08fc469ede7cae315ab63d88e4f46b8b434f9a0ad41"
+    },
+    {
+      "name": "source-archive/dependencies/linear-lossless-d0f27b01-main442-independent-code-user-contract-source-review-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/linear-lossless-d0f27b01-main442-independent-code-user-contract-source-review-v1.json",
+      "sha256": "82e29e78f3d3cc1534edf02d3275208f90945fd2e3e547f09f3375a93fe4133d"
+    },
+    {
+      "name": "source-archive/dependencies/linear-lossless-d0f27b01-independent-conservation-test-oracle-review-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/linear-lossless-d0f27b01-independent-conservation-test-oracle-review-v1.json",
+      "sha256": "4350a7e9477f743234349de8a8b2bd54332c947e8892f44fb01880f3221595e9"
+    },
+    {
+      "name": "source-archive/dependencies/linear-lossless-91892065-cli-stdout-successor-independent-source-review-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/linear-lossless-91892065-cli-stdout-successor-independent-source-review-v1.json",
+      "sha256": "43e4958ff096c4c8be8704e43c6625d5afab064de7ff5dc5499e7bb950cb10ba"
+    },
+    {
+      "name": "source-archive/dependencies/linear-lossless-91892065-independent-stdout-contract-conservation-review-v1.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/linear-lossless-91892065-independent-stdout-contract-conservation-review-v1.json",
+      "sha256": "306643a49f375f2a3883c0f572166b746557f98a6c7c5a950fa81ddbe6ce9595"
+    },
+    {
+      "name": "source-archive/dependencies/report.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/report.json",
+      "sha256": "056243ec76c3c878bc591d1c82cd8a05e80c92b4f7bdbad1c2f3b830e00b4d08"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/adoption_conservation.json",
+      "sha256": "af73a6fd8b90591cef59f3e8f5c3ab5d4a0a46a7842ee6e54742bb25fc7bc6a4"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_freeze.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/adoption_freeze.json",
+      "sha256": "735dd48b806302b3d70ce2f3e1aff957eb5e0b430b930133a34b9fd8fb2fb682"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_function.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/adoption_function.py",
+      "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_intake.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/adoption_intake.json",
+      "sha256": "e9aa09101ca6d215e6876de5b50c1fe1bc57bb3cc14f7bdd397b7772cd1e5843"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_old_function.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/adoption_old_function.py",
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_original_finding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/adoption_original_finding.json",
+      "sha256": "407384f676878767ccbc8b77f0c052de068e12da7361c9090517066b03a57bb8"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_pure4_reference.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/adoption_pure4_reference.json",
+      "sha256": "2f708553b45b5de26af8ec106051b6ede4c81a4cfa98228b0e1bc5fd3ad13005"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/adoption_semantic.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/adoption_semantic.json",
+      "sha256": "2c70042041fe7af081d1a4992f8d91bc133dac2fb6293554046dbbeb160709c8"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_additive_hold.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/prior_ca_additive_hold.json",
+      "sha256": "a32b9501efcfc05ba117cd89f10d903a02434943ce0ac5d70440b7ea69767ef9"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_author_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/prior_ca_author_conservation.json",
+      "sha256": "6781d55990d2afff29503f119249d3e56c2efdbafe22ebfc0d73a81469f7debd"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/prior_ca_conservation.json",
+      "sha256": "a8f548772659b46cbf51b921853f46c799b086cf52192793d03e242310b3b23d"
+    },
+    {
+      "name": "source-archive/dependencies/canonical/prior_ca_task_hold.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/canonical/prior_ca_task_hold.json",
+      "sha256": "e342ee5b3258889e2f258433b7cf3a47614d79e340a4313e678060b99bf53560"
+    },
+    {
+      "name": "source-archive/dependencies/donor-run-packet.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/donor-run-packet.py",
+      "sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25"
+    },
+    {
+      "name": "source-archive/dependencies/donor-plan.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/donor-plan.json",
+      "sha256": "d5c074fbea83b6863b73ae574a8b55fb8a4425cce527c6e0f87685dbf56990e9"
+    },
+    {
+      "name": "source-archive/dependencies/donor-source-binding.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/donor-source-binding.json",
+      "sha256": "12aec1cd635793e24907149e5fffebbc1b594aec652947064a82afc9c9e7e785"
+    },
+    {
+      "name": "source-archive/dependencies/donor-source-conservation.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/dependencies/donor-source-conservation.json",
+      "sha256": "628dd034d9038b882f0213db0fd098086474d244714bb362d14e34ccdcbb8595"
+    },
+    {
+      "name": "source-archive/command-data.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/command-data.json",
+      "sha256": "b9a16facba237037b9f98b6b04863842ea0d7be369244a5858a07f092f9c5a14"
+    },
+    {
+      "name": "source-archive/current-source-map.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/current-source-map.json",
+      "sha256": "1f66632cb80844a88cf5877dba602d89d59923784fbdac6d047ab1c51000c115"
+    },
+    {
+      "name": "source-archive/instruction-source.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/instruction-source.json",
+      "sha256": "399f888da8d60f7825a6671ef1e995baba2309749c3bffca56315ab2166e4e93"
+    },
+    {
+      "name": "source-archive/product-source/.cargo/config.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/.cargo/config.toml",
+      "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018"
+    },
+    {
+      "name": "source-archive/product-source/Cargo.lock",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/Cargo.lock",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    {
+      "name": "source-archive/product-source/Cargo.toml",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/Cargo.toml",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    {
+      "name": "source-archive/product-source/build.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/build.rs",
+      "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9"
+    },
+    {
+      "name": "source-archive/product-source/src/control.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/control.rs",
+      "sha256": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673"
+    },
+    {
+      "name": "source-archive/product-source/src/control/format.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/control/format.rs",
+      "sha256": "39dd6b05374050fc7e360e89ae04f3fe81c8dfb6938bd0976d77714dd27099b5"
+    },
+    {
+      "name": "source-archive/product-source/src/control/linear.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/control/linear.rs",
+      "sha256": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e"
+    },
+    {
+      "name": "source-archive/product-source/src/control/linear_output.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/control/linear_output.rs",
+      "sha256": "0063525d84429f2f7c362e908e7d505f14b813a1333490df6453d0824254554f"
+    },
+    {
+      "name": "source-archive/product-source/src/lib.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/lib.rs",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+    },
+    {
+      "name": "source-archive/product-source/src/linear/api.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/linear/api.rs",
+      "sha256": "330661d48559fecd1312b5fbc884906e19f175eb8e59d7b92cdacca325713922"
+    },
+    {
+      "name": "source-archive/product-source/src/main.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/main.rs",
+      "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d"
+    },
+    {
+      "name": "source-archive/product-source/src/modules.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/modules.rs",
+      "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+    },
+    {
+      "name": "source-archive/product-source/src/process.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/src/process.rs",
+      "sha256": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47"
+    },
+    {
+      "name": "source-archive/product-source/tests/fixtures/linear-curl.sh",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/tests/fixtures/linear-curl.sh",
+      "sha256": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee"
+    },
+    {
+      "name": "source-archive/product-source/tests/linear_cli_contract.rs",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/product-source/tests/linear_cli_contract.rs",
+      "sha256": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a"
+    }
+  ],
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac"
+}

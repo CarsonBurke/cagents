@@ -1,0 +1,51 @@
+{
+  "schema": "linear_lossless_91892065_root_source_adoption_v1",
+  "utc": "2026-10-31T15:58:39.106659+00:00",
+  "head": "918920655d841600e1a44b66057a634940e0e132",
+  "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+  "parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "reviewed_source_code_clear": true,
+  "reviewed_conservation_clear": true,
+  "reviews": [
+    {
+      "role": "production_code",
+      "path": "/tmp/linear-lossless-d0f27b01-main442-independent-code-user-contract-source-review-v1.json",
+      "sha256": "82e29e78f3d3cc1534edf02d3275208f90945fd2e3e547f09f3375a93fe4133d",
+      "actual_verdict": "BOUNDED_SOURCE_CLEAR_NO_CONCRETE_BLOCKER"
+    },
+    {
+      "role": "production_conservation",
+      "path": "/tmp/linear-lossless-d0f27b01-independent-conservation-test-oracle-review-v1.json",
+      "sha256": "4350a7e9477f743234349de8a8b2bd54332c947e8892f44fb01880f3221595e9",
+      "actual_verdict": "BOUNDED_CONSERVATION_AND_UNIT_ORACLE_SOURCE_CLEAR_EXECUTION_UNRUN"
+    },
+    {
+      "role": "stdout_code",
+      "path": "/tmp/linear-lossless-91892065-cli-stdout-successor-independent-source-review-v1.json",
+      "sha256": "43e4958ff096c4c8be8704e43c6625d5afab064de7ff5dc5499e7bb950cb10ba",
+      "actual_verdict": "BOUNDED_SOURCE_CLEAR_NO_CONCRETE_DELTA_BLOCKER"
+    },
+    {
+      "role": "stdout_conservation",
+      "path": "/tmp/linear-lossless-91892065-independent-stdout-contract-conservation-review-v1.json",
+      "sha256": "306643a49f375f2a3883c0f572166b746557f98a6c7c5a950fa81ddbe6ce9595",
+      "actual_verdict": "FINITE_TEST_SUCCESSOR_CONSERVATION_AND_CAUSAL_SOURCE_CLEAR_EXECUTION_UNRUN"
+    }
+  ],
+  "source_freezes": [
+    {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-main442-source-freeze-v1.json",
+      "sha256": "62368f7df0003fb1f2e8da2e80445e03681748753feb2a89d1f2b0b86e762687"
+    },
+    {
+      "path": "/tmp/fw16-backend-ec204421/linear-lossless-cli-stdout-successor-source-freeze-v1.json",
+      "sha256": "b0a826ef58fa7f782b61b08fc469ede7cae315ab63d88e4f46b8b434f9a0ad41"
+    }
+  ],
+  "scope": "Bounded two-file CLI Linear human-detail delivery with actual stdout owning fixture. Routine tables/data/auth/state/transport/proof policies conserved. Product/adaptedtests sourceclear; runtimeUNRUN.",
+  "source_only_adopted": true,
+  "runtime_grant": null,
+  "compile_tests_CI_native": "UNRUN; no old1238/otherhead result transfer",
+  "PR_create": "No request made; earlier automaticPRcreate rejection remains; no alternate route."
+}

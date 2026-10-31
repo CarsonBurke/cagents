@@ -1,0 +1,56 @@
+{
+  "schema": "linear_lossless_main442_source_freeze_v1",
+  "utc": "2026-10-31T15:49:47.283778+00:00",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-main442",
+  "branch": "fix/fw16-linear-lossless-detail",
+  "head": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "tree": "d2bcdf354c4bad41be7058ed166938f2cdb32f9f",
+  "sole_parent": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "changed_paths": [
+    "src/control/linear.rs"
+  ],
+  "other_entries_modes_types_blobs_exact_main": 2218,
+  "pins": {
+    "src/control/linear.rs": {
+      "sha256": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e",
+      "blob": "3bb92d8020aa34c4f137b2ea8ac3a1c9b6fd3878"
+    },
+    "src/control/linear_output.rs": {
+      "sha256": "0063525d84429f2f7c362e908e7d505f14b813a1333490df6453d0824254554f",
+      "blob": "1acbc297d499b213a909099471cb42626366ea22"
+    },
+    "src/control/format.rs": {
+      "sha256": "39dd6b05374050fc7e360e89ae04f3fe81c8dfb6938bd0976d77714dd27099b5",
+      "blob": "62198b822299349410281137799638de68840bd6"
+    },
+    "tests/linear_cli_contract.rs": {
+      "sha256": "d41bf29c8d1accd7b03eaec7b315e466f5ec77aba682550b62f88c1d10ca8152",
+      "blob": "e8447735228567f3c77d7c29a387ff8a6ac326b4"
+    },
+    "tests/fixtures/linear-curl.sh": {
+      "sha256": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee",
+      "blob": "77ff4f67a9bc416a3066de109fe71998640c79de"
+    },
+    "Cargo.toml": {
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+      "blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5"
+    },
+    "Cargo.lock": {
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+      "blob": "9ff31301cf43f2219a56415069c4d3026765f9bb"
+    }
+  },
+  "intended_task": "Read complete fetched Linear issue/comments/relations/children text, nested fields and exact cursors in ordinary human output; list/search/attachments/team/project stay compact.",
+  "delta": "Exact detail command-ID guard before existing list projection; two real-parser owning regression parents with rich/empty payload equality and synthetic projection-comment clarification. No fetch/auth/credential/account/settings/transcript/schema/wire/HOST/UI changes.",
+  "original_tools": {
+    "official_format_start": "26dfd5",
+    "session": 57983,
+    "final": "899142",
+    "exit": 0,
+    "diff_check": "c29b80 EXIT0",
+    "commit": "b71c4e EXIT0"
+  },
+  "independent_source_reviews": null,
+  "compile_test_C_native": "UNRUN; no execution or grant; no new native GUI behavior",
+  "publication": null
+}

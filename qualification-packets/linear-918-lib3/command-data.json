@@ -1,0 +1,147 @@
+{
+  "schema": "linear918-lib3-controller-task-data-v1",
+  "product_PR_reference": null,
+  "boundary": "cli",
+  "source": {
+    "head": "918920655d841600e1a44b66057a634940e0e132",
+    "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+    "parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract"
+  },
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "selected_names": [
+    "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+    "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+    "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json"
+  ],
+  "selected_parents": [
+    {
+      "name": "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+      "source": "src/control/linear.rs",
+      "line": 1495,
+      "source_body_sha256": "b798c940c47a63ed293de36e3e14f884e721a9e1d7e5a5eac0b0bb8dda772bcd",
+      "ordinary_cfg": "#[cfg(test)] mod tests; #[test]; CLI default graph",
+      "expected_stdout_child_results": 0,
+      "semantics": "Real clap/parser and output Values; no provider/subprocess/worker or native UI invocation. Loop cases are nonadditive."
+    },
+    {
+      "name": "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+      "source": "src/control/linear.rs",
+      "line": 1528,
+      "source_body_sha256": "a1c6f734d94d3b9144e753813da719f0484620babf01bd03cba12f3da875f91e",
+      "ordinary_cfg": "#[cfg(test)] mod tests; #[test]; CLI default graph",
+      "expected_stdout_child_results": 0,
+      "semantics": "Real clap/parser and output Values; no provider/subprocess/worker or native UI invocation. Loop cases are nonadditive."
+    },
+    {
+      "name": "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json",
+      "source": "src/control/linear.rs",
+      "line": 1449,
+      "source_body_sha256": "5b0cdf1cc055e6469da591cafc753d2642a21241a1d4694ca8691e21f3564b7b",
+      "ordinary_cfg": "#[cfg(test)] mod tests; #[test]; CLI default graph",
+      "expected_stdout_child_results": 0,
+      "semantics": "Real clap/parser and output Values; no provider/subprocess/worker or native UI invocation. Loop cases are nonadditive."
+    }
+  ],
+  "artifact_groups": [
+    {
+      "id": "cli-lib",
+      "features": [],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+        "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+        "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "control::linear::tests::human_issue_details_preserve_full_connections_and_cursors",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "control::linear::tests::human_comment_relation_and_child_details_are_lossless",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "control::linear::tests::readable_linear_actual_commands_select_columns_and_preserve_json",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 300
+    }
+  ],
+  "planned_phase_order": [
+    "cli-binary-check",
+    "compile-cli-lib",
+    "inventory-cli-lib",
+    "parent-cli-lib-1",
+    "parent-cli-lib-2",
+    "parent-cli-lib-3"
+  ],
+  "integration": {
+    "selector": "issue_context_connections_are_pageable",
+    "target": "linear_cli_contract",
+    "state": "UNINVOKED_UNQUALIFIED_HOLD",
+    "reason": "Maintained rootlib-only artifact grammar cannot establish integration ELF and compile-time CLI-bin binding. Source-only barrier/proposal separately pinned.",
+    "owning_pass_credit": 0,
+    "actual_result": null
+  },
+  "runtime_admission": {
+    "state": "LINEAR918_LIB3_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  }
+}

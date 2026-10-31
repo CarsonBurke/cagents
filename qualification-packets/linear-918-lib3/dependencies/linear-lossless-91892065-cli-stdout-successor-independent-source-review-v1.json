@@ -1,0 +1,172 @@
+{
+  "conservation": {
+    "all_other_entries_modes_types_blobs_exact_parent": 2218,
+    "definition_line": 359,
+    "delete_only_new_inline_block_reconstructs_exact_parent_test_leaf": true,
+    "exact_diff_sha256": "8ea1e5b06c3534d06d253c4dd687d3dac73147056ee7ef222e0a6df50572d28d",
+    "fixture_helper_transport_environment_authority_process_policy_and_all_other_tests_exact_parent": true,
+    "mode": "100644 unchanged",
+    "new_owning_parent_count": 0,
+    "numstat": {
+      "deletions": 0,
+      "insertions": 78
+    },
+    "only_changed_path": "tests/linear_cli_contract.rs",
+    "owning_parent": "issue_context_connections_are_pageable",
+    "production_exact_d0": true
+  },
+  "findings": [],
+  "freeze": {
+    "all_pins_verified": true,
+    "path": "/tmp/fw16-backend-ec204421/linear-lossless-cli-stdout-successor-source-freeze-v1.json",
+    "sha256": "b0a826ef58fa7f782b61b08fc469ede7cae315ab63d88e4f46b8b434f9a0ad41"
+  },
+  "head": "918920655d841600e1a44b66057a634940e0e132",
+  "limits": {
+    "authority": "Actual inherited authority remains opaque/unknown and was not probed; source conservation is not a runtime grant.",
+    "compile_tests": "ALL UNRUN at 91892065. No compiler success, inventory or actual stdout pass claimed.",
+    "format": "Root freeze reports original1d3202/session63408/final6f06f8 EXIT0 and commit/diff99c95b EXIT0; not rerun.",
+    "native_provider": "No native GUI or live Linear/provider execution; fake transport only in authored test source.",
+    "operations": "Immutable Git/source and supplied receipt reads plus stdlib text/hash comparison and own report only. No source/public edit, candidate import/evaluation, build/test/process/environment/account probe, child or execution allocation."
+  },
+  "owning_oracle": {
+    "definition_line": 359,
+    "nested_cases": {
+      "connection_variants": 8,
+      "full_issue": 1,
+      "output_paths_per_variant": 2
+    },
+    "new_parent": false,
+    "selector": "issue_context_connections_are_pageable",
+    "status": "COMPILE_AND_EXECUTION_UNRUN",
+    "target": "linear_cli_contract"
+  },
+  "prior_production_review": {
+    "path": "/tmp/linear-lossless-d0f27b01-main442-independent-code-user-contract-source-review-v1.json",
+    "sha256": "82e29e78f3d3cc1534edf02d3275208f90945fd2e3e547f09f3375a93fe4133d",
+    "use": "Retains source-only d0 production review. No runtime result transferred."
+  },
+  "result": "BOUNDED_SOURCE_CLEAR_NO_CONCRETE_DELTA_BLOCKER",
+  "reviewer": "/root/1954_directory_durability_bound",
+  "schema": "linear_lossless_91892065_cli_stdout_successor_independent_source_review_v1",
+  "sole_parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
+  "source_assessment": [
+    {
+      "anchors": [
+        "tests/linear_cli_contract.rs:100",
+        "tests/linear_cli_contract.rs:111",
+        "tests/linear_cli_contract.rs:415",
+        "tests/linear_cli_contract.rs:417",
+        "tests/linear_cli_contract.rs:440",
+        "src/control.rs:4416"
+      ],
+      "conclusion": "Fixture::command uses CARGO_BIN_EXE_cagents and puts --json first. Each new ordinary-output attempt asserts/removes exactly arguments[0], leaving the same program, command operands, cwd, environment and process limits. Success plus empty stderr is required, then actual stdout is parsed as Value and compared with the complete intended payload. JSON attempts use existing f.success, which checks success, parses the actual JSON envelope, checks ok=true and returns its data. Thus the tests cover both actual output paths, without substituting a direct output-helper call.",
+      "subject": "Built CLI and actual stdout selection"
+    },
+    {
+      "anchors": [
+        "tests/linear_cli_contract.rs:375",
+        "tests/linear_cli_contract.rs:402",
+        "tests/linear_cli_contract.rs:414",
+        "src/control/linear.rs:548",
+        "src/control/linear.rs:1021",
+        "src/control/linear.rs:1039",
+        "src/control/linear.rs:1301"
+      ],
+      "conclusion": "The four tuples select comments, outgoing relations, children and inverseRelations. Parenthesized json! object key (field) supplies the dynamic connection key; each canned envelope contains only that requested connection. --inverse is appended only for inverseRelations, so incorrect selection would fail result_field rather than accidentally receiving another connection. Existing Target accepts --id UUID; full issue uses positional UUID and --full. API response shape is data.issue.<connection> or data.issue; Fixture::read creates exactly that outer data envelope.",
+      "subject": "Response shape, dynamic field, parser and inverse route"
+    },
+    {
+      "anchors": [
+        "tests/linear_cli_contract.rs:374",
+        "tests/linear_cli_contract.rs:392",
+        "tests/linear_cli_contract.rs:406",
+        "tests/linear_cli_contract.rs:414",
+        "tests/linear_cli_contract.rs:428",
+        "src/process.rs:71",
+        "src/process.rs:325"
+      ],
+      "conclusion": "serde_json::json! serializes expression values by reference, so repeated long_text and later connection/issue comparisons do not consume those variables; owned array nodes/connections move only into their intended loop values. assert_eq! borrows comparisons. CommandSpec.arguments is public Vec<OsString>, so remove(0) is valid and its equality with --json checks the expected prefix. ProcessOutput derives Debug, matching diagnostic formatting. No additional narrow Rust move/type/parser blocker is evident; this has not been compiled.",
+      "subject": "Ownership and type surface"
+    },
+    {
+      "anchors": [
+        "tests/linear_cli_contract.rs:21",
+        "tests/linear_cli_contract.rs:34",
+        "tests/linear_cli_contract.rs:44",
+        "tests/linear_cli_contract.rs:90",
+        "tests/linear_cli_contract.rs:103",
+        "tests/fixtures/linear-curl.sh:4",
+        "tests/fixtures/linear-curl.sh:18",
+        "src/linear/api.rs:202"
+      ],
+      "conclusion": "Existing private TempDir installs fixture curl and prepends its bin to CLI PATH. Actual production API invokes Command::new(curl), so that existing path resolves the fixture script. It records stdin/config and returns the private read file plus HTTP200 marker; no branch forwards to another curl or network. These are private scripted fetches, not live Linear validation. Existing opaque AUTHORITY_ENV preservation and removal policy are byte-identical; new commands mutate only argv. Reviewer did not read actual authority/environment or execute any fixture.",
+      "subject": "Real fake transport and inherited authority boundary"
+    },
+    {
+      "anchors": [
+        "tests/linear_cli_contract.rs:374",
+        "tests/linear_cli_contract.rs:406",
+        "tests/linear_cli_contract.rs:428",
+        "tests/linear_cli_contract.rs:448"
+      ],
+      "conclusion": "Eight rich/empty connection cases and one full-issue case each compare complete JSON data and actual human stdout to the original payload. Rich bodies are long Markdown/multiline, relations retain nested endpoints, children retain description, unknown fields remain, and nonshell cursor strings retain spaces/newlines. Empty nodes, false hasNextPage and null cursor are checked. Main compact detail tables/empty notices fail these human JSON equality assertions; unchanged JSON and issue output supply positive compatibility controls. Full issue final recorded request additionally proves --full requested inverseRelations(first:100).",
+      "subject": "Meaningful completeness and predecessor discrimination"
+    },
+    {
+      "anchors": [
+        "tests/linear_cli_contract.rs:18",
+        "tests/linear_cli_contract.rs:30",
+        "tests/linear_cli_contract.rs:359"
+      ],
+      "conclusion": "All additions stay inside the existing owning parent. Nine new JSON/human case pairs are eighteen new CLI invocations within that one parent, not eighteen parents. Existing per-command22s timeout,1MiB stdout/stderr limits and SystemProcessExecutor are unchanged. This source review supplies no wall-time estimate, kernel/process settlement claim or execution admission.",
+      "subject": "Nonadditive scope and bounds"
+    }
+  ],
+  "source_pins": {
+    "Cargo.lock": {
+      "blob": "9ff31301cf43f2219a56415069c4d3026765f9bb",
+      "mode": "100644",
+      "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+    },
+    "Cargo.toml": {
+      "blob": "3c67491c83a0077d18b41a73ff5850488ebdf0f5",
+      "mode": "100644",
+      "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+    },
+    "src/control.rs": {
+      "blob": "d249a2f78aa0df6cef4e302f6b64444e1b2504b3",
+      "exact_parent": true,
+      "mode": "100644",
+      "sha256": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673"
+    },
+    "src/control/linear.rs": {
+      "blob": "3bb92d8020aa34c4f137b2ea8ac3a1c9b6fd3878",
+      "mode": "100644",
+      "sha256": "d187b74828f8a1a3042775feb0547f2a2597852aa6c9ea5f182b11f02008e97e"
+    },
+    "src/linear/api.rs": {
+      "blob": "20f8ab728e59742731a65535809af7e316c51823",
+      "exact_parent": true,
+      "mode": "100644",
+      "sha256": "330661d48559fecd1312b5fbc884906e19f175eb8e59d7b92cdacca325713922"
+    },
+    "src/process.rs": {
+      "blob": "a044a7e901cc28f02f4258b2679284eec19c4d9c",
+      "mode": "100644",
+      "sha256": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47"
+    },
+    "tests/fixtures/linear-curl.sh": {
+      "blob": "77ff4f67a9bc416a3066de109fe71998640c79de",
+      "mode": "100755",
+      "sha256": "91acc635ae75ff03c8b22b25ba88062420a5469c606bd312ee3fb93514a0faee"
+    },
+    "tests/linear_cli_contract.rs": {
+      "blob": "952de8904f7fe812a13f9da40ad852e0f92c73d3",
+      "mode": "100644",
+      "sha256": "866e56df7b907f522e724749b92212352280f73e80d9f7ea285c362864803e5a"
+    }
+  },
+  "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-linear-lossless-cli-contract"
+}

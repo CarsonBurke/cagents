@@ -1,0 +1,25 @@
+{
+  "kind": "NOT_SUBMITTABLE_PRE_REVIEW_SOURCE_TEMPLATE",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-linear-918-lib3-source/qualification-packets/linear-918-lib3/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "d99afc2e01e460284691a9c07f2765bb9f338f40c79b4828298452c07d334d4e",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "execution_authorized": false,
+  "review_ABI": {
+    "head": "918920655d841600e1a44b66057a634940e0e132",
+    "tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+    "controller_identity": "EXTERNAL_POSTCOMMIT",
+    "review": "PENDING_GENUINE_FROZEN_CODE_REVIEW"
+  }
+}
