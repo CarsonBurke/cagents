@@ -1,0 +1,249 @@
+{
+  "lane": {
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "jobs": 2,
+    "rust": "1.93.0",
+    "new_cache": false
+  },
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "environment": "Inherited opaque authority/config/context preserved except exact reviewed compiler-only overrides. No provider/User/native authority substitution or environment stripping.",
+  "bounded_failure_cleanup": {
+    "direct_child_TERM_wait_seconds": 3,
+    "direct_child_KILL_wait_seconds": 3,
+    "adopted_natural_seconds": 3,
+    "adopted_forced_window_seconds": 10,
+    "qualification": "Any timeout, nonzero exit, unresolved wait, forced custody or inspection uncertainty stops dependencies and prevents qualification; cleanup grace is not extra test budget.",
+    "read_only_source_check_seconds": 10,
+    "source_check_TERM_wait_seconds": 3,
+    "source_check_KILL_wait_seconds": 3,
+    "final_custody_passes": 2,
+    "final_custody_order": "before final source/context and again afterward, before lock release; all earlier uncertainty/forced state prevents qualification",
+    "maximum_two_final_custody_windows_seconds": 26
+  },
+  "grant_binding_limit": "A supplied --grant UUID is recorded against exact runner/plan/review/source receipts. Syntax acceptance neither verifies a fresh external cagents grant nor enforces once-only authorization. Root must obtain new actual grant for this exact packet/argv/cwd and coordinate fair admission before any execution; no current grant is present.",
+  "prepared_only": true,
+  "status": "SOURCE_PREPARED_PACKET_A_CHECKS_ONLY_REVIEW_AND_GRANT_REQUIRED",
+  "job_kind": "A_CHECKS_ONLY",
+  "product_head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "product_tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+  "product_parent": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/run-packet.py",
+  "source_review": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/source-binding.json",
+  "source_review_sha256": "6a071093f91a4cabc011773e9ed5ae3b91a6ab3b4a12b11fceae3ace68b7d827",
+  "source_paths_sha256": {
+    ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+    "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+    "build.rs": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+    "src/app.rs": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
+    "src/app/chat_ui.rs": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+    "src/app/saved_terminal.rs": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+    "src/app/shared_views.rs": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
+    "src/app/shared_views/tests/startup_terminals.rs": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+    "src/app/startup_gate.rs": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+    "src/app/startup_gate/attachment_tests.rs": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+    "src/app/startup_gate/tests.rs": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+    "src/bin/cagents-ui.rs": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+    "src/bin/cagentsd.rs": "252beaafc3b6226f96eb6816fa931c90e6370aac03abb75bb3529487acbe2830",
+    "src/control.rs": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+    "src/host/agent_execution/terminals.rs": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+    "src/host/client.rs": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+    "src/host/mod.rs": "8e8e16646cf8f964e5f736a68f1c42ec6e6feea32a5af5073afda696d9676864",
+    "src/host/state.rs": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+    "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+    "src/main.rs": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+    "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+    "src/terminal/hosted.rs": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+    "src/terminal/ipc.rs": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+    "src/terminal/surface.rs": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21"
+  },
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 600
+    },
+    {
+      "label": "host-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "seconds": 600
+    },
+    {
+      "label": "ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 900
+    }
+  ],
+  "artifact_groups": [],
+  "planned_phase_order": [
+    "cli-binary-check",
+    "host-binary-check",
+    "ui-binary-check"
+  ],
+  "planned_phase_count": 3,
+  "counts": {
+    "checks": 3,
+    "lib_compilations": 0,
+    "ELF_inventories": 0,
+    "test_invocations": 0,
+    "qualifying_outer_parents": 0,
+    "test_groups": 0,
+    "total_phases": 3
+  },
+  "packet_deadline_seconds": 2400,
+  "budget": "EC53a57eea A caps600+600+900=2100,300overhead in original2400. Every phase remains min(originalremaining, owncap); no extension/reset/retry. Runtime warmth/fit not measured.",
+  "archive_bindings": [
+    {
+      "name": "source-input-1.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/startup-two-job-DATA-design.md",
+      "sha256": "86cc623314a871d84af548e0abedb8118a2ee56434a7300268901c93079148c3"
+    },
+    {
+      "name": "source-input-2.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/prior-b914-DATA-design.md",
+      "sha256": "f20a4319cb3ca7916ae90d82a1352a58e7b32a26c298b09ddea139750156bfe1"
+    },
+    {
+      "name": "source-input-3.py",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/qualified-d610-run-packet.py",
+      "sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829"
+    },
+    {
+      "name": "source-input-4.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/qualified-d610-plan.json",
+      "sha256": "88b0b79fb975089b08d85d2b30a4a6bad1df5d7d5f2f3d9c28db188618695c6d"
+    },
+    {
+      "name": "source-input-5.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/qualified-d610-original-ready-handoff.json",
+      "sha256": "4e12e93c38ce86896d6e594caa856a42893ed989835bab1c6283b678f4c251c9"
+    },
+    {
+      "name": "source-input-6.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/qualified-d610-source-receipt.json",
+      "sha256": "a50888e9193246f3756ad4d661039bad196a6eee171a1c957fd30ad535c6a068"
+    },
+    {
+      "name": "source-input-7.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/qualified-d610-independent-review.json",
+      "sha256": "30254a713641b4fa383d3ccd29c22723a150c23cd198a298bcbd613432ed1c00"
+    },
+    {
+      "name": "source-input-8.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/qualified-d610-actual-acceptance.json",
+      "sha256": "116d7c57cef5667e2eaeb6ddb828f0a8f07d692e31fe5b0ac6eb422799c3b956"
+    },
+    {
+      "name": "source-input-9.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/eb7-transport-independent-review.json",
+      "sha256": "fcfa4aa9cb29c643668a0887c9d77e4d2d60d4a024783a4466c5282bf1a47015"
+    },
+    {
+      "name": "source-input-10.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/eb7-transport-author-freeze.json",
+      "sha256": "a346a4e9e743ebb5f2cca6eb1a637eb050fd5756d546eaeeea8a28443e2ab633"
+    },
+    {
+      "name": "source-input-11.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/b914-composition-author-freeze.json",
+      "sha256": "de41158a936a4086958ca95b126c621cf16b119c50870e25131bbe49df5727bc"
+    },
+    {
+      "name": "source-input-12.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/b914-original-source-publication.json",
+      "sha256": "52915b047ce2000a11652a0be727715d87145a74307688617b5a54027c8160cf"
+    },
+    {
+      "name": "source-input-13.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/eb7-original-source-publication.json",
+      "sha256": "706f56d4db64e69847f3bdd2b5dbcd20eface342156a05c91bf1e8231ea81114"
+    },
+    {
+      "name": "source-input-14.md",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/b914-independent-review-1.md",
+      "sha256": "b18d74d7b260317efcb26568d0f95a38f2ebf64b33cb20551769e98d0d93bfbd"
+    },
+    {
+      "name": "source-input-15.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/b914-independent-review-2.json",
+      "sha256": "5a821bb2a13da5fc74af1ef0f277fea2bf79ec975d36bf88dad75c9b4e367f0b"
+    },
+    {
+      "name": "source-input-16.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/b914-independent-review-3.json",
+      "sha256": "94bb0d85b4218e1e8f5069de74b4a1b2e81aa2b4973078c71ba564e51cfd1958"
+    },
+    {
+      "name": "source-input-17.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/dependencies/b914-independent-review-4.json",
+      "sha256": "32aefa8abe9198ce341082026684afaa66dd35eb10ac9cd619b18f48bc781349"
+    },
+    {
+      "name": "source-input-18.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/command-data.json",
+      "sha256": "b18be310ac48777a544571b1699253810bc3348606e17201c7fac88f0097360e"
+    },
+    {
+      "name": "source-input-19.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/source-preflight.json",
+      "sha256": "e77349fb99b102b5d848a1487312fd48b457c1ee42d7e1e4c14d396fa2eab6db"
+    },
+    {
+      "name": "source-input-20.json",
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/source-binding.json",
+      "sha256": "6a071093f91a4cabc011773e9ed5ae3b91a6ab3b4a12b11fceae3ace68b7d827"
+    }
+  ],
+  "actual_grant": null,
+  "actual_execution": null,
+  "actual_release": null,
+  "actual_allocation": null,
+  "actual_runtime_readiness": null,
+  "actual_independent_controller_review": null,
+  "actual_queue": null,
+  "controller_review_contract": {
+    "required_fields": {
+      "verdict": "CONTROLLER_SOURCE_CLEAR",
+      "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+      "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+      "runner_sha256": "<actual frozen source SHA256>",
+      "plan_sha256": "<actual frozen plan SHA256>"
+    },
+    "fresh_external_grant_required": true
+  },
+  "qualification_scope": "ONLY_3_ISOLATED_BINARY_CHECKS_NO_TEST_OR_NATIVE_QUALIFICATION",
+  "packet_B": "UNASSIGNED_DATA_ONLY_NOT_IMPLEMENTED",
+  "limits": "Packet A ONLY three isolated CLI/HOST/browserlessUI binary checks, zero tests/libtest compilations/artifacts/inventories/groups/helpers. No retained-actor/EOF test results or testcredits transfer. Current source/context/tools/resource availability and runtime outcomes UNRUN. No whole-suite/PR/main/installed/native/provider/UX/merge qualification. All original negatives, custody/359/WHOLE/nativeholds remain. Unknown/forced custody retains HOLD; original evidence and one-shot Cfd-close policy unchanged. Discrete source/context observations and grant-UUID syntax-only freshness/once-only limitation remain."
+}

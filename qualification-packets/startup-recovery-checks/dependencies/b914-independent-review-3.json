@@ -1,0 +1,432 @@
+{
+  "schema": "finite-independent-main-composition-source-conservation-v1",
+  "reviewer_role": "/root/1945_cache_io_oracles; independent outside-gate/API/main conservation reviewer, not composition author",
+  "utc": "2026-10-31T08:21:13.661150+00:00",
+  "verdict": "BOUNDED_OUTSIDE_GATE_SOURCE_CONSERVATION_CLEAR_RUNTIME_UNRUN",
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/startup-recovery-2030-2029-on-4429-source-v1/freeze.json",
+    "sha256": "de41158a936a4086958ca95b126c621cf16b119c50870e25131bbe49df5727bc"
+  },
+  "pins": {
+    "base_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "base_main_tree": "7fbf5b3c3eeb907af6cd3c01858d34f8f2644026",
+    "HEAD_before_commit": "ac54c12bb54dc433366fe2eeb992faa348428acb",
+    "HEAD_tree": "14e8a22e3945ab63f5fd1fd50b56fcb03e3ff3ff",
+    "public2030": "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+    "public2030_tree": "bee2d5a53cc164dbf5de36f4d5b4ba59dfa54fd3",
+    "public2029": "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd",
+    "public2029_tree": "195a5ebe7a3d65e713506827caf4a65e7f8a50fd",
+    "common_original_ancestor": "a3221af83d56663f0dcbef90f67b30ad6d9fe53d",
+    "calculated_uncommitted_source_tree": "21c43715d5de2288b27d5408e460fc7eaa7485de",
+    "calculated_tree_limit": "Pure Git-compatible Merkle digest of actual tracked working bytes/modes; no Git object was written and this is not an existing committed/public head."
+  },
+  "source_scope": "Exactly the frozen 15-path composition against4429. Gate implementation and new cross-test semantics are separately owned and excluded; their pins/count conservation only are included.",
+  "path_and_outside_conservation": {
+    "actual_affected_paths": [
+      "src/app.rs",
+      "src/app/chat_ui.rs",
+      "src/app/saved_terminal.rs",
+      "src/app/shared_views.rs",
+      "src/app/shared_views/tests/startup_terminals.rs",
+      "src/app/startup_gate.rs",
+      "src/app/startup_gate/attachment_tests.rs",
+      "src/app/startup_gate/tests.rs",
+      "src/control.rs",
+      "src/host/agent_execution/terminals.rs",
+      "src/host/client.rs",
+      "src/host/state.rs",
+      "src/terminal/hosted.rs",
+      "src/terminal/ipc.rs",
+      "src/terminal/surface.rs"
+    ],
+    "actual_count": 15,
+    "freeze_set_exact": true,
+    "tracked_entries": 2222,
+    "outside_entries_exact_to4429": 2207,
+    "comparison": "Every tracked source entry was read and its Git blob hash/type/executable mode compared to4429; no unexpected symlinks were followed. All changes equal the declared15 set, no deleted/untracked/unmerged entries. All15 freeze snapshots equal live bytes at start and end.",
+    "mode_scope": "Git type/executable modes, not arbitrary filesystem permissions or runtime namespace assurance."
+  },
+  "reference_byte_conservation": [
+    {
+      "path": "src/app/saved_terminal.rs",
+      "reference": "2030",
+      "head": "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+      "sha256": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+      "blob": "9f0f0421c08111f2e9b15ad8ac33e6f053983076",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/app/shared_views.rs",
+      "reference": "2030",
+      "head": "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+      "sha256": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
+      "blob": "24b8e50a46abca271a46a35fdd3305293676f68b",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "reference": "2030",
+      "head": "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+      "sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+      "blob": "2dab732885bb68e5b6d06fd433f4e0b3b5ef4812",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/terminal/hosted.rs",
+      "reference": "2030",
+      "head": "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+      "sha256": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+      "blob": "d57bc9411845d2da3209c4ac8279b73deb6ba0b4",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/terminal/surface.rs",
+      "reference": "2030",
+      "head": "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+      "sha256": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21",
+      "blob": "5e10df3f82349a0463cfa3a2aea245b7c2e23515",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/app/chat_ui.rs",
+      "reference": "2029",
+      "head": "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd",
+      "sha256": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+      "blob": "7185ed02bd905cf52d1f0019742abb54fbc9ea75",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "reference": "2029",
+      "head": "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd",
+      "sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+      "blob": "07c71dddb701dae4e02b1cd42b5a62ba1d21f24c",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/control.rs",
+      "reference": "2029",
+      "head": "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd",
+      "sha256": "37c489822925d1e5a62fe6a87aee2e226379979ae399f34957065277f948a3e9",
+      "blob": "f86959a04c4ec27b43c5cba5c6c43f3709bd251e",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/host/agent_execution/terminals.rs",
+      "reference": "2029",
+      "head": "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd",
+      "sha256": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+      "blob": "33760aec3b600344721d1e8ce0f39854da229b5d",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/host/client.rs",
+      "reference": "2029",
+      "head": "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd",
+      "sha256": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+      "blob": "3228e99c86c94947733ae2fdc3805aa648276436",
+      "mode": "100644",
+      "exact": true
+    },
+    {
+      "path": "src/terminal/ipc.rs",
+      "reference": "2029",
+      "head": "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd",
+      "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+      "blob": "1c610082dd9e4565ce4a3beb309351a346f0d158",
+      "mode": "100644",
+      "exact": true
+    }
+  ],
+  "app_exception": {
+    "path": "src/app.rs",
+    "combined_sha256": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
+    "full_leaf_exact_union": true,
+    "independent_method": "Canonical zero-context Git source operations from a322 to d2 and78ee. Each operation set independently reconstructs its original reference leaf; disjoint union reconstructs the entire combined leaf exactly. No authored verification/import/test helper was executed.",
+    "2030_operation_count": 12,
+    "2029_operation_count": 2,
+    "2029_exact_additions": [
+      "StartupStateInspected(startup_gate::Inspection),",
+      "Message::StartupStateInspected(state) => self.startup_state_inspected(state),"
+    ],
+    "scope": "Complete2030/R2 app source retained plus only these two original2029 Message insertions. Manual gate/handler semantics remain separately reviewed."
+  },
+  "main2026_preservation": {
+    "actual_two_main_paths": [
+      "src/host/chat/retained_actor_tests.rs",
+      "src/host/state.rs"
+    ],
+    "state_rs": {
+      "combined_sha256": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+      "full_leaf_exact_union": true,
+      "independent_method": "From a322, exact six4429 operations and four original78ee operations are disjoint and reconstruct the entire combined state.rs. Each input operation set reconstructs its own reference version first; original2030 state equals a322. Thus no4429 restore-classification/callsite bytes or2029 inspection bytes were replaced or lost.",
+      "main_operation_count": 6,
+      "2029_operation_count": 4
+    },
+    "retained_actor_tests_rs": {
+      "path": "src/host/chat/retained_actor_tests.rs",
+      "git_blob": "f136959230e3a02fbd95e0975401e18141bfb266",
+      "sha256": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658",
+      "entire_file_byte_exact_4429": true,
+      "not_replaced_by_a322": true,
+      "outside_15": true
+    },
+    "limit": "Preservation of production/test source is proved; dynamic behavior/interactions and new test semantics are not qualified."
+  },
+  "wire_and_API_conservation": {
+    "terminal_ipc_rs_sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+    "terminal_ipc_whole_leaf_exact_public78ee": true,
+    "all_other_2029_outside_exceptions_exact": true,
+    "composition_specific_wire_allocation": "NONE in the compared protocol source; all original78ee IPC changes are preserved exactly. Other unclaimed protocol files remain4429-exact. app.rs changes beyond2030 are exactly the two original2029 UI Message insertions.",
+    "limit": "This is source/API allocation conservation, not protocol execution/compatibility or gate semantic approval."
+  },
+  "tests": {
+    "existing_2029_leaf": "src/app/startup_gate/tests.rs",
+    "existing_2029_leaf_full_exact_public78ee": true,
+    "existing_2029_parent_count": 13,
+    "existing_2030_startup_terminal_leaf_full_exact_publicd2": true,
+    "original8_plus_R2_2_count": 10,
+    "R1_attachment_tests_original_prefix_exact_publicd2": true,
+    "R1_attachment_tests_prefix_sha256": "1791c2c35f6c3d5f68878cc45f667c720d7de727d1ff0ae4a1527100fde4760b",
+    "R1_original_parent_count": 3,
+    "only_appended_cross_parent_count": 2,
+    "appended_cross_names": [
+      "hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "actual_reconnect_retires_cached_inspection_until_fresh_acceptance"
+    ],
+    "source_authored_parent_inventory": {
+      "startup_terminals_original8_plus_R2_2": [
+        "reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+        "reopened_shared_window_reports_a_refused_offscreen_attach",
+        "shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+        "a_replaced_shared_session_is_qualified_again",
+        "a_detached_attach_is_retried_after_a_pause_and_then_reported",
+        "a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+        "a_hibernated_offscreen_attachment_qualifies",
+        "a_detached_offscreen_attach_is_reported_rather_than_awaited",
+        "restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+        "a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row"
+      ],
+      "2029_existing13": [
+        "retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+        "retained_reason_fits_one_launcher_handshake_line",
+        "panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+        "settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+        "the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+        "inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+        "old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+        "current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+        "losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+        "cached_ready_is_revalidated_after_a_new_owner_connects",
+        "delayed_retained_cannot_override_current_readiness_or_save_completion",
+        "a_retired_worker_keeps_occupancy_until_its_original_completion",
+        "a_stale_inspection_does_not_hide_a_real_save_error"
+      ],
+      "R1_original3": [
+        "hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+        "another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+        "oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery"
+      ],
+      "cross2": [
+        "hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+        "actual_reconnect_retires_cached_inspection_until_fresh_acceptance"
+      ],
+      "nonadditive_total": 28
+    },
+    "nonadditive_total": 28,
+    "limit": "Authored outer parent count only, not compiled --list inventory or executed results. Nested cases/helpers are nonadditive. No semantic review of the manual gate or new cross-test bodies was repeated."
+  },
+  "prior2030_conservation": {
+    "path": "/tmp/pr2030-assembled-conservation-94d2bruf/review.json",
+    "sha256": "a68b167eb5c13c892e9eae22e38c620e9debc03d8e4fd2aacbbccb242f1b49eb",
+    "meaning": "The ten-parent startup leaf is exactd2; previous original8 assertion/setup conservation therefore carries as a source fact, never as runtime evidence."
+  },
+  "historical_manifest_failures": {
+    "preserved": [
+      {
+        "chunk": "65c0d1",
+        "exit": 1,
+        "observed": "expected13paths assertion received15; no freeze written"
+      },
+      {
+        "chunk": "49dd5a",
+        "exit": 1,
+        "observed": "expected-set assertion failed; no freeze written; subsequent explicit pathset check7bff8a exit0 observed15/15 symmetricdifference empty; cause not inferred"
+      }
+    ],
+    "current_independent_check": "Current15-path set was independently computed from all tracked source bytes/modes and reconfirmed through Git at end; equals freeze15 exactly.",
+    "no_reclassification": "Both earlier manifest attempts remain original exit1 with no freeze. No cause is inferred, no earlier assertion is waived or turned into pass. Lead-reported format phase0 preceding a later manifest failure is distinct from whole-command exit1."
+  },
+  "start_end": {
+    "start_utc": "2026-10-31T08:16:38.712013+00:00",
+    "end_utc": "2026-10-31T08:21:13.660628+00:00",
+    "all15_path_hashes_and_lengths_identical": true,
+    "HEAD_unchanged": true,
+    "path_set_unchanged": true,
+    "start_file": "start-pins.json",
+    "end_file": "end-pins.json"
+  },
+  "new_findings": [],
+  "format_and_execution": "No formatter, compiler, tests, fixture/helper, native or provider ran in this review. Freeze format0/diff0 are retained as lead provenance only, with the recorded original manifest failures still exit1. All Rust/tests/native/UX remain UNRUN/MISSING; no C grant.",
+  "limits": [
+    "Outside-gate conservation only; semantic gate review, new cross-test oracle review and final assembled experience approval belong to other assigned reviewers.",
+    "No source/Git edit, build/test/import/fixture execution, runtime/process/env/account/DB/target/lock/endpoint probe, remote/GitHub action, resource allocation or new worker. All writes are own /tmp evidence artifacts.",
+    "No source-field/receipt is a runtime grant, release, native PASS, merge readiness or current installation claim."
+  ],
+  "signature": "Signed in role by /root/1945_cache_io_oracles; finite actual-source/tree conservation assessment only.",
+  "artifact_hashes": [
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/app-2029.patch",
+      "sha256": "4a6926b4439f2fdc4574824502530368c704fa881a4ec1a42e83d16398ee57bf"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/app-2030.patch",
+      "sha256": "30240d2ac7957d2ed2e31e4e9d0d1cdd1d673ebbcd34f7d7473657b117090357"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/base-a322__src__app.rs.frozen",
+      "sha256": "c405ea52503acc5076a5e77d3bc81d5e9ab341b1a78e313147e9ca70dfc67e77"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/base-a322__src__host__state.rs.frozen",
+      "sha256": "846fc2c0ca72312667ae36f4c1a05213bf505270272bc8a40817d9c1adcf3604"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/cross-append-only.rs.txt",
+      "sha256": "7cccf1bbab58e53fb7d1221a9a47ea39b418defa0027299b570f44a0aaf1390f"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/end-pins.json",
+      "sha256": "cf7023d888df9a5097ef2cd98a81727281f343acd38129c48c3216a12a51ae1f"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/exception-union-proof.json",
+      "sha256": "f23501212dd37a862d72b4fe0260d8c13c510e649e85ea34a575162372f27f17"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/input-freeze.json",
+      "sha256": "de41158a936a4086958ca95b126c621cf16b119c50870e25131bbe49df5727bc"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/main2026-retained-actor-tests.rs.frozen",
+      "sha256": "d56afb451a09d289ffdb49f850e6b7cf491d79f92c669f6435343a70efdee658"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/main4429-tree.nul",
+      "sha256": "d422c504186c625d3c1e1ad69ff521e60aff8d3751f240545c710e0cbe020c0a"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/main4429__src__app.rs.frozen",
+      "sha256": "c405ea52503acc5076a5e77d3bc81d5e9ab341b1a78e313147e9ca70dfc67e77"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/main4429__src__host__state.rs.frozen",
+      "sha256": "5bcba7e2d11ab12078c864cb1e7d3651bcd940ae71264aecaeea0987214ea52f"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/prospective-source-tree.json",
+      "sha256": "6675b595179ecd1132c19a5eca7a5b024b011d98170d5f8e51e5c3f4d5f2de87"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/public2029__src__app.rs.frozen",
+      "sha256": "efb7fbfc649bb99629a104ba93e061a5ba6c5a05718eaf976dffdcde87a53709"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/public2029__src__host__state.rs.frozen",
+      "sha256": "5e7ed6a15d0e1fe17d56161d78717954fc8d94a2aee70d16f9d614c48c9ce807"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/public2030__src__app.rs.frozen",
+      "sha256": "2edffc4a82f20282aafd3283583c0cce4709aff012c90e9367922e7766a175bc"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/public2030__src__host__state.rs.frozen",
+      "sha256": "846fc2c0ca72312667ae36f4c1a05213bf505270272bc8a40817d9c1adcf3604"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__app.rs.frozen",
+      "sha256": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__app__chat_ui.rs.frozen",
+      "sha256": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__app__saved_terminal.rs.frozen",
+      "sha256": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__app__shared_views.rs.frozen",
+      "sha256": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__app__shared_views__tests__startup_terminals.rs.frozen",
+      "sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__app__startup_gate.rs.frozen",
+      "sha256": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__app__startup_gate__attachment_tests.rs.frozen",
+      "sha256": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__app__startup_gate__tests.rs.frozen",
+      "sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__control.rs.frozen",
+      "sha256": "37c489822925d1e5a62fe6a87aee2e226379979ae399f34957065277f948a3e9"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__host__agent_execution__terminals.rs.frozen",
+      "sha256": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__host__client.rs.frozen",
+      "sha256": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__host__state.rs.frozen",
+      "sha256": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__terminal__hosted.rs.frozen",
+      "sha256": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__terminal__ipc.rs.frozen",
+      "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/src__terminal__surface.rs.frozen",
+      "sha256": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/start-pins.json",
+      "sha256": "1896829b90c1f735933c7880b4a3175a3869c0e7dc473c8a60318f5a1580ecad"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/state-2029.patch",
+      "sha256": "2cfd3541ed9801e37b0dabb3c33ae3707374c9aff9cd49d641196565255642f2"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/state-main2026.patch",
+      "sha256": "5ba486668701ec122ad62312022d27441976ff6dfc1c9ed935ec1e266d6eedb9"
+    },
+    {
+      "path": "/tmp/startup-recovery-composition-conservation-i6_m2ww3/tree-and-reference-proof.json",
+      "sha256": "5f5d8ba5ef875ae8aa8e1702664a3d916f080c867ce045435eb2413cf352b147"
+    }
+  ]
+}

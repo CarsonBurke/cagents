@@ -1,0 +1,131 @@
+{
+  "created_utc": "2026-10-31T08:35:45.901599+00:00",
+  "task": "/root/1892_ready_attachment_review",
+  "result": "SOURCE_CLEAR_BOUNDED_SHARED_TRANSPORT_TEST",
+  "verdict": "No concrete API/type/proof/refusal/peer-lifecycle blocker found by source inspection. One new owning parent exercises actual shared ControlClient and framed codec for five nonadditive cases. Production bytes, original tests and all other tracked files are conserved. No execution or pass/native/merge approval.",
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/b914-shared-startup-transport-test-source-v1/freeze.json",
+    "sha256": "a346a4e9e743ebb5f2cca6eb1a637eb050fd5756d546eaeeea8a28443e2ab633",
+    "head_before": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+    "head_after": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+    "base_tree": "21c43715d5de2288b27d5408e460fc7eaa7485de",
+    "file": "src/control.rs",
+    "file_sha256_before": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+    "file_sha256_after": "5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1",
+    "full_binary_delta_sha256": "0935bb7a26e9f39cac94056b09148f3dbc42a268b9daa58e3ae19aea28d4dc76",
+    "start_end_match": true
+  },
+  "conservation": {
+    "changed_tracked_files": [
+      "src/control.rs"
+    ],
+    "untracked_nonignored_files": [],
+    "edit_operations": [
+      {
+        "kind": "insert",
+        "old_insertion_line": 5940,
+        "new_start_line": 5940,
+        "new_end_line": 6053,
+        "inserted_bytes": 5276,
+        "inserted_sha256": "f9ae914f37e4bf8e5f35f3d9d77616ef05f427a9eff2fff3c2f3b5421639f1bb"
+      }
+    ],
+    "production_prefix_before_cfg_test_module_byte_exact": true,
+    "inverse_delete_only_new_insertion_equals_full_base_file": true,
+    "forward_insert_only_new_block_equals_full_candidate": true,
+    "original_test_bytes_exact": true,
+    "test_parent_count_before": 46,
+    "test_parent_count_after": 47,
+    "net_new_owning_parents": 1,
+    "case_count_not_additive": 5,
+    "supporting_unchanged_API_pins": [
+      {
+        "path": "src/terminal/ipc.rs",
+        "sha256": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+        "git_blob": "1c610082dd9e4565ce4a3beb309351a346f0d158",
+        "live_equals_base": true
+      },
+      {
+        "path": "src/model.rs",
+        "sha256": "cc4455180a27d116ff43f18ccb91e55fdf4dcc6aee43efc077df31948f270ba0",
+        "git_blob": "b6c8bba1e6456d1a3b9291c7173c81a819fa2ba7",
+        "live_equals_base": true
+      }
+    ]
+  },
+  "owning_parent": {
+    "name": "control::tests::startup_state_uses_framed_proof_pinned_transport_for_variants_and_refusals",
+    "definition_line": 5943,
+    "function_sha256": "106ce512106e6450a7a3fd7835d49c9920f30f2a36261fcd229a11abea2ea511"
+  },
+  "API_and_causal_review": [
+    {
+      "anchors": [
+        "src/control.rs:5942-6053",
+        "src/control.rs:656-711",
+        "src/control.rs:1307-1312"
+      ],
+      "finding": "Actual UnixStream::pair endpoints are handed to the original ControlClient::from_stream, existing HandshakeClient handshake, current proof getter and five original startup_state calls. No endpoint resolution, ensure_daemon_ready, ControlClient::connect, wrapper that returns fabricated StartupState, public helper or producer/provider launch is introduced."
+    },
+    {
+      "anchors": [
+        "src/control.rs:5957-6018",
+        "src/control.rs:5233-5248"
+      ],
+      "finding": "The peer checks the actual Connect protocol version/request_id1/no proof/expected_hostNone/empty resume. It sends existing connected_envelope with complete equal envelope and inner proof. Every startup request must be exactly StartupState, version current, ids2..6 in order and proofSome(the originally pinned full tuple). This prevents accidentally selecting another getter or changing proof after refusal."
+    },
+    {
+      "anchors": [
+        "src/control.rs:5973-6000",
+        "src/control.rs:6030-6052",
+        "src/control.rs:1307-1312"
+      ],
+      "finding": "Expected results are actual decoded Ready, Restoring awaiting37 and Unicode Retained detail equality; a static return of one variant cannot satisfy the parent. The fourth correlated TerminalUnavailable response must remain ControlError::Remote with exact message and retryable=false; it is not converted into Retained/Ready or confused with unsolicited ConnectionRejected."
+    },
+    {
+      "anchors": [
+        "src/control.rs:5999-6016",
+        "src/control.rs:1690-1746"
+      ],
+      "finding": "The fifth Ready envelope deliberately changes only host_incarnation while preserving session/boot and correct request id. Existing request validation precedes response extraction, so actual ProofMismatch is required. This directly covers the strict client transport proof path absent from typed UI/direct HOST tests. It does not mutate or forgive the originally pinned proof."
+    },
+    {
+      "anchors": [
+        "src/control.rs:6019-6033"
+      ],
+      "finding": "All five calls are collected without prematurely asserting/early-returning on the fourth error, so the fifth proof-negative exchange genuinely occurs. The result is stored outside the client-owning IIFE. The client is dropped at IIFE exit before peer.join(), allowing the peer final read to observe actual EOF. Main-thread result assertions run only after the original scoped peer is joined."
+    }
+  ],
+  "type_compatibility": [
+    "Existing tests module imports make UnixStream, ClientEnvelope/Request, ServerEnvelope/Message/Response, ProtocolError/Code, read_frame/write_frame, Duration, thread and helper proof/connected_envelope available. Only StartupState is locally imported.",
+    "StartupState is shared and the getter is not feature-gated here; it is callable from the shared CLI test boundary without selecting host or ui together. The descriptor/error enum shapes and protocol wrappers match the base source.",
+    "Closure return Result<_, ControlError> infers the owned pinned HostSessionProof plus Vec<Result<StartupState,ControlError>>. ControlError Debug supports unwrap; StartupState and proof support equality/debug. No Message Send problem is introduced: the only spawned scoped closure captures owned UnixStream/proofs and static string.",
+    "detail is a static string slice and Copy, pinned is an owned clone captured only by the peer, expected stays in the parent, and foreign moves into the final response. There is no borrowed data escaping the scoped thread or held client reference at join."
+  ],
+  "ownership_and_bounds": {
+    "original_peer": "One thread::scope child, explicitly joined by its original ScopedJoinHandle before main result assertions; no detached peer or forgotten JoinHandle.",
+    "normal_path": "Client IIFE drops the original stream after all five results; peer requires EOF and returns; parent joins then checks values.",
+    "construction_error": "from_stream consumes the supplied stream. Failure drops it, so the peer either observes EOF or fails its bounded write/read; joining does not depend on a client still retained outside observed.",
+    "unexpected_panic": "Client-local values unwind before the scope joins. Peer owns its stream; peer panic closes it, unblocking client I/O. Scope guarantees child settlement on an unexpected parent panic; explicit join unwrap propagates peer assertion failure. No external process is involved.",
+    "IObounds": "Peer read/write timeouts are2s. Original from_stream sets finite handshake/read/write limits (normally5s, selected-remote handshake policy30s); subsequent startup requests use original5s I/O timeout. Fixed six small exchanges plus EOF, with no intentional unbounded server wait. No uniform2s whole-test bound or arbitrary deadlock freedom is claimed.",
+    "no_extra_authority": "Only framing/complete proof pinning is covered. No account verification, authenticated HOST admission, live daemon readiness, provider effect, native GUI or caller authority is established."
+  },
+  "blocking_findings": [],
+  "coverage_limits": [
+    "One owning test parent with five cases, not five independent parents or five observed passes.",
+    "The peer fabricates protocol status/refusal frames; production HOST derivation of those states remains separately reviewed/tested.",
+    "The foreign-incarnation case rejects its response. This parent does not test later requests on that connection, every invalid proof component, unsolicited errors, wrong response/request IDs, or production endpoint routing; broader existing tests are not requalified here.",
+    "No Rust compile/test execution occurred. Source-compatible API analysis is not an executed compile result.",
+    "No native, matched-runner, screenshots, actual startup recovery, responsiveness or merge qualification is supplied."
+  ],
+  "evidence": {
+    "Rust_compile": "UNRUN",
+    "new_owning_parent": "UNRUN",
+    "native": "UNRUN",
+    "peer_join": "SOURCE_ONLY_NOT_OBSERVED",
+    "provider": "NOT_EXECUTED",
+    "allocation_or_grant": "NONE",
+    "publication": "NONE"
+  },
+  "operations": "Read/hash source and exact base Git object; compare forward/inverse byte insertion and tracked delta; write only this additive /tmp artifact. No edits/import/build/test/helper/process/endpoint/account/DB/env/native probes or execution, remote/public write, C use, peer messages or new agents."
+}
