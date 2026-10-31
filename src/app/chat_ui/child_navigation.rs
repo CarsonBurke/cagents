@@ -25,6 +25,37 @@ fn child_key(id: &str) -> [u8; 32] {
     sha2::Sha256::digest(id.as_bytes()).into()
 }
 
+// Keep a reported name primary. Only generic or visually repeated names need a
+// secondary identity, computed from the full snapshot so filtering/paging
+// cannot change it. Extend past eight characters on collisions; an ID that is
+// a prefix of another is retained whole, never replaced with the other's ID.
+fn identity_suffix<'a>(child: &'a chat::Subagent, peers: &[&chat::Subagent]) -> Option<&'a str> {
+    if !child.kind.trim().is_empty() && peers.len() == 1 {
+        return None;
+    }
+    let length = peers
+        .iter()
+        .filter(|peer| peer.id != child.id)
+        .map(|peer| {
+            child
+                .id
+                .chars()
+                .zip(peer.id.chars())
+                .take_while(|(left, right)| left == right)
+                .count()
+                + 1
+        })
+        .max()
+        .unwrap_or(0)
+        .max(8);
+    let end = child
+        .id
+        .char_indices()
+        .nth(length)
+        .map_or(child.id.len(), |(end, _)| end);
+    Some(&child.id[..end])
+}
+
 fn rank(child: &chat::Subagent) -> u8 {
     match child.status {
         chat::ToolStatus::Failed | chat::ToolStatus::Denied => 0,
@@ -45,7 +76,12 @@ impl Picker {
     }
 
     pub fn rows<'a>(&self, children: &'a [chat::Subagent]) -> Vec<&'a chat::Subagent> {
-        let query = self.query.trim().to_lowercase();
+        let query = self.query.trim();
+        // Share transcript Find's streaming, full Unicode case folding. Keep
+        // only query-sized matching state, never a folded copy of a task that
+        // may contain a multi-megabyte first line. Whole source characters
+        // still match across case-fold expansions (for example Straße/STRASSE).
+        let pattern = find::Pattern::prepare(query, &|| true).expect("uncancelled picker search");
         let mut rows: Vec<_> = children
             .iter()
             .filter(|child| {
@@ -58,12 +94,16 @@ impl Picker {
                     && (query.is_empty()
                         || [
                             Runtime::native_child_name(child),
+                            Runtime::native_child_task(child).unwrap_or_default(),
                             &child.id,
                             child.model.as_deref().unwrap_or_default(),
                             Runtime::native_child_status(child),
                         ]
                         .iter()
-                        .any(|part| part.to_lowercase().contains(&query)))
+                        .any(|part| {
+                            find::matched_pattern_checked(part, &pattern, 0, &|| true)
+                                .is_some_and(|matches| matches.truncated)
+                        }))
             })
             .collect();
         // Stable ordering preserves the provider's order among equal states.
@@ -197,6 +237,13 @@ impl Runtime {
         let page = picker.page.min(matches.len().saturating_sub(1) / PAGE_SIZE);
         let count = matches.len();
         let first = matches.get(page * PAGE_SIZE).map(|child| child.id.clone());
+        let mut names: HashMap<String, Vec<&chat::Subagent>> = HashMap::new();
+        for child in &self.snapshot.subagents {
+            names
+                .entry(Self::short_description(Self::native_child_name(child), 80))
+                .or_default()
+                .push(child);
+        }
         let mut rows = Vec::with_capacity(PAGE_SIZE);
         for child in matches.into_iter().skip(page * PAGE_SIZE).take(PAGE_SIZE) {
             let chosen = self.selected_subagent.as_ref() == Some(&child.id);
@@ -213,18 +260,27 @@ impl Runtime {
                 Self::native_child_name(child),
                 child.id
             );
+            let display_name = Self::short_description(Self::native_child_name(child), 80);
+            let identity = identity_suffix(child, &names[display_name.as_str()]).map_or_else(
+                || status.to_owned(),
+                |suffix| format!("{status} · ID: {suffix}"),
+            );
+            let task = Self::native_child_task(child)
+                .map(|task| format!("Task: {}", Self::short_description(task, 120)));
+            let mut details = vec![
+                design::body(display_name).width(Length::Fill).into(),
+                design::caption(identity).into(),
+            ];
+            if let Some(task) = &task {
+                details.push(design::caption(task.clone()).into());
+            }
             let row = widget::button::custom(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(marker, design::COMPACT_ICON_SIZE),
-                    widget::column::with_children(vec![
-                        design::body(Self::short_description(Self::native_child_name(child), 80))
-                            .width(Length::Fill)
-                            .into(),
-                        design::caption(status).into(),
-                    ])
-                    .width(Length::Fill)
-                    .spacing(space::XS)
-                    .into(),
+                    widget::column::with_children(details)
+                        .width(Length::Fill)
+                        .spacing(space::XS)
+                        .into(),
                     crate::ui_controls::passive_icon(
                         if chosen { Icon::Check } else { Icon::PanEnd },
                         design::COMPACT_ICON_SIZE,
@@ -234,6 +290,7 @@ impl Runtime {
                 .align_y(Alignment::Center),
             )
             .name(name)
+            .description(task.unwrap_or_default())
             .id(card_control_id(
                 target.card,
                 &format!("chat-subagent-{}", child.id),

@@ -2650,7 +2650,15 @@ impl Actor {
     }
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
-    fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+    fn apply_step(
+        &mut self,
+        mut step: Step,
+        confirmed: Option<Option<String>>,
+    ) -> Result<(), String> {
+        if step.historical_subagent_names {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            preserve_resident_child_names(&mut step, &state);
+        }
         let suppress_current_notification = step.suppress_current_notification;
         if !suppress_current_notification {
             if let Some(preview) = &step.notification_preview {
@@ -3092,6 +3100,47 @@ fn recover_history_error(
         }
         Event::Error { .. } | Event::Reset { .. } | Event::Exited { .. } => *history_error = None,
         _ => {}
+    }
+}
+
+/// Compare the complete frame with its entry snapshot, before Store or the
+/// reducer can observe an older name. Looking at that fixed baseline lets a
+/// previously unnamed child advance through names in one chronological page.
+fn preserve_resident_child_names(step: &mut Step, state: &Snapshot) {
+    if !step.historical_subagent_names {
+        return;
+    }
+    let end = step
+        .events
+        .iter()
+        .position(|event| match event {
+            Event::Reset { .. } => true,
+            Event::Session { id, .. } => state.session_id.as_deref() != Some(id.as_str()),
+            _ => false,
+        })
+        .unwrap_or(step.events.len());
+    for agent in state
+        .subagents
+        .iter()
+        .filter(|agent| !agent.kind.is_empty())
+    {
+        let mut carried = false;
+        for event in step.events[..end].iter_mut().rev() {
+            if let Event::Subagent { id, kind, .. } = event
+                && *id == agent.id
+                && !kind.is_empty()
+            {
+                if carried {
+                    kind.clear();
+                } else {
+                    // Earlier events can trim this row. Carry its entry name on
+                    // the last update, copying at most once per resident child.
+                    // Repeated short names must not amplify a long saved name.
+                    kind.clone_from(&agent.kind);
+                    carried = true;
+                }
+            }
+        }
     }
 }
 
@@ -3761,6 +3810,802 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 
 #[cfg(test)]
 mod tests {
+    fn codex_child_name_adapter(directory: &std::path::Path) -> Box<dyn Adapter> {
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: Some("parent-exact".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: directory.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.to_str().unwrap().into(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        // Build an owned-listener spec without creating a process or socket.
+        super::super::protocol::codex::create_with_listener(&launch, directory.join("unused.sock"))
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn codex_history_keeps_the_latest_name_in_a_page_without_rewinding_known_names() {
+        for old_name in ["Scout", " \t\n"] {
+            for failed_hydration in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut adapter = codex_child_name_adapter(directory.path());
+                let mut state = Snapshot::default();
+                let mut indices = BTreeMap::new();
+                let hello = adapter.initialize().unwrap();
+                let initialized = adapter.receive(json!({"id":hello.writes[0]["id"],"result":{
+                    "codexHome":directory.path().to_str().unwrap(),"userAgent":"codex-history-name-fixture"
+                }})).unwrap();
+                let attach = initialized
+                    .writes
+                    .iter()
+                    .find(|frame| frame["method"] == "thread/resume")
+                    .unwrap();
+                let attached = adapter
+                    .receive(json!({"id":attach["id"],"result":{
+                        "thread":{"id":"parent-exact","status":{"type":"idle"}},
+                        "initialTurnsPage":{"data":[],"nextCursor":"older"}
+                    }}))
+                    .unwrap();
+                let skills = initialized
+                    .writes
+                    .iter()
+                    .find(|frame| frame["method"] == "skills/list")
+                    .unwrap();
+                let ready = adapter
+                    .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+                    .unwrap();
+                assert!(ready.events.contains(&Event::Ready(true)));
+                for event in attached.events.into_iter().chain(ready.events) {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                let turn = |id: &str, name: &str| {
+                    json!({
+                        "id":id,"status":"completed","itemsView":"full","items":[{
+                            "id":format!("spawn-{id}"),"type":"collabAgentToolCall","tool":"spawnAgent",
+                            "status":"completed","senderThreadId":"parent-exact","receiverThreadIds":["child-exact"],
+                            "agentsStates":{"child-exact":{"agentNickname":name}}
+                        }]
+                    })
+                };
+                let request = adapter.command(Command::LoadEarlier).unwrap();
+                let history = adapter.receive(json!({"id":request.writes[0]["id"],"result":{
+                    "data":[turn("newest", " \t\n"),turn("renamed", "Navigator"),turn("oldest", old_name)],
+                    "nextCursor":"older-still"
+                }})).unwrap();
+                let names = history
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Subagent { id, kind, .. }
+                            if id == "child-exact" && !kind.is_empty() =>
+                        {
+                            Some(kind.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    names,
+                    if old_name == "Scout" {
+                        vec!["Scout", "Navigator"]
+                    } else {
+                        vec!["Navigator"]
+                    }
+                );
+                let resumes = history
+                    .writes
+                    .iter()
+                    .filter(|frame| {
+                        frame["method"] == "thread/resume"
+                            && frame["params"]["threadId"] == "child-exact"
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    resumes.len(),
+                    1,
+                    "the original child hydration request must be retained"
+                );
+                let resume = resumes[0]["id"].clone();
+                for event in history.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents.len(), 1);
+                assert_eq!(state.subagents[0].kind, "Navigator");
+                let response = if failed_hydration {
+                    json!({"id":resume,"error":{"message":"Child hydration unavailable"}})
+                } else {
+                    json!({"id":resume,"result":{
+                        "thread":{"id":"child-exact","status":{"type":"idle"}},
+                        "initialTurnsPage":{"data":[],"nextCursor":null}
+                    }})
+                };
+                for event in adapter.receive(response).unwrap().events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents[0].kind, "Navigator");
+                let older = adapter.command(Command::LoadEarlier).unwrap();
+                let older = adapter
+                    .receive(json!({"id":older.writes[0]["id"],"result":{
+                        "data":[turn("older-again", "Earlier name")],"nextCursor":"oldest-page"
+                    }}))
+                    .unwrap();
+                assert!(!older.events.iter().any(|event| matches!(event,
+                    Event::Subagent { kind, .. } if !kind.is_empty()
+                )));
+                for event in older.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents[0].kind, "Navigator");
+                let live = adapter
+                    .receive(json!({"method":"thread/started","params":{"thread":{
+                        "id":"child-exact","parentThreadId":"parent-exact","agentNickname":"Pilot"
+                    }}}))
+                    .unwrap();
+                for event in live.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                let older = adapter.command(Command::LoadEarlier).unwrap();
+                let older = adapter.receive(json!({"id":older.writes[0]["id"],"result":{
+                    "data":[turn("older-live-new", "Stale rename"),turn("older-live-old", "Stale name")],
+                    "nextCursor":null
+                }})).unwrap();
+                for event in older.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents.len(), 1);
+                assert_eq!(state.subagents[0].id, "child-exact");
+                assert_eq!(state.subagents[0].kind, "Pilot");
+            }
+        }
+    }
+
+    fn apply_child_name_step(
+        state: &mut Snapshot,
+        indices: &mut BTreeMap<String, usize>,
+        mut step: Step,
+    ) {
+        preserve_resident_child_names(&mut step, state);
+        for event in step.events {
+            apply_event(state, indices, event);
+        }
+    }
+
+    #[test]
+    fn codex_historical_names_preserve_resident_children_after_parser_eviction() {
+        for fail_hydration in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut adapter = codex_child_name_adapter(directory.path());
+            let mut state = Snapshot::default();
+            let mut indices = BTreeMap::new();
+            let hello = adapter.initialize().unwrap();
+            let initialized = adapter.receive(json!({"id":hello.writes[0]["id"],"result":{
+                "codexHome":directory.path().to_str().unwrap(),"userAgent":"codex-retained-name-fixture"
+            }})).unwrap();
+            let attach = initialized
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/resume")
+                .unwrap();
+            let attached = adapter
+                .receive(json!({"id":attach["id"],"result":{
+                    "thread":{"id":"parent-exact","status":{"type":"idle"}},
+                    "initialTurnsPage":{"data":[],"nextCursor":null}
+                }}))
+                .unwrap();
+            let list = attached
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/list")
+                .unwrap()["id"]
+                .clone();
+            apply_child_name_step(&mut state, &mut indices, attached);
+            let skills = initialized
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "skills/list")
+                .unwrap();
+            apply_child_name_step(
+                &mut state,
+                &mut indices,
+                adapter
+                    .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+                    .unwrap(),
+            );
+
+            // Exercise actual parser admission, exact hydration and both normal
+            // retirement policies. No private parser map is edited by the test.
+            for index in 0..32 {
+                let id = if index == 31 {
+                    "a-target".to_owned()
+                } else {
+                    format!("z-old-{index:02}")
+                };
+                let name = if index == 31 {
+                    "Navigator"
+                } else {
+                    "Finished child"
+                };
+                let discovered = adapter.receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":id,"parentThreadId":"parent-exact","agentNickname":name,"status":"completed"
+                }}})).unwrap();
+                assert!(!discovered.historical_subagent_names);
+                let resume = discovered
+                    .writes
+                    .iter()
+                    .find(|frame| {
+                        frame["method"] == "thread/resume" && frame["params"]["threadId"] == id
+                    })
+                    .unwrap()["id"]
+                    .clone();
+                apply_child_name_step(&mut state, &mut indices, discovered);
+                let hydrated = adapter
+                    .receive(json!({"id":resume,"result":{
+                        "thread":{"id":id,"status":{"type":"idle"}},
+                        "initialTurnsPage":{"data":[],"nextCursor":null}
+                    }}))
+                    .unwrap();
+                assert!(!hydrated.historical_subagent_names);
+                apply_child_name_step(&mut state, &mut indices, hydrated);
+            }
+            assert_eq!(state.subagents.len(), 32);
+            let admitted = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"z-new","parentThreadId":"parent-exact","status":"completed"
+                }}}))
+                .unwrap();
+            assert!(
+                admitted
+                    .writes
+                    .iter()
+                    .any(|frame| frame["method"] == "thread/unsubscribe"
+                        && frame["params"]["threadId"] == "a-target"),
+                "parser must really retire the named child"
+            );
+            apply_child_name_step(&mut state, &mut indices, admitted);
+            assert!(!state.subagents.iter().any(|child| child.id == "z-old-00"));
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "a-target")
+                    .unwrap()
+                    .kind,
+                "Navigator"
+            );
+
+            let historical = adapter.receive(json!({"id":list,"result":{"data":[
+                {"id":"a-target","parentThreadId":"parent-exact","agentNickname":"Scout"},
+                {"id":"unseen-child","parentThreadId":"parent-exact","agentNickname":"New child"},
+                {"id":"foreign-child","parentThreadId":"other-parent","agentNickname":"Foreign"}
+            ]}})).unwrap();
+            assert!(historical.historical_subagent_names);
+            assert!(historical.events.iter().any(|event| matches!(event, Event::Subagent {id,kind,..} if id == "a-target" && kind == "Scout")), "the re-admitted parser must expose the stale name at the merge boundary");
+            let resume = historical
+                .writes
+                .iter()
+                .find(|frame| {
+                    frame["method"] == "thread/resume" && frame["params"]["threadId"] == "a-target"
+                })
+                .unwrap()["id"]
+                .clone();
+            apply_child_name_step(&mut state, &mut indices, historical);
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "a-target")
+                    .unwrap()
+                    .kind,
+                "Navigator"
+            );
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "unseen-child")
+                    .unwrap()
+                    .kind,
+                "New child"
+            );
+            assert!(
+                !state
+                    .subagents
+                    .iter()
+                    .any(|child| child.id == "foreign-child")
+            );
+            let hydration = if fail_hydration {
+                json!({"id":resume,"error":{"message":"Child hydration unavailable"}})
+            } else {
+                json!({"id":resume,"result":{
+                    "thread":{"id":"a-target","status":{"type":"idle"}},
+                    "initialTurnsPage":{"data":[],"nextCursor":null}
+                }})
+            };
+            apply_child_name_step(
+                &mut state,
+                &mut indices,
+                adapter.receive(hydration).unwrap(),
+            );
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "a-target")
+                    .unwrap()
+                    .kind,
+                "Navigator"
+            );
+            let live = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"a-target","parentThreadId":"parent-exact","agentNickname":"Pilot"
+                }}}))
+                .unwrap();
+            assert!(!live.historical_subagent_names);
+            apply_child_name_step(&mut state, &mut indices, live);
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "a-target")
+                    .unwrap()
+                    .kind,
+                "Pilot"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_name_merge_uses_frame_entry_and_resets_with_its_session() {
+        let child = |name: &str| Event::Subagent {
+            id: "child".into(),
+            kind: name.into(),
+            description: String::new(),
+            status: None,
+            background: None,
+            model: None,
+            waiting: None,
+            detail: None,
+        };
+        let mut state = Snapshot {
+            session_id: Some("parent".into()),
+            ..Default::default()
+        };
+        let mut indices = BTreeMap::new();
+        apply_child_name_step(
+            &mut state,
+            &mut indices,
+            Step {
+                historical_subagent_names: true,
+                events: vec![child("Scout"), child("Navigator")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state.subagents[0].kind, "Navigator",
+            "the latest name in one chronological page wins"
+        );
+        apply_child_name_step(
+            &mut state,
+            &mut indices,
+            Step {
+                historical_subagent_names: true,
+                events: vec![child("Older")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.subagents[0].kind, "Navigator");
+        // Exact current metadata remains authoritative after historical discovery.
+        apply_child_name_step(
+            &mut state,
+            &mut indices,
+            Step {
+                events: vec![child("Exact current")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.subagents[0].kind, "Exact current");
+        for boundary in [
+            Event::Reset {
+                reason: "Reset".into(),
+            },
+            Event::Session {
+                id: "other-parent".into(),
+                title: None,
+            },
+        ] {
+            let mut replacement = state.clone();
+            apply_child_name_step(
+                &mut replacement,
+                &mut BTreeMap::new(),
+                Step {
+                    historical_subagent_names: true,
+                    events: vec![boundary, child("Other scope")],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                replacement
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "child")
+                    .unwrap()
+                    .kind,
+                "Other scope"
+            );
+        }
+        // Historical discovery can trim a protected row before its own event
+        // arrives. The entry name must survive that re-admission too.
+        let mut crowded = state.clone();
+        crowded.subagents[0].status = ToolStatus::Succeeded;
+        for index in 0..31 {
+            let mut event = child("Finished");
+            if let Event::Subagent { id, status, .. } = &mut event {
+                *id = format!("old-{index}");
+                *status = Some(ToolStatus::Succeeded);
+            }
+            apply_event(&mut crowded, &mut BTreeMap::new(), event);
+        }
+        assert_eq!(crowded.subagents.len(), 32);
+        let mut events = Vec::new();
+        for index in 0..31 {
+            let mut event = child("New child");
+            if let Event::Subagent { id, status, .. } = &mut event {
+                *id = format!("new-{index}");
+                *status = Some(ToolStatus::Succeeded);
+            }
+            events.push(event);
+        }
+        events.push(child("Older"));
+        apply_child_name_step(
+            &mut crowded,
+            &mut BTreeMap::new(),
+            Step {
+                historical_subagent_names: true,
+                events,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crowded
+                .subagents
+                .iter()
+                .find(|child| child.id == "child")
+                .unwrap()
+                .kind,
+            "Exact current"
+        );
+        let mut fresh_actor = Snapshot::default();
+        apply_child_name_step(
+            &mut fresh_actor,
+            &mut BTreeMap::new(),
+            Step {
+                historical_subagent_names: true,
+                events: vec![child("Fresh scope")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(fresh_actor.subagents[0].kind, "Fresh scope");
+    }
+
+    #[test]
+    fn historical_child_name_preservation_does_not_amplify_repeated_updates() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let child = |name: String| Event::Subagent {
+            id: "child".into(),
+            kind: name,
+            description: String::new(),
+            status: None,
+            background: None,
+            model: None,
+            waiting: None,
+            detail: None,
+        };
+        let name = "N".repeat(64 * 1024);
+        apply_event(&mut state, &mut indices, child(name.clone()));
+        let mut step = Step {
+            historical_subagent_names: true,
+            events: (0..128).map(|_| child("Old".into())).collect(),
+            ..Default::default()
+        };
+        preserve_resident_child_names(&mut step, &state);
+        let names = step
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Subagent { kind, .. } if !kind.is_empty() => Some(kind),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![&name]);
+        assert_eq!(
+            names.iter().map(|name| name.len()).sum::<usize>(),
+            name.len()
+        );
+        assert!(matches!(step.events.last(), Some(Event::Subagent { kind, .. }) if kind == &name));
+        apply_child_name_step(&mut state, &mut indices, step);
+        assert_eq!(state.subagents[0].kind, name);
+    }
+
+    #[test]
+    fn codex_child_hydration_backfills_only_reported_nonblank_nicknames() {
+        for (nickname, expected) in [
+            (Value::Null, ""),
+            (json!(""), ""),
+            (json!(" \t\n"), ""),
+            (json!(" Scout "), "Scout"),
+            (json!("worker"), "worker"),
+            (json!("Codex agent"), "Codex agent"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut adapter = codex_child_name_adapter(directory.path());
+            let mut state = Snapshot::default();
+            let mut indices = BTreeMap::new();
+            let discovered = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"child-exact","parentThreadId":"parent-exact","agentRole":"worker",
+                    "message":"Keep the current task","model":"gpt-child","status":"running"
+                }}}))
+                .unwrap();
+            let resume = discovered
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/resume")
+                .unwrap()["id"]
+                .clone();
+            for event in discovered.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            assert!(state.subagents[0].kind.is_empty());
+            let hydrated = adapter
+                .receive(json!({"id":resume,"result":{
+                    "thread":{"id":"child-exact","agentNickname":nickname,"agentRole":"explorer",
+                        "message":"Do not replay this task","status":{"type":"idle"}},
+                    "initialTurnsPage":{"data":[],"nextCursor":null}
+                }}))
+                .unwrap();
+            for event in hydrated.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            let child = &state.subagents[0];
+            assert_eq!(child.kind, expected);
+            assert_eq!(child.description, "Keep the current task");
+            assert_eq!(child.model.as_deref(), Some("gpt-child"));
+            assert_eq!(child.status, ToolStatus::Succeeded);
+            assert!(child.background);
+            let sparse = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"child-exact","parentThreadId":"parent-exact","agentRole":"worker"
+                }}}))
+                .unwrap();
+            for event in sparse.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            assert_eq!(state.subagents[0].kind, expected);
+        }
+    }
+
+    #[test]
+    fn codex_child_live_nickname_wins_over_delayed_hydration_and_sparse_refresh() {
+        for initial in [Value::Null, json!("Initial name")] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut adapter = codex_child_name_adapter(directory.path());
+            let mut state = Snapshot::default();
+            let mut indices = BTreeMap::new();
+            let discovered = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"child-exact","parentThreadId":"parent-exact","agentRole":"worker",
+                    "agentNickname":initial
+                }}}))
+                .unwrap();
+            let resume = discovered
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/resume")
+                .unwrap()["id"]
+                .clone();
+            for event in discovered.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            let renamed = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"child-exact","parentThreadId":"parent-exact","agentNickname":"Navigator"
+                }}}))
+                .unwrap();
+            for event in renamed.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            assert_eq!(state.subagents[0].kind, "Navigator");
+            let hydrated = adapter
+                .receive(json!({"id":resume,"result":{
+                    "thread":{"id":"child-exact","agentNickname":"Scout","status":{"type":"idle"}},
+                    "initialTurnsPage":{"data":[],"nextCursor":null}
+                }}))
+                .unwrap();
+            for event in hydrated.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            assert_eq!(state.subagents[0].kind, "Navigator");
+            for nickname in [Value::Null, json!(""), json!(" \t\n"), json!("Voyager")] {
+                let expected = if nickname.as_str() == Some("Voyager") {
+                    "Voyager"
+                } else {
+                    "Navigator"
+                };
+                let sparse = adapter
+                    .receive(json!({"method":"thread/started","params":{"thread":{
+                        "id":"child-exact","parentThreadId":"parent-exact","agentNickname":nickname,
+                        "agentRole":"worker"
+                    }}}))
+                    .unwrap();
+                for event in sparse.events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+                assert_eq!(state.subagents[0].kind, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_child_hydration_failure_or_foreign_thread_cannot_publish_a_nickname() {
+        for foreign in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut adapter = codex_child_name_adapter(directory.path());
+            let mut state = Snapshot::default();
+            let mut indices = BTreeMap::new();
+            let discovered = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"child-exact","parentThreadId":"parent-exact","agentRole":"worker"
+                }}}))
+                .unwrap();
+            let resume = discovered
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/resume")
+                .unwrap()["id"]
+                .clone();
+            for event in discovered.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            let response = if foreign {
+                json!({"id":resume,"result":{
+                    "thread":{"id":"foreign-child","agentNickname":"Untrusted name"},
+                    "initialTurnsPage":{"data":[],"nextCursor":null}
+                }})
+            } else {
+                json!({"id":resume,"error":{"message":"Child hydration unavailable"}})
+            };
+            let hydrated = adapter.receive(response);
+            if foreign {
+                assert_eq!(
+                    hydrated.err().as_deref(),
+                    Some("Codex returned a different child thread")
+                );
+            } else {
+                for event in hydrated.unwrap().events {
+                    apply_event(&mut state, &mut indices, event);
+                }
+            }
+            assert_eq!(state.subagents.len(), 1);
+            assert_eq!(state.subagents[0].id, "child-exact");
+            assert!(state.subagents[0].kind.is_empty());
+        }
+    }
+
+    #[test]
+    fn codex_child_nickname_survives_sparse_refresh_and_accepts_new_reported_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let started = adapter
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child-exact","parentThreadId":"parent-exact","agentNickname":"Scout",
+                "agentRole":"worker","status":{"type":"active"}
+            }}}))
+            .unwrap();
+        for event in started.events {
+            apply_event(&mut state, &mut indices, event);
+        }
+        assert_eq!(state.subagents[0].kind, "Scout");
+        let role_only = adapter
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child-exact","parentThreadId":"parent-exact","agentRole":"explorer",
+                "message":"Updated task description","model":"gpt-child","status":"completed"
+            }}}))
+            .unwrap();
+        for event in role_only.events {
+            apply_event(&mut state, &mut indices, event);
+        }
+        let child = &state.subagents[0];
+        assert_eq!(child.kind, "Scout");
+        assert_eq!(child.description, "Updated task description");
+        assert_eq!(child.model.as_deref(), Some("gpt-child"));
+        assert_eq!(child.status, ToolStatus::Succeeded);
+        for nickname in [Value::Null, json!(""), json!(" \t\n")] {
+            let sparse = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"child-exact","parentThreadId":"parent-exact","agentNickname":nickname,
+                    "agentRole":"worker"
+                }}}))
+                .unwrap();
+            assert!(sparse.events.iter().any(|event| matches!(event,
+                Event::Subagent { kind, .. } if kind.is_empty()
+            )));
+            for event in sparse.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            assert_eq!(state.subagents[0].kind, "Scout");
+        }
+        let renamed = adapter
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child-exact","parentThreadId":"parent-exact","agentNickname":"Navigator",
+                "agentRole":"worker"
+            }}}))
+            .unwrap();
+        for event in renamed.events {
+            apply_event(&mut state, &mut indices, event);
+        }
+        assert_eq!(state.subagents.len(), 1);
+        assert_eq!(state.subagents[0].kind, "Navigator");
+        // A fresh parser with an already reduced snapshot must not replace the
+        // retained nickname merely because reconnect metadata only has a role.
+        state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let mut reconnected = codex_child_name_adapter(directory.path());
+        let sparse = reconnected
+            .receive(json!({"method":"thread/started","params":{"thread":{
+                "id":"child-exact","parentThreadId":"parent-exact","agentRole":"worker"
+            }}}))
+            .unwrap();
+        for event in sparse.events {
+            apply_event(&mut state, &mut indices, event);
+        }
+        assert_eq!(state.subagents[0].kind, "Navigator");
+        assert_eq!(state.subagents[0].id, "child-exact");
+    }
+
+    #[test]
+    fn codex_unnamed_children_preserve_metadata_without_role_or_task_as_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        for (id, nickname) in [
+            ("role-only", Value::Null),
+            ("blank-nickname", json!(" \t\n")),
+        ] {
+            let mut metadata = json!({
+                "id":id,"parentThreadId":"parent-exact","agentRole":"worker",
+                "message":"Review the implementation","status":{"type":"active"},
+                "model":"gpt-child"
+            });
+            if !nickname.is_null() {
+                metadata["agentNickname"] = nickname;
+            }
+            let discovered = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":metadata}}))
+                .unwrap();
+            for event in discovered.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            let child = state.subagents.iter().find(|child| child.id == id).unwrap();
+            assert!(child.kind.is_empty());
+            assert_eq!(child.description, "Review the implementation");
+            assert_eq!(child.model.as_deref(), Some("gpt-child"));
+            assert_eq!(child.status, ToolStatus::Running);
+            assert!(child.background);
+        }
+        assert_eq!(state.subagents.len(), 2);
+    }
+
     #[test]
     fn typed_provider_error_items_keep_full_provenance_and_ids_through_store_hydration() {
         let mut store = Store::new().unwrap();
@@ -4308,6 +5153,7 @@ mod tests {
             ) -> Result<Step, String> {
                 self.run = Some(run);
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![serde_json::json!({"final":true})],
@@ -4326,6 +5172,7 @@ mod tests {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6059,6 +6906,7 @@ mod tests {
     impl Adapter for Echo {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"text": "hello"})],
@@ -6070,6 +6918,7 @@ mod tests {
                 return Err("fixture only supports refresh".into());
             }
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"text": " world"})],
@@ -6078,6 +6927,7 @@ mod tests {
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: Vec::new(),
@@ -6704,6 +7554,7 @@ mod tests {
         impl Adapter for Reporter {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({})],
@@ -6715,6 +7566,7 @@ mod tests {
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6780,6 +7632,7 @@ mod tests {
         impl Adapter for WholeTurn {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({})],
@@ -6792,6 +7645,7 @@ mod tests {
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 let execution = |event| Event::Execution { run: self.0, event };
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6953,6 +7807,7 @@ mod tests {
         fn command(&mut self, command: Command) -> Result<Step, String> {
             if command == Command::Interrupt {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
