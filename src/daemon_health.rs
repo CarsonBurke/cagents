@@ -451,6 +451,7 @@ mod tests {
             code: crate::terminal::ipc::ProtocolErrorCode::InvalidRequest,
             message: "rejected".into(),
             retryable: false,
+            details: None,
         });
         assert!(matches!(
             control_outcome(&remote),
