@@ -1,9 +1,9 @@
 {
   "schema": "pr1310-direct-entry-C-owner-source-contract-v2",
-  "status": "SOURCE_SLICE_IMPLEMENTED_REVIEW_PENDING_NOT_SUBMITTABLE_ACTUAL_PROVENANCE_NATIVE_GATES_UNRESOLVED",
+  "status": "ASSEMBLED_SOURCE_BINDING_REVIEW_PENDING_NOT_SUBMITTABLE_ACTUAL_PROVENANCE_NATIVE_GATES_UNRESOLVED",
   "worker": {
     "path": "qualification-packets/pr1310-native-entry/arm-worker.py",
-    "sha256": "da43b3a222671c9d87392791fbd6d006ef919481feb5c945fe9eaec03b9b8bfd",
+    "sha256": "ad3b76dfb13f8129915d89ef3c4ecb742b56f9b15aa5447e723654f72f510518",
     "invocation": "PINNED_PHYSICAL_PYTHON -I -B arm-worker.py --packet ACTUAL_PACKET --packet-sha256 ACTUAL_SHA --worker-sha256 FROZEN_WORKER_SHA --whole-deadline ORIGINAL_ABSOLUTE_DEADLINE",
     "standalone_admission": null,
     "authority": "Actual authenticated outer Root/User instruction; no argument or JSON authenticates it.",
@@ -11,13 +11,13 @@
   },
   "immutable_dependencies": {
     "library": {
-      "head": "b756e6f9165f6bf164b8acad1c77cdab34d3fd07",
-      "tree": "825fdfda1d7f15d928683449259d86ced8493d23",
+      "head": "a621a21e79704da83d0607c64edc01a25675bdf6",
+      "tree": "283b804e0e84c2399e9a3d308ac890a76e2da458",
       "relative_directory": "qualification-packets/pr1310-native-history-pair",
       "files": {
-        "native_owner.py": "e2e4a520087bf95c902646b4dbe6b69531944bb3cfad5fc8ddc1d3f77aab9fd8",
+        "native_owner.py": "a11744d28b08b3c1b28ce3a79fd0bd783012f5510894d36065cc00603605af1e",
         "history_driver.py": "0bd819fce05fc0559da8b874a190e666f5cc19ce768af4e23ee21690deaa27ce",
-        "observations.py": "bb97545b94c76d7ea85e404109241e49b3b985f97ba95aad52029cca5e22d4d2"
+        "observations.py": "abee2d3d2fa9e24cc65ff76425db99f102afd963dd5b72ee1fb1b77c05d793ea"
       }
     },
     "custody": {
@@ -117,7 +117,7 @@
     "negative_retention": "SAME original main context retains original owner+C state for genuine uncertainty. No new parent/handoff API is mandatory. Safe retention is not finite completion/terminal/PASS/C return; actual supported original tool execution and reviewed final coupling remain required."
   },
   "precise_missing_supported_seams": [
-    "Original producer/consumer of actual installed shell/Cargo/rustup/shim executable chain and all applicable effective ancestor/CARGO_HOME/env target/cfg runner configuration before effects. b756 only pins nonempty evidence bytes and explicitly lacks this producer.",
+    "Original producer/consumer of actual installed shell/Cargo/rustup/shim executable chain and all applicable effective ancestor/CARGO_HOME/env target/cfg runner configuration before effects. The pinned a621 library only pins nonempty evidence bytes and explicitly lacks this producer.",
     "Original serial C-build producer/evidence receiver selecting actual three isolated dev-runtime matched artifacts for each arm, actual renderer package/input/version/build/wait/writer provenance. Normal runner has no build-only mode; do not fabricate prior build records or reuse changing path hashes.",
     "The direct original-entry/Cfd SOURCE slice is now implemented, superseding mandatory new-parent topology. Actual authenticated original tool execution, independently reviewed final coupling, original session/chunks/terminal/outer streams and native import/compound AX containment remain UNRUN/unsupported actual evidence. No selfwait, carrier or positive-flag replacement.",
     "Actual admitted installed Python/GI/Atspi/PIL/module input baseline; hash expectations here do not discover or qualify the transitive closure.",
@@ -167,7 +167,7 @@
     "CLOSE1": "Source correction: original-object/generation attempt ledger retained before owner.close_history_root; failed/ambiguous intent cannot be replayed by cleanup. No owner/binding state fabricated.",
     "REPORT1": "Source correction: one report intent retained before first fence; same deadline/cancel fences surround serialization, write and flush. Original called/returned/partial/error state stays retained. Held never retries an attempted report or bypasses expired/cancelled admission.",
     "HOLD1": "Historical finite-completion concern remains. EC clarification bf7a1235 permits SAME original-owner retention for genuine uncertainty: deadline bounds new work, not safe-retention latency. No mandatory new finite-handoff API. Component still NOT SUBMITTABLE without actual original parent/C custody and reviewed coupling; no terminal/PASS/C return claimed.",
-    "review": "Historical feb4 CLOSE1/REPORT1 delta SOURCE_CLEAR, exact receipt preserved_feb4_source_clear below; new direct-entry C-owner review remains PENDING.",
+    "review": "Historical feb4 CLOSE1/REPORT1 source scope retained; a4ce direct-entry C-owner component independently SOURCE_CLEAR_WITH_EXPLICIT_HOLDS. Current assembled binding requires a fresh nonauthor review.",
     "runtime": "UNRUN; no authored functions/cases/module imports/native/effects executed.",
     "libraries_arms_driver_ABI_changed": false
   },
@@ -175,7 +175,7 @@
     "sole_parent": "feb4a2f722bb95f69ec2493dd3fc4a06d44ef0da",
     "parent_tree": "21effd1a314bf415532012fb93655b279d8b9823",
     "selection_reference": "EC8fecaecd-5328-4a35-8ffc-2fc24fceb531 via Root: prefer SINGLE original external tool->entry retaining existing owner+Cfd; source selection only.",
-    "scope": "Only current task entry leaves; no product/library/custody/driver/ARMS rewrite and no a621 adoption.",
+    "scope": "Historical a4ce task entry component preserved; current assembly changes only immutable library constants to exact a621 and matching source metadata. No product/custody/driver/physical/policy rewrite.",
     "CLOSE1_REPORT1": "Exact prior helper executable bodies preserved; original final/negative shared single-report attempt semantics unchanged.",
     "former_contracts_superseded": [
       "Mandatory new nested worker/Popen/parent/handoff topology",
@@ -192,11 +192,65 @@
     ],
     "evidence_order": "Original known owner finalization -> sole fenced final stdout write+flush -> one-shot actual Cclose -> no new own output; external original tool terminal/outer streams separate.",
     "actual_execution": null,
-    "source_review": "PENDING_NEW_INDEPENDENT_DIRECT_ENTRY_COUPLING_REVIEW"
+    "source_review": "a4ce component review pinned in current_source_binding; current assembled binding PENDING_FRESH_NONAUTHOR_REVIEW"
   },
   "preserved_feb4_source_clear": {
     "path": "/tmp/coord-b9-pr1310-feb4a2f7-independent-arm-worker-delta-review.json",
     "sha256": "66fd954e9782ed7b34371541b0f281d167d8db1cff07d1b1bb046e02f0117291",
     "scope": "SOURCE_CLEAR_FOR_CLOSE1_REPORT1_DELTA_ONLY; no runtime/native/current C-owner coupling transfer."
+  },
+  "current_source_binding": {
+    "schema": "pr1310-direct-entry-current-library-source-binding-v1",
+    "normal_merge": {
+      "head": "430d1272e74a23a17aea86a4aecfdc2c50c023a5",
+      "tree": "70ec2300f24faef6114c6b800f00c5e8396334d4",
+      "parents": [
+        "a4ce7ea73257e6c76d34b15982a31975fa1f07e4",
+        "a621a21e79704da83d0607c64edc01a25675bdf6"
+      ],
+      "scope": "Normal full-ancestry merge, then separate constants/metadata binding commit; final assembled tuple is in external author receipt, not a self-hash"
+    },
+    "direct_entry_component": {
+      "head": "a4ce7ea73257e6c76d34b15982a31975fa1f07e4",
+      "tree": "9edd47bd3b9b962feee8e3ba2bc18341eed24753",
+      "author_receipt": {
+        "path": "/tmp/coord-b9-1310-native-entry-c-owner-evidence/source-receipt.json",
+        "sha256": "2bbfb922b08ee7b342e45b5270dc3224f7fb134e47ec1b3c84e2d755f940259a"
+      },
+      "independent_review": {
+        "path": "/tmp/coord-b9-pr1310-a4ce7ea7-independent-direct-C-coupling-review.json",
+        "sha256": "f2c7a9807205deb4ac4cd35c6d24e7520a4c05f03c8446468801b977fb05e07b",
+        "scope": "a4ce direct-entry/original-C source component only; no runtime or assembled-head qualification"
+      }
+    },
+    "library_component": {
+      "head": "a621a21e79704da83d0607c64edc01a25675bdf6",
+      "tree": "283b804e0e84c2399e9a3d308ac890a76e2da458",
+      "files": {
+        "native_owner.py": "a11744d28b08b3c1b28ce3a79fd0bd783012f5510894d36065cc00603605af1e",
+        "history_driver.py": "0bd819fce05fc0559da8b874a190e666f5cc19ce768af4e23ee21690deaa27ce",
+        "observations.py": "abee2d3d2fa9e24cc65ff76425db99f102afd963dd5b72ee1fb1b77c05d793ea"
+      },
+      "author_receipt": {
+        "path": "/tmp/coord-b9-1310-native-scale-consumer-evidence/source-receipt.json",
+        "sha256": "12d44fc826341434108b6c110246e72953ee72330635aea060883b203cf36af9"
+      },
+      "independent_review": {
+        "path": "/tmp/coord-b9-pr1310-a621a21e-independent-scale-consumer-review.json",
+        "sha256": "7dc25885516e298685972774dbbf3205c69ebf8bdbd5e764e6fb1b661c353d6b",
+        "scope": "a621 six-file scale consumer/readiness source component only; five new oracles UNRUN"
+      }
+    },
+    "entry_delta": "Only immutable LIBRARY_HEAD/LIBRARY_TREE/LIBRARY_FILES constant values change; every original entry function/class executable body and all other globals byte-exact a4ce. No assembled-HEAD/self-hash constant.",
+    "library_delta": "Owner/driver/observations/oracle executable bytes EXACT a621; metadata only, including historical new4-to-new5 label correction. Actual producer4ad/028 tuples, all source pins and semantic binding retained.",
+    "source_review": "PENDING_FRESH_ASSEMBLED_SCOPE_NONAUTHOR_REVIEW",
+    "five_new_source_oracles": "AUTHORED_UNRUN; historical07b pure3 PASS applies only to unchanged old selected bodies, no new-result transfer",
+    "actual_execution": null,
+    "actual_C_grant_acquisition_close": null,
+    "actual_chain_effective_config_matched_builds": null,
+    "actual_native_import_appearance_frames_wholeflow_UX": null,
+    "raw_UI_code": "None remains unknown; no inference or policy change",
+    "resource_return": "HOLD until actual original execution, soleRAW, explicit executor return and Root acceptance; source binding is no availability/grant/native certificate",
+    "preserved_history": "Old0b/e374/4ab5 and all prior source negatives and scoped direct-C reviews remain immutable; actualA3 evidence untouched"
   }
 }

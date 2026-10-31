@@ -14,8 +14,10 @@ original-tool invocation, C acquisition, native result or logical return.
 The future authenticated original tool selects pinned physical Python `-I -B`
 and the unchanged original absolute workload deadline, at most 2400 seconds.
 References and source/input hashes only correlate actual external authorization.
-One invocation remains one arm: Before146ad67b or After3ba686a8 with the exact
-b756 owner/driver/observations and d9ee custody. No a621 consumer is adopted.
+One invocation remains one arm: Before4ad36779 or After02802c8a with the exact
+reviewed a621 owner/driver/observations and unchanged d9ee custody. The library
+constants name the immutable a621 library tuple and files, not this assembled
+HEAD or a self-hash. Original a4ce entry executable bodies remain unchanged.
 Before and After remain serial; this source supplies no paired build producer,
 changing-artifact repin, installed-chain certificate or new target/cache.
 
@@ -73,7 +75,7 @@ explicit executor return and Root acceptance. A parked entry has no claimed
 terminal/finite completion. No new negative-handoff API is mandatory.
 
 The direct entry/known Cfd SOURCE slice is implemented; actual invocation,
-reviewed final coupling and original external terminal evidence remain UNRUN.
+assembled-source review and original external terminal evidence remain pending.
 Actual normal launcher/effective ancestor-CARGO_HOME/env target/runner provenance,
 matched-build/source/version/wait/writer evidence, native input closure and
 import/compound-AX containment are still unresolved. A file-pin or allocation
@@ -97,5 +99,17 @@ d610 Cargo-only EOF donor supplies no native cleanup policy.
 `source-method-map.json` pins that reference and maps only this source delta.
 AST/JSON/hash/Git conservation checks are source preparation; no entry/module,
 function/case/helper, build/test, native/tool/process/env/target/lock probe or
-runtime operation was executed. Independent source review and all runtime gates
-remain pending. Protected product/provider/first-send/recovery files are exact.
+runtime operation was executed. The a4ce and a621 components have scoped independent source reviews; the new
+assembled binding needs a fresh nonauthor review. All runtime gates remain
+pending. Protected product/provider/first-send/recovery files are exact.
+
+## Current library source binding
+
+The normal ancestry-preserving a4ce+a621 merge retains the original entry C
+owner behavior and adopts the reviewed initial-scale consumer. Only immutable
+LIBRARY tuple/file constants and corresponding metadata change. The source map,
+contract and plan pin both actual component reviews and the actual4ad/028
+producer fields; no review certificate or runtime input is invented. Five new
+consumer source-oracle parents remain UNRUN; old pure3 results do not transfer.
+All actual chain/config/build/import/native/whole-flow/UX/FD-coverage/C grants
+remain UNKNOWN/HOLD. No actual A3 evidence or original negative is modified.

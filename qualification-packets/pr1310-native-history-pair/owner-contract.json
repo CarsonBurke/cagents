@@ -221,6 +221,60 @@
       "EXIT1: latch known nonzero normal runner and preserve separate physical closed fact"
     ]
   },
+  "current_source_binding": {
+    "actual_C_grant_acquisition_close": null,
+    "actual_chain_effective_config_matched_builds": null,
+    "actual_execution": null,
+    "actual_native_import_appearance_frames_wholeflow_UX": null,
+    "direct_entry_component": {
+      "author_receipt": {
+        "path": "/tmp/coord-b9-1310-native-entry-c-owner-evidence/source-receipt.json",
+        "sha256": "2bbfb922b08ee7b342e45b5270dc3224f7fb134e47ec1b3c84e2d755f940259a"
+      },
+      "head": "a4ce7ea73257e6c76d34b15982a31975fa1f07e4",
+      "independent_review": {
+        "path": "/tmp/coord-b9-pr1310-a4ce7ea7-independent-direct-C-coupling-review.json",
+        "scope": "a4ce direct-entry/original-C source component only; no runtime or assembled-head qualification",
+        "sha256": "f2c7a9807205deb4ac4cd35c6d24e7520a4c05f03c8446468801b977fb05e07b"
+      },
+      "tree": "9edd47bd3b9b962feee8e3ba2bc18341eed24753"
+    },
+    "entry_delta": "Only immutable LIBRARY_HEAD/LIBRARY_TREE/LIBRARY_FILES constant values change; every original entry function/class executable body and all other globals byte-exact a4ce. No assembled-HEAD/self-hash constant.",
+    "five_new_source_oracles": "AUTHORED_UNRUN; historical07b pure3 PASS applies only to unchanged old selected bodies, no new-result transfer",
+    "library_component": {
+      "author_receipt": {
+        "path": "/tmp/coord-b9-1310-native-scale-consumer-evidence/source-receipt.json",
+        "sha256": "12d44fc826341434108b6c110246e72953ee72330635aea060883b203cf36af9"
+      },
+      "files": {
+        "history_driver.py": "0bd819fce05fc0559da8b874a190e666f5cc19ce768af4e23ee21690deaa27ce",
+        "native_owner.py": "a11744d28b08b3c1b28ce3a79fd0bd783012f5510894d36065cc00603605af1e",
+        "observations.py": "abee2d3d2fa9e24cc65ff76425db99f102afd963dd5b72ee1fb1b77c05d793ea"
+      },
+      "head": "a621a21e79704da83d0607c64edc01a25675bdf6",
+      "independent_review": {
+        "path": "/tmp/coord-b9-pr1310-a621a21e-independent-scale-consumer-review.json",
+        "scope": "a621 six-file scale consumer/readiness source component only; five new oracles UNRUN",
+        "sha256": "7dc25885516e298685972774dbbf3205c69ebf8bdbd5e764e6fb1b661c353d6b"
+      },
+      "tree": "283b804e0e84c2399e9a3d308ac890a76e2da458"
+    },
+    "library_delta": "Owner/driver/observations/oracle executable bytes EXACT a621; metadata only, including historical new4-to-new5 label correction. Actual producer4ad/028 tuples, all source pins and semantic binding retained.",
+    "normal_merge": {
+      "head": "430d1272e74a23a17aea86a4aecfdc2c50c023a5",
+      "parents": [
+        "a4ce7ea73257e6c76d34b15982a31975fa1f07e4",
+        "a621a21e79704da83d0607c64edc01a25675bdf6"
+      ],
+      "scope": "Normal full-ancestry merge, then separate constants/metadata binding commit; final assembled tuple is in external author receipt, not a self-hash",
+      "tree": "70ec2300f24faef6114c6b800f00c5e8396334d4"
+    },
+    "preserved_history": "Old0b/e374/4ab5 and all prior source negatives and scoped direct-C reviews remain immutable; actualA3 evidence untouched",
+    "raw_UI_code": "None remains unknown; no inference or policy change",
+    "resource_return": "HOLD until actual original execution, soleRAW, explicit executor return and Root acceptance; source binding is no availability/grant/native certificate",
+    "schema": "pr1310-direct-entry-current-library-source-binding-v1",
+    "source_review": "PENDING_FRESH_ASSEMBLED_SCOPE_NONAUTHOR_REVIEW"
+  },
   "driver_api": {
     "append_history_observation(binding,value)": "Single original owner JSONL FD, strict finite JSON, 2MiB record/64MiB total, original root/arm/source/data/UI/generation/monotonic/writer identity. No App callback or provider claim.",
     "check_history_root(binding,operation)": "Original source/data FD metadata, root/dirs, live UI ELF, private original service owners, cancellation/deadline/exclusive generation fences; strictly positive recomputed remaining. Whole-source Git root proof is bounded initial source HEAD/tree/clean observation plus explicitly pinned immutable files, not a global hostile filesystem guarantee.",
@@ -321,7 +375,7 @@
     "capture_equality": "Existing actual semantic state + observation generation retained; opened generation and query UUID added to actual frame/native key. Raw log offsets/times remain excluded.",
     "consumer_source_scope": "Only ARMS/APPEARANCE_SOURCES, exact strict appearance schema/provenance/stream consistency, capture-key lifecycle/query fields and source metadata. No driver interaction/AX/physical/application/launch/custody changes.",
     "counters": "Native counter is nonbool bounded u64>=0 and persists across Closed/reopen. Known factor requires counter>0; unknown keeps None/bitsNone even at nonzero counter. Opened is positive saturating u64; no comparison assumes counters can increase after saturation.",
-    "historical_pure3": "Original07b three-PASS receipt remains historical for unchanged selected bodies only. Modified appearance/scanner/key consumer and new4 oracles have NO pass transfer.",
+    "historical_pure3": "Original07b three-PASS receipt remains historical for unchanged selected bodies only. Modified appearance/scanner/key consumer and new5 oracles have NO pass transfer.",
     "parent": "b756e6f9165f6bf164b8acad1c77cdab34d3fd07",
     "producer_arms": {
       "after": {
@@ -433,7 +487,7 @@
       "subcases_nonadditive": true
     },
     "stream_constraints": "One existing observer/main identity and contiguous bounded observation records. Open/native counters never regress. Within same nonsaturated Opened, unchanged nonsaturated native counter means identical factor/source/query; known factor cannot reset to unknown, query cannot displace Rescaled or change its issued token. A later Opened permits unknown factor with the retained counter.",
-    "unchanged_worker": "Existing feb4 worker remains independently bound b756; NOT repinned, no worker source edited"
+    "unchanged_worker": "Historical a621 component left the original feb4 worker bound b756 and untouched. This later normal assembly binds only the reviewed a4ce same-entry worker constants to exact a621; the original feb4 worktree/source is unchanged."
   },
   "native_owner_sha256": "a11744d28b08b3c1b28ce3a79fd0bd783012f5510894d36065cc00603605af1e",
   "physical_evidence_successor": {

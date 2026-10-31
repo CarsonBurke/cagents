@@ -24,12 +24,12 @@ import time
 import uuid
 
 
-LIBRARY_HEAD = "b756e6f9165f6bf164b8acad1c77cdab34d3fd07"
-LIBRARY_TREE = "825fdfda1d7f15d928683449259d86ced8493d23"
+LIBRARY_HEAD = "a621a21e79704da83d0607c64edc01a25675bdf6"
+LIBRARY_TREE = "283b804e0e84c2399e9a3d308ac890a76e2da458"
 LIBRARY_FILES = {
-    "native_owner.py": "e2e4a520087bf95c902646b4dbe6b69531944bb3cfad5fc8ddc1d3f77aab9fd8",
+    "native_owner.py": "a11744d28b08b3c1b28ce3a79fd0bd783012f5510894d36065cc00603605af1e",
     "history_driver.py": "0bd819fce05fc0559da8b874a190e666f5cc19ce768af4e23ee21690deaa27ce",
-    "observations.py": "bb97545b94c76d7ea85e404109241e49b3b985f97ba95aad52029cca5e22d4d2",
+    "observations.py": "abee2d3d2fa9e24cc65ff76425db99f102afd963dd5b72ee1fb1b77c05d793ea",
 }
 CUSTODY_SHA = "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
 PRIVATE_KEYS = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",

@@ -272,10 +272,14 @@ import or a rewritten desired implementation. Only AST/JSON parsing occurred
 here. Historical07b pure3 success does not qualify the modified consumer.
 
 All physical/FD/custody/launch/application/AX and native driver interaction bodies
-remain b756. Existing feb4 worker is still bound to b756 and is NOT retargeted.
-Actual chain/config/builds, Opened/query/Rescaled/logs, images/native flow/UX and
-entry/C/resource admission remain NULL/UNRUN. Independent consumer review is
-required; source binding is not a runnable or admitted native packet.
+remain b756. That a621 component left the historical feb4 worker bound to b756.
+The later current-source assembly now binds only the reviewed a4ce same-entry
+worker constants to the immutable a621 library tuple/files; original worker
+function/class bodies and library executable bytes are unchanged. Both component
+reviews are pinned in current_source_binding; the assembled source still needs
+fresh nonauthor review. Actual chain/config/builds, Opened/query/Rescaled/logs,
+images/native flow/UX and entry/C/resource admission remain NULL/UNRUN. Source
+binding is not a runnable or admitted native packet.
 
 The existing frame-readiness loop now read-only polls within its SAME original
 deadline until the latest complete valid appearance has an actual nonnull
