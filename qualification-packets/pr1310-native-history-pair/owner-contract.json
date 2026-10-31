@@ -1,0 +1,193 @@
+{
+  "allowed_preparation_checks": "Only source/metadata-Git/hash/AST/JSON/conservation; no owner import/call, fixture workload, native modules, tool versions, probes, builds or tests executed.",
+  "arms": {
+    "after": {
+      "head": "9dc2a70caebbfc972e537712b9f9326843f232d0",
+      "tree": "fcb1b582d894dc46590cc8fc8f20e9cb17920a0a"
+    },
+    "before": {
+      "head": "a174dc7e7aa651745c95714971054fc4c270c5a3",
+      "tree": "2d557d0cd3757a01ee9ca2da32d15f211ce464b6"
+    }
+  },
+  "base": {
+    "head": "9dc2a70caebbfc972e537712b9f9326843f232d0",
+    "tree": "fcb1b582d894dc46590cc8fc8f20e9cb17920a0a"
+  },
+  "constructor": {
+    "custody": "Actual pinned d9ee Custody instance created by the actual original entry, cancelled is custody.cancelled; same owner thread and original empty-child/subreaper provenance. No caller dictionary substitutes.",
+    "deadlines": "Already existing absolute monotonic phase<=whole deadlines; all nested loops/waits clamp to min and never reset. Expiry prevents further work and preserves HOLD; does not authorize extending cleanup.",
+    "effects": "Constructor reads source metadata/bytes and inherited environment; acquires no FD/child. Returned owner exists before effectful preparation, retaining partial acquisitions on any later failure.",
+    "entry_function": "Actual original entry callable on current stack; source file path/hash in entry_source. None refuses before effects. This is source provenance only, not User/resource authority.",
+    "input_discovery": "No guessed executables/profile/OIDs, tool versions, package probes, auth or fallback discovery. Missing input means refusal.",
+    "root": "Separately admitted already fresh UID-owned0700 /tmp/cagents-history-<canonical UUID>; owner opens original O_DIRECTORY|O_NOFOLLOW FD and checks empty before helpers.",
+    "signature": "NativeHistoryOwner(custody, cancelled, *, phase_deadline, whole_deadline, root, sources, tools, entry_function=None, entry_source=None)",
+    "sources_shape": {
+      "before|after": {
+        "cargo_target_dir": "already admitted existing C target from inherited CARGO_TARGET_DIR; no path probe in preparation",
+        "driver": {
+          "path": "actual composed immutable History driver source",
+          "sha256": "actual independently reviewed successor bytes"
+        },
+        "fixture_root": "actual public builder-created fresh0700 data root",
+        "indexes": {
+          "large": "actual generated index path",
+          "small": "actual generated index path"
+        },
+        "manifest": "actual nofollow fixture.json path",
+        "matched": {
+          "cli|host|ui": {
+            "path": "actual separately built dev-runtime matched ELF canonical path",
+            "sha256": "actual observed build output hash"
+          }
+        },
+        "profile": "dev-runtime",
+        "source_files": {
+          "other source/context/config pins": "actual source hashes from final entry",
+          "scripts/run-development": "actual reviewed SHA256",
+          "src/app/native_history_fixture.rs": "actual reviewed SHA256"
+        },
+        "worktree": "exact canonical adapter path"
+      }
+    },
+    "tools_shape": {
+      "Xvfb|dbus-daemon|gdbus|at-spi-bus-launcher|at-spi2-registryd|openbox|xprop|git|xdotool|import": {
+        "path": "canonical absolute tool executable, expected from future actual admission",
+        "sha256": "expected actual bytes; owner pins and streams hashes then retains FD"
+      }
+    }
+  },
+  "driver_api": {
+    "append_history_observation(binding,value)": "Single original owner JSONL FD, strict finite JSON, 2MiB record/64MiB total, original root/arm/source/data/UI/generation/monotonic/writer identity. No App callback or provider claim.",
+    "check_history_root(binding,operation)": "Original source/data FD metadata, root/dirs, live UI ELF, private original service owners, cancellation/deadline/exclusive generation fences; strictly positive recomputed remaining. Whole-source Git root proof is bounded initial source HEAD/tree/clean observation plus explicitly pinned immutable files, not a global hostile filesystem guarantee.",
+    "history_frame_observation(binding)": "Actually measured geometry and current UI/XID/log identity; configured Dark/scale1 source recorded separately; renderer/theme None and native factor None until actual observer implementation. Immutable FrameObservation makes absence a driver refusal.",
+    "pause_history_poll(binding,maximum_seconds)": "<=.05 seconds clamped original absolute remaining with pre/post fences.",
+    "require_history_root(arm,head,tree,fixture)": "Returns opaque identity-bound generation with actual ui_pid/xid, original UI node and fixture. Normal runner Popen is not assumed to be the UI; exact matched live ELF original descendant + XID/_NET_WM_PID corroboration required.",
+    "reserve_history_artifact(binding,basename)": "Exclusive0600 regular nofollow PNG/WebP original FD in nonaliased per-generation0700 directory; never overwrite/replay/repair.",
+    "retain_history_artifact(binding,png,webp,kind,metrics)": "Exact known original PNG producer wait0, same frozen driver/source/frame/thread/pair synchronous PIL before/after-save fence, original identities/size/hash/signature. No invented writer child/wait. Retention itself does not assert frame/native qualification.",
+    "run_history_tool(binding,argv,output_limit)": "Only actual frozen driver xdotool forms/import and owned XID/path. Original Custody.launch retains Popen before pin; bounded original wait, captured stdout/stderr files and raw argv/exit. poll may previously cache status; actual original.wait and provenance recorded without claiming new kernel wait syscall."
+  },
+  "environment": {
+    "application_requests": {
+      "CAGENTS_DEVELOPMENT_HISTORY_DATASET": "actual dataset",
+      "CAGENTS_DEVELOPMENT_HISTORY_FIXTURE": "actual manifest",
+      "ICED_BACKEND": "wgpu",
+      "LIBGL_ALWAYS_SOFTWARE": "1",
+      "WGPU_BACKEND": "gl"
+    },
+    "authority_limit": "No requested GL/backend, private UUID, env absence, source hash or syntax flag is User/resource proof. Unsupported ambient endpoint/activation-FD contexts refuse without stripping or copying descriptors.",
+    "preserved": "Copied original opaque authority, HOME/CODEX_HOME/PATH, account/policy, CARGO_HOME/RUSTUP_HOME unchanged by this owner; never serialized. Normal runner may perform its existing Zig PATH prepend/premain provider-home detachment.",
+    "private_overlay": [
+      "XDG_CONFIG_HOME",
+      "XDG_DATA_HOME",
+      "XDG_STATE_HOME",
+      "XDG_CACHE_HOME",
+      "XDG_RUNTIME_DIR",
+      "TMPDIR",
+      "DISPLAY",
+      "XAUTHORITY",
+      "DBUS_SESSION_BUS_ADDRESS",
+      "AT_SPI_BUS_ADDRESS"
+    ],
+    "refusal_unchanged": [
+      "inherited DISPLAY/XAUTHORITY/session/AX",
+      "WAYLAND_DISPLAY",
+      "WAYLAND_SOCKET",
+      "DBUS_STARTER_ADDRESS",
+      "DBUS_STARTER_BUS_TYPE",
+      "SESSION_MANAGER",
+      "LISTEN_PID",
+      "LISTEN_FDS",
+      "XDG_SESSION_TYPE=wayland",
+      "explicit Git-routing variables listed in source"
+    ]
+  },
+  "immutable_dependencies": {
+    "custody": {
+      "bytes": 21755,
+      "changes": "NONE",
+      "not_used": [
+        "capture (communicate cleanup not finite)",
+        "settle_all (unbounded loop)"
+      ],
+      "path": ".worktrees/fw16-issue2002-host-driver/scripts/qualification/process_custody.py",
+      "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9",
+      "used": [
+        "Custody(cancelled)",
+        "launch",
+        "direct",
+        "nodes",
+        "current",
+        "exact_matches",
+        "exited",
+        "scan",
+        "reap",
+        "signal_owned",
+        "snapshot",
+        "close_pidfds"
+      ]
+    },
+    "driver_interface_read": {
+      "head": "58c7ccf094e7e15b16693398cdf53b1639339acd",
+      "meaning": "historical ABI only; 58c driver negative preserved. Root must compose independently reviewed f86 successor and bind actual driver path/hash; no driver file copied or changed.",
+      "path": "qualification-packets/pr1310-native-history-pair/root-interface.md",
+      "sha256": "8d26069ef6ba60847c54ff60f37957bf15c4cfe88836c3516628bfe0ce70474c"
+    },
+    "private_launch_contract": {
+      "meaning": "SOURCE feasibility, not supplied runtime supervisor/admission",
+      "path": "/tmp/held-saved-scope-fw16-evidence/ee291-private-xvfb-dbus-direct-launch-source-contract-v1.json",
+      "sha256": "73a54b5accb61c65436871ced756570414e33db4981ff74ceee59ad5877a411c"
+    },
+    "public_builder": {
+      "meaning": "same actual builder bytes on both adapters; no generated Git observed in this preparation",
+      "path": "qualification-packets/pr1310-native-fixture/build.py",
+      "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01"
+    }
+  },
+  "native_owner_sha256": "ec1aadc264810c616dd7e7013bf5b42a7b9100a350f45b8b95711ffcc1584353",
+  "public_entry_sequence": [
+    "Actual outer authenticated EC/User/resource instruction and finite independently reviewed entry must precede effects. UUID/grant syntax is correlation, not authentication. Library cannot establish actual admission.",
+    "Install original cancellation before Custody construction; separately generate/verify owned public Git fixture and build matched dev-runtime CLI/HOST/UI under actual future C grant. No result/target warmth transfer from unit/dev tests.",
+    "Construct owner while actual pinned entry is on stack. prepare_private_desktop() retains root/files/FD generations, direct Xvfb and foreground session bus; verifies returned kernel socket->original process, AX bus and Registry/launcher descendants, actual supporting-WM root and PID property. Returns ONLY six private XDG/TMP plus DISPLAY/XAUTHORITY/session/AX endpoint overlay.",
+    "Final entry independently retains original native import/AX invocation/evidence custody and installs only these private endpoint/profile overlays before real pyatspi/PIL imports. This source does not import native modules or silently supply a bounded import mechanism.",
+    "Read exact physically owned manifest/index bytes for Fixture.from_owned_bytes; owner additionally validates physical inputs, actual fixture main/sibling HEAD and counts. Use require_history_root(arm, exact head/tree, fixture) once for each actual dataset/root; it launches the NORMAL development runner.",
+    "Actual HistoryDriver gets owner and real pyatspi/PIL and the opaque returned binding. Call its existing finite dataset flow; source says UNKNOWN renderer/theme stops capture, not PASS.",
+    "On any external driver/import/AX/decode error immediately call record_history_failure(error); retain original failure. close_history_root(binding) requests real private windowclose after verifying original identity; cancelled close uses only original UI pidfd TERM and records forced HOLD. Original runner.wait is distinct from UI-descendant exit.",
+    "After driver/readers/UI close, settle_history_services() keeps unclosed UIs or live/unproven children on HOLD. Hash/retain every reserved raw PNG/WebP including PNG-only negative; close settled nonservice evidence writers BEFORE private service teardown. Planned registry->AX bus->launcher->WM->session->Xvfb TERM records remain raw; original wait/provenance and descendant statuses explicit.",
+    "Final snapshot contains unknown status/first failure/signals; any unknown, failed supervision or close uncertainty is sticky HOLD. One-shot physical file/pidfd/root FD closures have no retry and do not establish logical C release. Original entry owns final archive/actual acceptance and authenticated lane handback."
+  ],
+  "readiness": "SOURCE_CANDIDATE_ONLY; ACTUAL_ENTRY/ADMISSION/BUILD/NATIVE/UX/C_RELEASE HOLD",
+  "remaining_gates": {
+    "actual_matched_builds_and_fixture": null,
+    "actual_native_import_and_AX_call_bounds": null,
+    "actual_original_entry_and_admission": null,
+    "actual_renderer_observer": {
+      "concrete_seam": "Pinned libcosmic caec74c iced/wgpu/src/window/compositor.rs202 logs Selected: adapter.get_info() at iced_wgpu info. Normal runner debug default suppresses it. Future reviewed entry needs explicit iced_wgpu=info request and source-bound parser of actual original UI log FD offset/time/PID/start/XID with ambiguous/missing records refusing; requested WGPU env cannot substitute.",
+      "status": "UNIMPLEMENTED_HOLD"
+    },
+    "actual_theme_scale_observer": {
+      "concrete_seam": "Context::install source configures Dark and scale1, then app.synchronize_appearance(1.0) schedules real task. Config is not completion/readback; finite entry/observer must obtain actual attributable native appearance/effective scale or retain UNKNOWN.",
+      "status": "UNIMPLEMENTED_HOLD"
+    },
+    "all_runtime_native_UX_images_performance_results": "UNRUN; no qualification transferred from source or prior unit packet",
+    "normal_service_TERM_acceptance": null,
+    "original_child_status_and_census_limits": "d9ee original-family/subreaper evidence only, not 359/global kernel proof; adopted statuses can genuinely be unknown and hold."
+  },
+  "schema": "pr1310-original-native-owner-source-v1",
+  "service_policy": {
+    "nonservice_or_SIGKILL": "No accepted normal policy. Cancelled UI TERM is forced/HOLD; no SIGKILL escalation.",
+    "partial_preparation": "Actual files/raw FD generation tuples/Popen originals remain retained. A launch whose fallible pin failed or activated child lacking a complete role blocks local normal settlement. Outer original owner must retain HOLD and handle explicit negative source policy; no detach/retry/new supervisor.",
+    "proposal_only": "Finite actual source service roles may receive original pidfd SIGTERM once. Original Custody history marks every signal; this wrapper never changes it.",
+    "unknown_wait": "Descendant parent-reaped status stays unknown even when original pidfd signals exit. Original runner.wait can be known0 while UI status unknown; final descriptor close and logical handback refuse unknown."
+  },
+  "source_limitations": [
+    "No native observation, actual User/resource admission, tool/ELF baseline, data generation or actual closure has run.",
+    "The pinned Custody primitive scans/polls and may already cache original child status before wrapper.wait. Recorded original wait remains actual, no independent kernel wait syscall claim.",
+    "Source-data file metadata fences and actual initial Git HEAD/tree/count observations are scoped checks, not an immutable filesystem snapshot or global namespace proof. Exact final whole-source/tool/context checks remain final entry responsibilities.",
+    "Synchronous metadata IO/PIL/AX imports are not independently supervised by this source. Root must bound/admit actual native imports and AX calls; this library does not make kernel filesystem calls preemptible.",
+    "Frame observation deliberately returns actual geometry plus UNKNOWN renderer/theme/native factor until separately implemented real observers. Capture stays blocked.",
+    "Incomplete private desktop preparation or unknown parent-reaped descendant status can prevent local settlement; original object/custody/FD records stay retained under HOLD, not detached or silently retried.",
+    "No delegated normal service TERM acceptance or automatic lane release; proposed finite role policy needs independent source review and actual execution evidence."
+  ],
+  "status": "IMPLEMENTED_SOURCE_CANDIDATE_WITH_EXPLICIT_HOLD_GATES"
+}
