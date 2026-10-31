@@ -5674,6 +5674,7 @@ for line in sys.stdin:
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -5759,6 +5760,7 @@ done
         process_recipe.program = "/bin/cat".into();
         let spec = ProcessSpec::from(&process_recipe);
         let mut initial = Step {
+            historical_subagent_names: false,
             suppress_current_notification: false,
             notification_preview: None,
             writes: vec![json!({"ready": true})],
@@ -5895,6 +5897,7 @@ done
             }
             fn command(&mut self, _: Command) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({"id":"saved-conversation"})],
@@ -5903,6 +5906,7 @@ done
             }
             fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -5963,6 +5967,7 @@ done
         }
         fn command(&mut self, command: Command) -> Result<Step, String> {
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: Vec::new(),
@@ -6070,6 +6075,7 @@ done
         };
         let spec = ProcessSpec::from(&recipe);
         let mut initial = Step {
+            historical_subagent_names: false,
             suppress_current_notification: false,
             notification_preview: None,
             writes: Vec::new(),
@@ -6257,6 +6263,7 @@ done
         }
         fn command(&mut self, _: Command) -> Result<Step, String> {
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"tick": true})],
@@ -6266,6 +6273,7 @@ done
         fn receive(&mut self, _: Value) -> Result<Step, String> {
             self.0 = !self.0;
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: Vec::new(),
@@ -6307,6 +6315,7 @@ done
             fn command(&mut self, command: Command) -> Result<Step, String> {
                 assert_eq!(command, Command::Interrupt);
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
@@ -6315,6 +6324,7 @@ done
             }
             fn receive(&mut self, value: Value) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),

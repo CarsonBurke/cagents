@@ -308,6 +308,11 @@ impl ProcessSpec {
 }
 #[derive(Debug, Default)]
 pub struct Step {
+    /// Nonempty child names in this frame come only from historical discovery.
+    /// The runtime preserves names already resident at frame entry. This local
+    /// flag never enters Event, Snapshot or the shared wire codec; exact child
+    /// hydration and live notifications leave it false.
+    pub historical_subagent_names: bool,
     /// The decoder has not qualified this frame as the current turn. Its
     /// transcript and exact managed execution evidence remain valid, but it
     /// cannot replace the current conversation's notification context/error.

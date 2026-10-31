@@ -1268,6 +1268,11 @@ impl Codex {
     }
 
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
+        // Root pages emit only historical child names. Child parsers cannot
+        // discover grandchildren, and their steps are mapped separately.
+        if !self.is_child {
+            step.historical_subagent_names = true;
+        }
         let mut items = Vec::new();
         let mut page_names = BTreeSet::new();
         for turn in array(page, "data")?.iter().rev() {
@@ -2575,6 +2580,9 @@ impl Adapter for Codex {
                     step.events.push(Event::Forked(id.into()));
                 }
                 Pending::ChildList => {
+                    // This correlated reply contains historical discovery only;
+                    // live names and exact ChildResume use separate Steps.
+                    step.historical_subagent_names = true;
                     let mut remaining = result["data"]
                         .as_array()
                         .into_iter()

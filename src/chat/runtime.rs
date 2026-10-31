@@ -2650,7 +2650,15 @@ impl Actor {
     }
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
-    fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+    fn apply_step(
+        &mut self,
+        mut step: Step,
+        confirmed: Option<Option<String>>,
+    ) -> Result<(), String> {
+        if step.historical_subagent_names {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            preserve_resident_child_names(&mut step, &state);
+        }
         let suppress_current_notification = step.suppress_current_notification;
         if !suppress_current_notification {
             if let Some(preview) = &step.notification_preview {
@@ -3092,6 +3100,47 @@ fn recover_history_error(
         }
         Event::Error { .. } | Event::Reset { .. } | Event::Exited { .. } => *history_error = None,
         _ => {}
+    }
+}
+
+/// Compare the complete frame with its entry snapshot, before Store or the
+/// reducer can observe an older name. Looking at that fixed baseline lets a
+/// previously unnamed child advance through names in one chronological page.
+fn preserve_resident_child_names(step: &mut Step, state: &Snapshot) {
+    if !step.historical_subagent_names {
+        return;
+    }
+    let end = step
+        .events
+        .iter()
+        .position(|event| match event {
+            Event::Reset { .. } => true,
+            Event::Session { id, .. } => state.session_id.as_deref() != Some(id.as_str()),
+            _ => false,
+        })
+        .unwrap_or(step.events.len());
+    for agent in state
+        .subagents
+        .iter()
+        .filter(|agent| !agent.kind.is_empty())
+    {
+        let mut carried = false;
+        for event in step.events[..end].iter_mut().rev() {
+            if let Event::Subagent { id, kind, .. } = event
+                && *id == agent.id
+                && !kind.is_empty()
+            {
+                if carried {
+                    kind.clear();
+                } else {
+                    // Earlier events can trim this row. Carry its entry name on
+                    // the last update, copying at most once per resident child.
+                    // Repeated short names must not amplify a long saved name.
+                    kind.clone_from(&agent.kind);
+                    carried = true;
+                }
+            }
+        }
     }
 }
 
@@ -3918,6 +3967,374 @@ mod tests {
         }
     }
 
+    fn apply_child_name_step(
+        state: &mut Snapshot,
+        indices: &mut BTreeMap<String, usize>,
+        mut step: Step,
+    ) {
+        preserve_resident_child_names(&mut step, state);
+        for event in step.events {
+            apply_event(state, indices, event);
+        }
+    }
+
+    #[test]
+    fn codex_historical_names_preserve_resident_children_after_parser_eviction() {
+        for fail_hydration in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut adapter = codex_child_name_adapter(directory.path());
+            let mut state = Snapshot::default();
+            let mut indices = BTreeMap::new();
+            let hello = adapter.initialize().unwrap();
+            let initialized = adapter.receive(json!({"id":hello.writes[0]["id"],"result":{
+                "codexHome":directory.path().to_str().unwrap(),"userAgent":"codex-retained-name-fixture"
+            }})).unwrap();
+            let attach = initialized
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/resume")
+                .unwrap();
+            let attached = adapter
+                .receive(json!({"id":attach["id"],"result":{
+                    "thread":{"id":"parent-exact","status":{"type":"idle"}},
+                    "initialTurnsPage":{"data":[],"nextCursor":null}
+                }}))
+                .unwrap();
+            let list = attached
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "thread/list")
+                .unwrap()["id"]
+                .clone();
+            apply_child_name_step(&mut state, &mut indices, attached);
+            let skills = initialized
+                .writes
+                .iter()
+                .find(|frame| frame["method"] == "skills/list")
+                .unwrap();
+            apply_child_name_step(
+                &mut state,
+                &mut indices,
+                adapter
+                    .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+                    .unwrap(),
+            );
+
+            // Exercise actual parser admission, exact hydration and both normal
+            // retirement policies. No private parser map is edited by the test.
+            for index in 0..32 {
+                let id = if index == 31 {
+                    "a-target".to_owned()
+                } else {
+                    format!("z-old-{index:02}")
+                };
+                let name = if index == 31 {
+                    "Navigator"
+                } else {
+                    "Finished child"
+                };
+                let discovered = adapter.receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":id,"parentThreadId":"parent-exact","agentNickname":name,"status":"completed"
+                }}})).unwrap();
+                assert!(!discovered.historical_subagent_names);
+                let resume = discovered
+                    .writes
+                    .iter()
+                    .find(|frame| {
+                        frame["method"] == "thread/resume" && frame["params"]["threadId"] == id
+                    })
+                    .unwrap()["id"]
+                    .clone();
+                apply_child_name_step(&mut state, &mut indices, discovered);
+                let hydrated = adapter
+                    .receive(json!({"id":resume,"result":{
+                        "thread":{"id":id,"status":{"type":"idle"}},
+                        "initialTurnsPage":{"data":[],"nextCursor":null}
+                    }}))
+                    .unwrap();
+                assert!(!hydrated.historical_subagent_names);
+                apply_child_name_step(&mut state, &mut indices, hydrated);
+            }
+            assert_eq!(state.subagents.len(), 32);
+            let admitted = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"z-new","parentThreadId":"parent-exact","status":"completed"
+                }}}))
+                .unwrap();
+            assert!(
+                admitted
+                    .writes
+                    .iter()
+                    .any(|frame| frame["method"] == "thread/unsubscribe"
+                        && frame["params"]["threadId"] == "a-target"),
+                "parser must really retire the named child"
+            );
+            apply_child_name_step(&mut state, &mut indices, admitted);
+            assert!(!state.subagents.iter().any(|child| child.id == "z-old-00"));
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "a-target")
+                    .unwrap()
+                    .kind,
+                "Navigator"
+            );
+
+            let historical = adapter.receive(json!({"id":list,"result":{"data":[
+                {"id":"a-target","parentThreadId":"parent-exact","agentNickname":"Scout"},
+                {"id":"unseen-child","parentThreadId":"parent-exact","agentNickname":"New child"},
+                {"id":"foreign-child","parentThreadId":"other-parent","agentNickname":"Foreign"}
+            ]}})).unwrap();
+            assert!(historical.historical_subagent_names);
+            assert!(historical.events.iter().any(|event| matches!(event, Event::Subagent {id,kind,..} if id == "a-target" && kind == "Scout")), "the re-admitted parser must expose the stale name at the merge boundary");
+            let resume = historical
+                .writes
+                .iter()
+                .find(|frame| {
+                    frame["method"] == "thread/resume" && frame["params"]["threadId"] == "a-target"
+                })
+                .unwrap()["id"]
+                .clone();
+            apply_child_name_step(&mut state, &mut indices, historical);
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "a-target")
+                    .unwrap()
+                    .kind,
+                "Navigator"
+            );
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "unseen-child")
+                    .unwrap()
+                    .kind,
+                "New child"
+            );
+            assert!(
+                !state
+                    .subagents
+                    .iter()
+                    .any(|child| child.id == "foreign-child")
+            );
+            let hydration = if fail_hydration {
+                json!({"id":resume,"error":{"message":"Child hydration unavailable"}})
+            } else {
+                json!({"id":resume,"result":{
+                    "thread":{"id":"a-target","status":{"type":"idle"}},
+                    "initialTurnsPage":{"data":[],"nextCursor":null}
+                }})
+            };
+            apply_child_name_step(
+                &mut state,
+                &mut indices,
+                adapter.receive(hydration).unwrap(),
+            );
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "a-target")
+                    .unwrap()
+                    .kind,
+                "Navigator"
+            );
+            let live = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":{
+                    "id":"a-target","parentThreadId":"parent-exact","agentNickname":"Pilot"
+                }}}))
+                .unwrap();
+            assert!(!live.historical_subagent_names);
+            apply_child_name_step(&mut state, &mut indices, live);
+            assert_eq!(
+                state
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "a-target")
+                    .unwrap()
+                    .kind,
+                "Pilot"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_name_merge_uses_frame_entry_and_resets_with_its_session() {
+        let child = |name: &str| Event::Subagent {
+            id: "child".into(),
+            kind: name.into(),
+            description: String::new(),
+            status: None,
+            background: None,
+            model: None,
+            waiting: None,
+            detail: None,
+        };
+        let mut state = Snapshot {
+            session_id: Some("parent".into()),
+            ..Default::default()
+        };
+        let mut indices = BTreeMap::new();
+        apply_child_name_step(
+            &mut state,
+            &mut indices,
+            Step {
+                historical_subagent_names: true,
+                events: vec![child("Scout"), child("Navigator")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            state.subagents[0].kind, "Navigator",
+            "the latest name in one chronological page wins"
+        );
+        apply_child_name_step(
+            &mut state,
+            &mut indices,
+            Step {
+                historical_subagent_names: true,
+                events: vec![child("Older")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.subagents[0].kind, "Navigator");
+        // Exact current metadata remains authoritative after historical discovery.
+        apply_child_name_step(
+            &mut state,
+            &mut indices,
+            Step {
+                events: vec![child("Exact current")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.subagents[0].kind, "Exact current");
+        for boundary in [
+            Event::Reset {
+                reason: "Reset".into(),
+            },
+            Event::Session {
+                id: "other-parent".into(),
+                title: None,
+            },
+        ] {
+            let mut replacement = state.clone();
+            apply_child_name_step(
+                &mut replacement,
+                &mut BTreeMap::new(),
+                Step {
+                    historical_subagent_names: true,
+                    events: vec![boundary, child("Other scope")],
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                replacement
+                    .subagents
+                    .iter()
+                    .find(|child| child.id == "child")
+                    .unwrap()
+                    .kind,
+                "Other scope"
+            );
+        }
+        // Historical discovery can trim a protected row before its own event
+        // arrives. The entry name must survive that re-admission too.
+        let mut crowded = state.clone();
+        crowded.subagents[0].status = ToolStatus::Succeeded;
+        for index in 0..31 {
+            let mut event = child("Finished");
+            if let Event::Subagent { id, status, .. } = &mut event {
+                *id = format!("old-{index}");
+                *status = Some(ToolStatus::Succeeded);
+            }
+            apply_event(&mut crowded, &mut BTreeMap::new(), event);
+        }
+        assert_eq!(crowded.subagents.len(), 32);
+        let mut events = Vec::new();
+        for index in 0..31 {
+            let mut event = child("New child");
+            if let Event::Subagent { id, status, .. } = &mut event {
+                *id = format!("new-{index}");
+                *status = Some(ToolStatus::Succeeded);
+            }
+            events.push(event);
+        }
+        events.push(child("Older"));
+        apply_child_name_step(
+            &mut crowded,
+            &mut BTreeMap::new(),
+            Step {
+                historical_subagent_names: true,
+                events,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            crowded
+                .subagents
+                .iter()
+                .find(|child| child.id == "child")
+                .unwrap()
+                .kind,
+            "Exact current"
+        );
+        let mut fresh_actor = Snapshot::default();
+        apply_child_name_step(
+            &mut fresh_actor,
+            &mut BTreeMap::new(),
+            Step {
+                historical_subagent_names: true,
+                events: vec![child("Fresh scope")],
+                ..Default::default()
+            },
+        );
+        assert_eq!(fresh_actor.subagents[0].kind, "Fresh scope");
+    }
+
+    #[test]
+    fn historical_child_name_preservation_does_not_amplify_repeated_updates() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let child = |name: String| Event::Subagent {
+            id: "child".into(),
+            kind: name,
+            description: String::new(),
+            status: None,
+            background: None,
+            model: None,
+            waiting: None,
+            detail: None,
+        };
+        let name = "N".repeat(64 * 1024);
+        apply_event(&mut state, &mut indices, child(name.clone()));
+        let mut step = Step {
+            historical_subagent_names: true,
+            events: (0..128).map(|_| child("Old".into())).collect(),
+            ..Default::default()
+        };
+        preserve_resident_child_names(&mut step, &state);
+        let names = step
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Subagent { kind, .. } if !kind.is_empty() => Some(kind),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![&name]);
+        assert_eq!(
+            names.iter().map(|name| name.len()).sum::<usize>(),
+            name.len()
+        );
+        assert!(matches!(step.events.last(), Some(Event::Subagent { kind, .. }) if kind == &name));
+        apply_child_name_step(&mut state, &mut indices, step);
+        assert_eq!(state.subagents[0].kind, name);
+    }
+
     #[test]
     fn codex_child_hydration_backfills_only_reported_nonblank_nicknames() {
         for (nickname, expected) in [
@@ -4736,6 +5153,7 @@ mod tests {
             ) -> Result<Step, String> {
                 self.run = Some(run);
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![serde_json::json!({"final":true})],
@@ -4754,6 +5172,7 @@ mod tests {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -6487,6 +6906,7 @@ mod tests {
     impl Adapter for Echo {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"text": "hello"})],
@@ -6498,6 +6918,7 @@ mod tests {
                 return Err("fixture only supports refresh".into());
             }
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: vec![json!({"text": " world"})],
@@ -6506,6 +6927,7 @@ mod tests {
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             Ok(Step {
+                historical_subagent_names: false,
                 suppress_current_notification: false,
                 notification_preview: None,
                 writes: Vec::new(),
@@ -7132,6 +7554,7 @@ mod tests {
         impl Adapter for Reporter {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({})],
@@ -7143,6 +7566,7 @@ mod tests {
             }
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -7208,6 +7632,7 @@ mod tests {
         impl Adapter for WholeTurn {
             fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({})],
@@ -7220,6 +7645,7 @@ mod tests {
             fn receive(&mut self, _: Value) -> Result<Step, String> {
                 let execution = |event| Event::Execution { run: self.0, event };
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: Vec::new(),
@@ -7381,6 +7807,7 @@ mod tests {
         fn command(&mut self, command: Command) -> Result<Step, String> {
             if command == Command::Interrupt {
                 Ok(Step {
+                    historical_subagent_names: false,
                     suppress_current_notification: false,
                     notification_preview: None,
                     writes: vec![json!({"interrupt": true})],
