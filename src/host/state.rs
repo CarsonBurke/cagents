@@ -5003,7 +5003,7 @@ mod retained_child_shutdown_tests;
 mod strict_upgrade_tests;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
 
@@ -6299,7 +6299,7 @@ for line in sys.stdin:
         restored_handle.close().unwrap();
     }
 
-    fn upgrade_fixture_in_fresh_process() -> bool {
+    pub(in crate::host) fn upgrade_fixture_in_fresh_process() -> bool {
         // Capability validation consults process-global retained child custody.
         // These upgrade fixtures need a fresh service, not another test's
         // legitimate retained ownership. Preserve the caller's environment.

@@ -2101,6 +2101,11 @@ mod tests {
 
     #[test]
     fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {
+        // Upgrade preparation touches runtime storage before stale-capability rejection.
+        // Keep this expected-error fixture in the same private child as upgrade tests.
+        if !super::super::state::tests::upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{
