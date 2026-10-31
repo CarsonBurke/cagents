@@ -287,6 +287,22 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
 }
 
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
+    discover_for(
+        directory,
+        boot,
+        kind,
+        crate::instance::APPLICATION_ID,
+        crate::instance::IS_DEVELOPMENT,
+    )
+}
+
+fn discover_for(
+    directory: &Path,
+    boot: &BootId,
+    kind: Kind,
+    application: &str,
+    development: bool,
+) -> Result<Vec<Record>, String> {
     crate::secure_file::prepare_private_directory(directory).map_err(|error| error.to_string())?;
     let mut records = Vec::new();
     for (index, entry) in fs::read_dir(directory)
@@ -309,7 +325,7 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
         };
         if !record.supported_version()
             || record.kind != kind
-            || !application_matches(kind, &record.application)
+            || !application_matches_for(kind, &record.application, application, development)
             || record.path(directory) != path
             || &record.boot != boot
         {
@@ -317,7 +333,11 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
             continue;
         }
         if !record.holder.is_current() {
-            record.remove(directory);
+            // Candidate intake grants no mutation authority over the other
+            // package's evidence, including an unresolved orphan root.
+            if record.application == application {
+                record.remove(directory);
+            }
             continue;
         }
         records.push(record);
@@ -401,6 +421,78 @@ mod tests {
         ));
         assert!(application_matches_for(Kind::Terminal, dev, dev, true));
     }
+
+    #[test]
+    fn discovery_preserves_other_package_records_and_endpoints() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let full = "dev.cagents.Cagents";
+        let browserless = "dev.cagents.Cagents.Browserless";
+        let development = "dev.cagents.Cagents.Development";
+        // Explicit policy fixtures exercise both production directions even
+        // when the test executable itself has development identity.
+        for (current, other, is_development, admits_other) in [
+            (full, browserless, false, true),
+            (browserless, full, false, true),
+            (development, full, true, false),
+            (development, browserless, true, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut own = record();
+            own.application = current.into();
+            own.create(directory.path()).unwrap();
+            let mut live_other = record();
+            live_other.application = other.into();
+            live_other.create(directory.path()).unwrap();
+            let mut stale_other = record();
+            stale_other.application = other.into();
+            stale_other.holder.start += 1;
+            stale_other.create(directory.path()).unwrap();
+            assert!(!stale_other.holder.is_current());
+            assert!(stale_other.root.is_current());
+            assert_eq!(
+                application_matches_for(Kind::Terminal, other, current, is_development),
+                admits_other
+            );
+            let other_path = stale_other.path(directory.path());
+            let before = fs::read(&other_path).unwrap();
+            let other_endpoint = socket(directory.path(), stale_other.terminal);
+            let _other_listener = bind(&other_endpoint).unwrap();
+            let endpoint_before = fs::symlink_metadata(&other_endpoint).unwrap();
+            assert!(endpoint_before.file_type().is_socket());
+
+            let mut stale_own = record();
+            stale_own.application = current.into();
+            stale_own.holder.start += 1;
+            stale_own.create(directory.path()).unwrap();
+            let own_endpoint = socket(directory.path(), stale_own.terminal);
+            let _own_listener = bind(&own_endpoint).unwrap();
+
+            for _ in 0..2 {
+                let found = discover_for(
+                    directory.path(),
+                    &own.boot,
+                    Kind::Terminal,
+                    current,
+                    is_development,
+                )
+                .unwrap();
+                assert!(found.contains(&own));
+                assert_eq!(found.contains(&live_other), admits_other);
+                assert_eq!(found.len(), 1 + usize::from(admits_other));
+                assert!(!found.contains(&stale_other));
+                assert_eq!(read(&other_path).unwrap(), stale_other);
+                assert_eq!(fs::read(&other_path).unwrap(), before);
+                let endpoint_after = fs::symlink_metadata(&other_endpoint).unwrap();
+                assert!(endpoint_after.file_type().is_socket());
+                assert_eq!(endpoint_after.dev(), endpoint_before.dev());
+                assert_eq!(endpoint_after.ino(), endpoint_before.ino());
+                assert!(!stale_own.path(directory.path()).exists());
+                assert!(!own_endpoint.exists());
+            }
+        }
+    }
+
     #[test]
     fn unix_address_boundary_preserves_full_endpoint_and_discovery_identity() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
