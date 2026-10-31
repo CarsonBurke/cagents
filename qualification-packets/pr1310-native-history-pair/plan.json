@@ -502,5 +502,40 @@
     "application": "normal_close_succeeded and close_history_root unchanged. Cargo0 not UI0, pidfd death not UI0/AX0, raw None/nonzero/force/cancel/first_failure remain. No wrapper/carrier/status supplier. Normal-service TERM stays PROPOSED.",
     "result": "Even if known local physical facts and closes return, final disposition is ALWAYS HOLD for external entry-C/upstream FD gaps and native qualification. Actual policy acceptance/resources/native remain null.",
     "cases": "No authored function/module/pure case/test/native execution; SOURCE ONLY pending independent review."
+  },
+  "conditional_application_facts_successor": {
+    "schema": "pr1310-conditional-application-facts-source-v1",
+    "parent": "8aa5dbbd16c03e69a24f3d5f14f77cc9c64a6049",
+    "source_policy": {
+      "path": "/tmp/b9-cargo193-native-outcome-inference-source-review.txt",
+      "sha256": "f42e8a46d3d189981bb7528e6d5e78431eb4e83effe8753b7f24128e96e99601"
+    },
+    "independent_policy_review": {
+      "path": "/tmp/pr1310-cargo193-inference-source-review-50odlmxf/review.json",
+      "sha256": "321c3e2257c39022e73de271fd2c5e9f1b20c42059d4afd09561e4da2a24aefc"
+    },
+    "callable": "history_application_outcome(binding)",
+    "actual_consumed_seam": "Only original self.bindings object, unique existing generation UI-root-exited event, full original runner_wait, self.launches/custody.direct exact Popen object correlation and owned UI node raw statuses/signals/source/dataset. No caller-positive flags, native probes or effectful receiver.",
+    "current_result": "UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW ALWAYS. No automatic INFERRED_SUCCESS/native PASS/UI0/AX0/C return. Raw None and actual nonzero/force/cancel/first_failure are preserved, never overwritten. Local missing/duplicate/ambiguous original records cannot authorize inference.",
+    "source_correction": "Official Cargo1.93 Unix exec_replace can exec the selected UI/runner. It does not establish installed shell/Cargo/rustup/shim/config semantics, same incarnation or actual application success. Remove blanket Cargo-always-reaps explanation, preserving raw facts and close control flow.",
+    "required_external_before_effects": [
+      "Actual admitted original shell/Cargo/rustup/shim executable chain and immutable source semantics",
+      "Actual effective target plus all applicable ancestor/CARGO_HOME/config/env runner inputs; establish no unresolved target/cfg/env runner/status masking",
+      "Actual selected Cargo artifact equals immutable matched UI/source/boot/PID/start/pidfd generation; resolve each different intermediary",
+      "Original finite authenticated Root/User/resource instruction and entry; flags/UUID/source hashes/version banners are not authority"
+    ],
+    "required_external_postrun": [
+      "Actual original normal-runner wait0 for SAME generation after intended normal close; preserve cached provenance, not UI-child-Popen claim",
+      "Complete same-generation native History flow/readbacks/images/viewport/theme/data/responsiveness plus independent UX review",
+      "Actual original writer completion, original budget/cancellation/force/negative/duplicate/unknown audit; every contrary fact prevents inferred success"
+    ],
+    "missing_supported_producers": [
+      "Actual effective shell/Cargo/rustup/shim/config/runner provenance producer/entry binding is UNSUPPLIED; existing file-pin seam only pins known bytes, never determines effective configuration",
+      "Complete native flow/application acceptance + independent UX evidence producer/receiver is UNSUPPLIED; current driver records partial interactions, not whole-flow/UX acceptance"
+    ],
+    "positive_consumer": "NOT IMPLEMENTED: no supported complete actual producers exist, so no ad-hoc evidence schema, reviewed/success booleans, wrapper or framework is accepted. A separately reviewed actual external postrun decision may later state a labelled conditional inference; this method cannot.",
+    "physical_native_resource_separation": "All physical settlement/census/FD/TERM policy code, normal_close_succeeded calculation, driver/appearance/AX/source pins and C HOLD are unchanged. Inference cannot replace raw UI/AX status, physical facts, managed proof or resource acceptance.",
+    "old_wrapper": "Blocked264bcbe1 remains historical unchanged; a mandatory NEW UI-wait wrapper is not required for this separately conditioned source-policy route. No wrapper restarted or replaced.",
+    "execution": "Source only; functions/imports/cases/tests/native/actual chain/flow UNKNOWN/UNRUN."
   }
 }

@@ -1648,8 +1648,85 @@ class NativeHistoryOwner:
                             "ui_node": {key: value for key, value in binding.node.items() if key != "pidfd"},
                             "runner_is_UI": self._runner.pid == binding.ui_pid})
         self._remaining(cleanup=True)
-        # Cargo's original wait and the UI's original pidfd are distinct. A UI
-        # status reaped by Cargo can remain unknown in Custody; do not invent it.
+        # Keep original runner-wait and UI-pidfd facts distinct. Cargo1.93's
+        # Unix source permits exec replacement; the actual installed chain and
+        # effective config remain unverified. Never invent a raw UI status.
+
+    @sticky
+    def history_application_outcome(self, binding):
+        """Collect actual generation facts, NOT a positive inference consumer.
+
+        No supported actual full-chain/config or complete-flow/independent-UX
+        producer exists in this library. Pinning a file/JSON expectation does
+        not establish those conditions. The future admitted entry must supply
+        and independently audit them before effects; this method takes no
+        caller proof dictionary and cannot emit INFERRED_SUCCESS or synthesize raw UI0/AX0.
+        """
+        self._remaining(cleanup=True)
+        require(binding.owner is self and any(binding is item for item in self.bindings),
+                "application facts require the original owned generation")
+        closed = [event for event in self.events if event.get("event") == "UI-root-exited"
+                  and event.get("generation") == binding.generation]
+        require(len(closed) <= 1, "duplicate original close events prevent attribution")
+        event, wait, runner = (closed[0] if closed else None), None, None
+        missing = []
+        if event is None:
+            missing.append("original intended close event/wait")
+        else:
+            wait = event["runner_wait"]
+            require(isinstance(wait, dict) and type(wait.get("pid")) is int,
+                    "original close event lacks original runner wait identity")
+            runner = self.launches.get(wait["pid"])
+            require(runner is not None and runner["role"] == "history-development-runner"
+                    and self.custody.direct.get(wait["pid"]) is runner["child"]
+                    and wait.get("original_handle") == id(runner["child"])
+                    and self.direct_waits.get(wait["pid"]) == wait == runner["wait"]
+                    and binding.runner_exit_code == wait["original_Popen_wait_return"],
+                    "original generation/runner-Popen/wait relation ambiguous")
+        raw_ui = {name: binding.node.get(name) for name in
+                  ("pid", "start_ticks", "uid", "settled", "exit_code", "exit_status_source",
+                   "provenance", "pinned_executable", "pinned_executable_identity", "signals")}
+        raw_code = raw_ui["exit_code"]
+        require(raw_code is None or type(raw_code) is int, "raw UI code malformed; never coerce")
+        contrary = []
+        if wait is not None and wait["original_Popen_wait_return"] != 0:
+            contrary.append("known nonzero original normal-runner wait")
+        if raw_code is not None and raw_code != 0:
+            contrary.append("known nonzero/signal original UI-node status")
+        if raw_ui["signals"] or any(attempt["pid"] == binding.ui_pid and attempt["called"]
+                                    for attempt in self.signal_attempts):
+            contrary.append("original UI signal/forced-close attempt")
+        if self.cancelled():
+            contrary.append("original cancellation observed")
+        if self.first_failure is not None:
+            contrary.append("sticky original failure/deadline/ambiguity remains")
+        if not binding.closed or binding.normal_close_succeeded is not True:
+            missing.append("intended uncancelled normal-close observation")
+        facts = {"record": "history-application-outcome-facts-v1", "generation": binding.generation,
+            "arm": binding.arm, "source": ARMS[binding.arm], "dataset": binding.fixture.dataset,
+            "manifest_sha256": binding.fixture.manifest_sha256, "xid": binding.xid,
+            "original_boot_id": self.custody.boot_id, "raw_UI_node": raw_ui,
+            "matched_UI_expectation": dict(self.sources[binding.arm]["matched"]["ui"]),
+            "original_runner_wait": wait, "runner_original_handle": None if runner is None else id(runner["child"]),
+            "runner_pid_equals_UI_pid_only": None if event is None else event["runner_is_UI"],
+            "normal_close_observation": binding.normal_close_succeeded,
+            "contrary_raw_facts": contrary, "missing_local_records": missing,
+            "first_failure_unchanged": self.first_failure,
+            "required_external_producers": [
+                "PRE-EFFECT actual shell/Cargo/rustup/shim/target plus ancestor/CARGO_HOME/env/effective-runner chain provenance",
+                "exact selected Cargo artifact/original UI incarnation and complete intermediary status relation",
+                "complete actual same-generation native flow/readbacks/images/responsiveness plus independent UX review",
+                "original writer completion, intended close, complete original budget/no-contrary-fact audit"],
+            "application_inference": "UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW",
+            "native_qualification": "NOT_ESTABLISHED_BY_THIS_METHOD",
+            "logical_resource_return": "UNCHANGED_HOLD_EXTERNAL_ENTRY_C",
+            "observed_monotonic": time.monotonic()}
+        # Freeze existing raw records without rewriting None, cached provenance,
+        # force/nonzero or a numeric equality into an incarnation certificate.
+        facts = json.loads(json.dumps(facts, allow_nan=False, sort_keys=True))
+        self._remaining(cleanup=True)
+        self.events.append({"event": "application-outcome-facts", "facts": facts})
+        return facts
 
     def _retain_failure_artifacts(self):
         records = []

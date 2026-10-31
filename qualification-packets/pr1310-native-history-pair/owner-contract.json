@@ -1,4 +1,7 @@
 {
+  "additional_entry_application_api": {
+    "history_application_outcome(binding)": "Additional original-entry-only readback, not part of the unchanged eight driver methods: original per-generation facts + UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW. No success consumer without actual chain/native/UX producers; raw statuses and resource/native HOLD unchanged."
+  },
   "allowed_preparation_checks": "Only source/metadata-Git/hash/AST/JSON/conservation; no owner import/call, fixture workload, native modules, tool versions, probes, builds or tests executed.",
   "appearance_consumer": {
     "appearance": "Exact version1 JSON keys, duplicate/nonfinite refusal; actual PID/source/build/version/manifest/dataset, one nonnil observer/main identity, contiguous1..256 records, positive actual Core scale/f32 bits and native Rescaled provenance when present. All complete records validated, not just last.",
@@ -92,6 +95,41 @@
   "base": {
     "head": "9dc2a70caebbfc972e537712b9f9326843f232d0",
     "tree": "fcb1b582d894dc46590cc8fc8f20e9cb17920a0a"
+  },
+  "conditional_application_facts_successor": {
+    "actual_consumed_seam": "Only original self.bindings object, unique existing generation UI-root-exited event, full original runner_wait, self.launches/custody.direct exact Popen object correlation and owned UI node raw statuses/signals/source/dataset. No caller-positive flags, native probes or effectful receiver.",
+    "callable": "history_application_outcome(binding)",
+    "current_result": "UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW ALWAYS. No automatic INFERRED_SUCCESS/native PASS/UI0/AX0/C return. Raw None and actual nonzero/force/cancel/first_failure are preserved, never overwritten. Local missing/duplicate/ambiguous original records cannot authorize inference.",
+    "execution": "Source only; functions/imports/cases/tests/native/actual chain/flow UNKNOWN/UNRUN.",
+    "independent_policy_review": {
+      "path": "/tmp/pr1310-cargo193-inference-source-review-50odlmxf/review.json",
+      "sha256": "321c3e2257c39022e73de271fd2c5e9f1b20c42059d4afd09561e4da2a24aefc"
+    },
+    "missing_supported_producers": [
+      "Actual effective shell/Cargo/rustup/shim/config/runner provenance producer/entry binding is UNSUPPLIED; existing file-pin seam only pins known bytes, never determines effective configuration",
+      "Complete native flow/application acceptance + independent UX evidence producer/receiver is UNSUPPLIED; current driver records partial interactions, not whole-flow/UX acceptance"
+    ],
+    "old_wrapper": "Blocked264bcbe1 remains historical unchanged; a mandatory NEW UI-wait wrapper is not required for this separately conditioned source-policy route. No wrapper restarted or replaced.",
+    "parent": "8aa5dbbd16c03e69a24f3d5f14f77cc9c64a6049",
+    "physical_native_resource_separation": "All physical settlement/census/FD/TERM policy code, normal_close_succeeded calculation, driver/appearance/AX/source pins and C HOLD are unchanged. Inference cannot replace raw UI/AX status, physical facts, managed proof or resource acceptance.",
+    "positive_consumer": "NOT IMPLEMENTED: no supported complete actual producers exist, so no ad-hoc evidence schema, reviewed/success booleans, wrapper or framework is accepted. A separately reviewed actual external postrun decision may later state a labelled conditional inference; this method cannot.",
+    "required_external_before_effects": [
+      "Actual admitted original shell/Cargo/rustup/shim executable chain and immutable source semantics",
+      "Actual effective target plus all applicable ancestor/CARGO_HOME/config/env runner inputs; establish no unresolved target/cfg/env runner/status masking",
+      "Actual selected Cargo artifact equals immutable matched UI/source/boot/PID/start/pidfd generation; resolve each different intermediary",
+      "Original finite authenticated Root/User/resource instruction and entry; flags/UUID/source hashes/version banners are not authority"
+    ],
+    "required_external_postrun": [
+      "Actual original normal-runner wait0 for SAME generation after intended normal close; preserve cached provenance, not UI-child-Popen claim",
+      "Complete same-generation native History flow/readbacks/images/viewport/theme/data/responsiveness plus independent UX review",
+      "Actual original writer completion, original budget/cancellation/force/negative/duplicate/unknown audit; every contrary fact prevents inferred success"
+    ],
+    "schema": "pr1310-conditional-application-facts-source-v1",
+    "source_correction": "Official Cargo1.93 Unix exec_replace can exec the selected UI/runner. It does not establish installed shell/Cargo/rustup/shim/config semantics, same incarnation or actual application success. Remove blanket Cargo-always-reaps explanation, preserving raw facts and close control flow.",
+    "source_policy": {
+      "path": "/tmp/b9-cargo193-native-outcome-inference-source-review.txt",
+      "sha256": "f42e8a46d3d189981bb7528e6d5e78431eb4e83effe8753b7f24128e96e99601"
+    }
   },
   "constructor": {
     "custody": "Actual pinned d9ee Custody instance created by the actual original entry, cancelled is custody.cancelled; same owner thread and original empty-child/subreaper provenance. No caller dictionary substitutes.",
@@ -278,7 +316,7 @@
       "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01"
     }
   },
-  "native_owner_sha256": "24694638becae5dbaeffa796212fed8a6668869d48664b5da1b0dc4109da16e8",
+  "native_owner_sha256": "e2e4a520087bf95c902646b4dbe6b69531944bb3cfad5fc8ddc1d3f77aab9fd8",
   "physical_evidence_successor": {
     "C_boundary": "ABSENT_EXTERNAL/HOLD: original entry-owned C descriptor is not supplied to this library. No number/JSON/closed flag establishes C ownership, acquisition, release or acceptance.",
     "acquisitions": "Every locally returned regular/input/raw FD is retained before metadata; prepare root_fd keeps its EXISTING one _retain_raw record. Final-census opens are additional distinct real acquisitions. Original FD numbers remain recorded after published-node pop. Any attempted/returned/ambiguous close is sticky; no double close/numeric retry. Memory snapshots survive negative paths.",
@@ -372,7 +410,7 @@
     "Frame equality excludes only irrelevant raw-read metadata; actual semantic state and meaningful producer observation_generation remain capture-critical. Missing native factor is never replaced by configured1.",
     "Current physical successor implements only known local facts; historical0ffb/07b strict unknown-status descriptor gate is preserved in old checkpoints, not silently claimed still active in this distinct source. Raw unknown status remains a native qualification gate.",
     "Python scandir retains a real iterator/API-close result but hides its internal temporary FD number and automatic exhaustion-close; transient stdlib/kernel accounting is explicitly not complete. No post-expiry repair.",
-    "Original UI-wait retained-owner supplier is still BLOCKED264bcbe1; no supported status carrier/inference implemented here.",
+    "Stopped UI-wait retained-owner supplier264bcbe1 remains historical BLOCKED. No mandatory new wrapper for the accepted conditional application-inference route; actual full-chain/config and complete native/UX producers remain absent, so this source only collects pending raw facts.",
     "Final snapshot is in original owner memory. Actual entry-owned immutable evidence publication and C descriptor custody are unsupplied; source library cannot publish/accept/release resources."
   ],
   "status": "IMPLEMENTED_SOURCE_CANDIDATE_WITH_EXPLICIT_HOLD_GATES"

@@ -214,3 +214,35 @@ is ALWAYS HOLD for external entry-C/upstream gaps; service TERM remains only a
 proposal. UI-wait, native imports/AX and actual entry/status/build/data/native UX
 gates remain unresolved. No new process/carrier/framework, policy adoption,
 execution grant, resource release or native pass is supplied by this source.
+
+## Conditional application facts, without a success consumer
+
+`history_application_outcome(binding)` is a small original-owner readback. It
+correlates the actual original binding/close event and retained runner Popen/wait
+objects, preserving raw UI status (including None), signals, cancellation and
+sticky failure. Its result is ALWAYS
+`UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW`. Neither runner0, numeric PID
+equality, a source review nor this record becomes raw UI0/AX0 or native PASS.
+
+Official Cargo1.93 Unix source permits exec replacement; the old blanket
+explanation that Cargo necessarily reaps the UI was unsupported. Actual installed
+shell/Cargo/rustup/shims and target/ancestor/CARGO_HOME/env/config runners remain
+UNKNOWN. Pinning known source files/version banners or a reviewed:true flag
+cannot establish the effective chain. A future actual admitted entry must bind
+that provenance BEFORE effects through supported original inputs. No such
+complete producer is supplied here, and no invented evidence schema is accepted.
+
+Only a separately supported original external postrun review could later make
+a labelled conditional application inference, requiring verified chain/artifact/
+incarnation/status relations, original generation runner wait0 after intended
+normal close, COMPLETE actual native interactions/readbacks/images and UX, and
+no contrary unknown/negative/duplicate/force/cancel/deadline/writer evidence.
+The complete native/UX producer/receiver is also missing; this method deliberately
+has no positive automatic branch. A new wait-wrapper is not mandatory for this
+conditional route; the historical stopped-wrapper negative stays unchanged.
+
+Physical/FD settlement, all driver/AX/appearance/source pins and the old bounded
+normal_close_succeeded observation are unchanged. Application inference supplies
+no physical return, raw missing status, C ownership, native qualification or
+resource acceptance. All actual entry/build/config/chain/native/UX inputs and
+results remain NULL/UNRUN. No owner function or test was executed in preparation.
