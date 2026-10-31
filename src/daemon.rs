@@ -1,3 +1,5 @@
+#[cfg(feature = "host")]
+pub(crate) mod adopted_orphans;
 #[cfg(all(feature = "host", target_os = "linux"))]
 pub(crate) mod child_reaper;
 pub(crate) mod holder_registry;
