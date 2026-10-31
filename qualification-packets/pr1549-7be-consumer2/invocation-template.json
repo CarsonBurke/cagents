@@ -1,0 +1,35 @@
+{
+  "kind": "NOT_SUBMITTABLE_PRE_TWO_REVIEWS_ADOPTION_AND_FRESH_ROOT_GRANT",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source",
+  "argv": [
+    "/usr/bin/python3",
+    "-I",
+    "-B",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source/qualification-packets/pr1549-7be-consumer2/run-packet.py",
+    "--grant",
+    null,
+    "--runner-sha256",
+    "cbcd227500992aa88f699ab038b9aa0ee22652b624f875e49455b46cb10f992e",
+    "--controller-review",
+    null,
+    "--controller-review-sha256",
+    null
+  ],
+  "grant_value_index": 5,
+  "execution_authorized": false,
+  "independent_code_review": null,
+  "independent_conservation_review": null,
+  "controller_source_adoption": null,
+  "controller_source_publication": null,
+  "queue": null,
+  "runtime": null,
+  "review_ABI": {
+    "verdict": "CONTROLLER_SOURCE_CLEAR",
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "runner_sha256": "cbcd227500992aa88f699ab038b9aa0ee22652b624f875e49455b46cb10f992e",
+    "plan_sha256": "6b16db2bcdb29abcc756042df954c7780d0e98fd355ee9def936bc20455e5b83",
+    "controller_identity": "EXTERNAL_POSTCOMMIT_REQUIRED"
+  },
+  "limits": "Both genuine reviews and fresh explicit Root C allocation required; initial NULL review/hash/grant cannot run. No descriptor/C reservation, publication, workload or self-clear."
+}

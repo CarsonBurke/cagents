@@ -1,0 +1,179 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_source_adoption": null,
+    "controller_source_publication": null,
+    "execution_authorized": false,
+    "grant": null,
+    "inventory_N": null,
+    "native_or_wholeUX": null,
+    "owning_results": null,
+    "queue": null,
+    "resource_or_safe_return_proof": null,
+    "runtime": null
+  },
+  "author_receipt": {
+    "expected_sha256": "6847038f6acea28f7680c0d35c6b39a42149c9abaa50f46e8f5b4470e6fed089",
+    "path": "/tmp/coord-b9-pr1549-worker21-author-freeze/source-receipt.json",
+    "sha256": "6847038f6acea28f7680c0d35c6b39a42149c9abaa50f46e8f5b4470e6fed089"
+  },
+  "binding_sha256": "b7a211290bb600106d3d7dc9469a7c963c53696f8feb281a15203d87a2b65d7b",
+  "blockers": [],
+  "controller_head": "ae17e43394f149fe2d6a54fb9503cbe40ff13a41",
+  "controller_tree": "ed08c813a6cff94b9088becc4b962795a9a58b14",
+  "excluded_claims": "No fullELF bytes/everyexec/embedded binary identity/global absence/fullfeature/performance/native/provider/installed/wholePR/UX/merge qualification. No other campaigns or old reviewed outcomes transfer.",
+  "findings": [],
+  "handoff": {
+    "expected_sha256": "3537d69db2baccb3f5c22684f5755c36b84c49a95ffb78b411a24778f696a6f7",
+    "path": "/tmp/coord-b9-pr1549-worker21-author-freeze/handoff.json",
+    "sha256": "3537d69db2baccb3f5c22684f5755c36b84c49a95ffb78b411a24778f696a6f7"
+  },
+  "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+  "independent_conservation_review": "Separate review pending/not supplied in this CODE/CALLER/ORACLE receipt.",
+  "manifest_sha256": "d86fb68c4dc7d271987039737a8d950bc81975d271706f747b0393a56a1a6aff",
+  "next_gate": "Root must combine separate genuine conservation review with this code review, then separately obtain actual controller adoption/publication and fair one-use admission before any runtime. Source clearance alone does not authorize execution.",
+  "performed": "Standard source/Git/hash/AST/JSON reads and this own /tmp receipt only. No candidate/helper/controller/module/function/parser import or evaluation, Cargo/tests/builds/native/process/resource/env/account/DB/target/cache probes, GitHub or source edits, new descriptor or usage retry.",
+  "phase_and_context_scope": {
+    "binary_checks": 0,
+    "compile_seconds": 900,
+    "graphs": [
+      "ui library only"
+    ],
+    "inventory_seconds": 30,
+    "lane_data": "Same C target/lock, jobs2, physical1.93 compiler pins, no new cache. Neither source preparation nor lock absence authenticates a future grant.",
+    "natural_refusal": "Original context/source/capture/scheduler/helper presence or resource failure stops without rerun/repair; unknown status remains unqualified. Grant-ID syntax is not freshness/authentication/once-use proof.",
+    "original_workload_cap": 2400,
+    "parent_seconds": 60,
+    "parents": 21,
+    "phase_caps_sum": 2190,
+    "reservations": "Original DATApre30/post60 remain proposed nonaggregate reservations, not newly enforced total bounds. Source/preparation/known original finalization retain their declared limits; uncertain custody/evidence remains HOLD beyond workload cap. No new aggregate timing guarantee.",
+    "serial_phases": 23,
+    "six_names_only_absences": [
+      "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+      "RUST_TEST_NOCAPTURE",
+      "RUST_TEST_THREADS",
+      "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+      "CAGENTS_RETAINED_ACTOR_FIXTURE",
+      "CAGENTS_SEARCH_FD_BUDGET_CHILD"
+    ],
+    "worker_scope": "Mandatory addendum explicitly permits bounded inherited global Gitignore/config and ancestor ignore reads. Not fixture-confined. HOME/XDG/opaque authority remain inherited; no scrub, fallback, account DB/provider/auth probe or User-proxy inference."
+  },
+  "plan_sha256": "bece97254c6b90f47dd1955f17ecdceaae1381d820a17ec188a074ab502a8a8c",
+  "private_git_pointer": "gitdir: /tmp/coord-b9-pr1549-7be-worker21-git/worktrees/coord-b9-pr1549-7be-worker21-source",
+  "reviewer": "/root/task_source_fix",
+  "runner_sha256": "1b6d5f5d8e09232d8812b6b34d86bb5592ee0cd226bc81f3fcb5c53626dd6647",
+  "schema": "pr1549-worker21-independent-code-caller-oracle-source-review-v1",
+  "scope": "CODE/CALLER/ORACLE source review of this actual worker21 controller only. Separate independent conservation/product-byte review remains separate. No old UI5/whole-feature/canonical-policy audit or runtime clearance transfer.",
+  "selection_and_oracle_contract": {
+    "accounting": "parent_accounting rereads original stdout, reconciles phase SHA/original wait/evidence/sticky supervision/history, preserves attempted vs unrun/unknown counts, requires21 exact labels and zero child credit. Inline subcases do not create extra parent waits or results.",
+    "actual_result_status": "ALL21_UNRUN; actual ELF/N/results NULL.",
+    "coordinator_intake_order_exact": true,
+    "count": 21,
+    "distinct": true,
+    "excluded": "All five UI5 selectors including low-FD child parent, ignored manual repository_first_result_latency, front19,CLI3,Main15,Linear,1921,native. No duplicates, scheduler overrides, nocapture/show-output or childmode arguments.",
+    "future_ELF_N": "Actual Cargo JSON test-library selection and full original emitted ELF --list --color=never inventory occur before any parent. inventory_names rejects unknown/duplicate/inconsistent totals and missing selected identities; grouped_contracts derives each expected_filtered_out from that original inventory as N-1. No old or guessed N exists.",
+    "future_singletons": "Exactly21 serial [actualELF, exactName,--exact,--format=pretty,--color=never] invocations using default outer scheduler/capture.",
+    "independent6ed2_order_exact": true,
+    "mandatory_DATA7190_order_exact": true,
+    "mandatory_addendum28c9_order_exact": true,
+    "selected_names_in_exact_order": [
+      "project_search::tests::ignore_hidden_globs_and_options",
+      "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope",
+      "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries",
+      "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes",
+      "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry",
+      "project_search::tests::large_search_streams_first_results_before_completion",
+      "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership",
+      "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal",
+      "project_search::tests::deep_ignore_error_terminates_without_a_finished_event",
+      "project_search::tests::regex_errors_and_binary_files",
+      "project_search::tests::content_search_never_follows_links_outside_the_selected_root",
+      "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data",
+      "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending",
+      "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix",
+      "project_search::tests::caps_results_and_cancels_during_delivery",
+      "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress",
+      "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+      "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree",
+      "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings",
+      "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources",
+      "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers"
+    ],
+    "source_only_metadata_joins": "Plan, command-data, current-source-map and selected-source-contract names, source paths/hashes, body hashes, definition lines, ordinary/not-ignored state and zero expected visible child results agree. These are source predictions, not actual inventory or pass evidence.",
+    "strict_parser": "Maintained grouped_result unchanged: exact named completion, running1, one ok1P0F0I0M/N-1 footer and ordered sole outer lifecycle; extra/unknown/malformed/indented/duplicate/standalone/child results fail qualification. Supported pending-test progress warning does not earn credit."
+  },
+  "sole_parent": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+  "source_preservation_limits": {
+    "canonical_and_original_wait_evidence_writer": "Complete adopted-child policy, original process ledger/direct waits/pidfd cancellation/final custody/evidence/raw reread/final writer behavior unchanged outside declared main composition. Sticky uncertainty cannot become clean handoff merely from a later empty observation; ambiguous close is not retried.",
+    "first_preparation_failure": "Author original incorrect directory-name assumption exit1 before runner creation retained at /tmp/coord-b9-pr1549-worker21-sourceprep-negative; initial generation0 draft correction retained at /tmp/coord-b9-pr1549-worker21-before-coherence-draft. No runtime failure/pass inferred from these source operations.",
+    "inspection_method": "Read-only AST source-segment comparison, file/JSON/hash inspection; no imported or evaluated controller/parser/helpers.",
+    "instruction_baseline": "Existing AGENTS filesystem/Git variance and flags preserved as recorded; latest user instructions apply. No normalization or new source/context qualification inferred.",
+    "only_three_methods_changed": [
+      "grouped_contracts",
+      "parent_accounting",
+      "main"
+    ],
+    "original_source_tool_provenance": {
+      "bytes": 2441,
+      "path": "/tmp/coord-b9-pr1549-worker21-author-freeze/original-local-source-tool-provenance.json",
+      "sha256": "c89a5e4712929952d7f243e3a103266e15e3b21eba052206039586229d7429f5"
+    },
+    "product_conservation": "Author declares116new packet files and2223 unchanged product entries; separate designated independent conservation review owns complete tree/product proof. This code review does not substitute for it.",
+    "top_level_functions": 32,
+    "unchanged_from_actual993_donor": 29
+  },
+  "task_seams": {
+    "grouped_contracts": {
+      "end_line": 491,
+      "line": 475,
+      "sha256": "03194e90511c55a0965d00bb3f2a48a67591406b6141aaf1691e14c715108eba"
+    },
+    "main": {
+      "end_line": 1420,
+      "line": 825,
+      "sha256": "38576d33bae7122fba39c6f02a6ba03267cba862efc7e4060ad49100f4018c07"
+    },
+    "parent_accounting": {
+      "end_line": 762,
+      "line": 680,
+      "sha256": "6712e2a95f9a55bb3694b19acd1a9f9cf7cf22e3652b9fd3940f792fc0f8f193"
+    }
+  },
+  "tree": "532d48f268b00fa658fea22a8418d41432879046",
+  "typed_proof_and_caller_bindings": {
+    "adoption_publication_queue": "Current controller adoption/publication/grant/queue/runtime NULL in preparation; only genuine future external Root action after required reviews can fill authority. Existing product publication is not controller self-adoption.",
+    "all105_archive_hashes_match": true,
+    "all_bound_reference_hashes_match": true,
+    "archive_count": 105,
+    "base_c28_publication_join_exact": true,
+    "base_c28_publication_role": "Actual main922 now checks base_c28_publication against genuine c28 publication/adoption/branch rather than current7be publication map.",
+    "bound_hash_failures": [],
+    "bound_reference_count": 51,
+    "c28_readers": "Base freeze/adoption/correction/conservation/UX/main-assembly/publication typed schemas, identities, source hashes and original negative/history remain c28, never current-product qualification.",
+    "canonical_reference_reader": "Canonical tuple/function/freezes/semantic/conservation/pure4 reference hashes remain immutable provenance, not current runnable caller/resource or task passes; natural unsignaled adopted-descendant HOLD is preserved. No canonical re-audit performed.",
+    "controller_identity": {
+      "head": "ae17e43394f149fe2d6a54fb9503cbe40ff13a41",
+      "tree": "ed08c813a6cff94b9088becc4b962795a9a58b14"
+    },
+    "current7be_publication_role": {
+      "published_source_branch": "fix/fw16-pr1549-search-child-scope",
+      "source_adoption_sha256": "3c1547c781a6a624b570035f1eceac14ab9c7ab1663d711ea0035cf23254ca7b",
+      "source_publication_sha256": "da981cd62a7df706a509a3c095ddb6d53d360cd24442a9ec513199f90aaeb074"
+    },
+    "current7be_readers": "7be freeze/code/conservation/adoption/publication/addendum checks remain distinct at937-979, with exact7be tuple and c28 parent, preserved independent review hashes/source pins and no runtime grant.",
+    "external_review_ABI": "This genuine independent receipt deliberately uses product7be head/tree for validate_controller_review, runner/plan SHA pins, and separate postcommit controllerae17 head/tree. The reader compares verdict/product tuple/runner/plan; external Root must retain exact receipt bytes and require separate conservation/adoption/publication/admission. Source review is not User/C authority.",
+    "original_UI5_defect_witness": {
+      "path": "/tmp/coord-b9-pr1549-ui5-c28-publication-source-witness.json",
+      "scope": "Original immutable oldUI5 mismatch/Root16 additiveHOLD retained; UI5 code/verdict not edited or cleared here.",
+      "sha256": "74bc11cd0b9d42134406231988a41a41a2d66e98ad3b1ffabf003aeced1fa147"
+    },
+    "prelock_archive": "Executing runner, pinned plan, all105 archive-bound source/proof payloads and genuine external controller review are copied before lock acquisition; source guards continue pinning them. All51 direct bound reference hashes match and are present in archive bindings; archive destination names are unique safe relative components.",
+    "product_identity": {
+      "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+      "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+      "tree": "532d48f268b00fa658fea22a8418d41432879046"
+    }
+  },
+  "verdict": "CONTROLLER_SOURCE_CLEAR",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source"
+}

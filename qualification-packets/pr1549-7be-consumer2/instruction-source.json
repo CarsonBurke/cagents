@@ -1,0 +1,9 @@
+{
+  "kind": "UNCHANGED_TRACKED_INSTRUCTION_SOURCE_NOT_QUALIFICATION",
+  "git_AGENTS_link_payload_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+  "git_CLAUDE_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+  "new_controller_AGENTS_resolves_to_tracked_CLAUDE": true,
+  "tracked_instruction_bytes_modes_changed": false,
+  "latest_user_AGENTS_instructions_followed": true,
+  "internal_worker_lead_role_unchanged": true
+}

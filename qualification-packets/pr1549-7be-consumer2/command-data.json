@@ -1,0 +1,128 @@
+{
+  "schema": "pr1549-7be-consumer2-controller-task-data-v1",
+  "product_PR_reference": 1549,
+  "boundary": "two isolated compiler consumers",
+  "source": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope"
+  },
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "selected_names": [],
+  "selected_parents": [],
+  "artifact_groups": [],
+  "binary_checks": [
+    {
+      "label": "ceditor-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "-p",
+        "ceditor",
+        "--bin",
+        "ceditor"
+      ],
+      "seconds": 480
+    },
+    {
+      "label": "integrated-ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--features",
+        "integrated-browser",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 1800
+    }
+  ],
+  "planned_phase_order": [
+    "ceditor-binary-check",
+    "integrated-ui-binary-check"
+  ],
+  "runtime_admission": {
+    "state": "PR1549_7BE_CONSUMER2_SOURCE_REQUIRES_TWO_REVIEWS_AND_FRESH_GRANT",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null,
+    "controller_source_adoption": null,
+    "controller_source_publication": null,
+    "queue": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "consumer_source_contract": {
+    "kind": "TWO_SERIAL_COMPILER_CONSUMERS_ZERO_TEST_PARENTS",
+    "consumer_DATA_sha256": "ad7c371d8ba90548dd1584a06612ed36ff5922c6cc7ad1cb2241879b64660044",
+    "binary_checks": [
+      {
+        "label": "ceditor-binary-check",
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "ceditor",
+          "--bin",
+          "ceditor"
+        ],
+        "seconds": 480
+      },
+      {
+        "label": "integrated-ui-binary-check",
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--features",
+          "integrated-browser",
+          "--bin",
+          "cagents-ui"
+        ],
+        "seconds": 1800
+      }
+    ],
+    "artifact_groups": [],
+    "selected_names": [],
+    "selected_parents": [],
+    "requested_test_invocations": 0,
+    "requested_unique_parents": 0,
+    "inventory_required": false,
+    "actual_inventory_N": null,
+    "actual_compiler_results": null,
+    "graphs": [
+      "ceditor default[] -> cagents default-features=false/ui; nohost/noServo",
+      "root defaultfull+integrated-browser/full/ui; nohost"
+    ],
+    "profile": "ordinary dev implicit default",
+    "root_browserless_UI_check_repeated": false,
+    "standalone_integrated_variant_added": false,
+    "phase_cap_sum": 2280,
+    "packet_cap": 2400,
+    "inherited_authority_HOME_XDG_unchanged": true,
+    "unknown_custody": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD",
+    "other_test_native_provider_scopes": "UNQUALIFIED"
+  }
+}

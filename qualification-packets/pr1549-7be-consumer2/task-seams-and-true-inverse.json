@@ -1,0 +1,42 @@
+{
+  "kind": "AUTHOR_TASK_SEAM_SOURCE_COMPARISON_NOT_REVIEW",
+  "donor_runner_sha256": "1b6d5f5d8e09232d8812b6b34d86bb5592ee0cd226bc81f3fcb5c53626dd6647",
+  "candidate_runner_sha256": "cbcd227500992aa88f699ab038b9aa0ee22652b624f875e49455b46cb10f992e",
+  "plan_sha256": "6b16db2bcdb29abcc756042df954c7780d0e98fd355ee9def936bc20455e5b83",
+  "task_seams": [
+    "main current consumer DATA/zero-artifact/two-compiler scope guards",
+    "main explicit current7be vs basec28 proofroles and genuine donor source-history refs",
+    "main own evidence output prefix",
+    "parent_accounting exact two phases/zero parents/empty requestset",
+    "final owning-command expectedempty testset and compiler-only scope literal"
+  ],
+  "generic_helpers_untouched": 30,
+  "main_nested_all5_exact": true,
+  "all_nested7_exact": true,
+  "protected3790_exact": true,
+  "canonical9004_exact": true,
+  "inverse_files": [
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source/qualification-packets/pr1549-7be-consumer2/from-ae17-forward.diff.json",
+      "sha256": "9be73d2e5b085829a5e7056420458e3fc9f17187e7dbc01ab23c22eaebd6df6e",
+      "bytes": 77562
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source/qualification-packets/pr1549-7be-consumer2/to-ae17-true-inverse.diff.json",
+      "sha256": "5d57bed9a9c198ca0452c3818c5c3905d80d0e2a3ae37c329832207f3f12097b",
+      "bytes": 42190
+    }
+  ],
+  "preseal_source_corrections": [
+    "Use actual7be publication refs field instead of nonexistent branch key",
+    "Distinguish AGENTS git symlink payload from followed-file digest; physical CLAUDE/source tree retained"
+  ],
+  "own_path_assertion": {
+    "PLAN": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source/qualification-packets/pr1549-7be-consumer2/plan.json",
+    "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source/qualification-packets/pr1549-7be-consumer2/run-packet.py",
+    "controller_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source",
+    "product_WT_unchanged_from_donor": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope",
+    "all_active_archive_paths_new_packet": true
+  },
+  "runtime": "UNRUN"
+}

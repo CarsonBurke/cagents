@@ -1,0 +1,135 @@
+{
+  "review_kind": "independent narrow code and permission-custody source review; Root authored successor",
+  "created_utc": "2026-10-31T16:23:49.447718+00:00",
+  "verdict": "BOUNDED SOURCE CLEAR; no concrete new type/gate/caller-custody/conservation blocker in the exact test-only delta; not runtime admission",
+  "identities": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "sole_parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "parent_tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-child-scope",
+    "before_after_head_and_tree": "exact frozen pins; clean porcelain at both reads",
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-low-fd-child-scope-source-freeze-v1.json",
+      "sha256": "f3e5626484baf74bfd80b67ca32f159145bebf4871766358e35ce0276439f0e9"
+    }
+  },
+  "conservation": {
+    "base_tracked_entries": 2223,
+    "head_tracked_entries": 2223,
+    "outside_sole_path_exact_entries_blobs_modes": 2222,
+    "sole_changed_path": "src/project_search/traversal.rs",
+    "mode_before_after": "100644",
+    "numstat": {
+      "added": 9,
+      "removed": 3
+    },
+    "base_leaf": {
+      "path": "src/project_search/traversal.rs",
+      "blob": "385721f63fb041b52f85059c3712a9686a040a6c",
+      "sha256": "1aaa151e6f507f589f9072798e2a9d289dee7071de51da6690b17a803fb59aab",
+      "bytes": 22062
+    },
+    "head_leaf": {
+      "path": "src/project_search/traversal.rs",
+      "blob": "e192a308d1828483171501130a886114689b2a57",
+      "sha256": "efe6e92570f66931b12c658765f6d3291a58620238c5ffd066d0752f84a2fd75",
+      "bytes": 22349
+    },
+    "exact_forward_hunk_reconstruction": true,
+    "production_prefix_bytes": 8783,
+    "production_prefix_sha256": "b9fb89e5b1e5c24e06349849ef76fac5d49a6276e76e5f2a32aed7a01444d458",
+    "production_prefix_exact": true,
+    "file_test_parent_count_before": 2,
+    "file_test_parent_count_after": 2,
+    "new_test_parents": 0,
+    "child_cases_exact": true,
+    "original_assertions_and_remainder": "Exact reconstruction changes only the command-setup span; child body, old original assertions, OwnedChild/wait/deadline and all subsequent bytes remain unchanged."
+  },
+  "code_and_permission_findings": [
+    {
+      "anchor": "src/project_search/traversal.rs:586-593",
+      "finding": "Command starts with normal inherited environment; vars_os names are removed except exact OsStr equality with crate::agent_execution::AUTHORITY_ENV. The opaque value is never selected into a named binding, parsed, logged, explicitly copied into Command::env, removed or replaced. Absent remains absent; present empty/non-Unicode authority is inherited unchanged. Names/values of all other enumerated entries remain excluded."
+    },
+    {
+      "anchor": "src/agent_execution.rs:31; src/modules.rs:17,102-103; src/lib.rs:5",
+      "finding": "AUTHORITY_ENV is public &str and its module is unconditional in the shared module list. project_search is ui-gated, and traversal tests are cfg(test) at272. The existing UI test graph can name this const; no HOST-only or UI/host reunification dependency is introduced."
+    },
+    {
+      "anchor": "src/project_search/traversal.rs:586-602; tests/linear_cli_contract.rs:21-29",
+      "finding": "vars_os yields OsString names; the exact OsString/OsStr comparison already appears in the unchanged accepted neighbor. std::process::Command::env_remove accepts that name by AsRef<OsStr>; its ignored return is &mut Command, unlike neighbor CommandSpec consuming-return reassignment. No new unsafe environment mutation/API, lifetime or experimental Rust syntax was introduced. This is source compatibility inference, not compiler output."
+    },
+    {
+      "anchor": "src/project_search/traversal.rs:568-629",
+      "finding": "Same current_exe remains a direct Child, with identical exact selector, inline child --nocapture/--test-threads=1, CHILD=1, private HOME/cwd, file-backed streams, retained OwnedChild guard, 30-second child deadline, original try_wait/wait and exact nested one-test success assertions. No new child, parent test, provider/Host request or production control path is added."
+    },
+    {
+      "anchor": "src/project_search/traversal.rs:377-566",
+      "finding": "The unchanged isolated child creates its fixtures before lowering only its soft RLIMIT_NOFILE to64, then exercises search traversal, incomplete-resource errors, cancellation/refusal and descriptor release. This delta does not remove or bypass any low-FD or outcome assertion."
+    }
+  ],
+  "neighbor_scope": {
+    "accepted_pattern": "tests/linear_cli_contract.rs::isolated",
+    "main_neighbor_compatibility": "The same authority-excepted name-removal expression is reused with the correct std Command mutating API. Search-neighbor scan of project_search.rs,project_search/,app/search_ui.rs found no other env_clear/env_remove/remove_var/Command/current_exe site beyond this setup. No broad environment or permission policy change is proposed.",
+    "limitation": "Name enumeration assumes the inherited environment is stable while this child command is prepared/spawned. It is not an atomic environment snapshot against unrelated concurrent process-environment mutation; no such concurrent writer is established by the inspected owning Search boundary. Do not expand this source review into a general environment-isolation guarantee."
+  },
+  "future_test_admission_requirements": [
+    "No invocation is granted by this source review. Bind any future selection and retained evidence to exact7bebe4df/tree532d48f and the appropriate isolated UI library graph; bare default/CLI and HOST-only graphs compile this test out.",
+    "Before the outer harness is admitted, its inherited CAGENTS_SEARCH_FD_BUDGET_CHILD name must be genuinely absent. Source:570-575 tests presence, so empty also triggers child_cases directly in the outer harness, bypassing the private Child/deadline guard and lowering shared harness limits. If present, refuse that admission; do not unset/override it to manufacture the precondition. This review performed no environment observation.",
+    "Retain opaque inherited AUTHORITY_ENV unchanged. Do not probe, print, copy into a receipt, remove, replace with a fixture token, or add User conversion. Other environment exclusions/private HOME/cwd remain the narrowly reviewed child setup.",
+    "The --exact owning selector, --nocapture and --test-threads=1 at587 belong only to the inline same-ELF child. They do not authorize outer --nocapture or forced outer serialization. Preserve the separately admitted outer selection/default capture and its original accounting policy.",
+    "Count this as one outer owning parent. The nested one-parent child summary printed at623-627 is nonadditive and must be joined to this parent, not added as another pass or confused with outer default-captured output. Require original parent return/deadline and intended nested name/count assertions.",
+    "This child changes only its own soft descriptor limit to64 and requires initial soft limit>=64 plus capacity>=32; preserve those assertions and original child ownership/cleanup. No runtime precondition was probed by this review."
+  ],
+  "pin_leaves": [
+    {
+      "path": "src/agent_execution.rs",
+      "blob": "209c36db63faa878e3e3dcd33e0c49d3e01db5e8",
+      "sha256": "14fc4f194cbc57dabc63bba2e719170dda3e05f97a5779f95b5607317104b452",
+      "bytes": 25326
+    },
+    {
+      "path": "src/modules.rs",
+      "blob": "6db64e6c78a4a733ab00ed07cb780e8bdb7b05ab",
+      "sha256": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f",
+      "bytes": 4190
+    },
+    {
+      "path": "src/lib.rs",
+      "blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+      "bytes": 350
+    },
+    {
+      "path": "Cargo.toml",
+      "blob": "5a981df1f743b2ccf624d498d24d3df120f13116",
+      "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac",
+      "bytes": 13215
+    },
+    {
+      "path": "tests/linear_cli_contract.rs",
+      "blob": "e8447735228567f3c77d7c29a387ff8a6ac326b4",
+      "sha256": "d41bf29c8d1accd7b03eaec7b315e466f5ec77aba682550b62f88c1d10ca8152",
+      "bytes": 21979
+    },
+    {
+      "path": "src/project_search.rs",
+      "blob": "57d7b18422355dbce3d36afdaeda1587f410b520",
+      "sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "bytes": 57357
+    },
+    {
+      "path": "src/app/search_ui.rs",
+      "blob": "812b30fb212924f19957cb42b8d5ce359dd7da37",
+      "sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "bytes": 59794
+    }
+  ],
+  "validation_and_limits": {
+    "all_new_head_Rust_tests_native": "UNRUN",
+    "format": "Root supplied official Rust1.93 format exit0 (start9c2725/session50828/final60b5ad) and diff/commit2ef3f4 exit0; not executed or independently result-audited by this source pass",
+    "old_results": "c28 HOST3/Script component results remain exact old-head/scope only; UI4 c28 was never granted and remains UNRUN. No result transfer.",
+    "no_actions": "No candidate imports/calls/tests/builds/native/children, authority/environment/process/current-runtime/DB/account probes, source/Git/GitHub writes or agents/peer messages. Only immutable/source/Git reads and this own /tmp receipt.",
+    "runtime_grant": "NONE; existing native eligibility and other startup permission holds unchanged"
+  }
+}

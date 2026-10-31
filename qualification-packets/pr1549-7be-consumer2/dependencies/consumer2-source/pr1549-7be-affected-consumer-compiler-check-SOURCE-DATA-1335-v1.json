@@ -1,0 +1,340 @@
+{
+  "schema": "pr1549_7be_affected_consumer_compiler_check_SOURCE_DATA_v1",
+  "utc": "2026-10-31T17:22:22.723183+00:00",
+  "reviewer": "1335_full_output_copy_lease",
+  "status": "SOURCE_DATA_ONLY_NOT_A_CONTROLLER_NOT_ADMITTED_ALL_RUNTIME_UNRUN",
+  "product": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046",
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main",
+    "reported_PR_state": "Draft; source/native readiness not changed by this DATA"
+  },
+  "scope": "Smallest remaining affected compiler consumers only: standalone ceditor binary and root integrated-browser UI binary. No test parents, native UX, full feature/source algorithm audit, generic runner or controller implementation.",
+  "prior_match_and_reuse": {
+    "inputs": [
+      {
+        "path": "/tmp/pr1549-c28-full-feature-remaining-qualification-DATA-v1.json",
+        "sha256": "7190a9f8d0825b75bc5bbf1b5a6acd06c66183fe89d1bc7dfd6bb06999fe6a40"
+      },
+      {
+        "path": "/tmp/fw16-backend-ec204421/pr1549-7be-full-feature-qualification-source-binding-addendum-v1.json",
+        "sha256": "28c949506a78c96eda81a0a791c731851f6e29cc2a1c01cb1f268663262e3993"
+      },
+      {
+        "path": "/tmp/search-diff-validation-plan-20261028.json",
+        "sha256": "0c9d15e032c9e4ac7b84f85f7aaf030ac5480083176e6d83212b40e7b8a67c76"
+      },
+      {
+        "path": "/tmp/pr1549-search-composition-20261029/qualification/plan.json",
+        "sha256": "9171d10c2c82ea3d5cde7748d8a7b59197a88a9408f4d938550730cc35288ee8"
+      }
+    ],
+    "finding": "The c28 full-feature DATA and historical plan already contain the two supported Cargo commands below and 480/1800-second phase budgets. No completed exact7be consumer receipt is supplied by those records; mandatory7be addendum explicitly says these checks remain UNRUN. This DATA reuses those argv/caps and supplies current exact graph/input bindings rather than inventing an extra lane/check.",
+    "accepted_execution_reuse": null,
+    "historical_test_or_cache_metadata": "No old source check/pass, test inventory, binary, target device/inode or cache warmth is transferred."
+  },
+  "source_mapping": [
+    {
+      "consumer": "ceditor",
+      "anchors": [
+        "Cargo.toml:1",
+        "Cargo.toml:4",
+        "crates/ceditor/Cargo.toml:10",
+        "crates/ceditor/Cargo.toml:14",
+        "crates/ceditor/src/app.rs:15",
+        "crates/ceditor/src/app.rs:26",
+        "src/lib.rs:5",
+        "src/modules.rs:119",
+        "src/modules.rs:157",
+        "docs/development.md:60"
+      ],
+      "graph": "Selected package ceditor default features[]; its cagents path dependency disables root defaults and explicitly enables ui. Root library therefore compiles ui production modules, including changed project_search/repository_widget/ui_controls/workspace_widget and optional ignore/memchr dependencies, plus the standalone application caller. It does not select host, full or integrated-browser through this consumer.",
+      "needed": "The standalone app imports shared RepositoryRuntime/RepositoryAction and UI/public control contracts. Workspace default-members=[.] means the existing root UI5 browserless binary check cannot compile this downstream binary. One separate ceditor check is required.",
+      "variants": "Only the existing browserless standalone graph is required here. Ceditor declares default[] and development=[cagents/development], with no integrated-browser feature or browser consumer variant. Adding dependency feature cagents/integrated-browser merely to manufacture a standalone integrated variant would broaden the graph without another affected standalone contract. Development changes identity and is not needed for this compiler-consumer floor."
+    },
+    {
+      "consumer": "root cagents-ui integrated-browser",
+      "anchors": [
+        "Cargo.toml:18",
+        "Cargo.toml:40",
+        "Cargo.toml:88",
+        "Cargo.toml:109",
+        "src/bin/cagents-ui.rs:4",
+        "src/lib.rs:5",
+        "src/modules.rs:23",
+        "docs/development.md:57"
+      ],
+      "graph": "Root default full remains selected; integrated-browser explicitly selects full+ui and Servo/browser dependencies. Its ui graph also includes the changed Search/editor/shared controls. host is absent. src/lib.rs includes the shared src/modules.rs list; its integrated-browser-gated browser module is enabled here.",
+      "needed": "This separately checks the actual root integrated consumer alongside existing browserless UI5 coverage. The standalone browserless check cannot qualify this Servo/UI combination. Do not combine host+ui, --workspace, --all-features or all binary targets."
+    }
+  ],
+  "exact_serial_check_plan": {
+    "cargo_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main",
+    "cargo_profile": "dev (ordinary cargo check implicit default; no --profile override and no dev-runtime optimisation introduced)",
+    "target_triple": "No --target override proposed; use the same original existing Root C Cargo context/configuration/target binding, frozen by the later owner. No actual installed target/toolchain/context was inspected.",
+    "phases": [
+      {
+        "id": "source_context_prerequisites",
+        "cap_seconds": 30,
+        "work": "Later Root-owned original source/context/lane admission and exact manifest/lock/config/checkout binding; not a runtime permission supplied here."
+      },
+      {
+        "id": "standalone_browserless_ceditor_check",
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "ceditor",
+          "--bin",
+          "ceditor"
+        ],
+        "cap_seconds": 480,
+        "expected": "Original cargo exit0 and successful dev-profile compiler check of ceditor binary and its ui-only root dependency; no tests or native result."
+      },
+      {
+        "id": "root_integrated_ui_check",
+        "argv": [
+          "cargo",
+          "check",
+          "--locked",
+          "--features",
+          "integrated-browser",
+          "--bin",
+          "cagents-ui"
+        ],
+        "cap_seconds": 1800,
+        "expected": "Original cargo exit0 and successful dev-profile compiler check of root cagents-ui with full+ui+integrated-browser and without host; no tests or native result."
+      },
+      {
+        "id": "post_source_original_receipts",
+        "cap_seconds": 60,
+        "work": "Later original source/lock/config conservation and owned Cargo/descendant/stream settlement evidence."
+      }
+    ],
+    "phase_cap_sum_seconds": 2370,
+    "recommended_unchanged_absolute_packet_cap_seconds": 2400,
+    "slack_seconds": 30,
+    "budget_limit": "Copied finite stop budgets, not measured runtime or evidence of warmth, fit, enough disk/RAM/toolchain/cache. First refusal/nonzero/timeout or unsettled originals stops dependent work and preserves negative/UNKNOWN. No retry, automatic extension, cold fallback, package clean or alternate cache is proposed. Required settlement may remain HOLD beyond workload/packet time instead of fabricated closure."
+  },
+  "existing_serial_C_compatibility": {
+    "answer": "Yes at source/configuration level: both cargo checks use the same workspace lock/patches, same ordinary dev profile and can reuse one existing serial C target/build directory without creating another lane. Cargo feature selections are separate invocations; sharing a target directory does not require host+ui feature union.",
+    "historical_operand_source": "/tmp/pr1549-search-composition-20261029/qualification/plan.json",
+    "existing_target_operand_DATA": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target",
+    "existing_lock_operand_DATA": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "operand_limit": "Historical exact operand strings only; no stat/open/lock/probe was made against either. Do not adopt copied historical device/inode as fresh identity, assume path exists or claim it is free/current. Later Root must bind the genuine then-authorized existing C lane/target/build-directory identities and current context in the concrete packet.",
+    "jobs": "Preserve the existing admitted jobs2 bound. Exact7be .cargo/config.toml defaults build.jobs=2; no inherited CARGO_BUILD_JOBS or effective config was inspected. Later controller must freeze its actual existing context rather than infer the default wins an override.",
+    "identity": "Run Cargo from the exact7be checkout. Its .cargo/config.toml forces CAGENTS_CHECKOUT_ROOT relative to the checkout; src/modules.rs, ceditor main and build.rs track it. Preserve these inputs when sharing targets so owned artifacts follow the selected checkout. No clean/bootstrap or target relocation is authorized.",
+    "not_inferred": [
+      "No lane reservation/grant/queue place",
+      "No current target existence/availability/warmth",
+      "No toolchain/version/installed package or cache identity",
+      "No simultaneous cold builds or new target/profile lane"
+    ]
+  },
+  "input_bindings": {
+    "tracked_manifest_inventory": {
+      "Cargo.toml": {
+        "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac",
+        "git_blob": "5a981df1f743b2ccf624d498d24d3df120f13116",
+        "bytes": 13215
+      },
+      "crates/browser-import/Cargo.toml": {
+        "sha256": "f5b6050089d17dbbb3f939c2dfd064c9e5b79a2c4e72d621c6d9c8083ddb0158",
+        "git_blob": "958252d153409249dfb8f14198c031e8fdf1b96b",
+        "bytes": 579
+      },
+      "crates/ceditor/Cargo.toml": {
+        "sha256": "ec03c70fe7f2151744e68208837dbe84e589b4940e0772c03427146be1237b76",
+        "git_blob": "0e0191d857f8e781cae22ff60703271c932e2048",
+        "bytes": 1065
+      },
+      "crates/iced-contracts/Cargo.toml": {
+        "sha256": "2b52fa79d91cb859f66855d5ea3ff8b01cb7ff9b0da1d12dd56daea0942c4d94",
+        "git_blob": "345ca6d9ffda35561202cc23a99650eafbf5a737",
+        "bytes": 394
+      },
+      "vendor/accesskit-atspi-common/Cargo.toml": {
+        "sha256": "a832ed464ea5993c6c1b11425d1696b0b29bbb5a7258b62893ed6f95222e4df0",
+        "git_blob": "a521a19d905d3016ea2e477e740454df9c97a941",
+        "bytes": 790
+      },
+      "vendor/accesskit-unix/Cargo.toml": {
+        "sha256": "957c185ddd3fbb0a1e8f5ea9118bc4700644a5bd90ff2023cb27fd2baa87b463",
+        "git_blob": "fd323bbdda24c9b6218c4e97539888bcb52b57a0",
+        "bytes": 1286
+      },
+      "vendor/cosmic-text/Cargo.toml": {
+        "sha256": "5dc7e4f245e7a53bc797fb4e31f4549d414801ef11a17975e14d9122ca6e7a0e",
+        "git_blob": "5a780e6f2fea5e913d91a569776d3a334d78cc59",
+        "bytes": 4057
+      },
+      "vendor/harfrust/Cargo.toml": {
+        "sha256": "54f471a97dda129f825d84c381533e099c799725ea181a706e043fce0b8359de",
+        "git_blob": "f8ba5e9c69ccd14c52d54b108917e1f8c0b44675",
+        "bytes": 2617
+      },
+      "vendor/iced-accessibility/Cargo.toml": {
+        "sha256": "b6876a9ecffbc57e386a7f49567136e765c8fd2ae4c6f081f6efb105f9158761",
+        "git_blob": "40188149826c74df35d04453aed056240ed8005a",
+        "bytes": 1140
+      },
+      "vendor/iced-core/Cargo.toml": {
+        "sha256": "c2ed696eaf1aa2fa11ca1b6d1061273e860c14db7f9b65817fdf3425a360b7ed",
+        "git_blob": "b15f448c27eef2db9d99a79bc56564a22243bc8c",
+        "bytes": 1815
+      },
+      "vendor/iced-graphics/Cargo.toml": {
+        "sha256": "2ed4f3bd684b3ebe7d590892be88b4f80a7ef38939d027d0a68a135ac0f7be66",
+        "git_blob": "09b6bbfd9e9fc4ee8544bdd0197e2d5a5dc2acca",
+        "bytes": 1239
+      },
+      "vendor/iced-runtime/Cargo.toml": {
+        "sha256": "8834bd1348c4ab4d9a9db62ed90f4225024422624fcd19fa4c3106edee485816",
+        "git_blob": "a235624472fab89be2d729f17f325b530c474691",
+        "bytes": 1763
+      },
+      "vendor/iced-winit/Cargo.toml": {
+        "sha256": "3f9496246024144c219c30849e764d0b30a37a141dc9bfe6effa28837a050429",
+        "git_blob": "b35e588c2f4c3164bf5fef3d7eec42f4ae00e1d9",
+        "bytes": 3787
+      },
+      "vendor/libcosmic/Cargo.toml": {
+        "sha256": "8fc4ff842d4c9d41334bfabc0828065c50797841904f1a2f856a1c62e4b2507f",
+        "git_blob": "834c239999d61b36a55526819752cf6cd02bc1d6",
+        "bytes": 7397
+      },
+      "vendor/libsqlite3-sys/Cargo.toml": {
+        "sha256": "54d98d6bef7f15016cb6ffcf64fe7ab239e609d5ead0d8fdfa05384c57dcce29",
+        "git_blob": "c264de330fca59ed140bccd3eaa8f4f24fc8ff7c",
+        "bytes": 2357
+      },
+      "vendor/smithay-clipboard/Cargo.toml": {
+        "sha256": "6eef103372398a15949c31e5704a75c6ea5e29d4a215bd3efa1520ed181058df",
+        "git_blob": "f426eadfc5ffd139b03385827a8378327bfb73b5",
+        "bytes": 1033
+      },
+      "vendor/winit-wayland/Cargo.toml": {
+        "sha256": "685a2adcc60a35ac03e587e48a071d3d7085a72a337121fef8ec641de8eec073",
+        "git_blob": "22bbe5a95a46671413fc4aeda90c2d81ce7e0c70",
+        "bytes": 1916
+      }
+    },
+    "manifest_inventory_scope": "All17 tracked manifests: workspace root and3 member manifests plus13 local patch manifests named by the root patch tables. This is a conservative source binding inventory, not a claim every member/patch is compiled by both commands. Root Cargo.lock pins external resolution; no registry/Git cache or external package source was inspected.",
+    "lock_config_source_and_documentation_pins": {
+      "Cargo.lock": {
+        "sha256": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d",
+        "git_blob": "20f963235fff416f76487a8a74a9f4b1d7bb4f8d",
+        "bytes": 341827
+      },
+      ".cargo/config.toml": {
+        "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "git_blob": "0e2d20b442d9256e22ecbe4852d77e2a07c45409",
+        "bytes": 412
+      },
+      "mise.toml": {
+        "sha256": "8d33cd18aeade46b6ef719241951bafff4655e011ed4d0c5d1cd9706acdfcdfe",
+        "git_blob": "4c98ba1df7ee301c7698893059de3adfda37f411",
+        "bytes": 23
+      },
+      "build.rs": {
+        "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+        "git_blob": "cc0447aee8720c7e850030ca36b5385665e6a275",
+        "bytes": 4593
+      },
+      "src/lib.rs": {
+        "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "git_blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e",
+        "bytes": 350
+      },
+      "src/modules.rs": {
+        "sha256": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f",
+        "git_blob": "6db64e6c78a4a733ab00ed07cb780e8bdb7b05ab",
+        "bytes": 4190
+      },
+      "src/bin/cagents-ui.rs": {
+        "sha256": "a6293ff7568de71eec2c1dbbace1c3cea7fb676b32a54acd87c673fea34ba94c",
+        "git_blob": "b60727496ec9a56b51f4fbfecba8babea69f3636",
+        "bytes": 24215
+      },
+      "crates/ceditor/src/main.rs": {
+        "sha256": "cc7769f9520528505cf021314580d9ea43cfb88b3aba9ac7cf1546e491e12769",
+        "git_blob": "f0515873bb90ef6d4bbbf7d68c2b1423ba3dedd4",
+        "bytes": 6065
+      },
+      "crates/ceditor/src/app.rs": {
+        "sha256": "1c3cd71848fd52af3ad843f4db67355332fba9c4847b2c524a58b043d80bc110",
+        "git_blob": "dca990b8429c902d36050c4c15e14393a28e7347",
+        "bytes": 392894
+      },
+      "src/repository_widget.rs": {
+        "sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+        "git_blob": "5673df0f96d439d09c7d496314cbc90bcf638c78",
+        "bytes": 924940
+      },
+      "src/ui_controls.rs": {
+        "sha256": "ca1dfc78cd7e4cb18e6495f62ed4565debd8354e60637be62a32a7d72361b2b7",
+        "git_blob": "590a64a8d5a89e5d8dd61409bd8e56fae64e27f0",
+        "bytes": 1043
+      },
+      "src/workspace_widget.rs": {
+        "sha256": "4ca92f5d0698ac66bc34199f6d6fa8043788cf2fa472da1eb5ed890965efb45e",
+        "git_blob": "bc3ecfaad21d667957bfb3dd0cb4d91638f6dde2",
+        "bytes": 175508
+      },
+      "src/project_search.rs": {
+        "sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+        "git_blob": "57d7b18422355dbce3d36afdaeda1587f410b520",
+        "bytes": 57357
+      },
+      "src/project_search/ignore_policy.rs": {
+        "sha256": "7a78519d0450b2b701fc3ff44011b25a8d800a7df6e5377273d6757dd647aeb8",
+        "git_blob": "2434b93e5ba3a42bf5532138fee63b98b855df69",
+        "bytes": 17525
+      },
+      "src/project_search/traversal.rs": {
+        "sha256": "efe6e92570f66931b12c658765f6d3291a58620238c5ffd066d0752f84a2fd75",
+        "git_blob": "e192a308d1828483171501130a886114689b2a57",
+        "bytes": 22349
+      },
+      "docs/development.md": {
+        "sha256": "cceaa574be6a5df7c72124add0a3c7cfa3307536fd5fa073c6eea541a6639d11",
+        "git_blob": "1716e7c6ecc2a94dd3c61913d56f94e42e56a781",
+        "bytes": 29978
+      },
+      "AGENTS.md": {
+        "sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+        "git_blob": "681311eb9cf453d0faddf3aacaec7357e97ba8e9",
+        "bytes": 9
+      },
+      "CLAUDE.md": {
+        "sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+        "git_blob": "903cbd9d81a4b61685558d2ee6951a0aa0a8e41d",
+        "bytes": 8820
+      }
+    },
+    "include_path_mapping": "The root library source includes src/modules.rs:5, which gates shared Search/editor/UI modules under ui and browser under integrated-browser. The inspected root app/repository_widget/project_search/ui_controls/workspace_widget and ceditor main/app contain no further Rust include! expansion. Normal module children remain within the immutable product tree; no hidden standalone include root or extra Cargo package is required.",
+    "external_runtime_bindings": "Later source/controller review must bind actual Cargo/toolchain executable and effective inherited Cargo configuration/target/build directory through its existing original admission. These NULL/unknown runtime facts are intentionally not synthesized by this source DATA."
+  },
+  "deliberately_not_repeated": [
+    "Root browserless cargo check --locked --no-default-features --features ui --bin cagents-ui already belongs to UI5; require that original exact-head result separately rather than duplicate it here.",
+    "CLI or host check/test parents, --lib --no-run compilation or test execution.",
+    "Standalone development/integrated-browser fabricated variants, native launch, screenshots, provider or performance measurement."
+  ],
+  "prerequisites_for_later_execution": [
+    "Independent concrete controller/code and conservation review with exact current source/input/argv/caps and inherited authority/context preserved.",
+    "Fresh explicit Root C allocation/grant on the genuine existing lane; none provided by historical operands or this DATA.",
+    "Original command outcomes/stream closure/source conservation must qualify each separate consumer. Compiler success does not qualify any Search UX or whole PR."
+  ],
+  "actual": {
+    "execution": "UNRUN",
+    "Cargo_invocation": null,
+    "compiler_result": null,
+    "target_or_tool_state_inspected": false,
+    "controller": null,
+    "grant": null,
+    "native": "UNRUN",
+    "ready": false
+  },
+  "actions": "Read-only specified prior DATA/plan/addendum records, immutable7be manifests/module/consumer/documentation source and hashes; own exclusive/tmp JSON only. No cargo/metadata/version invocation, imports/evaluation of candidate code, builds/tests/helpers/native, env/process/account/DB/resource/target/cache inspection, source/Git/GitHub mutation or child/session/grant."
+}

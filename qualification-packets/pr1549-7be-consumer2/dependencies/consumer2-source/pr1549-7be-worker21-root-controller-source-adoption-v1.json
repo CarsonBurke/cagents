@@ -1,0 +1,76 @@
+{
+  "schema": "pr1549_7be_worker21_root_controller_source_adoption_v1",
+  "utc": "2026-10-31T17:47:54.230562+00:00",
+  "product": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046"
+  },
+  "controller": {
+    "branch": "qualification/b9-pr1549-7be-worker21",
+    "head": "ae17e43394f149fe2d6a54fb9503cbe40ff13a41",
+    "packet": "qualification-packets/pr1549-7be-worker21",
+    "private_git": "/tmp/coord-b9-pr1549-7be-worker21-git",
+    "sole_parent": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "ed08c813a6cff94b9088becc4b962795a9a58b14",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source",
+    "writer_released": true
+  },
+  "handoff": {
+    "path": "/tmp/coord-b9-pr1549-worker21-reviewed-handoff.json",
+    "sha256": "761f23cc5b3be6eac9078dfa5df7ed7b02a8e5530d57a794b51e4e30d5909db0"
+  },
+  "named_external_artifacts_rehashed": 14,
+  "payloads_rehashed": 115,
+  "files": 116,
+  "archives_rehashed": 105,
+  "source_pins_verified": 47,
+  "product_entries_conserved": 2223,
+  "code_review": {
+    "findings": [],
+    "genuine_required_ABI_matches": true,
+    "path": "/tmp/coord-b9-pr1549-worker21-ae17-code-caller-oracle-review.json",
+    "sha256": "20d9e9aed8102bf15ab8c826845a4f3227469fa80e37d5760f8fa6dffa905a41",
+    "verdict": "CONTROLLER_SOURCE_CLEAR"
+  },
+  "conservation_review": {
+    "findings": [],
+    "path": "/tmp/coord-b9-pr1549-worker21-ae17-conservation-review.json",
+    "sha256": "3ceb553d671e6c60f4338087ececf5cd8b02dd118d767d81da7340ad688e511e",
+    "verdict": "SOURCE_CONSERVATION_CLEAR_FROZEN_WORKER21_ONLY"
+  },
+  "prospective_invocation": {
+    "argv": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/run-packet.py",
+      "--grant",
+      null,
+      "--runner-sha256",
+      "1b6d5f5d8e09232d8812b6b34d86bb5592ee0cd226bc81f3fcb5c53626dd6647",
+      "--controller-review",
+      "/tmp/coord-b9-pr1549-worker21-ae17-code-caller-oracle-review.json",
+      "--controller-review-sha256",
+      "20d9e9aed8102bf15ab8c826845a4f3227469fa80e37d5760f8fa6dffa905a41"
+    ],
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source",
+    "execution_authorized": false,
+    "grant": null,
+    "kind": "NOT_SUBMITTABLE_WITHOUT_NEW_ROOT_ADOPTION_PUBLICATION_AND_AUTHENTICATED_ALLOCATION"
+  },
+  "phase_caps_sum": 2190,
+  "original_workload_cap": 2400,
+  "scope": "Sourceonly worker21 on exact7be. UIlib compile/inventory/21 serial singleton parents/defaultcapturedscheduler/freshN required. No UI5/Front19/CLI3/consumer2/native/merge result transfer.",
+  "limits": [
+    "Source clear is not compilation/test/native/runtime qualification. All21 worker outcomes remain UNRUN.",
+    "Original default captured scheduler and strict fresh-N singleton contracts are source facts only.",
+    "Source/final reservations are not new aggregate enforcement; unknown custody/evidence retains canonical unsignaled HOLD.",
+    "Inherited global ignore/config/ancestor discovery scope and HOME/XDG/opaque authority stay unchanged under mandatory addendum.",
+    "No whole PR/nativeUX/screenshots/keyboard/focus/hover/scroll/performance/installed/WHOLE/1749/SeedView/merge or account/model/productivity claim.",
+    "No source publication, GitHub write, compile/test/helper execution, resource/process/target/cache/auth/accountDB probe or admission under this assignment."
+  ],
+  "runtime": "UNRUN_UNGRANTED",
+  "publication": "PENDING_NORMAL_NONFORCE",
+  "root_intake_history": "Initial nonmutating author-intake shape check expected tests key; actual documented selectors key verified and corrected, no source/runtime change."
+}

@@ -1,0 +1,39 @@
+# Upstream manifest normalized to keep dependencies on the pinned COSMIC graph.
+[package]
+name = "winit-wayland"
+version = "0.31.0-beta.2"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/rust-windowing/winit"
+rust-version = "1.85"
+description = "Winit's Wayland backend"
+[workspace]
+[features]
+default = ["dlopen", "csd-adwaita"]
+csd-adwaita = ["sctk-adwaita", "sctk-adwaita/ab_glyph"]
+csd-adwaita-crossfont = ["sctk-adwaita", "sctk-adwaita/crossfont"]
+csd-adwaita-notitle = ["sctk-adwaita"]
+csd-adwaita-notitlebar = ["csd-adwaita-notitle"]
+dlopen = ["wayland-backend/dlopen"]
+serde = ["dep:serde", "bitflags/serde", "smol_str/serde", "dpi/serde"]
+[dependencies]
+bitflags = "2"
+cursor-icon = "1.1.0"
+dpi = { git = "https://github.com/pop-os/winit.git", tag = "cosmic-0.14" }
+rwh_06 = { package = "raw-window-handle", version = "0.6", features = ["std"] }
+serde = { version = "1", features = ["serde_derive"], optional = true }
+smol_str = "0.3"
+tracing = { version = "0.1.40", default-features = false }
+winit-core = { git = "https://github.com/pop-os/winit.git", tag = "cosmic-0.14" }
+winit-common = { git = "https://github.com/pop-os/winit.git", tag = "cosmic-0.14", features = ["xkb", "wayland"] }
+ahash = { version = "0.8.7", features = ["no-rng"] }
+calloop = "0.14.3"
+libc = "0.2.64"
+memmap2 = "0.9.0"
+rustix = { version = "1.0.7", default-features = false, features = ["std", "system", "thread", "process", "event", "pipe"] }
+sctk = { package = "smithay-client-toolkit", version = "0.20.0", default-features = false, features = ["calloop"] }
+sctk-adwaita = { version = "0.11.0", default-features = false, optional = true }
+wayland-backend = { version = "0.3.10", default-features = false, features = ["client_system"] }
+wayland-client = "0.31.10"
+wayland-protocols = { version = "0.32.8", features = ["staging"] }
+wayland-protocols-plasma = { version = "0.3.8", features = ["client"] }

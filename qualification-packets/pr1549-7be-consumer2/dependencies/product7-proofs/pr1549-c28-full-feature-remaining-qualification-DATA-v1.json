@@ -1,0 +1,1376 @@
+{
+  "current_seven_scope": {
+    "HOST3": [
+      {
+        "actual_N": null,
+        "definition_line": 951,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "host",
+        "path": "src/git_watch.rs",
+        "purpose": "Already reported Root HOST3, pending sole RAW/return/Root acceptance; do not double-credit",
+        "selector": "git_watch::tests::exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 983,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "host",
+        "path": "src/git_watch.rs",
+        "purpose": "Already reported Root HOST3, pending sole RAW/return/Root acceptance; do not double-credit",
+        "selector": "git_watch::tests::reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1572,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "host",
+        "path": "src/git_watch.rs",
+        "purpose": "Already reported Root HOST3, pending sole RAW/return/Root acceptance; do not double-credit",
+        "selector": "git_watch::tests::native_watcher_observes_atomic_replacement_and_recreated_directory",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      }
+    ],
+    "HOST3_result_status": "Root reports 3P and HOST N3106; sole RAW/return/Root acceptance pending at task. Reviewer consumed no RAW and grants no acceptance. Do not reuse HOST N for UI/CLI.",
+    "UI4": [
+      {
+        "actual_N": null,
+        "definition_line": 1232,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Already planned Root UI4; do not double-credit",
+        "selector": "app::search_ui::tests::delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1345,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Already planned Root UI4; do not double-credit",
+        "selector": "app::search_ui::tests::retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 849,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Already planned Root UI4; do not double-credit",
+        "selector": "app::search_ui::tests::retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 917,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Already planned Root UI4; do not double-credit",
+        "selector": "app::search_ui::tests::a_native_result_press_cannot_cross_query_generations_but_survives_streamed_batches",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      }
+    ],
+    "UI4_result_status": "Root reports not yet granted at task. Source selectors only, all bodies UNRUN.",
+    "scope_limit": "Seven latest regressions cannot qualify full18-path feature."
+  },
+  "freeze": {
+    "18_feature_pins_verified": true,
+    "path": "/tmp/fw16-backend-ec204421/pr1549-current-main-search-source-freeze-v3.json",
+    "sha256": "9c4361dead8b82c4f07aa076265fadbb800880814a5ba10bb3b97d50c10044b7"
+  },
+  "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "historical_reconciliation": {
+    "0556_PR_body_prose_UI_count": 19,
+    "0556_source_active_worker_parents": 20,
+    "0556_source_declared_worker_parents": 21,
+    "0556_source_ignored": 1,
+    "0556_source_selectors": [
+      {
+        "ignored": false,
+        "selector": "project_search::tests::ignore_hidden_globs_and_options"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::large_search_streams_first_results_before_completion"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::deep_ignore_error_terminates_without_a_finished_event"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::regex_errors_and_binary_files"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::content_search_never_follows_links_outside_the_selected_root"
+      },
+      {
+        "ignored": true,
+        "selector": "project_search::tests::repository_first_result_latency"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::caps_results_and_cancels_during_delivery"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers"
+      },
+      {
+        "ignored": false,
+        "selector": "project_search::traversal::tests::deep_search_and_resource_failures_release_descriptors_with_a_low_child_limit"
+      }
+    ],
+    "actual_delta_after_0556": [
+      "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+      "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree"
+    ],
+    "current_worker_files_exact_formal_1a7_source_hashes": true,
+    "exact_19_selector_DATA": "No such exact list located among the bounded concrete references; do not fabricate it from prose. The old multi-filter Cargo strings are planning text, not supported exact current invocations.",
+    "formal_1a7_catalog": {
+      "active": 22,
+      "ignored": 1,
+      "inline_child_nonadditive": 1,
+      "path": "/tmp/pr1549-search-composition-20261029/qualification/selectors.json",
+      "sha256": "290fe7f30241b2b8c97fc213849031ed7fe4bd4e4fbe28f7b699a2c722984f98"
+    },
+    "historical_packet_not_adopted": "Includes env-clearing low-FD child, prefix/skip/show-output policy and 5400s cap. Not an admissible current Agent packet or current count oracle."
+  },
+  "holds": [
+    {
+      "additional_source_behavior": "Child alone lowers/restores its NOFILE soft limit64 and performs actual FD exhaustion; original parent waits up to30s and prints captured child libtest footer. These are unexecuted source facts, not closure evidence.",
+      "causal_source": "Same-ELF Command at587\u2013592 calls env_clear at589, then sets only CAGENTS_SEARCH_FD_BUDGET_CHILD=1 and HOME. This erases inherited opaque caller authority. No test or source change occurred here.",
+      "definition_line": 569,
+      "inline_child_accounting": {
+        "child_additive_parent_credit": 0,
+        "current_ordinary_packets_child_results": 0,
+        "outer_parent": 1,
+        "same_ELF_child_reentry": 1
+      },
+      "path": "src/project_search/traversal.rs",
+      "required_next": "Separate prospective source-policy correction and genuine independent review/admission if Root wants this oracle. No env clearing, role forging, opaque-authority replacement, direct child-flag injection, User proxy or silent skip workaround supplied.",
+      "selector": "project_search::traversal::tests::deep_search_and_resource_failures_release_descriptors_with_a_low_child_limit",
+      "status": "HOLD_NOT_ADMISSIBLE_FOR_INHERITED_AGENT_AS_WRITTEN"
+    },
+    {
+      "definition_line": 1145,
+      "path": "src/project_search.rs",
+      "selector": "project_search::tests::repository_first_result_latency",
+      "source_prerequisite": "Requires CAGENTS_SEARCH_BENCH_ROOT at1147 and asserts first batch<125ms; full200ms UI target also includes75ms debounce. No fixture-root value read, supplied or inferred. Native performance remains separate.",
+      "status": "EXISTING_IGNORED_LATENCY_PROBE_NOT_SELECTED_OR_QUALIFIED"
+    }
+  ],
+  "minimum_remaining_ordinary_parent_selection": {
+    "deduplicated_with_HOST3_UI4": true,
+    "meaning": "Coverage floor scoped to authored changed contracts and immediate changed neighbors; not all tests or whole-PR qualification.",
+    "new_remaining_unique_parents": 43,
+    "remaining_cli3": [
+      {
+        "actual_N": null,
+        "definition_line": 2079,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "cli",
+        "path": "src/fs_safety.rs",
+        "purpose": "Shared typed EMFILE/ENFILE classifier; fabricated errors, no actual FD exhaustion",
+        "selector": "fs_safety::tests::descriptor_exhaustion_remains_typed_without_classifying_other_failures",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 3674,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "cli",
+        "path": "src/settings.rs",
+        "purpose": "New persisted shortcut field preserves occupied custom chord",
+        "selector": "settings::tests::introducing_project_content_search_preserves_an_existing_custom_chord",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 3628,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "cli",
+        "path": "src/settings.rs",
+        "purpose": "Existing nearby settings migration preserves project-search versus pane-find chords",
+        "selector": "settings::tests::separating_project_search_migrates_defaults_and_preserves_custom_chords",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      }
+    ],
+    "remaining_ui_front_editor19": [
+      {
+        "actual_N": null,
+        "definition_line": 998,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Changed Search reducer, source callback, stale/modal/deleting/blocked/narrow result behavior",
+        "selector": "app::search_ui::tests::held_results_refuse_a_modal_or_deleting_worktree_before_editor_effects",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1036,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Changed Search reducer, source callback, stale/modal/deleting/blocked/narrow result behavior",
+        "selector": "app::search_ui::tests::narrow_result_rows_keep_the_actual_highlight_visible_and_cache_the_fit",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1126,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Changed Search reducer, source callback, stale/modal/deleting/blocked/narrow result behavior",
+        "selector": "app::search_ui::tests::opening_a_disk_search_result_preserves_a_blocked_editor_even_for_the_same_file",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1177,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Changed Search reducer, source callback, stale/modal/deleting/blocked/narrow result behavior",
+        "selector": "app::search_ui::tests::held_result_and_submit_cannot_open_a_new_queries_same_index",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1435,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/search_ui.rs",
+        "purpose": "Changed Search reducer, source callback, stale/modal/deleting/blocked/narrow result behavior",
+        "selector": "app::search_ui::tests::new_queries_cancel_old_search_and_reject_stale_batches",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 12754,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::search_locations_use_native_utf8_ranges_without_discarding_a_dirty_buffer",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 12790,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::file_location_jumps_separate_same_position_deletions_in_undo",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 12818,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::cached_file_and_search_jumps_retire_the_previous_completion_intent",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 12848,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::deferred_search_location_applies_after_the_requested_loading_path",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 12911,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::scanned_search_location_refuses_changed_cached_lines_without_moving_the_cursor",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 12950,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::scanned_search_location_validates_the_actual_deferred_file_read",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 12988,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::cached_stale_search_result_reveals_editor_notice_from_diff_without_losing_history",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 13049,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::ordinary_navigation_supersedes_a_search_guard_for_the_same_inflight_file",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 13089,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/repository_widget.rs",
+        "purpose": "Changed source-opening/editor line identity, async read, dirty buffer, history and completion boundaries",
+        "selector": "repository_widget::tests::failed_search_read_drops_its_guard_before_a_later_ordinary_reopen",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1288,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/palette_ui.rs",
+        "purpose": "Actual selected-root command availability and palette entry",
+        "selector": "app::palette_ui::tests::project_content_search_palette_command_requires_a_selected_root_and_opens_search",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1621,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/settings_ui.rs",
+        "purpose": "Actual Keyboard page field and pointer message",
+        "selector": "app::settings_ui::tests::keyboard_page_renders_project_content_search_and_records_its_actual_field",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 3118,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/workspace_widget.rs",
+        "purpose": "New configurable shortcut",
+        "selector": "workspace_widget::tests::project_content_search_uses_its_own_configurable_chord",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 3403,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/workspace_widget.rs",
+        "purpose": "Existing nearby project-search/pane-find routing must remain distinct",
+        "selector": "workspace_widget::tests::project_search_and_pane_find_have_distinct_workspace_chords",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 415,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/app/refresh_ui.rs",
+        "purpose": "Owning main focus-animation control for the actual merge export union",
+        "selector": "app::refresh_ui::tests::activity_spinners_run_at_full_cadence_only_while_the_main_window_is_focused",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      }
+    ],
+    "remaining_ui_worker21": [
+      {
+        "actual_N": null,
+        "definition_line": 709,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::ignore_hidden_globs_and_options",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 736,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 838,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 874,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 926,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 943,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::large_search_streams_first_results_before_completion",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 976,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1056,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1104,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::deep_ignore_error_terminates_without_a_finished_event",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1120,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::regex_errors_and_binary_files",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1132,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::content_search_never_follows_links_outside_the_selected_root",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1176,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1204,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1234,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1269,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::caps_results_and_cancels_during_delivery",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1301,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1331,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 1451,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 419,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search/ignore_policy.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 462,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search/ignore_policy.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      },
+      {
+        "actual_N": null,
+        "definition_line": 302,
+        "expected_singleton": {
+          "failed": 0,
+          "filtered_out": "actual_N_for_this_ELF_minus_1",
+          "ignored": 0,
+          "inline_child_results": 0,
+          "measured": 0,
+          "passed": 1
+        },
+        "graph": "ui",
+        "path": "src/project_search/traversal.rs",
+        "purpose": "Complete worker/filter/traversal contract retained from formal 1a7 catalog",
+        "selector": "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers",
+        "status": "SOURCE_PRESENT; EXECUTION_UNRUN_OR_PENDING_ROOT_RECEIPTS"
+      }
+    ],
+    "total_unique_candidate_parents_including_pending_seven": 50
+  },
+  "ordinary_exact_invocation_DATA": {
+    "ELF": null,
+    "actual_inventory_N": {
+      "cli": null,
+      "host": "Root-reported3106 for HOST3 only; not an owning input to these new packets",
+      "ui": null
+    },
+    "held_child_policy": "Not selected. If later separately corrected/admitted, its original same-ELF child result is nonadditive and must have its own original captured markers/footer/custody, not be silently stripped or credited as a second parent.",
+    "inventory_argv": [
+      null,
+      "--list",
+      "--format",
+      "terse"
+    ],
+    "outer_policy": "Default scheduler and captured output; no nocapture/show-output/test-threads override or prefix/module-wide test invocation. Require exactlyone named outer pass,1P/0F/0I/0M,N-1filtered andzero child results for each ordinary parent. Fresh actual inventory must bind each selector uniquely. Static source counts do not establish N.",
+    "singleton_argv": [
+      null,
+      "--exact",
+      "FULL_SELECTOR",
+      "--format",
+      "pretty"
+    ]
+  },
+  "packet_data_limits": {
+    "all_per_packet_caps_at_most_seconds": 2400,
+    "caps_are": "Finite stop budgets, not measured durations, cache/resource availability or success promises. Serial existing admitted lane only if Root separately authorizes; no lock/target/cache/resource was inspected.",
+    "cheap_artifact_reuse": "A Root-owned already-supported genuine current-head ELF handoff may remove redundant UI compilation only after authenticated original CargoJSON/source/hash custody and fresh inventory. No stale binary assumption or new handoff/controller framework is specified here; conservative data budgets include original compile per packet.",
+    "failure_policy": "Original compile/inventory/parent/context/timeout/output/settlement failure stops dependent work and is preserved. No retry, cold fallback, alternate cache or transfer of old results is authorized."
+  },
+  "performed": "Immutable Git/source and bounded concrete existing receipt reads, static name/gate/hash comparison, own DATA report. No compiler/ELF/cache/resource/current-authority/environment/state/desktop/provider probe, candidate import/evaluation, runtime, new worker, source/controller/public write or execution grant.",
+  "prior_inputs": [
+    {
+      "path": "/tmp/search-diff-pr1549-body.md",
+      "sha256": "9106f4e462f58da698bd31329d288fe86ff09f034d2451e6f1b9d14946b689d3"
+    },
+    {
+      "path": "/tmp/search-diff-validation-plan-20261028.json",
+      "sha256": "0c9d15e032c9e4ac7b84f85f7aaf030ac5480083176e6d83212b40e7b8a67c76"
+    },
+    {
+      "path": "/tmp/pr1549-search-composition-20261029/qualification/selectors.json",
+      "sha256": "290fe7f30241b2b8c97fc213849031ed7fe4bd4e4fbe28f7b699a2c722984f98"
+    },
+    {
+      "path": "/tmp/pr1549-search-composition-20261029/qualification/plan.json",
+      "sha256": "9171d10c2c82ea3d5cde7748d8a7b59197a88a9408f4d938550730cc35288ee8"
+    },
+    {
+      "path": "/tmp/pr1549-search-composition-20261029/qualification/manifest.json",
+      "sha256": "d82876e953ba47df59cebbcee997750d4a6edea9d5cb085decfe501c8fdb2b00"
+    },
+    {
+      "path": "/tmp/pr1549-c28-proposed-description-1335-v1.md",
+      "sha256": "3db7c5a52a5e2d77ea91154f6188c4e986b8c599ce8f6a4c0764d5733db1bea4"
+    },
+    {
+      "path": "/tmp/pr1549-c28e76c7-drop-state-fixture-correction-independent-source-review-v1.json",
+      "sha256": "30a8b6cd3d357d5812f62b5f0a40e1200c423a85b9a3bd23609eafe4d3d73edf"
+    }
+  ],
+  "prospective_packets": [
+    {
+      "cap_sum_seconds": 1680,
+      "id": "remaining_shared_CLI3",
+      "phases": [
+        {
+          "cap_seconds": 30,
+          "id": "source_context_prerequisites"
+        },
+        {
+          "argv": [
+            "cargo",
+            "check",
+            "--locked",
+            "--no-default-features",
+            "--bin",
+            "cagents"
+          ],
+          "cap_seconds": 480,
+          "id": "CLI_bin_check"
+        },
+        {
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "cap_seconds": 900,
+          "id": "CLI_lib_JSON_compile"
+        },
+        {
+          "cap_seconds": 30,
+          "id": "fresh_CLI_ELF_inventory"
+        },
+        {
+          "cap_seconds": 180,
+          "count": 3,
+          "each_cap_seconds": 60,
+          "id": "three_ordinary_exact_parents"
+        },
+        {
+          "cap_seconds": 60,
+          "id": "post_source_original_receipts"
+        }
+      ],
+      "scope": "CLI graph only; no HOST/UI union",
+      "selectors_group": "remaining_cli3"
+    },
+    {
+      "cap_sum_seconds": 2280,
+      "id": "remaining_UI_worker21",
+      "phases": [
+        {
+          "cap_seconds": 30,
+          "id": "source_context_prerequisites"
+        },
+        {
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "ui",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "cap_seconds": 900,
+          "id": "UI_lib_JSON_compile"
+        },
+        {
+          "cap_seconds": 30,
+          "id": "fresh_UI_ELF_inventory"
+        },
+        {
+          "cap_seconds": 1260,
+          "count": 21,
+          "each_cap_seconds": 60,
+          "id": "21_ordinary_exact_parents"
+        },
+        {
+          "cap_seconds": 60,
+          "id": "post_source_original_receipts"
+        }
+      ],
+      "scope": "UI graph only; low-FD parent and ignored benchmark excluded explicitly, not claimed qualified",
+      "selectors_group": "remaining_ui_worker21"
+    },
+    {
+      "cap_sum_seconds": 2160,
+      "id": "remaining_UI_front_editor19",
+      "phases": [
+        {
+          "cap_seconds": 30,
+          "id": "source_context_prerequisites"
+        },
+        {
+          "argv": [
+            "cargo",
+            "test",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "ui",
+            "--lib",
+            "--no-run",
+            "--message-format=json"
+          ],
+          "cap_seconds": 900,
+          "id": "UI_lib_JSON_compile"
+        },
+        {
+          "cap_seconds": 30,
+          "id": "fresh_UI_ELF_inventory"
+        },
+        {
+          "cap_seconds": 1140,
+          "count": 19,
+          "each_cap_seconds": 60,
+          "id": "19_ordinary_exact_parents"
+        },
+        {
+          "cap_seconds": 60,
+          "id": "post_source_original_receipts"
+        }
+      ],
+      "scope": "UI graph only; five other reducer tests, nine editor/source tests and five focused command/chord/main controls",
+      "selectors_group": "remaining_ui_front_editor19"
+    },
+    {
+      "cap_sum_seconds": 2370,
+      "id": "remaining_affected_consumers",
+      "phases": [
+        {
+          "cap_seconds": 30,
+          "id": "source_context_prerequisites"
+        },
+        {
+          "argv": [
+            "cargo",
+            "check",
+            "--locked",
+            "-p",
+            "ceditor",
+            "--bin",
+            "ceditor"
+          ],
+          "cap_seconds": 480,
+          "id": "standalone_editor_check"
+        },
+        {
+          "argv": [
+            "cargo",
+            "check",
+            "--locked",
+            "--features",
+            "integrated-browser",
+            "--bin",
+            "cagents-ui"
+          ],
+          "cap_seconds": 1800,
+          "id": "integrated_UI_check"
+        },
+        {
+          "cap_seconds": 60,
+          "id": "post_source_original_receipts"
+        }
+      ],
+      "scope": "Two serial isolated checks carried from historical full-feature plan; no native or test invocation",
+      "selectors_group": null
+    }
+  ],
+  "remaining_native_contract": "All native complete Search/filter/streaming/retained-error/Retry/focus/held-control/editor/narrow-wide behavior, matching WebPs, realistic concurrent frame/resource comparison and independent UX remain unqualified. No User proxy or new context recipe; no seven-parent/full50/native/whole-PR readiness inference.",
+  "reviewer": "/root/1954_directory_durability_bound",
+  "schema": "pr1549_c28_full_feature_remaining_qualification_DATA_v1",
+  "source_pins": {
+    "Cargo.lock": {
+      "blob": "20f963235fff416f76487a8a74a9f4b1d7bb4f8d",
+      "sha256": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d"
+    },
+    "Cargo.toml": {
+      "blob": "5a981df1f743b2ccf624d498d24d3df120f13116",
+      "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac"
+    },
+    "crates/ceditor/Cargo.toml": {
+      "blob": "0e0191d857f8e781cae22ff60703271c932e2048",
+      "sha256": "ec03c70fe7f2151744e68208837dbe84e589b4940e0772c03427146be1237b76"
+    },
+    "src/app.rs": {
+      "blob": "8afb92ad6021d854956b0981f6761427d5b742d6",
+      "sha256": "c020d39216c6829c1416bea8ef021489d31de9dfddacb09fb07bf917c3197f55"
+    },
+    "src/app/chrome_ui.rs": {
+      "blob": "045d3a144be6b5f05b1af55c0591f5154cf12a74",
+      "sha256": "978db2251313b3c27541a584195d0e7c7bcc3ae705d552c94eefb9d998728f44"
+    },
+    "src/app/git_ui.rs": {
+      "blob": "0a11d3c861b4ef51e27ca95a1f1161c56bc36d14",
+      "sha256": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246"
+    },
+    "src/app/palette_ui.rs": {
+      "blob": "7c4ee36200f76d82f988afff03ad5df76b5a0e07",
+      "sha256": "982b7391ba960d12d41e8c17270deb4b82e7840d4c66b365484d15934cc1c9ea"
+    },
+    "src/app/refresh_ui.rs": {
+      "blob": "4e0144ccbff5c1ef5c45e8c8b20496c71d621db3",
+      "sha256": "87ce7af9d52272f62d15ccd8ed88871a8f015bd71a4fed32d6ec1347e65d4d86"
+    },
+    "src/app/search_ui.rs": {
+      "blob": "812b30fb212924f19957cb42b8d5ce359dd7da37",
+      "sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534"
+    },
+    "src/app/settings_ui.rs": {
+      "blob": "af78586c8a9ae19c7def6ec60850e2930c5c6925",
+      "sha256": "ebabb40f72d28a46c3721dffeca3d237d86613accebe2af50251e53a9cce073e"
+    },
+    "src/fs_safety.rs": {
+      "blob": "c233c929275c9e32d81e9d2dc0723633d321e415",
+      "sha256": "23e606a5132e1f519d3c44e138e96b623f5f378824f6d2c3d37375a6561301f3"
+    },
+    "src/git_watch.rs": {
+      "blob": "6dad4e31b2b6aa249c7249182d480a15d480af39",
+      "sha256": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8"
+    },
+    "src/lib.rs": {
+      "blob": "f2ff4fc03dff4a45810eee2cc7af2393bc9c6c5e",
+      "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+    },
+    "src/modules.rs": {
+      "blob": "6db64e6c78a4a733ab00ed07cb780e8bdb7b05ab",
+      "sha256": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f"
+    },
+    "src/process.rs": {
+      "blob": "a044a7e901cc28f02f4258b2679284eec19c4d9c",
+      "sha256": "6d762ac6a2e020847af060f34c0cd2200db91b1c81a13e67df8edccfdfe8dc47"
+    },
+    "src/project_search.rs": {
+      "blob": "57d7b18422355dbce3d36afdaeda1587f410b520",
+      "sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6"
+    },
+    "src/project_search/ignore_policy.rs": {
+      "blob": "2434b93e5ba3a42bf5532138fee63b98b855df69",
+      "sha256": "7a78519d0450b2b701fc3ff44011b25a8d800a7df6e5377273d6757dd647aeb8"
+    },
+    "src/project_search/traversal.rs": {
+      "blob": "385721f63fb041b52f85059c3712a9686a040a6c",
+      "sha256": "1aaa151e6f507f589f9072798e2a9d289dee7071de51da6690b17a803fb59aab"
+    },
+    "src/repository_widget.rs": {
+      "blob": "5673df0f96d439d09c7d496314cbc90bcf638c78",
+      "sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f"
+    },
+    "src/settings.rs": {
+      "blob": "d47d13ec269ddfd91f014bfa09b271facb2cfb6e",
+      "sha256": "d9fffd9744ce76279865c1f9346e82e78c32d089b415f7830ddb06840b7a8932"
+    },
+    "src/ui_controls.rs": {
+      "blob": "590a64a8d5a89e5d8dd61409bd8e56fae64e27f0",
+      "sha256": "ca1dfc78cd7e4cb18e6495f62ed4565debd8354e60637be62a32a7d72361b2b7"
+    },
+    "src/workspace_widget.rs": {
+      "blob": "bc3ecfaad21d667957bfb3dd0cb4d91638f6dde2",
+      "sha256": "4ca92f5d0698ac66bc34199f6d6fa8043788cf2fa472da1eb5ed890965efb45e"
+    }
+  },
+  "source_prerequisites": [
+    {
+      "fact": "No new caller context is created. Current inherited authority is opaque/unknown and was not read. Selected ordinary source contains no explicit User assertion or authority removal; this is not an execution authorization or a guarantee that every current runtime prerequisite holds.",
+      "kind": "authority"
+    },
+    {
+      "fact": "include_ignored=false calls global_path and may read inherited HOME/.gitconfig, XDG git/config and configured/default global ignore using bounded descriptors; ancestor ignore discovery also walks root ancestors. Worker and scanner-backed editor tests are not honestly temp-fixture-only runtime reads. Actual paths/content/context were not read. Root must reconcile this with its concrete runtime scope before admission, without substituting HOME/XDG or authority.",
+      "kind": "global_ignore_reads",
+      "source": [
+        "src/project_search/ignore_policy.rs:49",
+        "src/project_search/ignore_policy.rs:376"
+      ]
+    },
+    {
+      "fact": "fs_safety and settings are shared and belong in cheapest CLI lib graph; project_search, app, repository_widget and workspace_widget require UI. HOST3 covers git_watch under host. A CLI lib selector naming project_search would run zero tests, not cover worker behavior.",
+      "kind": "feature_gates",
+      "source": [
+        "src/modules.rs:67",
+        "src/modules.rs:102",
+        "src/modules.rs:111",
+        "src/modules.rs:119",
+        "src/modules.rs:157"
+      ]
+    },
+    {
+      "fact": "New ignore/memchr optional dependencies are selected by ui. integrated-browser includes ui and ceditor depends on root ui; historical explicit checks remain UNRUN and are retained separately. Browserless HOST/UI check ownership remains existing packets, conditional on exact-head accepted original returns. No HOST+UI union invocation.",
+      "kind": "affected_consumers",
+      "source": [
+        "Cargo.toml:68",
+        "Cargo.toml:88",
+        "crates/ceditor/Cargo.toml:14"
+      ]
+    }
+  ],
+  "status": "SOURCE_DATA_ONLY_NOT_ADMITTED_ALL_NEW_COMMANDS_UNRUN",
+  "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main"
+}

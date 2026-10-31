@@ -1,0 +1,41 @@
+[package]
+name = "iced_runtime"
+description = "A renderer-agnostic runtime for iced"
+version = "0.14.0"
+edition = "2024"
+authors = ["Héctor Ramón Jiménez <hector@hecrj.dev>"]
+license = "MIT"
+repository = "https://github.com/iced-rs/iced"
+homepage = "https://iced.rs"
+categories = ["gui"]
+keywords = ["gui", "ui", "graphics", "interface", "widgets"]
+
+[workspace]
+
+[features]
+debug = []
+selector = ["dep:iced_selector"]
+a11y = ["iced_accessibility", "iced_core/a11y"]
+wayland = ["iced_core/wayland", "dep:cctk"]
+
+[dependencies]
+bytes = "1.6"
+iced_core = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
+iced_futures = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", features = ["thread-pool"] }
+
+raw-window-handle = "0.6"
+thiserror = "2"
+
+sipper.version = "0.1"
+sipper.optional = true
+
+iced_selector = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
+iced_accessibility = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", optional = true }
+window_clipboard = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+dnd = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20" }
+
+[target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_vendor = "apple"))))'.dependencies]
+cctk = { git = "https://github.com/pop-os/cosmic-protocols", package = "cosmic-client-toolkit", rev = "32283d7", optional = true }
+
+[build-dependencies]
+build_helpers = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }

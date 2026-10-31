@@ -1,0 +1,228 @@
+{
+  "UI5_static_reader_finding": {
+    "scope": "Pinned old UI5 source contradiction confirmed and sent to its owner; old UI5 additive HOLD and separate successor remain outside worker21. New worker21 uses base_c28_publication for old proof, with separate genuine7be checks.",
+    "sha256": "74bc11cd0b9d42134406231988a41a41a2d66e98ad3b1ffabf003aeced1fa147",
+    "witness": "/tmp/coord-b9-pr1549-ui5-c28-publication-source-witness.json"
+  },
+  "actual_ELF": null,
+  "actual_inventory_N": null,
+  "actual_owning_results": null,
+  "assignment": "9513286b-88b0-48e2-aec6-421ed522509c",
+  "author_handoff": {
+    "path": "/tmp/coord-b9-pr1549-worker21-author-freeze/handoff.json",
+    "sha256": "3537d69db2baccb3f5c22684f5755c36b84c49a95ffb78b411a24778f696a6f7"
+  },
+  "author_source_receipt": {
+    "path": "/tmp/coord-b9-pr1549-worker21-author-freeze/source-receipt.json",
+    "sha256": "6847038f6acea28f7680c0d35c6b39a42149c9abaa50f46e8f5b4470e6fed089"
+  },
+  "conservation": {
+    "UI5_f133_reference_only": true,
+    "actual_993_source_sha256": "f34efd08a8337994f2517744176924ac76ec84904a47731a258f4c2facf53d25",
+    "anchor_approved_source_993": "993cea26a29b5a2cd6857a959628de4e5f04c096",
+    "canonical9004_exact": true,
+    "complete3790_exact": true,
+    "declared_task_seams": 3,
+    "full3790_sha256": "dbc15cd15596d302554bf537226cfaf2d47cda63cf81c1c1290552a9784d6fa4",
+    "other_unchanged_nested": 2,
+    "strict_parser_context_source_direct_wait_heldpidfd_naturalHOLD_compact_stdout_return_policy": "UNCHANGED",
+    "top_level_definitions": 32,
+    "unchanged_main_nested": 5,
+    "unchanged_top_level": 29,
+    "whole_module_true_inverse_to_UI5_reference": true,
+    "whole_module_true_inverse_to_actual993": true
+  },
+  "controller": {
+    "branch": "qualification/b9-pr1549-7be-worker21",
+    "head": "ae17e43394f149fe2d6a54fb9503cbe40ff13a41",
+    "packet": "qualification-packets/pr1549-7be-worker21",
+    "private_git": "/tmp/coord-b9-pr1549-7be-worker21-git",
+    "sole_parent": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "tree": "ed08c813a6cff94b9088becc4b962795a9a58b14",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source",
+    "writer_released": true
+  },
+  "controller_source_adoption": null,
+  "controller_source_publication": null,
+  "coordinator_session": "b9aa3f1d-524e-49e2-a43c-e5d9acf6bbc6",
+  "execution_authorized": false,
+  "final_lead_source_tools": {
+    "frozen_HEAD_tree_parent_clean_verified": true,
+    "path": "/tmp/coord-b9-pr1549-worker21-final-lead-source-tools.json",
+    "sha256": "68d9087c216af022be8def419ce6552894071634705b129ffca12462df193eca"
+  },
+  "independent_code_caller_oracle_review": {
+    "findings": [],
+    "genuine_required_ABI_matches": true,
+    "path": "/tmp/coord-b9-pr1549-worker21-ae17-code-caller-oracle-review.json",
+    "sha256": "20d9e9aed8102bf15ab8c826845a4f3227469fa80e37d5760f8fa6dffa905a41",
+    "verdict": "CONTROLLER_SOURCE_CLEAR"
+  },
+  "independent_conservation_review": {
+    "findings": [],
+    "path": "/tmp/coord-b9-pr1549-worker21-ae17-conservation-review.json",
+    "sha256": "3ceb553d671e6c60f4338087ececf5cd8b02dd118d767d81da7340ad688e511e",
+    "verdict": "SOURCE_CONSERVATION_CLEAR_FROZEN_WORKER21_ONLY"
+  },
+  "kind": "TWO_INDEPENDENT_SOURCE_REVIEWS_CLEAR_NOT_EXECUTION_ADMISSION",
+  "limits": [
+    "Source clear is not compilation/test/native/runtime qualification. All21 worker outcomes remain UNRUN.",
+    "Original default captured scheduler and strict fresh-N singleton contracts are source facts only.",
+    "Source/final reservations are not new aggregate enforcement; unknown custody/evidence retains canonical unsignaled HOLD.",
+    "Inherited global ignore/config/ancestor discovery scope and HOME/XDG/opaque authority stay unchanged under mandatory addendum.",
+    "No whole PR/nativeUX/screenshots/keyboard/focus/hover/scroll/performance/installed/WHOLE/1749/SeedView/merge or account/model/productivity claim.",
+    "No source publication, GitHub write, compile/test/helper execution, resource/process/target/cache/auth/accountDB probe or admission under this assignment."
+  ],
+  "primary_frozen_artifacts": [
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/run-packet.py",
+      "sha256": "1b6d5f5d8e09232d8812b6b34d86bb5592ee0cd226bc81f3fcb5c53626dd6647"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/plan.json",
+      "sha256": "bece97254c6b90f47dd1955f17ecdceaae1381d820a17ec188a074ab502a8a8c"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/source-binding.json",
+      "sha256": "b7a211290bb600106d3d7dc9469a7c963c53696f8feb281a15203d87a2b65d7b"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/manifest.json",
+      "sha256": "d86fb68c4dc7d271987039737a8d950bc81975d271706f747b0393a56a1a6aff"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/command-data.json",
+      "sha256": "1324a25b6a11e45d3188976535cd5c38838e78a3544144f2e80c7841cc94f225"
+    },
+    {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/selected-source-contract.json",
+      "sha256": "516980537243cee4646402ef4130c7fe7d71c7fd8212e31edae2d3a2c8e4e387"
+    }
+  ],
+  "product": {
+    "head": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "parent": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+    "tree": "532d48f268b00fa658fea22a8418d41432879046"
+  },
+  "proposed_workload": {
+    "binchecks": 0,
+    "graph": [
+      "ui"
+    ],
+    "original_packet_workload_cap": 2400,
+    "phase_cap_sum": 2190,
+    "phase_caps_seconds": [
+      900,
+      30,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60,
+      60
+    ],
+    "phase_count": 23,
+    "reservation_honesty": "Original30pre+60post DATA are proposed reservations, not newly enforced aggregate bounds; unknown custody/evidence retains unsignaled canonical HOLD beyond workload cap."
+  },
+  "prospective_invocation": {
+    "argv": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source/qualification-packets/pr1549-7be-worker21/run-packet.py",
+      "--grant",
+      null,
+      "--runner-sha256",
+      "1b6d5f5d8e09232d8812b6b34d86bb5592ee0cd226bc81f3fcb5c53626dd6647",
+      "--controller-review",
+      "/tmp/coord-b9-pr1549-worker21-ae17-code-caller-oracle-review.json",
+      "--controller-review-sha256",
+      "20d9e9aed8102bf15ab8c826845a4f3227469fa80e37d5760f8fa6dffa905a41"
+    ],
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-pr1549-7be-worker21-source",
+    "execution_authorized": false,
+    "grant": null,
+    "kind": "NOT_SUBMITTABLE_WITHOUT_NEW_ROOT_ADOPTION_PUBLICATION_AND_AUTHENTICATED_ALLOCATION"
+  },
+  "queue": null,
+  "resource_allocation": null,
+  "runtime": null,
+  "schema": "pr1549_worker21_reviewed_source_handoff_v1",
+  "scope": "ONLY worker21 qualification-controller source on product7be. No product/source, UI5/front19/CLI3/Main15/Linear/1921/native implementation or result transfer.",
+  "selection": {
+    "UI5_low_FD_and_manual_benchmark_excluded": true,
+    "actual_N": null,
+    "actual_results": null,
+    "order": [
+      "project_search::tests::ignore_hidden_globs_and_options",
+      "project_search::tests::directory_globs_filter_descendants_without_losing_their_scope",
+      "project_search::tests::special_ignore_files_end_the_worker_without_blocking_or_leaking_queries",
+      "project_search::tests::descriptor_ignore_policy_preserves_precedence_nested_repositories_and_linked_excludes",
+      "project_search::tests::whole_word_handles_punctuation_and_regex_alternate_retry",
+      "project_search::tests::large_search_streams_first_results_before_completion",
+      "project_search::tests::deep_directory_search_preserves_ignore_glob_and_symlink_membership",
+      "project_search::tests::deep_wide_search_stops_on_first_delivery_cancellation_or_refusal",
+      "project_search::tests::deep_ignore_error_terminates_without_a_finished_event",
+      "project_search::tests::regex_errors_and_binary_files",
+      "project_search::tests::content_search_never_follows_links_outside_the_selected_root",
+      "project_search::tests::literal_block_prefilter_keeps_line_offsets_and_valid_prefix_before_invalid_data",
+      "project_search::tests::search_locations_select_native_editor_matches_for_every_line_ending",
+      "project_search::tests::bulk_reader_completes_cross_block_utf8_lines_and_skips_one_invalid_suffix",
+      "project_search::tests::caps_results_and_cancels_during_delivery",
+      "project_search::tests::cancellation_from_the_final_batch_suppresses_finished_progress",
+      "project_search::tests::sparse_batch_publishes_at_a_live_directory_boundary_and_respects_delivery_stop",
+      "project_search::tests::directory_replaced_after_admission_cannot_enumerate_an_outside_tree",
+      "project_search::ignore_policy::tests::cancelled_filter_returns_control_before_visiting_all_filtered_siblings",
+      "project_search::ignore_policy::tests::ignore_metadata_reads_bound_regular_growth_and_refuse_special_global_sources",
+      "project_search::traversal::tests::spill_budgets_are_global_and_cancellation_releases_partial_buffers"
+    ],
+    "source_count": 21
+  },
+  "source_bundle": {
+    "path": "/tmp/coord-b9-pr1549-worker21-author-freeze/source.bundle",
+    "prerequisite": "7bebe4df6498487eed97ac806c0d6509c5e88ed5",
+    "sha256": "89d2bc2c779acd557137425e666495a720f44b0801c7a0dcd0fa6c001254cd2a"
+  },
+  "source_counts": {
+    "archive_bindings": 105,
+    "binchecks": 0,
+    "fresh_inventory": 1,
+    "libcompile": 1,
+    "new_packet_files": 116,
+    "product_entries_exact": 2223,
+    "selected_distinct_worker_parents": 21,
+    "serial_phases": 23,
+    "singleton_invocations": 21,
+    "source_pins": 47,
+    "visible_child_result_credit": 0
+  },
+  "source_patch": {
+    "path": "/tmp/coord-b9-pr1549-worker21-author-freeze/source.patch",
+    "sha256": "ccbee41a17c86997fc2c9b9c84b62b88558e1d7e3be0897ba54564c8cd503805"
+  },
+  "source_preparation_history": {
+    "note": "First preparation directory mismatch and draft coherence corrections remain original source-preparation history; no workload or audited module/helper/function/parser was evaluated.",
+    "original_local_source_tools": {
+      "bytes": 2441,
+      "path": "/tmp/coord-b9-pr1549-worker21-author-freeze/original-local-source-tool-provenance.json",
+      "sha256": "c89a5e4712929952d7f243e3a103266e15e3b21eba052206039586229d7429f5"
+    },
+    "original_source_ops": "Local Git/source/AST/JSON/hash and artifacts only; audited controller/parser/helper/test modules/functions never imported/evaluated. Standard source-generation operations were executed."
+  },
+  "utc": "2026-10-31T17:25:19.837328+00:00"
+}

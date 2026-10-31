@@ -1,0 +1,33 @@
+{
+  "source_only": true,
+  "records": [
+    {
+      "argv": [
+        "git",
+        "clone",
+        "--no-checkout",
+        "--no-hardlinks",
+        "--separate-git-dir=/tmp/pr1549-7be-consumer2-private-git-rnex3xib/git",
+        "/tmp/coord-b9-pr1549-7be-worker21-git",
+        "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": "Cloning into '/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source'...\ndone.\n"
+    },
+    {
+      "argv": [
+        "git",
+        "-C",
+        "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-7be-consumer2-source",
+        "switch",
+        "--create",
+        "qualification/fw16-pr1549-7be-consumer2",
+        "7bebe4df6498487eed97ac806c0d6509c5e88ed5"
+      ],
+      "exit": 0,
+      "stdout": "",
+      "stderr": "Switched to a new branch 'qualification/fw16-pr1549-7be-consumer2'\n"
+    }
+  ]
+}

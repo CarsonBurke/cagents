@@ -1,0 +1,1760 @@
+{
+  "kind": "EXACT_STRING_REPLACEMENT_TRUE_INVERSE_SOURCE_DATA",
+  "from_sha256": "cbcd227500992aa88f699ab038b9aa0ee22652b624f875e49455b46cb10f992e",
+  "to_sha256": "1b6d5f5d8e09232d8812b6b34d86bb5592ee0cd226bc81f3fcb5c53626dd6647",
+  "edits": [
+    {
+      "candidate_start": 3,
+      "candidate_end": 6,
+      "before": "PR1",
+      "after": "Issue202"
+    },
+    {
+      "candidate_start": 7,
+      "candidate_end": 9,
+      "before": "49",
+      "after": ""
+    },
+    {
+      "candidate_start": 15,
+      "candidate_end": 19,
+      "before": "7be ",
+      "after": "-"
+    },
+    {
+      "candidate_start": 23,
+      "candidate_end": 24,
+      "before": "s",
+      "after": "recov"
+    },
+    {
+      "candidate_start": 26,
+      "candidate_end": 26,
+      "before": "",
+      "after": "y-cache part"
+    },
+    {
+      "candidate_start": 30,
+      "candidate_end": 32,
+      "before": "co",
+      "after": "diag"
+    },
+    {
+      "candidate_start": 33,
+      "candidate_end": 33,
+      "before": "",
+      "after": "o"
+    },
+    {
+      "candidate_start": 34,
+      "candidate_end": 37,
+      "before": "ume",
+      "after": "tic. F"
+    },
+    {
+      "candidate_start": 38,
+      "candidate_end": 38,
+      "before": "",
+      "after": "esh"
+    },
+    {
+      "candidate_start": 41,
+      "candidate_end": 45,
+      "before": "mpil",
+      "after": "d"
+    },
+    {
+      "candidate_start": 46,
+      "candidate_end": 77,
+      "before": "r checks. Source-only until two",
+      "after": ""
+    },
+    {
+      "candidate_start": 84,
+      "candidate_end": 85,
+      "before": "s",
+      "after": ""
+    },
+    {
+      "candidate_start": 90,
+      "candidate_end": 93,
+      "before": "fre",
+      "after": ""
+    },
+    {
+      "candidate_start": 94,
+      "candidate_end": 97,
+      "before": "h R",
+      "after": "c"
+    },
+    {
+      "candidate_start": 98,
+      "candidate_end": 100,
+      "before": "ot",
+      "after": "ped"
+    },
+    {
+      "candidate_start": 106,
+      "candidate_end": 106,
+      "before": "",
+      "after": " required; no full347 qualification"
+    },
+    {
+      "candidate_start": 759,
+      "candidate_end": 763,
+      "before": "fw16",
+      "after": "coord-b9"
+    },
+    {
+      "candidate_start": 775,
+      "candidate_end": 776,
+      "before": "c",
+      "after": "w"
+    },
+    {
+      "candidate_start": 777,
+      "candidate_end": 781,
+      "before": "nsum",
+      "after": "rk"
+    },
+    {
+      "candidate_start": 784,
+      "candidate_end": 784,
+      "before": "",
+      "after": "1"
+    },
+    {
+      "candidate_start": 825,
+      "candidate_end": 826,
+      "before": "c",
+      "after": "w"
+    },
+    {
+      "candidate_start": 827,
+      "candidate_end": 831,
+      "before": "nsum",
+      "after": "rk"
+    },
+    {
+      "candidate_start": 834,
+      "candidate_end": 834,
+      "before": "",
+      "after": "1"
+    },
+    {
+      "candidate_start": 1243,
+      "candidate_end": 1244,
+      "before": "6",
+      "after": ""
+    },
+    {
+      "candidate_start": 1245,
+      "candidate_end": 1251,
+      "before": "16db2b",
+      "after": "e"
+    },
+    {
+      "candidate_start": 1252,
+      "candidate_end": 1255,
+      "before": "db2",
+      "after": "e"
+    },
+    {
+      "candidate_start": 1256,
+      "candidate_end": 1260,
+      "before": "abcc",
+      "after": ""
+    },
+    {
+      "candidate_start": 1261,
+      "candidate_end": 1265,
+      "before": "5604",
+      "after": ""
+    },
+    {
+      "candidate_start": 1266,
+      "candidate_end": 1269,
+      "before": "df9",
+      "after": ""
+    },
+    {
+      "candidate_start": 1272,
+      "candidate_end": 1294,
+      "before": "7780d0e98fd355ee9def93",
+      "after": ""
+    },
+    {
+      "candidate_start": 1296,
+      "candidate_end": 1298,
+      "before": "c2",
+      "after": "9"
+    },
+    {
+      "candidate_start": 1299,
+      "candidate_end": 1299,
+      "before": "",
+      "after": "f"
+    },
+    {
+      "candidate_start": 1300,
+      "candidate_end": 1300,
+      "before": "",
+      "after": "7dd19"
+    },
+    {
+      "candidate_start": 1302,
+      "candidate_end": 1302,
+      "before": "",
+      "after": "f17"
+    },
+    {
+      "candidate_start": 1303,
+      "candidate_end": 1306,
+      "before": "5b8",
+      "after": "cdceaae1"
+    },
+    {
+      "candidate_start": 1307,
+      "candidate_end": 1307,
+      "before": "",
+      "after": "81d820a17ec188a074ab502a8a8c"
+    },
+    {
+      "candidate_start": 37581,
+      "candidate_end": 37581,
+      "before": "",
+      "after": "'parent-ui-lib-1', 'parent-ui-lib-2', 'parent-ui-lib-3', 'parent-ui-lib-4', 'parent-ui-lib-5', 'parent-ui-lib-6', 'parent-ui-lib-7', 'parent-ui-lib-8', 'parent-ui-lib-9', 'parent-ui-lib-10', 'parent-ui-lib-11', 'parent-ui-lib-12', 'parent-ui-lib-13', 'parent-ui-lib-14', 'parent-ui-lib-15', 'parent-ui-lib-16', 'parent-ui-lib-17', 'parent-ui-lib-18', 'parent-ui-lib-19', 'parent-ui-lib-20', 'parent-ui-lib-21'"
+    },
+    {
+      "candidate_start": 40303,
+      "candidate_end": 40304,
+      "before": "0",
+      "after": "21"
+    },
+    {
+      "candidate_start": 40899,
+      "candidate_end": 40901,
+      "before": "[]",
+      "after": "None"
+    },
+    {
+      "candidate_start": 41246,
+      "candidate_end": 41246,
+      "before": "",
+      "after": "'parent-ui-lib-1', 'parent-ui-lib-2', 'parent-ui-lib-3', 'parent-ui-lib-4', 'parent-ui-lib-5', 'parent-ui-lib-6', 'parent-ui-lib-7', 'parent-ui-lib-8', 'parent-ui-lib-9', 'parent-ui-lib-10', 'parent-ui-lib-11', 'parent-ui-lib-12', 'parent-ui-lib-13', 'parent-ui-lib-14', 'parent-ui-lib-15', 'parent-ui-lib-16', 'parent-ui-lib-17', 'parent-ui-lib-18', 'parent-ui-lib-19', 'parent-ui-lib-20', 'parent-ui-lib-21'"
+    },
+    {
+      "candidate_start": 41574,
+      "candidate_end": 41575,
+      "before": "0",
+      "after": "21"
+    },
+    {
+      "candidate_start": 42172,
+      "candidate_end": 42172,
+      "before": "",
+      "after": "3"
+    },
+    {
+      "candidate_start": 42603,
+      "candidate_end": 42604,
+      "before": "0",
+      "after": "21"
+    },
+    {
+      "candidate_start": 42757,
+      "candidate_end": 42758,
+      "before": "0",
+      "after": "21"
+    },
+    {
+      "candidate_start": 47771,
+      "candidate_end": 47772,
+      "before": "C",
+      "after": "W"
+    },
+    {
+      "candidate_start": 47773,
+      "candidate_end": 47777,
+      "before": "NSUM",
+      "after": "RK"
+    },
+    {
+      "candidate_start": 47780,
+      "candidate_end": 47780,
+      "before": "",
+      "after": "1"
+    },
+    {
+      "candidate_start": 48588,
+      "candidate_end": 48589,
+      "before": "C",
+      "after": "W"
+    },
+    {
+      "candidate_start": 48590,
+      "candidate_end": 48594,
+      "before": "NSUM",
+      "after": "RK"
+    },
+    {
+      "candidate_start": 48597,
+      "candidate_end": 48597,
+      "before": "",
+      "after": "1"
+    },
+    {
+      "candidate_start": 51873,
+      "candidate_end": 51882,
+      "before": "base_c28_",
+      "after": ""
+    },
+    {
+      "candidate_start": 56665,
+      "candidate_end": 56666,
+      "before": "c",
+      "after": "w"
+    },
+    {
+      "candidate_start": 56667,
+      "candidate_end": 56671,
+      "before": "nsum",
+      "after": "rk"
+    },
+    {
+      "candidate_start": 56674,
+      "candidate_end": 56678,
+      "before": "DATA",
+      "after": "binding_review"
+    },
+    {
+      "candidate_start": 56693,
+      "candidate_end": 56694,
+      "before": "c",
+      "after": "w"
+    },
+    {
+      "candidate_start": 56695,
+      "candidate_end": 56699,
+      "before": "nsum",
+      "after": "rk"
+    },
+    {
+      "candidate_start": 56701,
+      "candidate_end": 56701,
+      "before": "",
+      "after": "21"
+    },
+    {
+      "candidate_start": 56706,
+      "candidate_end": 56706,
+      "before": "",
+      "after": "_binding_review"
+    },
+    {
+      "candidate_start": 56719,
+      "candidate_end": 56721,
+      "before": "21",
+      "after": ""
+    },
+    {
+      "candidate_start": 56722,
+      "candidate_end": 56725,
+      "before": "cod",
+      "after": "intak"
+    },
+    {
+      "candidate_start": 56752,
+      "candidate_end": 56752,
+      "before": "",
+      "after": "or"
+    },
+    {
+      "candidate_start": 56753,
+      "candidate_end": 56753,
+      "before": "",
+      "after": "inator_intak"
+    },
+    {
+      "candidate_start": 56761,
+      "candidate_end": 56762,
+      "before": "w",
+      "after": "ui5_auth"
+    },
+    {
+      "candidate_start": 56764,
+      "candidate_end": 56765,
+      "before": "k",
+      "after": "_ref"
+    },
+    {
+      "candidate_start": 56767,
+      "candidate_end": 56772,
+      "before": "21_co",
+      "after": "e"
+    },
+    {
+      "candidate_start": 56773,
+      "candidate_end": 56774,
+      "before": "s",
+      "after": "ce"
+    },
+    {
+      "candidate_start": 56789,
+      "candidate_end": 56844,
+      "before": "worker21_conservation')\n    worker21_adoption = read_bo",
+      "after": ""
+    },
+    {
+      "candidate_start": 56846,
+      "candidate_end": 56896,
+      "before": "d('worker21_adoption')\n    worker21_publication = ",
+      "after": ""
+    },
+    {
+      "candidate_start": 56898,
+      "candidate_end": 56899,
+      "before": "a",
+      "after": "viewe"
+    },
+    {
+      "candidate_start": 56901,
+      "candidate_end": 56903,
+      "before": "bo",
+      "after": "UI5_a"
+    },
+    {
+      "candidate_start": 56904,
+      "candidate_end": 56909,
+      "before": "nd('w",
+      "after": "th"
+    },
+    {
+      "candidate_start": 56911,
+      "candidate_end": 56916,
+      "before": "ker21",
+      "after": ""
+    },
+    {
+      "candidate_start": 56917,
+      "candidate_end": 56935,
+      "before": "publication')\n    ",
+      "after": ""
+    },
+    {
+      "candidate_start": 56937,
+      "candidate_end": 56951,
+      "before": "ad_bound('work",
+      "after": "f"
+    },
+    {
+      "candidate_start": 56953,
+      "candidate_end": 56958,
+      "before": "21_ha",
+      "after": "e"
+    },
+    {
+      "candidate_start": 56959,
+      "candidate_end": 56963,
+      "before": "doff",
+      "after": "ce"
+    },
+    {
+      "candidate_start": 65963,
+      "candidate_end": 65964,
+      "before": "c",
+      "after": "w"
+    },
+    {
+      "candidate_start": 65965,
+      "candidate_end": 65969,
+      "before": "nsum",
+      "after": "rk"
+    },
+    {
+      "candidate_start": 65972,
+      "candidate_end": 65972,
+      "before": "",
+      "after": "1"
+    },
+    {
+      "candidate_start": 66484,
+      "candidate_end": 66497,
+      "before": "checks = [{'l",
+      "after": ""
+    },
+    {
+      "candidate_start": 66498,
+      "candidate_end": 66606,
+      "before": "bel': 'ceditor-binary-check', 'argv': ['cargo', 'check', '--locked', '-p', 'ceditor', '--bin', 'ceditor'], '",
+      "after": ""
+    },
+    {
+      "candidate_start": 66607,
+      "candidate_end": 66745,
+      "before": "econds': 480},\n              {'label': 'integrated-ui-binary-check', 'argv': ['cargo', 'check', '--locked', '--features', 'integrated-brow",
+      "after": ""
+    },
+    {
+      "candidate_start": 66748,
+      "candidate_end": 66750,
+      "before": "',",
+      "after": "t"
+    },
+    {
+      "candidate_start": 66751,
+      "candidate_end": 66764,
+      "before": "'--bin', 'cag",
+      "after": "l"
+    },
+    {
+      "candidate_start": 66766,
+      "candidate_end": 66780,
+      "before": "ts-ui'], 'seco",
+      "after": "(pla"
+    },
+    {
+      "candidate_start": 66781,
+      "candidate_end": 66782,
+      "before": "d",
+      "after": "['artifact_group"
+    },
+    {
+      "candidate_start": 66784,
+      "candidate_end": 66785,
+      "before": ":",
+      "after": "]) =="
+    },
+    {
+      "candidate_start": 66787,
+      "candidate_end": 66791,
+      "before": "800}",
+      "after": " and data['artifact_groups'] == plan['artifact_groups'"
+    },
+    {
+      "candidate_start": 66854,
+      "candidate_end": 66860,
+      "before": "checks",
+      "after": "[]"
+    },
+    {
+      "candidate_start": 66865,
+      "candidate_end": 66887,
+      "before": "assert data['artifact_",
+      "after": ""
+    },
+    {
+      "candidate_start": 66892,
+      "candidate_end": 66895,
+      "before": "s']",
+      "after": ""
+    },
+    {
+      "candidate_start": 66896,
+      "candidate_end": 66897,
+      "before": "=",
+      "after": ""
+    },
+    {
+      "candidate_start": 66922,
+      "candidate_end": 66926,
+      "before": " == ",
+      "after": ""
+    },
+    {
+      "candidate_start": 66927,
+      "candidate_end": 66927,
+      "before": "",
+      "after": "0"
+    },
+    {
+      "candidate_start": 66939,
+      "candidate_end": 66939,
+      "before": "",
+      "after": " group['id'] == 'ui-lib' and group['features'] == ['ui'] and group['manifest'] == 'Cargo.toml'\n    assert group['target_name'] == 'cagents' and group['target_kind'] == ['lib']\n    assert group['compile_argv'] == ['cargo', 'test', '--locked', '--no-default-features', '--features', 'ui', '--lib', '--no-run', '--message-format=json']\n    names = [row['name'] for row in group['selectors']]\n    assert names =="
+    },
+    {
+      "candidate_start": 66965,
+      "candidate_end": 66965,
+      "before": "",
+      "after": " addendum['selectors']['remaining_worker_UI21']\n    assert len(names) == len(set(names)) == 21 and all(row['seconds'] == 60 and row['expected_stdout_child_results'] == 0 for row in group['selectors'])\n    assert group['source_predicted_compiled_names'] == names and group['source_predicted_absent_names'] == []\n    assert"
+    },
+    {
+      "candidate_start": 66998,
+      "candidate_end": 67000,
+      "before": "[]",
+      "after": "names"
+    },
+    {
+      "candidate_start": 67070,
+      "candidate_end": 67070,
+      "before": "",
+      "after": "\n    assert [row['name'] for row in data['selected_parents']]"
+    },
+    {
+      "candidate_start": 67074,
+      "candidate_end": 67074,
+      "before": "",
+      "after": "names\n    assert all(row"
+    },
+    {
+      "candidate_start": 67075,
+      "candidate_end": 67075,
+      "before": "",
+      "after": "'ignored'"
+    },
+    {
+      "candidate_start": 67076,
+      "candidate_end": 67076,
+      "before": "",
+      "after": " is False and row['seconds'] == 60 and row['expected_stdout_child_results'] == 0 and row['source_sha256'] == plan['source_paths_sha256'][row['source']] for row in data['selected_parents'])\n    assert (group['compile_seconds'], group['inventory_seconds']) == (900, 30)"
+    },
+    {
+      "candidate_start": 67151,
+      "candidate_end": 67155,
+      "before": "row[",
+      "after": ""
+    },
+    {
+      "candidate_start": 67156,
+      "candidate_end": 67165,
+      "before": "label'] f",
+      "after": "c"
+    },
+    {
+      "candidate_start": 67166,
+      "candidate_end": 67167,
+      "before": "r",
+      "after": "mpile-ui-lib',"
+    },
+    {
+      "candidate_start": 67168,
+      "candidate_end": 67172,
+      "before": "row ",
+      "after": "'"
+    },
+    {
+      "candidate_start": 67174,
+      "candidate_end": 67177,
+      "before": " ch",
+      "after": "v"
+    },
+    {
+      "candidate_start": 67178,
+      "candidate_end": 67181,
+      "before": "cks",
+      "after": "ntory-ui-lib', 'parent-ui-lib-1', 'parent-ui-lib-2', 'parent-ui-lib-3', 'parent-ui-lib-4', 'parent-ui-lib-5', 'parent-ui-lib-6', 'parent-ui-lib-7', 'parent-ui-lib-8', 'parent-ui-lib-9', 'parent-ui-lib-10', 'parent-ui-lib-11', 'parent-ui-lib-12', 'parent-ui-lib-13', 'parent-ui-lib-14', 'parent-ui-lib-15', 'parent-ui-lib-16', 'parent-ui-lib-17', 'parent-ui-lib-18', 'parent-ui-lib-19', 'parent-ui-lib-20', 'parent-ui-lib-21'"
+    },
+    {
+      "candidate_start": 67226,
+      "candidate_end": 67226,
+      "before": "",
+      "after": "3"
+    },
+    {
+      "candidate_start": 67310,
+      "candidate_end": 67369,
+      "before": "280\n    assert sum(row['seconds'] for row in checks) == 228",
+      "after": "19"
+    },
+    {
+      "candidate_start": 67794,
+      "candidate_end": 68008,
+      "before": "consumer_DATA['schema'] == 'pr1549_7be_affected_consumer_compiler_check_SOURCE_DATA_v1'\n    assert consumer_DATA['product']['head'] == review['head'] and consumer_DATA['product']['tree'] == review['tree']\n    origi",
+      "after": ""
+    },
+    {
+      "candidate_start": 68010,
+      "candidate_end": 68014,
+      "before": "l_ch",
+      "after": "m"
+    },
+    {
+      "candidate_start": 68015,
+      "candidate_end": 68017,
+      "before": "ck",
+      "after": ""
+    },
+    {
+      "candidate_start": 68020,
+      "candidate_end": 68087,
+      "before": " consumer_DATA['exact_serial_check_plan']['phases'][1:3]\n    assert",
+      "after": "="
+    },
+    {
+      "candidate_start": 68094,
+      "candidate_end": 68095,
+      "before": "a",
+      "after": "selecto"
+    },
+    {
+      "candidate_start": 68096,
+      "candidate_end": 68098,
+      "before": "gv",
+      "after": ""
+    },
+    {
+      "candidate_start": 68121,
+      "candidate_end": 68136,
+      "before": "checks] == [row",
+      "after": "DATA"
+    },
+    {
+      "candidate_start": 68138,
+      "candidate_end": 68153,
+      "before": "argv'] for row ",
+      "after": "m"
+    },
+    {
+      "candidate_start": 68155,
+      "candidate_end": 68158,
+      "before": " ch",
+      "after": "imum_remaining_ordinary_parent_sel"
+    },
+    {
+      "candidate_start": 68160,
+      "candidate_end": 68160,
+      "before": "",
+      "after": "tion']['remaining_ui_wor"
+    },
+    {
+      "candidate_start": 68161,
+      "candidate_end": 68162,
+      "before": "s",
+      "after": "er21']"
+    },
+    {
+      "candidate_start": 68175,
+      "candidate_end": 68178,
+      "before": "[ro",
+      "after": "names == "
+    },
+    {
+      "candidate_start": 68179,
+      "candidate_end": 68179,
+      "before": "",
+      "after": "orker_intake"
+    },
+    {
+      "candidate_start": 68181,
+      "candidate_end": 68185,
+      "before": "cap_",
+      "after": ""
+    },
+    {
+      "candidate_start": 68187,
+      "candidate_end": 68187,
+      "before": "",
+      "after": "le"
+    },
+    {
+      "candidate_start": 68188,
+      "candidate_end": 68188,
+      "before": "",
+      "after": "t"
+    },
+    {
+      "candidate_start": 68189,
+      "candidate_end": 68191,
+      "before": "nd",
+      "after": "r"
+    },
+    {
+      "candidate_start": 68195,
+      "candidate_end": 68196,
+      "before": "f",
+      "after": "and w"
+    },
+    {
+      "candidate_start": 68198,
+      "candidate_end": 68199,
+      "before": " ",
+      "after": "ke"
+    },
+    {
+      "candidate_start": 68200,
+      "candidate_end": 68203,
+      "before": "ow ",
+      "after": "_"
+    },
+    {
+      "candidate_start": 68205,
+      "candidate_end": 68212,
+      "before": " origin",
+      "after": "t"
+    },
+    {
+      "candidate_start": 68213,
+      "candidate_end": 68213,
+      "before": "",
+      "after": "ke['se"
+    },
+    {
+      "candidate_start": 68214,
+      "candidate_end": 68217,
+      "before": "_ch",
+      "after": ""
+    },
+    {
+      "candidate_start": 68219,
+      "candidate_end": 68221,
+      "before": "ks",
+      "after": "ted_count'"
+    },
+    {
+      "candidate_start": 68226,
+      "candidate_end": 68260,
+      "before": "[row['seconds'] for row in checks]",
+      "after": "21"
+    },
+    {
+      "candidate_start": 68272,
+      "candidate_end": 68282,
+      "before": "all((revie",
+      "after": ""
+    },
+    {
+      "candidate_start": 68283,
+      "candidate_end": 68428,
+      "before": "['git_only_source_inputs'][path]['sha256'] if path in review['git_only_source_inputs'] else plan['source_paths_sha256'][path]) == pin['sha256'] f",
+      "after": ""
+    },
+    {
+      "candidate_start": 68430,
+      "candidate_end": 68446,
+      "before": " group in ('trac",
+      "after": ""
+    },
+    {
+      "candidate_start": 68447,
+      "candidate_end": 68539,
+      "before": "ed_manifest_inventory', 'lock_config_source_and_documentation_pins') for path, pin in consum",
+      "after": ""
+    },
+    {
+      "candidate_start": 68542,
+      "candidate_end": 68548,
+      "before": "DATA['",
+      "after": ""
+    },
+    {
+      "candidate_start": 68549,
+      "candidate_end": 68778,
+      "before": "nput_bindings'][group].items())\n    assert review['git_only_source_inputs'] == source_map['git_only_source_inputs'] == plan['git_only_source_inputs'] == {'AGENTS.md': consumer_DATA['input_bindings']['lock_config_source_and_docume",
+      "after": ""
+    },
+    {
+      "candidate_start": 68781,
+      "candidate_end": 69011,
+      "before": "tion_pins']['AGENTS.md']}\n    assert data['consumer_source_contract'] == source_map['consumer_source_contract'] == review['consumer_source_contract']\n    contract = data['consumer_source_contract']\n    assert contract['binary_chec",
+      "after": ""
+    },
+    {
+      "candidate_start": 69012,
+      "candidate_end": 69021,
+      "before": "s'] == ch",
+      "after": ""
+    },
+    {
+      "candidate_start": 69022,
+      "candidate_end": 69159,
+      "before": "cks and contract['artifact_groups'] == []\n    assert contract['selected_names'] == contract['selected_parents'] == []\n    assert contract",
+      "after": ""
+    },
+    {
+      "candidate_start": 69162,
+      "candidate_end": 69213,
+      "before": "equested_test_invocations'] == contract['requested_",
+      "after": ""
+    },
+    {
+      "candidate_start": 69215,
+      "candidate_end": 69215,
+      "before": "",
+      "after": "t"
+    },
+    {
+      "candidate_start": 69216,
+      "candidate_end": 69218,
+      "before": "qu",
+      "after": "m"
+    },
+    {
+      "candidate_start": 69220,
+      "candidate_end": 69250,
+      "before": "parents'] == 0\n    assert cont",
+      "after": "g"
+    },
+    {
+      "candidate_start": 69252,
+      "candidate_end": 69260,
+      "before": "ct['inve",
+      "after": ""
+    },
+    {
+      "candidate_start": 69262,
+      "candidate_end": 69318,
+      "before": "ory_required'] is False and contract['actual_inventory_N",
+      "after": ""
+    },
+    {
+      "candidate_start": 69333,
+      "candidate_end": 69334,
+      "before": "c",
+      "after": "w"
+    },
+    {
+      "candidate_start": 69335,
+      "candidate_end": 69337,
+      "before": "nt",
+      "after": ""
+    },
+    {
+      "candidate_start": 69338,
+      "candidate_end": 69356,
+      "before": "act['actual_compil",
+      "after": "k"
+    },
+    {
+      "candidate_start": 69359,
+      "candidate_end": 69364,
+      "before": "resul",
+      "after": "in"
+    },
+    {
+      "candidate_start": 69365,
+      "candidate_end": 69366,
+      "before": "s",
+      "after": "ake['queue_place"
+    },
+    {
+      "candidate_start": 69388,
+      "candidate_end": 69486,
+      "before": "contract['phase_cap_sum'] == 2280 and contract['packet_cap'] == 2400\n    assert contract['root_bro",
+      "after": ""
+    },
+    {
+      "candidate_start": 69487,
+      "candidate_end": 69529,
+      "before": "serless_UI_check_repeated'] is False and c",
+      "after": ""
+    },
+    {
+      "candidate_start": 69530,
+      "candidate_end": 69532,
+      "before": "nt",
+      "after": ""
+    },
+    {
+      "candidate_start": 69533,
+      "candidate_end": 69607,
+      "before": "act['standalone_integrated_variant_added'] is False\n    assert reconcile['",
+      "after": ""
+    },
+    {
+      "candidate_start": 69608,
+      "candidate_end": 69717,
+      "before": "ind'] == 'ADDITIVE_SOURCE_ARGV_AND_SCOPE_RECONCILIATION_NOT_RUNTIME_EQUIVALENCE'\n    assert reconcile['consum",
+      "after": ""
+    },
+    {
+      "candidate_start": 69720,
+      "candidate_end": 69724,
+      "before": "DATA",
+      "after": "binding"
+    },
+    {
+      "candidate_start": 69725,
+      "candidate_end": 69737,
+      "before": "sha256'] == ",
+      "after": ""
+    },
+    {
+      "candidate_start": 69745,
+      "candidate_end": 69748,
+      "before": "con",
+      "after": ""
+    },
+    {
+      "candidate_start": 69749,
+      "candidate_end": 69780,
+      "before": "umer_DATA']['sha256']\n    asser",
+      "after": ""
+    },
+    {
+      "candidate_start": 69781,
+      "candidate_end": 69796,
+      "before": " reconcile['bin",
+      "after": ""
+    },
+    {
+      "candidate_start": 69797,
+      "candidate_end": 69805,
+      "before": "ry_check",
+      "after": "tu"
+    },
+    {
+      "candidate_start": 69812,
+      "candidate_end": 69833,
+      "before": "checks and reconcile[",
+      "after": ""
+    },
+    {
+      "candidate_start": 69834,
+      "candidate_end": 70936,
+      "before": "artifact_groups'] == [] and reconcile['zero_parents_are_true'] is True and reconcile['no_inventory'] is True\n    assert review['product_reviews'] == {'correctness': review['product7_code']['sha256'], 'conservation': review['product7_conservation']['sha256']}\n    assert review['publication'] == {'source_publication_sha256': review['product7_publication']['sha256'], 'source_adoption_sha256': review['product7_adoption']['sha256'], 'published_source_branch': 'fix/fw16-pr1549-search-child-scope'}\n    assert review['publication']['published_source_branch'] in new_publication['ordinary_nonforce_push']['refs']\n    assert review['proof_roles'] == {'current7be': {'head': review['head'], 'tree': review['tree'], 'correctness': review['product7_code']['sha256'], 'conservation': review['product7_conservation']['sha256'], 'adoption': review['product7_adoption']['sha256'], 'publication': review['product7_publication']['sha256']}, 'base_c28': {'product': base_product, 'reviews': review['base_c28_product_reviews'], 'publication': review['base_c28_publication']}}\n    assert worker21_code['verdict'] == 'C",
+      "after": "B"
+    },
+    {
+      "candidate_start": 70937,
+      "candidate_end": 70937,
+      "before": "",
+      "after": "U"
+    },
+    {
+      "candidate_start": 70938,
+      "candidate_end": 70943,
+      "before": "TROLL",
+      "after": "D"
+    },
+    {
+      "candidate_start": 70944,
+      "candidate_end": 70945,
+      "before": "R",
+      "after": "D"
+    },
+    {
+      "candidate_start": 70953,
+      "candidate_end": 70953,
+      "before": "",
+      "after": "DATA_BINDING_"
+    },
+    {
+      "candidate_start": 70958,
+      "candidate_end": 70958,
+      "before": "",
+      "after": "_WITH_EXPLICIT_CHILD_OUTPUT_ACCOUNTING"
+    },
+    {
+      "candidate_start": 70970,
+      "candidate_end": 70972,
+      "before": "21",
+      "after": ""
+    },
+    {
+      "candidate_start": 70973,
+      "candidate_end": 70975,
+      "before": "co",
+      "after": "bin"
+    },
+    {
+      "candidate_start": 70976,
+      "candidate_end": 70976,
+      "before": "",
+      "after": "ing_r"
+    },
+    {
+      "candidate_start": 70977,
+      "candidate_end": 70977,
+      "before": "",
+      "after": "view"
+    },
+    {
+      "candidate_start": 71013,
+      "candidate_end": 71015,
+      "before": "21",
+      "after": ""
+    },
+    {
+      "candidate_start": 71016,
+      "candidate_end": 71018,
+      "before": "co",
+      "after": "bin"
+    },
+    {
+      "candidate_start": 71019,
+      "candidate_end": 71019,
+      "before": "",
+      "after": "ing_r"
+    },
+    {
+      "candidate_start": 71020,
+      "candidate_end": 71020,
+      "before": "",
+      "after": "view"
+    },
+    {
+      "candidate_start": 71057,
+      "candidate_end": 71059,
+      "before": "21",
+      "after": ""
+    },
+    {
+      "candidate_start": 71060,
+      "candidate_end": 71062,
+      "before": "co",
+      "after": "bin"
+    },
+    {
+      "candidate_start": 71063,
+      "candidate_end": 71063,
+      "before": "",
+      "after": "ing_r"
+    },
+    {
+      "candidate_start": 71064,
+      "candidate_end": 71064,
+      "before": "",
+      "after": "view"
+    },
+    {
+      "candidate_start": 71102,
+      "candidate_end": 71102,
+      "before": "",
+      "after": "names == [row['selector'] for row in "
+    },
+    {
+      "candidate_start": 71108,
+      "candidate_end": 71108,
+      "before": "",
+      "after": "_binding_review['selector_binding']['verified_selectors'] if row['group'] == 'remaining_worker_UI"
+    },
+    {
+      "candidate_start": 71110,
+      "candidate_end": 71112,
+      "before": "_c",
+      "after": "']\n    assert n"
+    },
+    {
+      "candidate_start": 71113,
+      "candidate_end": 71113,
+      "before": "",
+      "after": "t set(names).intersection(a"
+    },
+    {
+      "candidate_start": 71114,
+      "candidate_end": 71114,
+      "before": "",
+      "after": "dendum['selectors']['UI5_first'])\n    assert 'project_search::tests::repository_first_result_latency' not in names\n    assert ui5_author_referenc"
+    },
+    {
+      "candidate_start": 71117,
+      "candidate_end": 71119,
+      "before": "ru",
+      "after": "ki"
+    },
+    {
+      "candidate_start": 71120,
+      "candidate_end": 71120,
+      "before": "",
+      "after": "d'] == 'FROZEN_AUTHOR_HANDOFF_PENDING_INDEPENDENT_SOURCE_CODE_AND_CONSERVATION_REVIEW'\n    assert ui5_author_refere"
+    },
+    {
+      "candidate_start": 71121,
+      "candidate_end": 71121,
+      "before": "",
+      "after": "ce['independent_controller_review'] is None and ui5_author_reference['execution_authorized'] is False\n    assert data['work"
+    },
+    {
+      "candidate_start": 71125,
+      "candidate_end": 71126,
+      "before": "h",
+      "after": "ource_contr"
+    },
+    {
+      "candidate_start": 71127,
+      "candidate_end": 71130,
+      "before": "256",
+      "after": "ct'] == source_map['worker_source_contract"
+    },
+    {
+      "candidate_start": 71150,
+      "candidate_end": 71177,
+      "before": "21_donor_identity']['runner",
+      "after": ""
+    },
+    {
+      "candidate_start": 71179,
+      "candidate_end": 71192,
+      "before": "ha256'] and w",
+      "after": ""
+    },
+    {
+      "candidate_start": 71193,
+      "candidate_end": 71193,
+      "before": "",
+      "after": "u"
+    },
+    {
+      "candidate_start": 71194,
+      "candidate_end": 71195,
+      "before": "k",
+      "after": "c"
+    },
+    {
+      "candidate_start": 71196,
+      "candidate_end": 71199,
+      "before": "r21",
+      "after": ""
+    },
+    {
+      "candidate_start": 71202,
+      "candidate_end": 71249,
+      "before": "de['plan_sha256'] == review['worker21_donor_ide",
+      "after": ""
+    },
+    {
+      "candidate_start": 71251,
+      "candidate_end": 71260,
+      "before": "ity']['pl",
+      "after": "r"
+    },
+    {
+      "candidate_start": 71261,
+      "candidate_end": 71269,
+      "before": "n_sha256",
+      "after": "ct"
+    },
+    {
+      "candidate_start": 71283,
+      "candidate_end": 71283,
+      "before": "",
+      "after": "data['"
+    },
+    {
+      "candidate_start": 71289,
+      "candidate_end": 71291,
+      "before": "21",
+      "after": "_source"
+    },
+    {
+      "candidate_start": 71295,
+      "candidate_end": 71300,
+      "before": "s['ve",
+      "after": "t"
+    },
+    {
+      "candidate_start": 71301,
+      "candidate_end": 71303,
+      "before": "di",
+      "after": "a"
+    },
+    {
+      "candidate_start": 71307,
+      "candidate_end": 71377,
+      "before": " == 'SOURCE_CONSERVATION_CLEAR_FROZEN_WORKER21_ONLY' and worker21_cons",
+      "after": ""
+    },
+    {
+      "candidate_start": 71379,
+      "candidate_end": 71386,
+      "before": "finding",
+      "after": "selector"
+    },
+    {
+      "candidate_start": 71393,
+      "candidate_end": 71393,
+      "before": "",
+      "after": "names and data"
+    },
+    {
+      "candidate_start": 71394,
+      "candidate_end": 71394,
+      "before": "",
+      "after": "'worker_source_contract'"
+    },
+    {
+      "candidate_start": 71395,
+      "candidate_end": 71395,
+      "before": "",
+      "after": "['count'] == 21"
+    },
+    {
+      "candidate_start": 71407,
+      "candidate_end": 71417,
+      "before": "worker21_a",
+      "after": ""
+    },
+    {
+      "candidate_start": 71418,
+      "candidate_end": 71442,
+      "before": "option['controller']['he",
+      "after": ""
+    },
+    {
+      "candidate_start": 71443,
+      "candidate_end": 71456,
+      "before": "d'] == review",
+      "after": "ta"
+    },
+    {
+      "candidate_start": 71464,
+      "candidate_end": 71466,
+      "before": "21",
+      "after": ""
+    },
+    {
+      "candidate_start": 71467,
+      "candidate_end": 71468,
+      "before": "d",
+      "after": "s"
+    },
+    {
+      "candidate_start": 71469,
+      "candidate_end": 71471,
+      "before": "no",
+      "after": "u"
+    },
+    {
+      "candidate_start": 71472,
+      "candidate_end": 71475,
+      "before": "_id",
+      "after": "c"
+    },
+    {
+      "candidate_start": 71476,
+      "candidate_end": 71504,
+      "before": "ntity']['head'] and worker21",
+      "after": ""
+    },
+    {
+      "candidate_start": 71505,
+      "candidate_end": 71515,
+      "before": "adoption['",
+      "after": ""
+    },
+    {
+      "candidate_start": 71520,
+      "candidate_end": 71525,
+      "before": "oller",
+      "after": "act"
+    },
+    {
+      "candidate_start": 71529,
+      "candidate_end": 71531,
+      "before": "tr",
+      "after": "low_FD_s"
+    },
+    {
+      "candidate_start": 71532,
+      "candidate_end": 71532,
+      "before": "",
+      "after": "l"
+    },
+    {
+      "candidate_start": 71533,
+      "candidate_end": 71533,
+      "before": "",
+      "after": "cted"
+    },
+    {
+      "candidate_start": 71536,
+      "candidate_end": 71542,
+      "before": "== rev",
+      "after": ""
+    },
+    {
+      "candidate_start": 71543,
+      "candidate_end": 71543,
+      "before": "",
+      "after": "s Fals"
+    },
+    {
+      "candidate_start": 71544,
+      "candidate_end": 71545,
+      "before": "w",
+      "after": " and data"
+    },
+    {
+      "candidate_start": 71553,
+      "candidate_end": 71555,
+      "before": "21",
+      "after": ""
+    },
+    {
+      "candidate_start": 71556,
+      "candidate_end": 71557,
+      "before": "d",
+      "after": "source_c"
+    },
+    {
+      "candidate_start": 71559,
+      "candidate_end": 71566,
+      "before": "or_iden",
+      "after": ""
+    },
+    {
+      "candidate_start": 71567,
+      "candidate_end": 71568,
+      "before": "i",
+      "after": "rac"
+    },
+    {
+      "candidate_start": 71569,
+      "candidate_end": 71570,
+      "before": "y",
+      "after": ""
+    },
+    {
+      "candidate_start": 71574,
+      "candidate_end": 71575,
+      "before": "t",
+      "after": "igno"
+    },
+    {
+      "candidate_start": 71577,
+      "candidate_end": 71577,
+      "before": "",
+      "after": "d_manual_b"
+    },
+    {
+      "candidate_start": 71578,
+      "candidate_end": 71578,
+      "before": "",
+      "after": "nchmark_selected"
+    },
+    {
+      "candidate_start": 71580,
+      "candidate_end": 71580,
+      "before": "",
+      "after": " is False"
+    },
+    {
+      "candidate_start": 71592,
+      "candidate_end": 71602,
+      "before": "worker21_a",
+      "after": ""
+    },
+    {
+      "candidate_start": 71603,
+      "candidate_end": 71628,
+      "before": "option['code_review']['sh",
+      "after": ""
+    },
+    {
+      "candidate_start": 71629,
+      "candidate_end": 71644,
+      "before": "256'] == review",
+      "after": "ta"
+    },
+    {
+      "candidate_start": 71652,
+      "candidate_end": 71654,
+      "before": "21",
+      "after": "_source"
+    },
+    {
+      "candidate_start": 71657,
+      "candidate_end": 71659,
+      "before": "de",
+      "after": "ntract"
+    },
+    {
+      "candidate_start": 71663,
+      "candidate_end": 71674,
+      "before": "sha256'] an",
+      "after": "expecte"
+    },
+    {
+      "candidate_start": 71675,
+      "candidate_end": 71677,
+      "before": " w",
+      "after": "_visible_"
+    },
+    {
+      "candidate_start": 71678,
+      "candidate_end": 71680,
+      "before": "rk",
+      "after": "ut"
+    },
+    {
+      "candidate_start": 71682,
+      "candidate_end": 71684,
+      "before": "21",
+      "after": ""
+    },
+    {
+      "candidate_start": 71685,
+      "candidate_end": 71686,
+      "before": "a",
+      "after": "st"
+    },
+    {
+      "candidate_start": 71688,
+      "candidate_end": 71689,
+      "before": "p",
+      "after": "u"
+    },
+    {
+      "candidate_start": 71690,
+      "candidate_end": 71695,
+      "before": "ion['",
+      "after": "_"
+    },
+    {
+      "candidate_start": 71696,
+      "candidate_end": 71704,
+      "before": "onservat",
+      "after": "h"
+    },
+    {
+      "candidate_start": 71705,
+      "candidate_end": 71707,
+      "before": "on",
+      "after": "ld"
+    },
+    {
+      "candidate_start": 71710,
+      "candidate_end": 71718,
+      "before": "view']['",
+      "after": ""
+    },
+    {
+      "candidate_start": 71719,
+      "candidate_end": 71724,
+      "before": "ha256",
+      "after": "ults"
+    },
+    {
+      "candidate_start": 71730,
+      "candidate_end": 71771,
+      "before": "review['worker21_conservation']['sha256']",
+      "after": "0"
+    },
+    {
+      "candidate_start": 71783,
+      "candidate_end": 71798,
+      "before": "worker21_public",
+      "after": "d"
+    },
+    {
+      "candidate_start": 71800,
+      "candidate_end": 71827,
+      "before": "ion['controller'] == review",
+      "after": "a"
+    },
+    {
+      "candidate_start": 71835,
+      "candidate_end": 71837,
+      "before": "21",
+      "after": ""
+    },
+    {
+      "candidate_start": 71838,
+      "candidate_end": 71974,
+      "before": "donor_identity']['head'] and worker21_publication['tree'] == review['worker21_donor_identity']['tree']\n    assert worker21_publication['",
+      "after": ""
+    },
+    {
+      "candidate_start": 71981,
+      "candidate_end": 71987,
+      "before": "adopti",
+      "after": "c"
+    },
+    {
+      "candidate_start": 71989,
+      "candidate_end": 71989,
+      "before": "",
+      "after": "tract"
+    },
+    {
+      "candidate_start": 71993,
+      "candidate_end": 71995,
+      "before": "sh",
+      "after": "glob"
+    },
+    {
+      "candidate_start": 71996,
+      "candidate_end": 71999,
+      "before": "256",
+      "after": "l_configuration_scope_decision"
+    },
+    {
+      "candidate_start": 72005,
+      "candidate_end": 72022,
+      "before": "review['worker21_",
+      "after": ""
+    },
+    {
+      "candidate_start": 72024,
+      "candidate_end": 72024,
+      "before": "",
+      "after": "dendum['gl"
+    },
+    {
+      "candidate_start": 72025,
+      "candidate_end": 72026,
+      "before": "p",
+      "after": "bal_configura"
+    },
+    {
+      "candidate_start": 72030,
+      "candidate_end": 72034,
+      "before": "']['",
+      "after": "_"
+    },
+    {
+      "candidate_start": 72035,
+      "candidate_end": 72040,
+      "before": "ha256",
+      "after": "cope_decision"
+    },
+    {
+      "candidate_start": 72056,
+      "candidate_end": 72072,
+      "before": "view['worker21_d",
+      "after": "c"
+    },
+    {
+      "candidate_start": 72074,
+      "candidate_end": 72074,
+      "before": "",
+      "after": "cile['can"
+    },
+    {
+      "candidate_start": 72075,
+      "candidate_end": 72076,
+      "before": "r",
+      "after": "nical"
+    },
+    {
+      "candidate_start": 72078,
+      "candidate_end": 72079,
+      "before": "d",
+      "after": "nv"
+    },
+    {
+      "candidate_start": 72082,
+      "candidate_end": 72084,
+      "before": "it",
+      "after": "or"
+    },
+    {
+      "candidate_start": 72085,
+      "candidate_end": 72100,
+      "before": "']['independent",
+      "after": ""
+    },
+    {
+      "candidate_start": 72101,
+      "candidate_end": 72104,
+      "before": "cle",
+      "after": ""
+    },
+    {
+      "candidate_start": 72106,
+      "candidate_end": 72122,
+      "before": "ance_transferred",
+      "after": "gv"
+    },
+    {
+      "candidate_start": 72125,
+      "candidate_end": 72125,
+      "before": "",
+      "after": "== ['ACTUAL_EMITTED_UI_LIBTEST_ELF', '--l"
+    },
+    {
+      "candidate_start": 72127,
+      "candidate_end": 72127,
+      "before": "",
+      "after": "t',"
+    },
+    {
+      "candidate_start": 72128,
+      "candidate_end": 72130,
+      "before": "Fa",
+      "after": "'--co"
+    },
+    {
+      "candidate_start": 72131,
+      "candidate_end": 72131,
+      "before": "",
+      "after": "or=never']\n    as"
+    },
+    {
+      "candidate_start": 72133,
+      "candidate_end": 72133,
+      "before": "",
+      "after": "rt reconcile['canonical_singleton_argv'] == ['ACTUAL_EMITTED_UI_LIBTEST_ELF', 'EXACT_SELECTED_NAME', '--exact', '--format=pretty', '--color=never']"
+    },
+    {
+      "candidate_start": 73172,
+      "candidate_end": 73172,
+      "before": "",
+      "after": "coord-b9-"
+    },
+    {
+      "candidate_start": 73183,
+      "candidate_end": 73184,
+      "before": "c",
+      "after": "w"
+    },
+    {
+      "candidate_start": 73185,
+      "candidate_end": 73189,
+      "before": "nsum",
+      "after": "rk"
+    },
+    {
+      "candidate_start": 73192,
+      "candidate_end": 73192,
+      "before": "",
+      "after": "1"
+    },
+    {
+      "candidate_start": 93111,
+      "candidate_end": 93112,
+      "before": "0",
+      "after": "21"
+    },
+    {
+      "candidate_start": 93164,
+      "candidate_end": 93164,
+      "before": "",
+      "after": "'parent-ui-lib-1', 'parent-ui-lib-2', 'parent-ui-lib-3', 'parent-ui-lib-4', 'parent-ui-lib-5', 'parent-ui-lib-6', 'parent-ui-lib-7', 'parent-ui-lib-8', 'parent-ui-lib-9', 'parent-ui-lib-10', 'parent-ui-lib-11', 'parent-ui-lib-12', 'parent-ui-lib-13', 'parent-ui-lib-14', 'parent-ui-lib-15', 'parent-ui-lib-16', 'parent-ui-lib-17', 'parent-ui-lib-18', 'parent-ui-lib-19', 'parent-ui-lib-20', 'parent-ui-lib-21'"
+    },
+    {
+      "candidate_start": 93302,
+      "candidate_end": 93303,
+      "before": "C",
+      "after": "W"
+    },
+    {
+      "candidate_start": 93304,
+      "candidate_end": 93308,
+      "before": "NSUM",
+      "after": "RK"
+    },
+    {
+      "candidate_start": 93311,
+      "candidate_end": 93311,
+      "before": "",
+      "after": "1"
+    },
+    {
+      "candidate_start": 93312,
+      "candidate_end": 93315,
+      "before": "COM",
+      "after": ""
+    },
+    {
+      "candidate_start": 93316,
+      "candidate_end": 93319,
+      "before": "ILE",
+      "after": "A"
+    },
+    {
+      "candidate_start": 93320,
+      "candidate_end": 93320,
+      "before": "",
+      "after": "TIAL"
+    },
+    {
+      "candidate_start": 93325,
+      "candidate_end": 93343,
+      "before": "_ZERO_TEST_PARENTS",
+      "after": ""
+    }
+  ],
+  "verified_reconstruction": true
+}

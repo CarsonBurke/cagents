@@ -1,0 +1,135 @@
+{
+  "schema": "pr1549_current_main_search_source_freeze_v3",
+  "utc": "2026-10-31T15:25:31.885979+00:00",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main",
+  "branch": "fix/fw16-pr1549-search-current-main",
+  "head": "c28e76c72425a59abd32d977cef2c7995e8095c3",
+  "tree": "164a8860b6740bf36734fc6bfa5d812aceafd751",
+  "parents": [
+    "9e63cde8e9e6b1e80e128c7e1aa22681840f690d"
+  ],
+  "current_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+  "feature_parent": "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+  "feature_paths_against_main": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "src/app.rs",
+    "src/app/chrome_ui.rs",
+    "src/app/git_ui.rs",
+    "src/app/palette_ui.rs",
+    "src/app/search_ui.rs",
+    "src/app/settings_ui.rs",
+    "src/fs_safety.rs",
+    "src/git_watch.rs",
+    "src/modules.rs",
+    "src/project_search.rs",
+    "src/project_search/ignore_policy.rs",
+    "src/project_search/traversal.rs",
+    "src/repository_widget.rs",
+    "src/settings.rs",
+    "src/ui_controls.rs",
+    "src/workspace_widget.rs"
+  ],
+  "pins": {
+    "Cargo.lock": {
+      "sha256": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d",
+      "blob": "20f963235fff416f76487a8a74a9f4b1d7bb4f8d"
+    },
+    "Cargo.toml": {
+      "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac",
+      "blob": "5a981df1f743b2ccf624d498d24d3df120f13116"
+    },
+    "src/app.rs": {
+      "sha256": "c020d39216c6829c1416bea8ef021489d31de9dfddacb09fb07bf917c3197f55",
+      "blob": "8afb92ad6021d854956b0981f6761427d5b742d6"
+    },
+    "src/app/chrome_ui.rs": {
+      "sha256": "978db2251313b3c27541a584195d0e7c7bcc3ae705d552c94eefb9d998728f44",
+      "blob": "045d3a144be6b5f05b1af55c0591f5154cf12a74"
+    },
+    "src/app/git_ui.rs": {
+      "sha256": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246",
+      "blob": "0a11d3c861b4ef51e27ca95a1f1161c56bc36d14"
+    },
+    "src/app/palette_ui.rs": {
+      "sha256": "982b7391ba960d12d41e8c17270deb4b82e7840d4c66b365484d15934cc1c9ea",
+      "blob": "7c4ee36200f76d82f988afff03ad5df76b5a0e07"
+    },
+    "src/app/search_ui.rs": {
+      "sha256": "c7c61de09d2cb3f1d7c8fe4f7b27dfa7af1e7de6f584ce6d6eac67b80503e534",
+      "blob": "812b30fb212924f19957cb42b8d5ce359dd7da37"
+    },
+    "src/app/settings_ui.rs": {
+      "sha256": "ebabb40f72d28a46c3721dffeca3d237d86613accebe2af50251e53a9cce073e",
+      "blob": "af78586c8a9ae19c7def6ec60850e2930c5c6925"
+    },
+    "src/fs_safety.rs": {
+      "sha256": "23e606a5132e1f519d3c44e138e96b623f5f378824f6d2c3d37375a6561301f3",
+      "blob": "c233c929275c9e32d81e9d2dc0723633d321e415"
+    },
+    "src/git_watch.rs": {
+      "sha256": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8",
+      "blob": "6dad4e31b2b6aa249c7249182d480a15d480af39"
+    },
+    "src/modules.rs": {
+      "sha256": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f",
+      "blob": "6db64e6c78a4a733ab00ed07cb780e8bdb7b05ab"
+    },
+    "src/project_search.rs": {
+      "sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6",
+      "blob": "57d7b18422355dbce3d36afdaeda1587f410b520"
+    },
+    "src/project_search/ignore_policy.rs": {
+      "sha256": "7a78519d0450b2b701fc3ff44011b25a8d800a7df6e5377273d6757dd647aeb8",
+      "blob": "2434b93e5ba3a42bf5532138fee63b98b855df69"
+    },
+    "src/project_search/traversal.rs": {
+      "sha256": "1aaa151e6f507f589f9072798e2a9d289dee7071de51da6690b17a803fb59aab",
+      "blob": "385721f63fb041b52f85059c3712a9686a040a6c"
+    },
+    "src/repository_widget.rs": {
+      "sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f",
+      "blob": "5673df0f96d439d09c7d496314cbc90bcf638c78"
+    },
+    "src/settings.rs": {
+      "sha256": "d9fffd9744ce76279865c1f9346e82e78c32d089b415f7830ddb06840b7a8932",
+      "blob": "d47d13ec269ddfd91f014bfa09b271facb2cfb6e"
+    },
+    "src/ui_controls.rs": {
+      "sha256": "ca1dfc78cd7e4cb18e6495f62ed4565debd8354e60637be62a32a7d72361b2b7",
+      "blob": "590a64a8d5a89e5d8dd61409bd8e56fae64e27f0"
+    },
+    "src/workspace_widget.rs": {
+      "sha256": "4ca92f5d0698ac66bc34199f6d6fa8043788cf2fa472da1eb5ed890965efb45e",
+      "blob": "bc3ecfaad21d667957bfb3dd0cb4d91638f6dde2"
+    }
+  },
+  "outside_feature_entries_exact_main": 2205,
+  "clean": true,
+  "merge": "Normal actual merge --no-ff. Only textual conflict ui_controls.rs resolved unionFindOption/find_options plusmain cfgtestactivity_animates andanimate_activity exports. app.rs/git_watch.rs/repository_widget.rs clean3way joins; no other manual production edits. All mainworkflow/script/config sources retained bymerge.",
+  "intended_user_task": "Keep content-search results tied to the actual selected root; stale retiring-root results cannotreplace newgeneration; temporarymissingroot hasRetrypreservingquery/focus andpressidentity. CompleteoriginalPRsearchfeature retained.",
+  "format": {
+    "official_physical1_93_check_format_start": "82d6a6",
+    "original_session": 96536,
+    "final": "29ce02",
+    "exit": 0,
+    "diff_check": "0f3a4c EXIT0"
+  },
+  "prior_results": "HOST2accepted98e11 qualifies ONLYee7 product; current ee7UI3runningb7df independentoldsource. No resulttransferto this newmergedhead. All newheadcompiles/testbodies/native/UX/WebPs/performance UNRUN.",
+  "protected": "Separate ignoredRootP2worktree, no Main15/API/provider/proof/Seed/1749/lag instrumentation edits. RootUIcontroluniononlymanualhunk; no userinstall/restart/state/probes or Cgrant.",
+  "independent_reviews": null,
+  "public_write": null,
+  "runtime": "Currentfinalheadallcompiles/owningtests/nativeUX/WebPs/performanceUNRUN; exactnewsource+reviews+freshgrantrequired. No sameheadretry or globalavailability claim.",
+  "merge_commit": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+  "fixture_correction": "Only2searchUItestsetups: StateimplementsDrop, so eliminate both ..State::default structupdates via letmutState::default and equivalentfieldassignments. Productionmethods/otherfields/assertions/executionbranches exact9e63. AddressourRetrygesturefixtureandexistingresultgesture neighbor foundbyactualee7UILib compile9E0509. Both originalbranches/casesremain unchanged.",
+  "actual_previous_negative": {
+    "acceptance": "/tmp/fw16-backend-ec204421/pr1549-b7df772a-negative-ui3-root-acceptance-v1.json",
+    "sha256": "8dd3a2e63b3a6d15e2382cb7805de1556f8e445e1a0f704b9fd2305353121668",
+    "scope": "ee7UIbincheck0/libcompile1019E0509;N/inventory/3parentsUNRUN. Negativecannotbe relabeledpass on correction."
+  },
+  "metadata_correction": {
+    "old_record": "/tmp/fw16-backend-ec204421/pr1549-current-main-search-source-freeze-v2.json",
+    "old_sha256": "4be322aeaf40e25b4b5a34aa77fe5510760cb26a8c37648f7da471e2be10dbb7",
+    "change": "Correct the prior unverified placeholder in format.final to actual original wait chunk29ce02 (session96536 EXIT0), and exact diff chunk0f3a4c. No source/code/head/tree change, no new formatter execution or result claim; prior record preserved."
+  }
+}

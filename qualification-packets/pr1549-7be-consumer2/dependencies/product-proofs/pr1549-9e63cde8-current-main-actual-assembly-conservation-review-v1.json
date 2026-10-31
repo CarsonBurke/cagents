@@ -1,0 +1,590 @@
+{
+  "CI_and_validation": {
+    "follow_plan": "/tmp/pr1549-ee7-main442-current-main-composition-plan-v1.json",
+    "format": "Root freeze records physicalRust1.93 scripts/check-format0 and diff0 at exact9e63; this reviewer did not run them, and those results do not cover later working edits.",
+    "new_head_workflow_present": true,
+    "remaining": "After the separate fixture correction is frozen/reviewed, obtain exact-head formatter/Script-contract jobs and checkout counts, affected isolated CLI/HOST/UI/integrated checks and narrow/required Rust lanes, then actual native full search/recovery/focus/gesture/large-checkout evidence and independent UX review. No future result is inferred.",
+    "statics_only": "67 source test-method definitions across four Script contracts suites, not observed counts or pass credit.",
+    "workflow_and_helpers_exact_main": true,
+    "workflow_source_sha256": "d0bd373b65d73b24c0d6df64bfe089cf20093e70566a597597d0ab15a4aff975"
+  },
+  "CI_source_pins": {
+    ".github/workflows/script-contracts.yml": {
+      "entry": {
+        "mode": "100644",
+        "oid": "68c58f9806c1a53fc7b418a4cc6b0845d1b4a095",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "d0bd373b65d73b24c0d6df64bfe089cf20093e70566a597597d0ab15a4aff975"
+    },
+    "scripts/check-format": {
+      "entry": {
+        "mode": "100755",
+        "oid": "0ae25375094f337e2e5662afac70741d18af6809",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "8ac5f5ce28fe8d80229d6048b1a20edacfc9283f3cbc9d6f5100df632d089ee7"
+    },
+    "scripts/check-format-cache.py": {
+      "entry": {
+        "mode": "100644",
+        "oid": "24a2dbfdceca8f008fe962a45fbf4b41af123831",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "d722ec3c11165c22897630d0d5197afd49bd5d156c31068534c983153d3dd00b"
+    },
+    "scripts/prepare-validation-checkout": {
+      "entry": {
+        "mode": "100755",
+        "oid": "be0f3157c54f8d8592ec73d25427e0ce6a0e7e25",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "d0c11eb5630112f09b760bb9fd11487e002c665b33e779ba7372007e812bde74"
+    },
+    "scripts/qualification/process_custody.py": {
+      "entry": {
+        "mode": "100644",
+        "oid": "f349b79d8312691d91c385b1a2c0477118ddc709",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "d9eeec3f2e228e4844695de096f85ecf465381ebd0a2c7a85e964b7103ebe0d9"
+    },
+    "scripts/run-development": {
+      "entry": {
+        "mode": "100755",
+        "oid": "3044665920d638c081ec1efada45f27b3553cbc3",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "4e185d7b8297790515ffcfaf103abff7c3ad8682bcf5893097f94ae072779016"
+    },
+    "tests/check_format.py": {
+      "entry": {
+        "mode": "100755",
+        "oid": "931d774acf925fb44a325034b57a5b9bc900aa08",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "2558dca124d3029b6fa351d777fdac377b211833481f58b77ef8a00fcb53a3e0"
+    },
+    "tests/prepare_validation_checkout.py": {
+      "entry": {
+        "mode": "100644",
+        "oid": "9c799cf97da4e3b25e64811af6afe1b3b240792d",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "8c74298c6d6caaabaf590d65ce081f4fd807f610a44203028da4ee3688507592"
+    },
+    "tests/qualification/test_process_custody.py": {
+      "entry": {
+        "mode": "100644",
+        "oid": "eb1b303c457600837fa533f5c7bda3c7cd56c74a",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "90cbae4a068bddfda052d3e517e9320278d7b63e822198986a2e2aae4930fcec"
+    },
+    "tests/run-development-zig.py": {
+      "entry": {
+        "mode": "100644",
+        "oid": "da666e0d556d18e0a83d2abcf5a6d58910c99b82",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "68582131d7bbea343801937830bb0519be438022e56de4a3d36aaa3b51910e20"
+    }
+  },
+  "Root5_exact_ee7": [
+    {
+      "body_sha256": "288947e47ecda8829a94ba78b1bda03622ceafca5fd1e94a13f6faf2c7cf8f8d",
+      "exact_ee7": true,
+      "line": 951,
+      "name": "exact_root_retirement_survives_coalescing_without_retiring_ordinary_changes",
+      "path": "src/git_watch.rs"
+    },
+    {
+      "body_sha256": "87610afeb3e1fa06c2208de59521ce35acc6fafb7ab1aeff92c62572aeef24ab",
+      "exact_ee7": true,
+      "line": 983,
+      "name": "reconciliation_reports_replaced_root_identity_but_not_configuration_removal",
+      "path": "src/git_watch.rs"
+    },
+    {
+      "body_sha256": "54845a422678fa266d42081e2991a34a24e1f3c75d4a1cb9da2930c0210a55a4",
+      "exact_ee7": true,
+      "line": 1239,
+      "name": "delivered_root_retirement_rejects_queued_old_progress_under_the_same_key",
+      "path": "src/app/search_ui.rs"
+    },
+    {
+      "body_sha256": "18e28609e795bd68609df7dc2b6b0300cb1c69c99814fbd7aa2f59edbaa7afd6",
+      "exact_ee7": true,
+      "line": 1352,
+      "name": "retry_after_temporary_root_loss_preserves_the_query_and_fences_old_controls",
+      "path": "src/app/search_ui.rs"
+    },
+    {
+      "body_sha256": "99d7236c7580970e9655c9e85225604f9323162cd55590e07d92ad5c9227cbc0",
+      "exact_ee7": true,
+      "line": 849,
+      "name": "retry_press_cannot_cross_query_generations_but_survives_ordinary_rerendering",
+      "path": "src/app/search_ui.rs"
+    }
+  ],
+  "automatic_join_conservation": {
+    "src/app.rs": {
+      "all_feature_signed_edit_bodies_exact_base_to_ee7": true,
+      "all_main_signed_edits_exact_base_to442": true,
+      "main_delta_sha256": "1c2f682332f48e91326e82efc3db1c3aa34fe0d7594d92b1fc7428c1c5413fdc",
+      "source_equals_independent_dry_merge": true
+    },
+    "src/git_watch.rs": {
+      "all_feature_signed_edit_bodies_exact_base_to_ee7": true,
+      "all_main_signed_edits_exact_base_to442": true,
+      "main_delta_sha256": "e6adefb11015a172a9f1aa201f15daad1749c22f4931059653bce9d1be6593f1",
+      "source_equals_independent_dry_merge": true
+    },
+    "src/repository_widget.rs": {
+      "all_feature_signed_edit_bodies_exact_base_to_ee7": true,
+      "all_main_signed_edits_exact_base_to442": true,
+      "main_delta_sha256": "ae90097ad82e185322bd53824209da7cefd305ef630ea4c6a9353edafe8a6884",
+      "source_equals_independent_dry_merge": true
+    }
+  },
+  "both_parent_test_body_conservation": {
+    "src/app.rs": {
+      "actual_parent_names": 275,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 269,
+        "main_changed_feature_base": 6
+      },
+      "feature_parent_names": 272,
+      "main_parent_names": 275,
+      "mixed_changed_body_names": []
+    },
+    "src/app/chrome_ui.rs": {
+      "actual_parent_names": 27,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 27
+      },
+      "feature_parent_names": 27,
+      "main_parent_names": 27,
+      "mixed_changed_body_names": []
+    },
+    "src/app/git_ui.rs": {
+      "actual_parent_names": 9,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 9
+      },
+      "feature_parent_names": 9,
+      "main_parent_names": 9,
+      "mixed_changed_body_names": []
+    },
+    "src/app/palette_ui.rs": {
+      "actual_parent_names": 30,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 30
+      },
+      "feature_parent_names": 30,
+      "main_parent_names": 29,
+      "mixed_changed_body_names": []
+    },
+    "src/app/search_ui.rs": {
+      "actual_parent_names": 9,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 9
+      },
+      "feature_parent_names": 9,
+      "main_parent_names": 0,
+      "mixed_changed_body_names": []
+    },
+    "src/app/settings_ui.rs": {
+      "actual_parent_names": 1,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 1
+      },
+      "feature_parent_names": 1,
+      "main_parent_names": 0,
+      "mixed_changed_body_names": []
+    },
+    "src/fs_safety.rs": {
+      "actual_parent_names": 25,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 25
+      },
+      "feature_parent_names": 25,
+      "main_parent_names": 24,
+      "mixed_changed_body_names": []
+    },
+    "src/git_watch.rs": {
+      "actual_parent_names": 13,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 12,
+        "main_changed_feature_base": 1
+      },
+      "feature_parent_names": 13,
+      "main_parent_names": 11,
+      "mixed_changed_body_names": []
+    },
+    "src/project_search.rs": {
+      "actual_parent_names": 19,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 19
+      },
+      "feature_parent_names": 19,
+      "main_parent_names": 0,
+      "mixed_changed_body_names": []
+    },
+    "src/project_search/ignore_policy.rs": {
+      "actual_parent_names": 2,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 2
+      },
+      "feature_parent_names": 2,
+      "main_parent_names": 0,
+      "mixed_changed_body_names": []
+    },
+    "src/project_search/traversal.rs": {
+      "actual_parent_names": 2,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 2
+      },
+      "feature_parent_names": 2,
+      "main_parent_names": 0,
+      "mixed_changed_body_names": []
+    },
+    "src/repository_widget.rs": {
+      "actual_parent_names": 211,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 211
+      },
+      "feature_parent_names": 211,
+      "main_parent_names": 202,
+      "mixed_changed_body_names": []
+    },
+    "src/settings.rs": {
+      "actual_parent_names": 86,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 86
+      },
+      "feature_parent_names": 86,
+      "main_parent_names": 85,
+      "mixed_changed_body_names": []
+    },
+    "src/workspace_widget.rs": {
+      "actual_parent_names": 42,
+      "all_both_parent_names_retained": true,
+      "body_origin_counts": {
+        "feature_or_equal": 42
+      },
+      "feature_parent_names": 42,
+      "main_parent_names": 41,
+      "mixed_changed_body_names": []
+    }
+  },
+  "exact_dry_merge_comparison": {
+    "all_other2222_entries_modes_types_blobs_exact_dry_merge": true,
+    "manual_union_blob": "590a64a8d5a89e5d8dd61409bd8e56fae64e27f0",
+    "manual_union_source_sha256": "ca1dfc78cd7e4cb18e6495f62ed4565debd8354e60637be62a32a7d72361b2b7",
+    "no_conflict_marker_in_export": true,
+    "only_one_entry_differs": "src/ui_controls.rs",
+    "whole_actual_tree_equals_dry_merge_plus_declared_export_union": true,
+    "whole_in_memory_inverse_restores_dry_tree_entry_map": true
+  },
+  "feature_pins": {
+    "Cargo.lock": {
+      "blob": "20f963235fff416f76487a8a74a9f4b1d7bb4f8d",
+      "sha256": "43601c66917777b3e330290b093dabc2b7c02936ac0448286ef57a86e3120a8d"
+    },
+    "Cargo.toml": {
+      "blob": "5a981df1f743b2ccf624d498d24d3df120f13116",
+      "sha256": "f266ff0b44fc481d814edc68c4cc5664c2a78a433984839139516492a50a81ac"
+    },
+    "src/app.rs": {
+      "blob": "8afb92ad6021d854956b0981f6761427d5b742d6",
+      "sha256": "c020d39216c6829c1416bea8ef021489d31de9dfddacb09fb07bf917c3197f55"
+    },
+    "src/app/chrome_ui.rs": {
+      "blob": "045d3a144be6b5f05b1af55c0591f5154cf12a74",
+      "sha256": "978db2251313b3c27541a584195d0e7c7bcc3ae705d552c94eefb9d998728f44"
+    },
+    "src/app/git_ui.rs": {
+      "blob": "0a11d3c861b4ef51e27ca95a1f1161c56bc36d14",
+      "sha256": "0ea0552efc8d213163bdf1fa3a5555838383a25cc48add43f34c41c7b44c3246"
+    },
+    "src/app/palette_ui.rs": {
+      "blob": "7c4ee36200f76d82f988afff03ad5df76b5a0e07",
+      "sha256": "982b7391ba960d12d41e8c17270deb4b82e7840d4c66b365484d15934cc1c9ea"
+    },
+    "src/app/search_ui.rs": {
+      "blob": "fafc5771676703baec355c91587c83dae38b0858",
+      "sha256": "a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b"
+    },
+    "src/app/settings_ui.rs": {
+      "blob": "af78586c8a9ae19c7def6ec60850e2930c5c6925",
+      "sha256": "ebabb40f72d28a46c3721dffeca3d237d86613accebe2af50251e53a9cce073e"
+    },
+    "src/fs_safety.rs": {
+      "blob": "c233c929275c9e32d81e9d2dc0723633d321e415",
+      "sha256": "23e606a5132e1f519d3c44e138e96b623f5f378824f6d2c3d37375a6561301f3"
+    },
+    "src/git_watch.rs": {
+      "blob": "6dad4e31b2b6aa249c7249182d480a15d480af39",
+      "sha256": "286120bf03a400638052d48da4105093145630d0ba43e20afc8d0a9098ddf8c8"
+    },
+    "src/modules.rs": {
+      "blob": "6db64e6c78a4a733ab00ed07cb780e8bdb7b05ab",
+      "sha256": "240be0b4b107c81b44920e250e2ba99cfbf99763463b3fc6bb5b6eac68befd6f"
+    },
+    "src/project_search.rs": {
+      "blob": "57d7b18422355dbce3d36afdaeda1587f410b520",
+      "sha256": "1f11f2889dd2afe4511712823d1c034018ad9dbf438d289700c19c2ef6299ce6"
+    },
+    "src/project_search/ignore_policy.rs": {
+      "blob": "2434b93e5ba3a42bf5532138fee63b98b855df69",
+      "sha256": "7a78519d0450b2b701fc3ff44011b25a8d800a7df6e5377273d6757dd647aeb8"
+    },
+    "src/project_search/traversal.rs": {
+      "blob": "385721f63fb041b52f85059c3712a9686a040a6c",
+      "sha256": "1aaa151e6f507f589f9072798e2a9d289dee7071de51da6690b17a803fb59aab"
+    },
+    "src/repository_widget.rs": {
+      "blob": "5673df0f96d439d09c7d496314cbc90bcf638c78",
+      "sha256": "66d2961c86f0e77c3443e9393b2fb821dfe0fd00d0dc659aed5a192d5cc16c5f"
+    },
+    "src/settings.rs": {
+      "blob": "d47d13ec269ddfd91f014bfa09b271facb2cfb6e",
+      "sha256": "d9fffd9744ce76279865c1f9346e82e78c32d089b415f7830ddb06840b7a8932"
+    },
+    "src/ui_controls.rs": {
+      "blob": "590a64a8d5a89e5d8dd61409bd8e56fae64e27f0",
+      "sha256": "ca1dfc78cd7e4cb18e6495f62ed4565debd8354e60637be62a32a7d72361b2b7"
+    },
+    "src/workspace_widget.rs": {
+      "blob": "bc3ecfaad21d667957bfb3dd0cb4d91638f6dde2",
+      "sha256": "4ca92f5d0698ac66bc34199f6d6fa8043788cf2fa472da1eb5ed890965efb45e"
+    }
+  },
+  "independent_plan": {
+    "path": "/tmp/pr1549-ee7-main442-current-main-composition-plan-v1.json",
+    "scratch_git_dir": "/tmp/pr1549-ee7-main442-merge-analysis-ckktp1se/scratch/git",
+    "sha256": "aff6ff3c0fd592a061270d32b4758d4f5400036a7809e8ef852710c190e7e8b2",
+    "unresolved_analysis_tree": "c9f6110cb9a63aadad0620e6f03fdbcf5f101d2c"
+  },
+  "known_whole_head_blocker": {
+    "attribution": "Root reported actual ee7 UI3 lib-test compilation exit101 with9 E0509 errors; this review did not inspect that original run/log or execute a compiler.",
+    "id": "INHERITED-EE7-UI-TEST-STATE-UPDATE-E0509",
+    "no_pass_transfer": "Root's ee7 UI-bincheck0 and any old HOST/UI outcomes do not qualify9e63. All actual new9e63 compiles, test bodies and native evidence remain UNRUN.",
+    "scope": "Inherited exact fixture source, not a merge-introduced delta. Root's later mutable-default/field-assignment correction is excluded and requires a distinct exact-head delta/conservation review.",
+    "source_basis": "src/app/search_ui.rs is byte-exact ee7 (fafc5771676703baec355c91587c83dae38b0858; SHA256 a24e809ac0c82e4345b2e787b86aec47414dd72d853a396c23b902c461edad3b). The two State{..State::default()} cfg(test) constructions around856/929 therefore remain in immutable9e63 while State implements Drop.",
+    "status": "BLOCKED pending separately pinned fixture-only successor"
+  },
+  "limits": [
+    "This is an assembly conservation/source pin seal only. It is neither whole-feature correctness approval nor a merge, publication, runtime, Cgrant, readiness, policy or authority certificate.",
+    "No root/source/Git/ref edits, build/test/candidate/helper execution, native/provider/session/process/account/DB/environment/resource/target probe, public write or new worker.",
+    "Only immutable9e63 objects are reviewed. Root's authorized later working fixture edits, if visible at read end, are excluded. Original ee7/f5 negatives and all historical evidence remain attached to their original heads."
+  ],
+  "manual_resolution": {
+    "exact_planned_export_union": "pub use find_options::{FindOption, find_options};\n#[cfg(test)]\npub(crate) use gauge::activity_animates;\npub use gauge::{\n    activity_spinner, animate_activity, budget_bar, budget_radial, budget_radial_toned,\n};",
+    "feature_FindOption_find_options_and_owned_exports_retained": true,
+    "no_other_manual_code_or_helper_change": true,
+    "original_main_production_animate_activity_and_test_only_accessor_retained": true,
+    "path": "src/ui_controls.rs"
+  },
+  "parent_conservation": {
+    "actual_total_entries": 2223,
+    "all2205_outside_feature_entries_exact_main": true,
+    "exactly18_changed_paths_vs_main": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "src/app.rs",
+      "src/app/chrome_ui.rs",
+      "src/app/git_ui.rs",
+      "src/app/palette_ui.rs",
+      "src/app/search_ui.rs",
+      "src/app/settings_ui.rs",
+      "src/fs_safety.rs",
+      "src/git_watch.rs",
+      "src/modules.rs",
+      "src/project_search.rs",
+      "src/project_search/ignore_policy.rs",
+      "src/project_search/traversal.rs",
+      "src/repository_widget.rs",
+      "src/settings.rs",
+      "src/ui_controls.rs",
+      "src/workspace_widget.rs"
+    ],
+    "fourteen_exclusive_feature_leaves_exact_ee7": true,
+    "no_unexpected_added_deleted_paths_or_mode_type_changes": true,
+    "three_auto_join_leaves_exact_dry_merge": true
+  },
+  "protected_main_source_pins": {
+    "src/app/shared_views.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "7fe94fa4af678c2ce609ff9e1af1f0479a605741",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "a24b6f9c3ba0d9405ca5960b2a1df1ac9db0daa8e67c81cb8ed8f42c5dd3c653"
+    },
+    "src/app/shared_views/tests/published_card_edits.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "f412ffa8d4d09c0d6dce57d59b89cd6cc83f80e1",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "fef8a7723f00ed5c45d056ac1b086702ae7ffe99413458272aab399a62ae32a9"
+    },
+    "src/control.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "d249a2f78aa0df6cef4e302f6b64444e1b2504b3",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "34edc8c12a547f01091218b1ca761a50955e7cab1e04039d45cfa0a4cd764673"
+    },
+    "src/host/chat/native_cleanup.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "f8e55c78b1bf546c3c7c901f4f0bef8b4d519b5f",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "7a5a387ff14990662f5954a2521ef7ae00e201d41ff1653f7efc139259a071dd"
+    },
+    "src/host/chat/retained_actor.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "62c7ebd6f8f44436445bd28e207940790919f89f",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "7f09fb0556d97d1a1ff5e5b98874bf601462f7cfc3a9ce2af6450f19f16fe119"
+    },
+    "src/host/client.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "c0c095db53ee07e95482f9384962fe9bf80176e6",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "a93049717e7cf637663d069816b5023eca799005814742389019eada0905aac9"
+    },
+    "src/host/state.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "51c2651272c99c9a85dbd8e44c0a3267367e8c83",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "5bcba7e2d11ab12078c864cb1e7d3651bcd940ae71264aecaeea0987214ea52f"
+    },
+    "src/model.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "b6c8bba1e6456d1a3b9291c7173c81a819fa2ba7",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "cc4455180a27d116ff43f18ccb91e55fdf4dcc6aee43efc077df31948f270ba0"
+    },
+    "src/terminal/hosted.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "19e7023ececd20ba9357e71f02e8be2fa2866d01",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "d6c65d889586ba176e7266d94057c06ec0d6f67fc5a02d69b8b81c5f226d56e3"
+    },
+    "src/terminal/ipc.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "10953637ae526fa6ef19826d7a6fe5a741812f0d",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "31e137155f4c3b36953fba8d7fc2371f7eed0daaed08cf559a47a85c76eeae32"
+    },
+    "src/terminal/worker.rs": {
+      "entry": {
+        "mode": "100644",
+        "oid": "5c03d95126372ac58582794bf5c9aa6979ccbfd9",
+        "type": "blob"
+      },
+      "exact_main": true,
+      "sha256": "e3bba3a9d77b3219a6a503ae1fb2502c9bbd7774a35aa1621a7b6a969130848c"
+    }
+  },
+  "read_end_worktree": {
+    "head": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+    "qualification": "Later Root-owned source drift, if any, excluded from immutable9e63 seal.",
+    "status": " M src/app/search_ui.rs\n"
+  },
+  "reviewer": "/root/1281_holder_reconcile_review",
+  "schema": "pr1549_9e63_current_main_actual_merge_independent_assembly_conservation_review_v1",
+  "scope": "Finite immutable9e63 actual merge/provenance/conservation against independently sealed ee7+main442 dry analysis. No repeated search correctness/UX review or whole-feature readiness approval.",
+  "source": {
+    "freeze": {
+      "path": "/tmp/fw16-backend-ec204421/pr1549-current-main-search-source-freeze-v1.json",
+      "sha256": "b931519dff87786ff0aec7c488f90abb5bf605c99b77ad254d913957ccd01ece"
+    },
+    "head": "9e63cde8e9e6b1e80e128c7e1aa22681840f690d",
+    "parents": [
+      "ee7d58f4f32ec03d53312c39c8eeeff596b55c45",
+      "4429728a1f179ea7f7eaca9667156553209a46ac"
+    ],
+    "status": "",
+    "tree": "82e0c5430b0b4ee8ea1c3e483ce8ce99eab7b6c7",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-search-current-main"
+  },
+  "source_configuration": {
+    "Cargo_lock_main_exact_base": true,
+    "Cargo_toml_main_exact_base": true,
+    "UI_added_optional_dependencies": [
+      "dep:ignore",
+      "dep:memchr"
+    ],
+    "UI_existing_members_retained": true,
+    "all_feature_definitions_other_than_UI_exact_main": true,
+    "ignore": {
+      "optional": true,
+      "version": "0.4"
+    },
+    "main_public_protocol_version": 127,
+    "memchr": {
+      "optional": true,
+      "version": "2.8"
+    },
+    "qualification": "No private startup128/issued-return129/Main15 API port, permission/proof/native/quarantine/Seed/1749 policy or lifecycle change is imported here. Full18path feature preserved; only UI optional ignore/memchr additions differ in Cargo features.",
+    "terminal_ipc_exact_both_parents": true
+  },
+  "test_conservation_qualification": [
+    "Names are static source parent names, not observed N. For each test parent in touched Rust paths, the actual function body equals the common/feature body, or the current-main body where that side changed from the merge base. No both-sides-changed body required an unreviewed manual merge.",
+    "Current-main's six app parent bodies and its modified git-watch directory-recreation parent are retained. Fourteen exclusive feature leaves preserve every original feature test exactly. All five Root retirement/Retry function bodies equal ee7 exactly, including the subsequently reported invalid fixture construction.",
+    "Every other source path outside18 retains main mode/type/blob, conserving its tests and production source byte-for-byte. These checks establish source conservation, not successful compilation or execution."
+  ],
+  "verdict": "ASSEMBLY_CONSERVATION_CLEAR_WHOLEHEAD_UI_TEST_COMPILE_BLOCKED"
+}

@@ -1,0 +1,40 @@
+{
+  "kind": "ADDITIVE_SOURCE_ARGV_AND_SCOPE_RECONCILIATION_NOT_RUNTIME_EQUIVALENCE",
+  "original_DATA_sha256": "7190a9f8d0825b75bc5bbf1b5a6acd06c66183fe89d1bc7dfd6bb06999fe6a40",
+  "mandatory_addendum_sha256": "28c949506a78c96eda81a0a791c731851f6e29cc2a1c01cb1f268663262e3993",
+  "consumer_DATA_sha256": "ad7c371d8ba90548dd1584a06612ed36ff5922c6cc7ad1cb2241879b64660044",
+  "binary_checks": [
+    {
+      "label": "ceditor-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "-p",
+        "ceditor",
+        "--bin",
+        "ceditor"
+      ],
+      "seconds": 480
+    },
+    {
+      "label": "integrated-ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--features",
+        "integrated-browser",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 1800
+    }
+  ],
+  "artifact_groups": [],
+  "no_runtime_equivalence_or_old_N_claim": true,
+  "zero_parents_are_true": true,
+  "no_inventory": true,
+  "all_runtime": "UNRUN",
+  "no_new_C_lane_or_profile": true
+}
