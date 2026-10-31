@@ -398,10 +398,19 @@
     "log_bound_bytes": 8388608,
     "appearance_record_cap": 256,
     "driver_cap_assessment": "Per root, unborn has two captures; populated baseline has seven common captures plus small401 pagination captures and up to seven After query captures. Hover/scroll/captures do not themselves enter AppearanceKey. Loading/completion/query/selection/workspace/source-generation transitions can emit dedup records; source supplies no scheduling upper bound below256. Original cap unchanged; any stop warning or 257th record is HOLD, not a silent freshness promise.",
-    "comparison": "Actual geometry + full adapter fingerprint + observer/main identity + applied Core scale bits + actual native factor/provenance. Growing raw log offsets/read timestamps and ordinary state generations excluded from equality but preserved as raw evidence.",
+    "comparison": "Actual geometry + full adapter fingerprint + observer/main identity + applied Core scale bits + actual native factor/provenance + validated producer observation_generation + canonical complete parsed semantic state (history/head/rows/loading/selection/inspector/workspace/source). A->B and A->B->A cross-capture transitions fail equality. Only raw log offsets/read timestamps/unrelated log growth are excluded and retained separately.",
     "freshness_limit": "Deduplicated view state and adapter selection are NOT per-capture/present acknowledgements. Native factor remains null without actual matching Rescaled.",
     "original_build_provenance": null,
     "actual_log_records": null,
-    "runtime": "UNRUN"
+    "runtime": "UNRUN",
+    "correction": {
+      "parent": "e3740e1f204808a7fbfab2c7f00013eaed92111c",
+      "negative_sha256": "ce34d5484931dc3fd66b47aff503c3c8950212f6ced74c2cf42e63f7fd19a3a9",
+      "scope": [
+        "ADAPTER1 eleven exact fields + closing brace",
+        "FRAME1 semantic state + meaningful observation generation capture-critical"
+      ],
+      "execution": "UNRUN; no parser case executed"
+    }
   }
 }

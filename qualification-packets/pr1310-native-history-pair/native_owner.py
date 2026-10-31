@@ -1185,9 +1185,12 @@ class NativeHistoryOwner:
                 if end == len(lines):
                     pending = True
                     break
-                require(end - index == 13, "selected-adapter resolved field count changed")
                 block = "AdapterInfo {\n" + "\n".join(lines[index + 1:end + 1])
-                adapters.append(self._history_adapter(block))
+                adapter = self._history_adapter(block)
+                # Exact grammar returns the eleven named fields. Count those
+                # semantic fields plus the closing brace, not a second literal.
+                require(end - index == len(adapter) + 1, "selected-adapter resolved field count changed")
+                adapters.append(adapter)
                 require(len(adapters) == 1, "multiple selected-adapter records are ambiguous")
                 index = end
             index += 1
@@ -1218,7 +1221,10 @@ class NativeHistoryOwner:
                 "actual applied theme differs from exact Dark lane")
         stable_appearance = (binding.generation, binding.ui_pid, binding.xid,
                             appearance["observer_instance"], appearance["window_id"],
-                            appearance["applied_ui_scale_bits"], theme)
+                            appearance["applied_ui_scale_bits"], theme,
+                            appearance["observation_generation"],
+                            json.dumps(appearance["state"], allow_nan=False,
+                                       sort_keys=True, separators=(",", ":")))
         native = (appearance["native_scale"], appearance["native_scale_bits"],
                   appearance["native_scale_source"], appearance["native_scale_generation"])
         evidence = {"generation": binding.generation, "pid": binding.ui_pid, "xid": binding.xid,

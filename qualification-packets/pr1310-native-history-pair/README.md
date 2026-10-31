@@ -111,7 +111,7 @@ compiler grant, cleanup claim or native proof transfers into this packet.
 It reads only the original retained UI log FD, preserving append bytes/offsets
 and identities separately from frame equality. It validates every completed
 version1 appearance record from the paired producers and exactly one selected
-wgpu-types28 adapter (twelve fields). Actual Dark/Core scale are readback;
+wgpu-types28 adapter (eleven fields). Actual Dark/Core scale are readback;
 requested GL/software and configured scale1 are not observations. Native scale
 stays unknown without a real matching Rescaled. The observation is deduplicated
 view state, not a compositor-present or per-capture acknowledgement.
@@ -120,8 +120,11 @@ A zero-record or current incomplete append can read-only poll inside the same
 original deadline. Complete malformed records, conflicting observers/data,
 producer-stop/cap warnings, rewrite/truncation or multiple selections refuse.
 Capture equality compares actual geometry, adapter, main/observer identity, Core
-scale and native factor/provenance; ordinary source/workspace generations, log
-offsets and read timestamps stay in raw evidence without creating false changes.
+scale, native factor/provenance, validated observation generation and complete
+canonical parsed state. History/selection/loading/inspector/workspace/source
+changes fail equality, including A→B→A via the meaningful producer generation.
+Only log offsets, read timestamps and unrelated log growth stay outside equality;
+they remain in raw evidence.
 
 The mandatory `renderer_build` schema in owner-contract.json binds actual source,
 lock, resolved parser-producer files, matched UI digest and original immutable
@@ -147,3 +150,9 @@ matched builds/data, unknown child statuses, service TERM policy, physical
 release, native factors/frames/UX/performance all remain separate HOLD gates.
 `root-interface.md` is retained byte-exact as the historical driver ABI and
 requirements document; it does not supply the still-missing actual entry.
+
+The original e374 consumer is preserved as SOURCE_BLOCKED (ADAPTER1/FRAME1).
+This source-only successor derives the canonical closing offset from the exact
+parsed eleven-field grammar plus its brace and makes actual producer state
+transitions capture-critical. No whole-evidence equality or parser fallback was
+introduced. No pure parser case, owner function or runtime was executed.
