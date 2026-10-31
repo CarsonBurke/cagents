@@ -5,6 +5,7 @@ This leaf implements the real worker, not the still-missing parent controller.
 Its arguments identify immutable inputs and an existing absolute deadline; they
 are not User authorization, a C allocation, or evidence of a successful build.
 Importing this module performs no native import, acquisition, or launch.
+NOT SUBMITTABLE: actual original parent/C custody and reviewed coupling absent.
 """
 
 import argparse
@@ -107,29 +108,102 @@ def source_module(name, path, expected, deadline):
     return module
 
 
-def emit(value):
-    """Original parent must retain this pipe/file and its ORIGINAL worker wait."""
-    payload = (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
-    require(len(payload) <= MAX_REPORT, "worker report exceeds original byte cap")
-    sys.stdout.buffer.write(payload)
-    sys.stdout.buffer.flush()
+def close_attempted(binding, attempts):
+    return any(item["binding"] is binding or item["generation"] == binding.generation
+               for item in attempts)
 
 
-def held(owner, error):
+def close_once(owner, binding, attempts):
+    """Retain original identity BEFORE a possibly ambiguous close invocation."""
+    require(binding.owner is owner and any(item is binding for item in owner.bindings),
+            "close requires the original owner's binding object")
+    require(not close_attempted(binding, attempts),
+            "original close already attempted; do not replay or infer closure")
+    record = {"binding": binding, "original_binding_object": id(binding),
+              "generation": binding.generation, "called": False, "returned": False,
+              "binding_closed_at_intent": binding.closed, "error": None}
+    attempts.append(record)
+    try:
+        record["called"] = True
+        owner.close_history_root(binding)
+        record["returned"] = True
+        record["binding_closed_after_return"] = binding.closed
+    except BaseException as error:
+        record.update(error={"type": type(error).__name__, "reason": str(error)[:4096]},
+                      binding_closed_after_exception=binding.closed)
+        raise
+
+
+def close_facts(attempts):
+    # The original objects remain in main's ledger, never replaced by these
+    # serialized correlation IDs or an invented UI-death/closed assertion.
+    return [{key: value for key, value in item.items() if key != "binding"}
+            for item in attempts]
+
+
+def emit(value, deadline, attempts, kind):
+    """One original writer attempt; completion still needs the parent's wait."""
+    require(not attempts, "original report already attempted; no output replay")
+    record = {"kind": kind, "serialization_called": False, "serialization_returned": False,
+              "payload_bytes": None, "write_called": False, "write_returned": False,
+              "write_count": None, "flush_called": False, "flush_returned": False,
+              "completed": False, "failed_stage": None, "error": None}
+    attempts.append(record)  # Retain intent even if the first fence refuses.
+    stage = "serialization-before"
+    try:
+        checkpoint(deadline)
+        record["serialization_called"] = True
+        payload = (json.dumps(value, sort_keys=True, allow_nan=False) + "\n").encode()
+        record["serialization_returned"] = True
+        record["payload_bytes"] = len(payload)
+        stage = "serialization-after"
+        checkpoint(deadline)
+        require(len(payload) <= MAX_REPORT, "worker report exceeds original byte cap")
+        stream = sys.stdout.buffer
+        stage = "write-before"
+        checkpoint(deadline)
+        record["write_called"] = True
+        count = stream.write(payload)
+        record["write_returned"] = True
+        record["write_count"] = count
+        stage = "write-after"
+        checkpoint(deadline)
+        require(type(count) is int and count == len(payload), "partial/unknown original report write")
+        stage = "flush-before"
+        checkpoint(deadline)
+        record["flush_called"] = True
+        stream.flush()
+        record["flush_returned"] = True
+        stage = "flush-after"
+        checkpoint(deadline)
+        record["completed"] = True
+        return record
+    except BaseException as error:
+        record.update(failed_stage=stage,
+                      error={"type": type(error).__name__, "reason": str(error)[:4096]})
+        raise
+
+
+def held(owner, error, deadline, close_attempts, report_attempts):
     """No detach, speculative cleanup, PID lookup, or new supervisor on unknown."""
     # The original parent still owns this worker Popen/pidfd and C. Its source
     # controller is a missing prerequisite, not supplied by this waiting leaf.
     try:
-        emit({"record": "pr1310-arm-retained-hold-v1", "worker_pid": os.getpid(),
-              "error_type": type(error).__name__, "error": str(error)[:4096],
-              "first_failure": None if owner is None else owner.first_failure,
-              "events": [] if owner is None else owner.events,
-              "physical_evidence": {} if owner is None else owner.physical_evidence,
-              "logical_allocation": "HELD_EXTERNAL_ROOT", "native": "UNQUALIFIED",
-              "continued_work": False})
+        if not report_attempts:
+            emit({"record": "pr1310-arm-retained-hold-v1", "worker_pid": os.getpid(),
+                  "error_type": type(error).__name__, "error": str(error)[:4096],
+                  "first_failure": None if owner is None else owner.first_failure,
+                  "events": [] if owner is None else owner.events,
+                  "physical_evidence": {} if owner is None else owner.physical_evidence,
+                  "close_attempts": close_facts(close_attempts),
+                  "logical_allocation": "HELD_EXTERNAL_ROOT", "native": "UNQUALIFIED",
+                  "continued_work": False}, deadline, report_attempts, "retained-negative")
     finally:
         # An original deadline expiring does not authorize abandoning children
         # or retrying an ambiguous close. Signals latch; no task is polled here.
+        # HOLD1's finite-completion concern remains: retaining this SAME owner
+        # is allowed for genuine uncertainty, but supplies no terminal/PASS/C
+        # return. The deadline bounds new work, not safe-retention latency.
         while True:
             signal.pause()
 
@@ -181,6 +255,7 @@ def main():
     checkpoint(deadline)
     owner = None
     generations = []
+    close_attempts, report_attempts = [], []
     flow_completed = False
     try:
         custody = custody_module.Custody(cancelled)
@@ -228,7 +303,7 @@ def main():
             fixture = observations.Fixture.from_owned_bytes(manifest, index, dataset)
             driver = driver_module.HistoryDriver(owner, atspi, image, arm, fixture)
             driver.run_current_dataset()
-            owner.close_history_root(driver.binding)
+            close_once(owner, driver.binding, close_attempts)
             generations.append(owner.history_application_outcome(driver.binding))
         flow_completed = True
     except BaseException as error:
@@ -240,7 +315,7 @@ def main():
     try:
         for binding in owner.bindings:
             if not binding.closed:
-                owner.close_history_root(binding)
+                close_once(owner, binding, close_attempts)
                 generations.append(owner.history_application_outcome(binding))
         settlement = owner.settle_history_services()
         # Final report is a separate original-worker writer. Its return and
@@ -252,14 +327,17 @@ def main():
               "worker_sha256": arguments.worker_sha256,
               "original_whole_deadline": deadline, "stop_signals": STOP_SIGNALS,
               "flow_method_returned": flow_completed, "generations": generations,
+              "close_attempts": close_facts(close_attempts),
               "settlement": settlement, "events": owner.events,
               "logical_allocation": "HELD_EXTERNAL_ROOT",
               "application": "UNKNOWN_PENDING_EXTERNAL_APPLICATION_REVIEW",
-              "native": "UNQUALIFIED", "C_release": "NOT_PERFORMED_BY_WORKER"})
+              "native": "UNQUALIFIED", "C_release": "NOT_PERFORMED_BY_WORKER"},
+             deadline, report_attempts, "final-raw")
+        checkpoint(deadline)
         return 0 if flow_completed and owner.first_failure is None else 1
     except BaseException as error:
         owner.record_history_failure(error)
-        held(owner, error)
+        held(owner, error, deadline, close_attempts, report_attempts)
 
 
 if __name__ == "__main__":
