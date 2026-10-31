@@ -128,11 +128,28 @@ but emits nothing until an original matching Window::Opened event is received.
 That iced window ID is not an OS drawable/XID or a compositor mapping receipt.
 
 The existing fixture subscription observes original event_window before mapping
-to existing messages. Native scale begins None; only a matching original finite
-positive Window::Rescaled event sets Some. The initialized window_scale_factor,
-configured UI scale and an allocated ID never supply native-scale evidence. No
-initial native-scale query is invented: if Rescaled never arrives, native_scale
-stays null/unknown and physical-scale matching remains unqualified.
+to the unchanged geometry messages. Native scale begins None. After the original
+matching Window::Opened, the fixture's existing update tail may issue one real
+window::scale_factor(original_id) Task. The existing intercepted
+StartupWindowOpened message also checks the same latch, without entering the
+normal startup handshake. The query callback is bound to the observer UUID,
+original window ID, Opened generation, request UUID and native-scale generation.
+A finite positive reply is accepted only while that exact request is pending
+and the original window remains open; invalid or missing replies stay unknown.
+No retry or configured/initialized/default scale supplies an observation.
+
+The patched iced-runtime Task sends GetScaleFactor for that ID; the patched
+iced-winit handler reads window.raw.scale_factor() and replies only if that
+window exists. This is read-only query support, not proof that the Task executes
+or replies. A later actual Rescaled event supersedes an in-flight query and
+keeps its own provenance, even when its numeric value equals a prior query.
+Closed, foreign, replaced-observer and obsolete request/generation callbacks
+cannot set native scale. The log and its dedup key retain window-open generation,
+query-versus-Rescaled provenance, accepted native generation and query request
+UUID when applicable. An allocated Core ID/StartupWindowOpened alone still does
+not establish Opened proof. No atomic scale/present/compositor guarantee is made.
+Two owning reducer guard parents are authored, uncompiled and UNRUN; they do not
+exercise the native API or qualify a window, factor, callback or capture.
 
 Target `cagents::native_history` emits bounded `appearance_json` records, version 1,
 record kind `history-native-appearance`: original UI PID, opened iced window ID,
