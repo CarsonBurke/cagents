@@ -31656,7 +31656,7 @@ mod tests {
     ) -> Vec<Message> {
         use iced::advanced::{
             Layout, Shell, clipboard, layout,
-            widget::{Tree, operation},
+            widget::{Operation, Tree, operation},
         };
         use iced::futures::StreamExt;
         let ring = app.shared_return_notice_ring_for_test();
