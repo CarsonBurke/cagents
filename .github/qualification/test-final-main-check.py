@@ -181,7 +181,11 @@ class BoundedCheckerTests(unittest.TestCase):
         reject('selected-repository-artifact',lambda d:d['repository_selected']['artifact']['target'].update(name='wrong'))
         reject('selected-repository-identity',lambda d:d['repository_selected'].update(executable=library_binary))
         reject('selected-repository-identity',lambda d:d['repository_selected'].update(observed_binary_sha256='not-a-sha256'))
-        reject('selected-repository-identity',lambda d:change_repository(d,lambda a:a.update(executable='/outside/repository_git_contract')))
+        def outside_target(value):
+            binary = '/outside/repository_git_contract'
+            change_repository(value,lambda artifact:artifact.update(executable=binary))
+            value['repository_selected']['executable'] = binary
+        reject('selected-repository-identity',outside_target)
         def forbidden_library_feature(value):
             value['compiled'][3]['features'].append('host')
             value['selected']['artifact'] = copy.deepcopy(value['compiled'][3])
