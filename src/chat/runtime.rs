@@ -2117,7 +2117,9 @@ impl Actor {
                     );
                 }
             }
-            if stdout_eof && self.pending.is_empty() {
+            // A parsing budget can leave complete lines queued even after
+            // the pipe closes. Keep fair poll passes until those drain.
+            if stdout_eof && self.pending.is_empty() && !frames_ready {
                 if !self.output.is_empty() {
                     return Err("Provider ended with an incomplete JSON line".into());
                 }
