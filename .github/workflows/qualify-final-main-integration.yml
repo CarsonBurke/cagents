@@ -36,6 +36,10 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           path: control
           persist-credentials: false
+      - name: Refuse unestablished native producer roles before cache or Cargo
+        id: native_admission
+        shell: bash
+        run: python3 control/.github/qualification/final-main-prepare.py --admission-only "$GITHUB_WORKSPACE/control"
       - name: Verify the unchanged setup and warm-cache gate sources
         shell: bash
         run: |
@@ -101,10 +105,18 @@ jobs:
         if: ${{ success() && steps.warm_cache.outcome == 'success' }}
         shell: bash
         run: python3 control/.github/qualification/final-main-qualification.py "$GITHUB_WORKSPACE/product" "$GITHUB_WORKSPACE/control" --focused-only
+      - name: Prepare BOTH matched native heads before FIRST private desktop
+        id: preparation
+        if: ${{ success() && steps.focus.outcome == 'success' && steps.native_admission.outcome == 'success' }}
+        shell: bash
+        run: python3 control/.github/qualification/final-main-prepare.py --prepare "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product"
       - name: Exercise one actual chooser flow on Before and After
         id: native
+        if: ${{ success() && steps.preparation.outcome == 'success' }}
         shell: bash
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1600x1000x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 control/.github/qualification/final-main-native.py "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product"
+        run: |
+          python3 control/.github/qualification/final-main-prepare.py --verify "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product"
+          exec xvfb-run --auto-servernum --server-args="-screen 0 1600x1000x24 -nolisten tcp -dpi 96" dbus-run-session -- /usr/bin/python3 control/.github/qualification/final-main-native.py "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/before" "$GITHUB_WORKSPACE/product"
       - name: Upload the separate chooser-native evidence
         if: ${{ !cancelled() && (steps.native.outcome == 'success' || steps.native.outcome == 'failure') }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

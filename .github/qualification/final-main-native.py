@@ -7,6 +7,7 @@ import ast
 import ctypes
 from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,7 @@ RENDERER = {'ICED_BACKEND': 'wgpu', 'WGPU_BACKEND': 'gl', 'LIBGL_ALWAYS_SOFTWARE
 children = []
 ownership_errors = []
 cancellation = None
+preparation = None
 stopped = set()
 out = None
 arm = None
@@ -630,42 +632,23 @@ def open_monitor(resources, output):
         return monitor
 
 
-def compile_helper(control, checkout, label, target, base):
-    artifact = out / (label + '-development-ui.jsonl')
-    with artifact.open('xb') as stream:
-        command(['cargo', 'build', '--locked', '--profile', 'dev-runtime', '--no-default-features',
-                 '--features', 'development,ui', '--lib', '--message-format=json'], cwd=checkout, timeout=4200, stdout=stream)
-    rows = [json.loads(line) for line in artifact.read_text().splitlines() if line.startswith('{')]
-    libs = [name for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'cagents'
-            and set(row.get('features', [])) == {'development', 'ui'} for name in row['filenames'] if name.endswith('.rlib')]
-    serde = [name for row in rows if row.get('reason') == 'compiler-artifact' and row.get('target', {}).get('name') == 'serde_json'
-             and 'lib' in row['target']['kind'] for name in row['filenames'] if name.endswith('.rlib')]
-    assert len(libs) == len(serde) == 1
-    helper = base / (label + '-fixture')
-    argv = ['rustc', '--edition=2024', str(control / '.github/qualification/final-main-fixture.rs'),
-            '--extern', 'cagents=' + libs[0], '--extern', 'serde_json=' + serde[0],
-            '-L', 'dependency=' + str(target / 'dev-runtime/deps'), '-o', str(helper)]
-    for row in rows:
-        if row.get('reason') == 'build-script-executed':
-            for path in row.get('linked_paths', []):
-                argv += ['-L', path]
-    command(argv, timeout=180)
-    return helper
+def preparation_module(control):
+    path = control / '.github/qualification/final-main-prepare.py'
+    spec = importlib.util.spec_from_file_location('final_main_preparation',path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)  # Stdlib-only; no native or GI import/init.
+    return module
 
 
 def exercise(control, checkout, label, helper, base, target, plan, resources):
     global arm
     arm = label
     root = base / label
-    root.mkdir(mode=0o700)
-    env = dict(os.environ)
-    for key, suffix in [('HOME','home'),('XDG_DATA_HOME','data'),('XDG_CONFIG_HOME','config'),('XDG_CACHE_HOME','cache'),
-                        ('XDG_STATE_HOME','state'),('TMPDIR','tmp'),('XDG_RUNTIME_DIR','runtime')]:
-        path = root / suffix
-        path.mkdir(mode=0o700)
-        env[key] = str(path)
-    env.update(RENDERER, ACCESSIBILITY_ENABLED='1', NO_AT_BRIDGE='0', WINIT_UNIX_BACKEND='x11',
-               XDG_CURRENT_DESKTOP='GNOME')
+    assert root.resolve(strict=True) == root and stat.S_IMODE(root.stat().st_mode) == 0o700
+    inventory = plan['_prepared']['arms'][label]['inventory']
+    env = preparation.environment(dict(os.environ),str(base),label,inventory)
+    preparation.verify_environment(plan['_prepared']['arms'][label],env)
+    preparation.check_arm_files(plan['_prepared']['arms'][label])
     descriptors = root / 'portal-descriptors'
     descriptors.mkdir(mode=0o700)
     official_descriptor = Path('/usr/share/xdg-desktop-portal/portals/gtk.portal')
@@ -674,8 +657,6 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     assert sha(descriptor) == sha(official_descriptor)
     env['XDG_DESKTOP_PORTAL_DIR'] = str(descriptors)
     (out / (label + '-gtk.portal')).write_bytes(descriptor.read_bytes())
-    env['CARGO_HOME'] = os.environ.get('CARGO_HOME', str(Path.home() / '.cargo'))
-    env['RUSTUP_HOME'] = os.environ.get('RUSTUP_HOME', str(Path.home() / '.rustup'))
     icon = root / 'config/cosmic/com.system76.CosmicTk/v1/icon_theme'
     icon.parent.mkdir(parents=True)
     icon.write_text('"Adwaita"\n')
@@ -714,6 +695,7 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
         assert len(values) <= 1
         return values[0] if values else None
     window = wait(owned_window, 1800)
+    preparation.check_arm_files(plan['_prepared']['arms'][label])  # Refuse changed normal-runner output.
     pid = int(command(['xdotool', 'getwindowpid', window]).strip())
     ui_identity = processes()[pid]
     assert pid in family(processes(), {ui.pid}), 'Native window must belong to this actual development runner'
@@ -905,6 +887,7 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
     (out / (label + '-source.json')).write_text(json.dumps(dict(revision=plan[label if label == 'before' else 'product'],
         ui_pid=pid, ui_start_stamp=ui_identity['stamp'], ui_sha256=ui_sha, window=int(window), matched_triplet=triplet,
         helper_sha256=sha(helper), fixture_sha256=sha(control / '.github/qualification/final-main-fixture.rs'),
+        prepared_environment_sha256=plan['_prepared']['arms'][label]['environment_sha256'],
         portal_backend=dict(pid=backend.pid, owner=backend_owner, executable='/usr/libexec/xdg-desktop-portal-gtk',
                             sha256=sha(Path('/usr/libexec/xdg-desktop-portal-gtk')), identity=backend.owned_identity),
         portal_frontend=dict(pid=frontend.pid, owner=monitor.frontend_owner, executable='/usr/libexec/xdg-desktop-portal',
@@ -923,6 +906,7 @@ def exercise(control, checkout, label, helper, base, target, plan, resources):
         scope='Synthetic recipe and exact raw wrong-issuer sibling; actual UI, clipboard worker, portal and cancel. No provider/actor started.'), indent=2) + '\n')
     for name, value in triplet.items():
         assert sha(Path(value['path'])) == value['sha256'], 'Matched executable changed during its native arm'
+    preparation.check_arm_files(plan['_prepared']['arms'][label])
 
 
 def complete_arm_cleanup(resources, label, errors):
@@ -1003,7 +987,7 @@ def finish_cleanup(errors):
 
 
 def main():
-    global out, cancellation
+    global out, cancellation, preparation
     user()
     assert len(sys.argv) == 4
     control, before, after = [Path(value).resolve(strict=True) for value in sys.argv[1:]]
@@ -1019,15 +1003,19 @@ def main():
         libc = ctypes.CDLL(None, use_errno=True)
         if libc.prctl(36, 1, 0, 0, 0) != 0:
             raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER failed')
-        (out / 'source.json').write_text(json.dumps(dict(product=plan['product'], before=plan['before'],
-            control_sha=command(['git', '-C', str(control), 'rev-parse', 'HEAD']).decode().strip(),
-            control_tree=command(['git', '-C', str(control), 'rev-parse', 'HEAD^{tree}']).decode().strip(),
-            driver_sha256=sha(Path(__file__)), fixture_sha256=sha(control / '.github/qualification/final-main-fixture.rs'),
+        identity = dict(sha=command(['git','-C',str(control),'rev-parse','HEAD']).decode().strip(),
+                        tree=command(['git','-C',str(control),'rev-parse','HEAD^{tree}']).decode().strip())
+        preparation = preparation_module(control)
+        prepared,prepared_sha = preparation.load_prepared(control,plan,{'before':before,'after':after},dict(os.environ),identity)
+        plan['_prepared'] = prepared  # Runtime-only; source plan remains immutable.
+        (out / 'source.json').write_text(json.dumps(dict(product=plan['product'],before=plan['before'],
+            control_sha=identity['sha'],control_tree=identity['tree'],
+            driver_sha256=sha(Path(__file__)),fixture_sha256=sha(control / '.github/qualification/final-main-fixture.rs'),
+            preparation_sha256=prepared_sha,preparation_module_sha256=sha(control / '.github/qualification/final-main-prepare.py'),
+            late_environment_sha256={key:preparation.digest(os.environ[key].encode()) for key in preparation.LATE if key in os.environ},
             workflow_sha256=sha(control / '.github/workflows/qualify-final-main-integration.yml'),
-            run=os.environ['GITHUB_RUN_ID'], attempt=os.environ['GITHUB_RUN_ATTEMPT']), indent=2) + '\n')
-        base = Path(tempfile.mkdtemp(prefix='h2018.', dir='/tmp')).resolve(strict=True)
-        os.chmod(base, 0o700)
-        target_dir = Path(os.environ['CARGO_TARGET_DIR']).resolve(strict=True)
+            run=os.environ['GITHUB_RUN_ID'],attempt=os.environ['GITHUB_RUN_ATTEMPT']),indent=2) + '\n')
+        base = Path(prepared['base'])
         launcher = next(path for path in [Path('/usr/libexec/at-spi-bus-launcher'), Path('/usr/lib/at-spi2-core/at-spi-bus-launcher')] if path.exists())
         spawn([str(launcher), '--launch-immediately'], log=(out / 'atspi.log').open('wb'), role='accessibility-launcher')
         for key in ('IsEnabled', 'ScreenReaderEnabled'):
@@ -1054,7 +1042,10 @@ def main():
             assert command(['git', '-C', str(checkout), 'rev-parse', 'HEAD']).decode().strip() == pin['sha']
             assert command(['git', '-C', str(checkout), 'rev-parse', 'HEAD^{tree}']).decode().strip() == pin['tree']
             assert not command(['git', '-C', str(checkout), 'status', '--porcelain=v1']).strip()
-            helper = compile_helper(control, checkout, label, target_dir, base)
+            prepared_arm = prepared['arms'][label]
+            target_dir = Path(prepared_arm['inventory']['target'])
+            helper = Path(prepared_arm['helper'])
+            preparation.check_arm_files(prepared_arm)
             resources = {'desktop_owners':[child.owned_identity for child in children
                          if child.owned_identity is not None and child.poll() is None]}
             try:

@@ -4,6 +4,7 @@ The original22/100 stay at b3/3e. This file never merges historical logs or
 claims native Runtime internals that only the four owning Rust parents inspect.
 """
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import re
@@ -279,6 +280,34 @@ def check_flow(label, receipt, source, fixture_events, native_events, payload, f
     need(receipt['inspector_before']['present'] is True and receipt['inspector_after']['present'] is False, 'ordinary-inspector-setup')
 
 
+def check_preparation(root, control, plan, source, native_source):
+    path = control / '.github/qualification/final-main-prepare.py'
+    spec = importlib.util.spec_from_file_location('checked_preparation',path)
+    preparation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(preparation)  # Stdlib definitions only, no native import.
+    raw = (root / 'preparation/prepared.json').read_bytes()
+    record = json.loads(raw)
+    need(native_source['preparation_sha256'] == digest(raw)
+         and native_source['preparation_module_sha256'] == digest(path.read_bytes()),'preparation-native-binding')
+    preparation.verify_data(record,plan,dict(sha=source['control_sha'],tree=source['control_tree']),
+                            digest(path.read_bytes()),digest((control / '.github/qualification/final-main-fixture.rs').read_bytes()))
+    inventories = {label:record['arms'][label]['inventory'] for label in ('before','after')}
+    preparation.validate_inventories(plan,record['roles'],inventories,source['cargo_target_directory'])
+    need(inventories['after']['checkout'] == source['product_directory']
+         and inventories['before']['checkout'] == str(Path(source['product_directory']).parent / 'before'),'prepared-checkout-roles')
+    compiled = {}
+    for row in record['commands']:
+        label,graph = row['arm'],row['graph']
+        for stream,suffix in [('stdout','.jsonl'),('stderr','.stderr.log')]:
+            original = row[stream]
+            need(Path(original['path']).name == label + '-' + graph + suffix,'preparation-log-name')
+            ref = dict(path='preparation/' + Path(original['path']).name,sha256=original['sha256'],bytes=original['bytes'])
+            raw_log = member(root,ref)
+            if stream == 'stdout': compiled[label,graph] = [json.loads(line) for line in raw_log.decode().splitlines() if line.startswith('{')]
+    preparation.verify_artifacts(record,compiled,str(Path(source['product_directory']).parent / 'control/.github/qualification/final-main-fixture.rs'))
+    return record
+
+
 def inspect(root, control):
     need(root.resolve(strict=True) == root and control.resolve(strict=True) == control, 'canonical-roots')
     members = {}
@@ -312,9 +341,15 @@ def inspect(root, control):
          and all(native_source[key] == source[key] for key in ('control_sha','control_tree','workflow_sha256','run','attempt')), 'native-source-binding')
     need(native_source['driver_sha256'] == digest((control / '.github/qualification/final-main-native.py').read_bytes())
          and native_source['fixture_sha256'] == digest((control / '.github/qualification/final-main-fixture.rs').read_bytes()), 'native-helper-source')
+    prepared = check_preparation(root,control,plan,source,native_source)
     native_events = [json.loads(line) for line in (root / 'native/events.jsonl').read_text().splitlines()]
     for label in ('before', 'after'):
         receipt = json.loads((root / ('native/' + label + '-source.json')).read_text())
+        arm = prepared['arms'][label]
+        need(receipt['prepared_environment_sha256'] == arm['environment_sha256']
+             and receipt['helper_sha256'] == arm['files']['fixture']['sha256'] and all(
+             receipt['matched_triplet'][name] == {key:arm['files'][name][key] for key in ('path','sha256')}
+             for name in ('cagents','cagentsd','cagents-ui')),'prepared-runtime-set')
         fixtures = [json.loads(line) for line in (root / ('native/' + label + '-fixture.jsonl')).read_text().splitlines()]
         sources = [row for row in fixtures if row['event'] == 'source']
         need(len(sources) == 1, 'one-source-witness')
@@ -339,7 +374,8 @@ def inspect(root, control):
         original22_100_provenance=plan['retained_native_scope'], qualified=False,
         retained_evidence_verified_here=False, outside_local_checker=OUTSIDE, observed_members=members,
         limits=['Exact Runtime Target/editor/cursor/allocation and opaque full launch dimensions are asserted by the four owning Rust parents; native observes exact source, account/cwd footer, image/text, real portal and continuation input.',
-                'CI-observed binary digests are source-bound receipts, not recomputed from unavailable retained executable bytes.'])
+                'CI-observed binary digests are source-bound receipts, not recomputed from unavailable retained executable bytes.',
+                'Both native preparations are separate from ten Rust records; normal development-runner Cargo rechecks remain mandatory, and changed prepared bytes invalidate the arm.'])
     return result
 
 

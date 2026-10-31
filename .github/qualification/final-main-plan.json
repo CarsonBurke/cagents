@@ -51,6 +51,12 @@
     "owned_hook_pipe_holder_settles_when_no_hook_handoff_starts",
     "owned_hook_pipe_fixture_preserves_failures_and_settles_after_real_handoff"
   ],
+  "native_preparation": {
+    "status": "UNESTABLISHED: no admissible genuine native producer inventories",
+    "roles": {"before": null, "after": null},
+    "requirement": "Both distinct source/profile-bound native roles must be pinned by separately reviewed source before any Cargo/cache inspection/resource creation. No current positive admission or bootstrap.",
+    "ordering": "Global BOTH-heads preparation before FIRST private desktop; normal runner rechecks remain mandatory."
+  },
   "new_native": {
     "flow": "idle-draft-peer-recipe-during-real-chooser-cancel",
     "arms": ["before", "after"],
