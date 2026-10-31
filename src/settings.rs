@@ -2000,6 +2000,11 @@ fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut
         (base.as_table(), desired.as_table(), current.as_table_mut())
     {
         for (key, value) in desired {
+            // An unchanged optional field may have been removed on disk. Do
+            // not resurrect it just because it is absent from `current`.
+            if base.get(key) == Some(value) {
+                continue;
+            }
             match (base.get(key), current.get_mut(key)) {
                 (Some(previous), Some(current)) => merge_changed_fields(previous, value, current),
                 _ => {
@@ -3307,6 +3312,41 @@ mod tests {
         let restored = load(&path).unwrap();
         assert_eq!(restored.terminal_font_size, 19.0);
         assert_eq!(restored.app_theme, AppTheme::Light);
+    }
+
+    #[test]
+    fn stale_window_preserves_external_optional_field_removals() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let base = AppSettings {
+            editor_font_family: Some("monospace".into()),
+            editor_font_size: Some(18.0),
+            ..AppSettings::default()
+        };
+        save(&path, &base).unwrap();
+
+        // An editor clears both overrides and adds a key this build does not
+        // know while the window still holds the original settings snapshot.
+        let mut document = saved(&path);
+        document.remove("editor_font_family");
+        document.remove("editor_font_size");
+        document.insert("future_preference".into(), "keep me".into());
+        fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+
+        let mut desired = base.clone();
+        desired.terminal_font_size = 19.0;
+        save_merged(&path, &base, &desired).unwrap();
+        let restored = load(&path).unwrap();
+        assert_eq!(restored.editor_font_family, None);
+        assert_eq!(restored.editor_font_size, None);
+        assert_eq!(restored.terminal_font_size, 19.0);
+        assert_eq!(saved(&path)["future_preference"], "keep me".into());
+
+        // A deliberate change to the removed preference still wins.
+        desired.editor_font_size = Some(20.0);
+        save_merged(&path, &base, &desired).unwrap();
+        assert_eq!(load(&path).unwrap().editor_font_size, Some(20.0));
+        assert_eq!(load(&path).unwrap().editor_font_family, None);
     }
 
     #[test]
