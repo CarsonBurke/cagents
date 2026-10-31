@@ -1,0 +1,77 @@
+{
+  "schema": "eb7-startup-recovery-packet-A-three-isolated-binary-checks-v1",
+  "kind": "FIXED_SOURCE_DATA_ONLY_NO_EXECUTION_OR_GRANT",
+  "job_kind": "A_CHECKS_ONLY",
+  "head": "eb7ff16beb8864349573231521c5d4eab5270cc6",
+  "tree": "8d60fb0154109a82861f9b595f2b7296e4f55c26",
+  "parent": "b914f9d9b55527aa1bb22d591968c58958d717ee",
+  "product_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition",
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 600
+    },
+    {
+      "label": "host-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "seconds": 600
+    },
+    {
+      "label": "ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 900
+    }
+  ],
+  "artifact_groups": [],
+  "counts": {
+    "checks": 3,
+    "lib_compilations": 0,
+    "ELF_inventories": 0,
+    "test_invocations": 0,
+    "qualifying_outer_parents": 0,
+    "test_groups": 0,
+    "total_phases": 3
+  },
+  "packet_deadline_seconds": 2400,
+  "caps_override": {
+    "authority_reference": "EC53a57eea as relayed by Root task",
+    "supersedes": "design_v1 A600/600/600 only",
+    "phase_caps_seconds": [
+      600,
+      600,
+      900
+    ],
+    "sum_caps_seconds": 2100,
+    "remaining_overhead_seconds": 300,
+    "extends_live_workload": false
+  },
+  "actual_grant": null,
+  "actual_queue_admission_capacity_runtime": null,
+  "packet_B": "DATA_ONLY_UNASSIGNED_NOT_IMPLEMENTED"
+}

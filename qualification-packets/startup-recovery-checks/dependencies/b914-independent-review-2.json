@@ -1,0 +1,479 @@
+{
+  "created_utc": "2026-10-31T08:18:35.474671+00:00",
+  "task": "/root/1892_ready_attachment_review",
+  "scope": "Combined #2030/#2029 cross-oracle/API source review, frozen uncommitted aggregate on4429",
+  "result": "SOURCE_CLEAR_BOUNDED_CROSS_ORACLE_API",
+  "verdict": "No concrete test/API/type/causal-vacuity or fixture ownership blocker found in the two appended cross parents or source-level compatibility of the preserved test families. New tests meaningfully cover hibernated current owner vs lagging durable proof and actual EOF/held-ACK/fresh-ACK/currentness loss with identical Pending at stop. All actual Rust/native execution remains UNRUN. This is not production transport/gate approval or merge approval.",
+  "freeze": {
+    "path": "/tmp/fw16-backend-ec204421/startup-recovery-2030-2029-on-4429-source-v1/freeze.json",
+    "sha256": "de41158a936a4086958ca95b126c621cf16b119c50870e25131bbe49df5727bc",
+    "head_before": "ac54c12bb54dc433366fe2eeb992faa348428acb",
+    "head_after": "ac54c12bb54dc433366fe2eeb992faa348428acb",
+    "base_tree": "14e8a22e3945ab63f5fd1fd50b56fcb03e3ff3ff",
+    "target_main": "4429728a1f179ea7f7eaca9667156553209a46ac",
+    "source_inputs": [
+      "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+      "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd"
+    ],
+    "files": [
+      {
+        "path": "src/app.rs",
+        "sha256_before": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
+        "sha256_after": "22aa490df20e15110048cd9cdceaba2a365afff85c8bd442efb649f3b0ce92cf",
+        "start_end_match": true,
+        "bytes": 1380000
+      },
+      {
+        "path": "src/app/chat_ui.rs",
+        "sha256_before": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+        "sha256_after": "89157262169923105ad2d63ef79cda6a4fc76c9cd3b6ba726d2f601a1028dd84",
+        "start_end_match": true,
+        "bytes": 1214271
+      },
+      {
+        "path": "src/app/saved_terminal.rs",
+        "sha256_before": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+        "sha256_after": "0703f9cc4f8255d6c8896394575f8177ec88e4ef9b09bc005f6939e05df7a0bd",
+        "start_end_match": true,
+        "bytes": 37956
+      },
+      {
+        "path": "src/app/shared_views.rs",
+        "sha256_before": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
+        "sha256_after": "84f5c058963419c53f87435d1f9a3b0aa16fb048196d205a2e210458da9b3ffd",
+        "start_end_match": true,
+        "bytes": 233376
+      },
+      {
+        "path": "src/app/shared_views/tests/startup_terminals.rs",
+        "sha256_before": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+        "sha256_after": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+        "start_end_match": true,
+        "bytes": 29571
+      },
+      {
+        "path": "src/app/startup_gate.rs",
+        "sha256_before": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+        "sha256_after": "b3c219bd5f209c0d17b937ce231f613d7737abc45d2e7c581b4fd7786ed4332d",
+        "start_end_match": true,
+        "bytes": 28521
+      },
+      {
+        "path": "src/app/startup_gate/attachment_tests.rs",
+        "sha256_before": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+        "sha256_after": "ea53b6954256db7c61398c48d1009f31e148e18c6c9169b565e7f3a5653c4717",
+        "start_end_match": true,
+        "bytes": 18278
+      },
+      {
+        "path": "src/app/startup_gate/tests.rs",
+        "sha256_before": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+        "sha256_after": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+        "start_end_match": true,
+        "bytes": 30317
+      },
+      {
+        "path": "src/control.rs",
+        "sha256_before": "37c489822925d1e5a62fe6a87aee2e226379979ae399f34957065277f948a3e9",
+        "sha256_after": "37c489822925d1e5a62fe6a87aee2e226379979ae399f34957065277f948a3e9",
+        "start_end_match": true,
+        "bytes": 299253
+      },
+      {
+        "path": "src/host/agent_execution/terminals.rs",
+        "sha256_before": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+        "sha256_after": "2544087dae9936d68112512aa3263baf687a4bc05eb02a99af12f743fd68bbdf",
+        "start_end_match": true,
+        "bytes": 9314
+      },
+      {
+        "path": "src/host/client.rs",
+        "sha256_before": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+        "sha256_after": "edbc47b6a792da070bc6d9bdc721bf378375c6098a7f9bc803f2f7d14f1638d7",
+        "start_end_match": true,
+        "bytes": 155313
+      },
+      {
+        "path": "src/host/state.rs",
+        "sha256_before": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+        "sha256_after": "76c4ac44cfa70751f1e473ebfcc6ca6abecf0b1af2cafb70220332bfc7bf7090",
+        "start_end_match": true,
+        "bytes": 336801
+      },
+      {
+        "path": "src/terminal/hosted.rs",
+        "sha256_before": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+        "sha256_after": "4a97e21a38a90efae530c9f35de48f633ff0afda2756ef8d006f74012a95ecc8",
+        "start_end_match": true,
+        "bytes": 186517
+      },
+      {
+        "path": "src/terminal/ipc.rs",
+        "sha256_before": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+        "sha256_after": "8d46e960e3d00fb35f111959ea6cbcf98f1ac6749cd715d5fe47636d1763f885",
+        "start_end_match": true,
+        "bytes": 113283
+      },
+      {
+        "path": "src/terminal/surface.rs",
+        "sha256_before": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21",
+        "sha256_after": "da134f33421603317eb7183574147879e227b33d863756e081fa8588b51f4d21",
+        "start_end_match": true,
+        "bytes": 6261
+      }
+    ]
+  },
+  "new_parents": [
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "name": "hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "line": 349,
+      "end_line": 422,
+      "function_sha256": "7737094f2b927fd29b467f86a3e6166c465af3540c20b9469f8b23d0f791ef20"
+    },
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "name": "actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+      "line": 425,
+      "end_line": 507,
+      "function_sha256": "9bb607670d14f96c771ed8c82622b12a44bbdc98337f36ce7204d7dacc5119c4"
+    }
+  ],
+  "source_conservation": {
+    "donors": [
+      {
+        "revision": "d2a0f4f8f873a75f462dd6d24d1a5ea2b0126b37",
+        "path": "src/app/shared_views/tests/startup_terminals.rs",
+        "sha256": "0fa2cfaf9bd1a7a9cab447643f80cb03ea9439da77a67dba43b17a23345573bb",
+        "whole_file_exact": true
+      },
+      {
+        "revision": "78ee17d7f74a6238d12fd0dd38f74de4545e4fbd",
+        "path": "src/app/startup_gate/tests.rs",
+        "sha256": "0c87c715d782676cfec534600b6bb6b9fd0c9cbedcbe7da701b1ab7e2e6f2d6c",
+        "whole_file_exact": true
+      }
+    ],
+    "original_R1_three_parent_prefix_bytes": 10641,
+    "original_R1_prefix_sha256": "1791c2c35f6c3d5f68878cc45f667c720d7de727d1ff0ae4a1527100fde4760b",
+    "original_R1_prefix_exact": true,
+    "original_V3_tests_file_exact": true,
+    "focused_original8_plus_B9_R2_2_tests_file_exact": true,
+    "source_parent_inventory": {
+      "existing2029": 13,
+      "shared_terminal_original_plus_R2": 10,
+      "original_R1": 3,
+      "new_cross": 2,
+      "total": 28
+    },
+    "inventory_kind": "SOURCE_ONLY_NOT_COMPILED_TEST_INVENTORY"
+  },
+  "cross_oracle_assessment": [
+    {
+      "parent": "hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "anchors": [
+        "src/app/startup_gate/attachment_tests.rs:348-421",
+        "src/app/startup_gate.rs:514-552"
+      ],
+      "assessment": "Meaningful. Original real handle is accepted through actual Connect/Attach response, hibernated, and shared by the external surface and the App surface. startup_connected_owners must include that exact complete current proof despite detached hibernated rendering. Matching typed Ready is first accepted. Only the durable saved proof is then changed to A; the test explicitly requires the actual owner basis to stay B. Stale Ready/Retained responses from A are checked with the original opened/Pending/current-B basis, so saved-proof equality cannot authenticate A. A separate terminal_surface_ready mismatch asserts that observable owner evidence does not waive readiness/descriptor mismatch."
+    },
+    {
+      "parent": "actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+      "anchors": [
+        "src/app/startup_gate/attachment_tests.rs:425-506",
+        "src/app/startup_gate.rs:187-262",
+        "src/app/startup_gate.rs:448-476"
+      ],
+      "assessment": "Meaningful. Real original socket EOF is followed by acceptance of the same handle actual reconnect; remembered proof survives and no permanent refusal is fabricated, while current owner basis becomes empty. verify clears cached Ready, and the older typed Retained completion cannot fail the new waiting phase. Second Connected alone still yields no owner; exact fresh Attach ACK makes B observable again, and a new matching Ready response is accepted."
+    },
+    {
+      "id": "SAME_PENDING_STOP_BASIS",
+      "anchors": [
+        "src/app/startup_gate/attachment_tests.rs:489-506"
+      ],
+      "assessment": "The final stop is the decisive basis-only control. The fresh accepted observation is cloned and initially asserted current. Stopping removes current ownership; the test asserts exact equality of actual Pending with its pre-stop value because another loading pane masks the stopped terminal failure. Endpoint, complete proof and opened/context remain unchanged; startup_observation_current must nevertheless become false. Thus this assertion is not accidentally satisfied only by changing Pending IDs. It is a direct validator oracle, not a claim that the entire cache-reuse/launcher path was executed after stop."
+    },
+    {
+      "id": "TYPED_COMPONENT_COMPLETIONS",
+      "anchors": [
+        "src/app/startup_gate/attachment_tests.rs:316-346",
+        "src/app/startup_gate/attachment_tests.rs:447-489"
+      ],
+      "assessment": "reserved_answer calls actual reserve_startup_inspection for the current real Pending/owner basis and returns a typed completion under its ticket; it deliberately does not start an RPC worker. Each reserved ticket is consumed before the next reservation. The future inspected timestamp before EOF verification suppresses an otherwise-created unexecuted producer when delayed completion triggers a nested verify for changed Pending. Its reset for fresh typed dispatch is explicit fixture behavior, not a production timing/pass claim."
+    }
+  ],
+  "API_lifetime_and_cleanup": [
+    "waiting_beside moves a TerminalSurface wrapping the same handle into App; external surface clone and App surface share the actual worker/publication. The fresh wrapper does not fabricate proof or alter handle visibility. No positive authority constructor or injected Ui Ready exists in the cross additions.",
+    "All new signatures use existing visible types: Option<Pending>, InspectionContext, Observed, HostSessionProof and TerminalSurface; privacy permits child tests to access the parent gate methods. live_proof returns owned proof, so Some(old) comparison and later borrows are valid; NLL ends the earlier mutable stored-session borrow before other App reads.",
+    "Typed answers and returned Tasks remain local synchronous component values; no async spawn, nested Runtime or Message Send bound is introduced.",
+    "No new peer thread exists in the appended code. Original accept/read/write and wait_ready helpers retain their 2s deadlines. A new peer stream and App may be declared in different order, but both tests retain an external surface clone: App dropping first cannot cause the last worker join while a live same-thread peer must still be serviced; stream drops before the last external handle on panic. Explicit stop requests socket shutdown; final original handle Drop retains worker join ownership. No actual join/TLS settlement was observed.",
+    "The future timestamp is a private fixture clock only. Existing reservation uses Instant::elapsed; no explicit subtraction of the future inspected time is introduced. The real producer, endpoint resolver and provider connection are never polled by these cross tests."
+  ],
+  "existing_13_compatibility": [
+    {
+      "anchors": [
+        "src/app/startup_gate/tests.rs:7-29",
+        "src/app/startup_gate.rs:288-316",
+        "src/app.rs:5964-6010"
+      ],
+      "assessment": "Merged qualification does not change the existing synthetic waiting terminals into actual attaches. waiting inserts Loading runtime entries and durable cards but registers no lifecycle entries. Qualification may enqueue them, but attach_next_restored_agent rejects lifecycle=None before creating any attach Task or begin-terminal-start fence. Thus the new serial attach/retry scheduler does not consume a terminal start lease or produce a refusal in these thirteen fixtures. The helper recent-inspected suppression remains as previously reviewed."
+    },
+    {
+      "anchors": [
+        "src/app/startup_gate/tests.rs:300-341",
+        "src/app/startup_gate.rs:529-552"
+      ],
+      "assessment": "Existing connected-owner cases use Chat runtimes through actual Ready adoption. The changed terminal owner branch current_attachment is not accidentally selected for those chat fixtures; the unchanged read-only chat accessor still supplies the fixed fixture proof. No existing parent constructs a confirmed TerminalSurface; new cross parents provide the newly covered terminal branch."
+    },
+    {
+      "anchors": [
+        "src/app/startup_gate/tests.rs:496-584",
+        "src/app/startup_gate/tests.rs:615-772"
+      ],
+      "assessment": "Real private save/ack and actual held-worker parents retain the same source bodies. Ended-terminal phases skip qualification. On return to pending, the restored same-ID Loading terminal still has no lifecycle entry, so no unpolled attach worker is reserved. Inspection occupancy/throttle assertions therefore remain about the original controlled inspection worker, not an attach race. No new detached ledger or saved-Unavailable entries are installed by these fixtures."
+    },
+    {
+      "anchors": [
+        "src/app/startup_gate/tests.rs:117-294",
+        "src/app/startup_gate.rs:641-679"
+      ],
+      "assessment": "Original retained/stall/cap/ticket predicates remain compatible with the merged failure/retry ledger. Common bounded startup_detail preserves the meaningful required text, single-line/UTF8 bound and 90-second/cap controls. No new assertion was silently removed or source-body changed."
+    }
+  ],
+  "focused_2030_R2_compatibility": {
+    "source_file": "src/app/shared_views/tests/startup_terminals.rs",
+    "assessment": "All original8 plus two B9 R2 parents and helpers are byte-exact to d2a donor. Shared view APIs, saved-terminal APIs and hosted/surface APIs are byte-exact to that donor. Current App differs from donor only by the StartupStateInspected Message variant and its dispatch arm, leaving original attach-start/finish/result APIs used by those tests conserved. The original fake handles are held on their live framed peers until cleanup, so the new current_attachment predicate has a source-defined positive path after their initial real attachment. Existing injected refusal/virtual-retry and exact target admission inputs remain the same. This is bounded compatibility, not a repeat of the B9 R2 production/oracle review or execution of its tests.",
+    "protocol_limit": "Aggregate ipc source is not byte-identical to d2a; typed frame/descriptor constructor APIs used here are retained, but full wire/transport production compatibility belongs to its assigned reviewer."
+  },
+  "blocking_findings": [],
+  "coverage_limits": [
+    "The EOF case changes Pending when the terminal becomes reconnecting; its delayed response can be rejected by that Pending fence. The separate final STOP case holds Pending equal and isolates exact current-owner basis validation.",
+    "Stale-owner Ready/Retained after durable proof lag and STOP are tested through the actual eligibility validator, not the full launch acknowledgment/periodic cache reuse consumer. Initial accepted typed observations and real EOF verify cache loss are exercised.",
+    "Typed inspections are component inputs only; there is no actual ControlClient startup-state RPC, production daemon/provider, native UI or account/caller authorization proof.",
+    "Original R1 pre-reader-join timing gap, original #2030 owning worker-route/original receipt gaps and previous native UX gaps are not closed or waived by these two cross parents.",
+    "No fully owner-unknown same-ID attempt identity, scale/responsiveness, actual multiwindow persistence/update or integrated/browser behavior is qualified.",
+    "All parent counts are source inventory only. No Rust check/test compile, runtime pass, native screenshot or cleanup/TLS execution claim is made."
+  ],
+  "all_parent_source_ledger": [
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "retained_daemon_recovery_reports_its_reason_at_once_and_keeps_the_panes",
+      "line": 118,
+      "end_line": 153,
+      "function_sha256": "ea45b37b3c65cba0c3b3107fcad76034515c608c267b1e5b6d194aae8825dcd2"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "retained_reason_fits_one_launcher_handshake_line",
+      "line": 156,
+      "end_line": 168,
+      "function_sha256": "b6075dcdf5b5aded5b5f829bab2423009fa84fa93778e784f885fae454029da2"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_ready",
+      "line": 171,
+      "end_line": 188,
+      "function_sha256": "5efd3c49dd6b23834d6904b0c5e093d85b426eb494bcab5896a228915d5969b6"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "settling_panes_or_a_restoring_daemon_keep_the_gate_waiting",
+      "line": 191,
+      "end_line": 226,
+      "function_sha256": "98eb6790464fc04a61f35d8bc3c67b622ea90ed407811c9d338e40b7d57c57d7"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "the_inventory_budget_still_caps_a_daemon_that_keeps_restoring",
+      "line": 229,
+      "end_line": 251,
+      "function_sha256": "d073ce50557c5a3968476e2859872eeb8b3d050197d29ecf9271dfd0931052db"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "inspection_refuses_remote_before_resolving_an_ordinary_starting_bridge",
+      "line": 254,
+      "end_line": 268,
+      "function_sha256": "9a9f4b5356de36e5333f9572a516ec487e9bc665cb45eb4857c9808fe6211e57"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "old_inspection_cannot_clear_a_new_ticket_or_change_its_progress",
+      "line": 271,
+      "end_line": 294,
+      "function_sha256": "3f9a1f0a33259d327cd8f391803fccedb650178b47e89cff6668b19afcb1deac"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "current_connected_owner_refuses_old_or_incomplete_inspection_proofs",
+      "line": 351,
+      "end_line": 402,
+      "function_sha256": "07e1e9d2eab5c09cb1924962649921434c490032542f7d8ce19e750e47011cda"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "losing_a_connected_owner_invalidates_cached_and_delayed_ready",
+      "line": 417,
+      "end_line": 451,
+      "function_sha256": "18b13ab5a81c7777872083e4a0d330bd56f36b51a0bdeff59df972d7a3c16e69"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "cached_ready_is_revalidated_after_a_new_owner_connects",
+      "line": 454,
+      "end_line": 476,
+      "function_sha256": "0c4b3017539ef40957f5ed60bdddd5575c2d61ec3411d387ca009c717de1520b"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "delayed_retained_cannot_override_current_readiness_or_save_completion",
+      "line": 496,
+      "end_line": 584,
+      "function_sha256": "e10a7ee9668536134583b9c7193c846e22875276e8a937a45eb6bf1bac591443"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "a_retired_worker_keeps_occupancy_until_its_original_completion",
+      "line": 615,
+      "end_line": 743,
+      "function_sha256": "bed3c5f97413f9f9bdfda8dd3f476be3d1298f5c2f942ffb6a35009b4dcd32a9"
+    },
+    {
+      "path": "src/app/startup_gate/tests.rs",
+      "name": "a_stale_inspection_does_not_hide_a_real_save_error",
+      "line": 746,
+      "end_line": 773,
+      "function_sha256": "f8d32fb3ad7462e0eed16eb5ccfdafca55a4b8f74c50305938d3839f96daf8ca"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "reopened_shared_window_qualifies_offscreen_terminals_without_opening_them",
+      "line": 297,
+      "end_line": 316,
+      "function_sha256": "d92e13f1cbb91ea84dee49752a8cc9952e9df28b13a55fdaac5ddd3accd326fa"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "reopened_shared_window_reports_a_refused_offscreen_attach",
+      "line": 322,
+      "end_line": 347,
+      "function_sha256": "88939ec6d7acc5b53255b585b3fd8c24e8a3ab7a33efd9a07a122dd8898efbbd"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "shared_offscreen_terminal_waits_for_registry_admission_before_attaching",
+      "line": 350,
+      "end_line": 368,
+      "function_sha256": "5c00b3ac9ac7a1c1d9f528128601ce28e7ce111c122b1de662c8695e5af45cb9"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "a_replaced_shared_session_is_qualified_again",
+      "line": 373,
+      "end_line": 409,
+      "function_sha256": "ccf09d641e14fb6aeb61837c53c82d0d11c780f958a9c17adcde16acb8aaadd5"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "a_detached_attach_is_retried_after_a_pause_and_then_reported",
+      "line": 415,
+      "end_line": 444,
+      "function_sha256": "156aebea92a544bbd5bb80f97629d9d65753b18fcdb8047d7c6cccbefa541649"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "a_shared_pane_attaches_its_exact_hosted_terminal_under_the_current_proof",
+      "line": 449,
+      "end_line": 475,
+      "function_sha256": "7a4d62f6af0a14a9396b41962a8a3dba50d414df75e521c1a31b6d8156298a13"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "a_hibernated_offscreen_attachment_qualifies",
+      "line": 481,
+      "end_line": 488,
+      "function_sha256": "0e7cb8d4ff265a0c66bd5f2338e429d614d416b0a2ba70df1e986c55b3cbb3c1"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "a_detached_offscreen_attach_is_reported_rather_than_awaited",
+      "line": 493,
+      "end_line": 502,
+      "function_sha256": "4b3135becab802a63a6529eed7271fbb39d9fee26e2c68c5d2cd743b06d5582a"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "restored_observed_row_waits_for_its_own_seed_ack_after_connected",
+      "line": 577,
+      "end_line": 635,
+      "function_sha256": "b674c14b1b99e9ac7218120896b836bee36fd32e9ef34c9499292c3cdaa8c537"
+    },
+    {
+      "path": "src/app/shared_views/tests/startup_terminals.rs",
+      "name": "a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row",
+      "line": 638,
+      "end_line": 782,
+      "function_sha256": "690cc3e210778a7e59d7c7ccc3b9f6416e61accccdfb322643a4536f9432956b"
+    },
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "name": "hibernated_startup_waits_for_fresh_exact_ack_after_socket_eof",
+      "line": 154,
+      "end_line": 229,
+      "function_sha256": "ae76d53d9d18c810dceb563e6a6405ce9efde52e356e3ff25f643ef544d87b4d"
+    },
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "name": "another_resumed_terminal_cannot_hide_the_actual_attach_refusal",
+      "line": 232,
+      "end_line": 282,
+      "function_sha256": "3cd70f5a2dd0e015a8c83d89755be5d247e09d720580d28f5a5d26d0e009baa7"
+    },
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "name": "oversized_terminal_refusal_fits_the_startup_handshake_without_losing_recovery",
+      "line": 285,
+      "end_line": 314,
+      "function_sha256": "f2da300fed1ee7039345c8233cf985ba39e13cd5dadc2125b8493654bf298606"
+    },
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "name": "hibernated_current_owner_fences_inspection_even_when_the_saved_proof_lags",
+      "line": 349,
+      "end_line": 422,
+      "function_sha256": "7737094f2b927fd29b467f86a3e6166c465af3540c20b9469f8b23d0f791ef20"
+    },
+    {
+      "path": "src/app/startup_gate/attachment_tests.rs",
+      "name": "actual_reconnect_retires_cached_inspection_until_fresh_acceptance",
+      "line": 425,
+      "end_line": 507,
+      "function_sha256": "9bb607670d14f96c771ed8c82622b12a44bbdc98337f36ce7204d7dacc5119c4"
+    }
+  ],
+  "evidence": {
+    "actual_Rust_checks": "UNRUN",
+    "actual_Rust_tests": "UNRUN",
+    "native_UX": "UNRUN",
+    "original_worker_join": "SOURCE_ONLY_NOT_OBSERVED",
+    "account_verification": "NOT_PERFORMED",
+    "allocation_or_grant": "NONE",
+    "merge_approval": false
+  },
+  "preserved_prior_receipts": [
+    {
+      "path": "/tmp/pr2029-v3-startup-fixtures-independent-source-review-v1.json",
+      "sha256": "d743c76cf1ad7830f076283a7ddbeee7165c85da485eb16baf70ec5c47beb911"
+    },
+    {
+      "path": "/tmp/pr2030-R1-attachment-fixture-api-independent-review-v1.json",
+      "sha256": "dbed3cd6cea1ecbac07f7d9ad1f4402386755320d081ee2a6855e8b736ea9af9"
+    },
+    {
+      "path": "/tmp/pr2030-34917347-startup-terminal-test-evidence-audit-v1/review.json",
+      "sha256": "87a1f619340235233cb8bfb592b80ce2e87a4f8d70f5167073dc9cdaa7b42c15"
+    }
+  ],
+  "operations": "Read/hash frozen source, exact donor Git objects and previous scoped source fixtures only. Write only one additive /tmp review. No source edit, import/invocation, build/test/native/helper/endpoint/process/DB/env/account/lock/target probe, remote/public write, C allocation, peer message or new worker."
+}

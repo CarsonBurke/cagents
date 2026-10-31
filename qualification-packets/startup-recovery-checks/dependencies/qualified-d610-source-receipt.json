@@ -1,0 +1,703 @@
+{
+  "schema": "pr1239-73487c8d-host9-controller-source-freeze-v1",
+  "status": "SOURCE_PREPARED_EXECUTION_HOLD_REQUIRES_FRESH_NONAUTHOR_REVIEW_AND_DISTINCT_EC_GRANT",
+  "control_head": "d610e0ff6834c8023010645d9c65d9fbdf515061",
+  "control_tree": "3dec0e58099374e3f7f57c01c70da76cfcd2ff54",
+  "parent": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+  "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control",
+  "branch": "research/pr1239-7348-host9-b9",
+  "private_git_common": "/tmp/coord-b9-1239-7348-host9-control-git",
+  "product_head": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+  "product_tree": "0ac51f1aa553ddd30fd0e993d25397b08e58172f",
+  "fixed_product_cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1239-inventory-varint-fixture",
+  "source_authorization": "Root relayed EC fde8a4f3-14f1-4e27-b468-18ed77e80e93 exact7348 boundedSOURCEonly, no Cgrant/queue/execution/publication. EC97228b6c maina322 EOFimplementation not adopted.",
+  "runner_sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+  "plan_sha256": "88b0b79fb975089b08d85d2b30a4a6bad1df5d7d5f2f3d9c28db188618695c6d",
+  "source_binding_sha256": "1ac98654c62492f04483c3b3ef8dc4ffd646fd7e6a4f4cf37935a11ca50bc258",
+  "source_files": {
+    "qualification-packets/pr1239-7348/README.md": {
+      "sha256": "e67d42065eb684c3dd2bc2d072659fbc583d5e4228d31dbb752b312c4978cd6d",
+      "bytes": 5512
+    },
+    "qualification-packets/pr1239-7348/command-data-v3-to-v4-delta.json": {
+      "sha256": "71be2f38e1515d10bf51879627afe54622537b845d870fb6b060b18c69b68275",
+      "bytes": 2751
+    },
+    "qualification-packets/pr1239-7348/command-data-v4.json": {
+      "sha256": "a9816af90b53e587cea0cd96270cabc00c9e590731be15fa4b7731f614aa6e7e",
+      "bytes": 38925
+    },
+    "qualification-packets/pr1239-7348/dependencies/ancestor-command-data-v2.json": {
+      "sha256": "52fb82e130ab4e49a8191c1f8f88b96b8a9ec6afb33c6ea29bfd7654605f1b63",
+      "bytes": 32001
+    },
+    "qualification-packets/pr1239-7348/dependencies/command-data-v2-to-v3-delta.json": {
+      "sha256": "ecfe962a37b1158753cf1848b0e26d7951a5c89c98aaf146ff6bd5f727a4313b",
+      "bytes": 4145
+    },
+    "qualification-packets/pr1239-7348/dependencies/command-data-v3.json": {
+      "sha256": "25cc0330a49c9def7210a540c0338b6dfcdd3030b5824dbb66263dd8551864df",
+      "bytes": 28767
+    },
+    "qualification-packets/pr1239-7348/dependencies/current-publication.json": {
+      "sha256": "a0f41411668654c87dcb8a3630ee6f0a8f023438c90a0f603a6fbd00edadacc1",
+      "bytes": 1462
+    },
+    "qualification-packets/pr1239-7348/dependencies/donor-host8-plan.json": {
+      "sha256": "f9273a0b8daf00985737a61d3d475b6b4e47df2836e9d77ae1f4c420e69296bd",
+      "bytes": 35158
+    },
+    "qualification-packets/pr1239-7348/dependencies/donor-host8-run-packet.py": {
+      "sha256": "244901cd7d3e0986c51e7df2ad6c7134b424de54fe9de1c9fa5852c1dfb7ceb0",
+      "bytes": 69832
+    },
+    "qualification-packets/pr1239-7348/dependencies/fixture-source-review.json": {
+      "sha256": "63958262fb458d06156fd063dd7e2f1c6ea41afc2106f562446ee8e8f6ea3f39",
+      "bytes": 12732
+    },
+    "qualification-packets/pr1239-7348/dependencies/oracle-source-review.json": {
+      "sha256": "0f89938f74f1be76c9fd6c13c9d41de52d4f828392d5dc33fe6dda4af8c43cd2",
+      "bytes": 10805
+    },
+    "qualification-packets/pr1239-7348/dependencies/original-aa352-executor-return.json": {
+      "sha256": "ea2cb28910823bb174dac4508d9c4c6033e22e750e79905fcd88f9a95c8ac6b1",
+      "bytes": 8293
+    },
+    "qualification-packets/pr1239-7348/dependencies/original-command-data-v1.json": {
+      "sha256": "589e6e7179d4f4cef2cc912f5a5f971b0a23a0e2af505ad611a3808c0d30aa9a",
+      "bytes": 23791
+    },
+    "qualification-packets/pr1239-7348/dependencies/product-source-conservation.json": {
+      "sha256": "c4a9f0022401c0879ffefddcfa0ce3077e6b774211e3f12742dfbd8c45616bc1",
+      "bytes": 2112
+    },
+    "qualification-packets/pr1239-7348/dependencies/production-source-review.md": {
+      "sha256": "5001ebbc7a3c04d4a9bf543231ada7b439645c010efc8efcb69af82be529991f",
+      "bytes": 4127
+    },
+    "qualification-packets/pr1239-7348/dependencies/publication-receipt.json": {
+      "sha256": "4c3584c73fcb538045dfd2cb4d281b343602ded6b924f17c6a40c8e85f9b85a2",
+      "bytes": 1667
+    },
+    "qualification-packets/pr1239-7348/dependencies/script-ci-original-review.json": {
+      "sha256": "db5a2b5f4f4ab0068bcc3d2739c2471eed76505d3c13064ef5c402274ef76be5",
+      "bytes": 31033
+    },
+    "qualification-packets/pr1239-7348/dependencies/source-freeze-v2.json": {
+      "sha256": "153736a6be31a8f9299ef82ad57e5d9331d43d228c458d751b85ec21fba0e5c9",
+      "bytes": 1097
+    },
+    "qualification-packets/pr1239-7348/dependencies/test-api-source-review.md": {
+      "sha256": "80918d5623bc7aebff64e123b873845822d418c60ddfac32975e24ce4e55978a",
+      "bytes": 5307
+    },
+    "qualification-packets/pr1239-7348/dependencies/test-conservation-review.json": {
+      "sha256": "b9cd13113ef28caf52475e71dea5c3ff41b04154fc0eeb0a62a3875c623183de",
+      "bytes": 15081
+    },
+    "qualification-packets/pr1239-7348/dependencies/test-source-delta.json": {
+      "sha256": "d0e1fd780ea8ea028802bbd499462a2e8e2a8291425da244beea5ca365be5a67",
+      "bytes": 1381
+    },
+    "qualification-packets/pr1239-7348/dependencies/test-source-freeze.json": {
+      "sha256": "9c9c3800c7cb8bfde71518e76ea2b6a36311f27af2fb83dcae8ba46751ae29ec",
+      "bytes": 923
+    },
+    "qualification-packets/pr1239-7348/dependencies/varint-conservation-review.json": {
+      "sha256": "e8aefe80ba69c0d8938e5b0b3f870fd184fabefd35c1e500d93397188509a93e",
+      "bytes": 10402
+    },
+    "qualification-packets/pr1239-7348/dependencies/varint-publication.json": {
+      "sha256": "f81781b19c6d4282a319d143e691de94e4b0ebd9811f009c5f47452b0931ab03",
+      "bytes": 1215
+    },
+    "qualification-packets/pr1239-7348/dependencies/varint-semantic-review.md": {
+      "sha256": "cc47bd563582accf9d09aad17a86c2097cacb3d9f01122c87f34021151f126e1",
+      "bytes": 4868
+    },
+    "qualification-packets/pr1239-7348/dependencies/varint-source-delta.json": {
+      "sha256": "582679ff656aff75f1ee6aa3230d3617d0ab01d5173708fc3d5bab1ea347b9c1",
+      "bytes": 1290
+    },
+    "qualification-packets/pr1239-7348/dependencies/varint-source-freeze.json": {
+      "sha256": "8b9063f5607310c41d191f2c7e3e2f5f4825b0a27f946012a147783e664d6b51",
+      "bytes": 540
+    },
+    "qualification-packets/pr1239-7348/donor-to-task-runner.diff.json": {
+      "sha256": "3016f690f881f792fc94a39979ccff4735b1451ed0c073e85fd8f6a2d64874a2",
+      "bytes": 23863
+    },
+    "qualification-packets/pr1239-7348/plan.json": {
+      "sha256": "88b0b79fb975089b08d85d2b30a4a6bad1df5d7d5f2f3d9c28db188618695c6d",
+      "bytes": 39928
+    },
+    "qualification-packets/pr1239-7348/run-packet.py": {
+      "sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+      "bytes": 76963
+    },
+    "qualification-packets/pr1239-7348/source-binding.json": {
+      "sha256": "1ac98654c62492f04483c3b3ef8dc4ffd646fd7e6a4f4cf37935a11ca50bc258",
+      "bytes": 35250
+    },
+    "qualification-packets/pr1239-7348/source-conservation.json": {
+      "sha256": "79677a8e136324786a42a31fd59dabc833b73374a4846162b398540d01075d97",
+      "bytes": 8413
+    }
+  },
+  "product_conservation": {
+    "all_product_entries_and_modes_equal_parent": true,
+    "product_entry_count": 2223,
+    "only_new_task_paths": [
+      "qualification-packets/pr1239-7348/README.md",
+      "qualification-packets/pr1239-7348/command-data-v3-to-v4-delta.json",
+      "qualification-packets/pr1239-7348/command-data-v4.json",
+      "qualification-packets/pr1239-7348/dependencies/ancestor-command-data-v2.json",
+      "qualification-packets/pr1239-7348/dependencies/command-data-v2-to-v3-delta.json",
+      "qualification-packets/pr1239-7348/dependencies/command-data-v3.json",
+      "qualification-packets/pr1239-7348/dependencies/current-publication.json",
+      "qualification-packets/pr1239-7348/dependencies/donor-host8-plan.json",
+      "qualification-packets/pr1239-7348/dependencies/donor-host8-run-packet.py",
+      "qualification-packets/pr1239-7348/dependencies/fixture-source-review.json",
+      "qualification-packets/pr1239-7348/dependencies/oracle-source-review.json",
+      "qualification-packets/pr1239-7348/dependencies/original-aa352-executor-return.json",
+      "qualification-packets/pr1239-7348/dependencies/original-command-data-v1.json",
+      "qualification-packets/pr1239-7348/dependencies/product-source-conservation.json",
+      "qualification-packets/pr1239-7348/dependencies/production-source-review.md",
+      "qualification-packets/pr1239-7348/dependencies/publication-receipt.json",
+      "qualification-packets/pr1239-7348/dependencies/script-ci-original-review.json",
+      "qualification-packets/pr1239-7348/dependencies/source-freeze-v2.json",
+      "qualification-packets/pr1239-7348/dependencies/test-api-source-review.md",
+      "qualification-packets/pr1239-7348/dependencies/test-conservation-review.json",
+      "qualification-packets/pr1239-7348/dependencies/test-source-delta.json",
+      "qualification-packets/pr1239-7348/dependencies/test-source-freeze.json",
+      "qualification-packets/pr1239-7348/dependencies/varint-conservation-review.json",
+      "qualification-packets/pr1239-7348/dependencies/varint-publication.json",
+      "qualification-packets/pr1239-7348/dependencies/varint-semantic-review.md",
+      "qualification-packets/pr1239-7348/dependencies/varint-source-delta.json",
+      "qualification-packets/pr1239-7348/dependencies/varint-source-freeze.json",
+      "qualification-packets/pr1239-7348/donor-to-task-runner.diff.json",
+      "qualification-packets/pr1239-7348/plan.json",
+      "qualification-packets/pr1239-7348/run-packet.py",
+      "qualification-packets/pr1239-7348/source-binding.json",
+      "qualification-packets/pr1239-7348/source-conservation.json"
+    ],
+    "provided_fixed_product12source_hashes_match": true,
+    "old11pins_exact": true,
+    "old8bcd_WT_0b845HOST8_7c98handoff_DATA_actual_evidence_mutated": false,
+    "no_current_main_retarget": true
+  },
+  "mechanism_conservation": {
+    "unchanged25_generic_helpers": [
+      {
+        "function": "digest",
+        "source_sha256": "0788e7bbbdfaf494d1d2ef750a769f2996eb7684c57b2286a19bf58f2abe7192",
+        "AST_sha256": "92ef250ef7266e7f158a9b0895fe88168b949481a803e901ca846a0dfebae9c5",
+        "byte_exact": true
+      },
+      {
+        "function": "now",
+        "source_sha256": "657729523cb5c0ead0b1e95551773c0d89eca7b7f361a6f59a6766df30c1b014",
+        "AST_sha256": "da086d0ca38752ebe0b5fd5a5c7cfbbd32f0b690fcdcd3ca62cb4e50dc1587cd",
+        "byte_exact": true
+      },
+      {
+        "function": "observed_wait",
+        "source_sha256": "88fcfd895b84f04795856dd3d4c37696ed97449f0d9d59187d5815acb53f15ea",
+        "AST_sha256": "adca79cffcd8872ef7801e5b2c128928e91aa64691afdea48a082dce803e16e1",
+        "byte_exact": true
+      },
+      {
+        "function": "supervision_failure",
+        "source_sha256": "2e29e4a019dc5f94a025f57035135f29ad04ace67d1b62fa0d59480b53288125",
+        "AST_sha256": "d9e4b0bd0a1163fa461417559f2600e42cbbc404d74694e3f00ae0f3c3be76cf",
+        "byte_exact": true
+      },
+      {
+        "function": "bounded_capture",
+        "source_sha256": "06789de72d141a10b36c9d48ee17a158234c650a6405fd81bda63615dcffd037",
+        "AST_sha256": "60f4317ff8e2d62b099ea4778c653f39043e475a437845ca26368e87360dc81f",
+        "byte_exact": true
+      },
+      {
+        "function": "refuse_git_routing",
+        "source_sha256": "35d4f31fbcdf3481de96af48806e906df3e803b8bc60424d82c3ba258db9970a",
+        "AST_sha256": "472baf82df5c39f3406de61bec77e5e0658f01c1f0dbc57cf0059bc9cea57de3",
+        "byte_exact": true
+      },
+      {
+        "function": "git",
+        "source_sha256": "750f5a0a211e7a6e1d2f1a588ff9a1b62bee3c7f3d943f3f3e91aebb966f4d43",
+        "AST_sha256": "15bcfccc0a1f6971e192d8e1fedf8615de8dcf84773ebbf08a8c3eea19804a9a",
+        "byte_exact": true
+      },
+      {
+        "function": "git_nul_fields",
+        "source_sha256": "dcf51e0cdeadaefb39afcf8fac9f8ee98b2e072b7389eb120b3462a175573197",
+        "AST_sha256": "60e5530499cc08629a59107784ff87448629fa0d859a61f50c95295eef31e230",
+        "byte_exact": true
+      },
+      {
+        "function": "guard_git_metadata",
+        "source_sha256": "6981f57d1fbdc04bbee15f4645fb1499eb484e12e482e0c259d80aa8421d6a7d",
+        "AST_sha256": "4c45613330782582ef3793c49b3a8f0b5c46dfaae4463d6e44155e9f713aa666",
+        "byte_exact": true
+      },
+      {
+        "function": "signal_pidfd",
+        "source_sha256": "17149731ce4e6969dcc16757c7255d1a9c047723e7d7398f3ab551991c556a0d",
+        "AST_sha256": "5c437c3f93d678a0ab88bbc5b9e2fa4291e768f16ba17ae1d59aa15274402f57",
+        "byte_exact": true
+      },
+      {
+        "function": "children",
+        "source_sha256": "27ebafc89597f6f60900c4febb525d14102b9705a50187b5790236f998a4bfb7",
+        "AST_sha256": "d62354ce7c97665d4b7657d80c294290ed3f02a5654c3fb120114d99083ac5f9",
+        "byte_exact": true
+      },
+      {
+        "function": "settle_children",
+        "source_sha256": "71151774e2b830da92121e5f0e8e5aaa5f6f2a141b26899c67a4a5190894e273",
+        "AST_sha256": "53f30624540f596bb85e1618576c921614c9aa24cef8d53fbb6253d8ccb50a3a",
+        "byte_exact": true
+      },
+      {
+        "function": "cargo_test_artifact",
+        "source_sha256": "387771c5b388c9ef3a828e5c066130512b3f7f9a3ca2d376f38e28096cf02344",
+        "AST_sha256": "d32729b4cdbcf2848ce1d9a94306c2026a0f0efbdde1d86bfd43e1213fba0c81",
+        "byte_exact": true
+      },
+      {
+        "function": "inventory_names",
+        "source_sha256": "34ae8f662a6f89d9bac93ad0bdcec483f59650bb2cb12a1997a63e256731c44c",
+        "AST_sha256": "3258e238ac447080128f5dee87f9c535796c04715436ca5882aa000927b1f0f2",
+        "byte_exact": true
+      },
+      {
+        "function": "parent_pass",
+        "source_sha256": "c4cfc4d29c01099f3380b52a3e265ebdbbd5728c555546d0b0be96352c964dbb",
+        "AST_sha256": "7f25b77e4fb831814bcf407b5f6a3051e27ad6f212ac6453903ddd38458b5320",
+        "byte_exact": true
+      },
+      {
+        "function": "scope_observation",
+        "source_sha256": "4aa7617c003564ebf6054f74a42b31f7bd71b8d58bc6fe23635cedb773f39318",
+        "AST_sha256": "4157429e0a31b4f3e6eed66bf91f91febf0916c1f03f4e0fb452c1ffaa512e24",
+        "byte_exact": true
+      },
+      {
+        "function": "validate_controller_review",
+        "source_sha256": "455cc1c239038caa6837456d2c07f0bd753e1747ae4d40d65b4b66f02c7b6b5a",
+        "AST_sha256": "d94a3b30640fb38742d75158098909846f351eb291fbf9b6dd152884d6274c86",
+        "byte_exact": true
+      },
+      {
+        "function": "evidence_copy",
+        "source_sha256": "fe1303aed4561bb5887ffcc2fe671c074e0256a378b0405169c2424220d5dbca",
+        "AST_sha256": "40d47ebfc37465d97f5992d2cc072c86065f681809f02ec155f16e080ce0353c",
+        "byte_exact": true
+      },
+      {
+        "function": "execute_contracts",
+        "source_sha256": "f68400c1b9f9c56c8348834cceca7001021efef986b0a0a8205c7f94f30c3739",
+        "AST_sha256": "65caa126d23cc0ee31c4487ad86a7a635262a955bdf9228f2f6e12330b053c7d",
+        "byte_exact": true
+      },
+      {
+        "function": "custody_clean",
+        "source_sha256": "35f3884bb098750249ae9e0f623e77dd65ccd5e28f7e1d02ef4063b860829a0e",
+        "AST_sha256": "c4f0239c67534fbb54fa49c79e26852663167c89063b8ca4ffd8f7b93b7223f7",
+        "byte_exact": true
+      },
+      {
+        "function": "safe_lane_handoff",
+        "source_sha256": "462af48eb667cd8ebb735ea684f4c7a70690b702a4a6e2d9eb474c06e11491dd",
+        "AST_sha256": "b72eaf31d31f3b5460b9b53ce5277b5e21ddceae0b50b52e9f683053a284508c",
+        "byte_exact": true
+      },
+      {
+        "function": "final_observations",
+        "source_sha256": "a16ac162914838348954318f9c463a94735e755ddbb5501ea8f3a05b4f234527",
+        "AST_sha256": "b14f4feaca287fdac6e396c751f3480866ced7cea5fd32ce6bddb91a3344fdf6",
+        "byte_exact": true
+      },
+      {
+        "function": "note_lane_cancellation",
+        "source_sha256": "ef450e5fbf8ef068f7f913a4bff1e101ccdca2a97c46cbb19fc1fbe7e0593eb2",
+        "AST_sha256": "2f3f8f2934d4190861e476b4e5101efe7eeebc2ac31bcb0c4041cc97ed3ff3d2",
+        "byte_exact": true
+      },
+      {
+        "function": "require_workload_allowed",
+        "source_sha256": "e60adbf806b198bbbb6e7738c858af4e2bd3b4ddef897f0a7ce2f04446857bac",
+        "AST_sha256": "7d24d1d521ec35d15f4740318e0d0a0f67e1c6aba80e6172f3874e2cf7461fb6",
+        "byte_exact": true
+      },
+      {
+        "function": "retain_uncertain_lane",
+        "source_sha256": "f228711d05249ec995a6fbbbb6add8e83d8cc4d4f0111acb4a2f0528c1cd4a7c",
+        "AST_sha256": "c6a3b79bb565997f4fdba936d23b77ffabb7ae03daf2a929b22fa34d41c7e152",
+        "byte_exact": true
+      }
+    ],
+    "unchanged4_nested_core": [
+      {
+        "function": "main.read_bound",
+        "source_sha256": "ee5b8fa80f9dda924f6668585f697ac9ed23552438c6e55f6e4875a2e7f194ad",
+        "AST_sha256": "4e00c5556c4f7ba27fe21c2ec71823b1e20d96072fd97b48908fade1709b8cbf",
+        "byte_exact": true
+      },
+      {
+        "function": "main.source",
+        "source_sha256": "f2e83cc933c0145e7e241c5779b9a8c1381567fad1b0c47731aaa08fa0378478",
+        "AST_sha256": "9d2c2cf8ebe3680cb2a4dd7a8e6180b9a864b7ab07fceb5fcc1b179da2a998bd",
+        "byte_exact": true
+      },
+      {
+        "function": "main.context",
+        "source_sha256": "18c8c60d755876c3f4a03fa05f258065ee3db87719376d47cbb8dbf6150296f0",
+        "AST_sha256": "6d8a77f2827d63137cefc716f63517270409430bee893d9acb3536188d5af4a3",
+        "byte_exact": true
+      },
+      {
+        "function": "main.run",
+        "source_sha256": "c083137d078fd0fe4620c8e4e133f584a3670f0f64dcc38def58b4a19dee1a0a",
+        "AST_sha256": "67ef162be3cd1cf7661d29c32c262ad52a2096f30cc4cd3b62b237e2e735cb0b",
+        "byte_exact": true
+      }
+    ],
+    "only_four_accounting_literals": "Exact after four cardinality literals8->9 and11->12; allformula/predicates unchanged.",
+    "nonmain_inverse": "Exact after only docstring/WT/PLAN/PLAN_SHA plus fourcardinality literals.",
+    "main_tail_inverse": "Byteexact from controller_path through finalreturn after onlyoutputprefix/final9.",
+    "no_newhelper_parserexception_childinflation": true,
+    "originalsource_context_tools_nonblockinglock_originalwait_pidfd_family_cancel_error_evidence_HOLD_Cfdclose_failedposthash_policy": "Byteexact core retained; author sourcecomparisons only, no runtime evidence."
+  },
+  "planned_counts": {
+    "HOST_checks": 1,
+    "HOST_lib_compiles": 1,
+    "actual_unique_ELF_inventories": 1,
+    "outer_parents": 9,
+    "phases": 12,
+    "retained_first_parents": 8,
+    "appended_parents": 1,
+    "additional_counted_children": 0,
+    "new_EOF_table_cases_nonadditive": 4,
+    "varint_protocol_cases_nonadditive": 7
+  },
+  "selectors": [
+    "chat::runtime::tests::stdio_eof_drains_complete_frame_backlog_before_terminal_diagnostics",
+    "chat::runtime::tests::real_json_lines_pipe_keeps_hidden_state_without_presentation",
+    "chat::runtime::tests::managed_terminal_outcomes_survive_idle_diagnosis_and_nonzero_process_exit",
+    "chat::runtime::tests::a_new_actor_turn_clears_terminal_proof_before_classifying_its_own_exit",
+    "chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure",
+    "chat::runtime::tests::pipe_eof_waits_for_exact_exit_but_preserves_unobservable_writers",
+    "chat::client::tests::handled_command_refusals_do_not_become_shared_snapshot_errors",
+    "chat::native_holder::transport::tests::legacy_named_json_inspection_messages_remain_decodable",
+    "host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only"
+  ],
+  "new_selector_source": {
+    "selector": "host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only",
+    "source": "src/host/upgrade_inspect/current.rs",
+    "source_sha256": "c118617f5666ab3de65f5f755d670a4595c1432bf9374e0586189fcc8d2a4765",
+    "body_sha256": "b054e40bc3127245cd71855c25f2a7519675df86eef00e2d74bef189e3273c48",
+    "anchor_line": 762,
+    "cfg_test_module_line": 554,
+    "execution": "UNRUN",
+    "ignored": false,
+    "static_parent_count": 1,
+    "nested_cases": 7,
+    "nested_cases_are_nonadditive": true,
+    "future_argv": [
+      "host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only",
+      "--exact",
+      "--nocapture",
+      "--test-threads=1",
+      "--color=never"
+    ],
+    "fixture_source_screen": "Ordinary data-only postcard encode/decode/frozen frame fixture; no helper/selfexec/provider/process. Seven source_protocols iterations plus existing response roundtrips are internal to one parent. Name doesnot certify104 support or wire127 migration.",
+    "module_ancestry": [
+      {
+        "source": "src/lib.rs",
+        "line": 5,
+        "gate": "include modules.rs"
+      },
+      {
+        "source": "src/modules.rs",
+        "line": 73,
+        "gate": "cfg(feature=host) pubmodhost"
+      },
+      {
+        "source": "src/host/mod.rs",
+        "line": 196,
+        "gate": "mod upgrade_inspect"
+      },
+      {
+        "source": "src/host/upgrade_inspect.rs",
+        "line": 4,
+        "gate": "mod current"
+      },
+      {
+        "source": "src/host/upgrade_inspect/current.rs",
+        "line": 554,
+        "gate": "cfg(test) mod tests"
+      }
+    ]
+  },
+  "argv_cwd_DATA": {
+    "HOST_check": [
+      "cargo",
+      "check",
+      "--locked",
+      "--no-default-features",
+      "--features",
+      "host",
+      "--bin",
+      "cagentsd"
+    ],
+    "HOST_compile": [
+      "cargo",
+      "test",
+      "--locked",
+      "--no-default-features",
+      "--features",
+      "host",
+      "--lib",
+      "--no-run",
+      "--message-format=json"
+    ],
+    "actual_unique_ELF_inventory": [
+      "<fresh unique HOST lib Cargo-reported ELF>",
+      "--list",
+      "--color=never"
+    ],
+    "parent": [
+      "<SAME actual ELF>",
+      "<exact selected name>",
+      "--exact",
+      "--nocapture",
+      "--test-threads=1",
+      "--color=never"
+    ],
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1239-inventory-varint-fixture",
+    "no_guessed_ELF_or_source_count_as_discovery": true,
+    "expected_relayed_selfchild_results": 0
+  },
+  "varint_chain": {
+    "semantic_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/varint-semantic-review.md",
+      "sha256": "cc47bd563582accf9d09aad17a86c2097cacb3d9f01122c87f34021151f126e1",
+      "original_path": "/tmp/pr1239-inventory-varint-fixture-semantic-review-c118617f.md",
+      "encoding": "UTF-8 Markdown"
+    },
+    "conservation_review": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/varint-conservation-review.json",
+      "sha256": "e8aefe80ba69c0d8938e5b0b3f870fd184fabefd35c1e500d93397188509a93e",
+      "original_path": "/tmp/pr1239-inventory-varint-fixture-conservation-review-v1.json",
+      "encoding": "JSON"
+    },
+    "publication": {
+      "path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/dependencies/varint-publication.json",
+      "sha256": "f81781b19c6d4282a319d143e691de94e4b0ebd9811f009c5f47452b0931ab03",
+      "original_path": "/tmp/fw16-backend-ec204421/pr1239-73487c8d-reviewed-varint-publication-v1.json",
+      "encoding": "JSON"
+    },
+    "source_pin": "c118617f5666ab3de65f5f755d670a4595c1432bf9374e0586189fcc8d2a4765",
+    "working_delta_to_commit_binding": {
+      "kind": "AUTHOR_EXACT_COMMITTED_VARINT_FIXTURE_BINDING_NOT_WHOLE_HEAD_APPROVAL",
+      "head": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+      "tree": "0ac51f1aa553ddd30fd0e993d25397b08e58172f",
+      "parent": "8bcd52d1d99f9193cc3d4f5a8b121e0211d19a6e",
+      "parent_tree": "456474c461129f22dcfb51bd4dd6fe09e112fe2b",
+      "commit_object_sha256": "89662cda25272c17b5327af03688d6da94fcb2d5d42bc78ce0518afef8c3ddda",
+      "changed_paths": [
+        "src/host/upgrade_inspect/current.rs"
+      ],
+      "delta_sha256": "01e6101477ea2c63422606ccdc57775c171218d8935127363246d8085e165cfe",
+      "explicit_patch_abbreviation": 9,
+      "parent_file_sha256": "388a3af64773339ae79e4f21ca839f3c6f21c662800064885be8534556988e7a",
+      "current_file_sha256": "c118617f5666ab3de65f5f755d670a4595c1432bf9374e0586189fcc8d2a4765",
+      "exact_one_block_inverse_equals_parent": true,
+      "conserved_other_entries": 2222,
+      "all_other_entries_and_modes_equal": true,
+      "retained11_source_pins_exact": true,
+      "source_pins": [
+        {
+          "bytes": 426433,
+          "path": "src/chat/runtime.rs",
+          "sha256": "e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca"
+        },
+        {
+          "bytes": 129873,
+          "path": "src/chat.rs",
+          "sha256": "b1d71c4dbc20c05fd7f1304518ccc5e1cd6fcbabf21cecf9566fff8aa15e4418"
+        },
+        {
+          "bytes": 21560,
+          "path": "src/chat/protocol.rs",
+          "sha256": "94abf5661761f9f21aaeebc3bf1445d31a998d621c570d94aca0b54a6b00798e"
+        },
+        {
+          "bytes": 10784,
+          "path": "src/chat/stderr_log.rs",
+          "sha256": "2e8988082c2b50e5949aed9b5220788bda26d454ee930050ad4e27267c3ea1f2"
+        },
+        {
+          "bytes": 2206,
+          "path": "src/chat/runtime/worker_join.rs",
+          "sha256": "6fbe406ec6bf4ee75bb8e8006817aaca5594ca056f2a95e1d6a18dfa2fd14ec1"
+        },
+        {
+          "bytes": 4143,
+          "path": "src/modules.rs",
+          "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374"
+        },
+        {
+          "bytes": 350,
+          "path": "src/lib.rs",
+          "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e"
+        },
+        {
+          "bytes": 13087,
+          "path": "Cargo.toml",
+          "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48"
+        },
+        {
+          "bytes": 341188,
+          "path": "Cargo.lock",
+          "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e"
+        },
+        {
+          "path": "src/chat/client.rs",
+          "sha256": "a625d2b0d3773f234a8d8b7d66bb1ed0f001c365c833ed5debb6e98c41a6e156",
+          "bytes": 302750
+        },
+        {
+          "path": "src/chat/native_holder/transport.rs",
+          "sha256": "27788e187001a61d794404208d3cd4653d8e7ceccf4ee3a4ed6504867c293283",
+          "bytes": 132818
+        },
+        {
+          "path": "src/host/upgrade_inspect/current.rs",
+          "sha256": "c118617f5666ab3de65f5f755d670a4595c1432bf9374e0586189fcc8d2a4765",
+          "bytes": 49375
+        }
+      ],
+      "allowlist_and_production_and_assertions_conserved": true,
+      "wire127_migration": "HOLD unchanged; no qualification/currentmain/installed inference"
+    },
+    "scope": "Only malformedcfgtestfixture u16 scalar prefix; exact11byte suffix/production/allowlist/allassertions and2222otherentries conserved. Source-predicted repair, not actualtestfailure/pass or independentwholeheadapproval.",
+    "protocol_name_limit": "Testname99through104 is literal selector, not new104 support. Sevenprotocoliterations are oneparent.",
+    "wire127_migration": "HOLD unchanged; no allowlistwidening/currentmain/installed/matchedwire qualification."
+  },
+  "historical_evidence_limits": {
+    "oldaa352": "Existing HOST0/lib101/6UNRUN negative and pendingreturn/lateracceptedpublication metadata retained; no RAWread/reaudit/reclassification/granttransfer.",
+    "oldHOST8": "Unexecuted control/source/handoff immutable, no qualificationtransfer.",
+    "Script": "RetainedoldsourceScript evidence remains historical, no currentHOST/Rustpass. No fresh Script/format command ran here.",
+    "scoped_reviews": "OriginalEOF/cfgtest/fixture scopes retained andgenuine rawMD/JSON bytes preserved; no wholeheadapproval invented."
+  },
+  "bounds": {
+    "packet_cap_seconds": 2400,
+    "HOST_check_seconds": 600,
+    "HOST_compile_seconds": 900,
+    "inventory_seconds": 30,
+    "each_parent_seconds": 90,
+    "nominal_ceiling_sum_seconds": 2340,
+    "clamped_original_remaining": true,
+    "jobs": 2,
+    "newcache_target_coldfallback_extension": false,
+    "source_cleanup_custody_bounds_unchanged": true,
+    "physical_Rust1_93_hashes": "Donor literal pins only, not current tool reads/version probes.",
+    "existing_warm_Ctarget_lock": "Literal paths retained only; no access/readiness/availability probe."
+  },
+  "source_git_setup": {
+    "record": "/tmp/coord-b9-1239-7348-host9-control-evidence/source-git-setup.json",
+    "record_sha256": "18f05a5f65d3fb56848f1e59b1d82139df4966f4a30f30b4eeaf192d72fa6c4f",
+    "single_full_exact_HEAD_bundle": {
+      "path": "/tmp/coord-b9-1239-7348-host9-control-evidence/exact-product-head.bundle",
+      "sha256": "881ab017729c1c05b300e98c7e0b6d2376ec80a3ed9888125db082748c4c2b5f",
+      "bytes": 22457973
+    },
+    "noalternates": true,
+    "all_setup_commands_exit0": true,
+    "warnings": "Private init default-branch hint retained verbatim; no global config mutation or retry."
+  },
+  "source_checks": {
+    "AST_JSON_hash_source_inverse_only": true,
+    "controller_import_helper_function_purecase_execution": false,
+    "full_committed_whitespace_exit": 2,
+    "full_committed_whitespace_findings": [
+      "qualification-packets/pr1239-7348/dependencies/test-api-source-review.md:39: new blank line at EOF.",
+      "qualification-packets/pr1239-7348/dependencies/varint-semantic-review.md:38: new blank line at EOF."
+    ],
+    "all_other_files_whitespace_exit": 0,
+    "raw_review_hashes_untrimmed": true,
+    "Rust_source_edits_or_format_required": false,
+    "clean_new_dedicated_WT": true
+  },
+  "required_fresh_review_fields": {
+    "verdict": "CONTROLLER_SOURCE_CLEAR",
+    "head": "73487c8d69e826de3865b8e5692cd9e39485ddd5",
+    "tree": "0ac51f1aa553ddd30fd0e993d25397b08e58172f",
+    "runner_sha256": "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+    "plan_sha256": "88b0b79fb975089b08d85d2b30a4a6bad1df5d7d5f2f3d9c28db188618695c6d"
+  },
+  "external_launch_DATA_ONLY": [
+    "python3",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/run-packet.py",
+    "--runner-sha256",
+    "71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829",
+    "--controller-review",
+    "<actual fresh independent exact JSON receipt>",
+    "--controller-review-sha256",
+    "<actual SHA256>",
+    "--grant",
+    "<distinct actual external EC grant ID>"
+  ],
+  "actual": {
+    "controller_review": null,
+    "allocation": null,
+    "grant": null,
+    "queue": null,
+    "resource_readiness": null,
+    "tools": null,
+    "context": null,
+    "Cargo_compile": null,
+    "ELF": null,
+    "inventory": null,
+    "parents": null,
+    "original_waits": null,
+    "pidfd_family_custody": null,
+    "Cfd_close": null,
+    "native_provider": null,
+    "publication": null,
+    "qualification": "UNRUN_EXECUTION_HOLD"
+  },
+  "forbidden_actions_performed": {
+    "controller_helper_import_function_or_purecase": false,
+    "Cargo_build_test_toolversions": false,
+    "ELF_target_cache_lock_process_runtime_context_account_DBprobes": false,
+    "native_provider_input_clipboard_desktop": false,
+    "GitHub_inbox_publication_trigger_or_newworkers": false,
+    "model_account_effort_permissions_opaqueenv_policy_changes": false
+  },
+  "source_bundle": {
+    "path": "/tmp/coord-b9-1239-7348-host9-control-evidence/pr1239-host9-control.bundle",
+    "sha256": "30c8a2fafceb2f3e88f1058cbba25c7e6284cef0e6cb3959fba8b2f2d05db921",
+    "bytes": 103252,
+    "prerequisite_product": "73487c8d69e826de3865b8e5692cd9e39485ddd5"
+  },
+  "limits": "Exact7348/HOST9 sourceprepared only. Allcurrent Rust/artifact/inventory/parents/waits/pidfd/family/Cfdclose/context/tool/resource/native/provider/readinessUNRUN/NULL. No wire127migration/wholehead/currentmain/installed/allowlist claim. Retained fixtureRAII/fairness/failedinvokeELFposthash and discrete-source-observation limits unchanged. Nineordinary1P0F0I0M/12phases planned, old8sameorder, oneappendeddatafixture. Oldaa352negative remainsnegative metadataonly; no RAWreaudit/rewrite. No oldhandoff/grant/authority/publication/queue/availability transfer; unknown/forcedcustody retainsHOLD/no safehandback. Fresh exactnonauthorcontroller review plus distinct extrinsic ECgrant required.",
+  "fixture_limits": {
+    "fairness_limit": "real_json_lines_pipe is adjacent command/wake/stdin responsiveness coverage; it is not a latched sustained frame-flood fairness oracle. New600-line EOF case checks multi-budget completion. Fairness retention is the sealed production source conclusion, not measured native/performance evidence.",
+    "no_new_test_authored_unknown_signals": true,
+    "original_executor_custody": "A future separately authorized existing owner/controller must retain its original executable Child/pidfd/family and original wait/close evidence. A failed assertion, timeout, nonzero, uncertainty or surviving owned work remains negative/HOLD; this data does not grant release or authorize an unowned fallback.",
+    "private_state": "New EOF TempDir survives OwnedActor HOLD. Existing stderr Capture::new cfg(test) uses a private UUID /var/tmp root. The stderr parent self-reexec overrides only its fixture trace/cache selectors; no caller/delegation/authority clearing, copying or printing is proposed by this data.",
+    "screen": "Only selected parent/helper source topology screened; no broad test execution clearance. New EOF ownership/type review reused.",
+    "underlying_API_boundary": "Selected process parents use existing LocalHandle/ChildGuard teardown. This is distinct from test-authored raw PID/group cleanup; it does not prove every kernel failure settles. Existing adjacent parents generally call explicit close, but lack the new OwnedActor repeated-close wrapper on every assertion unwind; final Inner::Drop at1837-1866 can detach with unconfirmed diagnostic. Do not claim all selected existing fixtures have universal RAII join proof.",
+    "appended_parent_scopes": [
+      "Existing bounded UnixStream peer thread, original framing/correlated refusal and unsolicited error gates, original worker.join. No provider/helper/selfexec; two initialerror cases nonadditive.",
+      "Existing serde/proof data-only legacyJSON roundtrip, explicit conservative directory_pin=false. No child/helper/provider; no historicalbinary/matchedwire qualification."
+    ]
+  },
+  "failed_use_ELF_posthash_limit": "Conserved donor limitation: ELF digest is checked before inventory/each owning parent and after invoke returns successfully. If invoke raises on nonzero/timeout/custody/source/evidence error, control never reaches that phase's post-use digest. No post-failed-use ELF hash or full ELF bytes are guaranteed archived; do not claim unchanged ELF after a failed phase. All raw negative outcomes stay nonqualifying; strict original wait/custody still governs any release.",
+  "grant_binding_limit": "A supplied --grant UUID is recorded against exact runner/plan/review/source receipts. Syntax acceptance neither verifies a fresh external cagents grant nor enforces once-only authorization. Root must obtain new actual grant for this exact packet/argv/cwd and coordinate fair admission before any execution; no current grant is present."
+}

@@ -1,0 +1,607 @@
+--- qualified-d610/run-packet.py
++++ startup-A/run-packet.py
+@@ -1,4 +1,4 @@
+-"""Prepared PR1239 exact-head isolated HOST check plus nine ordinary HOST parents. No execution without fresh cagents grant and independent controller review."""
++"""Prepared eb7 startup packet A: exactly3 isolated binary checks; independent review and fresh grant required. No tests/native qualification."""
+ import argparse
+ import ctypes
+ import errno
+@@ -16,16 +16,16 @@
+ import time
+ from datetime import datetime, timezone
+ 
+-WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1239-inventory-varint-fixture')
++WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-startup-recovery-composition')
+ TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
+ LOCK = TARGET.parent / 'lane-c.lock'
+ TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
+-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-1239-7348-host9-control/qualification-packets/pr1239-7348/plan.json')
++PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord-b9-startup-recovery-checks/qualification-packets/startup-recovery-checks/plan.json')
+ PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
+ PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
+ SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
+ CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
+-PLAN_SHA = '88b0b79fb975089b08d85d2b30a4a6bad1df5d7d5f2f3d9c28db188618695c6d'
++PLAN_SHA = 'f53a1415715da6e109a905cf309be7fb2e387818b92f4120767ecb0c4fb9fc0e'
+ SCOPE_PARENT = None  # No selected PR1239 contract enables the dormant donor staged-scope path.
+ 
+ 
+@@ -398,54 +398,29 @@
+     assert digest(path) == expected_sha
+ 
+ 
+-def execute_contracts(plan, invoke, save, parents):
+-    artifacts = {}
++def binary_check_pass(stdout, stderr):
++    """Check-only output contract; original wait0 is separately mandatory."""
++    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', stdout + '\n' + stderr)
++    lines = text.splitlines()
++    finished = [line for line in lines if line.lstrip().startswith('Finished ')]
++    assert len(finished) == 1 and re.fullmatch(r'\s*Finished `dev` profile(?: .*)?', finished[0]), 'Missing/extra/wrong Cargo check completion'
++    assert not any(line.lstrip().startswith(('error:', 'error[', 'test result:', 'running ', 'test ', 'Running unittests')) for line in lines), 'Check emitted compiler error or unexpected test result'
++    return {'finished_dev_marker': finished[0], 'check_output_contract': True,
++            'scope': 'Binary-check output only; zero test/artifact/inventory qualification'}
++
++
++def execute_contracts(plan, invoke, save, checks):
++    assert plan['job_kind'] == 'A_CHECKS_ONLY' and plan['artifact_groups'] == []
++    assert plan['planned_phase_count'] == 3 and len(plan['binary_checks']) == 3
+     for check in plan['binary_checks']:
+-        invoke(check['label'], [str(TOOL / 'cargo'), *check['argv'][1:]], check['seconds'])
+-    for group in plan['artifact_groups']:
+-        gid = group['id']
+-        compiled = invoke('compile-' + gid, [str(TOOL / 'cargo'), *group['compile_argv'][1:]], group['compile_seconds'])
+-        artifact = cargo_test_artifact((compiled / 'stdout.log').read_text(), WT / group['manifest'], group['features'])
+-        exe = Path(artifact['executable'])
+-        assert exe.is_absolute() and exe == exe.resolve(strict=True)
+-        assert exe.is_relative_to(TARGET.resolve(strict=True)) and exe.is_file() and not exe.is_symlink()
+-        with exe.open('rb') as stream:
+-            assert stream.read(4) == b'\x7fELF'
+-        elf = {'path': str(exe), 'sha256': digest(exe), 'features': artifact['features'], 'artifact': artifact,
+-               'limits': 'Original Cargo-reported ELF is hashed before and after use; full ELF bytes are not archived.'}
+-        artifacts[gid] = elf
+-        save('test-elf-' + gid + '.json', elf)
+-        assert digest(exe) == elf['sha256']
+-        inventory = invoke('inventory-' + gid, [str(exe), '--list', '--color=never'], group['inventory_seconds'])
+-        assert digest(exe) == elf['sha256'], 'ELF changed during inventory'
+-        selected = [contract['name'] for contract in group['selectors']]
+-        compiled_selected = group['source_predicted_compiled_names']
+-        absent = group['source_predicted_absent_names']
+-        actual = inventory_names((inventory / 'stdout.log').read_text() + '\n' + (inventory / 'stderr.log').read_text(), compiled_selected)
+-        assert set(selected).issubset(compiled_selected), 'Assigned execution is absent from source-pinned compilation contract'
+-        assert not set(absent).intersection(actual), 'Source-pinned excluded feature selectors unexpectedly compiled'
+-        save('inventory-' + gid + '/inventory.json', {'assigned_execution_names': selected,
+-             'source_predicted_compiled_selected_names': compiled_selected, 'source_predicted_absent_names': absent,
+-             'full_names': actual, 'actual_test_N': len(actual), 'assigned_execution_count': len(selected),
+-             'compiled_selected_count': len(compiled_selected), 'not_passes': True})
+-        for index, contract in enumerate(group['selectors'], 1):
+-            contract = {**contract, 'expected_filtered_out': len(actual) - 1}
+-            assert digest(exe) == elf['sha256']
+-            d = invoke('parent-' + gid + '-' + str(index),
+-                       [str(exe), contract['name'], '--exact', '--nocapture', '--test-threads=1', '--color=never'],
+-                       contract['seconds'], contract)
+-            assert digest(exe) == elf['sha256'], 'ELF changed during owning parent'
+-            proof = parent_pass((d / 'stdout.log').read_text(), contract)
+-            if contract.get('staged_child_observation'):
+-                observation = scope_observation((d / 'stderr.log').read_bytes(), contract, True)
+-                save(str(d.relative_to(d.parent)) + '/staged-observation.json', observation)
+-                assert observation['adoption_close'] == 'OWNING_ASSERTIONS_COMPLETED', 'Incomplete actual staged adoption/close assertions'
+-                proof['nonadditive_child_results'] = observation['nonadditive_child_results']
+-                proof['scope_observation'] = observation
+-            parents.append({'group': gid, 'name': contract['name'], 'passed': 1, 'failed': 0, 'ignored': 0,
+-                            'elf_sha256': elf['sha256'], **proof})
+-    save('test-elfs.json', artifacts)
+-    return artifacts
++        argv = [str(TOOL / 'cargo'), *check['argv'][1:]]
++        d = invoke(check['label'], argv, check['seconds'])
++        proof = binary_check_pass((d / 'stdout.log').read_text(), (d / 'stderr.log').read_text())
++        record = {'label': check['label'], 'argv': argv, 'scope': 'isolated binary check candidate only', **proof}
++        save(check['label'] + '/check-output.json', record)
++        checks.append(record)
++    assert [check['label'] for check in checks] == plan['planned_phase_order']
++    save('binary-checks.json', checks)
+ 
+ 
+ def custody_clean(custody):
+@@ -473,41 +448,35 @@
+             and all(custody_clean(state['custody']) for state in phase_states))
+ 
+ 
+-def parent_accounting(attempts, states, phases, parents, out):
+-    attempted = [attempt for attempt in attempts if attempt[0] == 'phase' and attempt[1].startswith('parent-')]
++def check_accounting(attempts, states, phases, checks, out):
++    labels = ('cli-binary-check', 'host-binary-check', 'ui-binary-check')
++    phase_attempts = [attempt for attempt in attempts if attempt[0] == 'phase']
++    assert [attempt[1] for attempt in phase_attempts] == list(labels[:len(phase_attempts)])
++    assert 0 <= len(checks) <= len(phase_attempts) <= 3
+     raw, errors = [], []
+-    for stage, label, argv, pid in attempted:
++    for stage, label, argv, pid in phase_attempts:
+         state = next((state for state in states if state['stage'] == stage and state['label'] == label and state['pid'] == pid), None)
+-        record = next((phase for phase in phases if phase['label'] == label and phase['pid'] == pid), None)
+-        row = {'phase': label, 'pid': pid, 'exit': state['exit'] if state else None,
++        phase = next((phase for phase in phases if phase['label'] == label and phase['pid'] == pid), None)
++        row = {'label': label, 'pid': pid, 'exit': state['exit'] if state else None,
+                'original_wait_complete': bool(state and state['original_wait_complete']),
+-               'phase_recorded': record is not None,
+-               'evidence_complete': bool(state and state['evidence_complete']),
++               'phase_recorded': phase is not None, 'evidence_complete': bool(state and state['evidence_complete']),
+                'supervision_error': state['supervision_error'] if state else 'Spawn has no supervision state',
+-               'summaries': [], 'output_read_error': None}
+-        try:
+-            output = (out / label / 'stdout.log').read_text()
+-            row['summaries'] = [line for line in output.splitlines() if line.lstrip().startswith('test result:')]
+-            if len(argv) > 1 and argv[1] == SCOPE_PARENT:
+-                contract = {'name': SCOPE_PARENT, 'expected_stdout_child_results': 0}
+-                inventory = json.loads((out / 'inventory-host-lib/inventory.json').read_bytes())
+-                contract['expected_filtered_out'] = inventory['actual_test_N'] - 1
+-                outer_qualified = False
+-                try:
+-                    parent_pass(output, contract)
+-                    outer_qualified = bool(state and state['original_wait_complete'] and state['exit'] == 0
+-                                           and state['evidence_complete'] and not state['supervision_error'])
+-                except (AssertionError, UnicodeError, ValueError):
+-                    pass
+-                row['scope_observation'] = scope_observation((out / label / 'stderr.log').read_bytes(), contract, outer_qualified)
++               'output_read_error': None, 'output_parse_error': None, 'qualified_check_candidate': False}
++        try:
++            stdout = (out / label / 'stdout.log').read_text()
++            stderr = (out / label / 'stderr.log').read_text()
++            try:
++                row['output_proof'] = binary_check_pass(stdout, stderr)
++                row['qualified_check_candidate'] = bool(state and state['original_wait_complete'] and state['exit'] == 0
++                    and state['evidence_complete'] and not state['supervision_error'] and not state['direct_cleanup_attempted']
++                    and custody_clean(state['custody']) and phase and not phase['timed_out'] and phase['process_error'] is None
++                    and any(check['label'] == label and check['argv'] == list(argv) for check in checks))
++            except AssertionError as exc:
++                row['output_parse_error'] = type(exc).__name__ + ': ' + str(exc)
+         except Exception as exc:
+             row['output_read_error'] = type(exc).__name__ + ': ' + str(exc)
+             errors.append(row['output_read_error'])
+         raw.append(row)
+-    count = len(attempted)
+-    assert 0 <= len(parents) <= count <= 9
+-    settled = sum(row['original_wait_complete'] for row in raw)
+-    phase_attempts = [attempt for attempt in attempts if attempt[0] == 'phase']
+     phase_states = [state for state in states if state['stage'] == 'phase']
+     source_attempts = [attempt for attempt in attempts if attempt[0] == 'source']
+     source_states = [state for state in states if state['stage'] == 'source']
+@@ -518,18 +487,15 @@
+              'unknown_process_count': len(attempts) - settled_phases - settled_sources,
+              'attempted_phase_count': len(phase_attempts), 'recorded_phase_count': len(phases),
+              'original_wait_settled_phase_count': settled_phases,
+-             'unknown_phase_count': len(phase_attempts) - settled_phases,
+-             'unrun_phase_count': 12 - len(phase_attempts),
++             'unknown_phase_count': len(phase_attempts) - settled_phases, 'unrun_phase_count': 3 - len(phase_attempts),
+              'attempted_source_check_count': len(source_attempts),
+              'original_wait_settled_source_check_count': settled_sources,
+              'unknown_source_check_count': len(source_attempts) - settled_sources,
+              'all_original_waits_complete': len(attempts) == len(states) and all(state['original_wait_complete'] for state in states),
+-             'requested_parent_count': 9, 'passed_parent_count': len(parents),
+-             'attempted_parent_count': count, 'executed_parent_count': count,
+-             'original_wait_settled_parent_count': settled, 'unknown_parent_count': count - settled,
+-             'recorded_parent_count': sum(row['phase_recorded'] for row in raw),
+-             'incomplete_parent_record_count': sum(not row['evidence_complete'] for row in raw),
+-             'nonqualifying_parent_count': count - len(parents), 'unrun_parent_count': 9 - count}, raw, errors)
++             'requested_binary_check_count': 3, 'qualified_binary_check_candidate_count': sum(row['qualified_check_candidate'] for row in raw),
++             'attempted_binary_check_count': len(phase_attempts), 'unrun_binary_check_count': 3 - len(phase_attempts),
++             'nonqualifying_attempted_binary_check_count': len(phase_attempts) - sum(row['qualified_check_candidate'] for row in raw),
++             'declared_test_invocations': 0, 'declared_test_parents': 0, 'declared_ELF_inventories': 0}, raw, errors)
+ 
+ 
+ def final_observations(source, context, before, before_context, save):
+@@ -613,288 +579,66 @@
+     review_bytes = Path(plan['source_review']).read_bytes()
+     review = json.loads(review_bytes)
+     assert review['head'] == plan['product_head'] and review['tree'] == plan['product_tree']
+-    assert review['kind'] == 'AUTHOR_ASSEMBLED_PR1239_HOST9_SOURCE_BINDING_NOT_A_NEW_REVIEW'
+-    assert review['verdict'] == 'BOUND_EXACT_SCOPED_SOURCE_CHAIN_ONLY_NO_WHOLE_HEAD_APPROVAL'
+-    assert review['owning_parent_count'] == 9
++    assert review['kind'] == 'AUTHOR_EB7_PACKET_A_SOURCE_BINDING_NOT_INDEPENDENT_APPROVAL'
++    assert review['verdict'] == 'BOUND_EXACT_STARTUP_SOURCE_CHAIN_ONLY_NO_WHOLE_HEAD_OR_RUNTIME_APPROVAL'
++    assert review['job_kind'] == plan['job_kind'] == 'A_CHECKS_ONLY'
+     def read_bound(key, as_json=True):
+         ref = review[key]
+         payload = Path(ref['path']).read_bytes()
+         assert hashlib.sha256(payload).hexdigest() == ref['sha256'], 'Changed source/report input: ' + key
+         return json.loads(payload) if as_json else payload.decode('utf-8')
+-    original_data = read_bound('command_data_v1')
+-    data = read_bound('command_data_v2')
+-    assert review['command_data_v1']['sha256'] == '589e6e7179d4f4cef2cc912f5a5f971b0a23a0e2af505ad611a3808c0d30aa9a'
+-    assert original_data['schema'] == 'pr1239-195052bf-narrow-host-qualification-command-test-data-v1'
+-    assert original_data['kind'] == 'PLAIN_JSON_COMMAND_AND_TEST_DATA_ONLY_NO_EXECUTOR'
+-    source_data = original_data['source']
+-    assert source_data['head'] == review['eof_ancestor_head'] == '195052bf1d7ce2d5b6580e3335c6ef0628cae981'
+-    assert source_data['tree'] == review['eof_ancestor_tree'] == 'c92260aa4c2ea0a5a69935ca6aa347baa84497cb'
+-    assert source_data['parent'] == review['eof_base'] == '4976799fce3752372e421a2b5be247278b9a71e7'
+-    assert source_data['worktree'] == review['eof_ancestor_worktree']
+-    assert source_data['only_committed_changed_path'] == 'src/chat/runtime.rs'
+-    source_hashes = {pin['path']: pin['sha256'] for pin in source_data['pins']}
+-    assert len(source_hashes) == len(source_data['pins']) == 9
+-    assert source_hashes == review['retained_eof_source_hashes']
+-    runtime_sha = source_hashes['src/chat/runtime.rs']
+-    assert runtime_sha == 'e27090299528724f6a6e24d1f48fe5d8f8eeb5fedd52f2118feb51f97e2bc1ca'
+-    names = [parent['selector'] for parent in original_data['selected_parents']]
+-    assert len(names) == len(set(names)) == 6 and all(isinstance(name, str) for name in names)
+-    assert all(parent['source'] == 'src/chat/runtime.rs' and parent['source_sha256'] == runtime_sha
+-               and parent['ignored'] is False and parent['static_parent_count'] == 1
+-               for parent in original_data['selected_parents'])
+-    assert original_data['planned_counts']['proposed_phases'] == 9
+-    assert original_data['planned_counts']['original_required_libtest_parents'] == 6
+-    assert not set(names).intersection(parent['selector'] for parent in original_data['explicitly_excluded_parents'])
+-    # This versioned DATA normalization is explicit; execute_contracts stays byte-exact.
+-    expected_data = json.loads(json.dumps(original_data))
+-    expected_data['schema'] = 'pr1239-195052bf-narrow-host-qualification-command-test-data-v2-host9-argv-normalization'
+-    expected_data['Cargo_JSON_ELF_admission_recipe_DATA']['inventory'] = 'Invoke that one artifact with --list --color=never and original exit0. Preserve full actual inventory. Require all six exact selectors once as tests; selected-name static declarations are not binary discovery.'
+-    expected_data['proposed_serial_commands'][2]['argv'] = ['--list', '--color=never']
+-    for index in range(3, 9):
+-        expected_data['proposed_serial_commands'][index]['argv'].append('--color=never')
+-    for parent in expected_data['selected_parents']:
+-        parent['future_argv'].append('--color=never')
+-    expected_data['normalization'] = review['normalization']
+-    assert data == expected_data
+-    assert review['normalization']['source_sha256'] == review['command_data_v1']['sha256']
+-    assert len(review['normalization']['changes']) == 15
+-    production = read_bound('production_source_review', False)  # Actual raw Markdown, never relabelled JSON.
+-    oracle = read_bound('oracle_source_review')
+-    fixture = read_bound('fixture_source_review')
+-    freeze = read_bound('source_freeze')
+-    publication = read_bound('publication')
+-    conservation = read_bound('source_conservation')
+-    script_review = read_bound('script_ci_review')  # Prior Script63 review only; no original log read or rerun.
+-    refs = original_data['reused_reviews']
+-    for key, ref in zip(('production_source_review', 'oracle_source_review', 'fixture_source_review'), refs):
+-        assert review[key]['original_path'] == ref['path'] and review[key]['sha256'] == ref['sha256']
+-    assert 'Verdict: SOURCE-CLEAR for the two production changes.' in production
+-    assert 'Base: ' + review['eof_base'] in production and 'Reviewed runtime.rs SHA256: ' + runtime_sha in production
+-    assert 'source clearance only' in production and 'not approved by this receipt' in production
+-    assert oracle['base'] == oracle['head_readback'] == review['eof_base']
+-    assert oracle['verdict']['result'].startswith('Bounded source clear for the regression oracle;')
+-    assert oracle['owning_inventory']['selector'] == names[0]
+-    assert (oracle['owning_inventory']['new_libtest_parents'], oracle['owning_inventory']['nested_cases'], oracle['owning_inventory']['nonadditive']) == (1, 4, True)
+-    assert oracle['conservation']['full_reversion_equals_base'] is True
+-    assert {pin['path']: pin['sha256'] for pin in oracle['source_pins']}['src/chat/runtime.rs'] == runtime_sha
+-    assert fixture['verdict'] == 'BOUNDED_SOURCE_CLEAR_NO_CONCRETE_NEW_TEST_OWNERSHIP_OR_TYPE_BLOCKER_IDENTIFIED'
+-    assert fixture['findings'] == [] and fixture['compilation'] == fixture['Rust_tests'] == 'UNRUN'
+-    assert fixture['source']['observed_HEAD'] == review['eof_base']
+-    assert fixture['source']['runtime_source_matches_frozen_v2'] is True
+-    assert {pin['path']: pin['sha256'] for pin in fixture['source']['files']}['src/chat/runtime.rs'] == runtime_sha
+-    assert freeze['base'] == review['eof_base'] and freeze['source']['sha256'] == runtime_sha
+-    assert freeze['source']['bytes'] == 426433 and freeze['counts'] == {'parents': 1, 'nested_cases': 4, 'nonadditive': True}
+-    assert oracle['freeze_and_design'][0]['sha256'] == fixture['source']['freeze']['sha256'] == review['source_freeze']['sha256']
+-    # The archived stale196/2 sidecar is not repaired or promoted into a source result.
+-    assert freeze['diff_numstat'] == '196\t2\tsrc/chat/runtime.rs'
+-    assert source_data['numstat'] == '203 additions /2 deletions'
+-    assert conservation['kind'] == 'AUTHOR_EXACT_COMMIT_AND_SOURCE_CONSERVATION_NOT_INDEPENDENT_APPROVAL'
+-    assert conservation['head'] == publication['head'] == review['eof_ancestor_head']
+-    assert conservation['tree'] == publication['tree'] == review['eof_ancestor_tree']
+-    assert conservation['parent'] == publication['parent'] == review['eof_base']
+-    assert conservation['only_changed_path'] == ['src/chat/runtime.rs'] and conservation['all_other_tree_entries_equal'] is True
+-    assert conservation['source_paths_sha256'] == source_hashes
+-    assert conservation['current_runtime_sha256'] == publication['source_sha256'] == runtime_sha
+-    assert conservation['parent_runtime_sha256'] in production
+-    assert conservation['parent_tree'] == oracle['base_tree'] == fixture['source']['observed_HEAD_tree']
+-    assert publication['pr'] == 1239 and publication['branch'] == 'campaign/provider_stream'
+-    assert publication['reviews'] == refs and publication['push']['exit_code'] == 0
+-    assert publication['remote_readback'].splitlines() == [
+-        review['eof_ancestor_head'] + '\trefs/heads/campaign/provider_stream',
+-        review['eof_ancestor_head'] + '\trefs/heads/fix/fw16-pr1239-eof-backlog']
+-    assert script_review['publication_receipt']['sha256'] == review['publication']['sha256']
+-    assert script_review['head'] == script_review['current_pr']['head_sha'] == review['eof_ancestor_head']
+-    assert script_review['tree'] == script_review['run']['head_commit']['tree'] == review['eof_ancestor_tree']
+-    assert script_review['parent'] == review['eof_base'] and script_review['result'] == 'CLEAR_SCRIPT_CI_ONLY'
+-    assert script_review['observed_tests']['distinct_methods'] == script_review['observed_tests']['passed'] == 63
+-    assert script_review['qualification']['owning_HOST_tests'] == 'UNRUN'
+-    assert script_review['run']['id'] == original_data['linked_script63_result_DATA']['run_id'] == 41161495569
+-    assert review['script_ci_review']['sha256'] == original_data['linked_script63_result_DATA']['sha256']
+-    # The retained chain above covers identical EOF bytes only. The following
+-    # two-file working-delta reviews are tied to the newly published child.
+-    current = read_bound('current_command_data')
+-    current_delta = read_bound('current_data_delta')
+-    api_review = read_bound('test_api_review', False)  # Genuine raw Markdown.
+-    test_conservation = read_bound('test_conservation_review')
+-    test_freeze = read_bound('test_source_freeze')
+-    patch_archive = read_bound('test_source_delta')
+-    current_publication = read_bound('current_publication')
+-    old_return = read_bound('original_negative_return')  # Existing metadata only, not RAW re-audit.
+-    committed = review['current_commit_binding']  # Author binding, not independent whole-head approval.
+-    assert current['schema'] == 'pr1239-8bcd52d1-narrow-host-command-data-v3-host8'
+-    assert current['kind'] == 'TASK_BOUND_SOURCE_DATA_ONLY_NOT_AN_EXECUTION_GRANT'
+-    assert current['source']['head'] == review['host8_head'] == '8bcd52d1d99f9193cc3d4f5a8b121e0211d19a6e'
+-    assert current['source']['tree'] == review['host8_tree'] == '456474c461129f22dcfb51bd4dd6fe09e112fe2b'
+-    assert current['source']['parent'] == review['host8_parent'] == review['eof_ancestor_head']
+-    assert review['eof_ancestor_head'] == '195052bf1d7ce2d5b6580e3335c6ef0628cae981'
+-    assert current['source']['worktree'] == review['host8_worktree']
+-    current_hashes = {pin['path']: pin['sha256'] for pin in current['source']['pins']}
+-    assert len(current_hashes) == len(current['source']['pins']) == 11
+-    assert current_hashes == review['host8_source_paths_sha256']
+-    assert current['source']['pins'][:9] == original_data['source']['pins']
+-    assert {path: value for path, value in current_hashes.items() if path not in source_hashes} == {
+-        'src/chat/client.rs': 'a625d2b0d3773f234a8d8b7d66bb1ed0f001c365c833ed5debb6e98c41a6e156',
+-        'src/chat/native_holder/transport.rs': '27788e187001a61d794404208d3cd4653d8e7ceccf4ee3a4ed6504867c293283'}
+-    assert all(current_hashes[path] == value for path, value in source_hashes.items())
+-    assert current['selected_parents'][:6] == data['selected_parents']
+-    current_names = [parent['selector'] for parent in current['selected_parents']]
+-    assert current_names == names + [
+-        'chat::client::tests::handled_command_refusals_do_not_become_shared_snapshot_errors',
+-        'chat::native_holder::transport::tests::legacy_named_json_inspection_messages_remain_decodable']
+-    assert len(current_names) == len(set(current_names)) == 8
+-    assert all(parent['ignored'] is False and parent['static_parent_count'] == 1
+-               and parent['source_sha256'] == current_hashes[parent['source']]
+-               for parent in current['selected_parents'])
+-    assert current['counts'] == {'HOST_checks': 1, 'HOST_lib_compiles': 1,
+-        'actual_unique_ELF_inventories': 1, 'outer_parents': 8, 'phases': 11,
+-        'retained_first_parents': 6, 'appended_parents': 2,
+-        'additional_counted_children': 0, 'new_EOF_table_cases_nonadditive': 4}
+-    assert len(current['proposed_serial_commands']) == 11
+-    assert all(command['cwd'] == review['host8_worktree'] for command in current['proposed_serial_commands'])
+-    assert current['proposed_serial_commands'][2]['argv'] == ['--list', '--color=never']
+-    assert [command['argv'] for command in current['proposed_serial_commands'][:9]] == [command['argv'] for command in data['proposed_serial_commands']]
+-    for index, name in enumerate(current_names):
+-        assert current['proposed_serial_commands'][index + 3]['argv'] == [name, '--exact', '--nocapture', '--test-threads=1', '--color=never']
+-        assert current['selected_parents'][index]['future_argv'] == current['proposed_serial_commands'][index + 3]['argv']
+-    assert current_delta['before']['sha256'] == review['command_data_v2']['sha256']
+-    assert current_delta['after_sha256'] == review['current_command_data']['sha256']
+-    assert 'Verdict: SOURCE CLEAR for the exact three added cfg(test) lines only.' in api_review
+-    assert review['host8_parent'] in api_review and all(current_hashes[path] in api_review for path in ('src/chat/client.rs', 'src/chat/native_holder/transport.rs'))
+-    assert test_conservation['verdict'] == 'SOURCE_CONSERVATION_CLEAR_FOR_EXACT_FROZEN_THREE_LINE_TEST_DELTA'
+-    assert test_conservation['blocking_findings'] == []
+-    assert test_conservation['pins']['parent_commit'] == review['host8_parent']
+-    assert test_conservation['pins']['parent_tree'] == review['eof_ancestor_tree']
+-    assert test_conservation['exact_delta']['inserted_lines'] == 3 and test_conservation['exact_delta']['deleted_lines'] == 0
+-    assert test_conservation['exact_delta']['production_changed'] is False
+-    assert test_conservation['exact_delta']['original_assertions_weakened_or_removed'] is False
+-    assert test_conservation['all_other_entries_and_modes']['conserved_other_leaf_entries'] == 2221
+-    assert {pin['path']: pin['candidate_sha256'] for pin in test_conservation['pins']['source_files']} == {
+-        path: current_hashes[path] for path in ('src/chat/client.rs', 'src/chat/native_holder/transport.rs')}
+-    assert all(pin['inverse_byte_equal_entire_original_file'] and pin['production_prefix_byte_equal']
+-               and pin['original_test_assertions_and_all_other_bytes_retained'] for pin in test_conservation['pins']['source_files'])
+-    assert {pin['path']: pin['candidate_sha256'] for pin in test_conservation['original_eof_and_selected_parent_source_preservation']['all9_original_pinned_files_equal']} == source_hashes
+-    assert test_freeze['parent'] == review['host8_parent']
+-    assert test_freeze['source_files'] == {path: current_hashes[path] for path in ('src/chat/client.rs', 'src/chat/native_holder/transport.rs')}
+-    assert test_conservation['pins']['freeze_sha256'] == review['test_source_freeze']['sha256']
+-    assert patch_archive['raw_sha256'] == test_freeze['delta_sha256'] == test_conservation['pins']['frozen_delta_sha256']
+-    raw_patch = patch_archive['raw_utf8'].encode('utf-8')
+-    assert hashlib.sha256(raw_patch).hexdigest() == patch_archive['raw_sha256']
+-    assert len(raw_patch) == patch_archive['raw_bytes'] == test_conservation['pins']['delta_bytes'] == 1089
+-    assert committed['kind'] == 'AUTHOR_COMMITTED_THREE_CFGTEST_LINES_BINDING_NOT_INDEPENDENT_WHOLE_HEAD_APPROVAL'
+-    assert committed['head'] == current_publication['head'] == review['host8_head']
+-    assert committed['tree'] == current_publication['tree'] == review['host8_tree']
+-    assert committed['parent'] == current_publication['parent'] == review['host8_parent']
+-    assert committed['delta_sha256'] == patch_archive['raw_sha256']
+-    assert committed['changed_paths'] == current['source']['only_changed_paths_from_parent'] == ['src/chat/client.rs', 'src/chat/native_holder/transport.rs']
+-    assert committed['inserted_lines'] == 3 and committed['deleted_lines'] == 0
+-    assert committed['all_other_entries_and_modes_equal'] is True and committed['exact_inverse_changed_files_equals_parent'] is True
+-    assert committed['conserved_other_entries'] == 2221 and committed['source_pins'] == current['source']['pins']
+-    assert current_publication['source_review_sha256'] == review['test_api_review']['sha256']
+-    assert current_publication['conservation_review_sha256'] == review['test_conservation_review']['sha256']
+-    assert current_publication['pr'] == 1239 and current_publication['state'] == 'OPEN_DRAFT'
+-    assert current_publication['Script_contracts'] == current['current_Script_metadata']
+-    assert current_publication['Script_contracts']['head'] == review['host8_head']
+-    assert current_publication['Script_contracts']['status'] == 'completed' and current_publication['Script_contracts']['conclusion'] == 'success'
+-    assert old_return['product'] == review['host8_parent'] and old_return['controller'] == '54f49ab7dd2edd7367349f0698bae83efbd953b6'
+-    assert old_return['actual_results']['host_binary_check_exit'] == 0 and old_return['actual_results']['host_library_compile_exit'] == 101
+-    assert old_return['actual_results']['parents_attempted'] == old_return['actual_results']['parents_passed'] == 0
+-    assert old_return['actual_results']['parents_unrun'] == 6 and old_return['new_execution_authorized'] is False
+-    assert old_return['allocation'] == 'aa35221a-9192-4d38-b8f3-5e426578bfba'
+-    # The return retains its original pending timestamp. Later supplied publication
+-    # metadata records acceptance; neither record authorizes this new attempt.
+-    assert current_publication['old_C'] == 'aa352CLOSED_ACCEPTED2492b6bc; no consumedgranttransfer'
+-    # Existing HOST8 source evidence above remains scoped to its original
+-    # tuple. Only this new fixture block is bound to the current HOST9 source.
+-    host9 = read_bound('host9_command_data')
+-    host9_delta = read_bound('host9_data_delta')
+-    varint_semantic = read_bound('varint_semantic_review', False)  # Genuine raw Markdown.
+-    varint_conservation = read_bound('varint_conservation_review')
+-    varint_freeze = read_bound('varint_source_freeze')
+-    varint_patch = read_bound('varint_source_delta')
+-    varint_publication = read_bound('varint_publication')
+-    varint_committed = review['varint_commit_binding']  # Author binding only, not whole-head approval.
+-    leaf = 'src/host/upgrade_inspect/current.rs'
+-    varint_name = 'host::upgrade_inspect::current::tests::frozen_inventory_subset_accepts_99_through_104_only'
+-    assert host9['schema'] == 'pr1239-73487c8d-narrow-host-command-data-v4-host9'
+-    assert host9['source']['head'] == review['head'] == plan['product_head'] == '73487c8d69e826de3865b8e5692cd9e39485ddd5'
+-    assert host9['source']['tree'] == review['tree'] == plan['product_tree'] == '0ac51f1aa553ddd30fd0e993d25397b08e58172f'
+-    assert host9['source']['parent'] == review['parent'] == review['host8_head']
+-    assert review['host8_head'] == '8bcd52d1d99f9193cc3d4f5a8b121e0211d19a6e'
+-    assert host9['source']['worktree'] == str(WT)
+-    host9_hashes = {pin['path']: pin['sha256'] for pin in host9['source']['pins']}
+-    assert len(host9_hashes) == len(host9['source']['pins']) == 12
+-    assert host9_hashes == review['source_paths_sha256'] == plan['source_paths_sha256']
+-    assert host9['source']['pins'][:11] == current['source']['pins']
+-    assert {path: value for path, value in host9_hashes.items() if path not in current_hashes} == {
+-        leaf: 'c118617f5666ab3de65f5f755d670a4595c1432bf9374e0586189fcc8d2a4765'}
+-    assert all(host9_hashes[path] == value for path, value in current_hashes.items())
+-    assert host9['selected_parents'][:8] == current['selected_parents']
+-    host9_names = [parent['selector'] for parent in host9['selected_parents']]
+-    assert host9_names == current_names + [varint_name] and len(set(host9_names)) == 9
+-    assert all(parent['ignored'] is False and parent['static_parent_count'] == 1
+-               and parent['source_sha256'] == host9_hashes[parent['source']] for parent in host9['selected_parents'])
+-    assert host9['selected_parents'][8]['source'] == leaf
+-    assert host9['selected_parents'][8]['nested_cases'] == 7 and host9['selected_parents'][8]['nested_cases_are_nonadditive'] is True
+-    assert len(host9['proposed_serial_commands']) == 12 and host9['counts']['outer_parents'] == 9 and host9['counts']['phases'] == 12
+-    assert host9['counts']['additional_counted_children'] == 0
+-    assert all(command['cwd'] == str(WT) for command in host9['proposed_serial_commands'])
+-    assert [command['argv'] for command in host9['proposed_serial_commands'][:11]] == [command['argv'] for command in current['proposed_serial_commands']]
+-    assert host9['proposed_serial_commands'][2]['argv'] == ['--list', '--color=never']
+-    for index, name in enumerate(host9_names):
+-        assert host9['proposed_serial_commands'][index + 3]['argv'] == [name, '--exact', '--nocapture', '--test-threads=1', '--color=never']
+-        assert host9['selected_parents'][index]['future_argv'] == host9['proposed_serial_commands'][index + 3]['argv']
+-    assert host9_delta['before']['sha256'] == review['current_command_data']['sha256']
+-    assert host9_delta['after_sha256'] == review['host9_command_data']['sha256']
+-    assert 'Verdict: bounded SOURCE CLEAR for this cfg(test) fixture correction.' in varint_semantic
+-    assert review['parent'] in varint_semantic and host9_hashes[leaf] in varint_semantic
+-    assert varint_conservation['verdict'] == 'SOURCE_CONSERVATION_CLEAR_FOR_EXACT_FROZEN_ONE_TEST_BLOCK_DELTA'
+-    assert varint_conservation['blocking_findings'] == []
+-    assert varint_conservation['pins']['parent_commit'] == varint_freeze['parent'] == review['parent']
+-    assert varint_conservation['pins']['parent_tree'] == varint_freeze['parent_tree'] == review['host8_tree']
+-    assert varint_conservation['pins']['changed_source'] == leaf
+-    assert varint_conservation['pins']['candidate_file_sha256'] == varint_freeze['file_sha256'] == host9_hashes[leaf]
+-    assert varint_conservation['one_intended_test_block']['complete_file_after_inverse_byte_equal_parent'] is True
+-    assert varint_conservation['production_allowlist_assertion_conservation']['production_prefix_byte_equal'] is True
+-    assert varint_conservation['production_allowlist_assertion_conservation']['supports_protocol_function_byte_equal'] is True
+-    assert varint_conservation['production_allowlist_assertion_conservation']['source_protocols_helper_byte_equal'] is True
+-    assert varint_conservation['production_allowlist_assertion_conservation']['protocol_allowlist_change'] is False
+-    assert varint_conservation['production_allowlist_assertion_conservation']['original_assertion_start_line_sequence_byte_equal'] is True
+-    assert varint_conservation['all_other_tracked_entries']['conserved_other_entries'] == 2222
+-    assert varint_conservation['pins']['freeze_sha256'] == review['varint_source_freeze']['sha256']
+-    raw_varint_patch = varint_patch['raw_utf8'].encode('utf-8')
+-    assert hashlib.sha256(raw_varint_patch).hexdigest() == varint_patch['raw_sha256'] == varint_freeze['delta_sha256'] == varint_conservation['pins']['delta_sha256']
+-    assert len(raw_varint_patch) == varint_patch['raw_bytes'] == varint_conservation['pins']['delta_bytes'] == 1099
+-    assert varint_committed['kind'] == 'AUTHOR_EXACT_COMMITTED_VARINT_FIXTURE_BINDING_NOT_WHOLE_HEAD_APPROVAL'
+-    assert varint_committed['head'] == varint_publication['head'] == plan['product_head']
+-    assert varint_committed['tree'] == varint_publication['tree'] == plan['product_tree']
+-    assert varint_committed['parent'] == varint_publication['parent'] == review['parent']
+-    assert varint_committed['delta_sha256'] == varint_patch['raw_sha256']
+-    assert varint_committed['changed_paths'] == host9['source']['only_changed_paths_from_parent'] == [leaf]
+-    assert varint_committed['current_file_sha256'] == varint_publication['source_sha256'] == host9_hashes[leaf]
+-    assert varint_committed['exact_one_block_inverse_equals_parent'] is True and varint_committed['all_other_entries_and_modes_equal'] is True
+-    assert varint_committed['conserved_other_entries'] == 2222 and varint_committed['source_pins'] == host9['source']['pins']
+-    assert varint_publication['semantic_review_sha256'] == review['varint_semantic_review']['sha256']
+-    assert varint_publication['conservation_review_sha256'] == review['varint_conservation_review']['sha256']
+-    assert varint_publication['pr'] == 1239 and varint_publication['public_state'] == 'OPEN Draft'
+-    assert varint_publication['normal_push_original_exit'] == 0 and varint_publication['Rust_compile_tests_native'] == 'UNRUN'
+-    assert varint_publication['wire127_migration'] == 'HOLD unchanged; no allowlist widening/current installed inference'
+-    assert [group['id'] for group in plan['artifact_groups']] == ['host-lib']
+-    group = plan['artifact_groups'][0]
+-    assert group['features'] == ['host']
+-    assert [contract['name'] for contract in group['selectors']] == host9_names
+-    assert group['source_predicted_compiled_names'] == host9_names and group['source_predicted_absent_names'] == []
+-    assert all(contract['expected_stdout_child_results'] == 0 and contract['seconds'] == 90
+-               and not contract.get('staged_child_observation') for contract in group['selectors'])
+-    assert SCOPE_PARENT is None
+-    assert len(plan['binary_checks']) == 1
+-    assert plan['binary_checks'][0]['argv'] == ['cargo', *host9['proposed_serial_commands'][0]['argv']]
+-    assert group['compile_argv'] == ['cargo', *host9['proposed_serial_commands'][1]['argv']]
+-    assert plan['binary_checks'][0]['seconds'] == 600 and group['compile_seconds'] == 900 and group['inventory_seconds'] == 30
+-    assert plan['planned_phase_order'] == ['host-binary-check', 'compile-host-lib', 'inventory-host-lib'] + ['parent-host-lib-' + str(index) for index in range(1, 10)]
++    data = read_bound('command_data')
++    preflight = read_bound('source_preflight')
++    transport = read_bound('transport_review')
++    composition = read_bound('composition_freeze')
++    publication = read_bound('eb7_publication')
++    b914_publication = read_bound('b914_publication')
++    design = read_bound('design', False)
++    read_bound('prior_design', False)
++    donor_acceptance = read_bound('donor_acceptance')
++    donor_review = read_bound('donor_controller_review')
++    read_bound('donor_runner', False)
++    read_bound('donor_plan')
++    read_bound('donor_handoff')
++    read_bound('donor_source_receipt')
++    read_bound('transport_freeze')
++    for ref in review['composition_reviews']:
++        payload = Path(ref['path']).read_bytes()
++        assert hashlib.sha256(payload).hexdigest() == ref['sha256']
++    assert data['schema'] == 'eb7-startup-recovery-packet-A-three-isolated-binary-checks-v1'
++    assert data['kind'] == 'FIXED_SOURCE_DATA_ONLY_NO_EXECUTION_OR_GRANT'
++    assert data['head'] == review['head'] == plan['product_head'] == 'eb7ff16beb8864349573231521c5d4eab5270cc6'
++    assert data['tree'] == review['tree'] == plan['product_tree'] == '8d60fb0154109a82861f9b595f2b7296e4f55c26'
++    assert data['parent'] == review['parent'] == plan['product_parent'] == 'b914f9d9b55527aa1bb22d591968c58958d717ee'
++    assert data['product_cwd'] == str(WT)
++    assert data['job_kind'] == 'A_CHECKS_ONLY' and data['artifact_groups'] == plan['artifact_groups'] == []
++    assert data['binary_checks'] == plan['binary_checks'] == [
++        {'label': 'cli-binary-check', 'argv': ['cargo', 'check', '--locked', '--no-default-features', '--bin', 'cagents'], 'seconds': 600},
++        {'label': 'host-binary-check', 'argv': ['cargo', 'check', '--locked', '--no-default-features', '--features', 'host', '--bin', 'cagentsd'], 'seconds': 600},
++        {'label': 'ui-binary-check', 'argv': ['cargo', 'check', '--locked', '--no-default-features', '--features', 'ui', '--bin', 'cagents-ui'], 'seconds': 900}]
++    assert data['counts'] == review['counts'] == plan['counts'] == {'checks': 3, 'lib_compilations': 0, 'ELF_inventories': 0, 'test_invocations': 0, 'qualifying_outer_parents': 0, 'test_groups': 0, 'total_phases': 3}
++    assert data['caps_override']['phase_caps_seconds'] == [600, 600, 900]
++    assert data['caps_override']['sum_caps_seconds'] == 2100 and data['caps_override']['remaining_overhead_seconds'] == 300
++    assert data['caps_override']['authority_reference'] == 'EC53a57eea as relayed by Root task'
++    assert data['packet_deadline_seconds'] == plan['packet_deadline_seconds'] == 2400
++    assert plan['planned_phase_count'] == 3 and plan['planned_phase_order'] == ['cli-binary-check', 'host-binary-check', 'ui-binary-check']
++    assert preflight['product_head'] == publication['head'] == plan['product_head']
++    assert preflight['product_tree'] == publication['tree'] == plan['product_tree']
++    assert preflight['source_paths_sha256'] == review['source_paths_sha256'] == plan['source_paths_sha256']
++    assert plan['source_paths_sha256']['src/control.rs'] == '5ffc695ec8029d10808e05647d5bd106ff51e2e0b728b9a3b6ed3f2404e410c1'
++    assert transport['result'] == 'SOURCE_CLEAR_BOUNDED_SHARED_TRANSPORT_TEST' and transport['blocking_findings'] == []
++    assert publication['source_review_sha256'] == review['transport_review']['sha256']
++    assert publication['parent'] == b914_publication['head'] == data['parent']
++    assert composition['schema'] == 'fw16-startup-recovery-composition-source-v1'
++    assert all(name == 'src/control.rs' or plan['source_paths_sha256'][name] == spec['sha256'] for name, spec in composition['files'].items())
++    assert 'Job A: three isolated binary checks' in design
++    assert donor_acceptance['decision'] == 'CLOSED_ACCEPTED_BOUNDED_EXACT_73487_HOST9_PASS'
++    assert donor_acceptance['source_controller']['runner_sha256'] == donor_review['runner_sha256'] == review['donor_runner']['sha256'] == '71b1e67c73d075891c9b5c48a8fe6e53a4168bb2b86365bf23287b4590cf2829'
++    assert donor_acceptance['source_controller']['plan_sha256'] == donor_review['plan_sha256'] == review['donor_plan']['sha256']
++    assert SCOPE_PARENT is None and data['actual_grant'] is None
+     assert plan['lane']['target'] == str(TARGET) and plan['lane']['lock'] == str(LOCK)
+     assert plan['lane']['jobs'] == 2 and plan['lane']['new_cache'] is False
+-    assert plan['packet_deadline_seconds'] == 2400 and plan['planned_phase_count'] == 12
+-    assert plan['counts']['qualifying_outer_parents'] == 9
++    assert plan['physical_tool_bin'] == str(TOOL)
+     controller_path = Path(args.controller_review)
+     assert controller_path.is_absolute() and not controller_path.is_symlink() and controller_path.resolve(strict=True) == controller_path
+     controller_bytes = controller_path.read_bytes()
+@@ -910,7 +654,7 @@
+     for name, expected_sha in plan['tool_sha256'].items():
+         path = TOOL / name
+         assert path.is_file() and not path.is_symlink() and digest(path) == expected_sha
+-    out = Path('/tmp/coord-b9-pr1239-73487c8d-host9-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
++    out = Path('/tmp/coord-b9-startup-recovery-checks-validation-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ') + '-' + str(os.getpid()))
+     out.mkdir(mode=0o700)
+     save = lambda name, value: (out / name).write_text(json.dumps(value, indent=2) + '\n')
+     # Custody and original bytes are archived before touching the lane lock.
+@@ -932,7 +676,7 @@
+     # Install cooperative retention before any source child or C acquisition.
+     signal.signal(signal.SIGINT, note_lane_cancellation)
+     signal.signal(signal.SIGTERM, note_lane_cancellation)
+-    phases, tests = [], []
++    phases, checks = [], []
+     error = None
+     acquired = False
+     lock_fd = None
+@@ -1097,7 +841,7 @@
+         save('tools.json', {'physical_paths': {name: str(TOOL / name) for name in plan['tool_sha256']},
+                             'sha256': plan['tool_sha256'], 'version_processes': 'Not launched; physical1.93 paths and exact bytes pinned.'})
+         print(json.dumps({'state': 'LEASE_ACQUIRED', 'evidence': str(out), 'at': now()}), flush=True)
+-        artifacts = execute_contracts(plan, run, save, tests)
++        execute_contracts(plan, run, save, checks)
+     except Exception as exc:
+         error = type(exc).__name__ + ': ' + str(exc)
+     finally:
+@@ -1105,10 +849,10 @@
+             final_errors, custody = final_observations(source, context, before, before_context, save)
+             if final_errors:
+                 error = (error or '') + '; ' + '; '.join(final_errors)
+-            accounting, raw, raw_errors = parent_accounting(PROCESS_ATTEMPTS, PROCESS_STATES, phases, tests, out)
++            accounting, raw, raw_errors = check_accounting(PROCESS_ATTEMPTS, PROCESS_STATES, phases, checks, out)
+             for raw_error in raw_errors:
+-                supervision_failure(None, RuntimeError(raw_error), 'raw-parent-evidence')
+-                error = (error or '') + '; raw parent evidence: ' + raw_error
++                supervision_failure(None, RuntimeError(raw_error), 'raw-check-evidence')
++                error = (error or '') + '; raw check evidence: ' + raw_error
+             historical_handoff_clean = safe_lane_handoff(
+                 PROCESS_ATTEMPTS, PROCESS_STATES, phases, custody, SUPERVISION_FAILURES)
+         except BaseException as finalization_error:
+@@ -1124,7 +868,7 @@
+                 'stage': 'positive-handoff-unconfirmed', 'original_error': error,
+                 'lock_fd': lock_fd, 'close_attempted': False,
+                 'attempts': PROCESS_ATTEMPTS, 'states': PROCESS_STATES,
+-                'phases': phases, 'raw_parent_results': raw,
++                'phases': phases, 'raw_check_results': raw,
+                 'custody': custody, 'supervision_failures': SUPERVISION_FAILURES})
+         if lock_fd is not None:
+             try:
+@@ -1146,19 +890,16 @@
+         summary = {'head': plan['product_head'], 'tree': plan['product_tree'], 'grant': args.grant,
+              'runner_sha256': args.runner_sha256, 'plan_sha256': PLAN_SHA, 'source_review_sha256': plan['source_review_sha256'],
+              'controller_review_sha256': args.controller_review_sha256,
+-             'error': error, 'phases': phases, 'parents': tests, **accounting, 'raw_parent_results': raw,
++             'error': error, 'phases': phases, 'binary_checks': checks, **accounting, 'raw_check_results': raw,
+              'process_attempts': PROCESS_ATTEMPTS, 'process_states': PROCESS_STATES, 'supervision_failures': SUPERVISION_FAILURES,
+              'cancellation_signals': CANCELLATION_SIGNALS,
+              'custody': custody, 'historical_handoff_clean': historical_handoff_clean,
+              'lock_closed': lock_closed, 'lock_unlocked': lock_unlocked, 'lock_close_error': lock_close_error,
+              'actual_release': actual_release,
+              'release_policy': 'Original Cfd closes only after complete original waits/evidence and clean unforced phase plus both final custody observations. No LOCK_UN is issued. Unknown assessment/handoff or close retains no safe-return claim; ambiguous close is never retried.',
+-             'owning_commands_qualified': error is None and not CANCELLATION_SIGNALS and len(tests) == 9 and [phase['label'] for phase in phases] == plan['planned_phase_order'] and actual_release,
+-             'scope_observations': [row['scope_observation'] for row in raw if 'scope_observation' in row],
+-             'scope_isolation': next((row['scope_observation']['scope_isolation'] for row in raw if 'scope_observation' in row), 'UNKNOWN_UNQUALIFIED'),
+-             'adoption_close': next((row['scope_observation']['adoption_close'] for row in raw if 'scope_observation' in row), 'UNKNOWN_UNQUALIFIED'),
++             'owning_commands_qualified': error is None and not CANCELLATION_SIGNALS and len(checks) == 3 and accounting['qualified_binary_check_candidate_count'] == 3 and [phase['label'] for phase in phases] == plan['planned_phase_order'] and actual_release,
++             'qualification_scope': plan['qualification_scope'],
+              'native_provider_UI_global_qualification': 'NOT_ESTABLISHED_BY_THIS_PACKET',
+-             'nonadditive_child_result_count': sum(len(parent['nonadditive_child_results']) for parent in tests),
+              'finished': now(), 'limits': plan['limits']}
+         save('summary.json', summary)
+         files = sorted(path for path in out.rglob('*') if path.is_file())
