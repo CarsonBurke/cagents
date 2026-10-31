@@ -247,13 +247,13 @@
     },
     {
       "path": "from-993-forward.diff.json",
-      "bytes": 193626,
-      "sha256": "5c1a6074001f8a776620ba60a9787c64de4ea0160f094a556e2d7181a20d1c3c"
+      "bytes": 193652,
+      "sha256": "462f0227081bb007ac3799844818af78cc0afb2d9e0c21c9d492adc75e5d4d60"
     },
     {
       "path": "from-c28-UI4-forward.diff.json",
-      "bytes": 197987,
-      "sha256": "354a477758d0d7e1bbaf0b01ff2852cbcfe80ebc0329fcb9a6711bb23eca2b35"
+      "bytes": 198013,
+      "sha256": "2a405c6827b7db5fbb1bc39dc4b7c43a606574420a00af71691a85f100a8d00f"
     },
     {
       "path": "instruction-source.json",
@@ -262,8 +262,8 @@
     },
     {
       "path": "invocation-template.json",
-      "bytes": 829,
-      "sha256": "e41befedf219f8ee49a027b495ff61a848fe54fae05ae19ba4a1f6b57e78aa4b"
+      "bytes": 863,
+      "sha256": "06b4d47538c3acec01a297db218d251018e523e3df144366295ece41e2af7262"
     },
     {
       "path": "original-pre-freeze-source-tools.json",
@@ -272,8 +272,8 @@
     },
     {
       "path": "plan.json",
-      "bytes": 45324,
-      "sha256": "e14d5f9624be911fcf415b69028e5d0c21b81e12595960e80538597277b6e2a8"
+      "bytes": 46973,
+      "sha256": "116704a625010ba3547443e6d719643133d17ad1a47aaccd8e282527fbdb44a1"
     },
     {
       "path": "product-source/.cargo/config.toml",
@@ -517,8 +517,8 @@
     },
     {
       "path": "run-packet.py",
-      "bytes": 93700,
-      "sha256": "153bc925907ccd722407140f96b93b3d5bec53e11dd1b05ba114417cf799ab38"
+      "bytes": 93726,
+      "sha256": "d5f5102077a3d4df4e4800e564da1dbc0dc2f8bbd7876d22700b4a24f62a1c01"
     },
     {
       "path": "selected-source-contract.json",
@@ -527,23 +527,23 @@
     },
     {
       "path": "source-binding.json",
-      "bytes": 33769,
-      "sha256": "2be679120c9e3c85de1e9ae317637a3f699421644240191afe18a0fc2f1780a1"
+      "bytes": 34585,
+      "sha256": "ac746383f3747f3c9c43767d077ce9ca211b9b3bbb8d8bb25e29a621e0e0013c"
     },
     {
       "path": "source-conservation.json",
-      "bytes": 8348,
-      "sha256": "c0de55fe090fb91ee817aa51913f4dcbbb20dbfeb8b499fedeb074d547a16eac"
+      "bytes": 9995,
+      "sha256": "5b5a59f0f498bef15349ebaa431e1a2b58ae678fbe0161896f7c1e5a19440338"
     },
     {
       "path": "to-993-true-inverse.diff.json",
-      "bytes": 193631,
-      "sha256": "f4969d2c4716023b14cad7d7c1e9a9526697311d9016319fff4b0bd147ad9105"
+      "bytes": 193657,
+      "sha256": "ef3f38c8f0eef3d11172e159a317a2d3af183b2f7bf9e4036b53c87ace9b352d"
     },
     {
       "path": "to-c28-UI4-true-inverse.diff.json",
-      "bytes": 197992,
-      "sha256": "5a93420daaf691ca7b09f87d7eece92be29ebe5cf4dfc6646b7e7dc8f503bf8b"
+      "bytes": 198018,
+      "sha256": "74c2359825fb6a2c631d67285f5d6ff71075abaf5e1ed8545a2ef2685a5f7df3"
     }
   ],
   "limits": "Preparation supplies no runtime evidence. Original run phase/receipt fields and sole RAW can establish future bounded results. Source reviews do not qualify native UX, screenshots, performance, main or whole PR.",

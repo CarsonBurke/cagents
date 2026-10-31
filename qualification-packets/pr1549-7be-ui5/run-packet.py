@@ -20,12 +20,12 @@ WT = Path('/home/marvin/Documents/repositories/cagents/.worktrees/fw16-pr1549-se
 TARGET = Path('/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target')
 LOCK = TARGET.parent / 'lane-c.lock'
 TOOL = Path('/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin')
-PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/plan.json')
+PLAN = Path('/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-publication-role-source/qualification-packets/pr1549-7be-ui5/plan.json')
 PROCESS_ATTEMPTS = []  # Append-only immutable successful-spawn tuples; never inferred from evidence files.
 PROCESS_STATES = []    # Separate original-wait and evidence observations; null stays unknown.
 SUPERVISION_FAILURES = []  # Sticky history, including failures after an otherwise successful wait.
 CANCELLATION_SIGNALS = []  # Cooperative cancellation, never cleared by cleanup.
-PLAN_SHA = 'e14d5f9624be911fcf415b69028e5d0c21b81e12595960e80538597277b6e2a8'
+PLAN_SHA = '116704a625010ba3547443e6d719643133d17ad1a47aaccd8e282527fbdb44a1'
 SCOPE_PARENT = None  # No grouped contract enables the dormant donor staged-scope path.
 
 
@@ -919,7 +919,7 @@ def main():
     assert (publication['head'], publication['tree']) == (base_product['head'], base_product['tree'])
     assert publication['source_adoption']['sha256'] == review['product_adoption']['sha256']
     assert publication['separate_branch']['exit'] == 0 and publication['existing_PR_fastforward']['exit'] == 0 and publication['existing_PR_fastforward']['pr'] == 1549
-    assert review['publication'] == {'source_publication_sha256': review['product_publication']['sha256'], 'source_adoption_sha256': review['product_adoption']['sha256'], 'published_source_branch': publication['separate_branch']['branch']}
+    assert review['base_c28_publication'] == {'source_publication_sha256': review['product_publication']['sha256'], 'source_adoption_sha256': review['product_adoption']['sha256'], 'published_source_branch': publication['separate_branch']['branch']}
     original_DATA = read_bound('full_feature_DATA')
     addendum = read_bound('product7_addendum')
     new_freeze = read_bound('product7_freeze')

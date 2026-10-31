@@ -1,15 +1,15 @@
 {
   "kind": "NOT_SUBMITTABLE_PRE_REVIEW_SOURCE_TEMPLATE",
-  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source",
+  "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-publication-role-source",
   "argv": [
     "/usr/bin/python3",
     "-I",
     "-B",
-    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-source/qualification-packets/pr1549-7be-ui5/run-packet.py",
+    "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-pr1549-7be-ui5-publication-role-source/qualification-packets/pr1549-7be-ui5/run-packet.py",
     "--grant",
     null,
     "--runner-sha256",
-    "153bc925907ccd722407140f96b93b3d5bec53e11dd1b05ba114417cf799ab38",
+    "d5f5102077a3d4df4e4800e564da1dbc0dc2f8bbd7876d22700b4a24f62a1c01",
     "--controller-review",
     null,
     "--controller-review-sha256",
