@@ -7017,8 +7017,47 @@ mod tests {
         assert_eq!(published.worker_join.load(Ordering::Acquire), 2);
     }
 
+    // Own the original Child before capture, reservation or assertion can fail.
+    // PublishedState receives only a clone of this original shutdown descriptor.
+    struct EscalationFixtureChild { child: std::process::Child, pidfd: Option<File> }
+    impl EscalationFixtureChild {
+        fn spawn() -> Self {
+            let child=std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
+            let mut original=Self { child, pidfd: None };
+            let descriptor=unsafe {libc::syscall(libc::SYS_pidfd_open,original.child.id(),0)};
+            assert!(descriptor>=0,"original fixture pidfd capture: {}",std::io::Error::last_os_error());
+            original.pidfd=Some(unsafe {File::from_raw_fd(descriptor as i32)});
+            original
+        }
+        fn shutdown_pidfd(&self) -> File { self.pidfd.as_ref().unwrap().try_clone().unwrap() }
+        fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> { self.child.try_wait() }
+        fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> { self.child.wait() }
+    }
+    impl Drop for EscalationFixtureChild {
+        fn drop(&mut self) {
+            if self.child.try_wait().is_ok_and(|status|status.is_some()) { return; }
+            // This is the fixture's positively owned direct child, never a
+            // registry/marker PID. Capture failure retains the original Child.
+            let signalled=match self.pidfd.as_ref() {
+                Some(pidfd)=>close_processes::signal(pidfd,libc::SIGKILL),
+                None=>self.child.kill(),
+            };
+            if let Err(error)=signalled {
+                let _=writeln!(std::io::stderr().lock(),"original fixture signal: {error}");
+            }
+            if let Err(error)=self.child.wait() {
+                let _=writeln!(std::io::stderr().lock(),"original fixture wait HOLD: {error}");
+                // Unknown wait status cannot release the original descriptor
+                // or private fixture. No bounded-completion claim is made.
+                loop {thread::park();}
+            }
+        }
+    }
+
     #[test]
     fn final_drop_escalates_an_owned_root_while_all_join_workers_are_blocked() {
+        // Declared first so every release latch drops before original wait.
+        let mut child=EscalationFixtureChild::spawn();
         struct Releases(Vec<Sender<()>>);
         impl Drop for Releases { fn drop(&mut self) { for release in &self.0 { let _ = release.try_send(()); } } }
         let mut releases = Releases(Vec::new());
@@ -7031,12 +7070,9 @@ mod tests {
             assert!(!joins::join_until(&slot, &published, Instant::now()+WORKER_JOIN_TIMEOUT, false, false));
             owners.push(published);
         }
-        let mut child = std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
-        assert!(descriptor >= 0);
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         published.join_reservation.set(joins::reserve().unwrap()).unwrap();
-        published.shutdown_pidfd.set(unsafe { File::from_raw_fd(descriptor as i32) }).unwrap();
+        published.shutdown_pidfd.set(child.shutdown_pidfd()).unwrap();
         struct Kill(Arc<PublishedState>);
         impl Drop for Kill { fn drop(&mut self) { let _ = close_processes::signal(self.0.shutdown_pidfd.get().unwrap(), libc::SIGKILL); } }
         let _kill = Kill(Arc::clone(&published));
@@ -7071,11 +7107,10 @@ mod tests {
 
     #[test]
     fn worker_join_escalation_cannot_signal_a_root_retained_for_handoff() {
-        let mut child=std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
-        let descriptor=unsafe {libc::syscall(libc::SYS_pidfd_open,child.id(),0)}; assert!(descriptor>=0);
+        let mut child=EscalationFixtureChild::spawn();
         let published=Arc::new(PublishedState::new(true,Arc::new(|_|{})));
         published.join_reservation.set(joins::reserve().unwrap()).unwrap();
-        published.shutdown_pidfd.set(unsafe {File::from_raw_fd(descriptor as i32)}).unwrap();
+        published.shutdown_pidfd.set(child.shutdown_pidfd()).unwrap();
         let (release,blocked)=crossbeam_channel::bounded(1);
         struct Cleanup {owner:Arc<PublishedState>,release:Sender<()>}
         impl Drop for Cleanup {fn drop(&mut self){let _=close_processes::signal(self.owner.shutdown_pidfd.get().unwrap(),libc::SIGKILL);let _=self.release.try_send(());}}
@@ -7092,11 +7127,10 @@ mod tests {
 
     #[test]
     fn failed_carry_rearms_a_parked_join_deadline_without_losing_the_original_owner() {
-        let mut child=std::process::Command::new("/bin/sleep").arg("60").spawn().unwrap();
-        let descriptor=unsafe {libc::syscall(libc::SYS_pidfd_open,child.id(),0)};assert!(descriptor>=0);
+        let mut child=EscalationFixtureChild::spawn();
         let published=Arc::new(PublishedState::new(true,Arc::new(|_|{})));
         published.join_reservation.set(joins::reserve().unwrap()).unwrap();
-        published.shutdown_pidfd.set(unsafe {File::from_raw_fd(descriptor as i32)}).unwrap();
+        published.shutdown_pidfd.set(child.shutdown_pidfd()).unwrap();
         let (release,blocked)=crossbeam_channel::bounded(1);
         struct Cleanup {owner:Arc<PublishedState>,release:Sender<()>}
         impl Drop for Cleanup {fn drop(&mut self){let _=close_processes::signal(self.owner.shutdown_pidfd.get().unwrap(),libc::SIGKILL);let _=self.release.try_send(());}}
