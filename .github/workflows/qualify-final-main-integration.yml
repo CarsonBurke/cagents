@@ -13,7 +13,9 @@ concurrency:
 
 jobs:
   user-ui-integration:
-    if: github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16'
+    # Producer-only source phase. A separate reviewed consumer revision must
+    # restore this guard; no automatic producer -> native continuation.
+    if: false && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref == 'qual/held-saved-scope-fw16'
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     env:
