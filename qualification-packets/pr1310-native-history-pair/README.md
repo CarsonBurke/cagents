@@ -179,3 +179,38 @@ entry-owned C descriptor remain absent/HOLD. No physical/status/TERM acceptance
 policy was changed. Native imports/calls/input/frames/UX and performance remain
 UNRUN. Fresh assembled-source review and actual future authenticated admission
 are separate requirements; no runtime action or publication follows this merge.
+
+## Separate known-local physical facts
+
+This successor keeps421's AX/appearance driver and all source/arm/renderer/build
+pins unchanged. Only the owner and physical contract change. Actual original
+Popen waits retain object/stream correlation; original-incarnation published
+pidfd POLLIN can establish death while raw parent-reaped status remains None.
+`normal_close_succeeded` and native outcome inference are unchanged. Cargo0,
+death, an empty scoped observation and a successful close never become UI0/AX0.
+
+After all known local original waits/deaths and actual synchronous writer-return
+fences, a no-more-work latch refuses later Popen. One final bounded observation
+reads only the original current owner's all-thread proc children, with owner/
+TID incarnation and list bookends, actual raw bytes/times/IO/errors. Caps are512
+threads/4096 child IDs. Partial, unavailable, changing, ambiguous or nonempty
+observations refuse further original pidfd loss. Empty is scoped coverage only.
+Real temporary proc FDs are retained in the existing original raw ledger and
+closed once. The already retained prepare root FD is not duplicated. Python
+scandir hides its transient internal FD; iterator/API-close facts are recorded
+without pretending to observe that internal FD or syscall. Cooperative kernel/
+stdlib calls cannot be preempted; deadlines never reset or permit late repair.
+
+Only actual known local file/raw/published-pidfd acquisitions/close attempts are
+recorded. Published pidfds are first-observed, not falsely first-acquired: the
+unchanged d9ee primitive can open/close before publication on failure, which
+remains UNKNOWN/HOLD. Original FD numbers survive node pops. Ambiguous closes
+are never retried. The original entry-owned C descriptor is ABSENT; no FD number,
+JSON or local close flag supplies that ownership or acceptance.
+
+Local physical facts can coexist with failed/cancelled/forced/unknown application
+outcomes. All raw negatives and first failure remain. Final logical disposition
+is ALWAYS HOLD for external entry-C/upstream gaps; service TERM remains only a
+proposal. UI-wait, native imports/AX and actual entry/status/build/data/native UX
+gates remain unresolved. No new process/carrier/framework, policy adoption,
+execution grant, resource release or native pass is supplied by this source.

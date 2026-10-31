@@ -156,6 +156,8 @@ class NativeHistoryOwner:
         self.events, self.files, self.direct_waits, self.services = [], [], {}, {}
         self.raw_fds, self._directories, self.launches = [], [], {}
         self.launch_attempts, self.signal_attempts, self.pidfd_closes = [], [], []
+        self.published_pidfds, self.physical_evidence = [], {}
+        self.final_no_more_work = self.final_scoped_children = None
         self.inputs = {}
         self.bindings, self.artifacts, self.producers, self.writer_fences = [], {}, {}, {}
         self.first_failure = None
@@ -226,6 +228,13 @@ class NativeHistoryOwner:
         if getattr(self, "first_failure", None) is None:
             self.first_failure = {"type": type(error).__name__, "reason": str(error),
                                   "monotonic": time.monotonic()}
+        if hasattr(self, "physical_evidence"):
+            try:
+                self._published_pidfd_records()
+            except BaseException as inventory_error:
+                self.physical_evidence["published_inventory_error"] = {
+                    "type": type(inventory_error).__name__, "reason": str(inventory_error)}
+            self._snapshot_known_FDs()
         if hasattr(self, "final_settlement"):
             self.final_settlement.update(first_failure=self.first_failure, disposition="HOLD")
 
@@ -243,7 +252,8 @@ class NativeHistoryOwner:
         self._remaining(cleanup=cleanup)
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         item = {"path": Path(path), "fd": fd,
-                "secret": secret, "close_attempted": False}
+                "secret": secret, "acquisition": len(self.files),
+                "acquisition_kind": "local-file-open-return", "close_attempted": False}
         self.files.append(item)  # Actual open is retained BEFORE fallible fstat.
         self.events.append({"event": "file-open-return", "path": str(path), "fd": fd})
         item["identity"] = identity(os.fstat(fd))
@@ -274,11 +284,14 @@ class NativeHistoryOwner:
             item["before_close"] = unchanged(self._same_file(item))
         self._remaining(cleanup=cleanup)
         item["close_attempted"] = True
+        item["close_started_monotonic"] = time.monotonic()
         try:
             os.close(item["fd"])
             item["close_returned"] = True
+            item["close_ended_monotonic"] = time.monotonic()
         except BaseException as error:
-            item["close_returned"] = False
+            item.update(close_returned=False, close_ambiguous=True,
+                        close_error_type=type(error).__name__, close_errno=getattr(error, "errno", None))
             self._failure(error)
             raise
         self._remaining(cleanup=cleanup)
@@ -303,7 +316,8 @@ class NativeHistoryOwner:
         return {key: str(self._directory(parent, key.lower())) for key in PRIVATE_KEYS}
 
     def _retain_raw(self, fd, role):
-        item = {"fd": fd, "role": role, "acquisition": len(self.raw_fds), "close_attempted": False}
+        item = {"fd": fd, "role": role, "acquisition": len(self.raw_fds),
+                "acquisition_kind": "local-raw-return", "close_attempted": False}
         self.raw_fds.append(item)  # Before fstat/readiness/post-fence; numeric FD reuse is legitimate.
         self.events.append({"event": "fd-acquisition-return", **item})
         return item
@@ -327,7 +341,9 @@ class NativeHistoryOwner:
             return item
         self._remaining()
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        item = {"path": path, "fd": fd, "secret": False, "close_attempted": False}
+        item = {"path": path, "fd": fd, "secret": False,
+                "acquisition": len(self.files), "acquisition_kind": "local-input-open-return",
+                "close_attempted": False}
         self.files.append(item)
         self.events.append({"event": "input-open-return", "path": str(path), "fd": fd})
         info = os.fstat(fd)
@@ -363,6 +379,7 @@ class NativeHistoryOwner:
         number = len(self.custody.direct)
         stdout = self._new_file(self.root / f"process-{number}-{name}.stdout", cleanup=cleanup)
         stderr = self._new_file(self.root / f"process-{number}-{name}.stderr", cleanup=cleanup)
+        require(self.final_no_more_work is None, "final no-more-work barrier refuses launch")
         command = list(argv)
         arguments = {"cwd": str(self.root), "close_fds": True, "stdin": subprocess.DEVNULL,
                      "env": environment, "stdout": stdout["fd"], "stderr": stderr["fd"], "pass_fds": pass_fds}
@@ -375,6 +392,7 @@ class NativeHistoryOwner:
         require(not self.cancelled() and not self.custody.closed,
                 "cancellation/closure refuses workload before Popen")
         self._remaining(cleanup=cleanup)
+        require(self.final_no_more_work is None, "final no-more-work barrier refuses Popen")
         attempt["Popen_called"] = True
         child = subprocess.Popen(command, **arguments)
         self.custody.direct[child.pid] = child  # First retention, BEFORE clock/pin/evidence.
@@ -404,6 +422,11 @@ class NativeHistoryOwner:
         return child, stdout, stderr
 
     def _wait(self, child, output, errors, limit, cleanup=False):
+        original = self.launches.get(child.pid)
+        require(original is not None and original["child"] is child
+                and self.custody.direct.get(child.pid) is child
+                and original["stdout"] is output and original["stderr"] is errors,
+                "wait lacks exact retained original Popen/stream correlation")
         cached_before = child.returncode
         while True:
             self._remaining(cleanup=cleanup)
@@ -411,7 +434,9 @@ class NativeHistoryOwner:
                     and os.fstat(errors["fd"]).st_size <= limit, "tool output exceeded original bound")
             try:
                 code = child.wait(timeout=min(self._remaining(cleanup=cleanup), .05))
-                record = {"pid": child.pid, "original_Popen_wait_return": code,
+                record = {"pid": child.pid, "original_handle": id(child),
+                          "custody_direct_handle": id(self.custody.direct[child.pid]),
+                          "role": original["role"], "original_Popen_wait_return": code,
                           "cached_status_before_wait": cached_before,
                           "kernel_wait_syscall_independently_observed": False,
                           "monotonic": time.monotonic()}
@@ -629,12 +654,15 @@ class NativeHistoryOwner:
         require(not item["close_attempted"], "original FD acquisition close cannot be retried")
         self._remaining(cleanup=cleanup)
         item["close_attempted"] = True
+        item["close_started_monotonic"] = time.monotonic()
         try:
             os.close(item["fd"])
             item["close_returned"] = True
+            item["close_ended_monotonic"] = time.monotonic()
             self.events.append({"event": "fd-close-return", "fd": item["fd"], "acquisition": item["acquisition"]})
         except BaseException as error:
-            item["close_returned"] = False
+            item.update(close_returned=False, close_ambiguous=True,
+                        close_error_type=type(error).__name__, close_errno=getattr(error, "errno", None))
             self._failure(error)
             raise
         self._remaining(cleanup=cleanup)
@@ -684,35 +712,329 @@ class NativeHistoryOwner:
                                 "dispatch_result": attempt["dispatch_result"], "delivery_observed": False})
         self._remaining(cleanup=True)
 
-    def _close_pidfds(self):
-        """Preserve d9ee close predicates and one-shot pop, fence EACH close."""
-        require(not self.pidfd_close_attempted, "pidfd closure cannot be retried")
-        self.pidfd_close_attempted = True
-        # Actual pinned primitive globals, not an injected census/callback.
-        child_ids = type(self.custody).close_pidfds.__globals__["child_ids"]
-        require(child_ids is type(self.custody).scan.__globals__["child_ids"], "different original child census")
-        self._remaining(cleanup=True)
-        require(not child_ids(self.custody.pid) and all(node.get("settled") for node in self.custody.nodes.values()),
-                "Cannot close custody before positive child settlement")
-        self._remaining(cleanup=True)
+    def _snapshot_known_FDs(self):
+        # Memory-only snapshot; called on partial failure as well as completion.
+        # No credentials or file contents are included. Paths are owned source/
+        # artifact names; actual secret Xauthority bytes are never copied.
+        self.physical_evidence["known_local_acquisition_records"] = {
+            "files": [{key: str(value) if isinstance(value, Path) else value
+                       for key, value in item.items()} for item in self.files],
+            "raw_fds": [{key: str(value) if isinstance(value, Path) else value
+                         for key, value in item.items()} for item in self.raw_fds],
+            "published_pidfds": [{key: value for key, value in item.items() if key != "node"}
+                                 for item in self.published_pidfds]}
+
+    def _published_pidfd_records(self):
+        """First OBSERVED published originals, never d9ee's hidden acquisitions.
+
+        d9ee.pin can open/close before publication on failure. No wrapper can
+        recover those FD returns; that gap always remains external UNKNOWN.
+        """
+        require(len(self.custody.nodes) <= 4096, "published original node bound")
         for node in self.custody.nodes.values():
             descriptor = node.get("pidfd")
             if descriptor is None:
                 continue
-            record = {"pid": node["pid"], "fd": descriptor, "close_attempted": False, "close_returned": None}
-            self.pidfd_closes.append(record)  # Retain original numeric FD even after d9ee-style pop.
+            found = [item for item in self.published_pidfds if item["node"] is node]
+            require(len(found) <= 1, "ambiguous published pidfd observation")
+            if found:
+                require(found[0]["fd"] == descriptor, "original published pidfd replaced")
+                continue
+            self.published_pidfds.append({"node": node, "pid": node["pid"], "fd": descriptor,
+                "start_ticks": node.get("start_ticks"), "uid": node.get("uid"),
+                "observation": "first-observed-published-original-not-acquisition-return",
+                "observed_monotonic": time.monotonic(), "close_attempted": False})
+        return self.published_pidfds
+
+    def _physical_node_deaths(self):
+        records = []
+        self.physical_evidence["original_death_observations"] = records
+        published = self._published_pidfd_records()
+        for node in self.custody.nodes.values():
+            observation = {"pid": node["pid"], "start_ticks": node.get("start_ticks"),
+                "raw_exit_code": node.get("exit_code"), "raw_exit_source": node.get("exit_status_source"),
+                "original_settled": node.get("settled", False), "death_observed": False,
+                "original_pin_state": node.get("state"), "original_provenance": node.get("provenance"),
+                "transition_scope": "first positive original-pidfd death observation; no invented earlier poll-negative sample"}
+            records.append(observation)
+            matches = [item for item in published if item["node"] is node]
+            if not matches:
+                original = self.launches.get(node["pid"])
+                wait = self.direct_waits.get(node["pid"])
+                require(original is not None and wait is not None
+                        and wait["original_handle"] == id(original["child"])
+                        and self.custody.direct.get(node["pid"]) is original["child"],
+                        "node lacks original pidfd or known exact original direct wait")
+                observation.update(death_observed=True, original_wait=wait,
+                    source="exact original direct-Popen wait; no published pidfd existed")
+                continue
+            item = matches[0]
+            require(not item["close_attempted"] and node.get("pidfd") == item["fd"],
+                    "original pidfd lost before physical observation")
+            self._remaining(cleanup=True)
+            info = os.fstat(item["fd"])
+            item.setdefault("identity", identity(info))
+            require(identity(info) == item["identity"], "original pidfd identity changed")
+            poller = select.poll()
+            poller.register(item["fd"], select.POLLIN | select.POLLHUP | select.POLLERR)
+            self._remaining(cleanup=True)
+            before = time.monotonic()
+            flags = poller.poll(0)
+            observation.update(pidfd=item["fd"], pidfd_identity=list(item["identity"]),
+                               poll_started=before, poll_returned=time.monotonic(), raw_poll=flags)
+            self._remaining(cleanup=True)
+            require(all(fd == item["fd"] and not (bits & (select.POLLNVAL | select.POLLERR))
+                        for fd, bits in flags), "original pidfd poll invalid/ambiguous")
+            require(any(bits & select.POLLIN for _, bits in flags), "original incarnation death unproved")
+            observation.update(death_observed=True, source="original retained pidfd POLLIN",
+                               unavailable_status_remains_none=node.get("exit_code") is None)
+        return records
+
+    def _final_proc_open(self, name, role, directory=False, dir_fd=None):
+        event = {"operation": "open", "name": name, "role": role, "parent_fd": dir_fd,
+                 "called": False, "returned": False}
+        self.final_scoped_children["IO"].append(event)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+        if directory:
+            flags |= os.O_DIRECTORY
+        try:
+            self._remaining(cleanup=True)
+            event["called"] = True
+            descriptor = os.open(name, flags, dir_fd=dir_fd)
+            item = self._retain_raw(descriptor, "final-census:" + role)
+            # Actual return retained before metadata/post-fence can fail.
+            event.update(returned=True, fd=descriptor, acquisition=item["acquisition"])
+            self._remaining(cleanup=True)
+            item["census_identity"] = identity(os.fstat(descriptor))
+            self._remaining(cleanup=True)
+            return item
+        except BaseException as failure:
+            event.update(error_type=type(failure).__name__, errno=getattr(failure, "errno", None))
+            self.final_scoped_children["errors"].append({"operation": "open:" + role,
+                "type": type(failure).__name__, "errno": getattr(failure, "errno", None)})
+            raise
+
+    def _final_proc_bytes(self, directory, name, cap, census):
+        event = {"operation": "read", "relative": name, "parent_fd": directory["fd"],
+                 "parent_acquisition": directory["acquisition"], "cap": cap, "raw_hex": ""}
+        census["IO"].append(event)
+        item = None
+        error = None
+        try:
+            item = self._final_proc_open(name, name, dir_fd=directory["fd"])
+            event.update(fd=item["fd"], acquisition=item["acquisition"],
+                         identity=list(item["census_identity"]), started=time.monotonic())
+            payload = bytearray()
+            while True:
+                self._remaining(cleanup=True)
+                block = os.read(item["fd"], min(4096, cap + 1 - len(payload)))
+                payload.extend(block)
+                event["raw_hex"] = payload.hex()  # Actual partial bytes survive failure.
+                self._remaining(cleanup=True)
+                require(len(payload) <= cap, "final census read cap exceeded")
+                if not block:
+                    break
+            event.update(returned=time.monotonic(), bytes=len(payload), sha256=digest(payload))
+            return bytes(payload)
+        except BaseException as failure:
+            error = failure
+            event.update(error_type=type(failure).__name__, errno=getattr(failure, "errno", None))
+            census["errors"].append({"operation": "read:" + name, "type": type(failure).__name__,
+                                     "errno": getattr(failure, "errno", None)})
+            self._failure(failure)
+            raise
+        finally:
+            if item is not None and not item["close_attempted"]:
+                try:
+                    self._close_raw(item, cleanup=True)
+                except BaseException as failure:
+                    census["errors"].append({"operation": "close-read:" + name,
+                        "type": type(failure).__name__, "errno": getattr(failure, "errno", None)})
+                    if error is None:
+                        raise
+
+    def _final_task_names(self, task, label, census):
+        event = {"operation": "bounded-scandir", "label": label, "names": [],
+                 "close_attempted": False}
+        census["IO"].append(event)
+        iterator = None
+        error = None
+        try:
+            self._remaining(cleanup=True)
+            iterator = os.scandir(task["fd"])
+            # scandir's internal duplicate descriptor is not exposed by Python.
+            # Retain the actual iterator and one API-close result, not a fake FD.
+            self._census_iterators.append(iterator)
+            event.update(returned=True, started=time.monotonic())
+            while True:
+                self._remaining(cleanup=True)
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    break
+                event["names"].append(entry.name)
+                require(len(event["names"]) <= 512, "final census exceeds512 threads")
+                require(entry.name.isascii() and entry.name.isdigit() and int(entry.name) > 0,
+                        "final census thread entry malformed")
+            require(len(set(event["names"])) == len(event["names"]), "duplicate final thread entries")
+            event["ended"] = time.monotonic()
+            self._remaining(cleanup=True)
+            return sorted(event["names"], key=int)
+        except BaseException as failure:
+            error = failure
+            census["errors"].append({"operation": "enumerate:" + label,
+                "type": type(failure).__name__, "errno": getattr(failure, "errno", None)})
+            self._failure(failure)
+            raise
+        finally:
+            if iterator is not None:
+                try:
+                    self._remaining(cleanup=True)
+                    event["close_attempted"] = True
+                    iterator.close()
+                    event["close_returned"] = True
+                    event["close_boundary"] = "One explicit Python iterator-close call; internal FD number/automatic exhaustion-close not exposed"
+                    self._remaining(cleanup=True)
+                except BaseException as failure:
+                    event.update(close_returned=event.get("close_returned"),
+                                 close_error_type=type(failure).__name__)
+                    census["errors"].append({"operation": "close-iterator:" + label,
+                        "type": type(failure).__name__, "errno": getattr(failure, "errno", None)})
+                    if error is None:
+                        raise
+
+    @staticmethod
+    def _final_proc_stat(payload, pid):
+        text = payload.decode("utf-8", errors="strict")
+        values = text.rpartition(") ")[2].split()
+        require(text.partition(" ")[0] == str(pid) and len(values) > 19,
+                "final census stat identity malformed")
+        return {"pid": pid, "state": values[0], "ppid": int(values[1]), "start_ticks": int(values[19])}
+
+    def _final_all_thread_children(self):
+        require(self.final_no_more_work is not None and self.final_scoped_children is None,
+                "final census requires one original no-more-work barrier; no replay")
+        census = {"scope": "ONLY original current owner /proc/<pid>/task, all enumerated threads",
+            "owner_pid": self.custody.pid, "started": time.monotonic(), "IO": [], "threads": [],
+            "errors": [], "complete": False, "empty": False, "global_absence_claim": False}
+        self.final_scoped_children = census  # Retain partial facts BEFORE IO.
+        self._census_iterators = []
+        opened = []
+        error = None
+        try:
+            owner = self._final_proc_open(f"/proc/{self.custody.pid}", "owner", directory=True)
+            opened.append(owner)
+            task = self._final_proc_open("task", "all-threads", directory=True, dir_fd=owner["fd"])
+            opened.append(task)
+            before = self._final_proc_stat(self._final_proc_bytes(owner, "stat", 16384, census), self.custody.pid)
+            census["owner_before"] = before
+            require(self.custody.pid == os.getpid() and before["start_ticks"] == self.custody.wrapper["start_ticks"]
+                    and owner["census_identity"][2] == self.custody.uid, "final original owner incarnation mismatch")
+            names = self._final_task_names(task, "before", census)
+            require(names, "final owner has no observed threads")
+            census["thread_ids_before"] = names
+            all_children = set()
+            thread_records = {}
+            for name in names:
+                record = {"tid": int(name)}
+                census["threads"].append(record)
+                thread_records[name] = record
+                thread = self._final_proc_open(name, "thread-before:" + name, directory=True, dir_fd=task["fd"])
+                opened.append(thread)
+                record["identity_before"] = list(thread["census_identity"])
+                record["stat_before"] = self._final_proc_stat(
+                    self._final_proc_bytes(thread, "stat", 16384, census), int(name))
+                raw = self._final_proc_bytes(thread, "children", 65536, census)
+                record["children_before_hex"] = raw.hex()
+                fields = raw.decode("ascii", errors="strict").split()
+                require(len(fields) <= 4096 and all(value.isdigit() and 0 < int(value) <= 0x7fffffff for value in fields),
+                        "final children IDs malformed/exceed bound")
+                children = [int(value) for value in fields]
+                require(len(set(children)) == len(children) and not all_children.intersection(children),
+                        "final children duplicate/ambiguous across threads")
+                all_children.update(children)
+                require(len(all_children) <= 4096, "final census exceeds4096 child IDs")
+                record["children"] = children
+                self._close_raw(thread, cleanup=True)
+            # A second fixed bookend checks EACH original TID incarnation and
+            # children bytes, not just names which could have been reused.
+            for name in names:
+                record = thread_records[name]
+                thread = self._final_proc_open(name, "thread-after:" + name, directory=True, dir_fd=task["fd"])
+                opened.append(thread)
+                record["identity_after"] = list(thread["census_identity"])
+                record["stat_after"] = self._final_proc_stat(
+                    self._final_proc_bytes(thread, "stat", 16384, census), int(name))
+                raw = self._final_proc_bytes(thread, "children", 65536, census)
+                record["children_after_hex"] = raw.hex()
+                require(record["stat_before"]["start_ticks"] == record["stat_after"]["start_ticks"]
+                        and record["identity_before"] == record["identity_after"]
+                        and record["identity_after"][2] == self.custody.uid
+                        and record["children_before_hex"] == record["children_after_hex"],
+                        "final thread incarnation/children bookends changed")
+                self._close_raw(thread, cleanup=True)
+            after_names = self._final_task_names(task, "after", census)
+            census["thread_ids_after"] = after_names
+            require(names == after_names, "final original thread list changed")
+            after = self._final_proc_stat(self._final_proc_bytes(owner, "stat", 16384, census), self.custody.pid)
+            census.update(owner_after=after, child_ids=sorted(all_children))
+            require(before["start_ticks"] == after["start_ticks"], "final owner incarnation changed")
+            require(not all_children, "final scoped children observation is nonempty")
+            census.update(complete=True, empty=True, observed_ended=time.monotonic())
+        except BaseException as failure:
+            error = failure
+            census["errors"].append({"operation": "final-census", "type": type(failure).__name__,
+                                     "errno": getattr(failure, "errno", None)})
+            self._failure(failure)
+        finally:
+            for item in reversed(opened):
+                if not item["close_attempted"]:
+                    try:
+                        self._close_raw(item, cleanup=True)
+                    except BaseException as failure:
+                        census["errors"].append({"operation": "final-census-close", "type": type(failure).__name__,
+                                                 "errno": getattr(failure, "errno", None)})
+                        self._failure(failure)
+                        if error is None:
+                            error = failure
+            census["ended"] = time.monotonic()
+        require(error is None and not census["errors"] and census["complete"] and census["empty"],
+                "final scoped observation partial/error/nonempty; retain originals and HOLD")
+        self._remaining(cleanup=True)
+        return census
+
+    def _close_pidfds(self):
+        """Only known published originals after archived FINAL scoped evidence."""
+        require(not self.pidfd_close_attempted, "pidfd closure cannot be retried")
+        self.pidfd_close_attempted = True
+        census = self.final_scoped_children
+        require(self.final_no_more_work is not None and census is not None and census["complete"]
+                and census["empty"] and not census["errors"]
+                and all(node.get("settled") for node in self.custody.nodes.values()),
+                "Cannot close pidfds without final scoped observation and original settlement")
+        for item in self._published_pidfd_records():
+            node, descriptor = item["node"], item["fd"]
+            require(not item["close_attempted"] and node.get("pidfd") == descriptor,
+                    "known original pidfd close/replacement cannot be replayed")
+            self._remaining(cleanup=True)
+            info = os.fstat(descriptor)
+            require(identity(info) == item["identity"], "known original pidfd changed before close")
+            record = {"pid": node["pid"], "fd": descriptor, "start_ticks": item["start_ticks"],
+                      "observation": item["observation"], "close_attempted": False, "close_returned": None}
+            self.pidfd_closes.append(record)
+            # Preserve original FD in BOTH ledgers before the d9ee-style pop.
             node.pop("pidfd")
             self._remaining(cleanup=True)
-            record["close_attempted"] = True
+            record["close_attempted"] = item["close_attempted"] = True
             try:
                 os.close(descriptor)
-                record["close_returned"] = True
-            except BaseException as error:
-                record.update(close_returned=False, error_type=type(error).__name__)
-                self._failure(error)
-                raise  # Ambiguous close is never retried, regardless of a later census.
+                record["close_returned"] = item["close_returned"] = True
+            except BaseException as failure:
+                record.update(close_returned=False, close_ambiguous=True, error_type=type(failure).__name__)
+                item.update(close_returned=False, close_ambiguous=True)
+                self._failure(failure)
+                raise  # No retry even if close actually consumed the numeric FD.
             self._remaining(cleanup=True)
-        self._remaining(cleanup=True)
 
     def _source_inputs(self, arm, fixture):
         spec = self.sources[arm]
@@ -1438,25 +1760,60 @@ class NativeHistoryOwner:
             "first_failure": self.first_failure, "failure_artifacts": self.failure_artifacts,
             "planned_service_TERM_policy": "PROPOSED_ONLY_REQUIRES_FRESH_ACCEPTANCE",
             "logical_C_return": "NOT_AUTHORIZED_BY_THIS_LIBRARY", "disposition": "HOLD"}
-        # Preserve the snapshot even when these gates refuse final descriptor
-        # closure. A later empty census or successful close cannot erase it.
-        require(not unknown, "unknown status/custody; keep original descriptors and logical HOLD")
-        require(all(item["signal"] == signal.SIGTERM and item["pid"] in service_ids for item in raw_signals),
-                "forced/nonservice signal retained; logical HOLD")
+        # Raw unavailable outcome remains in unknown, but an original pidfd can
+        # independently establish physical death. Never turn None into UI/AX0.
+        self.final_settlement["physical_evidence"] = self.physical_evidence
+        self._snapshot_known_FDs()
+        require(set(self.custody.direct) == set(self.launches), "incomplete original direct inventory")
+        correlations = []
+        self.physical_evidence["original_direct_wait_correlations"] = correlations
+        for pid, original in self.launches.items():
+            wait = self.direct_waits.get(pid)
+            require(self.custody.direct[pid] is original["child"] and wait is original["wait"]
+                    and wait is not None and wait["original_handle"] == id(original["child"])
+                    and type(wait["original_Popen_wait_return"]) is int, "original direct wait coverage incomplete")
+            correlations.append({"pid": pid, "original_handle": id(original["child"]), "wait": wait})
+        deaths = self._physical_node_deaths()
+        require(all(node.get("settled") for node in self.custody.nodes.values())
+                and all(item["death_observed"] for item in deaths), "known original physical death/reaping incomplete")
+        # Existing synchronous save-return fences and original producer waits
+        # are the ONLY local writer facts; no arbitrary completion assertion.
+        for fences in self.writer_fences.values():
+            require(len(fences) % 2 == 0 and all(
+                [fences[index]["operation"], fences[index + 1]["operation"]] ==
+                ["frame-WebP-before", "frame-WebP-after"] for index in range(0, len(fences), 2)),
+                "synchronous image writer return incomplete")
+        for producer in self.producers.values():
+            require(producer["pid"] in self.direct_waits, "original image producer wait unavailable")
+        self.physical_evidence["known_local_writer_returns"] = {
+            "direct_waits": list(self.direct_waits), "same_thread_save_fences": self.writer_fences,
+            "native_import_AX_or_external_writer_completion": "NOT_ESTABLISHED_BY_THIS_LIBRARY"}
+        self.final_no_more_work = {"monotonic": time.monotonic(), "owner_pid": self.custody.pid,
+            "owner_start_ticks": self.custody.wrapper["start_ticks"], "launch_count": len(self.launches),
+            "boundary": "all original local waits/deaths and synchronous writer-return fences; no further Popen"}
+        self.physical_evidence["no_more_work"] = self.final_no_more_work
+        self.physical_evidence["final_scoped_children"] = self._final_all_thread_children()
         for item in self.files:
             if not item["close_attempted"]:
                 self._retain_and_close(item)
+            require(item.get("close_returned") is True, "known local file close incomplete/ambiguous")
         self._close_pidfds()
-        self.final_settlement["pidfd_close_returned"] = True
+        self.final_settlement["known_published_pidfd_closes_returned"] = True
         for item in reversed(self.raw_fds):
             if not item["close_attempted"]:
-                self._remaining(cleanup=True)
                 self._close_raw(item, cleanup=True)
-        self.final_settlement["raw_fd_closes_returned"] = True
-        self.final_settlement["disposition"] = "SOURCE_PREDICATES_ONLY_NOT_RESOURCE_RELEASE"
-        # first_failure stays sticky even after all physical closes succeed.
+            require(item.get("close_returned") is True, "known local raw close incomplete/ambiguous")
+        self._snapshot_known_FDs()
+        self.physical_evidence.update(known_local_death_writer_census_FD_facts_returned=True,
+            upstream_unpublished_pidfd_acquisitions="UNKNOWN: immutable d9ee.pin can acquire/close before publication",
+            entry_owned_C_descriptor="ABSENT_EXTERNAL: no acquisition/custody/close fact supplied",
+            whole_family_global_absence=False, native_application_qualified=False)
+        # Local physical facts supply neither C ownership nor acceptance. Keep
+        # raw unknowns/nonzero/cancel/force/TERM proposal and first failure.
+        self.final_settlement["disposition"] = "HOLD_EXTERNAL_ENTRY_C_AND_UNPUBLISHED_FD_COVERAGE"
+        self.final_settlement["application_qualification"] = "UNQUALIFIED_RAW_OUTCOMES_AND_ALL_NATIVE_GATES_RETAINED"
         if self.first_failure is not None:
-            self.final_settlement["disposition"] = "HOLD_ORIGINAL_FAILURE_RETAINED"
+            self.final_settlement["disposition"] = "HOLD_ORIGINAL_FAILURE_AND_EXTERNAL_GAPS_RETAINED"
         return self.final_settlement
 
 

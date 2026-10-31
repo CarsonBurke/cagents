@@ -278,7 +278,47 @@
       "sha256": "77b0694f9b3e2f7cec55ba4bbd6e2a534e5f661c5340cef342ad2669f11d5b01"
     }
   },
-  "native_owner_sha256": "c5802e1b721694106ed26f94caa2e5dfca0782324a5a539dd506512a4acf53da",
+  "native_owner_sha256": "a5b1dff85e6f6e02b0181468a78b98ed6d89cf02a2a49a5b9ef60fda4424262d",
+  "physical_evidence_successor": {
+    "C_boundary": "ABSENT_EXTERNAL/HOLD: original entry-owned C descriptor is not supplied to this library. No number/JSON/closed flag establishes C ownership, acquisition, release or acceptance.",
+    "acquisitions": "Every locally returned regular/input/raw FD is retained before metadata; prepare root_fd keeps its EXISTING one _retain_raw record. Final-census opens are additional distinct real acquisitions. Original FD numbers remain recorded after published-node pop. Any attempted/returned/ambiguous close is sticky; no double close/numeric retry. Memory snapshots survive negative paths.",
+    "application": "normal_close_succeeded and close_history_root unchanged. Cargo0 not UI0, pidfd death not UI0/AX0, raw None/nonzero/force/cancel/first_failure remain. No wrapper/carrier/status supplier. Normal-service TERM stays PROPOSED.",
+    "cases": "No authored function/module/pure case/test/native execution; SOURCE ONLY pending independent review.",
+    "death": "Actual POLLIN of still-retained original published pidfd with incarnation/FD identity/raw flags/time interval. Raw unavailable code remains None. A direct fast-exit node with no published pidfd needs its exact original Popen.wait instead. This is first positive death observation, not an invented earlier poll-negative sample.",
+    "final_census": {
+      "IO": "Actual returned proc directory/read FDs immediately enter original raw ledger before fallible metadata. Bounded scandir enumeration retains actual iterator and one explicit close API call. Python internal transient duplicate-FD/automatic exhaustion-close is not exposed; never invent numeric FD or complete syscall accounting.",
+      "children_bytes": 65536,
+      "deadline": "Same phase/whole absolute deadline before and after IO; no time reset. Blocking kernel/proc/stdlib operations are cooperative/nonpreemptible, not hard realtime.",
+      "max_child_IDs": 4096,
+      "max_threads": 512,
+      "meaning": "Empty is this bounded original-owner coverage observation only; no global absence certificate or resource acceptance.",
+      "partial": "Any unavailable/malformed/changed/duplicate/nonempty/error/deadline or ambiguous close => HOLD; preserve actual partial bytes/FDs/errors, no retry or post-expiry effects.",
+      "scope": "One final observation of current original owner /proc/<pid>/task only. Owner PID/start/UID, actual raw TID names and per-thread stat/children bytes, source FD/identity/read times and errors retained. Stable owner/thread-list bookends plus every original TID incarnation/children bookends. No global sweep or arbitrary PID discovery.",
+      "stat_bytes": 16384
+    },
+    "no_more_work": "Set only after actual known original direct waits, positive original-incarnation death and complete existing same-thread writer-return fences; all later local Popen attempts refuse even cleanup=True. Not a claim that unknown external import/AX work completed.",
+    "parent": "421bb15922b90b317575ce78d48d232a1a667d2b",
+    "parent_tree": "04af63cbd6c3563f2df87ec6652c6dc2d0751b16",
+    "policy_source_inputs": {
+      "application_review": {
+        "path": "/tmp/coord-b9-c57-independent-ui-ax-policy-review.txt",
+        "sha256": "6a2055220c6f8177578868649207568bc57ee014c5fb6e4869f02b9b8d6401df"
+      },
+      "physical_review": {
+        "path": "/tmp/pr1310-physical-contract-source-review-oe5p5y81/review.json",
+        "sha256": "dbee6fb56225ecff0c11bea3c14f302c13666f3f8222c7e2e035e8004e7ea862"
+      },
+      "proposal": {
+        "path": "/tmp/coord-b9-pr1310-physical-closure-vs-native-qualification-proposal.md",
+        "sha256": "c57c1d35dbe5ef1aba6ccdbe2760631843d2725ec972f91d674f329d65eed4aa"
+      }
+    },
+    "result": "Even if known local physical facts and closes return, final disposition is ALWAYS HOLD for external entry-C/upstream FD gaps and native qualification. Actual policy acceptance/resources/native remain null.",
+    "schema": "pr1310-known-local-physical-evidence-source-v1",
+    "scope": "Original direct wait correlation, published-original pidfd death observations, final scoped all-thread children observation, actual known local acquisition/one-shot-close ledgers only. No application outcome inference, wrapper, C authority, normal_close_succeeded or accepted shutdown-policy change.",
+    "upstream_gap": "UNKNOWN/HOLD: immutable d9ee.pin can acquire then internally close before publishing node or raising. Published pidfds are first OBSERVED, never claimed acquisition-return. Primitive unchanged; no repair or fake complete acquisition proof.",
+    "waits": "Exact custody.direct/launches original Popen and exact stdout/stderr objects. Actual original wait return and cached provenance retain handle/role/status; no second kernel-wait claim."
+  },
   "public_entry_sequence": [
     "Actual outer authenticated EC/User/resource instruction and finite independently reviewed entry must precede effects. UUID/grant syntax is correlation, not authentication. Library cannot establish actual admission.",
     "Install original cancellation before Custody construction; separately generate/verify owned public Git fixture and build matched dev-runtime CLI/HOST/UI under actual future C grant. No result/target warmth transfer from unit/dev tests.",
@@ -288,7 +328,7 @@
     "Actual HistoryDriver gets owner and real pyatspi/PIL and the opaque returned binding. Call its existing finite dataset flow; source says UNKNOWN renderer/theme stops capture, not PASS.",
     "On external driver/import/AX/decode error latch record_history_failure(error), preserving original failure. close_history_root requests actual private windowclose; cancelled close is forced original pidfd TERM/HOLD. The exact original runner wait latches any known nonzero immediately before post-fence. Binding.closed means physical original UI exit only; runner_exit_code and normal_close_succeeded are separate, not qualification. Earlier failure never clears after physical cleanup.",
     "After driver/readers/UI close, settle_history_services() keeps unclosed UIs or live/unproven children on HOLD. Hash/retain every reserved PNG/WebP including PNG-only negatives; close settled nonservice writers BEFORE desktop teardown. Final original clock follows metadata/hash before each close, actual wait, read and owned signal. Registry->AX bus->launcher->WM->session->Xvfb policy remains proposed/raw, not accepted.",
-    "Final snapshot separately retains original runner wait failures, raw signal attempts/returns/ambiguities, unknown descendants and first failure. Fresh per-FD checks precede each one-shot physical close; returned close facts are retained before post-fence. Any unknown/failure/deadline or close ambiguity remains HOLD; no physical close establishes logical C release or authorization."
+    "Final raw snapshot preserves original nonzero/cancel/force/None and first failure. New finite physical evidence records actual original waits/pidfd death/final scoped all-thread children and one-shot known local closes separately. Upstream unpublished primitive acquisitions and original entry-C are absent/unknown; final logical disposition always HOLD. No native success/resource return inferred."
   ],
   "readiness": "SOURCE_CANDIDATE_ONLY; ACTUAL_ENTRY/ADMISSION/BUILD/NATIVE/UX/C_RELEASE HOLD",
   "remaining_gates": {
@@ -307,7 +347,7 @@
     },
     "all_runtime_native_UX_images_performance_results": "UNRUN; no qualification transferred from source or prior unit packet",
     "normal_service_TERM_acceptance": null,
-    "original_child_status_and_census_limits": "d9ee original-family/subreaper evidence only, not 359/global kernel proof; adopted statuses can genuinely be unknown and hold."
+    "original_child_status_and_census_limits": "Actual raw unknown descendant outcomes remain native HOLD. New final observation is scoped original-owner/all-thread coverage, never359/global proof. Actual entry-owned C and unpublished primitive acquisition coverage absent."
   },
   "schema": "pr1310-original-native-owner-source-v1",
   "service_policy": {
@@ -315,7 +355,7 @@
     "partial_preparation": "Actual files/raw FD generation tuples/Popen originals remain retained. A launch whose fallible pin failed or activated child lacking a complete role blocks local normal settlement. Outer original owner must retain HOLD and handle explicit negative source policy; no detach/retry/new supervisor.",
     "proposal_only": "Finite actual source service roles may receive original pidfd SIGTERM once. Original Custody history marks every signal; this wrapper never changes it.",
     "signal_recording": "Separate intent/called/returned/dispatch_result; signal syscall return is not proof of delivery. ESRCH with original pidfd exit is explicitly not delivered. Uncalled intent never enters successful signal history; failed/ambiguous attempts remain sticky and raw history never clears.",
-    "unknown_wait": "Descendant parent-reaped status stays unknown even when original pidfd signals exit. Original runner.wait can be known0 while UI status unknown; final descriptor close and logical handback refuse unknown."
+    "unknown_wait": "Raw descendant None remains application/native UNKNOWN/HOLD. Positive ORIGINAL pidfd death, all original direct waits/writer returns and strict final scoped census may separately precede closing only known local observer FDs; never UI0/AX0/C acceptance. Upstream unpublished FD/entry-C remain HOLD."
   },
   "source_limitations": [
     "No native observation, actual User/resource admission, tool/ELF baseline, data generation or actual closure has run.",
@@ -329,7 +369,11 @@
     "Observed cached source bytes/hash + actual Cargo.lock versions. .cargo-checksum.json absent for wgpu-types28; package archive and matched-build input provenance NOT independently established here, mandatory original build evidence remains NULL.",
     "Original ui.log is shared runner/Cargo/UI stdout+stderr. Source/matched artifact/appearance PID provide scoped attribution, not per-line kernel writer authentication. Exact original writer/build provenance remains external.",
     "The256-record cap remains unchanged; no source scheduling proof guarantees workload stays below it. Any stopped/capped producer holds.",
-    "Frame equality excludes only irrelevant raw-read metadata; actual semantic state and meaningful producer observation_generation remain capture-critical. Missing native factor is never replaced by configured1."
+    "Frame equality excludes only irrelevant raw-read metadata; actual semantic state and meaningful producer observation_generation remain capture-critical. Missing native factor is never replaced by configured1.",
+    "Current physical successor implements only known local facts; historical0ffb/07b strict unknown-status descriptor gate is preserved in old checkpoints, not silently claimed still active in this distinct source. Raw unknown status remains a native qualification gate.",
+    "Python scandir retains a real iterator/API-close result but hides its internal temporary FD number and automatic exhaustion-close; transient stdlib/kernel accounting is explicitly not complete. No post-expiry repair.",
+    "Original UI-wait retained-owner supplier is still BLOCKED264bcbe1; no supported status carrier/inference implemented here.",
+    "Final snapshot is in original owner memory. Actual entry-owned immutable evidence publication and C descriptor custody are unsupplied; source library cannot publish/accept/release resources."
   ],
   "status": "IMPLEMENTED_SOURCE_CANDIDATE_WITH_EXPLICIT_HOLD_GATES"
 }
