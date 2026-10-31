@@ -35,8 +35,7 @@ pub(super) enum Directory {
 enum Disposition {
     Pending,
     Dormant,
-    /// Why the exact owner could not be verified.
-    Unavailable(String),
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -295,18 +294,15 @@ impl Cagents {
         })
     }
 
-    /// Why an inspection that settled without attaching or proving absence
-    /// left this saved terminal unresolved. It is inspected again only when a
-    /// related owner is observed or the user reconnects, so it is a refusal
-    /// to report rather than a check still under way.
-    pub(super) fn saved_terminal_unavailable(&self, card: CardId) -> Option<String> {
-        if self.terminal_start_in_flight(card) {
-            return None;
-        }
-        match &self.saved_terminal_current(card)?.disposition {
-            Disposition::Unavailable(reason) => Some(reason.clone()),
-            _ => None,
-        }
+    /// Whether an inspection settled without attaching or proving absence.
+    /// Several of those refusals are races that a later check resolves, and
+    /// one is re-inspected only when a related owner is observed or someone
+    /// reconnects, so a startup gate checks it again itself.
+    pub(super) fn saved_terminal_unavailable(&self, card: CardId) -> bool {
+        !self.terminal_start_in_flight(card)
+            && self
+                .saved_terminal_current(card)
+                .is_some_and(|entry| matches!(entry.disposition, Disposition::Unavailable))
     }
 
     /// Diagnostics must not reopen a User control connection for an inherited
@@ -687,8 +683,12 @@ impl Cagents {
             if let Some(entry) = self.saved_terminals.entries.get_mut(&card)
                 && entry.request == request
             {
-                entry.disposition =
-                    Disposition::Unavailable("it changed while it was being checked".into());
+                entry.disposition = Disposition::Unavailable;
+                self.startup_attach_failed(
+                    card,
+                    source.id,
+                    "it changed while it was being checked".into(),
+                );
             }
             return self.finish_terminal_start(card);
         }
@@ -717,13 +717,14 @@ impl Cagents {
                 let entry = self.saved_terminals.entries.get_mut(&card).unwrap();
                 entry.directory = directory;
                 let absent = result.is_ok();
-                entry.disposition = match result {
-                    Ok(_) => Disposition::Dormant,
-                    Err(error) => {
-                        tracing::warn!(?card, %error, "saved terminal inspection refused");
-                        Disposition::Unavailable(error)
-                    }
+                entry.disposition = if absent {
+                    Disposition::Dormant
+                } else {
+                    Disposition::Unavailable
                 };
+                if let Err(error) = result {
+                    self.startup_attach_failed(card, source.id, error);
+                }
                 self.lifecycle.remove(card);
                 let finished = self.finish_terminal_start(card);
                 if absent
@@ -773,7 +774,7 @@ impl Cagents {
         match self.saved_terminal_current(card)?.disposition {
             Disposition::Pending => Some(("Checking saved terminal", true)),
             Disposition::Dormant => None,
-            Disposition::Unavailable(_) => Some(("Reconnect unavailable", false)),
+            Disposition::Unavailable => Some(("Reconnect unavailable", false)),
         }
     }
 
@@ -806,7 +807,7 @@ impl Cagents {
                 Disposition::Dormant => {
                     "Not connected. The saved command was not restarted. Reconnect checks for the original terminal. Resume or Restart runs the saved session only when you choose."
                 }
-                Disposition::Unavailable(_) => {
+                Disposition::Unavailable => {
                     "The existing terminal could not be verified. Reconnect to check again; the saved command has not been restarted."
                 }
             }

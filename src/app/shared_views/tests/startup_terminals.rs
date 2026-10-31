@@ -89,11 +89,24 @@ fn rehosted(saved: &TerminalSession) -> TerminalSession {
 /// What the attach-only path hands back once the replacement daemon accepted
 /// `saved`'s exact terminal: a confirmed attachment under that daemon's proof.
 fn attached(directory: &Path, saved: &TerminalSession) -> StartedTerminal {
+    attached_with_connection(directory, saved).0
+}
+
+/// [`attached`], with the daemon's end of the view's connection.
+fn attached_with_connection(
+    directory: &Path,
+    saved: &TerminalSession,
+) -> (StartedTerminal, std::os::unix::net::UnixStream) {
     let socket = directory.join(format!("{}.sock", saved.id));
     let listener = UnixListener::bind(&socket).unwrap();
     let hosted = rehosted(saved);
     let served = hosted.clone();
-    std::thread::spawn(move || serve(listener.accept().unwrap().0, vec![served]));
+    let (connection_tx, connection) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let stream = listener.accept().unwrap().0;
+        connection_tx.send(stream.try_clone().unwrap()).unwrap();
+        serve(stream, vec![served]);
+    });
     let handle = crate::terminal::HostedTerminalHandle::connect_at(
         socket,
         saved.id,
@@ -102,11 +115,12 @@ fn attached(directory: &Path, saved: &TerminalSession) -> StartedTerminal {
     )
     .unwrap();
     handle.wait_until_attached(Duration::from_secs(5)).unwrap();
-    StartedTerminal {
+    let started = StartedTerminal {
         handle: TerminalSurface::from(handle),
         session: hosted,
         spawned: false,
-    }
+    };
+    (started, connection.recv().unwrap())
 }
 
 fn live_terminal() -> TerminalSession {
@@ -191,7 +205,7 @@ fn reopened_window(with_projected: bool) -> Window {
 }
 
 /// Drive the actual initial-model and SeedView acknowledgement reducers.
-fn admit(window: &mut Window) {
+fn admit(window: &mut Window) -> crate::workspace_model::WorkspaceModel {
     let pane = |card: &CardState| Pane::from_card(card, None).unwrap();
     let mut view = View::empty(Scope::Channel(window.hidden));
     view.panes = window.terminals().iter().map(pane).collect();
@@ -228,6 +242,7 @@ fn admit(window: &mut Window) {
         );
     }
     assert!(window.app.shared_views_ready_for_startup());
+    model
 }
 
 fn session(card: &CardState) -> TerminalSession {
@@ -245,7 +260,7 @@ const REFUSAL: &str =
 /// `refuse_cached`.
 fn run_gate(window: &mut Window, directory: &Path, refuse_cached: bool) {
     for _ in 0..6 {
-        window.app.startup_gate.expire_attach_retries();
+        window.app.startup_gate.retries.expire_window();
         drop(window.app.update(Message::VerifyStartupPanes));
         complete_attaches(window, directory, refuse_cached);
     }
@@ -272,6 +287,22 @@ fn complete_attaches(window: &mut Window, directory: &Path, refuse_cached: bool)
             }));
         }
     }
+}
+
+/// One gate check, then the cached pane's attach, if one started, refused
+/// with `reason`. Whether an attempt started.
+fn refused_attempt(window: &mut Window, reason: &str) -> bool {
+    drop(window.app.update(Message::VerifyStartupPanes));
+    let started = window.app.terminal_start_in_flight(window.cached.id);
+    if started {
+        let terminal = session(window.app.card_state(window.cached.id).unwrap()).id;
+        drop(window.app.update(Message::RestoredAgentAttached {
+            card: window.cached.id,
+            terminal,
+            result: Err(reason.to_owned()),
+        }));
+    }
+    started
 }
 
 fn assert_hibernated_attachment(app: &Cagents, card: CardId) {
@@ -374,12 +405,13 @@ fn a_replaced_shared_session_is_qualified_again() {
     let directory = tempfile::tempdir().unwrap();
     let mut window = reopened_window(true);
     admit(&mut window);
-    // Spend the cached pane's attempts before a gate check reports them.
-    for _ in 0..3 {
-        window.app.startup_gate.expire_attach_retries();
+    // Spend the cached pane's retries before a gate check reports them.
+    for _ in 0..2 {
+        window.app.startup_gate.retries.expire_window();
         drop(window.app.qualify_startup_terminals());
         complete_attaches(&mut window, directory.path(), true);
     }
+    window.app.startup_gate.retries.expire_window();
     assert!(window.app.startup_pane_check().is_err());
     let mut replacement = session(&window.cached);
     replacement.id = TerminalId::new();
@@ -408,38 +440,223 @@ fn a_replaced_shared_session_is_qualified_again() {
     assert!(window.app.terminal_start_in_flight(window.cached.id));
 }
 
-/// A terminal the daemon has only just restored may refuse the first
-/// attempt. The same attach-only path tries again after a pause, and the gate
-/// reports the refusal once those attempts are spent.
+/// A terminal the daemon has only just restored may refuse at once. The same
+/// attach-only path tries again after each pause, and an unchanged refusal is
+/// reported only once its window, measured from the first refusal, has passed.
 #[test]
-fn a_detached_attach_is_retried_after_a_pause_and_then_reported() {
-    let directory = tempfile::tempdir().unwrap();
+fn an_unchanged_refusal_is_retried_through_its_window_and_then_reported() {
     let mut window = reopened_window(false);
     admit(&mut window);
-    let mut attempts = 0;
-    for expected in 1..=3 {
-        drop(window.app.update(Message::VerifyStartupPanes));
-        assert!(window.app.terminal_start_in_flight(window.cached.id));
-        attempts += 1;
-        complete_attaches(&mut window, directory.path(), true);
-        if expected < 3 {
-            assert_eq!(window.app.startup_pane_check(), Ok(false));
-            drop(window.app.update(Message::VerifyStartupPanes));
-            assert!(
-                !window.app.terminal_start_in_flight(window.cached.id),
-                "no retry before its pause"
-            );
-            window.app.startup_gate.expire_attach_retries();
-        }
+    assert!(refused_attempt(&mut window, REFUSAL));
+    assert_eq!(window.app.startup_pane_check(), Ok(false));
+    assert!(
+        !refused_attempt(&mut window, REFUSAL),
+        "no retry before its pause"
+    );
+    for _ in 0..3 {
+        window.app.startup_gate.retries.expire_delay();
+        assert!(refused_attempt(&mut window, REFUSAL));
+        assert_eq!(
+            window.app.startup_pane_check(),
+            Ok(false),
+            "a refusal that returns at once is not reported within seconds"
+        );
     }
-    assert_eq!(attempts, 3);
+    window.app.startup_gate.retries.expire_window();
     let report = window.app.startup_pane_check().unwrap_err();
     assert!(report.contains(REFUSAL), "{report}");
-    drop(window.app.update(Message::VerifyStartupPanes));
-    assert_eq!(
-        window.app.terminal_starts_in_flight(),
-        0,
+    assert!(
+        !refused_attempt(&mut window, REFUSAL),
         "reported, not retried"
+    );
+}
+
+/// A refusal whose reason keeps changing is still settling, so its window
+/// starts again each time.
+#[test]
+fn a_changing_refusal_is_retried_until_it_settles() {
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    let reasons = [
+        crate::app::SHARED_TERMINAL_DISCONNECTED,
+        "could not connect to the daemon: Connection refused (os error 111)",
+    ];
+    for reason in reasons.iter().cycle().take(5) {
+        window.app.startup_gate.retries.expire_window();
+        assert!(refused_attempt(&mut window, reason));
+        assert_eq!(window.app.startup_pane_check(), Ok(false), "{reason}");
+    }
+    window.app.startup_gate.retries.expire_window();
+    assert!(refused_attempt(&mut window, reasons[0]));
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(report.contains(reasons[0]), "{report}");
+}
+
+/// A new descriptor for the same terminal, or a new registry entry for its
+/// pane, is new evidence: a reported refusal is tried again.
+#[test]
+fn a_new_descriptor_or_registry_entry_restarts_the_retry_window() {
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    let exhaust = |window: &mut Window| {
+        for _ in 0..2 {
+            window.app.startup_gate.retries.expire_window();
+            assert!(refused_attempt(window, REFUSAL));
+        }
+        window.app.startup_gate.retries.expire_window();
+        assert!(window.app.startup_pane_check().is_err());
+    };
+    exhaust(&mut window);
+
+    let mut descriptor = session(&window.cached);
+    descriptor.continuity = TerminalContinuity::Live {
+        host_session_id: HostSessionId::new("restored-host"),
+        boot_id: BootId::new("boot"),
+        host_incarnation: HostIncarnation::new("restored-incarnation"),
+    };
+    // A shared pane's descriptor arrives through its registry entry.
+    let cached = window.cached.id;
+    for pane in window
+        .app
+        .workspace_model
+        .views
+        .iter_mut()
+        .flat_map(|view| &mut view.panes)
+        .filter(|pane| pane.id == cached)
+    {
+        pane.kind = CardKind::Terminal(descriptor.clone());
+    }
+    window.app.card_state_mut(cached).unwrap().kind = CardKind::Terminal(descriptor);
+    assert_eq!(window.app.startup_pane_check(), Ok(false));
+    exhaust(&mut window);
+
+    let pane = window
+        .app
+        .workspace_model
+        .views
+        .iter_mut()
+        .flat_map(|view| &mut view.panes)
+        .find(|pane| pane.id == window.cached.id)
+        .unwrap();
+    pane.title = "Renamed elsewhere".into();
+    assert_eq!(window.app.startup_pane_check(), Ok(false));
+    assert!(refused_attempt(&mut window, REFUSAL));
+}
+
+/// An edit to another pane of the same view says nothing about this one.
+#[test]
+fn an_edit_to_a_neighbouring_pane_does_not_restart_the_retry_window() {
+    let mut window = reopened_window(true);
+    admit(&mut window);
+    for _ in 0..2 {
+        window.app.startup_gate.retries.expire_window();
+        drop(window.app.update(Message::VerifyStartupPanes));
+        let directory = tempfile::tempdir().unwrap();
+        complete_attaches(&mut window, directory.path(), true);
+    }
+    let projected = window.projected();
+    let view = window
+        .app
+        .workspace_model
+        .views
+        .iter_mut()
+        .find(|view| view.panes.iter().any(|pane| pane.id == projected))
+        .unwrap();
+    view.revision += 1;
+    view.panes
+        .iter_mut()
+        .find(|pane| pane.id == projected)
+        .unwrap()
+        .title = "Renamed elsewhere".into();
+    window.app.startup_gate.retries.expire_window();
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(report.contains(REFUSAL), "{report}");
+}
+
+/// The refusals a shared pane's own attach produces, through the choice
+/// `attach_restored_agent` makes for it: a daemon that no longer hosts the
+/// exact terminal, and one that cannot be reached. Each is retried while it
+/// changes, and the last is reported once it stops changing.
+#[test]
+fn a_shared_attach_refusal_is_retried_and_then_reported() {
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    let shared = window.app.attaches_as_shared(window.cached.id);
+    assert!(shared);
+    let saved = session(&window.cached);
+    let unhosted = || {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        serve(server, Vec::new());
+        crate::control::ControlClient::from_stream(client).map_err(|error| error.to_string())
+    };
+    let disconnected = crate::app::restored_attachment(shared, saved.clone(), unhosted)
+        .err()
+        .unwrap();
+    assert_eq!(disconnected, crate::app::SHARED_TERMINAL_DISCONNECTED);
+    let unreachable = crate::app::restored_attachment(shared, saved, || {
+        Err("could not connect to the daemon: Connection refused (os error 111)".to_owned())
+    })
+    .err()
+    .unwrap();
+    for reason in [&disconnected, &unreachable, &disconnected] {
+        window.app.startup_gate.retries.expire_window();
+        assert!(refused_attempt(&mut window, reason));
+        assert_eq!(window.app.startup_pane_check(), Ok(false), "{reason}");
+    }
+    window.app.startup_gate.retries.expire_window();
+    assert!(refused_attempt(&mut window, &disconnected));
+    window.app.startup_gate.retries.expire_window();
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(report.contains(&disconnected), "{report}");
+}
+
+/// A daemon that cannot open its shared model still hosts the terminals.
+/// Shared agent rows then attach from their own descriptor, as they did
+/// before sharing, instead of waiting for a registry that is not coming.
+#[test]
+fn shared_agent_rows_attach_from_their_descriptor_when_the_daemon_has_no_registry() {
+    let mut window = reopened_window(false);
+    let card = window.cached.id;
+    drop(window.app.update(Message::VerifyStartupPanes));
+    assert!(!window.app.shared_views_ready_for_startup());
+    assert!(window.app.restored_agent_attaches.is_empty());
+    window.app.restored_agent_attaches.push_back(card);
+    drop(window.app.attach_next_restored_agent());
+    assert!(
+        !window.app.terminal_start_in_flight(card),
+        "held while the registry may still answer"
+    );
+    assert_eq!(window.app.restored_agent_attaches, [card]);
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Unavailable(
+                "daemon rejected the request (Internal): registry is unavailable".into(),
+            )),
+    );
+    assert!(window.app.terminal_start_in_flight(card));
+    assert!(window.app.restored_agent_attaches.is_empty());
+    assert!(
+        !window.app.attaches_as_shared(card),
+        "attached from its saved descriptor, not a registry pane"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let source = session(&window.cached);
+    drop(window.app.update(Message::RestoredAgentAttached {
+        card,
+        terminal: source.id,
+        result: Ok(Some(attached(directory.path(), &source))),
+    }));
+    for _ in 0..50 {
+        if window.app.startup_pane_check().is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(
+        report.contains(crate::workspace_model::REGISTRY_UNAVAILABLE),
+        "reported for the missing registry, not left waiting for it: {report}"
     );
 }
 
@@ -917,4 +1134,98 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
             assert_hibernated_attachment(&window.app, card);
         }
     }
+}
+
+/// The surface of a pane attached under the replacement daemon, after the
+/// gate's first check started it.
+fn attach_cached(window: &mut Window, directory: &Path) -> std::os::unix::net::UnixStream {
+    drop(window.app.update(Message::VerifyStartupPanes));
+    assert!(window.app.terminal_start_in_flight(window.cached.id));
+    let saved = session(&window.cached);
+    let (started, connection) = attached_with_connection(directory, &saved);
+    drop(window.app.update(Message::RestoredAgentAttached {
+        card: window.cached.id,
+        terminal: saved.id,
+        result: Ok(Some(started)),
+    }));
+    connection
+}
+
+fn cached_surface(window: &Window) -> &TerminalSurface {
+    match window.app.cards.get(&window.cached.id) {
+        Some(CardRuntime::Terminal(surface)) => surface,
+        _ => panic!("the cached terminal was never attached"),
+    }
+}
+
+/// Every window: a pane woken while its attachment was settling still holds
+/// the detached marker its hibernated view left, until its first frame
+/// arrives. The gate read that marker as a failed attachment and reported
+/// every such pane at its first check, without a reason.
+#[test]
+fn a_woken_terminal_qualifies_before_its_first_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    let _connection = attach_cached(&mut window, directory.path());
+    let surface = cached_surface(&window);
+    assert_ne!(
+        session(&window.cached).continuity.live_proof(),
+        surface.host_proof(),
+        "attached under the replacement daemon, not the saved one"
+    );
+    for wake in [TerminalSurface::reveal, TerminalSurface::hide] {
+        wake(surface).unwrap();
+        assert!(surface.snapshot().detached, "no frame has arrived yet");
+        assert_eq!(window.app.startup_pane_check(), Ok(true));
+    }
+}
+
+/// A connection lost after the attachment was confirmed is still
+/// reconnecting, which the view itself retries and reports if it gives up.
+#[test]
+fn a_lost_connection_waits_for_its_reconnect_and_a_stopped_one_is_reported() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    let connection = attach_cached(&mut window, directory.path());
+    assert_eq!(window.app.startup_pane_check(), Ok(true));
+    connection.shutdown(std::net::Shutdown::Both).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while cached_surface(&window)
+        .current_attachment()
+        .is_ok_and(|current| current.is_some())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the view never saw its connection end"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(window.app.startup_pane_check(), Ok(false));
+    cached_surface(&window).stop_for_test();
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(report.contains("A terminal reported: "), "{report}");
+}
+
+/// A shared pane's record follows the registry. A record still naming the
+/// previous daemon waits while this window's edit carrying the attachment is
+/// pending, and is reported with its reason once nothing will correct it.
+#[test]
+fn a_stale_shared_record_waits_for_its_edit_and_is_then_reported() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    let _connection = attach_cached(&mut window, directory.path());
+    assert!(window.app.shared_views.has_pending_update(window.cached.id));
+    window.app.card_state_mut(window.cached.id).unwrap().kind = window.cached.kind.clone();
+    assert_eq!(window.app.startup_pane_check(), Ok(false));
+    window.app.shared_views.pending.clear();
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(
+        report.contains(
+            "A terminal reported: The terminal attachment no longer matches this saved pane's owner"
+        ),
+        "{report}"
+    );
 }

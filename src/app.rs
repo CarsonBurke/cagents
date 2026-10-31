@@ -5847,7 +5847,7 @@ impl Cagents {
         if self.shared_views.defaults.contains_key(&card)
             || self.durable.pending_terminal_creations.contains(&card)
             || (self.shared_views.attached.contains(&card)
-                && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                && self.shared_registry_connecting()
                 && !explicit_retry)
         {
             return Task::none();
@@ -5864,7 +5864,7 @@ impl Cagents {
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
-        let shared = self.shared_views.attached.contains(&card);
+        let shared = self.attaches_as_shared(card);
         let reserved = self
             .workspace_model
             .views
@@ -5928,21 +5928,18 @@ impl Cagents {
         let config = self.terminal_config(false);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
-        let shared = self.shared_views.attached.contains(&card);
+        let shared = self.attaches_as_shared(card);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let (recovered, mode) = if shared {
+                let connect = || {
                     let socket = crate::terminal::ensure_daemon_ready()
                         .map_err(|error| error.to_string())?;
-                    let mut client = crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?;
-                    hosted_shared_terminal(&mut client, session.id)?
-                } else {
-                    recover_terminal(session, false)?
+                    crate::control::ControlClient::connect(&socket)
+                        .map_err(|error| error.to_string())
                 };
-                if matches!(mode, TerminalStartMode::Spawn(_)) {
+                let Some((recovered, mode)) = restored_attachment(shared, session, connect)? else {
                     return Ok(None);
-                }
+                };
                 open_terminal(card, recovered, mode, config, sender, false).map(Some)
             })
             .await
@@ -5967,7 +5964,8 @@ impl Cagents {
         // A worktree being deleted is about to close its cards, so theirs
         // wait: a deletion that fails leaves them to be attached after all.
         // A shared pane waits for the registry to confirm its descriptor, as
-        // opening it would.
+        // opening it would. A daemon without one leaves its descriptor the
+        // only record, which is attached the way it was before sharing.
         let mut held = Vec::new();
         let mut task = Task::none();
         while let Some(card) = self.restored_agent_attaches.pop_front() {
@@ -14701,8 +14699,7 @@ impl Application for Cagents {
                         let reason = result.err().unwrap_or_else(|| {
                             "the terminal service no longer hosts it; open it to relaunch".into()
                         });
-                        tracing::warn!(?card, %terminal, %reason, "restored terminal stays detached");
-                        self.startup_gate.terminal_detached(card, terminal, reason);
+                        self.startup_attach_failed(card, terminal, reason);
                         self.finish_terminal_start(card)
                     }
                 }
@@ -19380,6 +19377,21 @@ fn shared_terminal_attachment(
         },
         TerminalStartMode::Attach(proof),
     )
+}
+
+/// What a restored agent row attaches, or `None` when only a launch could
+/// bring it back. `connect` reaches the daemon a shared pane is hosted by.
+fn restored_attachment(
+    shared: bool,
+    session: TerminalSession,
+    connect: impl FnOnce() -> Result<crate::control::ControlClient, String>,
+) -> Result<Option<(daemon_recovery::RecoveredTerminal, TerminalStartMode)>, String> {
+    let (recovered, mode) = if shared {
+        hosted_shared_terminal(&mut connect()?, session.id)?
+    } else {
+        recover_terminal(session, false)?
+    };
+    Ok(matches!(mode, TerminalStartMode::Attach(_)).then_some((recovered, mode)))
 }
 
 /// The exact shared terminal `client`'s daemon hosts, ready to attach.
