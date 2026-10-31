@@ -5797,10 +5797,20 @@ mod tests {
             program: executable.to_string_lossy().into_owned(),
             arguments: Vec::new(),
             working_directory: directory.path().into(),
-            environment: BTreeMap::from([(
-                "HOME".into(),
-                directory.path().to_string_lossy().into_owned(),
-            )]),
+            environment: BTreeMap::from([
+                (
+                    "HOME".into(),
+                    directory.path().to_string_lossy().into_owned(),
+                ),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    directory
+                        .path()
+                        .join(".claude")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ]),
         };
         let source = TerminalSession {
             owned_codex_listener: None,
@@ -6312,6 +6322,15 @@ for line in sys.stdin:
                 let mut output = tempfile::tempdir().unwrap();
                 output.disable_cleanup(true);
                 eprintln!("Upgrade fixture output: {}", output.path().display());
+                let mut runtime = tempfile::Builder::new()
+                    .prefix("cagents-upgrade-runtime-")
+                    .tempdir()
+                    .unwrap();
+                // Child exit alone does not establish descendant settlement.
+                runtime.disable_cleanup(true);
+                let runtime_path = runtime.path().canonicalize().unwrap();
+                crate::secure_file::prepare_private_directory(&runtime_path).unwrap();
+                eprintln!("Upgrade fixture runtime: {}", runtime_path.display());
                 let stdout_path = output.path().join("stdout");
                 let stderr_path = output.path().join("stderr");
                 let mut child = OriginalChild(
@@ -6327,6 +6346,8 @@ for line in sys.stdin:
                         // Update inspection reads the real application-data store.
                         // Give each fresh fixture child its own private storage.
                         .env("XDG_DATA_HOME", output.path().join("data"))
+                        .env("XDG_CONFIG_HOME", output.path().join("config"))
+                        .env("XDG_RUNTIME_DIR", &runtime_path)
                         .stdout(fs::File::create(&stdout_path).unwrap())
                         .stderr(fs::File::create(&stderr_path).unwrap())
                         .spawn()
