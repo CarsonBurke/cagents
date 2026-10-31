@@ -840,6 +840,43 @@ impl Cagents {
             })
     }
 
+    /// A queued row may attach only after its own canonical view is admitted.
+    /// The daemon still resolves this exact terminal under its current proof;
+    /// this check never compares that proof with a cached session's old proof.
+    pub(super) fn shared_terminal_ready_for_restored_attach(
+        &self,
+        card: CardId,
+        source: &TerminalSession,
+    ) -> bool {
+        if self.shared_views.defaults.contains_key(&card)
+            || self.durable.pending_terminal_creations.contains(&card)
+        {
+            return false;
+        }
+        if !self.shared_views.attached.contains(&card) {
+            return true;
+        }
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return false;
+        }
+        let mut owners = self.workspace_model.views.iter().flat_map(|view| {
+            view.panes
+                .iter()
+                .filter(move |pane| pane.id == card)
+                .map(move |pane| (view, pane))
+        });
+        let Some((view, pane)) = owners.next() else {
+            return false;
+        };
+        owners.next().is_none()
+            && !view.retired.contains(&card)
+            && self.shared_views.initialized.contains(&view.scope)
+            && !self.shared_views.seeding.contains(&view.scope)
+            && !self.shared_views.blocked.contains(&view.scope)
+            && !pane.pending_terminal_start
+            && matches!(&pane.kind, CardKind::Terminal(current) if current == source)
+    }
+
     fn local_view_scopes(&self) -> Vec<Scope> {
         let mut scopes = self
             .durable

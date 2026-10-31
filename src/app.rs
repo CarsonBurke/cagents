@@ -5897,8 +5897,6 @@ impl Cagents {
             if self
                 .card_state(card)
                 .is_some_and(|state| self.project_ui.deleting_card(state))
-                || (self.shared_views.attached.contains(&card)
-                    && self.workspace_model.identity == crate::workspace_model::NO_REGISTRY)
             {
                 held.push(card);
                 continue;
@@ -5907,6 +5905,10 @@ impl Cagents {
                 self.card_state(card),
                 matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
             ) {
+                if !self.shared_terminal_ready_for_restored_attach(card, &session) {
+                    held.push(card);
+                    continue;
+                }
                 // Attached for its row or for startup qualification only, so
                 // its rendering surface stays asleep until the card is opened.
                 if cold {
