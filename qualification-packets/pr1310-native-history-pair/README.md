@@ -58,6 +58,11 @@ after. Both `import -screen -window <XID>` and direct `import -window <XID>` mus
 succeed and produce the same planned window dimensions, a nonblank image and
 lossless WebP. An arbitrary full desktop image is never compared to a smaller
 drawable. No pointer move, focus or geometry repair occurs inside capture.
+The raw PNG and its mode/bands/transparency metadata presence/decoded alpha range
+are retained. Acceptance requires every decoded alpha sample to be 255 before RGB
+nonblank metrics or saving the original image as WebP. No background is invented
+and no alpha is silently discarded. This strict source policy does not establish
+actual X11 alpha semantics or the appearance of any unobserved app frame.
 Renderer requested settings are not observations; the owner still owes a live
 PID/log/XID-bound observed backend, theme/scale provenance and an actual frame.
 Configured app scale1.0 is separate from any unmeasured internal native factor.
@@ -76,6 +81,11 @@ The nine-case DATA matrix is bound in `plan.json`. Coverage remains partial:
 - Neither adapter exports a request/result ledger, delayed-callback seam or held
   page producer. Replacement, paging and immediate snapshots cannot qualify
   stale A rejection, duplicate completion or generation/HEAD ownership.
+  Result polling retains actual draft/notices/row/pager observations. Prior or
+  mixed renders inconsistent with the new query remain transitional until a
+  consistent visible shape or the original deadline; they are not early
+  completeness failures. A consistent unchanged old shape can still be
+  ambiguous without an applied-submit witness, so this is no causal verdict.
 - Reader error/retry needs a genuine error producer; no fake Git error is
   injected. Global App shortcuts are excluded by the fixture, so actual local
   Tab/Shift+Tab/Escape observations are not whole-app shortcut qualification.

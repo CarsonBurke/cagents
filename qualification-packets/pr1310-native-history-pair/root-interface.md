@@ -84,7 +84,7 @@ adapters/three datasets, using the maintained custody primitive only where its
 actual contract fits; private direct Xvfb/session/AX launch plus authenticated
 readiness; original runner and fixed tool commands; evidence-writer ledger;
 bounded cancellation/settlement and staged handback. Review that exact assembled
-source and policy before requesting Root16 resource admission. Do not build a
+source and policy before requesting EC resource scheduler admission. Do not build a
 maintained generic platform or assume the moving main15 owner supplies it.
 
 Separate missing evidence remains even after a root binding: actual delayed

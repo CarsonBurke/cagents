@@ -7,7 +7,7 @@ obtain independent review of the assembled executable BEFORE use.
 
 import re
 
-from observations import (ADAPTERS, EMPTY, FIRST_PAGER, LIMIT, LOADING,
+from observations import (ADAPTERS, EMPTY, FIRST_PAGER, Hold, LIMIT, LOADING,
                           PAGER, SEARCH, UNBORN, outcome, require, row_text)
 
 
@@ -344,12 +344,21 @@ class HistoryDriver:
             self.check("frame-decode-before")
             with self.Image.open(png) as image:
                 require(image.size == self.size, "frame not exact owned-window dimensions")
+                require(image.format == "PNG", "native capture is not the retained original PNG")
+                alpha_extrema = image.convert("RGBA").getchannel("A").getextrema()
+                alpha = {"original_mode": image.mode, "original_bands": list(image.getbands()),
+                         "original_transparency_metadata_present": "transparency" in image.info,
+                         "decoded_alpha_extrema": list(alpha_extrema)}
+                self.record("native-frame-alpha", kind=kind, original_png=str(png), **alpha)
+                require(alpha_extrema == (255, 255),
+                        "nonopaque native frame; retain original PNG without accepting a screenshot")
                 rgb = image.convert("RGB")
                 histogram = rgb.convert("L").histogram()
                 levels = [level for level, count in enumerate(histogram) if count]
                 metrics = {"size": list(image.size), "luminance_range": max(levels) - min(levels),
                            "at_least_16_colors": rgb.getcolors(maxcolors=15) is None,
-                           "fraction_above_8": sum(histogram[9:]) / (image.width * image.height)}
+                           "fraction_above_8": sum(histogram[9:]) / (image.width * image.height),
+                           **alpha}
                 require(metrics["luminance_range"] >= 16 and metrics["at_least_16_colors"]
                         and metrics["fraction_above_8"] > .01, "blank/unrendered native frame")
                 self.check("frame-WebP-before")
@@ -428,26 +437,35 @@ class HistoryDriver:
             nodes = self.nodes()
             labels = [node.name for _, node in nodes if self.showing(node)]
             rows = self.row_nodes()
-            if LOADING in labels or self.query_text() != query:
+            draft = self.query_text()
+            row_oids = set(rows)
+            pager = PAGER in labels or FIRST_PAGER in labels
+            self.record("query-read-observation", expected_query=query, actual_draft=draft,
+                        visible_notices=[label for label in (LOADING, LIMIT, EMPTY, UNBORN) if label in labels],
+                        recognized_fixture_row_oids=list(rows), pager_observed=pager,
+                        applied_submit_or_callback_witness="UNSUPPLIED")
+            # The draft is visible before Enter is applied. Prior/mixed renders
+            # are ambiguous observations, not completed-new-query failures.
+            # Retry reads only under the same original absolute deadline.
+            if LOADING in labels or UNBORN in labels or draft != query:
                 return None
             if LIMIT in labels:
-                require(set(rows) <= candidates | optional, "limited result has nonmatching fixture rows")
-                require(PAGER not in labels and FIRST_PAGER not in labels, "limited result exposes pager")
-                return "limited-zero" if not rows else "limited-known"
+                if EMPTY not in labels and row_oids <= candidates | optional and not pager:
+                    return "limited-zero" if not rows else "limited-known"
+                return None
             if EMPTY in labels:
-                require(not rows, "complete-empty notice with rows")
-                require(not candidates, "complete-empty notice lost actual literal fixture candidates")
-                return "complete-empty"
-            if rows and set(rows) <= candidates | optional:
-                if len(rows) < 200 and self.button(PAGER) is None:
-                    require(candidates <= set(rows), "short completed result lost literal fixture candidates")
+                return "complete-empty" if not rows and not candidates and not pager else None
+            if rows and row_oids <= candidates | optional:
+                if len(rows) < 200 and not pager and candidates <= row_oids:
                     return "visible-short-result"
-                if len(rows) == 200 and self.button(PAGER) is not None:
+                if len(rows) == 200 and pager:
                     return "visible-full-page"
             return None
 
         shape = self.poll(observed, "query-visible-result")
-        self.visible_outcome("query-result-" + key.replace("_", "-"))
+        # A later AX read is another observation, not an atomic callback result
+        # or grounds to reapply completeness assertions without that witness.
+        self.snapshot("query-result-" + key.replace("_", "-"))
         self.capture("query-" + key.replace("_", "-"))
         self.record("query-result-shape", key=key, shape=shape,
                     meaning="visible UI only; no generation, limit cause, exhaustion or OID-resolution proof")
