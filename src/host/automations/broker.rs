@@ -1,7 +1,7 @@
 //! One sleeping coordinator owns schedule deadlines and bounded precheck
 //! observations. Provider execution stays in the shared execution service.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, Weak},
     thread::JoinHandle,
@@ -59,6 +59,9 @@ struct Inner {
     root: PathBuf,
     wake: Wake,
     workers: Mutex<BTreeMap<Uuid, Worker>>,
+    // A manual claim becomes durable before its precheck owner can be
+    // published. Only this daemon's exact in-flight launches defer recovery.
+    launching: Mutex<BTreeSet<Uuid>>,
     // One lazy startup census catches receipts left after a committed result
     // followed by daemon loss. Each wake visits at most 32 owned directories.
     cleanup: Mutex<Option<std::fs::ReadDir>>,
@@ -71,6 +74,21 @@ struct Inner {
 
 #[derive(Clone)]
 pub(in crate::host) struct Handle(Arc<Inner>);
+
+struct PendingLaunch<'a> {
+    inner: &'a Inner,
+    firing: Uuid,
+}
+
+impl Drop for PendingLaunch<'_> {
+    fn drop(&mut self) {
+        self.inner
+            .launching
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.firing);
+    }
+}
 
 pub(in crate::host) struct Broker {
     handle: Handle,
@@ -88,6 +106,7 @@ impl Broker {
             root,
             wake: Wake::default(),
             workers: Mutex::new(BTreeMap::new()),
+            launching: Mutex::default(),
             cleanup: Mutex::new(Some(cleanup)),
             attention: Mutex::new(attention),
             notifications: Mutex::default(),
@@ -190,22 +209,17 @@ impl Handle {
         }
         service::validate_target(&host, &automation.definition, &automation.target_identity)?;
         agent_execution::selected_account(&automation.definition.agent)?;
-        let claim = self
-            .0
-            .registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .claim_automation(
-                id,
-                revision,
-                None,
-                Trigger::Manual { request },
-                automation.next,
-                confirmed,
-                service::now()?,
-            )?;
+        let (claim, launching) = self.claim_manual(
+            id,
+            revision,
+            request,
+            automation.next,
+            confirmed,
+            service::now()?,
+        )?;
         let firing = claim.firing.clone();
         let result = self.launch(&host, claim);
+        drop(launching);
         self.wake();
         result?;
         self.0
@@ -213,6 +227,45 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .automation_firing(firing.id)
+    }
+
+    fn claim_manual(
+        &self,
+        id: Uuid,
+        revision: u64,
+        request: Uuid,
+        next: Option<crate::automations::Occurrence>,
+        confirmed: bool,
+        now: u64,
+    ) -> Result<(Claimed, Option<PendingLaunch<'_>>), String> {
+        let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
+        let claim = registry.claim_automation(
+            id,
+            revision,
+            None,
+            Trigger::Manual { request },
+            next,
+            confirmed,
+            now,
+        )?;
+        // Publish before releasing the registry census lock. A tick that sees
+        // this newly committed firing must also see its launch custody. No
+        // registry or launching lock is held over validation or process I/O.
+        let launching = (claim.created
+            && claim.firing.state == FiringState::Prechecking
+            && claim.definition.precheck.is_some())
+        .then(|| {
+            self.0
+                .launching
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(claim.firing.id);
+            PendingLaunch {
+                inner: &self.0,
+                firing: claim.firing.id,
+            }
+        });
+        Ok((claim, launching))
     }
 
     /// Caller holds the daemon control read gate, either the IPC dispatcher or
@@ -628,6 +681,15 @@ impl Handle {
         firing: &Firing,
         now: u64,
     ) -> Result<bool, String> {
+        if self
+            .0
+            .launching
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&firing.id)
+        {
+            return Ok(true);
+        }
         let status = {
             let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
             workers
@@ -780,6 +842,243 @@ mod tests {
     use super::*;
     use crate::host::state::HostState;
 
+    fn manual_precheck_fixture() -> (
+        tempfile::TempDir,
+        SharedHost,
+        Handle,
+        crate::automations::Automation,
+    ) {
+        use crate::{host::model::Registry, model::ProjectKind, workspace_model::ModelEdit};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: "/fixture".into(),
+                name: "Fixture".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Manual check", "prompt":"Fixture prompt",
+            "agent":{"provider":"Claude","account":null,"target":{"repository":"/fixture","directory":"/fixture","channel":null},"surface":"Chat","model":null,"permission_mode":null},
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":{"command":"exit 0","timeout_seconds":1}
+        })).unwrap();
+        let automation = registry
+            .create_automation(
+                definition,
+                100,
+                crate::automations::DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        let host = crate::host::service::test_host();
+        let handle = Handle(Arc::new(Inner {
+            host: Arc::downgrade(&host),
+            registry: Arc::new(Mutex::new(registry)),
+            root: directory.path().join("prechecks"),
+            wake: Wake::default(),
+            workers: Mutex::default(),
+            launching: Mutex::default(),
+            cleanup: Mutex::new(None),
+            attention: Mutex::default(),
+            notifications: Mutex::default(),
+        }));
+        (directory, host, handle, automation)
+    }
+
+    #[test]
+    fn manual_precheck_claim_defers_only_its_own_recovery_until_worker_publication() {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+        let (_directory, host, handle, automation) = manual_precheck_fixture();
+        let request = Uuid::new_v4();
+        let (claim, launching) = handle
+            .claim_manual(automation.id, 1, request, None, true, 200)
+            .unwrap();
+        assert!(launching.is_some());
+        // A concurrent retry reads the same durable receipt but must not take
+        // away the original launch's custody when its own scope ends.
+        let (retried, retry_launching) = handle
+            .claim_manual(automation.id, 1, request, None, true, 201)
+            .unwrap();
+        assert!(!retried.created);
+        assert_eq!(retried.firing.id, claim.firing.id);
+        assert!(retry_launching.is_none());
+        drop(retry_launching);
+
+        // This other committed firing has no in-process launch custodian,
+        // exactly as after restart. Its absent receipt must remain uncertain.
+        let recovered = {
+            let mut registry = handle.0.registry.lock().unwrap();
+            let other = registry
+                .create_automation(
+                    automation.definition.clone(),
+                    100,
+                    automation.target_identity,
+                )
+                .unwrap();
+            registry
+                .claim_automation(
+                    other.id,
+                    1,
+                    None,
+                    Trigger::Manual {
+                        request: Uuid::new_v4(),
+                    },
+                    None,
+                    true,
+                    200,
+                )
+                .unwrap()
+                .firing
+        };
+        let observer = handle.clone();
+        let observed_host = host.clone();
+        let pending_id = claim.firing.id;
+        let recovered_id = recovered.id;
+        std::thread::spawn(move || {
+            // Obtain the actual committed active census, as tick does; do not
+            // inject a fabricated firing into the observation under test.
+            let active = observer
+                .0
+                .registry
+                .lock()
+                .unwrap()
+                .active_automation_firings()
+                .unwrap();
+            assert_eq!(active.len(), 2);
+            for firing in active {
+                assert_eq!(
+                    observer
+                        .observe_precheck(&observed_host, &firing, 300)
+                        .unwrap(),
+                    firing.id == pending_id
+                );
+            }
+        })
+        .join()
+        .unwrap();
+        {
+            let registry = handle.0.registry.lock().unwrap();
+            assert_eq!(
+                registry.automation_firing(pending_id).unwrap().state,
+                FiringState::Prechecking
+            );
+            assert_eq!(
+                registry.automation_firing(recovered_id).unwrap().state,
+                FiringState::Interrupted
+            );
+            assert!(
+                registry
+                    .automation(automation.id)
+                    .unwrap()
+                    .blocked
+                    .is_none()
+            );
+        }
+        assert!(!handle.0.workers.lock().unwrap().contains_key(&pending_id));
+
+        // Publish a real lease-backed owner record, without launching a shell
+        // or provider. Publication precedes releasing the launch guard, just
+        // as Worker::launch followed by workers.insert does in production.
+        crate::secure_file::prepare_private_directory(&handle.0.root).unwrap();
+        let owner_directory = handle.0.root.join(pending_id.to_string());
+        crate::secure_file::prepare_private_directory(&owner_directory).unwrap();
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(owner_directory.join("lease"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        handle.0.workers.lock().unwrap().insert(
+            pending_id,
+            Worker::recover(&handle.0.root, pending_id, claim.firing.revision),
+        );
+        drop(launching);
+        assert!(handle.observe_precheck(&host, &claim.firing, 400).unwrap());
+        assert_eq!(
+            handle
+                .0
+                .registry
+                .lock()
+                .unwrap()
+                .automation_firing(pending_id)
+                .unwrap()
+                .state,
+            FiringState::Prechecking
+        );
+        // Once ownership really disappears without a receipt, normal recovery
+        // must still record uncertainty rather than inventing success.
+        drop(lease);
+        assert!(!handle.observe_precheck(&host, &claim.firing, 500).unwrap());
+        assert_eq!(
+            handle
+                .0
+                .registry
+                .lock()
+                .unwrap()
+                .automation_firing(pending_id)
+                .unwrap()
+                .state,
+            FiringState::Interrupted
+        );
+    }
+
+    #[test]
+    fn failed_or_panicked_manual_launch_does_not_hide_missing_cleanup_forever() {
+        for panic in [false, true] {
+            let (_directory, host, handle, automation) = manual_precheck_fixture();
+            let attempted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (_claim, _launching) = handle
+                    .claim_manual(automation.id, 1, Uuid::new_v4(), None, true, 200)
+                    .unwrap();
+                if panic {
+                    panic!("launch interrupted before owner publication");
+                }
+                Err::<(), _>("launch failed before owner publication")
+            }));
+            if panic {
+                assert!(attempted.is_err());
+            } else {
+                assert!(attempted.unwrap().is_err());
+            }
+            let active = handle
+                .0
+                .registry
+                .lock()
+                .unwrap()
+                .active_automation_firings()
+                .unwrap();
+            assert_eq!(active.len(), 1);
+            assert!(!handle.observe_precheck(&host, &active[0], 300).unwrap());
+            let registry = handle.0.registry.lock().unwrap();
+            let interrupted = registry.automation_firing(active[0].id).unwrap();
+            assert_eq!(interrupted.state, FiringState::Interrupted);
+            assert_eq!(
+                registry.automation(automation.id).unwrap().active_firing,
+                Some(interrupted.id)
+            );
+            assert!(
+                registry
+                    .automation(automation.id)
+                    .unwrap()
+                    .blocked
+                    .is_some()
+            );
+            assert!(interrupted.run.is_none());
+        }
+    }
+
     #[test]
     fn proposal_inspection_does_not_wake_scheduler_but_a_new_decline_does() {
         use crate::{
@@ -817,6 +1116,7 @@ mod tests {
             root: directory.path().into(),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
@@ -1026,6 +1326,7 @@ mod tests {
             root: path.parent().unwrap().join("prechecks"),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
@@ -1264,6 +1565,7 @@ mod tests {
             root: directory.path().into(),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
@@ -1348,6 +1650,7 @@ mod tests {
             root: directory.path().join("prechecks"),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
@@ -1545,6 +1848,7 @@ mod tests {
             root: directory.path().join("prechecks"),
             wake: Wake::default(),
             workers: Mutex::default(),
+            launching: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
             notifications: Mutex::default(),
