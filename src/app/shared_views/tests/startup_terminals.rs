@@ -365,10 +365,12 @@ fn reopened_shared_window_reports_a_refused_offscreen_attach() {
     ));
     let report = app.startup_pane_check().unwrap_err();
     assert!(
-        report.starts_with("recovery-incomplete: 1 saved panes"),
-        "{report}"
+        report.starts_with(
+            "recovery-incomplete: 1 pane did not reconnect: \u{201c}Terminal\u{201d}."
+        ),
+        "named as its tab is: {report}"
     );
-    assert!(report.contains(&window.cached.id.to_string()), "{report}");
+    assert!(!report.contains(&window.cached.id.to_string()), "{report}");
     assert!(report.contains(REFUSAL), "{report}");
     assert_eq!(
         app.card_state(window.cached.id).unwrap().kind,
@@ -471,10 +473,10 @@ fn an_unchanged_refusal_is_retried_through_its_window_and_then_reported() {
     );
 }
 
-/// A refusal whose reason keeps changing is still settling, so its window
-/// starts again each time.
+/// A refusal whose reason keeps changing is not new evidence about the pane,
+/// so it is reported, with its latest reason, once the same window passes.
 #[test]
-fn a_changing_refusal_is_retried_until_it_settles() {
+fn a_changing_refusal_is_reported_within_its_window() {
     let mut window = reopened_window(false);
     admit(&mut window);
     let reasons = [
@@ -482,18 +484,41 @@ fn a_changing_refusal_is_retried_until_it_settles() {
         "could not connect to the daemon: Connection refused (os error 111)",
     ];
     for reason in reasons.iter().cycle().take(5) {
-        window.app.startup_gate.retries.expire_window();
+        window.app.startup_gate.retries.expire_delay();
         assert!(refused_attempt(&mut window, reason));
         assert_eq!(window.app.startup_pane_check(), Ok(false), "{reason}");
     }
     window.app.startup_gate.retries.expire_window();
-    assert!(refused_attempt(&mut window, reasons[0]));
     let report = window.app.startup_pane_check().unwrap_err();
-    assert!(report.contains(reasons[0]), "{report}");
+    assert!(report.contains(reasons[0]), "the latest reason: {report}");
 }
 
-/// A new descriptor for the same terminal, or a new registry entry for its
-/// pane, is new evidence: a reported refusal is tried again.
+/// The registry pane with the cached pane's attach fields changed by `edit`.
+fn edit_registry_pane(window: &mut Window, edit: impl FnOnce(&mut Pane)) {
+    let cached = window.cached.id;
+    let mut model = window.app.workspace_model.clone();
+    model.sequence += 1;
+    let view = model
+        .views
+        .iter_mut()
+        .find(|view| view.panes.iter().any(|pane| pane.id == cached))
+        .unwrap();
+    view.revision += 1;
+    edit(
+        view.panes
+            .iter_mut()
+            .find(|pane| pane.id == cached)
+            .unwrap(),
+    );
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Read(model)),
+    );
+}
+
+/// A new descriptor for the same terminal, or a change to what the registry
+/// entry attaches, is new evidence: a reported refusal is tried again.
 #[test]
 fn a_new_descriptor_or_registry_entry_restarts_the_retry_window() {
     let mut window = reopened_window(false);
@@ -515,32 +540,76 @@ fn a_new_descriptor_or_registry_entry_restarts_the_retry_window() {
         host_incarnation: HostIncarnation::new("restored-incarnation"),
     };
     // A shared pane's descriptor arrives through its registry entry.
-    let cached = window.cached.id;
-    for pane in window
-        .app
-        .workspace_model
-        .views
-        .iter_mut()
-        .flat_map(|view| &mut view.panes)
-        .filter(|pane| pane.id == cached)
-    {
+    edit_registry_pane(&mut window, |pane| {
         pane.kind = CardKind::Terminal(descriptor.clone());
-    }
-    window.app.card_state_mut(cached).unwrap().kind = CardKind::Terminal(descriptor);
+    });
+    assert_eq!(
+        window.app.card_state(window.cached.id).unwrap().kind,
+        CardKind::Terminal(descriptor)
+    );
     assert_eq!(window.app.startup_pane_check(), Ok(false));
     exhaust(&mut window);
 
-    let pane = window
-        .app
-        .workspace_model
-        .views
-        .iter_mut()
-        .flat_map(|view| &mut view.panes)
-        .find(|pane| pane.id == window.cached.id)
-        .unwrap();
-    pane.title = "Renamed elsewhere".into();
+    edit_registry_pane(&mut window, |pane| {
+        pane.scope = Some("/fixture-project/moved".into());
+    });
     assert_eq!(window.app.startup_pane_check(), Ok(false));
     assert!(refused_attempt(&mut window, REFUSAL));
+}
+
+/// Evidence that keeps changing is still bounded: past the overall limit
+/// the pane is reported however recently its descriptor changed.
+#[test]
+fn a_pane_whose_evidence_keeps_changing_is_reported_at_the_overall_limit() {
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    for host in ["first-host", "second-host", "third-host"] {
+        window.app.startup_gate.retries.expire_window();
+        assert!(refused_attempt(&mut window, REFUSAL));
+        edit_registry_pane(&mut window, |pane| {
+            let CardKind::Terminal(session) = &mut pane.kind else {
+                unreachable!()
+            };
+            session.continuity = TerminalContinuity::Live {
+                host_session_id: HostSessionId::new(host),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new(host),
+            };
+        });
+        assert_eq!(window.app.startup_pane_check(), Ok(false), "{host}");
+    }
+    window.app.startup_gate.retries.expire_limit();
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(report.contains(REFUSAL), "{report}");
+    assert!(
+        !refused_attempt(&mut window, REFUSAL),
+        "reported, not retried"
+    );
+}
+
+/// Another window renaming or resizing the pane changes nothing it attaches.
+/// Its retries keep their pace and window, and its refusal is reported.
+#[test]
+fn title_churn_on_the_same_pane_neither_restarts_nor_hurries_its_retries() {
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    assert!(refused_attempt(&mut window, REFUSAL));
+    for round in 0..4 {
+        edit_registry_pane(&mut window, |pane| {
+            pane.title = format!("Renamed elsewhere {round}");
+            pane.width_fraction = 0.5 + round as f32 / 10.0;
+        });
+        assert!(
+            !refused_attempt(&mut window, REFUSAL),
+            "no retry before its pause"
+        );
+        assert_eq!(window.app.startup_pane_check(), Ok(false));
+        window.app.startup_gate.retries.expire_delay();
+        assert!(refused_attempt(&mut window, REFUSAL));
+    }
+    window.app.startup_gate.retries.expire_window();
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(report.contains(REFUSAL), "{report}");
 }
 
 /// An edit to another pane of the same view says nothing about this one.
@@ -575,8 +644,8 @@ fn an_edit_to_a_neighbouring_pane_does_not_restart_the_retry_window() {
 
 /// The refusals a shared pane's own attach produces, through the choice
 /// `attach_restored_agent` makes for it: a daemon that no longer hosts the
-/// exact terminal, and one that cannot be reached. Each is retried while it
-/// changes, and the last is reported once it stops changing.
+/// exact terminal, and one that cannot be reached. Each is retried after its
+/// pause, and the latest is reported once the window passes.
 #[test]
 fn a_shared_attach_refusal_is_retried_and_then_reported() {
     let mut window = reopened_window(false);
@@ -599,12 +668,10 @@ fn a_shared_attach_refusal_is_retried_and_then_reported() {
     .err()
     .unwrap();
     for reason in [&disconnected, &unreachable, &disconnected] {
-        window.app.startup_gate.retries.expire_window();
+        window.app.startup_gate.retries.expire_delay();
         assert!(refused_attempt(&mut window, reason));
         assert_eq!(window.app.startup_pane_check(), Ok(false), "{reason}");
     }
-    window.app.startup_gate.retries.expire_window();
-    assert!(refused_attempt(&mut window, &disconnected));
     window.app.startup_gate.retries.expire_window();
     let report = window.app.startup_pane_check().unwrap_err();
     assert!(report.contains(&disconnected), "{report}");
@@ -1205,27 +1272,235 @@ fn a_lost_connection_waits_for_its_reconnect_and_a_stopped_one_is_reported() {
     assert_eq!(window.app.startup_pane_check(), Ok(false));
     cached_surface(&window).stop_for_test();
     let report = window.app.startup_pane_check().unwrap_err();
-    assert!(report.contains("A terminal reported: "), "{report}");
+    assert!(report.contains(" Details: "), "{report}");
 }
 
-/// A shared pane's record follows the registry. A record still naming the
-/// previous daemon waits while this window's edit carrying the attachment is
-/// pending, and is reported with its reason once nothing will correct it.
+/// The cached pane attached under the replacement daemon by the gate, with
+/// the edit carrying that attachment this window published to the registry.
+fn attach_cached_publishing(
+    window: &mut Window,
+    directory: &Path,
+) -> (std::os::unix::net::UnixStream, Scope, uuid::Uuid, Change) {
+    let (publisher, requests) = async_channel::unbounded();
+    window.app.workspace_model_tx = publisher;
+    let connection = attach_cached(window, directory);
+    assert!(window.app.shared_views.has_pending_update(window.cached.id));
+    let mut update = None;
+    while let Ok(edit) = requests.try_recv() {
+        if let ModelEdit::ChangeView {
+            scope,
+            operation,
+            change: change @ Change::Update { .. },
+            ..
+        } = edit
+            && matches!(&change, Change::Update { pane, .. } if pane.id == window.cached.id)
+        {
+            update = Some((scope, operation, change));
+        }
+    }
+    let (scope, operation, change) = update.expect("the attachment's edit was published");
+    (connection, scope, operation, change)
+}
+
+/// The registry as it stands once another window's `edit` to the cached pane
+/// landed.
+fn registry_after(
+    window: &Window,
+    edit: impl FnOnce(&mut Pane),
+) -> crate::workspace_model::WorkspaceModel {
+    let mut model = window.app.workspace_model.clone();
+    model.sequence += 1;
+    let view = model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == Scope::Channel(window.hidden))
+        .unwrap();
+    view.revision += 1;
+    edit(
+        view.panes
+            .iter_mut()
+            .find(|pane| pane.id == window.cached.id)
+            .unwrap(),
+    );
+    model
+}
+
+fn surface_proof(window: &Window) -> HostSessionProof {
+    cached_surface(window)
+        .current_attachment()
+        .unwrap()
+        .unwrap()
+}
+
+/// The registry applies the edit carrying the attachment and acknowledges
+/// that exact operation; the record it returns names the attachment.
 #[test]
-fn a_stale_shared_record_waits_for_its_edit_and_is_then_reported() {
+fn an_acknowledged_attachment_edit_qualifies_the_pane() {
     let directory = tempfile::tempdir().unwrap();
     let mut window = reopened_window(false);
     admit(&mut window);
-    let _connection = attach_cached(&mut window, directory.path());
-    assert!(window.app.shared_views.has_pending_update(window.cached.id));
-    window.app.card_state_mut(window.cached.id).unwrap().kind = window.cached.kind.clone();
+    let (_connection, scope, operation, change) =
+        attach_cached_publishing(&mut window, directory.path());
+    // A read from before the edit landed does not take the attachment back.
+    let stale = registry_after(&window, |_| {});
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Read(stale)),
+    );
+    assert_eq!(window.app.startup_pane_check(), Ok(true));
+
+    let mut model = window.app.workspace_model.clone();
+    model.sequence += 1;
+    let view = model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == scope)
+        .unwrap();
+    assert!(view.apply(&change).unwrap());
+    view.revision += 1;
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope,
+                operation: Some(operation),
+                model,
+            }),
+    );
+    assert!(!window.app.shared_views.has_pending_update(window.cached.id));
+    assert_eq!(
+        session(window.app.card_state(window.cached.id).unwrap())
+            .continuity
+            .live_proof(),
+        Some(surface_proof(&window))
+    );
+    drop(window.app.update(Message::VerifyStartupPanes));
+    assert_eq!(window.app.startup_pane_check(), Ok(true));
+}
+
+/// Two windows attached the same pane after the update. The other window's
+/// edit landed first, so the registry refuses this one through
+/// `refuse_conflicting_view_update`. When the record it settles on names the
+/// same attachment the pane qualifies; when it names another service, the
+/// pane waits through its window and is then reported with that reason.
+#[test]
+fn a_refused_attachment_edit_settles_on_the_record_that_won() {
+    for (other, qualifies) in [(None, true), (Some("another-host"), false)] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut window = reopened_window(false);
+        admit(&mut window);
+        let (_connection, scope, operation, change) =
+            attach_cached_publishing(&mut window, directory.path());
+        let mut won = rehosted(&session(&window.cached));
+        if let Some(host) = other {
+            won.continuity = TerminalContinuity::Live {
+                host_session_id: HostSessionId::new(host),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new(host),
+            };
+        }
+        let model = registry_after(&window, |pane| pane.kind = CardKind::Terminal(won.clone()));
+        drop(window.app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::ViewConflicted {
+                scope,
+                operation,
+                change,
+                model,
+                error: "the pane's source changed".into(),
+            },
+        )));
+        assert!(!window.app.shared_views.has_pending_update(window.cached.id));
+        assert_eq!(
+            window.app.card_state(window.cached.id).unwrap().kind,
+            CardKind::Terminal(won)
+        );
+        for _ in 0..2 {
+            drop(window.app.update(Message::VerifyStartupPanes));
+        }
+        if qualifies {
+            assert_eq!(window.app.startup_pane_check(), Ok(true));
+            continue;
+        }
+        assert_eq!(
+            window.app.startup_pane_check(),
+            Ok(false),
+            "a record that may still follow the registry is given its window"
+        );
+        window.app.startup_gate.retries.expire_window();
+        let report = window.app.startup_pane_check().unwrap_err();
+        assert!(
+            report.contains(
+                "this window's record of it names a different terminal service than the one it is attached to"
+            ),
+            "{report}"
+        );
+    }
+}
+
+/// A pane the attach queue keeps holding back is reported with why, once its
+/// window passes, instead of waiting for the gate's overall timeout.
+#[test]
+fn a_held_restored_pane_is_reported_with_its_hold() {
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    edit_registry_pane(&mut window, |pane| pane.pending_terminal_start = true);
+    for _ in 0..2 {
+        drop(window.app.update(Message::VerifyStartupPanes));
+        assert!(!window.app.terminal_start_in_flight(window.cached.id));
+    }
     assert_eq!(window.app.startup_pane_check(), Ok(false));
-    window.app.shared_views.pending.clear();
+    window.app.startup_gate.retries.expire_window();
     let report = window.app.startup_pane_check().unwrap_err();
     assert!(
-        report.contains(
-            "A terminal reported: The terminal attachment no longer matches this saved pane's owner"
+        report.contains("the shared workspace is still starting its terminal"),
+        "{report}"
+    );
+}
+
+/// A view the registry never admits holds every pane in it. Past its window
+/// the gate reports that, rather than waiting for its timeout.
+#[test]
+fn a_view_that_is_never_admitted_is_reported() {
+    let mut window = reopened_window(false);
+    for _ in 0..2 {
+        drop(window.app.update(Message::VerifyStartupPanes));
+    }
+    assert_eq!(window.app.startup_pane_check(), Ok(false));
+    window.app.startup_gate.retries.expire_limit();
+    window.app.startup_gate.expire_views_unready();
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(
+        report.contains("the shared workspace has not answered this window"),
+        "{report}"
+    );
+}
+
+/// Whatever is still unsettled when the gate's budget runs out is named, with
+/// why, rather than reported as conversations still reconnecting.
+#[test]
+fn the_budget_report_names_each_waiting_pane_and_why() {
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    drop(window.app.update(Message::VerifyStartupPanes));
+    assert!(window.app.terminal_start_in_flight(window.cached.id));
+    let report = window.app.startup_timeout_report();
+    assert!(
+        report.starts_with(
+            "recovery-incomplete: 1 pane did not reconnect: \u{201c}Terminal\u{201d}."
         ),
         "{report}"
     );
+    assert!(
+        report.contains("Details: it was still reconnecting."),
+        "{report}"
+    );
+
+    drop(window.app.update(Message::RestoredAgentAttached {
+        card: window.cached.id,
+        terminal: session(&window.cached).id,
+        result: Err(REFUSAL.to_owned()),
+    }));
+    let report = window.app.startup_timeout_report();
+    assert!(report.contains(REFUSAL), "the latest refusal: {report}");
 }
