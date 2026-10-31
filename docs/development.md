@@ -164,6 +164,54 @@ How the runner works:
 The browserless UI keeps saved browser descriptors and opens their URLs through
 the system browser instead of compiling Servo.
 
+### Required build isolation (opt-in)
+
+The source runner supports an explicit Linux-only mode for isolating its owned
+Cargo children. Supply an **already qualified, stable** `cagentsd` helper built
+with the required build-scope entry and the SHA256 of that exact executable:
+
+```sh
+scripts/run-development --browserless \
+  --build-scope-helper /absolute/stable/cagentsd \
+  --build-scope-sha256 EXPECTED_64_LOWERCASE_HEX_DIGITS
+
+# The same paired options precede --review-alerts / -- on the editor runner.
+scripts/run-ceditor-development \
+  --build-scope-helper /absolute/stable/cagentsd \
+  --build-scope-sha256 EXPECTED_64_LOWERCASE_HEX_DIGITS -- /path/to/project
+```
+
+Both options are required together. The runner never discovers an installed
+helper, builds one to bootstrap itself, or falls back to unisolated Cargo when
+this mode was requested. Hot reload is unsupported in this mode and refuses.
+The artifact selector verifies a regular executable helper and its SHA256
+before **each** build; malformed input, a changed helper, failed manager proof,
+or failed enrollment stops the workflow. Hash checking is a path-based
+preflight, **not atomic every-exec attestation**. The caller must exclude all
+other writers or replacements of the helper and its path ancestors throughout
+the workflow, and retain its independent source/tool qualification. Do not use
+a helper inside an output location that these builds can overwrite.
+
+Only the original Cargo child enrolls, before same-PID exec. The outer runner,
+artifact reader, evidence owner and later UI/CLI launches remain outside that
+build scope. Arguments, working directory, inherited environment, streams,
+Cargo targets/jobs and `dev-runtime` profile retain the maintained workflow's
+meaning. The three CLI, host and UI builds stay separate and use Cargo JSON to
+select their exact executable paths. All three must succeed in one selected
+directory before `--fresh-daemon` stops the old daemon; the selected CLI and UI
+then run directly, without a later `cargo run` that could rebuild outside the
+scope. The ceditor selector retains its exact selected-path output and original
+build status behavior; the editor runner forwards these options to each of its
+existing build lanes and launches from the original calling directory.
+
+This opt-in source mode does not qualify a helper ELF, its first-build bootstrap,
+the manager/kernel path, or native behavior merely by existing. Those require
+separate admitted validation. The fake-command regression source in
+`tests/required-build-scope.py` checks workflow routing, not real scope membership.
+No memory cap or immunity from an ancestor's OOM policy is implied, and no
+daemon restart/recovery, provider cleanup or signal authority is added. Existing
+ordinary mode and optional provider-scope behavior remain separate.
+
 ### Experimental hot reload
 
 The opt-in lane uses the same application modules and startup entry in a separate

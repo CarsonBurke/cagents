@@ -10,6 +10,11 @@ debug=false
 fresh_daemon=false
 hot=false
 log_file=
+build_scope=false
+build_scope_helper=
+build_scope_sha256=
+build_scope_helper_seen=false
+build_scope_sha256_seen=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --browserless) browserless=true ;;
@@ -17,6 +22,27 @@ while [ "$#" -gt 0 ]; do
         --fresh-daemon) fresh_daemon=true ;;
         --hot) hot=true; browserless=true ;;
         --hot-integrated) hot=true; browserless=false ;;
+        --build-scope-helper|--build-scope-sha256)
+            option=$1
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                printf '%s\n' "$option requires a value" >&2
+                exit 2
+            fi
+            case $option in
+                --build-scope-helper)
+                    [ "$build_scope_helper_seen" = false ] || { printf '%s\n' "$option cannot be repeated" >&2; exit 2; }
+                    build_scope_helper_seen=true
+                    build_scope_helper=$2
+                    ;;
+                --build-scope-sha256)
+                    [ "$build_scope_sha256_seen" = false ] || { printf '%s\n' "$option cannot be repeated" >&2; exit 2; }
+                    build_scope_sha256_seen=true
+                    build_scope_sha256=$2
+                    ;;
+            esac
+            build_scope=true
+            shift
+            ;;
         --log-file)
             if [ "$#" -lt 2 ] || [ -z "$2" ]; then
                 printf '%s\n' "--log-file requires a path" >&2
@@ -40,6 +66,8 @@ Options:
   --hot            Experimental browserless Linux hot reload (pinned cargo-hot/bwrap)
   --hot-integrated  Explicit embedded-browser hot reload
   --log-file PATH  Write UI tracing output to PATH (relative to caller)
+  --build-scope-helper PATH  Require build isolation using a qualified stable helper
+  --build-scope-sha256 HASH  Expected SHA256 of that helper (both options required)
   --help           Show this help
 
 Environment:
@@ -58,6 +86,17 @@ USAGE
     esac
     shift
 done
+
+if [ "$build_scope" = true ]; then
+    if [ "$build_scope_helper_seen" = false ] || [ "$build_scope_sha256_seen" = false ]; then
+        printf '%s\n' 'Build isolation requires both helper path and SHA256' >&2
+        exit 2
+    fi
+    if [ "$hot" = true ]; then
+        printf '%s\n' 'Required build isolation does not support hot reload' >&2
+        exit 2
+    fi
+fi
 
 if [ "$hot" = true ]; then
     "$root/scripts/hot-development" --check
@@ -175,6 +214,10 @@ if [ "$hot" = true ]; then
 fi
 
 run_cli() {
+    if [ "$build_scope" = true ]; then
+        "$cli_product" "$@"
+        return
+    fi
     if [ "$browserless" = true ]; then
         cargo run --quiet --locked --profile dev-runtime --no-default-features \
             --features development --bin cagents -- "$@"
@@ -187,7 +230,35 @@ run_cli() {
 # Build each product boundary separately. Cargo features are package-wide, so a
 # single --bins invocation would reunify the UI and host graphs and make the UI
 # compile Ghostty while making the daemon compile libcosmic.
-if [ "$browserless" = true ]; then
+if [ "$build_scope" = true ]; then
+    command -v python3 >/dev/null 2>&1 || {
+        printf '%s\n' 'required command not found: python3 (reads Cargo executable artifacts)' >&2
+        exit 1
+    }
+    build_product() {
+        python3 "$root/scripts/build-ceditor-product" \
+            --build-scope-helper "$build_scope_helper" --build-scope-sha256 "$build_scope_sha256" "$@"
+    }
+    if [ "$browserless" = true ]; then
+        cli_product=$(build_product cagents --locked --profile dev-runtime --no-default-features \
+            --features development --bin cagents)
+        daemon_product=$(build_product cagentsd --locked --profile dev-runtime --no-default-features \
+            --features development,host --bin cagentsd)
+        ui_product=$(build_product cagents-ui --locked --profile dev-runtime --no-default-features \
+            --features development,ui --bin cagents-ui)
+    else
+        cli_product=$(build_product cagents --locked --profile dev-runtime \
+            --features development --bin cagents)
+        daemon_product=$(build_product cagentsd --locked --profile dev-runtime \
+            --features development,host --bin cagentsd)
+        ui_product=$(build_product cagents-ui --locked --profile dev-runtime \
+            --features development,integrated-browser --bin cagents-ui)
+    fi
+    if [ "${cli_product%/*}" != "${daemon_product%/*}" ] || [ "${cli_product%/*}" != "${ui_product%/*}" ]; then
+        printf '%s\n' 'Matched development products must share one Cargo-selected directory' >&2
+        exit 1
+    fi
+elif [ "$browserless" = true ]; then
     cargo build --locked --profile dev-runtime --no-default-features \
         --features development --bin cagents
     cargo build --locked --profile dev-runtime --no-default-features \
@@ -221,6 +292,11 @@ if [ "$fresh_daemon" = true ]; then
 fi
 
 run_ui() {
+    if [ "$build_scope" = true ]; then
+        # The outer runner did not enroll: only each original Cargo child did.
+        # Launch the selected product here without another potentially rebuilding Cargo.
+        exec "$ui_product" "$@"
+    fi
     if [ "$browserless" = true ]; then
         exec cargo run --quiet --locked --profile dev-runtime --no-default-features \
             --features development,ui --bin cagents-ui -- "$@"

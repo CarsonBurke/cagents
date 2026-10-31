@@ -4,23 +4,77 @@ caller_cwd=$PWD
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 alerts=0
+build_scope_helper=
+build_scope_sha256=
+build_scope_helper_seen=false
+build_scope_sha256_seen=false
+editor_arguments=false
+# Wrapper options precede --review-alerts or --; editor arguments stay opaque.
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --build-scope-helper|--build-scope-sha256)
+            option=$1
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                printf '%s\n' "$option requires a value" >&2
+                exit 2
+            fi
+            case $option in
+                --build-scope-helper)
+                    [ "$build_scope_helper_seen" = false ] || { printf '%s\n' "$option cannot be repeated" >&2; exit 2; }
+                    build_scope_helper_seen=true
+                    build_scope_helper=$2
+                    ;;
+                --build-scope-sha256)
+                    [ "$build_scope_sha256_seen" = false ] || { printf '%s\n' "$option cannot be repeated" >&2; exit 2; }
+                    build_scope_sha256_seen=true
+                    build_scope_sha256=$2
+                    ;;
+            esac
+            shift 2
+            ;;
+        --build-scope-*) printf '%s\n' 'Unknown build scope option' >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+if [ "$build_scope_helper_seen" != "$build_scope_sha256_seen" ]; then
+    printf '%s\n' 'Build isolation requires both helper path and SHA256' >&2
+    exit 2
+fi
 case "${1:-}" in
     --help)
-        printf '%s\n' 'Usage: scripts/run-ceditor-development [--review-alerts] [--] [FILE_OR_DIRECTORY...]' '' 'Builds only ceditor with dev-runtime and an isolated development identity.' 'Requires Python 3 to read Cargo executable artifacts.' 'Use --review-alerts to build matched CLI/daemon companions in separate lanes.' 'Without that flag, ordinary editing requires no terminal host, Zig, or Servo.' 'Pass -- --help for ceditor CLI help; -- --settings-path prints its settings path.'
+        printf '%s\n' 'Usage: scripts/run-ceditor-development [--build-scope-helper PATH --build-scope-sha256 HASH] [--review-alerts] [--] [FILE_OR_DIRECTORY...]' '' 'Builds only ceditor with dev-runtime and an isolated development identity.' 'Requires Python 3 to read Cargo executable artifacts.' 'Use --review-alerts to build matched CLI/daemon companions in separate lanes.' 'Without that flag, ordinary editing requires no terminal host, Zig, or Servo.' 'The paired build-scope options require an externally qualified stable helper.' 'Pass -- --help for ceditor CLI help; -- --settings-path prints its settings path.'
         exit 0
         ;;
-    --review-alerts) alerts=1; shift; [ "${1:-}" != -- ] || shift ;;
-    --) shift ;;
+    --review-alerts) alerts=1; shift; if [ "${1:-}" = -- ]; then shift; editor_arguments=true; fi ;;
+    --) shift; editor_arguments=true ;;
 esac
+if [ "$editor_arguments" = false ]; then
+    for argument do
+        case $argument in
+            --build-scope-*)
+                printf '%s\n' 'Build scope options must precede --review-alerts or --' >&2
+                exit 2
+                ;;
+        esac
+    done
+fi
 command -v python3 >/dev/null 2>&1 || {
     printf '%s\n' 'required command not found: python3 (reads Cargo executable artifacts)' >&2
     exit 1
 }
+build_product() {
+    if [ "$build_scope_helper_seen" = true ]; then
+        python3 "$root/scripts/build-ceditor-product" \
+            --build-scope-helper "$build_scope_helper" --build-scope-sha256 "$build_scope_sha256" "$@"
+    else
+        python3 "$root/scripts/build-ceditor-product" "$@"
+    fi
+}
 if [ "$alerts" = 1 ]; then
-    python3 "$root/scripts/build-ceditor-product" cagents --locked --profile dev-runtime --no-default-features --features development --bin cagents >/dev/null
-    python3 "$root/scripts/build-ceditor-product" cagentsd --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd >/dev/null
+    build_product cagents --locked --profile dev-runtime --no-default-features --features development --bin cagents >/dev/null
+    build_product cagentsd --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd >/dev/null
 fi
-editor=$(python3 "$root/scripts/build-ceditor-product" ceditor --locked --profile dev-runtime --package ceditor --features development)
+editor=$(build_product ceditor --locked --profile dev-runtime --package ceditor --features development)
 # Cargo's artifact path honors configured targets and directories, including
 # build.target without CARGO_BUILD_TARGET. Never guess a path to an older build.
 # Companions are started lazily only when a review alert is observed.

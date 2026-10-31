@@ -1,18 +1,81 @@
 #!/usr/bin/env python3
 """Build one ceditor product lane and print its Cargo-reported executable path."""
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
+import shutil
+import stat
 import subprocess
 import sys
 
 
+def build_scope_options(arguments):
+    """Consume only the explicit wrapper options before the product name."""
+    values = {}
+    flags = ("--build-scope-helper", "--build-scope-sha256")
+    while arguments and arguments[0] in flags:
+        flag = arguments[0]
+        if flag in values or len(arguments) < 2 or not arguments[1]:
+            raise ValueError(f"{flag} requires one value and cannot be repeated")
+        values[flag] = arguments[1]
+        arguments = arguments[2:]
+    if arguments and arguments[0].startswith("--build-scope-"):
+        raise ValueError("Unknown build scope option")
+    if any(argument.startswith("--build-scope-") for argument in arguments[1:]):
+        raise ValueError("Build scope options must precede the product name")
+    if values and len(values) != 2:
+        raise ValueError("Build isolation requires both helper path and SHA256")
+    return values, arguments
+
+
+def required_build_command(values, arguments):
+    """Preflight an externally qualified stable helper before this build."""
+    if sys.platform != "linux":
+        raise ValueError("Required build isolation is available only on Linux")
+    helper = values["--build-scope-helper"]
+    expected = values["--build-scope-sha256"]
+    if not os.path.isabs(helper):
+        raise ValueError("Build scope helper must be an absolute stable path")
+    if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise ValueError("Build scope SHA256 must be 64 lowercase hexadecimal characters")
+    # A hash preflight cannot make a path-based exec atomic. The caller must
+    # exclude all other writers/replacers of this helper and its ancestors.
+    with os.fdopen(os.open(helper, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as file:
+        before = os.fstat(file.fileno())
+        if not stat.S_ISREG(before.st_mode) or not os.access(helper, os.X_OK):
+            raise ValueError("Build scope helper must be a regular executable")
+        digest = hashlib.sha256()
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+        after = os.fstat(file.fileno())
+        current = os.stat(helper, follow_symlinks=False)
+        identity = lambda info: (
+            info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns,
+        )
+        if identity(before) != identity(after) or identity(after) != identity(current):
+            raise ValueError("Build scope helper changed during its hash preflight")
+        if digest.hexdigest() != expected:
+            raise ValueError("Build scope helper SHA256 does not match")
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        raise ValueError("Required command not found: cargo")
+    # Keep the selected PATH executable named cargo, including a rustup proxy;
+    # resolving its symlink could change argv[0]-based proxy dispatch.
+    return [helper, "--internal-build-scope-exec", "--", os.path.abspath(cargo), *arguments]
+
+
 def main():
-    if len(sys.argv) < 3:
-        sys.exit("usage: build-ceditor-product NAME CARGO_BUILD_ARGUMENTS...")
-    name = sys.argv[1]
+    values, arguments = build_scope_options(sys.argv[1:])
+    if len(arguments) < 2:
+        sys.exit("usage: build-ceditor-product [--build-scope-helper PATH --build-scope-sha256 SHA256] NAME CARGO_BUILD_ARGUMENTS...")
+    name = arguments[0]
     products = []
-    command = ["cargo", "build", *sys.argv[2:], "--message-format=json-render-diagnostics"]
+    command = ["cargo", "build", *arguments[1:], "--message-format=json-render-diagnostics"]
+    if values:
+        command = required_build_command(values, command[1:])
     with subprocess.Popen(command, stdout=subprocess.PIPE, encoding="utf-8") as child:
         for line in child.stdout:
             try:
@@ -37,6 +100,8 @@ def main():
     product = products[0]
     if not isinstance(product, str) or not os.path.isabs(product):
         sys.exit(f"Cargo reported an invalid executable path for {name}")
+    if values and ("\n" in product or "\r" in product):
+        sys.exit(f"Cargo executable for {name} cannot use the isolated mode's single-line path interface")
     if not Path(product).is_file() or not os.access(product, os.X_OK):
         sys.exit(f"Cargo executable for {name} is missing or not runnable: {product}")
     print(product)
@@ -46,5 +111,5 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except OSError as error:
+    except (OSError, ValueError) as error:
         sys.exit(f"Could not build ceditor product: {error}")

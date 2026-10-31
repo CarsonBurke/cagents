@@ -70,6 +70,9 @@ jobs:
       - name: Check Zig discovery contracts
         run: python3 tests/run-development-zig.py -v
 
+      - name: Check required build isolation workflow contracts
+        run: python3 tests/required-build-scope.py -v
+
       - name: Check validation checkout and process custody contracts
         run: |
           python3 -I -B - <<'PY'
