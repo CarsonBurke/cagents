@@ -13182,7 +13182,9 @@ impl Cagents {
             return Some("Wait for the device operation to finish before closing the window.");
         }
         if self.chat_ui.return_cleanup_unresolved() {
-            return Some("Finish closing the original conversation in Application notices before closing this window.");
+            return Some(
+                "Finish closing the original conversation in Application notices before closing this window.",
+            );
         }
         if self.chat_ui.transition_pending() {
             return Some(

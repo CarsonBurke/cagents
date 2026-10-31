@@ -900,7 +900,6 @@ impl Cagents {
         Ok(operation)
     }
 
-
     pub(super) fn pane_is_quarantined(&self, card: CardId) -> bool {
         self.shared_views.quarantined.contains(&card)
             || self.durable.quarantined_panes.contains_key(&card)
