@@ -77,6 +77,9 @@ pub(super) struct Context {
     git_identity: Identity,
     name: &'static str,
     expected_head: Option<String>,
+    manifest_sha256: String,
+    source_sha256: [String; 3],
+    appearance: std::sync::Mutex<AppearanceObserver>,
 }
 
 static CONTEXT: OnceLock<Result<Option<Context>, String>> = OnceLock::new();
@@ -224,6 +227,21 @@ fn read_context() -> Result<Option<Context>, String> {
         git_identity,
         name: key,
         expected_head: selected.head_oid.clone(),
+        manifest_sha256: format!("{:x}", Sha256::digest(&bytes)),
+        // Literal source bytes included by this compilation, not a hardcoded
+        // claimed commit/hash or whole-product/matched-executable certificate.
+        source_sha256: [
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!("native_history_fixture.rs"))
+            ),
+            format!("{:x}", Sha256::digest(include_bytes!("../app.rs"))),
+            format!(
+                "{:x}",
+                Sha256::digest(include_bytes!("../bin/cagents-ui.rs"))
+            ),
+        ],
+        appearance: std::sync::Mutex::new(AppearanceObserver::new()),
     };
     result.recheck()?;
     Ok(Some(result))
@@ -344,6 +362,20 @@ impl Context {
         if app.session.is_some() || !app.durable.cards.is_empty() || !app.cards.is_empty() {
             return Err("History fixture requires its empty sessionless startup".into());
         }
+        let window = app
+            .core
+            .main_window_id()
+            .ok_or("History fixture has no main window target")?;
+        let mut observer = self
+            .appearance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if observer.target.is_some() {
+            return Err("History appearance observer already installed".into());
+        }
+        observer.target = Some(window);
+        // Opened and native_scale remain unknown until original window events.
+        drop(observer);
         app.active_workspace = Some(self.repository.clone());
         app.context_tab = ContextTab::Changes;
         app.context_inspector_open = true;
@@ -467,17 +499,22 @@ pub(super) fn after_update(app: &mut Cagents, task: Task<Message>) -> Task<Messa
 }
 
 pub(super) fn subscription(app: &Cagents) -> Subscription<Message> {
-    let native = event::listen_with(|event, _, event_window| match event {
-        iced::Event::Window(window::Event::Rescaled(scale)) => {
-            Some(Message::WindowScaleFactorChanged(scale))
+    let native = event::listen_with(|event, _, event_window| {
+        if !observe_native_window(event_window, &event) {
+            return None;
         }
-        iced::Event::Window(window::Event::CloseRequested) => {
-            Some(Message::WindowCloseRequested(event_window))
+        match event {
+            iced::Event::Window(window::Event::Rescaled(scale)) => {
+                Some(Message::WindowScaleFactorChanged(scale))
+            }
+            iced::Event::Window(window::Event::CloseRequested) => {
+                Some(Message::WindowCloseRequested(event_window))
+            }
+            iced::Event::Window(window::Event::Closed) => Some(Message::WindowClosed(event_window)),
+            iced::Event::Window(event) => window_geometry_message(&event),
+            event @ iced::Event::PlatformSpecific(_) => window_edge_message(&event, event_window),
+            _ => None,
         }
-        iced::Event::Window(window::Event::Closed) => Some(Message::WindowClosed(event_window)),
-        iced::Event::Window(event) => window_geometry_message(&event),
-        event @ iced::Event::PlatformSpecific(_) => window_edge_message(&event, event_window),
-        _ => None,
     });
     let frames = app
         .core
@@ -488,4 +525,240 @@ pub(super) fn subscription(app: &Cagents) -> Subscription<Message> {
     // Widget callbacks are delivered by iced itself. There is deliberately no
     // global KeyEvent/RefreshUi routing, watcher, tick, account or daemon stream.
     Subscription::batch([native, frames])
+}
+
+// This observer records applied shell state. It is not a compositor-present,
+// renderer, authority, successful-log-write or matched-binary acknowledgement.
+const APPEARANCE_RECORD_LIMIT: u64 = 256;
+const APPEARANCE_RECORD_BYTES: usize = 4096;
+
+struct AppearanceObserver {
+    instance: uuid::Uuid,
+    target: Option<window::Id>,
+    opened: Option<window::Id>,
+    native_scale: Option<f32>,
+    native_scale_generation: u64,
+    generation: u64,
+    last: Option<AppearanceKey>,
+    stopped: bool,
+}
+
+impl AppearanceObserver {
+    fn new() -> Self {
+        Self {
+            instance: uuid::Uuid::new_v4(),
+            target: None,
+            opened: None,
+            native_scale: None,
+            native_scale_generation: 0,
+            generation: 0,
+            last: None,
+            stopped: false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+struct HistoryObservation {
+    source_state: &'static str,
+    head_oid: Option<String>,
+    rows: usize,
+    next_page: u32,
+    loading: bool,
+    selected_commit: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AppearanceKey {
+    window: window::Id,
+    theme_kind: &'static str,
+    dark: bool,
+    high_contrast: bool,
+    exact_dark_class: bool,
+    ui_scale_bits: Option<u32>,
+    native_scale_bits: Option<u32>,
+    workspace_generation: u64,
+    source_generation: u64,
+    inspector_open: bool,
+    history: Option<HistoryObservation>,
+}
+
+/// Observe the original iced event before the existing fixture mapping drops
+/// its window ID. An allocated Core ID is only a target, never opened evidence.
+fn observe_native_window(event_window: window::Id, event: &iced::Event) -> bool {
+    let Some(context) = context().expect("validated History fixture context") else {
+        return false;
+    };
+    let mut observer = context
+        .appearance
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if observer.target != Some(event_window) {
+        return false;
+    }
+    match event {
+        iced::Event::Window(window::Event::Opened { .. }) => {
+            observer.opened = Some(event_window);
+        }
+        iced::Event::Window(window::Event::Rescaled(scale))
+            if scale.is_finite() && *scale > 0.0 =>
+        {
+            if observer.native_scale.map(f32::to_bits) != Some(scale.to_bits()) {
+                observer.native_scale = Some(*scale);
+                observer.native_scale_generation =
+                    observer.native_scale_generation.saturating_add(1);
+            }
+        }
+        iced::Event::Window(window::Event::Closed) => {
+            observer.opened = None;
+            observer.native_scale = None;
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Read the same applied state used by Shell::theme/scale_factor, from a real
+/// main-window view. No configured preference or initialized scale is promoted
+/// to a native DPI observation. No timer, synthetic Frame or capture selector.
+pub(super) fn observe_view(app: &Cagents) {
+    let Some(context) = context().expect("validated History fixture context") else {
+        return;
+    };
+    let Some(window) = app.core.main_window_id() else {
+        return;
+    };
+    let theme = cosmic::theme::active();
+    let theme_kind = match &theme.theme_type {
+        cosmic::theme::ThemeType::Dark => "dark",
+        cosmic::theme::ThemeType::Light => "light",
+        cosmic::theme::ThemeType::HighContrastDark => "high_contrast_dark",
+        cosmic::theme::ThemeType::HighContrastLight => "high_contrast_light",
+        cosmic::theme::ThemeType::Custom(_) => "custom",
+        cosmic::theme::ThemeType::System { .. } => "system",
+    };
+    // Shell::scale_factor returns f64::from(Core::scale_factor()). This is
+    // applied application scaling; the separately observed OS factor may be None.
+    let ui_scale = app.core.scale_factor();
+    let ui_scale_bits = (ui_scale.is_finite() && ui_scale > 0.0).then(|| ui_scale.to_bits());
+    let history = app
+        .sidebar_model
+        .source_control
+        .as_ref()
+        .filter(|source| source.key == context.key())
+        .map(|source| HistoryObservation {
+            source_state: match &source.data_state {
+                SidebarDataState::Loading => "loading",
+                SidebarDataState::Ready => "ready",
+                SidebarDataState::Error(_) => "error",
+            },
+            head_oid: source.head_oid.as_deref().map(str::to_owned),
+            rows: source.history.len(),
+            next_page: source.next_history_page,
+            loading: source.history_loading,
+            selected_commit: source
+                .commit_changes
+                .as_ref()
+                .map(|changes| changes.commit.oid.as_str().to_owned()),
+        });
+    let window_id = format!("{window:?}");
+    let mut observer = context
+        .appearance
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if observer.stopped || observer.target != Some(window) || observer.opened != Some(window) {
+        return;
+    }
+    if crate::VERSION.len() > 256
+        || window_id.len() > 64
+        || history.as_ref().is_some_and(|history| {
+            history.head_oid.as_ref().is_some_and(|oid| oid.len() > 64)
+                || history
+                    .selected_commit
+                    .as_ref()
+                    .is_some_and(|oid| oid.len() > 64)
+        })
+    {
+        observer.stopped = true;
+        drop(observer);
+        tracing::warn!(target: "cagents::native_history", "appearance observer stopped: unbounded field");
+        return;
+    }
+    let key = AppearanceKey {
+        window,
+        theme_kind,
+        dark: theme.theme_type.is_dark(),
+        high_contrast: theme.theme_type.is_high_contrast(),
+        exact_dark_class: matches!(theme.theme_type, cosmic::theme::ThemeType::Dark),
+        ui_scale_bits,
+        native_scale_bits: observer.native_scale.map(f32::to_bits),
+        workspace_generation: app.durable.generation,
+        source_generation: app.refresh_ui.source_generation,
+        inspector_open: app.context_inspector_open,
+        history,
+    };
+    if observer.last.as_ref() == Some(&key) {
+        return;
+    }
+    if observer.generation >= APPEARANCE_RECORD_LIMIT {
+        observer.stopped = true;
+        drop(observer);
+        tracing::warn!(target: "cagents::native_history", "appearance observer stopped: record limit");
+        return;
+    }
+    observer.generation += 1;
+    let record = serde_json::json!({
+        "record_version": 1,
+        "record": "history-native-appearance",
+        "observer_instance": observer.instance,
+        "observation_generation": observer.generation,
+        "pid": std::process::id(),
+        "window_id_kind": "iced_main_window_debug",
+        "window_id": window_id,
+        "window_open_source": "original_window_opened_event",
+        "product_version": crate::VERSION,
+        "compiled_source_sha256": {
+            "src/app/native_history_fixture.rs": &context.source_sha256[0],
+            "src/app.rs": &context.source_sha256[1],
+            "src/bin/cagents-ui.rs": &context.source_sha256[2],
+        },
+        "data": { "manifest_sha256": &context.manifest_sha256, "dataset": context.name },
+        "theme_kind": key.theme_kind,
+        "theme_is_dark": key.dark,
+        "theme_is_high_contrast": key.high_contrast,
+        "theme_is_exact_dark_class": key.exact_dark_class,
+        "applied_ui_scale": key.ui_scale_bits.map(|bits| f64::from(f32::from_bits(bits))),
+        "applied_ui_scale_bits": key.ui_scale_bits,
+        "applied_ui_scale_source": "Core::scale_factor_as_returned_by_Shell",
+        "native_scale": key.native_scale_bits.map(|bits| f64::from(f32::from_bits(bits))),
+        "native_scale_bits": key.native_scale_bits,
+        "native_scale_source": if key.native_scale_bits.is_some() { "rescaled_event" } else { "unknown" },
+        "native_scale_generation": observer.native_scale_generation,
+        "state": {
+            "workspace_generation": key.workspace_generation,
+            "source_generation": key.source_generation,
+            "inspector_open": key.inspector_open,
+            "history": &key.history,
+        },
+        "observation_boundary": "view_state_readback_not_compositor_present",
+    });
+    let serialized = serde_json::to_string(&record);
+    let Ok(serialized) = serialized else {
+        observer.stopped = true;
+        drop(observer);
+        tracing::warn!(target: "cagents::native_history", "appearance observer stopped: serialization");
+        return;
+    };
+    if serialized.len() > APPEARANCE_RECORD_BYTES {
+        observer.stopped = true;
+        drop(observer);
+        tracing::warn!(target: "cagents::native_history", "appearance observer stopped: record byte limit");
+        return;
+    }
+    observer.last = Some(key);
+    drop(observer);
+    // Actual recovered original UI log bytes are still required: tracing may
+    // be filtered or its sink unavailable. This call does not certify delivery.
+    tracing::info!(target: "cagents::native_history", appearance_json = %serialized,
+        "history native appearance state");
 }

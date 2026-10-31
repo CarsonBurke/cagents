@@ -19217,6 +19217,10 @@ impl Application for Cagents {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        #[cfg(feature = "development")]
+        if Self::native_history_fixture_active() {
+            native_history_fixture::observe_view(self);
+        }
         let content_width = self.content_width();
         let sidebar_mode = self.projects_sidebar_mode();
         let sidebar = sidebar::view_cached(
