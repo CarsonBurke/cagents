@@ -68,7 +68,25 @@
   "limits": "Static AST/hash/JSON/source Git and line reconstruction only. New task functions are unexecuted. Original exact package/test/bin mapping is source-derived; no embedded/every-exec attestation, old LIB3 pass transfer or runtime admission.",
   "original_absolute_workload_cap": 2400,
   "original_park": {
-    "all57_original_member_bytes_unchanged": true,
+    "actual_frozen_byte_exact_member_count": 56,
+    "actual_frozen_member_mismatches": [
+      {
+        "current_record": {
+          "bytes": 863,
+          "path": "invocation-template.json",
+          "sha256": "2dd44ddf0ff27d17016cee96ace4410183d13b30bb8c01d13b92ed78185b38fb"
+        },
+        "park_record": {
+          "bytes": 856,
+          "path": "invocation-template.json",
+          "sha256": "0f71f96ee17f735c6a02a9d5a0c2bb3ba2be691b59c1518257807038c7873d2d"
+        }
+      }
+    ],
+    "actual_frozen_original_member_count": 57,
+    "all57_original_member_bytes_unchanged": false,
+    "old_template_raw_bytes_available": false,
+    "old_template_semantic_delta": "UNKNOWN_NOT_RECONSTRUCTED",
     "path": "/var/tmp/coord16-linear918-integration1-priority-park-xyjjpnty/wip.json",
     "sha256": "c985958307b16a4bfb7ee7bc61715d16f40734766e64692d154b793017752166"
   },
@@ -83,6 +101,34 @@
   "product_head": "918920655d841600e1a44b66057a634940e0e132",
   "product_parent": "d0f27b0131ea018101fed58532e3c1bb0305c092",
   "product_tree": "ef0cbda8169d35f1d63920797441995c4bf220ab",
+  "provenance_correction": {
+    "actual_frozen_conservation": "56 of57 parked member bytes identical; all57 original paths remain. Current invocation-template differs; six sealing files were added.",
+    "current_template_bytes_hash": {
+      "bytes": 863,
+      "path": "invocation-template.json",
+      "sha256": "2dd44ddf0ff27d17016cee96ace4410183d13b30bb8c01d13b92ed78185b38fb"
+    },
+    "exact_semantic_or_serialization_delta": "UNKNOWN; no guessed reconstruction or field/format-only claim.",
+    "execution_authorized": false,
+    "grant": null,
+    "independent_delta_review": null,
+    "kind": "METADATA_ONLY_CORRECTION_OF_FALSE_ALL57_FROZEN_BYTE_PRESERVATION_CLAIM",
+    "negative_review": {
+      "archive_path": "/var/tmp/coord16-linear918-integration1-provenance-author-z5ngatgc/original-negative-review.json",
+      "original_path": "/var/tmp/coord16-linear918-integration1-conservation-final-lyrt9imr/review.json",
+      "sha256": "9beea35e783d95cbf3059423aeee8faaa900bc3b059b1f21114dc3f19b880030"
+    },
+    "old_template_raw_bytes_available": false,
+    "park_record_only_old_template_bytes_hash": {
+      "bytes": 856,
+      "path": "invocation-template.json",
+      "sha256": "0f71f96ee17f735c6a02a9d5a0c2bb3ba2be691b59c1518257807038c7873d2d"
+    },
+    "phase_distinction": "Original ac314f before-mutation check verified57 exact at resume. It does not prove the later45c frozen set. Original e88697/freeze7e2d/handoff3725/sourcecons8d02 wrong final57 claims remain immutable history.",
+    "runtime": null,
+    "source_parent_head": "45c4c51eb37e73ad43bff2fd1c6ede32d7f02745",
+    "unchanged_executable_and_policy_scope": "Runnerac80/planff147/sourcebinding0c53/current template2dd4 and every other packet/product byte remain exact45c. No algorithm, CargoJSON reader, fixture, parser, environment, authority, custody, phase or runtime change."
+  },
   "queue": null,
   "review": null,
   "runner_sha256": "ac80b9e7ea0495c43ab56c1806fdedc37d8880d1327365eaa5802181213014d2",
