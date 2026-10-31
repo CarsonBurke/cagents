@@ -563,6 +563,14 @@ pub(crate) fn is_cached_inline_image(path: &std::path::Path) -> bool {
             .is_some_and(|id| uuid::Uuid::parse_str(&id).is_ok())
 }
 
+/// A terminal issued by one native return, with authority to clean up only
+/// that issued worker. This transient receipt is never a saved terminal ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReturnedTerminal {
+    pub session: crate::model::TerminalSession,
+    pub cleanup_receipt: uuid::Uuid,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: crate::model::TerminalId,

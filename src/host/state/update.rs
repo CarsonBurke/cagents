@@ -170,6 +170,16 @@ impl HostState {
                 .blockers
                 .push("Finish saving the pending return to terminal.".into());
         }
+        if self
+            .issued_terminal_returns
+            .values()
+            .any(|receipt| receipt.blocks_upgrade(self))
+        {
+            impact.blockers.push(
+                "Finish the returned terminal's unconfirmed original cleanup before upgrading."
+                    .into(),
+            );
+        }
         for (&id, record) in &self.terminals {
             if record.handle.is_completed() || self.chats.contains_key(&id) {
                 continue;

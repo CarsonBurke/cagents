@@ -330,6 +330,10 @@ pub(crate) struct HostState {
     pub(super) native_chat_capacity: usize,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
+    pub(super) issued_terminal_returns:
+        BTreeMap<uuid::Uuid, super::chat::terminal_return_cleanup::Receipt>,
+    pub(super) terminal_return_reservations: BTreeSet<uuid::Uuid>,
+    pub(super) acknowledged_terminal_returns: VecDeque<(uuid::Uuid, TerminalId, HostSessionProof)>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
@@ -455,6 +459,9 @@ impl HostState {
             native_chat_capacity: crate::native_chat_capacity::DEFAULT_LIMIT as usize,
             chats: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
+            issued_terminal_returns: BTreeMap::new(),
+            terminal_return_reservations: BTreeSet::new(),
+            acknowledged_terminal_returns: VecDeque::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             native_closing: BTreeMap::new(),
@@ -1348,6 +1355,10 @@ impl HostState {
                 .is_some_and(|record| !record.handle.is_completed())
             || self.chat_spawning.contains_key(id)
             || self.chat_handoffs.contains_key(id)
+            || self
+                .issued_terminal_returns
+                .values()
+                .any(|receipt| receipt.pending() && receipt.terminal_id() == *id)
     }
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {
@@ -1685,6 +1696,8 @@ impl HostState {
             || !self.execution_startups.is_empty()
             || !self.chat_bindings.is_empty()
             || !self.chat_handoffs.is_empty()
+            || !self.terminal_return_reservations.is_empty()
+            || self.issued_terminal_returns.values().any(|receipt| receipt.pending())
             || !self.native_closing.is_empty()
             || !self.native_adoption_failures.is_empty()
         {
@@ -2277,6 +2290,15 @@ fn prepare_upgrade_with_carry_policy(
                 terminal = %receipt.replacement().id,
                 "checkpointing past a native-to-terminal handoff no client acknowledged"
             );
+        }
+        if state
+            .issued_terminal_returns
+            .values()
+            .any(|receipt| receipt.blocks_upgrade(&state))
+        {
+            return Err(upgrade_error(
+                "A returned terminal's original cleanup is unconfirmed; finish that cleanup before upgrading",
+            ));
         }
         if state.chats.values().any(|record| record.returning_terminal) {
             return Err(upgrade_error(

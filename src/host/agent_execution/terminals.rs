@@ -104,6 +104,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatCandidates { .. }
         | R::ChatStartSelected { .. }
         | R::ChatReturnTerminal { .. }
+        | R::ChatCloseReturnedTerminal { .. }
         | R::ChatCommitTerminal { .. }
         | R::ChatPrepareResume { .. }
         | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {

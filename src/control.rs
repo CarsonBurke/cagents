@@ -722,8 +722,12 @@ impl ControlClient {
     pub(crate) fn commit_terminal_handoff(
         &mut self,
         terminal_id: TerminalId,
+        cleanup_receipt: Option<uuid::Uuid>,
     ) -> Result<(), ControlError> {
-        match self.request_strict(ClientRequest::ChatCommitTerminal { terminal_id })? {
+        match self.request_strict(ClientRequest::ChatCommitTerminal {
+            terminal_id,
+            cleanup_receipt,
+        })? {
             ServerResponse::Accepted => Ok(()),
             response => Err(unexpected_response(
                 "a terminal handoff acknowledgement",
@@ -1161,6 +1165,28 @@ impl ControlClient {
                 outcome,
             } if terminal_id == id => Ok(outcome),
             response => Err(unexpected_response("completed terminal release", &response)),
+        }
+    }
+
+    /// Close an issued native return without attaching to its reusable ID.
+    #[cfg(any(feature = "ui", all(test, feature = "host")))]
+    pub(crate) fn close_returned_terminal(
+        &mut self,
+        terminal_id: TerminalId,
+        cleanup_receipt: uuid::Uuid,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChatCloseReturnedTerminal {
+                terminal_id,
+                cleanup_receipt,
+            },
+            Instant::now() + CHAT_CLOSE_TIMEOUT,
+        )? {
+            ServerResponse::TerminalCloseChecked {
+                terminal_id: actual,
+                outcome,
+            } if actual == terminal_id => Ok(outcome),
+            response => Err(unexpected_response("issued terminal cleanup", &response)),
         }
     }
 

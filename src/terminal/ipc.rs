@@ -199,7 +199,9 @@ use crate::{
 /// A reopened window sends it to the daemon an update just started, so a
 /// same-numbered older daemon that would drop the undecodable frame must be
 /// refused at connection instead.
-pub const PROTOCOL_VERSION: u16 = 128;
+/// Version 129 adds an issued cleanup receipt to returned terminals and their
+/// durable acknowledgement; older positional encodings require a matched set.
+pub const PROTOCOL_VERSION: u16 = 129;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -437,6 +439,9 @@ pub enum ClientRequest {
     /// GUI acknowledgement after the replacement terminal is durably saved.
     ChatCommitTerminal {
         terminal_id: TerminalId,
+        /// Only this exact issued cleanup capability may be released. Saved
+        /// terminals restored without it may still retire their replay receipt.
+        cleanup_receipt: Option<uuid::Uuid>,
     },
     /// Subscribe this connection to terminal-inventory edges caused by other
     /// clients. A connection that never asks receives none, so a strict
@@ -557,6 +562,12 @@ pub enum ClientRequest {
     /// or kept them after a failure. Answered during recovery, unlike every
     /// request that recovery refuses with the same `TerminalUnavailable`.
     StartupState,
+    /// Closes only the worker captured when this native return was issued.
+    /// A terminal UUID, List entry or fresh attachment grants no such authority.
+    ChatCloseReturnedTerminal {
+        terminal_id: TerminalId,
+        cleanup_receipt: uuid::Uuid,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -839,6 +850,7 @@ pub enum ServerResponse {
     ChatTerminal {
         chat_id: TerminalId,
         session: TerminalSession,
+        cleanup_receipt: uuid::Uuid,
         snapshot: crate::chat::Snapshot,
     },
     WorkspaceModel {

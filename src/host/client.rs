@@ -295,6 +295,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 | ClientRequest::ShutdownTerminal { .. }
                 | ClientRequest::ChatClose { .. }
                 | ClientRequest::ChatCloseRetained { .. }
+                | ClientRequest::ChatCloseReturnedTerminal { .. }
                 | ClientRequest::Agent {
                     operation: crate::agent_execution::Operation::Close(_),
                     ..
@@ -427,6 +428,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
             | ClientRequest::WatchTerminals
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
+            | ClientRequest::ChatCloseReturnedTerminal { .. }
     ) {
         return Ok(());
     }
@@ -502,6 +504,7 @@ fn ensure_startup_recovery_request(
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
             | ClientRequest::ChatCloseRetained { .. }
+            | ClientRequest::ChatCloseReturnedTerminal { .. }
     );
     let shutdown = matches!(
         request,
@@ -598,6 +601,7 @@ pub(super) fn process_request(
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
             | ClientRequest::ChatReturnTerminal { .. }
+            | ClientRequest::ChatCloseReturnedTerminal { .. }
             | ClientRequest::ChatRelease { dry_run: false, .. }
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
@@ -966,6 +970,21 @@ pub(super) fn process_request(
                 ServerResponse::AgentActivity {
                     terminal_id,
                     activity,
+                },
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::ChatCloseReturnedTerminal {
+            terminal_id,
+            cleanup_receipt,
+        } => {
+            let outcome =
+                super::chat::terminal_return_cleanup::close(host, terminal_id, cleanup_receipt)?;
+            Ok((
+                ServerResponse::TerminalCloseChecked {
+                    terminal_id,
+                    outcome,
                 },
                 Vec::new(),
                 false,

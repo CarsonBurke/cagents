@@ -124,10 +124,7 @@ struct Wire {
 }
 type Pending = Arc<
     Mutex<
-        BTreeMap<
-            u64,
-            crossbeam_channel::Sender<Result<Option<crate::model::TerminalSession>, String>>,
-        >,
+        BTreeMap<u64, crossbeam_channel::Sender<Result<Option<super::ReturnedTerminal>, String>>>,
     >,
 >;
 type FilePending =
@@ -2125,7 +2122,7 @@ impl ClientHandle {
                 if matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::ChatClosed { .. } | ServerResponse::ChatTerminal { .. } }) {
                     let (chat_id, final_snapshot, terminal) = match envelope.message {
                         ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id, snapshot } } => (chat_id, snapshot, None),
-                        ServerMessage::Response { response: ServerResponse::ChatTerminal { chat_id, session, snapshot } } => (chat_id, snapshot, Some(session)),
+                        ServerMessage::Response { response: ServerResponse::ChatTerminal { chat_id, session, cleanup_receipt, snapshot } } => (chat_id, snapshot, Some(super::ReturnedTerminal { session, cleanup_receipt })),
                         _ => unreachable!(),
                     };
                     if chat_id!=id { break "Daemon closed a different chat".into(); }
@@ -2452,7 +2449,7 @@ impl ClientHandle {
     fn request_response(
         &self,
         request: ClientRequest,
-    ) -> Result<Option<crate::model::TerminalSession>, String> {
+    ) -> Result<Option<super::ReturnedTerminal>, String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; exact reattachment is required".into());
         }
@@ -2485,14 +2482,19 @@ impl ClientHandle {
 
     /// The daemon retains and replays the resulting terminal across lost replies.
     /// Credentials stay entirely within the host's native/PTY execution context.
-    pub fn return_terminal(&self) -> Result<crate::model::TerminalSession, String> {
+    pub fn return_terminal(&self) -> Result<super::ReturnedTerminal, String> {
         let terminal = self
             .request_response(ClientRequest::ChatReturnTerminal {
                 chat_id: self.inner.id,
             })?
             .ok_or("Daemon did not return the exact replacement terminal")?;
-        if terminal.continuity.live_proof().as_ref() != Some(&self.inner.proof) {
+        if terminal.session.continuity.live_proof().as_ref() != Some(&self.inner.proof) {
             return Err("Replacement terminal has no matching daemon ownership proof".into());
+        }
+        if terminal.cleanup_receipt.is_nil() {
+            return Err(
+                "The service did not provide the returned terminal's cleanup receipt".into(),
+            );
         }
         Ok(terminal)
     }
@@ -2756,6 +2758,13 @@ impl ClientHandle {
 pub fn acknowledge_terminal_handoffs(
     terminals: &[crate::model::TerminalSession],
 ) -> Vec<Result<(), String>> {
+    acknowledge_terminal_handoffs_with_receipts(terminals, &BTreeMap::new())
+}
+
+pub fn acknowledge_terminal_handoffs_with_receipts(
+    terminals: &[crate::model::TerminalSession],
+    cleanup_receipts: &BTreeMap<crate::model::TerminalId, uuid::Uuid>,
+) -> Vec<Result<(), String>> {
     if terminals.is_empty() {
         return Vec::new();
     }
@@ -2763,12 +2772,25 @@ pub fn acknowledge_terminal_handoffs(
         Ok(socket) => socket,
         Err(error) => return vec![Err(error.to_string()); terminals.len()],
     };
-    acknowledge_terminal_handoffs_on(crate::control::ControlClient::connect(&socket), terminals)
+    acknowledge_terminal_handoffs_with_receipts_on(
+        crate::control::ControlClient::connect(&socket),
+        terminals,
+        cleanup_receipts,
+    )
 }
 
+#[cfg(test)]
 fn acknowledge_terminal_handoffs_on(
     connection: Result<crate::control::ControlClient, crate::control::ControlError>,
     terminals: &[crate::model::TerminalSession],
+) -> Vec<Result<(), String>> {
+    acknowledge_terminal_handoffs_with_receipts_on(connection, terminals, &BTreeMap::new())
+}
+
+fn acknowledge_terminal_handoffs_with_receipts_on(
+    connection: Result<crate::control::ControlClient, crate::control::ControlError>,
+    terminals: &[crate::model::TerminalSession],
+    cleanup_receipts: &BTreeMap<crate::model::TerminalId, uuid::Uuid>,
 ) -> Vec<Result<(), String>> {
     use crate::control::ControlError;
 
@@ -2804,7 +2826,9 @@ fn acknowledge_terminal_handoffs_on(
             if let Some(error) = &connection_failure {
                 return Err(error.clone());
             }
-            match client.commit_terminal_handoff(terminal.id) {
+            match client
+                .commit_terminal_handoff(terminal.id, cleanup_receipts.get(&terminal.id).copied())
+            {
                 Ok(()) => Ok(()),
                 Err(error) => {
                     // A correlated refusal leaves the stream in step. Transport
@@ -3024,6 +3048,47 @@ mod tests {
     }
 
     #[test]
+    fn handoff_ack_transmits_only_the_captured_receipt_for_each_terminal() {
+        let terminals = vec![handoff_terminal(), handoff_terminal()];
+        let receipt = uuid::Uuid::new_v4();
+        let receipts = [(terminals[0].id, receipt)].into();
+        let expected = [(terminals[0].id, Some(receipt)), (terminals[1].id, None)];
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            for (terminal_id, cleanup_receipt) in expected {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert_eq!(request.proof, Some(handoff_proof()));
+                assert_eq!(
+                    request.request,
+                    ClientRequest::ChatCommitTerminal {
+                        terminal_id,
+                        cleanup_receipt,
+                    }
+                );
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(request.request_id),
+                    &handoff_proof(),
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    },
+                );
+            }
+        });
+        let results = acknowledge_terminal_handoffs_with_receipts_on(
+            crate::control::ControlClient::from_stream(client),
+            &terminals,
+            &receipts,
+        );
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(results.len(), 2);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn handoff_batch_continues_after_a_refusal_and_an_incomplete_saved_proof() {
         use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
         let mut terminals = vec![
@@ -3046,7 +3111,7 @@ mod tests {
                 let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                 assert_eq!(request.request_id, index as u64 + 2);
                 assert!(
-                    matches!(request.request, ClientRequest::ChatCommitTerminal { terminal_id: actual } if actual == terminal_id)
+                    matches!(request.request, ClientRequest::ChatCommitTerminal { terminal_id: actual, cleanup_receipt: None } if actual == terminal_id)
                 );
                 assert_eq!(request.proof, Some(handoff_proof()));
                 let message = if index == 0 {

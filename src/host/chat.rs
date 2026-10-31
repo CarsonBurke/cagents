@@ -30,6 +30,7 @@ mod retained_resolution_tests;
 mod retained_resume;
 #[cfg(test)]
 mod startup_tests;
+pub(super) mod terminal_return_cleanup;
 pub(super) mod upgrade_resolution;
 use crate::{
     agent::Provider,
@@ -124,6 +125,7 @@ pub(super) struct TerminalHandoff {
     /// replacement, counted from the conversion or from the most recent replay
     /// of its response, whichever happened last.
     acknowledgement_deadline: Instant,
+    cleanup_receipt: Option<uuid::Uuid>,
 }
 
 /// A window acknowledges a receipt one round trip after its own durable save,
@@ -156,7 +158,13 @@ impl TerminalHandoff {
             generation,
             subscribers,
             acknowledgement_deadline,
+            cleanup_receipt: None,
         }
+    }
+
+    fn with_cleanup_receipt(mut self, receipt: uuid::Uuid) -> Self {
+        self.cleanup_receipt = Some(receipt);
+        self
     }
 
     /// Whether no window can still be waiting to save this replacement.
@@ -1861,6 +1869,7 @@ fn codex_terminal_view(
     chat_id: TerminalId,
     mut owners: paired_close::Owners,
     closing: &capacity::Reservation,
+    cleanup_admission: &terminal_return_cleanup::Reservation,
     mut session: Session,
     recipe: crate::model::LaunchRecipe,
 ) -> Result<ServerResponse, ProtocolError> {
@@ -1887,12 +1896,19 @@ fn codex_terminal_view(
                     "The CLI view was replaced; it is not owned by this thread.",
                 ));
             }
+            let terminal = state.descriptor(client, terminal.id)?.session;
+            let worker = live.handle.clone();
+            let target = CloseTarget::from_record(record);
+            let snapshot = handle.snapshot(None).ok_or_else(|| {
+                unavailable("Exact native snapshot is unavailable; no replacement was started")
+            })?;
+            let cleanup_receipt =
+                cleanup_admission.publish(&mut state, &terminal, &worker, Some(target))?;
             return Ok(ServerResponse::ChatTerminal {
                 chat_id,
-                session: state.descriptor(client, terminal.id)?.session,
-                snapshot: handle.snapshot(None).ok_or_else(|| {
-                    unavailable("Exact native snapshot is unavailable; no replacement was started")
-                })?,
+                session: terminal,
+                cleanup_receipt,
+                snapshot,
             });
         }
         if record.returning_terminal {
@@ -2081,12 +2097,21 @@ fn codex_terminal_view(
         record.returning_terminal = false;
         owners = paired_close::Owners::capture(&state, &state.chats[&chat_id])?;
         state.inventory_generation += 1;
+        let snapshot = handle.snapshot(None).ok_or_else(|| {
+            unavailable("Exact native snapshot is unavailable; no replacement was started")
+        })?;
+        let target = CloseTarget::from_record(&state.chats[&chat_id]);
+        let cleanup_receipt = cleanup_admission.publish(
+            &mut state,
+            &descriptor.session,
+            &paired_terminal,
+            Some(target),
+        )?;
         Ok(ServerResponse::ChatTerminal {
             chat_id,
             session: descriptor.session.clone(),
-            snapshot: handle.snapshot(None).ok_or_else(|| {
-                unavailable("Exact native snapshot is unavailable; no replacement was started")
-            })?,
+            cleanup_receipt,
+            snapshot,
         })
     })();
     if let Err(error) = result {
@@ -2881,17 +2906,26 @@ fn process_inner(
         }
         ClientRequest::ChatReturnTerminal { chat_id } => {
             super::account_lifecycle::ensure_idle(host)?;
-            let (owners, closing) = {
+            let (owners, closing, cleanup_admission) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.shutting_down {
                     return Err(unavailable("Daemon is shutting down"));
                 }
-                if let Some(receipt) = state.chat_handoffs.get_mut(&chat_id) {
+                if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
                     receipt.require_attached(client)?;
+                    let cleanup_receipt = receipt.cleanup_receipt.ok_or_else(|| unavailable(
+                        "The original terminal cleanup receipt is unavailable; no replacement was selected",
+                    ))?;
+                    terminal_return_cleanup::replay(&state, &receipt.terminal, cleanup_receipt)?;
+                    let receipt = state
+                        .chat_handoffs
+                        .get_mut(&chat_id)
+                        .expect("checked handoff");
                     receipt.reissue(Instant::now());
                     return Ok(ServerResponse::ChatTerminal {
                         chat_id,
                         session: receipt.terminal.clone(),
+                        cleanup_receipt,
                         snapshot: receipt.snapshot(),
                     });
                 }
@@ -2904,7 +2938,13 @@ fn process_inner(
                     paired_close::Owners::capture(&state, attached(&state, client, chat_id)?)?;
                 let closing =
                     capacity::Reservation::closing(host, &mut state, &owners.target.source)?;
-                (owners, closing)
+                let cleanup_admission =
+                    terminal_return_cleanup::Reservation::new(host, &mut state, chat_id);
+                // An admission refusal must drop the closing reservation only
+                // after releasing HostState; its Drop reacquires this lock.
+                drop(state);
+                let cleanup_admission = cleanup_admission?;
+                (owners, closing, cleanup_admission)
             };
             let handle = owners.target.handle.clone();
             let mut session = owners.target.source.clone();
@@ -2926,7 +2966,14 @@ fn process_inner(
                         .any(|arg| arg == "--remote" || arg.starts_with("--remote=")))
             {
                 return codex_terminal_view(
-                    host, client, chat_id, owners, &closing, session, recipe,
+                    host,
+                    client,
+                    chat_id,
+                    owners,
+                    &closing,
+                    &cleanup_admission,
+                    session,
+                    recipe,
                 );
             }
             if session.launch.provider == Provider::Codex && session.terminal.is_some() {
@@ -3039,6 +3086,12 @@ fn process_inner(
                     ));
                 }
                 let old_pair = owners.remove_pair(&mut state, &closing)?;
+                let cleanup_receipt = cleanup_admission.publish(
+                    &mut state,
+                    &descriptor.session,
+                    &replacement_worker,
+                    None,
+                )?;
                 let mut record = state
                     .chats
                     .remove(&chat_id)
@@ -3051,13 +3104,17 @@ fn process_inner(
                         snapshot.generation,
                         std::mem::take(&mut record.subscribers),
                         Instant::now() + ACKNOWLEDGEMENT_GRACE,
-                    ),
+                    )
+                    .with_cleanup_receipt(cleanup_receipt),
                 );
                 state.inventory_generation += 1;
-                Ok((record, old_pair))
+                Ok(((record, old_pair), cleanup_receipt))
             })();
-            match publication {
-                Ok(retired) => drop(retired),
+            let cleanup_receipt = match publication {
+                Ok((retired, cleanup_receipt)) => {
+                    drop(retired);
+                    cleanup_receipt
+                }
                 Err(error) => {
                     // Retire only the worker returned by this spawn. A reused
                     // terminal ID cannot authorize removing its replacement.
@@ -3101,26 +3158,26 @@ fn process_inner(
                     drop(orphan);
                     return Err(error);
                 }
-            }
+            };
             Ok(ServerResponse::ChatTerminal {
                 chat_id,
                 session: descriptor.session,
+                cleanup_receipt,
                 snapshot,
             })
         }
-        ClientRequest::ChatCommitTerminal { terminal_id } => {
-            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        ClientRequest::ChatCommitTerminal {
+            terminal_id,
+            cleanup_receipt,
+        } => {
             // The authenticated envelope pins this receipt to the saved host.
             // Terminal retirement cannot invalidate a durable commit or its retry.
             // The GUI must flush replacement of all of its source references first.
-            let source_id = state
-                .chat_handoffs
-                .iter()
-                .find_map(|(&id, receipt)| (receipt.terminal.id == terminal_id).then_some(id));
-            if let Some(source_id) = source_id {
-                state.chat_handoffs.remove(&source_id);
-                state.inventory_generation += 1;
-            }
+            let released = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                terminal_return_cleanup::acknowledge(&mut state, terminal_id, cleanup_receipt)?
+            };
+            drop(released);
             Ok(ServerResponse::Accepted)
         }
         ClientRequest::ChatClose { chat_id } => {
@@ -4899,7 +4956,15 @@ for line in sys.stdin:
         // names the durable replacement. EOF/terminal close did not consume it.
         for _ in 0..2 {
             assert!(matches!(
-                process(&host, 1, ClientRequest::ChatCommitTerminal { terminal_id }).unwrap(),
+                process(
+                    &host,
+                    1,
+                    ClientRequest::ChatCommitTerminal {
+                        terminal_id,
+                        cleanup_receipt: None
+                    }
+                )
+                .unwrap(),
                 ServerResponse::Accepted
             ));
         }
@@ -5076,7 +5141,9 @@ for line in sys.stdin:
         )
         .unwrap();
         let ServerResponse::ChatTerminal {
-            session: terminal, ..
+            session: terminal,
+            cleanup_receipt,
+            ..
         } = process(
             &host,
             1,
@@ -5177,7 +5244,9 @@ for line in sys.stdin:
         };
         assert!(sessions.is_empty());
         let ServerResponse::ChatTerminal {
-            session: repeated, ..
+            session: repeated,
+            cleanup_receipt: repeated_cleanup_receipt,
+            ..
         } = process(
             &host,
             2,
@@ -5190,6 +5259,7 @@ for line in sys.stdin:
             panic!("lost handoff response was not replayed");
         };
         assert_eq!(repeated, terminal);
+        assert_eq!(repeated_cleanup_receipt, cleanup_receipt);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !directory.path().join("terminal-starts").exists() {
             assert!(
@@ -5227,6 +5297,7 @@ for line in sys.stdin:
             2,
             ClientRequest::ChatCommitTerminal {
                 terminal_id: TerminalId::new(),
+                cleanup_receipt: None,
             },
         )
         .unwrap();
@@ -5245,6 +5316,7 @@ for line in sys.stdin:
                     2,
                     ClientRequest::ChatCommitTerminal {
                         terminal_id: terminal.id,
+                        cleanup_receipt: Some(cleanup_receipt),
                     }
                 )
                 .unwrap(),
@@ -6059,6 +6131,15 @@ done
 
     #[test]
     fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
+        managed_cli_close_fixture(false);
+    }
+
+    #[test]
+    fn issued_codex_return_closes_original_pair_and_caches_positive_reply() {
+        managed_cli_close_fixture(true);
+    }
+
+    fn managed_cli_close_fixture(receipt_cleanup: bool) {
         let (_directory, host, _) = upgrade_fixture();
         let chat_id = TerminalId::new();
         let recipe = LaunchRecipe {
@@ -6140,18 +6221,31 @@ done
             session.owned_codex_listener
         );
         let view = |client, session, recipe| {
-            let (owners, closing) = {
+            let (owners, closing, cleanup_admission) = {
                 let mut state = host.lock().unwrap();
                 let owners = paired_close::Owners::capture(&state, &state.chats[&chat_id])?;
                 let closing =
                     capacity::Reservation::closing(&host, &mut state, &owners.target.source)?;
-                (owners, closing)
+                let cleanup_admission =
+                    terminal_return_cleanup::Reservation::new(&host, &mut state, chat_id);
+                drop(state);
+                (owners, closing, cleanup_admission?)
             };
-            codex_terminal_view(&host, client, chat_id, owners, &closing, session, recipe)
+            codex_terminal_view(
+                &host,
+                client,
+                chat_id,
+                owners,
+                &closing,
+                &cleanup_admission,
+                session,
+                recipe,
+            )
         };
         let first = view(1, session.clone(), recipe.clone()).unwrap();
         let ServerResponse::ChatTerminal {
             session: terminal,
+            cleanup_receipt: first_cleanup_receipt,
             snapshot,
             ..
         } = first
@@ -6163,7 +6257,8 @@ done
         let worker = host.lock().unwrap().terminals[&terminal.id].handle.clone();
         let second = view(1, session.clone(), recipe.clone()).unwrap();
         assert!(
-            matches!(second, ServerResponse::ChatTerminal { snapshot, .. } if !snapshot.exited)
+            matches!(second, ServerResponse::ChatTerminal { snapshot, cleanup_receipt, .. }
+                if !snapshot.exited && cleanup_receipt == first_cleanup_receipt)
         );
         assert!(
             host.lock().unwrap().terminals[&terminal.id]
@@ -6214,9 +6309,18 @@ done
                 .handle
                 .same_actor(&handle)
         );
-        view(2, session, recipe).unwrap();
+        let ServerResponse::ChatTerminal {
+            cleanup_receipt: next_cleanup_receipt,
+            ..
+        } = view(2, session, recipe).unwrap()
+        else {
+            panic!("CLI replacement missing")
+        };
+        assert_ne!(next_cleanup_receipt, first_cleanup_receipt);
         let replacement = host.lock().unwrap().terminals[&terminal.id].handle.clone();
         assert!(!replacement.same_worker(&worker));
+        assert!(terminal_return_cleanup::close(&host, terminal.id, first_cleanup_receipt).is_err());
+        assert!(!replacement.is_completed());
         // A recreated terminal can have the same public ID, launch recipe and
         // daemon proof. A stale private pairing must not authorize its close.
         host.lock()
@@ -6244,7 +6348,18 @@ done
                 crate::model::agent_recovery::hint_from_launch(&observed);
             assert!(terminal.session.resume_hint.is_some());
         }
-        process(&host, 2, ClientRequest::ChatClose { chat_id }).unwrap();
+        if receipt_cleanup {
+            assert_eq!(
+                terminal_return_cleanup::close(&host, terminal.id, next_cleanup_receipt).unwrap(),
+                crate::terminal_ipc::TerminalCloseResult::Closed,
+            );
+            assert_eq!(
+                terminal_return_cleanup::close(&host, terminal.id, next_cleanup_receipt).unwrap(),
+                crate::terminal_ipc::TerminalCloseResult::Closed,
+            );
+        } else {
+            process(&host, 2, ClientRequest::ChatClose { chat_id }).unwrap();
+        }
         assert!(handle.is_completed());
         assert!(worker.is_completed());
         assert!(replacement.is_completed());

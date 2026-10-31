@@ -1074,6 +1074,7 @@ fn retained_turn_final_action(action: &str) {
             0,
             ClientRequest::ChatCommitTerminal {
                 terminal_id: session.id,
+                cleanup_receipt: None,
             },
         )
         .unwrap();

@@ -196,6 +196,15 @@ impl Reservation {
                     hosted.push(("A chat handing off to a terminal", directory.to_owned()));
                 }
             }
+            for receipt in state
+                .issued_terminal_returns
+                .values()
+                .filter(|receipt| receipt.pending())
+            {
+                for directory in receipt.working_directories() {
+                    hosted.push(("A returned terminal awaiting cleanup", directory.to_owned()));
+                }
+            }
             for closing in state.native_closing.values() {
                 hosted.push(("A closing chat", closing.working_directory().to_owned()));
             }
