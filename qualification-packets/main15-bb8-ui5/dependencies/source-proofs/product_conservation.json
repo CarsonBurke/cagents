@@ -1,0 +1,493 @@
+{
+  "kind": "F95DF2DA_ISSUED_RETURN_CONSUMER_INDEPENDENT_CONSERVATION_PRIVACY_TEST_BODY_DELTA_REVIEW",
+  "reviewer": "/root/async_races",
+  "verdict": "BOUNDED_EXACT_SOURCE_CONSERVATION_DELTA_CLEAR; AUTHORITY_UX_AND_RUNTIME_CLEARANCE_SEPARATE",
+  "scope": "Only frozen b8-to-f95 correction conservation/privacy/test-body and helper delta, plus exact API-baseline tree/hash joins. No repeat API14 physical effects or new lifecycle/UX semantic audit.",
+  "identity": {
+    "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+    "parent_tree": "a4bed73ab90387d45052999f1f762545726eae04",
+    "API_base": "615e62c0b8604f94bc4f89613c49e5b796e6f1e0",
+    "API_tree": "834d2844924ea655ecf84952d682e8c645089425",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15",
+    "observed_HEAD_and_tree_match": true,
+    "observed_status_porcelain": "",
+    "raw_delta": [
+      {
+        "path": "src/app/chat_ui.rs",
+        "old_mode": "100644",
+        "new_mode": "100644",
+        "old_blob": "ddf59dce0fcd142c371618932f00432802de10f6",
+        "new_blob": "77681ebe5c3050ab212be626ed487e0d63618ba9",
+        "status": "M"
+      },
+      {
+        "path": "src/app/chrome_ui.rs",
+        "old_mode": "100644",
+        "new_mode": "100644",
+        "old_blob": "23e19c8dfcf9a87c77e7c55a6f949c2c49485a8e",
+        "new_blob": "e94db20b119745f12f5e3d4069ff8fe25154be03",
+        "status": "M"
+      }
+    ]
+  },
+  "inputs": [
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-b8-bounded-source-correction-freeze-v1.json",
+      "sha256": "24ab6dc0d43d9ce328cf4e9cf445a9f1ea6405038a93201b175bf88d1fc84a54",
+      "bytes": 14616,
+      "mode": "0444",
+      "hash_size_match": true
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-consumer-static-vsb8-v1.json",
+      "sha256": "971df8817c59bf7e2727832ed040251b0d4d6a47f3663dc652c92b9526d6ddb5",
+      "bytes": 21446,
+      "mode": "0444",
+      "hash_size_match": true,
+      "independent_measurement_matches": true
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-consumer-static-vs615e-v1.json",
+      "sha256": "299ea0a155d7f8ddf6d9c6adbd3765124d2a9cdc67b393b61a9ec02a76d1c187",
+      "bytes": 36405,
+      "mode": "0444",
+      "hash_size_match": true,
+      "independent_measurement_matches": true
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-b8-bounded-correction-v1.patch",
+      "sha256": "37fac55564dc80bbe1bad4547a6c23ad96b6cd0dc6c8b20478f91f0f7fbb0e4e",
+      "bytes": 34868,
+      "mode": "0444",
+      "hash_size_match": true,
+      "recomputed_git_histogram_fullbyte_match": true
+    },
+    {
+      "path": "/tmp/held-saved-scope-fw16-evidence/b8ebb9ca-issued-return-consumer-independent-source-conservation-review-v1.json",
+      "sha256": "8b4e4723ad52c5d83161247eb7c04d06c42db28bf815725e9e136c19387b23f3",
+      "bytes": 27422,
+      "mode": "0444",
+      "hash_size_match": true,
+      "preserved": true
+    }
+  ],
+  "source_conservation": {
+    "delta_vs_b8": {
+      "base_entries": 2231,
+      "head_entries": 2231,
+      "changed_paths": [
+        "src/app/chat_ui.rs",
+        "src/app/chrome_ui.rs"
+      ],
+      "outside_exact": 2229,
+      "all_modes_blobs_equal": true
+    },
+    "full_vs_API": {
+      "base_entries": 2231,
+      "head_entries": 2231,
+      "changed_paths": [
+        "src/app.rs",
+        "src/app/chat_ui.rs",
+        "src/app/chrome_ui.rs"
+      ],
+      "outside_exact": 2228,
+      "all_modes_blobs_equal": true
+    },
+    "app_rs_exact_b8": true,
+    "source_pins": {
+      "src/app.rs": {
+        "sha256": "de2b68f872f4195e87a3cbdee1fa846ab2655726cf9e8540141ec0701f5aec4c",
+        "bytes": 1390648
+      },
+      "src/app/chat_ui.rs": {
+        "sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+        "bytes": 1418988
+      },
+      "src/app/chrome_ui.rs": {
+        "sha256": "651091245803497ff0705a287d952b839137c4cf842675617d4752e26eb0272c",
+        "bytes": 160413
+      }
+    },
+    "all_freeze_source_entry_hash_size_mode_blob_pins_match_immutable_head": true,
+    "protected_spans": {
+      "count": 32,
+      "all_full_bytes_hashes_and_sizes_exact_b8_and_API": true,
+      "all_32_join_prior8b_hashes": true,
+      "prior_full_hash_table": "8b4e4723 review protected_source.spans; newly measured same hashes without semantic re-audit.",
+      "historical_874_guard": {
+        "bytes": 874,
+        "sha256": "bc7b40fa27a72af46891dfea62a93afbf65ec3d045e8134fb03fd3216300df21",
+        "equal": true
+      },
+      "separate_840_ledger_prefix": {
+        "bytes": 840,
+        "sha256": "25be4f10632112d337d64de21dfedc3cacaf3c297b8c9943545752a7dd0c6148",
+        "equal": true
+      }
+    },
+    "unchanged_scope": "All2228 entries outside full consumer3 retain exact615e mode/type/blob; all2229 entries outside correction2 retain exactb8. Root14 API, ClientHandle1749/first-send, Host/native_cleanup/retained_actor, wire/issuance/permissions/control/CallerContext, Cargo/controller and shared_views proof/raw/Seed/admission/recheck sources remain exactAPI. New correction does not edit the old guarded/preflight/native/None helpers.",
+    "legacy_inverse_applicability": "The entire app.rs blob is exactb8, so the prior measured legacy ACK rename+issued-ID-exclusion inverse, separate generic message/callback shape, save-health and old generic test-body conservation remain applicable by exact source identity. No old runtime result is transferred."
+  },
+  "test_and_helper_delta": {
+    "plain_parent_counts_before": 584,
+    "plain_parent_counts_after": 584,
+    "unchanged_parent_bodies_vs_b8": 583,
+    "changed_parent_bodies_vs_b8": 1,
+    "new_or_removed_parent_names": 0,
+    "per_file_vs_b8": {
+      "src/app.rs": {
+        "owning_count_before": 271,
+        "owning_count_after": 271,
+        "unchanged_body_count": 271,
+        "changed_bodies": [],
+        "added_owning_parents": [],
+        "executed": false
+      },
+      "src/app/chat_ui.rs": {
+        "owning_count_before": 286,
+        "owning_count_after": 286,
+        "unchanged_body_count": 285,
+        "changed_bodies": [
+          {
+            "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+            "before": {
+              "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+              "bytes": 12053,
+              "sha256": "5d6d6c2a11c3daaaaba5618e4893662b1c4194db1b43f2734ceb7b232c7c64e0"
+            },
+            "after": {
+              "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+              "bytes": 12109,
+              "sha256": "565bd3c418fc742f2d7b25dba2a66ad5aa28ae84fdbf651aacac2d4a350c56b7"
+            }
+          }
+        ],
+        "added_owning_parents": [],
+        "executed": false
+      },
+      "src/app/chrome_ui.rs": {
+        "owning_count_before": 27,
+        "owning_count_after": 27,
+        "unchanged_body_count": 27,
+        "changed_bodies": [],
+        "added_owning_parents": [],
+        "executed": false
+      }
+    },
+    "full_vs_API_counts": {
+      "app_unchanged": 271,
+      "chrome_unchanged": 27,
+      "chat_unchanged": 281,
+      "chat_changed_disclosed": 5
+    },
+    "same_two_selectors": [
+      {
+        "selector": "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+        "head_line": 32332,
+        "status": "Existing parent adds exactly one nested helper invocation; old body reconstructed after removing that invocation."
+      },
+      {
+        "selector": "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+        "head_line": 32603,
+        "status": "Body exactb8; shared helpers changed and therefore behavior/result applicability is not inferred from parent-body equality."
+      }
+    ],
+    "independent_helper_function_ledger_counts": {
+      "src/app.rs": {
+        "changed_unique_functions": 0,
+        "new_unique_functions": 0,
+        "removed_names": [],
+        "all_ledger_entries_match": true
+      },
+      "src/app/chat_ui.rs": {
+        "changed_unique_functions": 12,
+        "new_unique_functions": 4,
+        "removed_names": [],
+        "all_ledger_entries_match": true
+      },
+      "src/app/chrome_ui.rs": {
+        "changed_unique_functions": 3,
+        "new_unique_functions": 0,
+        "removed_names": [],
+        "all_ledger_entries_match": true
+      }
+    },
+    "before_after_ledger_verified": {
+      "src/app.rs": {
+        "changed": [],
+        "new": []
+      },
+      "src/app/chat_ui.rs": {
+        "changed": [
+          {
+            "name": "purpose",
+            "before": {
+              "name": "purpose",
+              "bytes": 293,
+              "sha256": "120830b6281ae4402970dc13ab786d527356b0fe44e62b31a3698f3aa20a505a"
+            },
+            "after": {
+              "name": "purpose",
+              "bytes": 353,
+              "sha256": "8fd6ae0cea158f9352918a8e615b52f5c37365c8410420ae0ff35a08eab2e13c"
+            }
+          },
+          {
+            "name": "label",
+            "before": {
+              "name": "label",
+              "bytes": 303,
+              "sha256": "3fd35cce0ed862f109765eea445965ab9b0f1d2e9d8e64e20ac7a849843e5e37"
+            },
+            "after": {
+              "name": "label",
+              "bytes": 325,
+              "sha256": "aa178bb1d7e63f14c7f3148146be1cb59444532e4ab21d410398c781a7652419"
+            }
+          },
+          {
+            "name": "retry_shared_return_cleanup",
+            "before": {
+              "name": "retry_shared_return_cleanup",
+              "bytes": 2803,
+              "sha256": "4b6c4e290e2795a5f7eded7b32ef903acf092eb231a3bb3bdf19e1f3a91202e9"
+            },
+            "after": {
+              "name": "retry_shared_return_cleanup",
+              "bytes": 2976,
+              "sha256": "6a464db5aaa1eb6d9f95b1fafb088cc453171c2761f801bb61d00b0a5e3489b6"
+            }
+          },
+          {
+            "name": "issued_notices",
+            "before": {
+              "name": "issued_notices",
+              "bytes": 4851,
+              "sha256": "e929e512303e151714eaec28637037084102b10ca6df83a29250371436af9844"
+            },
+            "after": {
+              "name": "issued_notices",
+              "bytes": 5294,
+              "sha256": "747e57d1d03ff0310c9901b5e651b4bed39cfb1d2d2c053cf5ab9a9c4b058e6b"
+            }
+          },
+          {
+            "name": "native_result_error",
+            "before": {
+              "name": "native_result_error",
+              "bytes": 503,
+              "sha256": "4a664dbef70b3d7cd052bf827602144b41bb3912d4f7c6ab989c462ec063fa9c"
+            },
+            "after": {
+              "name": "native_result_error",
+              "bytes": 490,
+              "sha256": "3a2bbc7ddb1737a4a5157de67917a1e20d17d981543c698d9895c78c773e7b01"
+            }
+          },
+          {
+            "name": "retain_issued_return",
+            "before": {
+              "name": "retain_issued_return",
+              "bytes": 2962,
+              "sha256": "bb864143c48d559dd2132899a9d71aed8e49d0076c4fba3643d8ec1450f06ed7"
+            },
+            "after": {
+              "name": "retain_issued_return",
+              "bytes": 3101,
+              "sha256": "588380059f828cd9aa1e80d527b56c07a1adda61d22041b11bee61fd0a50c35c"
+            }
+          },
+          {
+            "name": "issued_action",
+            "before": {
+              "name": "issued_action",
+              "bytes": 1437,
+              "sha256": "b80da01435c4f55e5d36e40575180bbd2d43a58005128eee3f3d9b6f44aeb9f9"
+            },
+            "after": {
+              "name": "issued_action",
+              "bytes": 1690,
+              "sha256": "1be4b6cc0b18231d49c8435eeaa873162daa2041062fc8d38e3c2ebbff81ac78"
+            }
+          },
+          {
+            "name": "shared_return_fixture",
+            "before": {
+              "name": "shared_return_fixture",
+              "bytes": 5310,
+              "sha256": "671bb404e43efa082af7ca97f6eb1720322d9823e44fbc6bb404067a18ab566f"
+            },
+            "after": {
+              "name": "shared_return_fixture",
+              "bytes": 111,
+              "sha256": "b0526bd304b54b6ad351e0b0d33355e7bf6f24b4cbb4cd8b6fdfd96289383428"
+            }
+          },
+          {
+            "name": "issued_request_component",
+            "before": {
+              "name": "issued_request_component",
+              "bytes": 5433,
+              "sha256": "475dcd556b438f80e3a3c441aed28d3191c4470c6b1fea30a49a2870b95a1284"
+            },
+            "after": {
+              "name": "issued_request_component",
+              "bytes": 5646,
+              "sha256": "f3aaf48462cc99fe6ca7ad06f9b8baa91a2ef7899e63209008faf5069b708193"
+            }
+          },
+          {
+            "name": "issued_orphan_and_persistence_controls",
+            "before": {
+              "name": "issued_orphan_and_persistence_controls",
+              "bytes": 10505,
+              "sha256": "e787f426328eae0b66b69c8ffd92b4a7c817b4e65583f5868938bad7791d63fe"
+            },
+            "after": {
+              "name": "issued_orphan_and_persistence_controls",
+              "bytes": 11728,
+              "sha256": "cf2daea1f0e5078b45774dbf33e39c395659b7b80ead87d9c8dd79bff7674814"
+            }
+          },
+          {
+            "name": "issued_nonshared_caller_controls",
+            "before": {
+              "name": "issued_nonshared_caller_controls",
+              "bytes": 10036,
+              "sha256": "f0080b78a0c204265ce40bcd776cf9745dac56fdf595699a0e2dca370df146b6"
+            },
+            "after": {
+              "name": "issued_nonshared_caller_controls",
+              "bytes": 11007,
+              "sha256": "420086f80497a9fa1faf5fa2a3602beffcf4279cbbb89c300feba7ecf2fc63cf"
+            }
+          },
+          {
+            "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+            "before": {
+              "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+              "bytes": 12053,
+              "sha256": "5d6d6c2a11c3daaaaba5618e4893662b1c4194db1b43f2734ceb7b232c7c64e0"
+            },
+            "after": {
+              "name": "stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+              "bytes": 12109,
+              "sha256": "565bd3c418fc742f2d7b25dba2a66ad5aa28ae84fdbf651aacac2d4a350c56b7"
+            }
+          }
+        ],
+        "new": [
+          {
+            "name": "action_id",
+            "bytes": 167,
+            "sha256": "e85c4c3f7314cd8df4ece1601d6439c350718fb30ae47b5bc2a349b165a87897"
+          },
+          {
+            "name": "shared_return_fixture_with_registry",
+            "bytes": 5409,
+            "sha256": "911089672e859f3daf22d7db64aa999fceed2cf99461f1cd272fe0a3f43c5442"
+          },
+          {
+            "name": "tab_mounted_return_control",
+            "bytes": 4517,
+            "sha256": "507b05533cd308dce4bcfb054adaab158bcc553fab66da84cf704a8aacbc5dbb"
+          },
+          {
+            "name": "issued_first_some_after_replacement_controls",
+            "bytes": 9476,
+            "sha256": "894030556f819391f1468208dedadb5995e0bd2ee1da291d175b02ca86b67702"
+          }
+        ]
+      },
+      "src/app/chrome_ui.rs": {
+        "changed": [
+          {
+            "name": "popup_focus_ring",
+            "before": {
+              "name": "popup_focus_ring",
+              "bytes": 3064,
+              "sha256": "144096f0f3e9fc7c1b8492cabcda4917ee3a0852f9082bd6677b25851846c3c0"
+            },
+            "after": {
+              "name": "popup_focus_ring",
+              "bytes": 3280,
+              "sha256": "176b91af54b9288c5a42a73166b8a12e41954e6009b7bda1e18c598e025b2490"
+            }
+          },
+          {
+            "name": "notice_control_severity",
+            "before": {
+              "name": "notice_control_severity",
+              "bytes": 1360,
+              "sha256": "17925db27ac157fc945c50b699ff608204baf48382b690c27835f7fc80e601c7"
+            },
+            "after": {
+              "name": "notice_control_severity",
+              "bytes": 1619,
+              "sha256": "f5f26e644e1b665fe29630da7cb9c6ca6d39dd154d34c4a6f5a5f84398949fb3"
+            }
+          },
+          {
+            "name": "notice_control",
+            "before": {
+              "name": "notice_control",
+              "bytes": 11755,
+              "sha256": "b661a7a900c60bb12218d62834c3a21127de93e1c2bca7081ac052148ac70cf9"
+            },
+            "after": {
+              "name": "notice_control",
+              "bytes": 11810,
+              "sha256": "99dfb1ccf6c333d2f56939f5240015622adff48164fee323fd174e3e5cbdefbe"
+            }
+          }
+        ],
+        "new": []
+      }
+    },
+    "bounded_inspection": [
+      "The stale parent retains its entire prior body with only issued_first_some_after_replacement_controls() added after the prior nested orphan control. No previous assertion was removed there.",
+      "shared_return_fixture now wraps shared_return_fixture_with_registry(true); the new bool controls intentional local-vs-registry setup. The default existing fixture path retains the registered setup, while the new nonshared route is disclosed. No test parent is added by that split.",
+      "issued_request_component retains supplied-client framing/assertions/client drop/peer join and now returns the observed tuple/result. issued_nonshared_caller_controls feeds the actual synthetic refusal result into IssuedCloseFinished and asserts retained original tuple/source/owner/caller/error instead of substituting an unrelated synthetic Unknown.",
+      "The new mounted Tab helper verifies ring membership, requests actual production Tab/Shift-Tab navigation, accepts only Widget runtime actions, applies those operations to the mounted widget tree and requires reached focus plus Enter message. The source explicitly distinguishes these future test-local focus operations from dropped cleanup/provider/save Tasks. None of this code was imported or executed.",
+      "Existing orphan persistence helper gains navigation/ring checks and original retry paths; current parent body equality is not claimed as unchanged helper behavior. Typed Closed and persistence/ACK completion injection remain component-only, not native ownership or durable-writer proof."
+    ],
+    "limits": "Static body/name/hash accounting and bounded obvious-weakening inspection only. No compilation/discovery/test pass is established, no nested case count becomes additive, and no old b8/API result transfers. Detailed new oracle/lifecycle correctness remains with other reviewers."
+  },
+  "privacy_delta": {
+    "refs": [
+      "src/app/chat_ui.rs:754",
+      "src/app/chat_ui.rs:13340",
+      "src/app/chrome_ui.rs:1724",
+      "src/app/chrome_ui.rs:2510"
+    ],
+    "observations": [
+      "New IssuedNotice::action_id formats only the separately generated local notice UUID and static action purpose. It neither accepts nor reads CallerContext, ReturnedTerminal or cleanup_receipt.",
+      "Both popup_focus_ring and mounted button construction consume the same filtered IssuedNotice action_id. ContinueClose adds only the static continue-issued-close purpose and label; owned keys retain local notice/operation/attempt/purpose components. No receipt/caller material is introduced into public widget IDs or ring strings.",
+      "No new capability/state fields or serialization derives are introduced by this correction. Existing private caller/nonce UI state and IssuedBinding Debug remain exactlyb8; both Action discriminant-only Debug and IssuedBinding redacted Debug spans were independently byte-compared.",
+      "No memory/schema/API/protocol/control/Root14 file changes exist. The inherited API ReturnedTerminal wire serde remains its existing API contract; this note only excludes new consumer persistence/public-ID exposure."
+    ],
+    "limit": "Direct source uses and unchanged safe Debug spans only; no actual UI/accessibility/log/environment/private-content inspection or runtime privacy claim."
+  },
+  "findings": {
+    "in_scope_conservation_privacy_or_test_disclosure_blockers": [],
+    "conclusion": "The exact two-leaf correction is faithfully disclosed, stays within the approved full three-leaf consumer boundary, and conserves prior measured protected/legacy/source surfaces. No new conservation blocker found.",
+    "no_semantic_waiver": "This receipt does not close authority nil-operation, first-valid-queued-C1 or UX keyboard/recovery findings by proxy; the responsible reviewers assess those exact semantic corrections. Historical b8 reviews and negatives remain immutable."
+  },
+  "limits": {
+    "method": "Immutable Git/source/JSON/hash/diff reads only, independently recomputed byte-oriented lexical Rust function extraction and test/helper ledgers. No authored static helper/module/function executed.",
+    "formatter": "Author reports rustfmt0/check-format0/diff-check0 in freeze; not rerun here and not treated as typecheck or test results.",
+    "compiled_test_or_native_results": "UNRUN",
+    "actual_grant_context_inventory_results": null,
+    "native_qualification": null,
+    "consumer_adoption": null,
+    "source_publication": null,
+    "queueable": false,
+    "merge_ready": false,
+    "resource_acceptance": false,
+    "holds": "Native/User5/FULL52/WHOLE/qclosed/general/conflict full outcome HOLD. PR1933 NEVER_MERGE.",
+    "not_performed": "No source/Git/public edits, imported/evaluated candidate/function/helper/Task, tests/build/Cargo/rustc/formatter/native/provider, authority/environment/process/resource/cache/target/API probes or new workers."
+  },
+  "stop": true
+}

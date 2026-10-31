@@ -1,0 +1,215 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "adopted_child_settlement": {
+    "canonical_head": "fef275ca853f01cb8fb6dfc698127920e4bcc9b5",
+    "canonical_parent": "347c2adc5ec7820477c49947b4906e2dc35f3986",
+    "canonical_tree": "dec517c58adc9bfc8d0eb466e66498dc5e205e1d",
+    "execution_authorized": false,
+    "fresh_successor_code_caller_conservation_review": null,
+    "function_sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "historical_function_sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b",
+    "natural_grace_seconds_unchanged": 3,
+    "original_direct_Popen_timeout_wait_pidfd_paths": "UNCHANGED",
+    "pure4_result_scope": "Reference only: canonical pure4 once4OK; no current packet/caller/child/runtime PASS transfer",
+    "unproven_adopted_survivors": "UNSIGNALED_UNCLEAN_UNFORCED_RETAIN_ACQUIRED_C_HOLD"
+  },
+  "artifact_groups": [
+    {
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "features": [
+        "ui"
+      ],
+      "id": "ui-lib",
+      "inventory_seconds": 30,
+      "manifest": "Cargo.toml",
+      "selectors": [
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+          "seconds": 90
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+          "seconds": 90
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+          "seconds": 90
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+          "seconds": 90
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
+          "seconds": 90
+        }
+      ],
+      "source_predicted_absent_names": [],
+      "source_predicted_compiled_names": [
+        "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+        "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+        "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+        "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+        "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+      ],
+      "target_kind": [
+        "lib"
+      ],
+      "target_name": "cagents"
+    }
+  ],
+  "binary_checks": [
+    {
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "label": "cli-binary-check",
+      "seconds": 300
+    },
+    {
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "label": "ui-binary-check",
+      "seconds": 450
+    }
+  ],
+  "execution_authorized": false,
+  "phase_caps_sum_seconds": 2130,
+  "planned_phase_count": 9,
+  "planned_phase_order": [
+    "cli-binary-check",
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2",
+    "parent-ui-lib-3",
+    "parent-ui-lib-4",
+    "parent-ui-lib-5"
+  ],
+  "readiness": false,
+  "reconciliation": {
+    "HOST16_DATA_entry_count": 21,
+    "HOST16_DATA_outer_slack": 60,
+    "HOST16_DATA_total": 2340,
+    "HOST16_command_caps_sum": 2250,
+    "HOST16_command_phase_count": 19,
+    "HOST16_original_DATA_sha256": "ee9956573d7fc627cf517897a66950c037eec1049c3c2f335e167cd09f492542",
+    "HOST16_source_reservations": [
+      30,
+      60
+    ],
+    "UI5_command_caps_seconds": [
+      300,
+      450,
+      900,
+      30,
+      90,
+      90,
+      90,
+      90,
+      90
+    ],
+    "UI5_command_caps_sum": 2130,
+    "UI5_phase_count": 9,
+    "all_actual_runtime": null,
+    "boundary_partition": "CLI and browserless UI checks are in UI5; HOST check is only in separate HOST16. Both actual packets are required for all three affected isolated boundaries; no graph union, new lane, or duplicate HOST check inside UI5.",
+    "canonical_inventory_argv": [
+      "ACTUAL_CURRENT_LIB_ELF",
+      "--list",
+      "--color=never"
+    ],
+    "canonical_singleton_argv": [
+      "ACTUAL_CURRENT_LIB_ELF",
+      "EXACT_SELECTED_NAME",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    "deferred_unqualified": {
+      "boundary": "Needs separate same-head helper, caller-preservation and custody qualification. No helper path override, invocation, authority clearing/downgrade or role change is proposed here. It remains an explicitly unqualified affected neighbor.",
+      "facts": "retained_turn_final_action462 requires CAGENTS_TEST_RETAINED_ACTOR_HELPER463 and reexecs current test binary487 with --exact/--nocapture and env_clear488. It is not an ordinary no-child-results parent.",
+      "selected": false,
+      "selector": "host::chat::retained_actor_tests::retained_terminal_handoff_proves_original_console_cleanup",
+      "source": "src/host/chat/retained_actor_tests.rs:448"
+    },
+    "kind": "ADDITIVE_CANONICAL_ARGV_AND_SEPARATE_BOUNDARY_BUDGET_RECONCILIATION_NOT_RUNTIME_EQUIVALENCE",
+    "no_runtime_equivalence_or_prior_count_result_transfer": true,
+    "original_HOST_inventory_argv": [
+      null,
+      "--list",
+      "--format",
+      "terse"
+    ],
+    "original_HOST_singleton_argv": [
+      null,
+      "--exact",
+      "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+      "--format",
+      "pretty"
+    ],
+    "product": {
+      "head": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+      "parent": "b8ebb9ca378eb9b006f3e47eb319625047877712",
+      "tree": "246ea7398afcf6e10625954296601ca3254428e6",
+      "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15"
+    },
+    "source_reservation_limit": "Thirty/sixty source DATA reservations create no command or wait records and do not enforce aggregate source/finalization deadlines. Original2400 workload cap/remaining clamps and indefinite uncertain-custody HOLD remain unchanged."
+  },
+  "runtime_admission": {
+    "execution_authorized": false,
+    "helper_binding": null,
+    "state": "MAIN15_F95_UI5_SOURCE_REQUIRES_FROZEN_CODE_REVIEW_AND_FRESH_GRANT"
+  },
+  "schema": "main15-bb8-ui5-controller-task-data-v1",
+  "selected_names": [
+    "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+    "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+    "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+    "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+    "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too"
+  ],
+  "source": {
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15"
+  },
+  "source_reservations": "Source DATA only; no added invocation or finalization bound."
+}

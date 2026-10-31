@@ -1,0 +1,191 @@
+{
+  "kind": "BB8DF653_TITLE_OWNERSHIP_INDEPENDENT_CONSERVATION_PRIVACY_SOURCE_DELTA_REVIEW",
+  "reviewer": "/root/async_races",
+  "verdict": "EXACT_TWO_EXPRESSION_CONSERVATION_SOURCE_CLEAR; NO_BUILD_TEST_NATIVE_OR_READINESS_CLEARANCE",
+  "scope": "Only f95-to-bb8 title ownership delta, complete tree/source inverse, function/test conservation, no new privacy/authority carrier, and supplied freeze/formatter data join. Correctness/UX, original negative RAW and whole API/core audits remain separate.",
+  "identity": {
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+    "sole_parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15",
+    "observed_HEAD_tree_match": true,
+    "observed_branch": "fix/fw16-return-title-ownership-main15",
+    "raw_diff": {
+      "path": "src/app/chat_ui.rs",
+      "old_mode": "100644",
+      "new_mode": "100644",
+      "old_blob": "77681ebe5c3050ab212be626ed487e0d63618ba9",
+      "new_blob": "8aded4804a4055f04fadba8054fd26e42eeeba75",
+      "status": "M"
+    }
+  },
+  "freeze": {
+    "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-source-freeze-v1.json",
+    "sha256": "8131db186b26ee8af54b1aa623799e224634bc095741805237adc1c631b32efa",
+    "bytes": 8772,
+    "mode": "0444",
+    "hash_size_match": true
+  },
+  "independent_measurement": {
+    "base": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "entries_before": 2231,
+    "entries_after": 2231,
+    "only_changed": [
+      "src/app/chat_ui.rs"
+    ],
+    "outside_exact_mode_type_blob": 2230,
+    "delta_lines": "2\t2\tsrc/app/chat_ui.rs",
+    "source_before": {
+      "bytes": 1418988,
+      "sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3"
+    },
+    "source_after": {
+      "bytes": 1419010,
+      "sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d"
+    },
+    "patch": {
+      "bytes": 916,
+      "sha256": "3bb9d263783b8206cbee87bf9e17904bbbe54bb9a2cf0a1629de03213d3dbe0d"
+    },
+    "two_expression_fullfile_inverse": {
+      "exact": true,
+      "reconstructed_bytes": 1418988,
+      "reconstructed_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+      "rules": [
+        {
+          "before": "let title = self.card_display_title(&card);",
+          "after": "let title = self.card_display_title(&card).to_owned();",
+          "exact_unique_occurrence": true
+        },
+        {
+          "before": "title: self.card_display_title(card),",
+          "after": "title: self.card_display_title(card).to_owned(),",
+          "exact_unique_occurrence": true
+        }
+      ]
+    }
+  },
+  "function_spans": {
+    "method": "Independent immutable Git byte-oriented lexical Rust comment/string masking and balanced function extraction; not authored helper execution or Rust compilation.",
+    "before_count": 731,
+    "after_count": 731,
+    "identical_count": 729,
+    "only_changed": [
+      {
+        "name": "capture_shared_return_close",
+        "before": {
+          "name": "capture_shared_return_close",
+          "bytes": 1458,
+          "sha256": "284180bf43538c6d318dc3ae1a842f536c3df3dd71fcf5edc9a2c22c856a0e07"
+        },
+        "after": {
+          "name": "capture_shared_return_close",
+          "bytes": 1469,
+          "sha256": "48ef982b6fa604f67bfdf94427360ba0bc490c711ebcc8fc26c542c5e3cf958a"
+        },
+        "before_line": 7361,
+        "after_line": 7361
+      },
+      {
+        "name": "capture_native_return",
+        "before": {
+          "name": "capture_native_return",
+          "bytes": 1725,
+          "sha256": "a6d9a83e37643964fdc83cb765fa5f096554f611762387c13f9b49cd13da495a"
+        },
+        "after": {
+          "name": "capture_native_return",
+          "bytes": 1736,
+          "sha256": "cb2f013ceb778a6334f7f12bf0e6e532a908dc698d163db39e29598e2b962521"
+        },
+        "before_line": 13502,
+        "after_line": 13502
+      }
+    ],
+    "all_other_full_function_spans_exact_f95": true,
+    "all_existing_test_module_bytes_through_EOF_exact_f95": true,
+    "new_or_changed_test_helpers_or_parents": 0
+  },
+  "source_anchors": [
+    {
+      "function": "capture_shared_return_close",
+      "function_line": 7361,
+      "expression_line": 7389,
+      "before": "let title = self.card_display_title(&card);",
+      "after": "let title = self.card_display_title(&card).to_owned();",
+      "observation": "The owned title is computed before the immediately following terminal_returns.get_mut lookup. All owner/caller/source/origin/Arc/presentation fields and guard/order bytes are otherwise exact parent."
+    },
+    {
+      "function": "capture_native_return",
+      "function_line": 13502,
+      "expression_line": 13531,
+      "before": "title: self.card_display_title(card),",
+      "after": "title: self.card_display_title(card).to_owned(),",
+      "observation": "Only the title value is converted to owned storage. Return operation/source/Arc/presentation/origin/save_caller fields, admission checks and publication/mutation sequence are exact parent."
+    }
+  ],
+  "conservation_and_privacy": {
+    "complete_product": "Both trees have2231 entries. Exactly one100644 Rust file differs by two removed/two added source lines; all2230 other mode/type/blob entries are exactf95. No addition/deletion or mode/type change.",
+    "full_file_inverse": "Each new expression appears exactly once; replacing just those two new expressions with their old versions reconstructs the complete1418988-byte f95 chat_ui file and SHA35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3.",
+    "protected_scope": "The two changed functions are outside the prior32 protected/core spans. Every other function and every other source byte is unchanged. Full begin_chat_close_as/874-byte guards, shared-view/raw/Seed/proof/admission/q/recheck, genericNone/preflight/legacy ACK, held Close/caller/nonce context,1749 first-send, native_cleanup/retained_actor/API/control/wire/permissions/Cargo/controller/retained-helper source remain exactf95.",
+    "privacy": "No new field, serializable type, callback, action, widget ID, Debug/log path, protocol/API, caller/nonce carrier or memory persistence is added. Existing title text is copied into its existing owned storage; receipt/caller/proof/privacy surfaces are otherwise byte-identical.",
+    "prior_receipt": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-issued-return-independent-conservation-privacy-test-delta-review-v1.json",
+      "sha256": "bc758675dcc4a05c97825a721ad36bac543f913ab2935b2cebab8295bbcc0fd8",
+      "applicability": "Only unchanged source-byte findings carry through this inverse/tree proof. No old execution, semantic, compile or native result transfers."
+    }
+  },
+  "supplied_evidence_join": {
+    "refs": [
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-function-span-conservation-v1.json",
+        "bytes": 142031,
+        "sha256": "e39eb61a43bd5efc82d795f658ceac50ba6f20d9538032a218ddc174a507f9df",
+        "mode": "0o444"
+      },
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-exact-two-expression-diff-v1.patch",
+        "bytes": 916,
+        "sha256": "3bb9d263783b8206cbee87bf9e17904bbbe54bb9a2cf0a1629de03213d3dbe0d",
+        "mode": "0o444"
+      },
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stdout.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "0o444"
+      },
+      {
+        "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-official-format-stderr.log",
+        "bytes": 0,
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "mode": "0o444"
+      }
+    ],
+    "exact_patch_recomputed_from_immutable_Git": true,
+    "format_record": "Exact freeze source_only_checks records official scripts/check-format exit0/toolchunk b952be and narrower rustfmt/diff0. Both named original official stdout/stderr files match supplied zero bytes/empty SHA. This reviewer did not rerun a formatter or independently execute that command.",
+    "format_is_not": "Compilation, typechecking, test discovery/body execution, actual native evidence or resource admission."
+  },
+  "findings": {
+    "in_scope_conservation_or_privacy_blockers": [],
+    "conclusion": "The exact frozen correction stays within the two authorized title expressions and preserves every other product byte. This bounded conservation source delta is clear.",
+    "not_decided": "Whether the separately tested owning workflow now compiles and passes, correctness/UX semantic acceptance, or full product/runtime qualification. The original f95 negative remains immutable and is not retrospectively passed."
+  },
+  "limits": {
+    "performed": "Immutable Git commit/tree/diff/show reads and in-memory source/hash/JSON/lexical analysis; supplied freeze and named formatter output hash joins. One exclusive evidence receipt only.",
+    "not_performed": "No source/Git/public edits, imported/evaluated authored function/helper/module/Task, test/check/build/Cargo/rustc/formatter/native/provider execution; no authority/environment/account/process/cache/target/resource/API probes or new workers/descriptors.",
+    "actual_current_head_compile_result": null,
+    "actual_current_head_test_result": null,
+    "actual_current_head_native_result": null,
+    "actual_grant": null,
+    "adoption": false,
+    "queueable": false,
+    "publication": false,
+    "merge_ready": false,
+    "resource_acceptance": false,
+    "holds": "Current-head owning tests/native remain UNRUN. User5/FULL52/native/WHOLE/qclosed/general HOLD; physical retained helper remains explicitly deferred by Root1dda627d. PR1933 NEVER_MERGE. Originalf95/a7c8/3dd2 source/negative receipts were not altered; no C/lane/grant or result transfer."
+  },
+  "stop": true
+}

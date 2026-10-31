@@ -1,0 +1,237 @@
+{
+  "actual": {
+    "ELF": null,
+    "controller_review": null,
+    "current_resource_admission": null,
+    "grant": null,
+    "inventory_N": null,
+    "results": null
+  },
+  "issue": null,
+  "lane": {
+    "jobs": 2,
+    "lock": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c.lock",
+    "new_cache": false,
+    "rust": "1.93.0",
+    "target": "/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target"
+  },
+  "limits": "INTERMEDIATE SOURCE PREPARATION ONLY, not final runnable source or runtime admission. Three isolated checks confer zero parent credit; UI compile/list confer zero pass credit; exactly two ordinary UI singleton parents are prospective. Captured pretty/default scheduler/strict fresh inventory N-1/raw reread; no nocapture/thread override/feature union/User proxy/context repair/helper/newcache/tempbase/authority change. Caps2310 within original2400 proposed only; no current resource availability. Original waits/held pidfds/family and unbounded uncertain custody HOLD remain exact. FullELF bytes not archived; failed invoke may bypass post-failed-use hash; no every-exec/embedded-version/native/WHOLE qualification. Preparation supplies no runtime evidence; original execution phase/receipt fields and sole RAW would establish later bounded results.",
+  "packet_deadline_seconds": 2400,
+  "phase_caps_sum_seconds": 2310,
+  "physical_tool_bin": "/home/marvin/.rustup/toolchains/1.93.0-x86_64-unknown-linux-gnu/bin",
+  "planned_phase_count": 7,
+  "planned_phase_order": [
+    "cli-binary-check",
+    "host-binary-check",
+    "ui-binary-check",
+    "compile-ui-lib",
+    "inventory-ui-lib",
+    "parent-ui-lib-1",
+    "parent-ui-lib-2"
+  ],
+  "prepared_only": true,
+  "product_head": null,
+  "product_parent": null,
+  "product_pr": null,
+  "product_tree": null,
+  "readiness": false,
+  "required_absent_environment_names": [
+    "CAGENTS_UPGRADE_STATE_FIXTURE_SELECTOR",
+    "RUST_TEST_NOCAPTURE",
+    "RUST_TEST_THREADS",
+    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+    "CAGENTS_RETAINED_ACTOR_FIXTURE"
+  ],
+  "runner_path": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-return-error-ui2-preparation/qualification-packets/main15-return-error-ui2-preparation/run-packet.py",
+  "runtime_admission": {
+    "state": "INTERMEDIATE_PREPARATION_ONLY_FINAL_SOURCE_BINDING_REQUIRED",
+    "execution_authorized": false,
+    "helper_binding": null
+  },
+  "source_review": null,
+  "source_review_sha256": null,
+  "tool_pin_provenance": "Immutable donor source data only, no current installed-file/context observation",
+  "tool_sha256": {
+    "cargo": "9548937d530bf439ff1ba47a3b2bd26eeb9c3aff1961c20c01798613de922578",
+    "rustc": "d32249a7c3bfcfc67b471460386e46323accae7125e344567a12d5664d99bb57",
+    "rustdoc": "ece7829b8e7448a9d59c88080e2b16253b885c560f792002837901c7f24b7695"
+  },
+  "worktree": null,
+  "source_paths_sha256": {},
+  "artifact_groups": [
+    {
+      "id": "ui-lib",
+      "features": [
+        "ui"
+      ],
+      "manifest": "Cargo.toml",
+      "target_name": "cagents",
+      "target_kind": [
+        "lib"
+      ],
+      "compile_argv": [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "compile_seconds": 900,
+      "inventory_seconds": 30,
+      "source_predicted_compiled_names": [
+        "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+        "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody"
+      ],
+      "source_predicted_absent_names": [],
+      "selectors": [
+        {
+          "name": "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        },
+        {
+          "name": "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+          "seconds": 90,
+          "expected_stdout_child_results": 0
+        }
+      ]
+    }
+  ],
+  "binary_checks": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "seconds": 300
+    },
+    {
+      "label": "host-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "host",
+        "--bin",
+        "cagentsd"
+      ],
+      "seconds": 450
+    },
+    {
+      "label": "ui-binary-check",
+      "argv": [
+        "cargo",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "ui",
+        "--bin",
+        "cagents-ui"
+      ],
+      "seconds": 450
+    }
+  ],
+  "archive_bindings": [],
+  "controller_worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-return-error-ui2-preparation",
+  "preparation_only": true,
+  "precursor_reference": {
+    "branch": "fix/fw16-stale-shared-return-error-main15",
+    "head": "d26d4e9e76f73b4add0c050a2b1b8f52f820e248",
+    "original_base": "aeb1345d5ca48e5999b799b5b607bc81dfdd06d8",
+    "original_base_tree": "fa12c3229556f732c4d7232d3d6a706e8cfc9a74",
+    "parent": "6ceaaa7a2ff588efc2655d40d8cc2a8ea27e46c4",
+    "parent_tree": "489fab66f88528745deed99468effde19284414d",
+    "tree": "1e13f499090af31858cc085c1c1955903a7b5a76",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-stale-shared-return-error-main15"
+  },
+  "precursor_reference_is_final_product": false,
+  "precursor_input_refs": {
+    "precursor_proposal": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-main15-lead-source-handoff-and-two-parent-qualification-proposal-v1.json",
+      "sha256": "6ea3915e9cb5af1dc38241a01d1be0daf78bf6b21ec6f513ed91b1fe40bee1f1",
+      "bytes": 17750,
+      "scope": "IMMUTABLE_PRECURSOR_SOURCE_DATA_NOT_FINAL_APPROVAL"
+    },
+    "default_scheduler_addendum": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-two-return-parent-default-scheduler-argv-correction-addendum-v1.json",
+      "sha256": "6f99e090455482aedcfb723de36682fe653d1493df0e5ad6752e66785a836edd",
+      "bytes": 4323,
+      "scope": "IMMUTABLE_PRECURSOR_SOURCE_DATA_NOT_FINAL_APPROVAL"
+    },
+    "caller_classifier": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-two-return-parent-caller-graph-source-classification-v1.json",
+      "sha256": "daee3662c177ac59f6b723cf4645d93c9a2af8ed87663be3a0bdc3416429e4bb",
+      "bytes": 13120,
+      "scope": "IMMUTABLE_PRECURSOR_SOURCE_DATA_NOT_FINAL_APPROVAL"
+    },
+    "additive_precursor_v2": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/d26d4e9e-main15-lead-source-handoff-and-two-parent-qualification-proposal-v2.json",
+      "sha256": "8a4511a9f7562980c5743d226c8f3a185d6ef957cf4d2d8309bf531bb7801705",
+      "bytes": 26503,
+      "scope": "IMMUTABLE_PRECURSOR_SOURCE_DATA_NOT_FINAL_APPROVAL"
+    }
+  },
+  "pending_final_binding_inputs": [
+    "Genuine FINAL composed product head/tree/sole parent and readable exact source objects; d26 is precursor only. Root terminal-API correction and final Main15 consumer integration remain pending; additive v2 bounds the precursor direct-Arc challenge without supplying the final tuple.",
+    "Final product source freeze with real source file/mode/blob/SHA pins, actual owning definitions/cfg/helper graph and exact source conservation. No d26 source proof transfers as final approval.",
+    "Genuine final API and Main15 consumer/directArc/caller/error/recovery reviews, bounded UX/source and conservation receipts in their actual schemas, plus authorized source publication/adoption.",
+    "Refreshed final parent caller/body classification and exact selected-name order from final source. Ordinary inherited Agent is a precursor source class; actual causal bodies/caller/authority remain unobserved.",
+    "Task-main genuine typed proof reader, final product WT/source pins/archive binding and safe archive-parent enrollment replacing the fixed preparation refusal through a source change.",
+    "Fresh frozen controller/plan identity and independent actual-code/conservation/argv review after final binding; final external handoff may leave only grant slot5 NULL.",
+    "Separate actual current EC source/resource adoption and one-use scoped grant; current physical Rust1.93/tools/target/lock/context/source cleanliness and availability remain unobserved.",
+    "Fresh actual UI lib ELF/compiler CargoJSON/inventory N and strict raw results with original waits/custody; no precomputed N or old runtime result transfer.",
+    "Native matched Before/After full-flow interaction, HOST cleanup authority/custody, realistic responsiveness and independent UX remain separate unqualified gates, not settled by these two parents."
+  ],
+  "prospective_test_argv_templates": [
+    [
+      null,
+      "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ],
+    [
+      null,
+      "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+      "--exact",
+      "--format=pretty",
+      "--color=never"
+    ]
+  ],
+  "superseded_precursor_recommendations": {
+    "nocapture": "Not adopted; canonical captured pretty output is required.",
+    "test_threads": "No explicit thread override; canonical required-absent RUST_TEST_THREADS policy remains. No live environment read.",
+    "CargoJSON": "Use current canonical --message-format=json, not old json-render-diagnostics recommendation.",
+    "caller": "Natural inherited authority unchanged; synthetic test caller strings are not genuine authority."
+  },
+  "prospective_controller_argv": {
+    "status": "NOT_SUBMITTABLE_PREPARATION_ONLY",
+    "cwd": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-return-error-ui2-preparation",
+    "argv": [
+      "/usr/bin/python3",
+      "-I",
+      "-B",
+      "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-return-error-ui2-preparation/qualification-packets/main15-return-error-ui2-preparation/run-packet.py",
+      "--grant",
+      null,
+      "--runner-sha256",
+      null,
+      "--controller-review",
+      null,
+      "--controller-review-sha256",
+      null
+    ]
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "bytes_flags_changed_by_author": false,
+  "filesystem_sha256": "5a91f02d49cd5c10df5c03db79d01529a1aa96f800d1e4a4eac64e8019bf8987",
+  "git_sha256": "6ebdb617a8104a7756d0cf36578ab01103dc9f07e4dc6feb751296b9c402faf7",
+  "index_flag": "H AGENTS.md",
+  "kind": "UNCHANGED_INSTRUCTION_BASELINE_VARIANCE_NOT_QUALIFICATION",
+  "latest_user_AGENTS_instructions_followed": true,
+  "variance": true
+}

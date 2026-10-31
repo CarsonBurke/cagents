@@ -1,0 +1,434 @@
+{
+  "actual_author_utility_rejection": {
+    "candidate_or_runtime_attempt": false,
+    "error": "exec_command failed: CreateProcess { message: \"Rejected(\\\"Failed to create unified exec process: Argument list too long (os error 7)\\\")\" }",
+    "interpretation": "Unified exec rejected process creation before the source author utility could run; not a candidate/controller/runtime failure.",
+    "operation": "First external map artifact write with embedded full prior read-tool outputs",
+    "returned_exec_result": null,
+    "session_id": null,
+    "source_or_packet_write_observed": false,
+    "tool": "tools.exec_command via functions.exec"
+  },
+  "actual_tools_ELFs_N_results": null,
+  "chronology": {
+    "actual_Root_adoption_publication_now_verified": true,
+    "at_initial_intake_Root_adoption_publication": null,
+    "no_source_implementation_in_this_artifact": true,
+    "subsequent_authenticated_Root_source_authorization": "11caede9-0a8a-4bdb-ba73-3bf8bcff38f9"
+  },
+  "grant": null,
+  "kind": "FINITE_SOURCE_REBIND_INTAKE_MAIN15_BB8_UI5_HOST16_NOT_CODE_OR_RUNTIME_APPROVAL",
+  "limits": [
+    "Physical retained helper DEFERRED; no reexec/envclear/helper neighbor. Original47 ordinary+5 genuine-User startup52 and full55 stack/native/WHOLE remain unqualified.",
+    "Original f95 CLI0/UIcheck101 negative and no owning test invocations are preserved as reported, no RAW rereview or result transfer.",
+    "UI5 9 commands2130 and HOST16 19 commands2250 unchanged within2400; source reservations30/60 are not command invocations or uncertain-finalization caps.",
+    "No candidate import/evaluation/function/parser example/test/compiler/helper/runtime/env/tool/resource/context/process/target/account/API or public action."
+  ],
+  "minimal_seams": [
+    "Only task main/admission reader and WT/PLAN/PLAN_SHA/data/own paths/proof archives/inverse/manifest need change. grouped_contracts,parent_accounting, all other defs/five nested, canonical9004, strict parser/execute/raw reread/FULL3790/context/owner/HOLD/Cclose/compact tail and phase/cap/cardinality remain exact immediate f95 controller.",
+    "UI5 main849-850 current tuples become bb8; retain f95/tree246e/parentb8,615e API and main442 separately as BASE. Existing f95 proof checks880-938 must bind immutable base-f95 roles, not retarget old source receipts. HOST corresponding same task reader is separately rebound.",
+    "Critical UI5 pin joins903/908/921/936 must compare old f95 freeze/authority/conservation/three-caller records to base_f95_source_paths_sha256 (old35c465f7 chat_ui), not new current plan pin cab7a8e5. Current data/map/selected-source product+enrollment uses bb8; other43 pins unchanged by genuine direct-parent conservation.",
+    "Preserve original f95 adoption/publication/handoff/delivery/freeze/correctness/UX/conservation/caller/API receipts and old product snapshot bytes under explicit base_f95 keys. New bb8 correction handoff/freeze/code/conservation/format/adoption/publication are a separate typed current layer. No verdict normalization, snapshot rewriting or wholehead approval.",
+    "Own successor paths must be declared once and bind runner PLAN,PLAN_SHA,plan.runner_path/source_review/archive refs, source-binding local paths and template argv3/cwd. __file__/PLAN/archive/template must statically agree; no6af geometry mistake. Product WT is genuine fw16-return-title-ownership-main15.",
+    "Retain old snapshot chat_ui35c4 as base evidence; add current cab7 snapshot plus genuine new proofs/historical7bfc. Safe relative parent creation before byte-exact evidence_copy remains. Derive actual future files/payload/archive counts; do not equate85 physical originals with90 binding records.",
+    "Immediate successor inverse must restore entire old runner incl only main/WT/PLAN/PLAN_SHA; also refresh original donor inverses, source-conservation and manifest from actual bytes. All current scalar/cardinality/default scheduler/captured pretty/zero-child-footer semantics unchanged."
+  ],
+  "new_controller_heads": null,
+  "original_tool_metadata": [
+    {
+      "chunk_id": "e97c24",
+      "exit_code": 0,
+      "original_token_count": 13161,
+      "session_id": null,
+      "wall_time_seconds": 1.9777e-05
+    },
+    {
+      "chunk_id": "787307",
+      "exit_code": 0,
+      "original_token_count": 1320,
+      "session_id": null,
+      "wall_time_seconds": 1.3806e-05
+    },
+    {
+      "chunk_id": "d96ee9",
+      "exit_code": 0,
+      "original_token_count": 1573,
+      "session_id": null,
+      "wall_time_seconds": 9.628e-06
+    },
+    {
+      "chunk_id": "0eee53",
+      "exit_code": 0,
+      "original_token_count": 6160,
+      "session_id": null,
+      "wall_time_seconds": 1.033e-05
+    },
+    {
+      "chunk_id": "a6ed79",
+      "exit_code": 0,
+      "original_token_count": 6031,
+      "session_id": null,
+      "wall_time_seconds": 1.3806e-05
+    },
+    {
+      "chunk_id": "f2f098",
+      "exit_code": 0,
+      "original_token_count": 1613,
+      "session_id": null,
+      "wall_time_seconds": 2.4707e-05
+    },
+    {
+      "chunk_id": "82fdbe",
+      "exit_code": 0,
+      "original_token_count": 1485,
+      "session_id": null,
+      "wall_time_seconds": 1.2153e-05
+    }
+  ],
+  "pending_after_map": [
+    "Exact bb8 source object availability/import for authorized new worktrees, not inspected by this read-only intake.",
+    "Two future immutable source code/caller/oracle and separate conservation reviews with top product ABI bb8/tree6ae8 and distinct controller identity. Old a7c8/3dd2 reviews remain base history.",
+    "External Root handoff fills actual review9/11 only after fresh reviews; grant5 remainsNULL. Tracked prereview9/11NULL template NOT_SUBMITTABLE, no selfhashcycle.",
+    "Separate fresh runtime grant/current context/tools/actual emitted ELFs/N/results; allNULL here."
+  ],
+  "postrun_only7bfc": {
+    "bridge": "New bb8 source correction preserves existing caller/helper/test spans; this bridge never turns old7bfc into bb8 wholeUser/HOST/stack approval or retroactive runtime evidence.",
+    "current_consumption": "No references in either old runner/plan/binding/command/map/selected/reconciliation; exact static search f2f098. Not part of original f95 prelaunch archive/use/admission.",
+    "future_packet_copy": "dependencies/f95-UI5-postrun-scope-ABI-intake.json",
+    "future_safe_archive_name": "source-archive/dependencies/f95-UI5-postrun-scope-ABI-intake.json",
+    "future_source_role": "base_f95_UI5_postrun_scope_ABI",
+    "original_identity": "f95/tree246e/parentb8 product; a7c8/tree1533 controller; unchanged. source intake for five Return components only."
+  },
+  "product": {
+    "branch": "fix/fw16-return-title-ownership-main15",
+    "head": "bb8df65354297c99228c6ff4f1aef75e9ae79b23",
+    "parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+    "parent_tree": "246ea7398afcf6e10625954296601ca3254428e6",
+    "tree": "6ae8fd5787f1c33349ac6e8a9f966c2e719f126f",
+    "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/fw16-return-title-ownership-main15"
+  },
+  "profiles": {
+    "HOST16": {
+      "absolute_cap": 2400,
+      "binary_checks": [
+        {
+          "argv": [
+            "cargo",
+            "check",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "host",
+            "--bin",
+            "cagentsd"
+          ],
+          "label": "host-binary-check",
+          "seconds": 480
+        }
+      ],
+      "caps_sum": 2250,
+      "future_own_path_NOT_CREATED": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-host16-source",
+      "future_packet_relative_path": "qualification-packets/main15-bb8-host16",
+      "immutable_controller": {
+        "branch": "qualification/coord16-main15-f95-issued-return-host16",
+        "head": "3dd236df2ce3878ca059f6aadbb9b195d3c6fe0e",
+        "packet": "qualification-packets/main15-f95-issued-return-host16",
+        "sole_parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+        "tree": "fe32c7229c89b054c40d0877ed6b537fab99b1c2",
+        "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-issued-return-host16-source"
+      },
+      "old_archive_composition": {
+        "binding_records": 90,
+        "bound_current_inputs": [
+          "command-data.json",
+          "current-source-map.json",
+          "instruction-source.json",
+          "reconciliation.json",
+          "selected-source-contract.json",
+          "source-binding.json"
+        ],
+        "bound_originals": 84,
+        "materialized_runtime_archive": null,
+        "physical_dependency_files": 41,
+        "physical_source_snapshot_files": 44,
+        "physical_total": 85,
+        "source_index_present_unarchived_history": [
+          "dependencies/base-search-UI5/source-binding.json"
+        ]
+      },
+      "phase_count": 19,
+      "plan_sha256": "0edd5020f753c30f7ab4f130ffa1fe47f13ddf99e2ab20ad1edd2a706373cc76",
+      "reviewed_handoff": {
+        "path": "/var/tmp/coord16-main15-f95-packets-lead-lzobj2ih/HOST16-reviewed-handoff.json",
+        "sha256": "c1b55010a290dd01e74068c5ada0336a0a81ffa2850f89e32aa881fa5655f27a"
+      },
+      "runner_sha256": "471b91174f01c5d3262e8da3debb48421b4015fe6b91827620c9da40c28b7b5c",
+      "selectors": [
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::issued_close_preserves_same_id_same_recipe_successor",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::positive_original_close_and_lost_reply_replay_never_touch_successor",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::nil_unknown_and_wrong_terminal_receipts_refuse_without_effects",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::changed_native_instance_refuses_before_stopping_original_terminal",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::nonce_ack_is_effect_free_and_cannot_evict_closing_or_newer_capability",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::natural_exit_requires_actual_original_release_and_absence_stays_unknown",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::issuance_reuses_original_owner_and_capacity_refuses_without_worker_effects",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::unwound_attempt_retains_original_custody_and_allows_explicit_original_retry",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::terminal_return_cleanup::tests::upgrade_requires_custody_for_unconfirmed_original_but_not_settled_receipts",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::tests::issued_codex_return_closes_original_pair_and_caches_positive_reply",
+          "seconds": 60
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "chat::client::tests::handoff_ack_transmits_only_the_captured_receipt_for_each_terminal",
+          "seconds": 45
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "terminal::ipc::tests::framing_round_trips_and_rejects_oversized_prefixes",
+          "seconds": 15
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "control::tests::handshake_rejects_versions_incomplete_proofs_mismatches_and_streaming",
+          "seconds": 45
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::tests::managed_cli_keeps_the_active_actor_and_close_retires_both_views",
+          "seconds": 45
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::tests::standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence",
+          "seconds": 45
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "host::chat::tests::durable_terminal_commit_retires_evidence_after_terminal_retirement",
+          "seconds": 45
+        }
+      ],
+      "source_binding_sha256": "1f8dbef099c8583fbaa0c009a44386ccb1e2c75a9baa763d8e5593a7df7af9a1",
+      "source_pin_count": 44
+    },
+    "UI5": {
+      "absolute_cap": 2400,
+      "binary_checks": [
+        {
+          "argv": [
+            "cargo",
+            "check",
+            "--locked",
+            "--no-default-features",
+            "--bin",
+            "cagents"
+          ],
+          "label": "cli-binary-check",
+          "seconds": 300
+        },
+        {
+          "argv": [
+            "cargo",
+            "check",
+            "--locked",
+            "--no-default-features",
+            "--features",
+            "ui",
+            "--bin",
+            "cagents-ui"
+          ],
+          "label": "ui-binary-check",
+          "seconds": 450
+        }
+      ],
+      "caps_sum": 2130,
+      "future_own_path_NOT_CREATED": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-bb8-ui5-source",
+      "future_packet_relative_path": "qualification-packets/main15-bb8-ui5",
+      "immutable_controller": {
+        "branch": "qualification/coord16-main15-f95-return-error-ui5",
+        "head": "a7c8f4c2a9ea158e40b0c97ac2e9500f548fff29",
+        "packet": "qualification-packets/main15-f95-return-error-ui5",
+        "sole_parent": "f95df2da80a23b2a50c8c2304e19805423ca7da3",
+        "tree": "153390d555aeeff38c5f505d1c1fa4900d4807d4",
+        "worktree": "/home/marvin/Documents/repositories/cagents/.worktrees/coord16-main15-f95-return-error-ui5-source"
+      },
+      "old_archive_composition": {
+        "binding_records": 90,
+        "bound_current_inputs": [
+          "command-data.json",
+          "current-source-map.json",
+          "instruction-source.json",
+          "reconciliation.json",
+          "selected-source-contract.json",
+          "source-binding.json"
+        ],
+        "bound_originals": 84,
+        "materialized_runtime_archive": null,
+        "physical_dependency_files": 41,
+        "physical_source_snapshot_files": 44,
+        "physical_total": 85,
+        "source_index_present_unarchived_history": [
+          "dependencies/base-search-UI5/source-binding.json"
+        ]
+      },
+      "phase_count": 9,
+      "plan_sha256": "2d779fd3585c084ce19799cb2e225b58d46ba7b2a85622619880274a25ebc82e",
+      "reviewed_handoff": {
+        "path": "/var/tmp/coord16-main15-f95-packets-lead-lzobj2ih/UI5-reviewed-handoff.json",
+        "sha256": "438e152c1b00503e6c94c65869a8c8b2960825e95479640a39cd1d76691399b6"
+      },
+      "runner_sha256": "337258965c34ab95759552e27b63682751468e622cd9781ddc553c6336ec7474",
+      "selectors": [
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::stale_shared_return_error_keeps_original_close_intent_without_closing_the_replacement",
+          "seconds": 90
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::current_shared_return_error_continues_the_first_close_and_retains_retry_custody",
+          "seconds": 90
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::a_chat_whose_return_failed_reads_the_activity_it_missed",
+          "seconds": 90
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::late_handoff_reply_cannot_consume_a_restart_close",
+          "seconds": 90
+        },
+        {
+          "expected_stdout_child_results": 0,
+          "name": "app::chat_ui::tests::a_codex_chat_closed_during_its_daemon_return_closes_its_cli_too",
+          "seconds": 90
+        }
+      ],
+      "source_binding_sha256": "8cdf8e8494443080ba00dd2beacef6fac10085d53e032f2cc1b04899a8aa667f",
+      "source_pin_count": 44
+    }
+  },
+  "queue": null,
+  "read_display_limit": "Initial full handoff and combined batch displays were truncated; full source files were hashchecked/parsed. No hidden display content asserted.",
+  "source_correction": {
+    "bb8_sha256": "cab7a8e5f63940020b0fbc37605669cdfd5dd5af87dc4bf1290e05b5e5829f2d",
+    "f95_sha256": "35c465f71618d5485d54ecb5dcbcfe5a8a06e57eebd959a2d5110df5f4c1dce3",
+    "path": "src/app/chat_ui.rs",
+    "scope": "Exact two .to_owned expressions; source-only existing test/helper/caller spans unchanged per genuine receipts.2231 entries/2230 outside exact directf95; not a new whole-product review."
+  },
+  "typed_new_roles": {
+    "Root_adoption": {
+      "schema": "issued_return_bb8df653_title_ownership_root_source_adoption_v1",
+      "source_publication_snapshot": "PENDING_NONFORCE_F95_TO_BB8_ON_EXISTING_FIX_BRANCH",
+      "tuple": "product.head/tree/parent"
+    },
+    "code": {
+      "findings": "blockers == []",
+      "schema": "main15-bb8df653-return-title-ownership-independent-source-delta-review-v1",
+      "tuple": "source.head/tree/parent",
+      "verdict": "CLEAR_FOR_EXACT_TWO_TITLE_OWNERSHIP_EXPRESSIONS_AT_SOURCE_LEVEL; NO_NEW_CORRECTNESS_CALLER_OR_UX_SOURCE_BLOCKER; COMPILE_TEST_NATIVE_UNRUN"
+    },
+    "conservation": {
+      "findings": "findings.in_scope_conservation_or_privacy_blockers == []",
+      "freeze": "freeze.sha256",
+      "kind": "BB8DF653_TITLE_OWNERSHIP_INDEPENDENT_CONSERVATION_PRIVACY_SOURCE_DELTA_REVIEW",
+      "tuple": "identity.head/tree/sole_parent",
+      "verdict": "EXACT_TWO_EXPRESSION_CONSERVATION_SOURCE_CLEAR; NO_BUILD_TEST_NATIVE_OR_READINESS_CLEARANCE"
+    },
+    "freeze": {
+      "kind": "return-title-ownership-exact-two-expression-source-freeze-v1",
+      "pins": "source[src/app/chat_ui.rs].before_sha256/after_sha256",
+      "publication_snapshot": null,
+      "tuple_fields": [
+        "head",
+        "tree",
+        "parent"
+      ]
+    },
+    "late_format": {
+      "links": "prior_independent_review.sha256=dd632b62; late_author_freeze.sha256=8131db18; format only",
+      "schema": "main15-bb8df653-title-source-review-late-freeze-format-binding-addendum-v1"
+    },
+    "publication": {
+      "links": "source_adoption.sha256==81e56319; push_final.exit_code==0; readback.head==bb8; branch fix/fw16-issued-return-cleanup-api",
+      "schema": "issued_return_bb8df653_title_ownership_reviewed_source_publication_v1",
+      "tuple": "product string/tree; previous=f95"
+    }
+  },
+  "verified_refs": {
+    "Main15_handoff": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-main15-two-title-source-correction-reviewed-handoff-v1.json",
+      "sha256": "b3e3ead0f9d85260c5b2867dcbd4073c2c2825ea14c589f0489f6b4876e6227f"
+    },
+    "Root_adoption": {
+      "path": "/tmp/fw16-backend-ec204421/issued-return-bb8df653-title-ownership-root-source-adoption-v1.json",
+      "sha256": "81e5631986046571b2388fef51997daab6c370964a2c3463f3e61a89b0cc7a94"
+    },
+    "author_freeze": {
+      "bytes": 8772,
+      "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-source-freeze-v1.json",
+      "sha256": "8131db186b26ee8af54b1aa623799e224634bc095741805237adc1c631b32efa"
+    },
+    "historical_POSTRUN_UI5_scope_ABI": {
+      "path": "/tmp/held-saved-scope-fw16-evidence/f95df2da-a7c8f4c2-UI5-reviewed-controller-main15-lead-scope-ABI-intake-v1.json",
+      "sha256": "7bfc05fea563f2837ef60ac3accd162b6dac0a6c00d27fc8caef3ad449e79138"
+    },
+    "independent_conservation_privacy_review": {
+      "bytes": 10214,
+      "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-title-ownership-independent-conservation-privacy-source-review-v1.json",
+      "sha256": "949805650285374751f4b97cb8b1d938ce29c404a10080cff0ea3b2db245bbf6"
+    },
+    "independent_correctness_caller_UX_review": {
+      "bytes": 6860,
+      "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-ownership-independent-source-review-v1.json",
+      "sha256": "dd632b6257efaac8ffd24d22abc2b52129dc24ec3572beaff6fe96022d2c8e8e"
+    },
+    "late_format_binding_addendum": {
+      "bytes": 2913,
+      "path": "/tmp/held-saved-scope-fw16-evidence/bb8df653-return-title-source-review-freeze-format-binding-addendum-v1.json",
+      "sha256": "a305a7d79759a33a4083104fbfa62196295d4b0f03e191426cf88d5032b76f73"
+    },
+    "publication": {
+      "path": "/tmp/fw16-backend-ec204421/issued-return-bb8df653-title-ownership-reviewed-source-publication-v1.json",
+      "sha256": "8d14ce129c0833d55f7fba198f84839cab095ae9ec8ee270c31a2e8bc1400141"
+    }
+  }
+}
