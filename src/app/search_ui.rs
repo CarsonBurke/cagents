@@ -853,16 +853,11 @@ mod tests {
         for replace in [false, true] {
             let model = sidebar::tests::panel_model();
             let sidebar = sidebar::tests::panel_state(&model);
-            let mut state = State {
-                root: sidebar.active_worktree().cloned(),
-                generation: 41,
-                options: Options {
-                    query: "needle".into(),
-                    ..Options::default()
-                },
-                error: Some("original error".into()),
-                ..State::default()
-            };
+            let mut state = State::default();
+            state.root = sidebar.active_worktree().cloned();
+            state.generation = 41;
+            state.options.query = "needle".into();
+            state.error = Some("original error".into());
             let control = retry_control(&state, true);
             let mut tree = Tree::new(control.as_widget());
             drop(control);
@@ -926,20 +921,18 @@ mod tests {
         for replace in [false, true] {
             let model = sidebar::tests::panel_model();
             let sidebar = sidebar::tests::panel_state(&model);
-            let mut state = State {
-                root: sidebar.active_worktree().cloned(),
-                generation: 41,
-                matches: vec![project_search::Match {
-                    path: "original.rs".into(),
-                    line: 0,
-                    column: 0,
-                    length: 3,
-                    line_identity: project_search::LineIdentity::new("hit"),
-                    snippet: "hit".into(),
-                    highlight: 0..3,
-                }],
-                ..State::default()
-            };
+            let mut state = State::default();
+            state.root = sidebar.active_worktree().cloned();
+            state.generation = 41;
+            state.matches = vec![project_search::Match {
+                path: "original.rs".into(),
+                line: 0,
+                column: 0,
+                length: 3,
+                line_identity: project_search::LineIdentity::new("hit"),
+                snippet: "hit".into(),
+                highlight: 0..3,
+            }];
             let row = result_row(&state, &state.matches[0], 0, true);
             let mut tree = Tree::new(row.as_widget());
             drop(row);
