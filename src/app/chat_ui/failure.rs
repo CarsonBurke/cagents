@@ -12,6 +12,194 @@ enum Source {
     Snapshot,
 }
 
+/// Child originals are read only through their published owned-source proof.
+/// Resident details remain an explicitly bounded diagnostic preview.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct CopyPlan {
+    parts: Vec<(Source, Option<chat::TextCopySource>, String)>,
+}
+
+fn child_source<'a>(snapshot: &'a Snapshot, source: &Source) -> Option<&'a str> {
+    match source {
+        Source::ChildItem(child, id) => snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)?
+            .items
+            .iter()
+            .find(|item| &item.id == id)
+            .and_then(|item| match &item.content {
+                ItemContent::Text { text, .. } => Some(text.as_str()),
+                ItemContent::Delivery { body, .. } => Some(body.as_str()),
+                ItemContent::Tool { output, .. } => Some(output.as_str()),
+                _ => None,
+            }),
+        Source::ChildDetail(child) => snapshot
+            .subagents
+            .iter()
+            .find(|agent| &agent.id == child)
+            .map(|agent| agent.detail.as_str()),
+        _ => None,
+    }
+}
+
+fn child_copy_source(snapshot: &Snapshot, child: &str, id: &str) -> Option<chat::TextCopySource> {
+    let index = snapshot
+        .subagents
+        .iter()
+        .find(|agent| agent.id == child)?
+        .items
+        .iter()
+        .position(|item| item.id == id)?;
+    snapshot
+        .text_copy_sources
+        .children
+        .get(child)?
+        .get(index)?
+        .clone()
+        .filter(|source| source.scope == (chat::TextCopyScope::Subagent { id: child.into() }))
+}
+
+impl CopyPlan {
+    pub(super) fn is_current(&self, snapshot: &Snapshot) -> bool {
+        self.parts
+            .iter()
+            .all(|(identity, source, text)| match (identity, source) {
+                (Source::ChildItem(child, item), Some(source)) => {
+                    child_copy_source(snapshot, child, item).as_ref() == Some(source)
+                        && child_source(snapshot, identity) == Some(text.as_str())
+                }
+                (_, None) => child_source(snapshot, identity) == Some(text.as_str()),
+                _ => false,
+            })
+    }
+
+    pub(super) fn is_current_or_withdrawn(&self, snapshot: &Snapshot) -> bool {
+        self.parts.iter().all(|(identity, source, preview)| {
+            if child_source(snapshot, identity) != Some(preview.as_str()) {
+                return false;
+            }
+            match (identity, source) {
+                (Source::ChildItem(child, item), Some(captured)) => {
+                    child_copy_source(snapshot, child, item)
+                        .as_ref()
+                        .is_none_or(|current| current == captured)
+                }
+                (_, None) => true,
+                _ => false,
+            }
+        })
+    }
+
+    pub(super) fn read(
+        &self,
+        handle: &ClientHandle,
+        current: impl Fn() -> bool,
+    ) -> Result<String, String> {
+        self.read_with(current, |source| handle.copy_text(source.clone()))
+    }
+
+    fn read_with(
+        &self,
+        current: impl Fn() -> bool,
+        mut read: impl FnMut(&chat::TextCopySource) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let mut originals = Vec::new();
+        let mut bytes = 0usize;
+        let started = Instant::now();
+        for (_, source, literal) in &self.parts {
+            // Do not keep admitting independent reads after the user has
+            // copied something else, or accumulate per-source timeouts forever.
+            // An in-flight read retains the client's existing bounded timeout.
+            if !current() || started.elapsed() >= Duration::from_secs(30) {
+                return Err("Diagnostic copy was superseded or exceeded its read window".into());
+            }
+            let text = match source {
+                Some(source) => read(source)?,
+                None => literal.clone(),
+            };
+            if !current() {
+                return Err("Diagnostic copy was superseded".into());
+            }
+            if !originals.contains(&text) {
+                bytes = bytes.saturating_add(text.len()).saturating_add(7);
+                if bytes > chat::TEXT_COPY_LIMIT_BYTES {
+                    return Err("Diagnostic originals exceed the clipboard limit".into());
+                }
+                originals.push(text);
+            }
+        }
+        Ok(originals.join("\n\n---\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod retained_original_tests {
+    use super::*;
+
+    #[test]
+    fn worker_assembles_distinct_originals_and_stops_after_superseding_copy() {
+        let first = format!(
+            "first request-id\r\n{}\nTAIL λ",
+            "猫 original A\n".repeat(20_000)
+        );
+        let second = "second request-id\nDistinct original B\n".to_owned();
+        let cache = uuid::Uuid::new_v4();
+        let plan = CopyPlan {
+            parts: (1..=3)
+                .map(|token| {
+                    (
+                        Source::ChildItem("child".into(), token.to_string()),
+                        Some(chat::TextCopySource {
+                            cache,
+                            scope: chat::TextCopyScope::Subagent { id: "child".into() },
+                            token,
+                            revision: 1,
+                            bytes: if token == 2 {
+                                second.len()
+                            } else {
+                                first.len()
+                            } as u64,
+                        }),
+                        "bounded preview".into(),
+                    )
+                })
+                .collect(),
+        };
+        let mut reads = Vec::new();
+        let actual = plan
+            .read_with(
+                || true,
+                |source| {
+                    reads.push(source.token);
+                    Ok(if source.token == 2 {
+                        second.clone()
+                    } else {
+                        first.clone()
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(reads, vec![1, 2, 3]);
+        assert_eq!(actual, format!("{first}\n\n---\n\n{second}"));
+        let current = std::cell::Cell::new(true);
+        let mut reads = 0;
+        let result = plan.read_with(
+            || current.get(),
+            |_| {
+                reads += 1;
+                current.set(false);
+                Ok(first.clone())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            reads, 1,
+            "a superseded worker cannot keep reading every source"
+        );
+    }
+}
+
 /// A notice kept in the transcript after its live source has gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Note {
@@ -729,6 +917,104 @@ struct Preview {
 }
 
 impl Runtime {
+    pub(super) fn failure_plan_still_shown(&self, key: &str, plan: &CopyPlan) -> bool {
+        self.failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)
+            .is_some_and(|incident| {
+                incident.sources.len() == plan.parts.len()
+                    && incident
+                        .sources
+                        .iter()
+                        .zip(&plan.parts)
+                        .all(|(source, (captured, _, _))| source == captured)
+            })
+    }
+    pub(super) fn failure_originals_retained(&self, key: &str) -> Option<bool> {
+        let incident = self
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)?;
+        let mut retained = false;
+        let mut complete = true;
+        for source in &incident.sources {
+            if let Source::ChildItem(child, id) = source {
+                let item = self
+                    .snapshot
+                    .subagents
+                    .iter()
+                    .find(|agent| &agent.id == child)
+                    .and_then(|agent| agent.items.iter().find(|item| &item.id == id));
+                if item.is_some_and(|item| {
+                    chat::failure::provider_error_text(Provider::Codex, item).is_some()
+                }) {
+                    retained = true;
+                    complete &= child_copy_source(&self.snapshot, child, id).is_some();
+                }
+            } else if !matches!(source, Source::ChildDetail(_)) {
+                complete = false;
+            }
+        }
+        retained.then_some(complete)
+    }
+
+    pub(super) fn failure_copy_plan(&self, key: &str) -> Result<Option<CopyPlan>, String> {
+        let Some(incident) = self
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.key == key)
+        else {
+            return Ok(None);
+        };
+        let retained = incident.sources.iter().any(|source| match source {
+            Source::ChildItem(child, id) => self
+                .snapshot
+                .subagents
+                .iter()
+                .find(|agent| &agent.id == child)
+                .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
+                .is_some_and(|item| {
+                    chat::failure::provider_error_text(Provider::Codex, item).is_some()
+                }),
+            _ => false,
+        });
+        if !retained {
+            return Ok(None);
+        }
+        let mut parts = Vec::new();
+        for identity in &incident.sources {
+            let text = child_source(&self.snapshot, identity)
+                .ok_or("Original diagnostic unavailable in this view")?;
+            let source = match identity {
+                Source::ChildItem(child, id) => {
+                    let item = self
+                        .snapshot
+                        .subagents
+                        .iter()
+                        .find(|agent| &agent.id == child)
+                        .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
+                        .ok_or("Original diagnostic item is unavailable")?;
+                    if chat::failure::provider_error_text(Provider::Codex, item).is_some() {
+                        Some(child_copy_source(&self.snapshot, child, id).ok_or(
+                            "Original diagnostic unavailable: it was refused, changed or evicted",
+                        )?)
+                    } else {
+                        None
+                    }
+                }
+                Source::ChildDetail(_) => None,
+                _ => return Err("Original diagnostic unavailable in this view".into()),
+            };
+            // Capture only the bounded resident preview, including for paged
+            // originals, so withdrawal errors cannot attach to a replacement.
+            parts.push((identity.clone(), source, text.into()));
+        }
+        Ok(Some(CopyPlan { parts }))
+    }
+
     pub(super) fn reconcile_failure_ui(&mut self) -> bool {
         if self.failure_ui.local_error.as_deref() == self.error.as_deref() {
             return false;
@@ -1016,7 +1302,15 @@ impl Runtime {
                     .max_height(240)
                     .into(),
                 );
-                if omitted {
+                let retained = self.failure_originals_retained(&incident.key);
+                if let Some(available) = retained {
+                    let caption = if !available {
+                        "Diagnostic preview only. Original unavailable: it was refused, changed or evicted."
+                    } else {
+                        "Diagnostic preview only. Copy details retrieves the retained originals."
+                    };
+                    rows.push(design::caption(caption).width(Length::Fill).into());
+                } else if omitted {
                     rows.push(design::caption("Diagnostic preview is limited to 8 KiB. Copy details includes the complete originals.").width(Length::Fill).into());
                 }
             }
