@@ -3243,6 +3243,8 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
+        // Every child spawned from here on must register with the sweep.
+        crate::daemon::adopted_orphans::become_sweeper();
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
             let server = Server::start_after_scope_enrollment(

@@ -68,6 +68,11 @@ pub(crate) fn sweeping() -> bool {
     SWEEPING.load(Ordering::Acquire)
 }
 
+/// Declares, before any child is spawned, that this process will sweep.
+pub(crate) fn become_sweeper() {
+    SWEEPING.store(true, Ordering::Release);
+}
+
 /// Outcome of one bounded sweep.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Sweep {
@@ -81,7 +86,7 @@ pub(crate) struct Sweep {
 /// otherwise touched. Only a subreaper whose every waited child is spawned
 /// through [`spawn_owned`] may call this.
 pub(crate) fn reap_exited(limit: usize) -> io::Result<Sweep> {
-    SWEEPING.store(true, Ordering::Release);
+    become_sweeper();
     let children = super::owned_children::direct_children()?;
     let _gate = GATE
         .write()
@@ -98,10 +103,11 @@ pub(crate) fn reap_exited(limit: usize) -> io::Result<Sweep> {
         }
         let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
         loop {
-            // SAFETY: the siginfo buffer is live and writable. An unregistered
-            // child of this process can only be reaped here, so its pid cannot
-            // be recycled between the census above and this wait. WNOHANG
-            // leaves a live child untouched.
+            // SAFETY: the siginfo buffer is live and writable. An owner may
+            // have reaped a pid from the census before the gate was taken; if
+            // it was recycled, the new process is either registered (its spawn
+            // finished under the gate) or another adopted orphan, and any other
+            // pid yields ECHILD. WNOHANG leaves a live child untouched.
             let result = unsafe {
                 libc::waitid(
                     libc::P_PID,
