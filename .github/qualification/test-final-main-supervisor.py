@@ -8,6 +8,7 @@ import copy
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import struct
@@ -31,7 +32,7 @@ class InertPath:
 
 def definitions():
     namespace=dict(__builtins__=__builtins__,contextmanager=contextmanager,hashlib=hashlib,json=json,
-        re=re,struct=struct,sys=sys,Path=InertPath,signal=SimpleNamespace(SIGINT=2,SIGTERM=15,SIGKILL=9),
+        re=re,struct=struct,sys=sys,math=math,SimpleNamespace=SimpleNamespace,Path=InertPath,signal=SimpleNamespace(SIGINT=2,SIGTERM=15,SIGKILL=9),
         subprocess=SimpleNamespace(DEVNULL=-3,PIPE=-1,TimeoutExpired=subprocess.TimeoutExpired))
     parsed=ast.parse(SOURCE)
     nodes=[copy.deepcopy(n) for n in parsed.body if isinstance(n,(ast.FunctionDef,ast.ClassDef,ast.Assign))]
@@ -74,6 +75,8 @@ class InertSystem:
         self.kernel=[];self.on_create=lambda p:None;self.on_identity=lambda p:None
         self.on_events=lambda:None;self.on_write=lambda stream:None;self.on_close=lambda stream:None
         self.on_register=lambda fd:None;self.on_signal=lambda p,s:None
+        self.on_unregister=lambda fd:None;self.on_directory_create=lambda kind:None;self.on_directory_validate=lambda path:None
+        self.directory_fds={};self.native_files={};self.native_reads=[];self.native_existing=None;self.directory_alias=False
     def now(self):self.t+=.1;return self.t
     def stamp(self):self.ns+=1;return self.ns
     def descriptor(self, chunks=()):
@@ -84,7 +87,7 @@ class InertSystem:
         return self.descriptor([raw,b'']),self.descriptor()
     def nonblocking(self, fd):self.events_seen.append(('nonblocking',fd))
     def register(self, fd):self.on_register(fd);self.registered.add(fd)
-    def unregister(self, fd):self.registered.remove(fd)
+    def unregister(self, fd):self.on_unregister(fd);self.registered.remove(fd)
     def events(self, timeout):
         assert 0<=timeout<=.1;self.t+=.1;self.on_events()
         return [fd for fd in sorted(self.registered) if self.queues[fd]]
@@ -121,13 +124,33 @@ class InertSystem:
         if isinstance(value,BaseException):raise value
         return value
     def close_selector(self):self.events_seen.append(('selector-close',))
-    def private(self, evidence):self.events_seen.append(('private',str(evidence)));return '/tmp/h2018.x.algorithm'
+    def create_private(self):
+        self.events_seen.append(('private-create',));self.on_directory_create('private');return '/tmp/h2018.x.algorithm'
+    def create_native(self, evidence):
+        self.events_seen.append(('native-create',str(evidence)))
+        if self.native_existing is not None:raise FileExistsError('algorithm existing '+self.native_existing)
+        self.on_directory_create('native');return str(evidence)+'/native'
+    def open_directory(self, path):
+        fd=self.descriptor();self.directory_fds[fd]=dict(device=1,inode=fd,uid=123,mode=0o700,directory=True)
+        return fd
+    def observe_directory(self, fd):return dict(self.directory_fds[fd])
+    def validate_directory(self, path, observed, private, evidence):
+        self.on_directory_validate(path)
+        if self.directory_alias:raise ValueError('original-directory-identity')
+        assert observed in self.directory_fds.values()
+    def native_bytes(self, fd, name):
+        assert fd in self.directory_fds and fd not in self.closed
+        self.native_reads.append((fd,name))
+        if name not in self.native_files:raise FileNotFoundError(name)
+        return self.native_files[name]
     def random(self):return b'algorithm-cookie'  # Exactly16 inert test bytes, not a generated secret.
     def secret(self, path):
         fd=self.descriptor();self.events_seen.append(('secret-open',path,fd));return fd
     def write_fd(self, fd, raw):self.events_seen.append(('secret-write',fd,len(raw)));return len(raw)
     def fsync(self, fd):self.events_seen.append(('fsync',fd))
-    def remove_private(self, path):self.events_seen.append(('private-remove',path))
+    def remove_private(self, path, fd, observed):
+        assert fd not in self.closed and observed==self.directory_fds[fd]
+        self.events_seen.append(('private-remove',path))
 
 
 def harness():
@@ -161,7 +184,7 @@ def driver_data(n, role='command'):
         writer=dict(id='writer-'+str(index),scope=scope,path='<creation-1.'+name+'>' if role=='command' else '/algorithm/root.log',
             kind='child-PIPE' if role=='command' else 'parent-log',acquired=True,closed=True,error=None,inherited_by=['creation-1'],callback=None)
         root['writers'].append(writer['id']);value['writers'].append(writer)
-    terminal=dict(exit_code=1,error=None);captured=[dict(eof=True,closed=True,error=None,capture_closed=True) for unused in range(2)]
+    terminal=dict(start_ns=5,finish_ns=6,exit_code=1,error=None);captured=[dict(eof=True,closed=True,error=None,capture_closed=True) for unused in range(2)]
     return value,source,expected,original,terminal,captured,{},dict(before='/algorithm/before/runtime/doc',after='/algorithm/after/runtime/doc'),900
 
 
@@ -248,6 +271,7 @@ class SupervisorTests(unittest.TestCase):
             checks.append('driver-ledger-after-independent-wait-and-EOF')
             return dict(local_settled=True,work_outcome_ok=False,algorithm_only=True)
         owner.check_driver=consume
+        owner.establish_native(InertPath('/algorithm/evidence'))
         p,row,code,env=owner.launch({},InertPath('/control'),'/before','/after',{'algorithm':'prepared'})
         self.assertEqual(code,0);self.assertEqual(env['DISPLAY'],':77')
         self.assertTrue(all(item['bytes']==3 for item in row['streams']))
@@ -331,6 +355,145 @@ class SupervisorTests(unittest.TestCase):
         self.assertNotIn('os.environ.pop',SOURCE)
         n=definitions();self.assertEqual(n['READY_BYTES'],1024);self.assertEqual(n['READY_SECONDS'],30)
         self.assertLessEqual(n['DRIVER_SECONDS']+n['CLEANUP_SECONDS'],n['WHOLE_SECONDS'])
+
+    def test_delivered_cancel_at_metadata_EOF_still_refuses_every_new_work_entry(self):
+        n,io,c,owner=harness();io.on_create=lambda p:setattr(p,'code',0)
+        fired=[]
+        def interrupt(fd):
+            if not fired:
+                fired.append(fd);c.request(15,None)  # Actual handler control inside the recoverable close boundary.
+        io.on_unregister=interrupt
+        escaped=[]
+        with self.assertRaises(n['SupervisorCancelled']) as caught:
+            with c.work():owner.metadata(['algorithm-metadata']);escaped.append('metadata returned')
+        self.assertTrue(c.delivered);self.assertIs(caught.exception,c.cancel);self.assertEqual(escaped,[])
+        count=len(io.handles)
+        with self.assertRaises(n['SupervisorCancelled']) as again:owner.start('bus',['forbidden-next-root'],{})
+        self.assertIs(again.exception,caught.exception);self.assertEqual(len(io.handles),count)
+        result=owner.finish()
+        self.assertTrue(any(e[0]=='wait' for e in io.events_seen));self.assertTrue(all(s.closed for s in owner.original_streams))
+        self.assertIs(c.cancel,caught.exception);self.assertTrue(result['errors'])
+        original=RuntimeError('earlier terminal work');c.latch(original)
+        with self.assertRaises(RuntimeError) as first:c.admit()
+        self.assertIs(first.exception,original)
+
+    def test_private_creation_path_is_retained_before_cancel_or_validation_failure(self):
+        for stage in ('valid','cancel','validation'):
+            with self.subTest(stage=stage):
+                n,io,c,owner=harness();original=RuntimeError('post-create validation failure')
+                if stage=='cancel':io.on_directory_create=lambda kind:c.request(2,None)
+                def validate(path):
+                    self.assertEqual(owner.private,path)
+                    self.assertTrue(owner.directories[0]['created'])
+                    self.assertIsNotNone(owner.directories[0]['fd_id'])
+                    if stage=='validation':raise original
+                io.on_directory_validate=validate
+                if stage=='valid':owner.acquire_directory('private',InertPath('/algorithm/evidence'))
+                else:
+                    with self.assertRaises(n['SupervisorCancelled'] if stage=='cancel' else RuntimeError) as caught:
+                        owner.acquire_directory('private',InertPath('/algorithm/evidence'))
+                    self.assertIs(caught.exception,c.cancel if stage=='cancel' else original)
+                self.assertEqual(owner.private,'/tmp/h2018.x.algorithm');self.assertEqual(io.handles,[])
+                result=owner.finish()
+                self.assertIn(('private-remove',owner.private),io.events_seen)
+                self.assertTrue(owner.directories[0]['removed'])
+                if stage=='validation':self.assertTrue(result['errors']);self.assertIs(c.failure,original)
+
+    def test_fresh_native_directory_and_original_FD_fence_alias_or_stale_destinations(self):
+        n,io,c,owner=harness();record=owner.establish_native(InertPath('/algorithm/evidence'))
+        self.assertTrue(record['created'] and record['validated'])
+        io.native_files['source.json']=b'{"algorithm":true}'
+        self.assertEqual(owner.read_native('source.json'),{'algorithm':True})
+        original_fd=owner.directory_items['native']['fd'];self.assertEqual(io.native_reads,[(original_fd,'source.json')])
+        for case in ('symlink','foreign','stale-without-ledger'):
+            n,io,c,owner=harness();io.native_existing=case
+            with self.assertRaises(FileExistsError):owner.establish_native(InertPath('/algorithm/evidence'))
+            self.assertEqual(io.handles,[]);self.assertEqual(io.native_reads,[]);self.assertIsNone(owner.native)
+            self.assertFalse(owner.directories[0]['created']);self.assertTrue(owner.finish()['errors'])
+        for case in ('path-alias','FD-replaced'):
+            n,io,c,owner=harness();owner.establish_native(InertPath('/algorithm/evidence'))
+            if case=='path-alias':io.directory_alias=True
+            else:io.directory_fds[owner.directory_items['native']['fd']]['inode']+=1
+            with self.assertRaisesRegex(ValueError,'directory'):owner.read_native('source.json')
+            self.assertEqual(io.native_reads,[])
+
+    def test_invalid_arm_prefix_is_rejected_before_any_cleanup_name_or_read(self):
+        n=definitions()
+        for arms in ([],['before'],['before','after']):
+            value=driver_data(n)[0];value['entered_arms']=arms
+            self.assertEqual(n['entered_arms'](value),arms)
+        for arms in (['../outside'],['/outside'],[1],['before','before'],['after'],['after','before'],'before'):
+            value=driver_data(n)[0];value['entered_arms']=arms;reads=[]
+            class Owner:
+                def read_native(self, name, optional=False):
+                    reads.append(name)
+                    if name=='driver-role-writer-ledger.json':return value
+                    raise AssertionError('Read before arm prefix validated')
+            with self.assertRaisesRegex(ValueError,'entered-prefix'):
+                n['inspect_driver'](Owner(),InertPath('/control'),{},'sha',{}, {},{})
+            self.assertEqual(reads,['driver-role-writer-ledger.json'])
+
+    def test_strict_nested_types_and_reciprocal_scope_do_not_use_Python_numeric_equality(self):
+        n=definitions()
+        for variant in ('group-float','group-bool','terminal-bool','terminal-float','terminal-extra','writer-scope'):
+            args=list(driver_data(n,'ui' if variant=='writer-scope' else 'command'));root=args[0]['creations'][0]
+            if variant=='group-bool':root['pid']=root['identity']['pid']=root['identity']['group']=1
+            if variant=='writer-scope':args[0]['entered_arms']=['before','after']
+            self.assertTrue(n['consume_driver'](*copy.deepcopy(args))['local_settled'])
+            if variant=='group-float':root['identity']['group']=float(root['pid'])
+            elif variant=='group-bool':root['identity']['group']=True
+            elif variant=='terminal-bool':root['terminal']['exit_code']=False
+            elif variant=='terminal-float':root['terminal']['exit_code']=0.0
+            elif variant=='terminal-extra':root['terminal']['extra']=True
+            else:args[0]['writers'][0]['scope']='after'
+            with self.assertRaisesRegex(ValueError,'identity|terminal-wait|reciprocal-scope'):n['consume_driver'](*args)
+        for field,wrong in [('errors',''),('errors',{}),('owned_descendants_remaining',0),('private_bus_names',False)]:
+            args=list(driver_data(n,'ui'));root=args[0]['creations'][0]
+            root['role']='documents';root['exit_policy']=dict(kind='documents-normal-TERM-wait0-unmount',allowed_exit_codes=[0])
+            root['expected_mount']=args[7]['before'];root['waits'][-1]['method']=root['terminal']['method']='Documents-normal-TERM'
+            root['signals']=[dict(signal=15,unix_ns=5,scope='original Documents',target=77,returned=True,outcome='returned',error=None)]
+            cleanup=dict(errors=[],documents_graceful=dict(exit_code=0,mount=root['expected_mount'],mounted_after=False,identity=copy.deepcopy(root['identity'])),
+                private_bus_names={name:None for name in n['BUS_NAMES']},owned_descendants_remaining=[])
+            args[6]['before']=cleanup
+            self.assertTrue(n['consume_driver'](*copy.deepcopy(args))['local_settled'])
+            cleanup[field]=wrong
+            with self.assertRaisesRegex(ValueError,'cleanup'):n['consume_driver'](*args)
+
+    def test_preparation_executes_exact_retained_verified_buffer_without_loader_or_reread(self):
+        n=definitions();reads=[]
+        raw=b"PINNED_ROLES={'before':None,'after':None}\nMARKER='retained verified bytes'\nSEEN_FILE=__file__\nSEEN_NAME=__name__\ndef admit_references(roles,pinned):\n    raise ValueError('NULL algorithm producer')\n"
+        class BytesPath:
+            def __str__(self):return '/algorithm/control/final-main-prepare.py'
+            def read_bytes(self):
+                reads.append('read')
+                if len(reads)>1:raise AssertionError('Second source/cache read')
+                return raw
+        class Root:
+            def __truediv__(self, name):return BytesPath()
+        n['PREPARATION_SHA']=hashlib.sha256(raw).hexdigest()
+        module=n['load_preparation'](Root())
+        self.assertEqual(reads,['read']);self.assertEqual(module.MARKER,'retained verified bytes')
+        self.assertEqual(module.SEEN_FILE,'/algorithm/control/final-main-prepare.py')
+        self.assertEqual(module.SEEN_NAME,'held_scope_preparation_for_supervisor')
+        calls=[]
+        with self.assertRaisesRegex(ValueError,'NULL algorithm'):
+            n['admit_preparation']({'native_preparation':{'roles':module.PINNED_ROLES}},module,lambda:calls.append('resource'))
+        self.assertEqual(calls,[])
+        with self.assertRaisesRegex(ValueError,'Frozen preparation'):
+            n['execute_preparation'](b"raise AssertionError('must never execute')",'algorithm-label',n['PREPARATION_SHA'])
+
+    def test_actual_JSON_parser_rejects_duplicates_nonfinite_overflow_and_each_finite_cap(self):
+        n=definitions();parse=n['parse_json']
+        self.assertEqual(parse(b'{"finite":1.25,"values":[1,true,null]}'),{'finite':1.25,'values':[1,True,None]})
+        with self.assertRaisesRegex(ValueError,'duplicate-JSON-key'):parse(b'{"x":1,"x":2}')
+        for raw in (b'NaN',b'Infinity',b'-Infinity',b'1e999',b'-1e999'):
+            with self.assertRaisesRegex(ValueError,'Nonfinite'):parse(raw)
+        depth=n['JSON_DEPTH'];self.assertIsInstance(parse(b'['*depth+b'0'+b']'*depth),list)
+        with self.assertRaisesRegex(ValueError,'complexity-cap'):parse(b'['*(depth+1)+b'0'+b']'*(depth+1))
+        size=n['JSON_STRING'];self.assertEqual(len(parse(json.dumps('x'*size))),size)
+        with self.assertRaisesRegex(ValueError,'string-cap'):parse(json.dumps('x'*(size+1)))
+        nodes=n['JSON_NODES'];self.assertEqual(len(parse(b'['+b','.join([b'0']*(nodes-1))+b']')),nodes-1)
+        with self.assertRaisesRegex(ValueError,'complexity-cap'):parse(b'['+b','.join([b'0']*nodes)+b']')
 
 
 if __name__=='__main__':unittest.main()

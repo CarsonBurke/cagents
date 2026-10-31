@@ -6,8 +6,8 @@ All limits below are new proposals, not measured sufficiency or execution grants
 """
 from contextlib import contextmanager
 import hashlib
-import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 
 READY_BYTES = 1024
 READY_SECONDS = 30
@@ -71,7 +72,7 @@ def integer(value, minimum=0):
 
 def identity(value, pid=None):
     keys(value,'pid group stamp','identity-shape')
-    need(integer(value['pid'],1) and value['group']==value['pid']
+    need(integer(value['pid'],1) and integer(value['group'],1) and value['group']==value['pid']
          and isinstance(value['stamp'],str) and STAMP.fullmatch(value['stamp']),'identity-generation')
     if pid is not None: need(value['pid']==pid,'identity-original-PID')
 
@@ -99,6 +100,7 @@ class Control:
 
     def admit(self):
         if self.failure is not None:raise self.failure
+        if self.cancel is not None:raise self.cancel
         self.checkpoint()
 
     @contextmanager
@@ -185,19 +187,35 @@ class System:
     def open_capture(self, path):return Path(path).open('xb')
     def signal_group(self, group, signum):os.killpg(group,signum)
     def waitpid(self):return os.waitpid(-1,os.WNOHANG)
-    def private(self, evidence):
-        path=Path(tempfile.mkdtemp(prefix='h2018.x.',dir='/tmp')).resolve(strict=True)
-        info=path.stat()
-        need(info.st_uid==os.geteuid() and stat.S_IMODE(info.st_mode)==0o700
-             and len(str(path/'bus'))<100 and not path.is_relative_to(evidence) and not evidence.is_relative_to(path),'private-desktop-root')
-        return str(path)
+    def create_private(self):return tempfile.mkdtemp(prefix='h2018.x.',dir='/tmp')
+    def create_native(self, evidence):
+        path=str(evidence)+'/native';os.mkdir(path,0o700);return path
+    def open_directory(self, path):return os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC)
+    def observe_directory(self, fd):
+        info=os.fstat(fd)
+        return dict(device=info.st_dev,inode=info.st_ino,uid=info.st_uid,mode=stat.S_IMODE(info.st_mode),directory=stat.S_ISDIR(info.st_mode))
+    def validate_directory(self, path, observed, private, evidence):
+        original=Path(path);info=original.lstat()
+        need(original.resolve(strict=True)==original and not original.is_symlink()
+             and (info.st_dev,info.st_ino)==(observed['device'],observed['inode'])
+             and observed['directory'] is True and observed['uid']==os.geteuid() and observed['mode']==0o700,'original-directory-identity')
+        if private:
+            need(len(str(original/'bus'))<100 and not original.is_relative_to(evidence)
+                 and not evidence.is_relative_to(original),'private-desktop-root')
+        else:need(original==evidence/'native','native-fixed-destination')
+    def native_bytes(self, fd, name):return regular_bytes(name,directory_fd=fd)
     def secret(self, path):return os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
     def write_fd(self, fd, data):return os.write(fd,data)
     def fsync(self, fd):os.fsync(fd)
     def random(self):return os.urandom(16)
-    def remove_private(self, private):
+    def remove_private(self, private, fd, observed):
         # Never unlink display sockets/locks or delete an arbitrary tree.
-        for name in ('server.Xauthority','client.Xauthority'):(Path(private)/name).unlink(missing_ok=True)
+        info=Path(private).lstat();current=os.fstat(fd)
+        need(not stat.S_ISLNK(info.st_mode) and (info.st_dev,info.st_ino)==(current.st_dev,current.st_ino)==
+             (observed['device'],observed['inode']) and current.st_uid==os.geteuid(),'private-cleanup-generation')
+        for name in ('server.Xauthority','client.Xauthority'):
+            try:os.unlink(name,dir_fd=fd)
+            except FileNotFoundError:pass
         Path(private).rmdir()  # A surviving bus socket/other member remains an explicit failure.
 
 
@@ -210,6 +228,8 @@ class Supervisor:
         self.started=system.now();self.kernel=None;self.private=None;self.driver_fact=None
         self.check_driver=None;self.driver_environment=None
         self.source=None
+        self.directories=[];self.directory_items={};self.native=None;self.evidence=None
+        self.original_directory_fds=[]
 
     def negative(self, error, context):
         self.control.latch(error);self.errors.append(context+': '+repr(error))
@@ -254,6 +274,44 @@ class Supervisor:
             write=self.retain_fd(pair[1],'ready-parent-write');original['members'].append(write)
             self.listen(read)
             return read,write
+
+    def acquire_directory(self, kind, evidence):
+        self.control.admit()
+        with self.control.defer():
+            row=dict(id='directory-'+str(len(self.directories)+1),kind=kind,attempted=True,created=False,path=None,
+                identity=None,fd_id=None,validated=False,removed=False,error=None)
+            self.directories.append(row)
+            try:
+                path=self.io.create_private() if kind=='private' else self.io.create_native(evidence)
+                row['path']=path;row['created']=True  # FIRST retention after actual create returns.
+                if kind=='private':self.private=path
+                else:self.native=path
+                fd=self.io.open_directory(path)
+                original=dict(fd=fd,item=None);self.original_directory_fds.append(original)
+                item=self.retain_fd(fd,'directory-'+kind);original['item']=item
+                self.directory_items[kind]=item;row['fd_id']=item['id']
+                row['identity']=self.io.observe_directory(fd)
+                self.io.validate_directory(path,row['identity'],kind=='private',evidence)
+                row['validated']=True
+                return row
+            except BaseException as error:
+                row['error']=repr(error);self.control.latch(error);raise
+
+    def establish_native(self, evidence):
+        self.evidence=evidence
+        return self.acquire_directory('native',evidence)
+
+    def read_native(self, name, optional=False):
+        need(name in ('driver-role-writer-ledger.json','source.json','before-cleanup.json','after-cleanup.json'),'native-fixed-member')
+        row=next((r for r in self.directories if r['kind']=='native'),None)
+        item=self.directory_items.get('native')
+        need(row is not None and row['validated'] and item is not None and not item['closed'],'retained-native-directory-UNKNOWN')
+        need(self.io.observe_directory(item['fd'])==row['identity'],'retained-native-directory-changed')
+        self.io.validate_directory(row['path'],row['identity'],False,self.evidence)
+        try:return parse_json(self.io.native_bytes(item['fd'],name))
+        except FileNotFoundError:
+            if optional:return None
+            raise
 
     def start(self, role, argv, env, cwd=None, inherited=()):
         self.control.admit();need(not self.fenced and len(self.roots)<MAX_ROOTS,'supervisor-spawn-fence')
@@ -399,7 +457,8 @@ class Supervisor:
     def launch(self, env, control, before, after, verified):
         need(verified is not None,'prepared-before-desktop')
         self.control.admit();need(self.io.now()<self.started+WHOLE_SECONDS-CLEANUP_SECONDS,'supervisor-work-budget')
-        self.private=self.io.private(Path(self.output).parent.resolve(strict=True))
+        need(self.native is not None,'fresh-native-before-desktop')
+        self.acquire_directory('private',self.evidence)
         cookie=self.io.random();self.secret(self.private+'/server.Xauthority',authority_bytes(cookie))
         read,write=self.ready_pipe()
         with self.control.defer():
@@ -461,7 +520,19 @@ class Supervisor:
         try:self.kernel=self.kernel_drain(min(deadline,self.io.now()+KERNEL_SECONDS))
         except BaseException as error:self.negative(error,'Scoped kernel drain');self.kernel=dict(waits=[],echild=False,errors=[repr(error)])
         self.errors.extend(self.kernel['errors'])
+        private=next((r for r in self.directories if r['kind']=='private'),None)
+        if private is not None and private['created']:
+            item=self.directory_items.get('private')
+            if self.kernel['echild'] and all(row['terminal'] is not None for row in self.roots) and item is not None and private['identity'] is not None:
+                try:self.io.remove_private(private['path'],item['fd'],private['identity']);private['removed']=True
+                except BaseException as error:self.negative(error,'Private auth/socket directory cleanup')
+            else:self.errors.append('Original private directory custody UNKNOWN')
         for item in self.fds:self.close_fd(item)
+        for original in self.original_directory_fds:
+            if original['item'] is None:
+                try:self.io.close_fd(original['fd'])
+                except BaseException as error:self.negative(error,'Unpublished original directory FD close')
+                self.errors.append('Original directory FD metadata UNKNOWN')
         for stream in self.original_streams:
             if not any(item['object'] is stream for item in self.fds):
                 try:stream.close()
@@ -490,9 +561,8 @@ class Supervisor:
         if any(not item['closed'] or item['error'] or (item['kind'].startswith('capture-') and not item['eof']) for item in self.fds):self.errors.append('Original descriptor/EOF UNKNOWN')
         if any(not row['closed'] or row['error'] for row in self.captures):self.errors.append('Original capture writer UNKNOWN')
         if self.source is None:self.errors.append('Supervisor source binding UNKNOWN')
-        if self.private is not None and self.kernel['echild'] and not any(row['terminal'] is None for row in self.roots):
-            try:self.io.remove_private(self.private)
-            except BaseException as error:self.negative(error,'Private auth/socket directory cleanup')
+        for row in self.directories:
+            if not row['created'] or not row['validated'] or row['error'] is not None:self.errors.append(row['id']+' acquisition UNKNOWN')
         return self.record()
 
     def record(self):
@@ -501,6 +571,7 @@ class Supervisor:
             supervisor_instance=self.io.instance,roots=[dict(**clean(row),streams=[clean(item) for item in row['streams']]) for row in self.roots],
             source=self.source,
             descriptors=[clean(item) for item in self.fds],captures=[clean(item) for item in self.captures],
+            directories=self.directories,
             spawn_fenced=self.fenced,subreaper=self.subreaper,kernel=self.kernel,driver_ledger=self.driver_fact,
             first_diagnostic=None if self.control.failure is None else repr(self.control.failure),cancel_signal=self.control.signum,errors=list(self.errors),
             outside_scope=['Supervisor later exit and parent-captured stdout/stderr','Immutable staging/seals',
@@ -533,6 +604,22 @@ def strings(value, reason):
 def nullable_string(value):return value is None or type(value) is str
 
 
+def entered_arms(value):
+    keys(value,FIELDS['top'],'driver-ledger-shape')
+    arms=value['entered_arms']
+    need(type(arms) is list and all(type(v) is str for v in arms)
+         and arms in ([],['before'],['before','after']),'driver-entered-prefix')
+    return arms
+
+
+def strict_wait(value, independent=False):
+    keys(value,'start_ns finish_ns exit_code error' if independent else FIELDS['wait'],'driver-terminal-wait-shape')
+    need(integer(value['start_ns'],1) and integer(value['finish_ns'],1)
+         and (value['exit_code'] is None or type(value['exit_code']) is int)
+         and nullable_string(value['error']),'driver-terminal-wait-types')
+    if not independent:need(value['method'] in ('wait','communicate','identity-unresolved-wait','Documents-normal-TERM'),'driver-terminal-wait-method')
+
+
 def consume_driver(value, source, expected, original, terminal, captured, arm_cleanups, mounts, parent_pid):
     """Strict frozen producer reader; data only, never opens row-named paths."""
     keys(value,FIELDS['top'],'driver-ledger-shape');keys(source,FIELDS['binding'],'driver-source-shape')
@@ -546,13 +633,14 @@ def consume_driver(value, source, expected, original, terminal, captured, arm_cl
          and obs['group']==original['group'] and type(obs['group']) is int and obs['parent']==parent_pid
          and type(obs['parent']) is int and obs['state'] in ('R','S','D','T','t','I','P','W'),'driver-original-generation')
     need(source['numeric_job_id'] is None and source['numeric_job_note']=='No actual supported numeric job supplier is implemented.', 'driver-logical-job-only')
-    need(value['entered_arms'] in ([],['before'],['before','after']),'driver-entered-prefix')
+    entered_arms(value)
     need(type(value['no_future_spawns']) is bool and type(value['requested_cancel']) in (type(None),int)
          and value['requested_cancel'] in (None,2,15) and nullable_string(value['first_terminal_diagnostic']),'driver-work-types')
     strings(value['errors'],'driver-errors');need(value['outside_scope']==OUTSIDE and value['final_publication'] in (FINAL,PARTIAL),'driver-scope-publication')
     bad=list(value['errors'])
     if value['no_future_spawns'] is not True or value['final_publication']!=FINAL:bad.append('Driver spawning/writer boundary incomplete')
-    need(type(terminal) is dict and type(terminal.get('exit_code')) is int and terminal.get('error') is None,'independent-original-driver-wait')
+    need(type(terminal) is dict,'independent-original-driver-wait');strict_wait(terminal,True)
+    need(type(terminal['exit_code']) is int and terminal['error'] is None,'independent-original-driver-wait')
     need(type(captured) is list and len(captured)==2 and all(item.get('eof') is True and item.get('closed') is True
          and item.get('error') is None and item.get('capture_closed') is True for item in captured),'independent-original-driver-streams')
     if terminal['exit_code']==-signal.SIGKILL:bad.append('Actual driver SIGKILL')
@@ -586,12 +674,10 @@ def consume_driver(value, source, expected, original, terminal, captured, arm_cl
         need(type(row['waits']) is list and len(row['waits'])<=256,'driver-wait-cap')
         successes=[]
         for wait in row['waits']:
-            keys(wait,FIELDS['wait'],'driver-wait-shape')
-            need(wait['method'] in ('wait','communicate','identity-unresolved-wait','Documents-normal-TERM')
-                 and integer(wait['start_ns'],1) and integer(wait['finish_ns'],1)
-                 and (wait['exit_code'] is None or type(wait['exit_code']) is int) and nullable_string(wait['error']),'driver-wait-types')
+            strict_wait(wait)
             # time.time_ns can move backwards; timestamps are observations, not ordering authority.
             if wait['error'] is None and type(wait['exit_code']) is int:successes.append(wait)
+        if row['terminal'] is not None:strict_wait(row['terminal'])
         if not successes or row['terminal']!=successes[-1]:bad.append(row['id']+' terminal UNKNOWN')
         keys(row['exit_policy'],'kind allowed_exit_codes','driver-policy-shape')
         need(type(row['exit_policy']['allowed_exit_codes']) is list
@@ -632,11 +718,22 @@ def consume_driver(value, source, expected, original, terminal, captured, arm_cl
             if cleanup is None:bad.append('Driver Documents cleanup receipt UNKNOWN')
             else:
                 keys(cleanup,'errors documents_graceful private_bus_names owned_descendants_remaining','driver-arm-cleanup-shape')
+                strings(cleanup['errors'],'driver-arm-cleanup-errors')
+                need(type(cleanup['owned_descendants_remaining']) is list and all(integer(v,1) or (type(v) is str and v)
+                     for v in cleanup['owned_descendants_remaining']),'driver-arm-cleanup-remaining')
+                names=cleanup['private_bus_names'];need(type(names) is dict,'driver-arm-cleanup-names')
+                need(set(names)==BUS_NAMES or (not names and cleanup['errors']),'driver-arm-cleanup-name-set')
+                for name,owner in names.items():
+                    if owner is not None:
+                        keys(owner,'name owner pid','driver-arm-cleanup-owner')
+                        need(owner['name']==name and type(owner['owner']) is str and owner['owner']
+                             and integer(owner['pid'],1),'driver-arm-cleanup-owner-types')
                 graceful=cleanup['documents_graceful']
                 if graceful is None:bad.append('Driver Documents graceful UNKNOWN')
                 else:
                     keys(graceful,'exit_code mount mounted_after identity','driver-Documents-graceful-shape')
                     need(type(graceful['exit_code']) is int and graceful['mounted_after'] is False,'driver-Documents-graceful-types')
+                    identity(graceful['identity'])
                     need(graceful==dict(exit_code=0,mount=row['expected_mount'],mounted_after=False,identity=row['identity']),'driver-Documents-graceful')
                 if cleanup['errors'] or cleanup['owned_descendants_remaining'] or cleanup['private_bus_names']!={name:None for name in BUS_NAMES}:bad.append('Driver arm settlement UNKNOWN')
                 if not successes or successes[-1]['exit_code']!=0 or not any(w['method']=='Documents-normal-TERM' and w['exit_code']==0 and w['error'] is None for w in row['waits']):bad.append('Driver Documents normal wait UNKNOWN')
@@ -646,7 +743,8 @@ def consume_driver(value, source, expected, original, terminal, captured, arm_cl
         need(row['kind'] in kinds and type(row['path']) is str and row['path'] and nullable_string(row['error'])
              and type(row['acquired']) is bool and type(row['closed']) is bool,'driver-writer-types')
         unique_strings(row['inherited_by'],'driver-writer-inheritance')
-        need(all(child in roots and row['id'] in roots[child]['writers'] for child in row['inherited_by']),'driver-writer-reciprocal')
+        need(all(child in roots and row['id'] in roots[child]['writers'] and row['scope']==roots[child]['scope']
+             for child in row['inherited_by']),'driver-writer-reciprocal-scope')
         if row['kind']=='child-PIPE':
             match=re.fullmatch(r'<(creation-[1-9][0-9]*)\.(stdin|stdout|stderr)>',row['path'])
             need(match is not None and row['inherited_by']==[match[1]],'driver-symbolic-PIPE')
@@ -656,7 +754,8 @@ def consume_driver(value, source, expected, original, terminal, captured, arm_cl
         elif row['kind']=='callback-log':bad.append('Driver callback writer association UNKNOWN')
         if not row['acquired'] or not row['closed'] or row['error'] is not None:bad.append('Driver writer UNKNOWN')
     for row in roots.values():
-        need(all(w in writers and row['id'] in writers[w]['inherited_by'] for w in row['writers']),'driver-root-reciprocal')
+        need(all(w in writers and row['id'] in writers[w]['inherited_by'] and row['scope']==writers[w]['scope']
+             for w in row['writers']),'driver-root-reciprocal-scope')
         owned=[writers[w] for w in row['writers']]
         if row['role']=='command':
             if any(sum(w['path']=='<'+row['id']+'.'+name+'>' and w['kind']=='child-PIPE' for w in owned)!=1 for name in ('stdout','stderr')):bad.append('Driver command PIPE membership UNKNOWN')
@@ -698,9 +797,10 @@ def consume_driver(value, source, expected, original, terminal, captured, arm_cl
         limit='Neither local settlement nor entry proves source cleanliness/native8 frames, supervisor later exit/staging/whole-job or acceptance.')
 
 
-def regular_bytes(path, cap=LEDGER_BYTES, allow_empty=False):
+def regular_bytes(path, cap=LEDGER_BYTES, allow_empty=False, directory_fd=None):
     """Expected caller-selected file only; no ledger-supplied path is opened."""
-    began=time.monotonic();fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW)
+    if directory_fd is not None:need(path in ('driver-role-writer-ledger.json','source.json','before-cleanup.json','after-cleanup.json'),'native-fixed-member')
+    began=time.monotonic();fd=os.open(path,os.O_RDONLY|os.O_CLOEXEC|os.O_NOFOLLOW,dir_fd=directory_fd)
     try:
         before=os.fstat(fd)
         need(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_uid==os.geteuid()
@@ -733,24 +833,30 @@ def parse_json(raw):
         item,depth=pending.pop();count+=1
         need(depth<=JSON_DEPTH and count<=JSON_NODES,'JSON-complexity-cap')
         if isinstance(item,str):need(len(item)<=JSON_STRING,'JSON-string-cap')
+        elif type(item) is float:need(math.isfinite(item),'Nonfinite JSON number')
         elif type(item) is dict:
             pending.extend((v,depth+1) for pair in item.items() for v in pair)
         elif type(item) is list:pending.extend((v,depth+1) for v in item)
     return value
 
 
+def execute_preparation(raw, path, expected):
+    need(digest(raw)==expected,'Frozen preparation module changed')
+    namespace=dict(__file__=str(path),__name__='held_scope_preparation_for_supervisor',__package__=None,__cached__=None)
+    exec(compile(raw,str(path),'exec'),namespace)
+    return SimpleNamespace(**namespace)
+
+
 def load_preparation(control):
     path=control/'.github/qualification/final-main-prepare.py'
-    need(digest(path.read_bytes())==PREPARATION_SHA,'Frozen preparation module changed')
-    spec=importlib.util.spec_from_file_location('held_scope_preparation_for_supervisor',path)
-    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-    return module  # Exact stdlib definitions only; never the --verify CLI.
+    raw=path.read_bytes()  # One retained buffer; no .pyc/cache/path reread.
+    return execute_preparation(raw,path,PREPARATION_SHA)
 
 
 def inspect_driver(owner, control, prepared, preparation_sha, identity_control, plan, env):
-    native=Path(env['QUALIFICATION_EVIDENCE'])/'native'
-    value=parse_json(regular_bytes(native/'driver-role-writer-ledger.json'))
-    source=parse_json(regular_bytes(native/'source.json'))
+    value=owner.read_native('driver-role-writer-ledger.json')
+    arms=entered_arms(value)  # Before any arm-derived cleanup operation.
+    source=owner.read_native('source.json')
     expected=dict(product=plan['product'],before=plan['before'],control_sha=identity_control['sha'],control_tree=identity_control['tree'],
         driver_sha256=DRIVER_SHA,fixture_sha256=digest((control/'.github/qualification/final-main-fixture.rs').read_bytes()),
         preparation_sha256=preparation_sha,preparation_module_sha256=PREPARATION_SHA,
@@ -759,9 +865,10 @@ def inspect_driver(owner, control, prepared, preparation_sha, identity_control, 
         run=env['GITHUB_RUN_ID'],attempt=env['GITHUB_RUN_ATTEMPT'],logical_job=env['GITHUB_JOB'],numeric_job_id=None,
         numeric_job_note='No actual supported numeric job supplier is implemented.',plan_sha256=digest((control/'.github/qualification/final-main-plan.json').read_bytes()))
     cleanups={}
-    for label in value['entered_arms']:
-        path=native/(label+'-cleanup.json')
-        if path.exists():cleanups[label]=parse_json(regular_bytes(path))
+    for label in ('before','after'):
+        if label in arms:
+            cleanup=owner.read_native(label+'-cleanup.json',optional=True)
+            if cleanup is not None:cleanups[label]=cleanup
     mounts={label:str(Path(prepared['base'])/label/'runtime/doc') for label in ('before','after')}
     def consume(process,row):
         captured=[dict(eof=item['eof'],closed=item['closed'],error=item['error'],capture_closed=item['capture']['closed']) for item in row['streams']]
@@ -823,7 +930,7 @@ def main():
                 attempt=env['GITHUB_RUN_ATTEMPT'],logical_job=env['GITHUB_JOB'],numeric_job_id=None,
                 supervisor_sha256=digest(Path(__file__).read_bytes()),driver_sha256=DRIVER_SHA,
                 preparation_module_sha256=PREPARATION_SHA,prepared_sha256=prepared_sha)
-            need(not (Path(env['QUALIFICATION_EVIDENCE'])/'native/driver-role-writer-ledger.json').exists(),'Prior driver ledger exists')
+            owner.establish_native(evidence)  # Fresh retained destination AFTER both prepared heads.
             def reader(process,row):
                 return inspect_driver(owner,control,prepared,prepared_sha,current,plan,env)(process,row)
             owner.check_driver=reader
