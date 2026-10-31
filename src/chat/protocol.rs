@@ -356,6 +356,12 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Arguments to start this conversation's next process, and what to apply
+    /// first, when its process ending is an expected part of a turn stopping.
+    /// `None` leaves the exit to be reported as the provider ending.
+    fn relaunch_after_exit(&mut self) -> Option<(Vec<String>, Step)> {
+        None
+    }
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.

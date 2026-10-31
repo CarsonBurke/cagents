@@ -2908,8 +2908,10 @@ impl Cagents {
                     state.signing_in_from = None;
                     state.sign_in_terminal = None;
                 }
-                state.present =
-                    snapshot.status != UsageStatus::Unavailable || !state.account.is_system();
+                // A provider that reports no limits still names a working login.
+                state.present = snapshot.status != UsageStatus::Unavailable
+                    || !state.account.is_system()
+                    || identity.is_some();
                 // A signed-out answer, or an identity lookup that failed this
                 // time, names nobody; the account last seen is still the one
                 // it is, or the one to sign back in to.

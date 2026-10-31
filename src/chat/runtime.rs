@@ -12,7 +12,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{net::UnixStream, process::CommandExt},
     },
-    process::{Child, Command as Process, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -472,6 +472,8 @@ impl LocalHandle {
             .spawn(move || {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
+                    process_spec: spec.clone(),
+                    provider_process: provider_process.clone(),
                     launch_context: spec.execution.clone(),
                     launch_account_scope,
                     working_directory: spec.working_directory.clone(),
@@ -1860,6 +1862,8 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    process_spec: ProcessSpec,
+    provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
@@ -2009,34 +2013,48 @@ impl Actor {
         }
         Ok(())
     }
-    fn run(&mut self, initial: Step) -> Result<(), String> {
-        let mut stdin = self
+    fn provider_pipes(&mut self) -> Result<(ChildStdin, ChildStdout, ChildStderr), String> {
+        let child = &mut self
             .child
             .as_mut()
             .ok_or("Provider process unavailable")?
-            .child
-            .stdin
-            .take()
-            .ok_or("Provider stdin unavailable")?;
-        let mut stdout = self
-            .child
-            .as_mut()
-            .ok_or("Provider process unavailable")?
-            .child
-            .stdout
-            .take()
-            .ok_or("Provider stdout unavailable")?;
-        let mut stderr = self
-            .child
-            .as_mut()
-            .ok_or("Provider process unavailable")?
-            .child
-            .stderr
-            .take()
-            .ok_or("Provider stderr unavailable")?;
+            .child;
+        let stdin = child.stdin.take().ok_or("Provider stdin unavailable")?;
+        let stdout = child.stdout.take().ok_or("Provider stdout unavailable")?;
+        let stderr = child.stderr.take().ok_or("Provider stderr unavailable")?;
         nonblocking(&stdin)?;
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
+        Ok((stdin, stdout, stderr))
+    }
+    /// Replaces an exited provider with the same launch under new arguments.
+    /// The old group is gone before the new process can touch the conversation.
+    fn relaunch(
+        &mut self,
+        arguments: Vec<String>,
+    ) -> Result<(ChildStdin, ChildStdout, ChildStderr), String> {
+        if let Some(mut previous) = self.child.take() {
+            previous.terminate().map_err(|error| error.to_string())?;
+        }
+        self.process_spec.arguments = arguments;
+        let child = spawn_provider(&self.process_spec, &self.stop)?
+            .ok_or("Provider process unavailable")?;
+        *self
+            .provider_process
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(
+            crate::daemon::holder_registry::Process::read(child.child.id() as i32)
+                .map_err(|error| error.to_string())?,
+        );
+        self.child = Some(child);
+        self.stderr.clear();
+        self.first_frame = false;
+        self.started = Instant::now();
+        self.write_started = None;
+        self.provider_pipes()
+    }
+    fn run(&mut self, initial: Step) -> Result<(), String> {
+        let (mut stdin, mut stdout, mut stderr) = self.provider_pipes()?;
         self.step(initial)?;
         let mut stdout_eof = false;
         let mut stderr_eof = false;
@@ -2128,6 +2146,16 @@ impl Actor {
                     .observe_exit_within(PROTOCOL_EXIT_GRACE)
                     .map_err(|error| error.to_string())?
                 {
+                    if closing.is_none()
+                        && let Some((arguments, step)) = self.adapter.relaunch_after_exit()
+                    {
+                        self.step(step)?;
+                        (stdin, stdout, stderr) = self.relaunch(arguments)?;
+                        stdout_eof = false;
+                        stderr_eof = false;
+                        partial_started = None;
+                        continue;
+                    }
                     if status.success() {
                         return Ok(());
                     }

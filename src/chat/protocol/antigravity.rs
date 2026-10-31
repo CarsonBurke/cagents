@@ -5,7 +5,7 @@
 //! - It never asks. A tool that needs an approval it does not hold is denied,
 //!   so a conversation's permission mode is chosen once, at launch.
 //! - It has no cancel message. SIGINT is the only way to stop a turn and ends
-//!   the process with it; `--conversation` continues afterwards.
+//!   the process with it, so a new process continues with `--conversation`.
 //! - Resuming replays nothing, so earlier messages are read from the
 //!   conversation's `transcript.jsonl`. That file is undocumented, so one that
 //!   cannot be read leaves what is already shown in place.
@@ -109,6 +109,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
             mode = inline.unwrap_or_default().to_owned();
         }
     }
+    let arguments = kept.clone();
     if let Some(id) = &launch.session_id {
         if uuid::Uuid::parse_str(id).is_err() {
             return Err("Antigravity requires an exact conversation ID to resume.".into());
@@ -130,6 +131,7 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
                 .into_owned(),
             resume: launch.session_id.clone(),
             mode,
+            arguments,
             run_nonce: uuid::Uuid::new_v4().simple().to_string(),
             ..Antigravity::default()
         }),
@@ -142,10 +144,17 @@ struct Antigravity {
     cwd: String,
     resume: Option<String>,
     mode: String,
+    /// The launch's arguments, without a conversation to continue.
+    arguments: Vec<String>,
     run_nonce: String,
     conversation: Option<String>,
     busy: bool,
     interrupted: bool,
+    /// The current process has been stopped and takes nothing more.
+    ending: bool,
+    /// Processes that have replaced the first, so the reply steps of each
+    /// remain separate items and what is already shown stays in place.
+    relaunches: u64,
     turn: u64,
     /// Text of the reply step being streamed: its index and what arrived.
     reply: Option<(u64, String)>,
@@ -270,6 +279,16 @@ impl Antigravity {
             );
         }
         self.conversation = Some(id.clone());
+        // A Reset forgets the session, so it has to come before naming it.
+        if self.resume.is_some()
+            && self.relaunches == 0
+            && let Some(items) = history(&self.root, &id, &self.cwd)
+        {
+            step.events.push(Event::Reset {
+                reason: "Loading this Antigravity conversation.".into(),
+            });
+            step.events.extend(items.into_iter().map(Event::Item));
+        }
         step.events.push(Event::Session {
             id: id.clone(),
             title: None,
@@ -280,14 +299,6 @@ impl Antigravity {
         // The event's own `permission_mode` reads the same whatever was chosen.
         step.events
             .push(Event::PermissionMode(Some(self.mode.clone())));
-        if self.resume.is_some()
-            && let Some(items) = history(&self.root, &id, &self.cwd)
-        {
-            step.events.push(Event::Reset {
-                reason: "Loading this Antigravity conversation.".into(),
-            });
-            step.events.extend(items.into_iter().map(Event::Item));
-        }
         step.events.push(Event::Ready(true));
         step.events.push(Event::Status {
             busy: false,
@@ -299,7 +310,7 @@ impl Antigravity {
     fn step_update(&mut self, update: &Value, step: &mut Step) {
         let index = update["step_index"].as_u64().unwrap_or_default();
         let done = update["state"] == "DONE";
-        let conversation = self.conversation().to_owned();
+        let conversation = format!("{}:{}", self.conversation(), self.relaunches);
         match update["step_type"].as_str() {
             Some("agent_response") => {
                 let delta = update["text_delta"].as_str().unwrap_or_default();
@@ -361,8 +372,12 @@ impl Antigravity {
 
     fn finished(&mut self, result: &Value, step: &mut Step) {
         // A streaming session's `usage` is its running total.
-        self.usage.input_tokens = result["usage"]["input_tokens"].as_u64().unwrap_or(0);
-        self.usage.output_tokens = result["usage"]["output_tokens"].as_u64().unwrap_or(0);
+        if let Some(input) = result["usage"]["input_tokens"].as_u64() {
+            self.usage.input_tokens = input;
+        }
+        if let Some(output) = result["usage"]["output_tokens"].as_u64() {
+            self.usage.output_tokens = output;
+        }
         step.events.push(Event::Usage(self.usage.clone()));
         let status = result["status"].as_str().unwrap_or_default();
         let outcome = if self.interrupted
@@ -408,10 +423,14 @@ impl Antigravity {
         self.busy = false;
         self.interrupted = false;
         self.reply = None;
+        self.ending = outcome == Kind::Interrupted;
         step.events.push(Event::TurnSettled);
+        if self.ending {
+            step.events.push(Event::Ready(false));
+        }
         step.events.push(Event::Status {
             busy: false,
-            detail: "Ready".into(),
+            detail: if self.ending { "Stopping" } else { "Ready" }.into(),
         });
         if let Some(run) = self.execution.take() {
             step.events.push(Event::Execution {
@@ -477,7 +496,7 @@ impl Adapter for Antigravity {
                 if !attachments.is_empty() {
                     return Err("Antigravity chats accept text only.".into());
                 }
-                if mode != PromptMode::Send || self.busy {
+                if mode != PromptMode::Send || self.busy || self.ending {
                     return Err("Antigravity cannot take a message while it is working.".into());
                 }
                 self.conversation
@@ -515,6 +534,24 @@ impl Adapter for Antigravity {
             }
             _ => Err("Antigravity chats choose this when they start.".into()),
         }
+    }
+
+    fn relaunch_after_exit(&mut self) -> Option<(Vec<String>, Step)> {
+        let id = self.conversation.clone()?;
+        if !self.ending && !self.interrupted {
+            return None;
+        }
+        let mut step = Step::default();
+        // The process can end on the signal without reporting the turn.
+        if self.busy {
+            self.finished(&json!({"finished_reason":"interrupted"}), &mut step);
+        }
+        self.ending = false;
+        self.resume = Some(id.clone());
+        self.relaunches += 1;
+        let mut arguments = self.arguments.clone();
+        arguments.extend(["--conversation".to_owned(), id]);
+        Some((arguments, step))
     }
 
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
@@ -612,6 +649,68 @@ mod tests {
     }
 
     #[test]
+    fn stopping_continues_the_conversation_in_a_new_process_without_reloading_it() {
+        let mut adapter = adapter();
+        adapter.arguments = vec!["--mode".into(), "plan".into()];
+        adapter.receive(init()).unwrap();
+        assert!(
+            adapter.relaunch_after_exit().is_none(),
+            "a crash is a crash"
+        );
+        let prompt = || Command::Prompt {
+            text: "hi".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        };
+        adapter.command(prompt()).unwrap();
+        adapter.command(Command::Interrupt).unwrap();
+        adapter
+            .receive(json!({"event":"result","result":{"status":"ERROR","finished_reason":"interrupted"}}))
+            .unwrap();
+        assert!(adapter.command(prompt()).is_err(), "the process is ending");
+
+        let (arguments, _) = adapter.relaunch_after_exit().unwrap();
+        assert_eq!(
+            arguments,
+            [
+                "--mode",
+                "plan",
+                "--conversation",
+                "5c09bb42-7e18-40d3-9545-ac00cd55e9e0"
+            ]
+        );
+        let step = adapter.receive(init()).unwrap();
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Reset { .. }))
+        );
+        assert!(
+            step.events
+                .iter()
+                .any(|event| matches!(event, Event::Ready(true)))
+        );
+        adapter.command(prompt()).unwrap();
+    }
+
+    #[test]
+    fn a_process_that_ends_on_the_signal_still_settles_the_turn() {
+        let mut adapter = adapter();
+        adapter.receive(init()).unwrap();
+        adapter.busy = true;
+        adapter.command(Command::Interrupt).unwrap();
+        let (_, step) = adapter.relaunch_after_exit().unwrap();
+        assert!(step.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: Kind::Interrupted,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn refused_tools_are_reported_rather_than_implied_to_have_run() {
         let mut adapter = adapter();
         adapter.receive(init()).unwrap();
@@ -635,6 +734,32 @@ mod tests {
                 .events
                 .iter()
                 .any(|event| matches!(event, Event::Reset { .. }))
+        );
+    }
+
+    #[test]
+    fn a_resume_names_its_conversation_after_resetting_the_view() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "5c09bb42-7e18-40d3-9545-ac00cd55e9e0";
+        let logs = root
+            .path()
+            .join("brain")
+            .join(id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("transcript.jsonl"),
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","content":"pong"}"#,
+        )
+        .unwrap();
+        let mut adapter = adapter();
+        adapter.root = root.path().into();
+        adapter.resume = Some(id.into());
+        let events = adapter.receive(init()).unwrap().events;
+        let position = |found: fn(&Event) -> bool| events.iter().position(found).unwrap();
+        assert!(
+            position(|event| matches!(event, Event::Reset { .. }))
+                < position(|event| matches!(event, Event::Session { .. }))
         );
     }
 

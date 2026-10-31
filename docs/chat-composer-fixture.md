@@ -133,4 +133,7 @@ stream-json mode, linked as `bin/agy`. A prompt's first word chooses the turn:
 an error. Native chat needs a non-personal sign-in, so give the fixture home a
 `.gemini/antigravity-cli/settings.json` containing `{"modelProvider":"gemini"}`.
 `AGY_FIXTURE_SIGNED_OUT=1` refuses `agy models`. It checks this application's
-handling, not Google's service or the real CLI's behavior.
+handling, not Google's service or the real CLI's behavior. A terminal running the
+linked script is seen as `python3`, not `agy`, so it isn't recognized as an agent.
+To check terminal recognition, use a small compiled `bin/agy` that executes the
+script.

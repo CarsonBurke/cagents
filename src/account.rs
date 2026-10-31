@@ -488,8 +488,8 @@ impl Account {
             | AccountHome::Managed { path, .. }
             | AccountHome::Linked { path, .. } => Some(path.clone()),
             AccountHome::System => {
-                let variable = home_variable(self.provider)?;
-                if let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
+                if let Some(variable) = home_variable(self.provider)
+                    && let Some(explicit) = environment(variable).filter(|value| !value.is_empty())
                     && !inherited_selections(environment).contains(&variable)
                 {
                     return Some(PathBuf::from(explicit));
@@ -1251,6 +1251,12 @@ mod tests {
             Some(PathBuf::from("/home/a/.codex"))
         );
         assert_eq!(codex.home_directory(&environment(&[])), None);
+        // No selecting variable, yet its default home is still where it lives.
+        assert_eq!(
+            Account::system(Provider::Antigravity)
+                .home_directory(&environment(&[("HOME", "/home/a")])),
+            Some(PathBuf::from("/home/a/.gemini/antigravity-cli"))
+        );
         assert_eq!(claude.probe_environment(), None);
         let key = uuid::Uuid::from_u128(1);
         let managed = Account::managed(Provider::Codex, key, "/data/accounts/codex/1".into());
