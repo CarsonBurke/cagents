@@ -74,6 +74,17 @@ MAX_RUNNER_LOG_BYTES = 8 * 1024 * 1024
 DEFAULT_WIDTH = 1600
 MIN_WIDTH = 320
 MAX_WIDTH = 3840
+ACCOUNTS_SCENES = (
+    "claude-sparse", "codex-sparse", "claude-malformed", "codex-malformed",
+    "claude-delayed", "codex-delayed", "claude-ticket", "codex-ticket",
+    "claude-startup", "codex-startup", "claude-catalog",
+)
+ACCOUNTS_FIELDS = {"recipe", "scene", "layout", "side"}
+ACCOUNTS_XDG = (
+    ("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"),
+    ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state"),
+    ("XDG_RUNTIME_DIR", "runtime"),
+)
 SYSTEM_PATH = "/usr/bin:/usr/sbin"
 TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # Per process, except nproc. Aggregate memory needs a cgroup, which needs systemd.
@@ -267,7 +278,7 @@ def _input_fields(request):
 INPUT_KEYS = {"op", "fixture", "owner", "action", "target", "button", "double", "text",
               "chords", "axis", "notches", "at", "gone", "timeout", "no_text"}
 OP_KEYS = {
-    "start": {"op", "fixture", "checkout", "width"},
+    "start": {"op", "fixture", "checkout", "width", *ACCOUNTS_FIELDS},
     "run-ui": {"op", "fixture", "owner"},
     "cli": {"op", "fixture", "owner", "args"},
     "input": INPUT_KEYS,
@@ -299,6 +310,14 @@ def validate_request(request, repo):
     if op == "start":
         result["checkout"] = validate_checkout(request.get("checkout"), repo)
         result["width"] = _width(request)
+        selected = ACCOUNTS_FIELDS.intersection(request)
+        if selected:
+            if selected != ACCOUNTS_FIELDS or "width" not in request:
+                raise Refusal("invalid_request", "Accounts recipe needs recipe, scene, layout, side and explicit width")
+            if (request["recipe"] != "accounts-quota" or request["scene"] not in ACCOUNTS_SCENES
+                    or request["layout"] not in ("wide", "narrow") or request["side"] not in ("before", "after")):
+                raise Refusal("invalid_request", "unknown fixed Accounts recipe, scene, layout or side")
+            result["recipe"] = AccountsRecipe(request["scene"], request["layout"], request["side"], result["width"])
     elif op == "cli":
         args = request.get("args")
         if not isinstance(args, list) or not 1 <= len(args) <= MAX_ARGS:
@@ -451,11 +470,24 @@ class Host:
 
 
 @dataclass(frozen=True)
+class AccountsRecipe:
+    scene: str
+    layout: str
+    side: str
+    width: int
+
+    @property
+    def root(self):
+        return Path("/tmp") / f"cagents-1938-native-{self.scene}-{self.layout}-{self.side}"
+
+
+@dataclass(frozen=True)
 class Layout:
     host: Host
     name: str
     checkout: Path
     zig_dir: Path
+    accounts: AccountsRecipe = None
 
     @property
     def root_parts(self):
@@ -516,7 +548,15 @@ class Layout:
 
     @property
     def nested_wayland(self):
-        return self.host.runtime_dir / "nested-wayland"
+        return self.command_runtime / "nested-wayland"
+
+    @property
+    def runtime_destination(self):
+        return self.accounts.root if self.accounts is not None else self.host.runtime_dir
+
+    @property
+    def command_runtime(self):
+        return self.accounts.root / "runtime" if self.accounts is not None else self.host.runtime_dir
 
     @property
     def runner_log(self):
@@ -653,7 +693,7 @@ def sandbox_args(layout, binds):
         "--bind-fd", str(binds.sandbox), str(layout.sandbox),
         # Zig fetches into this cache; with no network it reads what exists.
         "--ro-bind-try", str(host.home / ".cache/zig/p"), str(layout.sandbox / "cache/zig/p"),
-        "--bind-fd", str(binds.runtime), str(host.runtime_dir),
+        "--bind-fd", str(binds.runtime), str(layout.runtime_destination),
         "--bind-fd", str(binds.wayland), str(layout.nested_wayland),
         "--chdir", str(layout.sandbox / "project"),
         # Last, once every mount point exists: nothing can be planted at the root.
@@ -666,7 +706,7 @@ def sandbox_env(layout):
     """The whole environment of a sandboxed process, built from nothing."""
     host = layout.host
     sandbox = layout.sandbox
-    return {
+    environment = {
         "HOME": str(sandbox / "home"),
         "USER": host.home.name,
         "LOGNAME": host.home.name,
@@ -689,6 +729,10 @@ def sandbox_env(layout):
         "CARGO_NET_OFFLINE": "true",
         "ZIG_GLOBAL_CACHE_DIR": str(sandbox / "cache/zig"),
     }
+    if layout.accounts is not None:
+        environment.update({name: str(layout.accounts.root / child) for name, child in ACCOUNTS_XDG})
+        environment["CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE"] = layout.accounts.scene
+    return environment
 
 
 # Runs inside the sandbox on a socketpair inherited from the broker, so no path
@@ -923,6 +967,7 @@ class Fixture:
     released: bool = False
     runner_attempted: bool = False
     runner_attempt: int = 0
+    accounts_root_owned: bool = False
 
     @property
     def runner_log(self):
@@ -1165,6 +1210,8 @@ class Fixtures:
             if len(self.live) >= MAX_LIVE_FIXTURES:
                 raise Refusal("too_many_fixtures", f"at most {MAX_LIVE_FIXTURES} fixtures can run at once")
             layout = self.layout_for(name, request["checkout"])
+            if "recipe" in request:
+                layout = Layout(layout.host, layout.name, layout.checkout, layout.zig_dir, request["recipe"])
             if os.path.lexists(layout.root):
                 raise Refusal("fixture_exists", f"run `scripts/native-fixture clear {name}` first")
             fixture = Fixture(layout, secrets.token_hex(16))
@@ -1180,7 +1227,7 @@ class Fixtures:
                 except BaseException as cleanup_error:
                     stopping(f"{name}: failed start remains owned: {type(cleanup_error).__name__}: {cleanup_error}")
                 raise
-        return {
+        result = {
             "fixture": name,
             "owner": fixture.owner,
             "root": str(layout.root),
@@ -1190,6 +1237,11 @@ class Fixtures:
             "shots": str(layout.shots),
             "viewport": viewport,
         }
+        if layout.accounts is not None:
+            result["recipe"] = {"name": "accounts-quota", "scene": layout.accounts.scene,
+                                "layout": layout.accounts.layout, "side": layout.accounts.side,
+                                "root": str(layout.accounts.root), "width": layout.accounts.width}
+        return result
 
     def _create(self, fixture, width):
         layout = fixture.layout
@@ -1200,13 +1252,15 @@ class Fixtures:
             for directory, parts in (
                 (repo, (*layout.root_parts, "shots")),
                 *((repo, (*layout.root_parts, "sandbox", *name.split("/"))) for name in layout.sandbox_directories),
-                (self.host.runtime_dir, (layout.runtime_name,)),
+                *(((self.host.runtime_dir, (layout.runtime_name,)),) if layout.accounts is None else ()),
                 *((self.host.runtime_dir, (*layout.private_parts, name)) for name in ("niri", "state")),
             ):
                 fixture.spawn_resources["creation_directory"] = hold_directory(directory, parts, create=True)
                 errors = self._close_spawn_resources(fixture, ("creation_directory",))
                 if errors:
                     raise Refusal("cleanup_incomplete", "; ".join(errors))
+            if layout.accounts is not None:
+                self._create_accounts_runtime(fixture)
             provider = hold_directory(repo, (*layout.root_parts, "sandbox", "bin"))
             fixture.spawn_resources["provider_directory"] = provider
             try:
@@ -1245,6 +1299,42 @@ class Fixtures:
         if initialized["exit_code"]:
             raise Refusal("sandbox_failed", initialized["stderr"])
         return self._apply_viewport(fixture, width)
+
+    def _create_accounts_runtime(self, fixture):
+        """One new fixed namespace, backed by the original held runtime bind."""
+        layout = fixture.layout
+        owner = os.geteuid()
+        try:
+            parent = hold_directory(self.host.runtime_dir, ())
+            fixture.spawn_resources["accounts_parent"] = parent
+            try:
+                os.mkdir(layout.runtime_name, mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                raise Refusal("fixture_exists", "existing private Accounts runtime is not adopted") from None
+            fixture.accounts_root_owned = True
+            root = os.open(layout.runtime_name, NO_FOLLOW_DIRECTORY, dir_fd=parent)
+            fixture.spawn_resources["accounts_root"] = root
+            metadata = os.fstat(root)
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or metadata.st_mode & 0o7777 != 0o700:
+                raise Refusal("invalid_fixture_roots", "Accounts root must be an owned private mode0700 directory")
+            for _name, child in ACCOUNTS_XDG:
+                try:
+                    os.mkdir(child, mode=0o700, dir_fd=root)
+                except FileExistsError:
+                    raise Refusal("invalid_fixture_roots", "existing Accounts child is not adopted") from None
+                descriptor = os.open(child, NO_FOLLOW_DIRECTORY, dir_fd=root)
+                fixture.spawn_resources["accounts_child"] = descriptor
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or metadata.st_mode & 0o7777 != 0o700:
+                    raise Refusal("invalid_fixture_roots", "Accounts child must be an owned private mode0700 directory")
+                errors = self._close_spawn_resources(fixture, ("accounts_child",))
+                if errors:
+                    raise Refusal("cleanup_incomplete", "; ".join(errors))
+        finally:
+            original = sys.exc_info()[1]
+            errors = self._close_spawn_resources(fixture, ("accounts_child", "accounts_root", "accounts_parent"))
+            if errors and original is None:
+                raise Refusal("cleanup_incomplete", "; ".join(errors))
 
     def _nested_session(self, layout):
         handshake = read_regular(self.host.runtime_dir, (*layout.private_parts, "niri"), "session.env", 4096)
@@ -1506,6 +1596,8 @@ class Fixtures:
             return {"requested_width": fixture.width, "matches": False, "error": str(error)}
 
     def viewport(self, fixture, request):
+        if fixture.layout.accounts is not None and request["width"] != fixture.layout.accounts.width:
+            raise Refusal("invalid_request", "a fixed Accounts layout needs its original width; start a fresh fixture to change it")
         return self._apply_viewport(fixture, request["width"])
 
     def _in_sandbox(self, fixture, command, timeout=CLI_SECONDS):
@@ -1557,6 +1649,8 @@ class Fixtures:
             return self._start_runner(fixture)
 
     def _start_runner(self, fixture):
+        if fixture.layout.accounts is not None and fixture.runner_attempted:
+            raise Refusal("fixture_used", "Accounts recipe is single-use; stop it and create a fresh fixture")
         if self._runner_state(fixture) == "running":
             raise Refusal("runner_active", "the development runner is already running")
         layout = fixture.layout
@@ -1699,7 +1793,10 @@ class Fixtures:
         left_behind = []
         if not remove_beneath(self.host.runtime_dir, layout.private_parts):
             left_behind.append(str(layout.private))
-        if not remove_beneath(self.host.runtime_dir, (layout.runtime_name,)):
+        if layout.accounts is not None and fixture is not None and not fixture.accounts_root_owned:
+            if os.path.lexists(layout.runtime):
+                left_behind.append(str(layout.runtime))
+        elif not remove_beneath(self.host.runtime_dir, (layout.runtime_name,)):
             left_behind.append(str(layout.runtime))
         if remove and not remove_beneath(self.host.repo, layout.root_parts):
             left_behind.append(str(layout.root))

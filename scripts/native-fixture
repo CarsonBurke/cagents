@@ -13,6 +13,11 @@ import socket
 import sys
 
 SOCKET_NAME = "native-fixture-broker.sock"
+ACCOUNTS_SCENES = (
+    "claude-sparse", "codex-sparse", "claude-malformed", "codex-malformed",
+    "claude-delayed", "codex-delayed", "claude-ticket", "codex-ticket",
+    "claude-startup", "codex-startup", "claude-catalog",
+)
 EXIT_NO_BROKER = 69
 MAX_REPLY_BYTES = 2 * 1024 * 1024
 # Longer than any operation the broker allows, so a hung broker still ends this.
@@ -38,6 +43,10 @@ def parse(argv):
     start = command("start", "start a nested session and sandbox")
     start.add_argument("--checkout", required=True, help="checkout beneath this repository's .worktrees/")
     start.add_argument("--width", type=int, help="logical width of the app's viewport")
+    start.add_argument("--recipe", choices=("accounts-quota",))
+    start.add_argument("--scene", choices=ACCOUNTS_SCENES)
+    start.add_argument("--layout", choices=("wide", "narrow"))
+    start.add_argument("--side", choices=("before", "after"))
     command("viewport", "set the logical viewport width").add_argument("--width", type=int, required=True)
     command("clear", "remove a stopped or left-behind fixture by name")
     command("run-ui", "build and launch through scripts/run-development --browserless")
@@ -72,6 +81,10 @@ def request_from(parsed):
         request = {"op": "start", "fixture": fixture, "checkout": str(Path(parsed.checkout).absolute())}
         if parsed.width is not None:
             request["width"] = parsed.width
+        for name in ("recipe", "scene", "layout", "side"):
+            value = getattr(parsed, name)
+            if value is not None:
+                request[name] = value
         return request
     if command == "clear":
         return {"op": "clear", "fixture": fixture}

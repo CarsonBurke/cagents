@@ -99,6 +99,64 @@ The optional behaviors below use `sandbox/home/.claude` under the root, which yo
 can write from your own shell. Also `move`, `key`, `scroll` and `observe`; see
 `scripts/native-fixture --help`.
 
+### Fixed Accounts scenes
+
+The optional `accounts-quota` recipe selects only these inert scenes:
+`claude-sparse`, `codex-sparse`, `claude-malformed`, `codex-malformed`,
+`claude-delayed`, `codex-delayed`, `claude-ticket`, `codex-ticket`,
+`claude-startup`, `codex-startup`, and `claude-catalog`. Select it at `start`;
+the scene, layout and source-side labels cannot change afterward. All four
+recipe fields and an explicit width are required. No environment, root path,
+extra command arguments or clock override can be supplied.
+
+```sh
+scripts/native-fixture start accounts-before --checkout "$before_checkout" \
+  --width 1600 --recipe accounts-quota --scene claude-sparse --layout wide --side before
+scripts/native-fixture run-ui --owner "$owner" accounts-before
+```
+
+Use the owner returned by that `start`. Use matching 1600-pixel wide and
+480-pixel narrow requests for a comparison, with a fresh fixture for each
+scene/layout/side. These are proposed capture sizes, not proof of the reached
+viewport; inspect the existing viewport reports and actual native frames.
+For this recipe, `viewport` can only re-fit the original requested width.
+
+The fixed selector reaches the same `scripts/run-development --browserless`
+matched CLI/HOST/UI builds and default local UI window. Inside the sandbox,
+the existing held private runtime directory is mounted at
+`/tmp/cagents-1938-native-<scene>-<wide|narrow>-<before|after>`. Its distinct
+`data`, `config`, `cache`, `state` and `runtime` children are owned mode0700
+directories; all five XDG variables point there. The held nested Wayland socket
+is mounted at that namespace's `runtime/nested-wayland`. HOME stays private.
+Existing roots are refused, not adopted or repaired, and failed setup does not
+automatically delete an unowned preexisting runtime root.
+
+Accounts launches are single-use, including a lost launch reply. A second
+`run-ui` refuses; safely stop/clear the fixture and start a fresh one instead.
+Never delete `accounts-native-started` or reset logs to reuse a scene. Original
+wait/close/host-stop uncertainty still retains ownership and can keep shutdown
+incomplete. `--keep` keeps the repository fixture logs/screenshots; the private
+runtime-backed Accounts namespace remains subject to normal runtime cleanup.
+
+Source pairs are separate from side labels. The original ten-scene ports are
+Before `dc2a10b0f3b925e5c2546722004782b629d4de3b` and After
+`48f5254a97e6b8865c40f7d9a1cbc73f41c530f2`. The catalog pair is Before
+`471bd5316a54ec9f4ed888f207dc11ceeffead8a` and After
+`aa0606e351fc4a54ed097a1878655bd216caa856`; catalog Before is the old Accounts
+feature/main composition, not the whole main baseline. Owners must bind actual
+source/build/ELF evidence. An incompatible checkout fails fixture startup;
+there is no ordinary-mode fallback. Catalog uses the fixed Nov1 UTC seed and
+refuses at Nov2 2026 00:00 UTC; no broker time override extends it. F8 supplies
+only the fixture's fixed typed Loaded event, not arbitrary callback data.
+
+This recipe supplies source controls, not build or native admission. The real
+three-graph build still needs a separately decided stable resource/build
+admission. Existing per-checkout targets and per-process limits are not an
+aggregate memory cgroup cap. A genuine User must start the reviewed broker;
+actual bootstrap, matched executables, native screenshots/interaction and UX
+review remain required. Synthetic Accounts rows and receipts do not qualify
+provider/account/home/daemon behavior or grant User authority.
+
 ### What the sandbox can reach
 
 Each fixture runs in a bubblewrap sandbox with its own HOME, XDG directories,

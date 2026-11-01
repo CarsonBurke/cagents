@@ -10,6 +10,7 @@ one get an inert placeholder.
 """
 
 import ast
+import argparse
 import importlib.machinery
 import importlib.util
 import io
@@ -2119,6 +2120,296 @@ class OwnershipContracts(TemporaryRepository):
         self.assertIsNone(operation["child"])
         self.assertEqual(operation["streams"], [stream])
         self.assertTrue(operation["close_errors"])
+
+
+class AccountsContracts(TemporaryRepository):
+    """Fixed-recipe input and ownership oracles, without a native child.
+
+    Descriptor numbers are synthetic while their OS operations are mocked.
+    The collision control uses only this test's private TemporaryDirectory.
+    No broker entry point, inherited environment or authority is changed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.host = broker.Host(
+            repo=self.repo, home=self.base / "home", runtime_dir=self.base / "runtime",
+            cargo_home=self.base / "cargo", rustup_home=self.base / "rustup",
+            mise_data=self.base / "mise", harness="synthetic-harness", niri="synthetic-niri",
+        )
+        self.manager = object.__new__(broker.Fixtures)
+        self.manager.host = self.host
+        self.manager.harness_env = {"SYNTHETIC_FIXTURE": "mock only; no child executes"}
+        self.manager.lock = threading.Lock()
+        self.manager.build_lock = threading.Lock()
+        self.manager.closing = False
+        self.manager.clearing = set()
+        self.manager.host_operations = []
+        self.manager.spawner = mock.Mock()
+        self.manager.spawner.close.return_value = []
+        self.manager.live = {}
+
+    def request(self, **changes):
+        return {"op": "start", "fixture": "accounts", "checkout": str(self.checkout),
+                "width": 480, "recipe": "accounts-quota", "scene": "claude-malformed",
+                "layout": "narrow", "side": "before", **changes}
+
+    def fixture(self):
+        request = broker.validate_request(self.request(), self.repo)
+        layout = broker.Layout(self.host, "accounts", self.checkout, self.base / "zig", request["recipe"])
+        fixture = broker.Fixture(layout, OWNER, width=request["width"])
+        fixture.channel = mock.Mock()
+        self.manager.live[layout.name] = fixture
+        return fixture
+
+    @staticmethod
+    def directory_metadata(**changes):
+        return mock.Mock(**{"st_mode": stat.S_IFDIR | 0o700, "st_uid": 1000, **changes})
+
+    def test_every_fixed_scene_layout_and_side_has_one_exact_namespace(self):
+        expected = {
+            "claude-sparse", "codex-sparse", "claude-malformed", "codex-malformed",
+            "claude-delayed", "codex-delayed", "claude-ticket", "codex-ticket",
+            "claude-startup", "codex-startup", "claude-catalog",
+        }
+        self.assertEqual(set(broker.ACCOUNTS_SCENES), expected)
+        self.assertEqual(len(broker.ACCOUNTS_SCENES), len(expected))
+        for scene in broker.ACCOUNTS_SCENES:
+            for layout in ("wide", "narrow"):
+                for side in ("before", "after"):
+                    with self.subTest(scene=scene, layout=layout, side=side):
+                        request = broker.validate_request(self.request(scene=scene, layout=layout, side=side), self.repo)
+                        recipe = request["recipe"]
+                        self.assertEqual((recipe.scene, recipe.layout, recipe.side, recipe.width),
+                                         (scene, layout, side, 480))
+                        self.assertEqual(recipe.root, Path(f"/tmp/cagents-1938-native-{scene}-{layout}-{side}"))
+        longest = max(len(str(broker.AccountsRecipe(scene, layout, side, 480).root))
+                      for scene in broker.ACCOUNTS_SCENES
+                      for layout in ("wide", "narrow") for side in ("before", "after"))
+        self.assertEqual(longest, 55)
+        self.assertEqual(longest + len("/runtime/cagents-development/cagentsd.sock"), 97)
+        self.assertEqual(longest + len("/runtime/nested-wayland"), 78)
+        self.assertLess(97 + 1, 108)  # Literal path plus terminating NUL, not a live ABI probe.
+
+    def test_partial_unknown_or_unbounded_recipe_inputs_refuse_before_dispatch(self):
+        fields = ("recipe", "scene", "layout", "side")
+        requests = []
+        for mask in range(1, 15):
+            request = self.request()
+            for index, field in enumerate(fields):
+                if not mask & (1 << index):
+                    del request[field]
+            requests.append(request)
+        missing_width = self.request()
+        del missing_width["width"]
+        requests.append(missing_width)
+        for field, value in (("recipe", "other"), ("scene", "arbitrary"),
+                             ("layout", "medium"), ("side", "live"), ("scene", None),
+                             ("width", True), ("width", 0), ("width", broker.MAX_WIDTH + 1)):
+            requests.append(self.request(**{field: value}))
+        for field in ("env", "argv", "root", "cwd", "clock", "extra_args"):
+            requests.append(self.request(**{field: "not an interface"}))
+        for request in requests:
+            with self.subTest(request=request):
+                dispatch = mock.Mock()
+                response = broker.answer(json.dumps(request).encode(), self.repo, dispatch)
+                self.assertFalse(response["ok"])
+                self.assertEqual(response["code"], "invalid_request")
+                dispatch.assert_not_called()
+
+    def test_client_fixed_fields_match_server_and_ordinary_wire_stays_unchanged(self):
+        # Extract these two argument-to-data functions only. Never execute the
+        # client entry point, socket path or any environment-reading statement.
+        tree = ast.parse(CLIENT.read_text())
+        functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name in ("parse", "request_from")]
+        self.assertEqual([node.name for node in functions], ["parse", "request_from"])
+        scenes = next(ast.literal_eval(node.value) for node in tree.body
+                      if isinstance(node, ast.Assign)
+                      and any(isinstance(name, ast.Name) and name.id == "ACCOUNTS_SCENES" for name in node.targets))
+        self.assertEqual(scenes, broker.ACCOUNTS_SCENES)
+        namespace = {"argparse": argparse, "Path": Path, "__doc__": "fixed client parser",
+                     "ACCOUNTS_SCENES": scenes}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "<fixed-client-input-mock>", "exec"), namespace)
+        ordinary = ["start", "accounts", "--checkout", str(self.checkout), "--width", "480"]
+        request = namespace["request_from"](namespace["parse"](ordinary))
+        self.assertEqual(request, {"op": "start", "fixture": "accounts", "checkout": str(self.checkout), "width": 480})
+        request = namespace["request_from"](namespace["parse"](
+            [*ordinary, "--recipe", "accounts-quota", "--scene", "claude-catalog",
+             "--layout", "narrow", "--side", "before"]))
+        self.assertEqual(request, self.request(scene="claude-catalog"))
+        self.assertEqual(broker.validate_request(request, self.repo)["recipe"].scene, "claude-catalog")
+        for arguments in ([*ordinary, "--env", "X=Y"], [*ordinary, "--scene", "unknown"]):
+            with self.subTest(arguments=arguments), mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    namespace["parse"](arguments)
+
+    def test_fixed_mount_environment_and_wayland_only_change_the_recipe_namespace(self):
+        fixture = self.fixture()
+        profile = fixture.layout
+        ordinary = broker.Layout(self.host, profile.name, profile.checkout, profile.zig_dir)
+        binds = broker.Binds(11, 12, 13, 14, 15)
+        with mock.patch.object(broker, "git_common_dir", return_value=None), mock.patch.object(
+                Path, "is_symlink", return_value=False), mock.patch.object(Path, "is_dir", return_value=True):
+            previous = broker.sandbox_args(ordinary, binds)
+            current = broker.sandbox_args(profile, binds)
+        expected = list(previous)
+        index = next(index for index in range(len(expected) - 2)
+                     if expected[index:index + 2] == ["--bind-fd", "14"])
+        expected[index + 2] = str(profile.accounts.root)
+        index = next(index for index in range(len(expected) - 2)
+                     if expected[index:index + 2] == ["--bind-fd", "15"])
+        expected[index + 2] = str(profile.accounts.root / "runtime/nested-wayland")
+        self.assertEqual(current, expected)
+        self.assertEqual(binds.fds(), (11, 12, 13, 14, 15))
+        original_env = broker.sandbox_env(ordinary)
+        self.assertEqual(original_env["XDG_RUNTIME_DIR"], str(self.host.runtime_dir))
+        self.assertNotIn("XDG_STATE_HOME", original_env)
+        self.assertNotIn("CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE", original_env)
+        expected_env = {**original_env,
+                        **{name: str(profile.accounts.root / child) for name, child in broker.ACCOUNTS_XDG},
+                        "CAGENTS_DEVELOPMENT_ACCOUNT_FIXTURE": "claude-malformed"}
+        self.assertEqual(broker.sandbox_env(profile), expected_env)
+        self.assertEqual(broker.runner_command(profile), broker.runner_command(ordinary))
+        self.assertEqual(profile.runtime, self.host.runtime_dir / "nf-accounts")
+        self.assertEqual(profile.command_runtime, profile.accounts.root / "runtime")
+
+    def test_exclusive_namespace_registers_and_closes_every_original_descriptor_once(self):
+        fixture = self.fixture()
+        with mock.patch.object(broker.os, "geteuid", return_value=1000), mock.patch.object(
+                broker, "hold_directory", return_value=100), mock.patch.object(broker.os, "mkdir") as mkdir, mock.patch.object(
+                broker.os, "open", side_effect=range(101, 107)) as opened, mock.patch.object(
+                broker.os, "fstat", side_effect=lambda _fd: self.directory_metadata()), mock.patch.object(broker.os, "close") as close:
+            self.manager._create_accounts_runtime(fixture)
+        self.assertTrue(fixture.accounts_root_owned)
+        self.assertEqual(fixture.spawn_resources, {})
+        self.assertEqual(fixture.resource_errors, [])
+        self.assertEqual(mkdir.call_args_list, [mock.call("nf-accounts", mode=0o700, dir_fd=100)]
+                         + [mock.call(child, mode=0o700, dir_fd=101) for _name, child in broker.ACCOUNTS_XDG])
+        self.assertEqual(opened.call_args_list, [mock.call("nf-accounts", broker.NO_FOLLOW_DIRECTORY, dir_fd=100)]
+                         + [mock.call(child, broker.NO_FOLLOW_DIRECTORY, dir_fd=101) for _name, child in broker.ACCOUNTS_XDG])
+        self.assertEqual(close.call_args_list, [mock.call(value) for value in range(102, 107)]
+                         + [mock.call(101), mock.call(100)])
+
+    def test_invalid_root_or_child_refuses_before_provider_or_holder_dispatch(self):
+        bad_metadata = (self.directory_metadata(st_uid=1001), self.directory_metadata(st_mode=stat.S_IFDIR | 0o755),
+                        self.directory_metadata(st_mode=stat.S_IFREG | 0o700))
+        variants = [("metadata", metadata, child) for metadata in bad_metadata for child in (False, True)]
+        variants += [("symlink", None, child) for child in (False, True)]
+        variants += [("existing-child", None, True), ("unreadable", None, True)]
+        for kind, invalid, child in variants:
+            with self.subTest(kind=kind, child=child):
+                fixture = self.fixture()
+                # The pre-namespace directory loop also uses hold_directory;
+                # each acquisition gets a distinct mock descriptor.
+                descriptors = iter(range(200, 300))
+                metadata = [self.directory_metadata(), invalid] if child else [invalid]
+                open_values = [101, OSError("synthetic nofollow refusal")] if child else [OSError("synthetic nofollow refusal")]
+                open_effect = open_values if kind == "symlink" else iter(range(101, 107))
+                def make_directory(name, **_kwargs):
+                    if kind == "existing-child" and name == "data":
+                        raise FileExistsError("synthetic existing child")
+                if kind == "unreadable":
+                    metadata = [self.directory_metadata(), OSError("synthetic fstat refusal")]
+                elif kind != "metadata":
+                    metadata = [self.directory_metadata()] * 6
+                with mock.patch.object(broker.os, "geteuid", return_value=1000), mock.patch.object(
+                        broker, "hold_directory", side_effect=lambda *_a, **_k: next(descriptors)), mock.patch.object(
+                        broker.os, "mkdir", side_effect=make_directory), mock.patch.object(broker.os, "open", side_effect=open_effect), mock.patch.object(
+                        broker.os, "fstat", side_effect=metadata), mock.patch.object(broker.os, "close") as close, mock.patch.object(
+                        broker.os, "symlink") as symlink, mock.patch.object(self.manager, "_host_focus") as focus, mock.patch.object(
+                        self.manager, "_spawn_holder") as holder, mock.patch.object(self.manager, "harness") as harness:
+                    with self.assertRaises((broker.Refusal, OSError)):
+                        self.manager._create(fixture, 480)
+                symlink.assert_not_called()
+                focus.assert_not_called()
+                holder.assert_not_called()
+                harness.assert_not_called()
+                closed = [call.args[0] for call in close.call_args_list]
+                self.assertEqual(len(closed), len(set(closed)))
+                self.assertEqual(fixture.spawn_resources, {})
+
+    def test_failed_start_preserves_a_preexisting_unowned_namespace_and_sentinel(self):
+        self.host.runtime_dir.mkdir(mode=0o700)
+        runtime = self.host.runtime_dir / "nf-accounts"
+        runtime.mkdir(mode=0o700)
+        sentinel = runtime / "not-owned-by-this-start"
+        sentinel.write_bytes(b"preserve original collision")
+        ordinary = broker.Layout(self.host, "accounts", self.checkout, self.base / "zig")
+        retained = []
+        def create(fixture, _width):
+            retained.append(fixture)
+            return self.manager._create_accounts_runtime(fixture)
+        with mock.patch.object(self.manager, "layout_for", return_value=ordinary), mock.patch.object(
+                self.manager, "_create", side_effect=create), mock.patch.object(
+                broker, "remove_beneath", wraps=broker.remove_beneath) as remove, mock.patch.object(
+                self.manager, "harness") as harness, mock.patch.object(broker.subprocess, "Popen") as child:
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.start(broker.validate_request(self.request(), self.repo))
+        self.assertEqual(caught.exception.code, "fixture_exists")
+        self.assertFalse(retained[0].accounts_root_owned)
+        self.assertEqual(retained[0].spawn_resources, {})
+        self.assertEqual(sentinel.read_bytes(), b"preserve original collision")
+        self.assertTrue(runtime.is_dir())
+        self.assertNotIn(mock.call(self.host.runtime_dir, ("nf-accounts",)), remove.call_args_list)
+        harness.assert_not_called()
+        child.assert_not_called()
+        self.assertEqual(self.manager.live, {})
+
+    def test_namespace_close_uncertainty_keeps_first_refusal_and_owned_name(self):
+        ordinary = broker.Layout(self.host, "accounts", self.checkout, self.base / "zig")
+        retained = []
+        def create(fixture, _width):
+            retained.append(fixture)
+            return self.manager._create_accounts_runtime(fixture)
+        with mock.patch.object(self.manager, "layout_for", return_value=ordinary), mock.patch.object(
+                self.manager, "_create", side_effect=create), mock.patch.object(broker.os.path, "lexists", return_value=False), mock.patch.object(
+                broker.os, "geteuid", return_value=1000), mock.patch.object(broker, "hold_directory", return_value=100), mock.patch.object(
+                broker.os, "mkdir"), mock.patch.object(broker.os, "open", side_effect=[101, 102]), mock.patch.object(
+                broker.os, "fstat", side_effect=[self.directory_metadata(), self.directory_metadata(st_uid=1001)]), mock.patch.object(
+                broker.os, "close", side_effect=[OSError("synthetic uncertain child close"), None, None]) as close, mock.patch.object(
+                broker, "remove_beneath") as remove, mock.patch.object(broker, "stopping"):
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.start(broker.validate_request(self.request(), self.repo))
+        self.assertEqual(caught.exception.code, "invalid_fixture_roots")
+        fixture, = retained
+        self.assertTrue(fixture.accounts_root_owned)
+        self.assertIs(self.manager.live["accounts"], fixture)
+        self.assertTrue(fixture.resource_errors)
+        self.assertEqual(fixture.spawn_resources, {})
+        self.assertEqual(close.call_args_list, [mock.call(102), mock.call(101), mock.call(100)])
+        remove.assert_not_called()
+
+    def test_single_use_consumes_success_or_lost_ack_before_any_second_launch(self):
+        for reply in ({"state": "running"}, {"state": "invalid"}, broker.Refusal("timeout", "synthetic lost ACK")):
+            with self.subTest(reply=reply):
+                fixture = self.fixture()
+                fixture.channel.call.side_effect = [{"state": "not_started"}, reply]
+                if isinstance(reply, broker.Refusal) or reply["state"] != "running":
+                    with self.assertRaises(broker.Refusal):
+                        self.manager.run_ui(fixture, {})
+                else:
+                    self.manager.run_ui(fixture, {})
+                self.assertTrue(fixture.runner_attempted)
+                self.assertEqual(fixture.runner_started, isinstance(reply, dict) and reply["state"] == "running")
+                self.assertEqual(fixture.runner_attempt, 1)
+                first_calls = list(fixture.channel.call.call_args_list)
+                self.assertTrue(first_calls[-1].args[0]["background"] == "runner")
+                with self.assertRaises(broker.Refusal) as caught:
+                    self.manager.run_ui(fixture, {})
+                self.assertEqual(caught.exception.code, "fixture_used")
+                self.assertEqual(fixture.channel.call.call_args_list, first_calls)
+                self.assertEqual(fixture.runner_attempt, 1)
+
+    def test_viewport_refits_only_the_original_explicit_width(self):
+        fixture = self.fixture()
+        with mock.patch.object(self.manager, "_apply_viewport", return_value={"matches": True}) as apply:
+            self.assertEqual(self.manager.viewport(fixture, {"width": 480}), {"matches": True})
+            apply.assert_called_once_with(fixture, 480)
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.viewport(fixture, {"width": 1600})
+            self.assertEqual(caught.exception.code, "invalid_request")
+            apply.assert_called_once_with(fixture, 480)
 
 
 class Protocol(TemporaryRepository):
