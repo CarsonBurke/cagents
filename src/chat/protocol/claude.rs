@@ -1856,9 +1856,15 @@ impl Claude {
         let Some(content) = recorded_notification(frame) else {
             return;
         };
-        // Replay tolerates a truncated quoted result; live state needs a
-        // complete recognized envelope before it can settle an owner.
-        if notification_elements(&content).is_empty() {
+        // A result is opaque and may quote an unclosed notification opener.
+        // Keep the outcome parser's fallback only when both that result and
+        // its outer notification close; truncated live reports stay inert.
+        let closed_result = content
+            .split_once(NOTIFICATION_OPEN)
+            .and_then(|(_, outer)| outer.trim_end().strip_suffix("</task-notification>"))
+            .and_then(|inner| inner.split_once("<result>"))
+            .is_some_and(|(_, result)| result.trim_end().ends_with("</result>"));
+        if notification_elements(&content).is_empty() && !closed_result {
             return;
         }
         for (reported, task, status) in notification_outcomes(&content) {
@@ -10295,6 +10301,80 @@ mod tests {
                 );
                 assert!(adapter.visible_task_rows.is_empty());
             }
+        }
+    }
+
+    #[test]
+    fn a_live_quoted_report_settles_only_its_closed_outer_notification() {
+        let quoting = "<task-notification>\n<task-id>task-one</task-id>\n<tool-use-id>tool-one</tool-use-id>\n<status>completed</status>\n<summary>Agent finished</summary>\n<result>The log shows:\n<task-notification>\n<task-id>task-two</task-id>\n<tool-use-id>tool-two</tool-use-id>\n<status>failed</status>\n</result>\n</task-notification>";
+        let quoted_close = quoting.replace("</result>", "</task-notification>\n</result>");
+        for (label, content, settled) in [
+            ("closed", quoting.to_owned(), true),
+            (
+                "outer-open",
+                quoting
+                    .strip_suffix("</task-notification>")
+                    .unwrap()
+                    .to_owned(),
+                false,
+            ),
+            ("result-open", quoting.replace("</result>", ""), false),
+            (
+                "only-quoted-close",
+                quoted_close
+                    .strip_suffix("</task-notification>")
+                    .unwrap()
+                    .to_owned(),
+                false,
+            ),
+        ] {
+            let mut adapter = Claude::default();
+            notification_agent(&mut adapter, "tool-one", "task-one", true);
+            notification_agent(&mut adapter, "tool-two", "task-two", true);
+            let frame = json!({"type":"user","uuid":label,"origin":{"kind":"task-notification"},"message":{"content":content}});
+            let expected_delivery = delivery(&frame);
+            assert!(matches!(
+                expected_delivery.as_slice(),
+                [ItemContent::Delivery { .. }]
+            ));
+            let step = adapter.receive(frame).unwrap();
+            assert_eq!(
+                items(&step),
+                expected_delivery,
+                "{label}: original Delivery exactly once"
+            );
+            assert_eq!(
+                notification_agent_statuses(&step, "tool-one"),
+                if settled {
+                    vec![ToolStatus::Succeeded]
+                } else {
+                    Vec::new()
+                },
+                "{label}"
+            );
+            assert!(
+                notification_agent_statuses(&step, "tool-two").is_empty(),
+                "{label}: quoted identity is inert"
+            );
+            assert_eq!(
+                adapter.background_agents.contains("tool-one"),
+                !settled,
+                "{label}"
+            );
+            assert_eq!(
+                adapter.tasks.iter().any(|id| id == "task-one"),
+                !settled,
+                "{label}"
+            );
+            assert_eq!(
+                adapter.ended_agent("tool-one"),
+                settled.then_some(ToolStatus::Succeeded),
+                "{label}"
+            );
+            assert!(adapter.background_agents.contains("tool-two"), "{label}");
+            assert!(adapter.tasks.iter().any(|id| id == "task-two"), "{label}");
+            assert_eq!(adapter.ended_agent("tool-two"), None, "{label}");
+            assert!(adapter.visible_task_rows.is_empty(), "{label}");
         }
     }
 
