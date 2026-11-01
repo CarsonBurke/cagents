@@ -25,6 +25,8 @@ mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
+#[cfg(test)]
+mod new_window_save_feedback_tests;
 mod notification_ui;
 mod operation_recovery_ui;
 mod palette_ui;
@@ -16193,7 +16195,16 @@ impl Application for Cagents {
             }
             Message::NewWindowOpened { saved, result } => {
                 if let Ok(saved) = saved {
+                    // This receipt may wait behind a later failed save. With
+                    // no failure-generation field, only the latest captured
+                    // save can retire the existing settings error.
+                    if saved.generation >= self.settings_ack_generation
+                        && saved.generation >= self.settings_save_generation
+                    {
+                        self.settings_save_error = None;
+                    }
                     self.acknowledge_settings_save(saved);
+                    self.refresh_settings_feedback();
                 }
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(format!(
