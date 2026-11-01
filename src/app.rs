@@ -2250,6 +2250,8 @@ pub(crate) struct Bootstrap {
 /// Loaded before iced starts: session restoration and file locks never wait on
 /// the native event loop. Only successfully restored launches can report ready.
 pub struct Startup {
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    native_close_context: Option<project_ui::native_close_fixture::Context>,
     bootstrap: Bootstrap,
     window_view: Option<WindowView>,
 }
@@ -4241,6 +4243,8 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    ProjectCloseFixtureCheckpoint,
     Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -5518,10 +5522,23 @@ impl Cagents {
         })
     }
 
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    pub fn validate_native_project_close_fixture() -> Result<bool, String> {
+        project_ui::native_close_fixture::validate_fresh()
+    }
+
     pub fn load_startup() -> Result<Startup, String> {
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        let native_close_context = project_ui::native_close_fixture::context()?;
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        if let Some(context) = &native_close_context {
+            project_ui::native_close_fixture::seed(context)?;
+        }
         #[cfg(feature = "latency-harness")]
         if crate::latency_fixture::Fixture::from_env().is_some() {
             return Ok(Startup {
+                #[cfg(all(feature = "development", target_os = "linux"))]
+                native_close_context,
                 bootstrap: Self::fixture_bootstrap(),
                 window_view: None,
             });
@@ -5552,6 +5569,8 @@ impl Cagents {
             }
         };
         Ok(Startup {
+            #[cfg(all(feature = "development", target_os = "linux"))]
+            native_close_context,
             bootstrap,
             window_view,
         })
@@ -14043,6 +14062,8 @@ impl Application for Cagents {
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
         let latency_fixture = crate::latency_fixture::Fixture::from_env();
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        let native_close_context = startup.native_close_context;
         let Bootstrap {
             workspace: durable,
             session,
@@ -14390,6 +14411,11 @@ impl Application for Cagents {
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        if let Some(context) = native_close_context {
+            let task = project_ui::native_close_fixture::install(&mut app, context);
+            return (app, task);
+        }
         let scope = app.restore_worktree_scope();
         // Closed/exited replacements can still owe a lost durable acknowledgement.
         for card in &app.durable.cards {
@@ -14442,6 +14468,9 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        let (message, native_close_task) =
+            project_ui::native_close_fixture::before_update(self, message);
         // Pane callbacks retain their rendering origin while queued. Unwrap
         // once before all message-dependent policy and completion bookkeeping.
         let (message, pane_origin) = match message {
@@ -14586,6 +14615,8 @@ impl Application for Cagents {
             Projection::Full
         };
         let task = match message {
+            #[cfg(all(feature = "development", target_os = "linux"))]
+            Message::ProjectCloseFixtureCheckpoint => Task::none(),
             Message::TerminalFailure(action) => self.update_terminal_failure(action),
             Message::SavedTerminal(action) => self.update_saved_terminal(action),
             Message::Device(action) => self.update_device(action),
@@ -18115,10 +18146,21 @@ impl Application for Cagents {
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
-        Task::batch([task, activation, visibility])
+        let task = Task::batch([task, activation, visibility]);
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        {
+            let followup = project_ui::native_close_fixture::after_update(self);
+            return Task::batch([task, native_close_task, followup]);
+        }
+        #[cfg(not(all(feature = "development", target_os = "linux")))]
+        task
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        if self.project_ui.native_fixture.is_some() {
+            return project_ui::native_close_fixture::subscription(self);
+        }
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),
