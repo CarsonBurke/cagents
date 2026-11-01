@@ -2552,6 +2552,205 @@ mod tests {
         ended
     }
 
+    /// A console agent's own pane, seeded in the agent's channel under an
+    /// automatic title.
+    fn seeded_console_pane() -> (
+        Registry,
+        tempfile::TempDir,
+        Accepted,
+        crate::workspace_model::views::Pane,
+        crate::workspace_model::views::Scope,
+    ) {
+        use crate::workspace_model::views::Scope;
+        let (mut registry, directory, accepted, pane) = console_pane_fixture();
+        let channel = accepted.agent.channel().unwrap();
+        let scope = Scope::Channel(channel);
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        registry
+            .apply(&ModelEdit::SuggestChannelTitle {
+                id: channel,
+                title: "Provider chosen".into(),
+                source: crate::model::ChannelTitleSource::Provider,
+            })
+            .unwrap();
+        (registry, directory, accepted, pane, scope)
+    }
+
+    fn shown_pane(
+        registry: &Registry,
+        scope: &crate::workspace_model::views::Scope,
+        pane: &crate::workspace_model::views::Pane,
+    ) -> crate::workspace_model::views::Pane {
+        registry
+            .model()
+            .unwrap()
+            .views
+            .into_iter()
+            .find(|view| &view.scope == scope)
+            .unwrap()
+            .panes
+            .into_iter()
+            .find(|current| current.id == pane.id)
+            .unwrap()
+    }
+
+    /// A window may show a console agent's pane as its native chat and as
+    /// its console again. The channel keeps its name, since the conversation
+    /// did not change.
+    #[test]
+    fn a_console_agent_pane_switches_between_its_chat_and_console() {
+        use crate::agent_execution::Surface;
+        let (mut registry, _directory, accepted, console, scope) = seeded_console_pane();
+        let agent = registry.agent(accepted.agent.id).unwrap();
+        let presentation = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+        let chat = crate::workspace_model::views::Pane {
+            kind: presentation.kind(Surface::Chat),
+            ..console.clone()
+        };
+        let channel = accepted.agent.channel().unwrap();
+        assert!(
+            registry
+                .view_change_refusal(
+                    &scope,
+                    &crate::workspace_model::views::Change::Update {
+                        before: console.clone(),
+                        pane: chat.clone(),
+                    },
+                )
+                .unwrap()
+                .is_none()
+        );
+        publish_console(&mut registry, &scope, &console, &chat).unwrap();
+        assert_eq!(shown_pane(&registry, &scope, &console).kind, chat.kind);
+        assert_eq!(
+            registry.model().unwrap().channel(channel).unwrap().title,
+            "Provider chosen"
+        );
+        publish_console(&mut registry, &scope, &chat, &console).unwrap();
+        assert_eq!(shown_pane(&registry, &scope, &console).kind, console.kind);
+        assert_eq!(
+            registry.model().unwrap().channel(channel).unwrap().title,
+            "Provider chosen"
+        );
+        assert_eq!(registry.agent(accepted.agent.id).unwrap(), agent);
+    }
+
+    /// Nothing but the agent's own chat or console can take over the pane
+    /// that names it.
+    #[test]
+    fn an_agent_pane_refuses_to_show_another_conversation() {
+        let (mut registry, directory, accepted, console, scope) = seeded_console_pane();
+        let crate::model::CardKind::Terminal(own) = &console.kind else {
+            unreachable!()
+        };
+        let mut foreign = source();
+        let HostedSession::Chat(foreign_chat) = &mut foreign else {
+            unreachable!()
+        };
+        foreign_chat.id = crate::model::TerminalId::new();
+        let mut other_console = own.clone();
+        other_console.launch.arguments = vec![
+            "agent".into(),
+            "console".into(),
+            crate::model::AgentId::new().to_string(),
+        ];
+        for kind in [
+            crate::model::CardKind::Chat(foreign_chat.clone()),
+            crate::model::CardKind::Repository(crate::model::RepositoryView {
+                project: crate::model::ProjectId::new(),
+                repository: directory.path().join(".git"),
+                worktree: directory.path().into(),
+                selected_file: None,
+            }),
+        ] {
+            let replaced = crate::workspace_model::views::Pane {
+                kind,
+                ..console.clone()
+            };
+            let change = crate::workspace_model::views::Change::Update {
+                before: console.clone(),
+                pane: replaced.clone(),
+            };
+            let reason = registry
+                .view_change_refusal(&scope, &change)
+                .unwrap()
+                .expect("refused");
+            assert!(reason.contains("belongs to an agent"), "{reason}");
+            assert_eq!(
+                publish_console(&mut registry, &scope, &console, &replaced).unwrap_err(),
+                reason
+            );
+            assert_eq!(shown_pane(&registry, &scope, &console), console);
+        }
+        // Shown as its chat, the pane still cannot become another agent's
+        // console.
+        let agent = registry.agent(accepted.agent.id).unwrap();
+        let chat = crate::workspace_model::views::Pane {
+            kind: crate::workspace_model::views::AgentPresentation::of(&agent)
+                .unwrap()
+                .kind(crate::agent_execution::Surface::Chat),
+            ..console.clone()
+        };
+        publish_console(&mut registry, &scope, &console, &chat).unwrap();
+        let replaced = crate::workspace_model::views::Pane {
+            kind: crate::model::CardKind::Terminal(other_console),
+            ..console.clone()
+        };
+        assert!(publish_console(&mut registry, &scope, &chat, &replaced).is_err());
+        assert_eq!(shown_pane(&registry, &scope, &console), chat);
+    }
+
+    /// Returning an agent's chat to its provider's terminal is the user's to
+    /// do, as it was, and so is opening a chat over that terminal later.
+    #[test]
+    fn an_agent_chat_may_still_return_to_its_providers_terminal() {
+        let (mut registry, _directory, accepted, pane) = closed_pane_fixture();
+        let scope =
+            crate::workspace_model::views::Scope::Channel(accepted.agent.channel().unwrap());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        let crate::model::CardKind::Chat(chat) = &pane.kind else {
+            unreachable!()
+        };
+        let resumed = crate::model::TerminalSession {
+            id: crate::model::TerminalId::new(),
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: chat.launch.recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe: chat.launch.recipe.clone(),
+                last_exit: None,
+            },
+        };
+        let terminal = crate::workspace_model::views::Pane {
+            kind: crate::model::CardKind::Terminal(resumed.clone()),
+            ..pane.clone()
+        };
+        publish_console(&mut registry, &scope, &pane, &terminal).unwrap();
+        let mut reopened = chat.clone();
+        reopened.id = resumed.id;
+        let chat = crate::workspace_model::views::Pane {
+            kind: crate::model::CardKind::Chat(reopened),
+            ..pane.clone()
+        };
+        publish_console(&mut registry, &scope, &terminal, &chat).unwrap();
+        assert_eq!(shown_pane(&registry, &scope, &pane), chat);
+    }
+
     #[test]
     fn ended_console_provenance_survives_batched_and_late_hints_move_and_restart() {
         use crate::workspace_model::views::{Change, Scope};
