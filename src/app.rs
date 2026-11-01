@@ -40,6 +40,8 @@ mod saved_terminal;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
+#[cfg(feature = "development")]
+mod sidebar_fixture;
 mod sidebar_selection_ui;
 mod startup_gate;
 mod terminal_adoption;
@@ -5518,7 +5520,26 @@ impl Cagents {
         })
     }
 
+    /// Fixed, development-only renderer fixture; never grants host authority.
+    pub fn native_validation_fixture_enabled() -> bool {
+        #[cfg(feature = "development")]
+        {
+            sidebar_fixture::enabled()
+        }
+        #[cfg(not(feature = "development"))]
+        {
+            false
+        }
+    }
+
     pub fn load_startup() -> Result<Startup, String> {
+        #[cfg(feature = "development")]
+        if Self::native_validation_fixture_enabled() {
+            return Ok(Startup {
+                bootstrap: sidebar_fixture::bootstrap(),
+                window_view: None,
+            });
+        }
         #[cfg(feature = "latency-harness")]
         if crate::latency_fixture::Fixture::from_env().is_some() {
             return Ok(Startup {
@@ -14038,7 +14059,9 @@ impl Application for Cagents {
             tracing::warn!(target: "cagents::chat_stage", error_code = ?error.raw_os_error(),
                 "Could not enable opt-in chat stage measurements");
         }
-        std::thread::spawn(chat_ui::prune_pasted_images);
+        if !Self::native_validation_fixture_enabled() {
+            std::thread::spawn(chat_ui::prune_pasted_images);
+        }
         core.window.show_headerbar = false;
         core.window.border_padding = Some(0);
         #[cfg(feature = "latency-harness")]
@@ -14106,18 +14129,22 @@ impl Application for Cagents {
         // the whole of its life, so the observer starts with the window rather
         // than with the first card that happens to need a daemon.
         let (hosted_terminals_tx, hosted_terminals_rx) = async_channel::unbounded();
-        terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        if !Self::native_validation_fixture_enabled() {
+            terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+        }
         // The daemon owns the shared sidebar model for the same reason it owns
         // the terminal inventory: it outlives every window. Both threads start
         // with the window, so a channel created elsewhere appears without the
         // window having to do anything first.
         let (workspace_model_updates, workspace_model_rx) = async_channel::unbounded();
         let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
-        workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
-        workspace_model_sync::publish_workspace_model(
-            workspace_model_updates,
-            workspace_model_requests,
-        );
+        if !Self::native_validation_fixture_enabled() {
+            workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
+            workspace_model_sync::publish_workspace_model(
+                workspace_model_updates,
+                workspace_model_requests,
+            );
+        }
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -14221,14 +14248,22 @@ impl Application for Cagents {
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments),
             resume_ui: resume_ui::State::default(),
-            update_ui: update_ui::State::new(),
+            update_ui: if Self::native_validation_fixture_enabled() {
+                update_ui::State::default()
+            } else {
+                update_ui::State::new()
+            },
             branch_ui: branch_ui::State::default(),
             history_ui: history_ui::State::default(),
             refresh_ui: refresh_ui::State::default(),
             source_control_mutations: HashMap::new(),
             operation_recovery: Default::default(),
             device_ui: device_ui::State::default(),
-            account_ui: account_ui::State::installation(),
+            account_ui: if Self::native_validation_fixture_enabled() {
+                account_ui::State::default()
+            } else {
+                account_ui::State::installation()
+            },
             automation_ui: crate::automation_ui::State::default(),
             work_ui: crate::work_ui::State::default(),
             channel_work: channel_work::State::default(),
@@ -14390,6 +14425,10 @@ impl Application for Cagents {
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
+        #[cfg(feature = "development")]
+        if Self::native_validation_fixture_enabled() {
+            return sidebar_fixture::install(app);
+        }
         let scope = app.restore_worktree_scope();
         // Closed/exited replacements can still owe a lost durable acknowledgement.
         for card in &app.durable.cards {
@@ -14442,6 +14481,10 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        #[cfg(feature = "development")]
+        if Self::native_validation_fixture_enabled() {
+            return sidebar_fixture::update(self, message);
+        }
         // Pane callbacks retain their rendering origin while queued. Unwrap
         // once before all message-dependent policy and completion bookkeeping.
         let (message, pane_origin) = match message {
@@ -18114,6 +18157,10 @@ impl Application for Cagents {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        #[cfg(feature = "development")]
+        if Self::native_validation_fixture_enabled() {
+            return sidebar_fixture::subscription(self);
+        }
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
             self.chat_subscription(),
@@ -19037,6 +19084,9 @@ impl Application for Cagents {
 
 impl Drop for Cagents {
     fn drop(&mut self) {
+        if Self::native_validation_fixture_enabled() {
+            return;
+        }
         self.latency.abandon_pending();
         self.persist();
         self.fold_settings_drafts();

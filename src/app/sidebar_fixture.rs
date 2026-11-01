@@ -18,12 +18,22 @@ fn selected(value: Option<&str>) -> bool {
     matches!(value, Some(MODE | COMPACT))
 }
 
+fn mode() -> Option<bool> {
+    // Match the common startup fence: one process cannot change between an
+    // inert fixture and ordinary storage/host behavior after initialization.
+    static SELECTED_MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *SELECTED_MODE.get_or_init(|| {
+        let value = std::env::var("CAGENTS_SIDEBAR_ROW_FIXTURE").ok();
+        selected(value.as_deref()).then_some(value.as_deref() == Some(COMPACT))
+    })
+}
+
 pub(super) fn enabled() -> bool {
-    selected(std::env::var("CAGENTS_SIDEBAR_ROW_FIXTURE").ok().as_deref())
+    mode().is_some()
 }
 
 fn compact() -> bool {
-    std::env::var("CAGENTS_SIDEBAR_ROW_FIXTURE").as_deref() == Ok(COMPACT)
+    mode() == Some(true)
 }
 
 fn project_id(value: u128) -> ProjectId {
