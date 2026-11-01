@@ -17093,7 +17093,7 @@ pub(crate) mod tests {
             );
         }
 
-        fn captured(sidebar: &mut Sidebar, event: Event, at: Point) {
+        fn captured(sidebar: &mut Sidebar, event: Event, at: Point, case: (bool, bool, usize)) {
             let mut ui = interface_in_mode(
                 &sidebar.model,
                 &sidebar.state,
@@ -17105,15 +17105,25 @@ pub(crate) mod tests {
                 &mut sidebar.renderer,
             );
             let mut actions = Vec::new();
+            let events = [event];
             let (_, statuses) = ui.update(
-                &[event],
+                &events,
                 mouse::Cursor::Available(at),
                 &mut sidebar.renderer,
                 &mut clipboard::Null,
                 &mut actions,
             );
-            assert_eq!(statuses, vec![event::Status::Captured]);
-            assert!(actions.is_empty(), "menu motion/wheel emitted {actions:?}");
+            assert_eq!(
+                statuses,
+                vec![event::Status::Captured],
+                "(insert_rows, wheel, probe_y)={case:?}, at={at:?}, event={:?}",
+                events[0]
+            );
+            assert!(
+                actions.is_empty(),
+                "menu motion/wheel emitted {actions:?}, case={case:?}, event={:?}",
+                events[0]
+            );
             sidebar.cache = ui.into_cache();
         }
 
@@ -17201,6 +17211,7 @@ pub(crate) mod tests {
                         &mut sidebar,
                         Event::Mouse(mouse::Event::CursorMoved { position: inside }),
                         inside,
+                        (insert_rows, wheel, y),
                     );
                     if wheel {
                         let (before_controls, before) = sidebar.attention_frame();
@@ -17215,6 +17226,7 @@ pub(crate) mod tests {
                                 delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -480.0 },
                             }),
                             inside,
+                            (insert_rows, wheel, y),
                         );
                         redraw(&mut sidebar, inside);
                         let (after_controls, after) = sidebar.attention_frame();
