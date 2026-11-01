@@ -4371,7 +4371,8 @@ impl Runtime {
             .and_then(|index| {
                 failure::prompt_anchor(self.session.launch.provider, &snapshot.items[..=index])
             })
-            .or_else(|| self.notice_anchor(&snapshot, turns.as_deref().unwrap_or(&self.turns)));
+            .or_else(|| self.notice_anchor(&snapshot, turns.as_deref().unwrap_or(&self.turns)))
+            .map(str::to_owned);
         if self
             .snapshot
             .error
@@ -4384,7 +4385,11 @@ impl Runtime {
             && !snapshot.exited
             && snapshot.turn_generation == self.snapshot.turn_generation
             && snapshot.session_id == self.snapshot.session_id
-            && failure::same_prompt(self.session.launch.provider, current_anchor, next_anchor)
+            && failure::same_prompt(
+                self.session.launch.provider,
+                current_anchor,
+                next_anchor.as_deref(),
+            )
         {
             let provider = self.session.launch.provider;
             self.failures.retain(|note| {
@@ -4392,7 +4397,6 @@ impl Runtime {
                     || !chat::requires_sign_in(provider, &note.text)
             });
         }
-        let next_anchor = next_anchor.map(str::to_owned);
         let next_after = snapshot
             .error_item
             .clone()
