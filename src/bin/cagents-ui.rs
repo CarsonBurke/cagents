@@ -301,6 +301,18 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device,
         device_window_scoped,
     } = options;
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    if cagents::app::Cagents::validate_native_project_close_fixture()?
+        && (new_window
+            || slot.is_some()
+            || source.is_some()
+            || device.is_some()
+            || device_window_scoped)
+    {
+        return Err(
+            "fixed project-close fixture requires the ordinary local primary window".into(),
+        );
+    }
     let _device_cleanup = cagents::device::Cleanup;
     cagents::device::select(device)?;
     cagents::device::prepare()?;

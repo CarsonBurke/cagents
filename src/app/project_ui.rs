@@ -1,4 +1,8 @@
 use super::*;
+
+#[cfg(all(feature = "development", target_os = "linux"))]
+pub(super) mod native_close_fixture;
+
 use crate::repository::{CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
 use crate::{
     github::avatar::{self, OwnerKey},
@@ -52,6 +56,8 @@ fn removal_device_key() -> Option<(String, String, String)> {
 
 #[derive(Debug, Default)]
 pub struct State {
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    pub(in crate::app) native_fixture: Option<native_close_fixture::Fixture>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
