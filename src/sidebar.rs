@@ -14575,7 +14575,7 @@ pub(crate) mod tests {
                 .into();
                 let mut element = panel_section(
                     &main_key(),
-                    PanelSection::Files,
+                    PanelSection::Unstaged,
                     Id::new("test.section"),
                     None,
                     false,
