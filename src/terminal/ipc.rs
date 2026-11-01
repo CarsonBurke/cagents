@@ -195,7 +195,10 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 128 appends agent execution `Operation::Present`, which switches an
+/// existing agent's pane between its native chat and its console. All prior
+/// tags and layouts remain; the matched executables require the new tag.
+pub const PROTOCOL_VERSION: u16 = 128;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

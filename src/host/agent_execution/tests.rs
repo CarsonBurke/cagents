@@ -4443,3 +4443,219 @@ fn execution_gates_keep_existing_callers_after_successful_close() {
     );
     assert!(Arc::ptr_eq(&pending, &agent_gate(&host, accepted.agent.id)));
 }
+
+/// Seeds an agent's pane as a console over its running native provider, the
+/// way `--surface terminal` shows it.
+fn shown_on_console(host: &SharedHost, agent: AgentId) -> crate::workspace_model::views::Pane {
+    let store = registry(host).unwrap();
+    let mut store = store.lock().unwrap();
+    let agent = store.agent(agent).unwrap();
+    let HostedSession::Chat(source) = agent.session.as_ref().unwrap() else {
+        unreachable!()
+    };
+    let proof = source.proof.clone().unwrap();
+    let mut recipe = source.launch.recipe.clone();
+    recipe.program = "/bin/cat".into();
+    recipe.arguments = vec!["agent".into(), "console".into(), agent.id.to_string()];
+    let console = crate::model::TerminalSession {
+        id: source.id,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        launch: recipe,
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id,
+            boot_id: proof.boot_id,
+            host_incarnation: proof.host_incarnation,
+        },
+    };
+    let agent = store
+        .bind_agent_console(agent.id, agent.session.as_ref().unwrap(), console.clone())
+        .unwrap();
+    let pane = crate::workspace_model::views::Pane {
+        id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+        title: "Console".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 1.0,
+        kind: crate::model::CardKind::Terminal(console),
+        scope: None,
+    };
+    store
+        .apply(&ModelEdit::SeedView {
+            scope: agent.placement.clone(),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    pane
+}
+
+fn shown_kind(host: &SharedHost, pane: crate::model::CardId) -> crate::model::CardKind {
+    registry(host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .model()
+        .unwrap()
+        .views
+        .into_iter()
+        .flat_map(|view| view.panes)
+        .find(|shown| shown.id == pane)
+        .unwrap()
+        .kind
+}
+
+/// Presenting an agent as its chat and back only changes its pane: the same
+/// provider answers the next prompt, and nothing is spawned for it.
+#[test]
+fn presenting_an_agent_keeps_its_provider_and_spawns_nothing() {
+    if isolated("presenting_an_agent_keeps_its_provider_and_spawns_nothing").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let owner = Authority::default();
+    let accepted = submit(&host, &owner, request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let agent = accepted.agent.id;
+    let pane = shown_on_console(&host, agent);
+    let before = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap();
+    let source = before.session.as_ref().unwrap().id();
+    let actor = host.lock().unwrap().chats[&source].handle.clone();
+    let spawns = std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap();
+
+    let present =
+        |surface| match process(&host, owner.clone(), Operation::Present { agent, surface })
+            .unwrap()
+        {
+            Reply::Status { agent, .. } => agent,
+            reply => panic!("{reply:?}"),
+        };
+    assert_eq!(present(Surface::Chat), before);
+    let crate::model::CardKind::Chat(chat) = shown_kind(&host, pane.id) else {
+        panic!("shown as chat");
+    };
+    assert!(crate::agent_execution::same_chat_process(
+        &chat,
+        match before.session.as_ref().unwrap() {
+            HostedSession::Chat(session) => session,
+            HostedSession::Terminal(_) => unreachable!(),
+        }
+    ));
+    // Presenting again changes nothing.
+    assert_eq!(present(Surface::Chat), before);
+    // Showing the agent is not taking it over.
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap()
+    );
+
+    let followup = submit(
+        &host,
+        &owner,
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent),
+            prompt: "Answer while shown as chat".into(),
+            idempotency_key: "after-present".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        settled(&host, followup.run.id).result.text,
+        "SERVICE_RESULT_2"
+    );
+    assert_eq!(present(Surface::Terminal), before);
+    assert_eq!(shown_kind(&host, pane.id), pane.kind);
+    assert!(
+        host.lock().unwrap().chats[&source]
+            .handle
+            .same_actor(&actor),
+        "the same provider stays attached"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(),
+        spawns,
+        "presenting spawned a provider"
+    );
+    assert_eq!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(agent)
+            .unwrap(),
+        before
+    );
+}
+
+/// Only an agent's owner chooses how it is shown; the user's CLI cannot
+/// present another session's child.
+#[test]
+fn only_an_agents_owner_presents_it() {
+    if isolated("only_an_agents_owner_presents_it").is_some() {
+        return;
+    }
+    let (host, request, _) = fixture();
+    let user = Authority::default();
+    let accepted = submit(&host, &user, request.clone()).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let parent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    let parent_authority = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retained_agent_authority(parent.session.as_ref().unwrap().id())
+        .unwrap();
+    let mut child_request = request;
+    child_request.idempotency_key = "child".into();
+    let child = submit(&host, &parent_authority, child_request).unwrap();
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let pane = shown_on_console(&host, child.agent.id);
+    let operation = Operation::Present {
+        agent: child.agent.id,
+        surface: Surface::Chat,
+    };
+    let error = process(&host, user.clone(), operation.clone()).unwrap_err();
+    assert!(error.contains("does not own"), "{error}");
+    assert_eq!(shown_kind(&host, pane.id), pane.kind);
+    let error = process(
+        &host,
+        user,
+        Operation::Present {
+            agent: AgentId::new(),
+            surface: Surface::Chat,
+        },
+    )
+    .unwrap_err();
+    assert!(!error.is_empty());
+    assert!(matches!(
+        process(&host, parent_authority.clone(), operation).unwrap(),
+        Reply::Status { .. }
+    ));
+    assert!(matches!(
+        shown_kind(&host, pane.id),
+        crate::model::CardKind::Chat(_)
+    ));
+    assert!(
+        close(&host, &parent_authority, child.agent.id)
+            .unwrap()
+            .closed
+    );
+}

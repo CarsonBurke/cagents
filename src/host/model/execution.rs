@@ -1384,6 +1384,31 @@ impl Registry {
         Ok(agent)
     }
 
+    /// Show an open agent's existing pane as its native chat or its console,
+    /// in one transaction. The agent record, its runs and its provider are
+    /// unchanged; `true` when the pane changed.
+    pub(crate) fn present_agent(
+        &mut self,
+        id: AgentId,
+        surface: crate::agent_execution::Surface,
+    ) -> Result<bool, String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let agent = read_agent(&tx, id)?;
+        let changed = super::views::present_agent_pane(&tx, &agent, surface)?;
+        if changed {
+            tx.execute(
+                "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(changed)
+    }
+
     pub(crate) fn retained_agent_authority_source(
         &self,
         id: crate::model::TerminalId,
@@ -2704,6 +2729,134 @@ mod tests {
         };
         assert!(publish_console(&mut registry, &scope, &chat, &replaced).is_err());
         assert_eq!(shown_pane(&registry, &scope, &console), chat);
+    }
+
+    /// Presenting an agent switches its existing pane between its native chat
+    /// and its console in one transaction, and presenting the surface already
+    /// shown changes nothing.
+    #[test]
+    fn presenting_an_agent_switches_its_pane_in_place() {
+        use crate::agent_execution::Surface;
+        let (mut registry, _directory, accepted, console, scope) = seeded_console_pane();
+        let id = accepted.agent.id;
+        let agent = registry.agent(id).unwrap();
+        let channel = accepted.agent.channel().unwrap();
+        let presentation = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+        let sequence = registry.model().unwrap().sequence;
+        let revision = registry.view_revision(&scope).unwrap();
+
+        assert!(!registry.present_agent(id, Surface::Terminal).unwrap());
+        assert_eq!(registry.model().unwrap().sequence, sequence);
+        assert_eq!(registry.view_revision(&scope).unwrap(), revision);
+
+        assert!(registry.present_agent(id, Surface::Chat).unwrap());
+        let shown = shown_pane(&registry, &scope, &console);
+        assert_eq!(shown.kind, presentation.kind(Surface::Chat));
+        assert_eq!(
+            shown,
+            crate::workspace_model::views::Pane {
+                kind: shown.kind.clone(),
+                ..console.clone()
+            },
+            "only the kind changes"
+        );
+        assert_eq!(registry.view_revision(&scope).unwrap(), revision + 1);
+        assert!(registry.model().unwrap().sequence > sequence);
+        assert_eq!(
+            registry.model().unwrap().channel(channel).unwrap().title,
+            "Provider chosen"
+        );
+        assert!(!registry.present_agent(id, Surface::Chat).unwrap());
+
+        assert!(registry.present_agent(id, Surface::Terminal).unwrap());
+        assert_eq!(shown_pane(&registry, &scope, &console), console);
+        assert_eq!(registry.agent(id).unwrap(), agent);
+        assert_eq!(registry.agent(id).unwrap().spec.surface, agent.spec.surface);
+    }
+
+    #[test]
+    fn presenting_refuses_an_agent_without_a_switchable_pane() {
+        use crate::agent_execution::Surface;
+        // Not shown in any window yet.
+        let (mut registry, _directory, accepted, _) = console_pane_fixture();
+        let error = registry
+            .present_agent(accepted.agent.id, Surface::Chat)
+            .unwrap_err();
+        assert!(error.contains("retry once its pane appears"), "{error}");
+
+        // No console to switch with.
+        let (mut registry, _directory, accepted, pane) = closed_pane_fixture();
+        let scope =
+            crate::workspace_model::views::Scope::Channel(accepted.agent.channel().unwrap());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope,
+                panes: vec![pane],
+                closed: vec![],
+            })
+            .unwrap();
+        let error = registry
+            .present_agent(accepted.agent.id, Surface::Terminal)
+            .unwrap_err();
+        assert!(error.contains("no console"), "{error}");
+
+        // The pane shows something else.
+        let (mut registry, _directory, accepted, console, scope) = seeded_console_pane();
+        let crate::model::CardKind::Terminal(own) = &console.kind else {
+            unreachable!()
+        };
+        let mut replaced = console.clone();
+        let mut successor = own.clone();
+        successor.id = crate::model::TerminalId::new();
+        replaced.kind = crate::model::CardKind::Terminal(successor);
+        publish_console(&mut registry, &scope, &console, &replaced).unwrap();
+        let error = registry
+            .present_agent(accepted.agent.id, Surface::Chat)
+            .unwrap_err();
+        assert!(error.contains("shows something else"), "{error}");
+        assert_eq!(shown_pane(&registry, &scope, &console), replaced);
+
+        // Closed: its pane is retired with it, and nothing brings it back.
+        let (mut registry, _directory, accepted, _, scope) = seeded_console_pane();
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        let revision = registry.view_revision(&scope).unwrap();
+        let error = registry
+            .present_agent(accepted.agent.id, Surface::Chat)
+            .unwrap_err();
+        assert!(error.contains("closed"), "{error}");
+        assert_eq!(registry.view_revision(&scope).unwrap(), revision);
+    }
+
+    /// A failure anywhere in presenting leaves the pane as it was.
+    #[test]
+    fn presenting_is_one_transaction() {
+        use crate::agent_execution::Surface;
+        let (mut registry, _directory, accepted, console, scope) = seeded_console_pane();
+        let revision = registry.view_revision(&scope).unwrap();
+        registry
+            .db
+            .execute_batch(
+                "CREATE TRIGGER reject_sequence BEFORE UPDATE ON metadata
+             BEGIN SELECT RAISE(ABORT, 'fixture sequence failure'); END;",
+            )
+            .unwrap();
+        let error = registry
+            .present_agent(accepted.agent.id, Surface::Chat)
+            .unwrap_err();
+        assert!(error.contains("fixture sequence failure"), "{error}");
+        assert_eq!(shown_pane(&registry, &scope, &console), console);
+        assert_eq!(registry.view_revision(&scope).unwrap(), revision);
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_sequence;")
+            .unwrap();
+        assert!(
+            registry
+                .present_agent(accepted.agent.id, Surface::Chat)
+                .unwrap()
+        );
     }
 
     /// Returning an agent's chat to its provider's terminal is the user's to

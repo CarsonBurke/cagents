@@ -914,7 +914,34 @@ pub(super) fn process(
         Operation::AcknowledgeInbox(receipt) => {
             mailbox::acknowledge(host, &authority, receipt).map(|()| Reply::InboxAcknowledged)
         }
+        Operation::Present { agent, surface } => present(host, &authority, agent, surface)
+            .map(|(agent, run)| Reply::Status { agent, run }),
     }
+}
+
+/// Shows an owned agent's existing pane as its native chat or its console.
+/// Both surfaces are the same live provider, so nothing is launched, sent or
+/// closed, and showing the agent does not take it over.
+fn present(
+    host: &SharedHost,
+    authority: &Authority,
+    id: AgentId,
+    surface: Surface,
+) -> Result<(Agent, Run), String> {
+    // Ownership first, so a caller cannot make the daemon keep a gate for an
+    // agent it does not own.
+    status(host, authority, id)?;
+    let gate = agent_gate(host, id);
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let registry = registry(host)?;
+    let changed = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .present_agent(id, surface)?;
+    if changed {
+        announce(host, &registry);
+    }
+    status(host, authority, id)
 }
 
 /// The live provider of an open agent the caller owns, and the agent's

@@ -340,6 +340,48 @@ fn agent_pane_kind(
     Ok(Ok(false))
 }
 
+/// Show an open agent's pane as its native chat or as its console. Only the
+/// pane's kind changes, in the caller's transaction: the provider, console,
+/// runs, history and the channel's name are left as they are. `Ok(false)`
+/// when the pane already shows that surface.
+pub(super) fn present_agent_pane(
+    db: &Connection,
+    agent: &crate::agent_execution::Agent,
+    surface: crate::agent_execution::Surface,
+) -> Result<bool, String> {
+    if agent.closed {
+        return Err("The agent is closed".into());
+    }
+    let presentation = crate::workspace_model::views::AgentPresentation::of(agent)
+        .ok_or("This agent has no console to switch with; it is shown as its native chat")?;
+    let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
+    let missing =
+        || "The agent is not shown in a window yet; retry once its pane appears".to_owned();
+    let scope = owner(db, id)?.ok_or_else(missing)?;
+    let mut view = read(db, &scope)?;
+    if view.retired.contains(&id) || view.panes.iter().filter(|pane| pane.id == id).count() != 1 {
+        return Err(missing());
+    }
+    let before = view.clone();
+    let pane = view.panes.iter_mut().find(|pane| pane.id == id).unwrap();
+    let shown = presentation
+        .shown(agent, &pane.kind)
+        .ok_or("The agent's pane shows something else; refresh and retry")?;
+    if shown == surface {
+        return Ok(false);
+    }
+    let previous = pane.kind.clone();
+    pane.kind = presentation.kind(surface);
+    let current = pane.kind.clone();
+    view.revision = view
+        .revision
+        .checked_add(1)
+        .ok_or("view revision exhausted")?;
+    update_terminal_source(db, id, &previous, Some(&previous), Some(&current))?;
+    write_presentation(db, &before, &view)?;
+    Ok(true)
+}
+
 /// Publish a view whose panes changed only in how they show the same work.
 /// The channel's naming choice and every other view field stay as they are.
 fn write_presentation(db: &Connection, before: &View, view: &View) -> Result<(), String> {

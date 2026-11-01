@@ -136,6 +136,18 @@ pub enum AgentCommand {
         #[arg(long)]
         including_subagents: bool,
     },
+    /// Show an agent spawned with `--surface terminal` as its native chat, or
+    /// as its console again, in the pane it already has.
+    ///
+    /// Both are the same running agent: nothing is restarted or resent, and
+    /// its console keeps running while its chat is shown.
+    Present {
+        #[arg(help = "Agent handle, ID, or unique ID prefix.")]
+        agent: String,
+        #[arg(long, value_parser = ["chat", "terminal"])]
+        #[arg(help = "Show the agent's native chat, or its console.")]
+        surface: String,
+    },
     /// Stop and close an agent, including its background subagents.
     Close {
         #[arg(help = "Agent handle, ID, or unique ID prefix.")]
@@ -1150,6 +1162,19 @@ pub(super) fn execute_with_context(
                         ""
                     }
                 ),
+            })
+        }
+        AgentCommand::Present { agent, surface } => {
+            let agent = session.agent(&agent)?;
+            let (label, surface) = match surface.as_str() {
+                "terminal" => ("its console", Surface::Terminal),
+                _ => ("its native chat", Surface::Chat),
+            };
+            let (agent, run) = status_reply(session.call(Operation::Present { agent, surface })?)?;
+            Ok(CommandOutput {
+                command: "agent.present",
+                human: format!("Agent {} is shown as {label}", short(agent.id)),
+                data: json!({"agent": agent, "run": run, "surface": surface}),
             })
         }
         AgentCommand::Close { agent } => {
@@ -2366,6 +2391,35 @@ mod tests {
         assert!(
             matches!(parse(&["interrupt", "1a2b"]), AgentCommand::Interrupt { agent, including_subagents: false } if agent == "1a2b")
         );
+    }
+
+    #[test]
+    fn present_names_the_agent_and_one_surface() {
+        for surface in ["chat", "terminal"] {
+            let AgentCommand::Present {
+                agent,
+                surface: parsed,
+            } = parse(&["present", "worker", "--surface", surface])
+            else {
+                panic!("agent present")
+            };
+            assert_eq!(agent, "worker");
+            assert_eq!(parsed, surface);
+        }
+        for arguments in [
+            &["cagents", "agent", "present", "worker"][..],
+            &["cagents", "agent", "present", "--surface", "chat"],
+            &[
+                "cagents",
+                "agent",
+                "present",
+                "worker",
+                "--surface",
+                "browser",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err(), "{arguments:?}");
+        }
     }
 
     #[test]

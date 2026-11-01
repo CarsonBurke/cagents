@@ -120,6 +120,7 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                 agents: vec![agent],
             }),
             AgentCommand::Console { .. } => return None,
+            AgentCommand::Present { .. } => Kind::Act(Act::Cli(subcommand_path(argv))),
         },
         // The rest manage the application rather than other agents, and are
         // named by the subcommand words the agent typed.

@@ -511,6 +511,14 @@ pub enum Operation {
     PeekInbox(mailbox::Inbox),
     /// Settle exact received IDs in the authenticated recipient's mailbox.
     AcknowledgeInbox(mailbox::Receipt),
+    /// Show an owned agent's existing pane as its native chat or its console.
+    /// Only the presentation changes: no provider starts, no prompt is sent,
+    /// and the agent's provider, console and history are left as they are.
+    /// Owner only. Replies with the agent's status.
+    Present {
+        agent: AgentId,
+        surface: Surface,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

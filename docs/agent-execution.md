@@ -178,7 +178,7 @@ A message body is at most 64 KiB, and a lineage holds at most 64 undelivered mes
 - `/quit` detaches the console; the provider remains hosted.
 - Closing the terminal card follows normal active-work confirmation and retires the exact paired actor.
 
-The console and the native chat are two views of the same running agent, so its pane can show either. **Show as chat** in the pane's menu or header attaches the chat to the running provider in place, and **Show as console** puts the console back. Switching starts no provider, replays no prompt, closes neither the actor nor the console, does not take the agent over, and leaves its history and its spawn surface unchanged; presenting the surface already shown changes nothing.
+The console and the native chat are two views of the same running agent, so its pane can show either. **Show as chat** in the pane's menu or header attaches the chat to the running provider in place, and **Show as console** puts the console back. `cagents agent present AGENT --surface chat|terminal` does the same from the agent's owner. Switching starts no provider, replays no prompt, closes neither the actor nor the console, does not take the agent over, and leaves its history and its spawn surface unchanged; presenting the surface already shown changes nothing. The agent needs a saved pane to switch, so an agent no window shows yet is refused with a message to retry once its pane appears.
 
 ## Delegation and bundled skill
 
