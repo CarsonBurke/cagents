@@ -36,8 +36,6 @@
 "iced_wgpu" = { "version" = "0.14.0", "default-features" = false, "git" = "https://github.com/pop-os/libcosmic.git", "rev" = "caec74c2559924443f12fc6faf97a5bcefe6271d", "optional" = true }
 "log" = { "version" = "0.4" }
 "thiserror" = { "version" = "2" }
+raw-window-handle = "0.6"
 
 ["workspace"]
-
-[dev-dependencies]
-raw-window-handle = "0.6"

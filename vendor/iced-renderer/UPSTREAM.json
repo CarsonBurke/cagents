@@ -1,7 +1,7 @@
 {
   "additional_test_dependency": {
     "raw-window-handle": "0.6",
-    "scope": "dev-only existing locked package, to supply handle-error-only NoWindow fake"
+    "scope": "Direct ordinary dependency on the existing locked package, required for owning dependency tests under Cargo 1.93 without a new nested lock or workspace. Supplies the handle-error-only NoWindow fake; no version or feature change."
   },
   "local_changed_upstream_files": [
     "Cargo.toml",
@@ -10,7 +10,7 @@
   "locked_commit": "caec74c2559924443f12fc6faf97a5bcefe6271d",
   "locked_package_repository": "https://github.com/pop-os/libcosmic.git",
   "normalization": "Standalone package/workspace; exact inherited package metadata, lints, dependencies/features/target tables; iced path packages and build_helpers use original libcosmic source/revision. No dependency version updates. Local checked-surface modifications are separately visible in Git diff.",
-  "normalized_cargo_sha256": "e7a8b87cc93af9c8afdb87ab53a9893a2977283d4befc188aede59fc8fa12adb",
+  "normalized_cargo_sha256": "4f4e4e08b59ef8daf95e48a1f976566f2e87fce4a8bfa5b9e3e8bd038c673d4b",
   "ordinary_apis": "Existing create_surface/configure_surface and backend constructor paths preserved; checked method is additive. Local owning test modules are unexecuted.",
   "pinned_root_support_files": {
     "LICENSE": {

@@ -122,6 +122,29 @@ pub(crate) fn main_with_before_start(
             }
             let _ = cagents::instance::report_ui_startup(&Err("an update is in progress".into()));
         }
+        Err(error)
+            if cagents::instance::ui_launch_update_handshake_requested()
+                && error
+                    .downcast_ref::<cagents::app::startup_window::StartupFailure>()
+                    .is_some_and(|error| error.renderer_before_state().is_some()) =>
+        {
+            let failure = error
+                .downcast_ref::<cagents::app::startup_window::StartupFailure>()
+                .unwrap();
+            cagents::instance::report_startup_failure();
+            let _ = cagents::instance::report_ui_renderer_before_state(
+                failure.renderer_before_state().unwrap(),
+            );
+            // The updater waits this original process naturally. No detached
+            // StartupError process is spawned for its retry-eligible attempt.
+        }
+        Err(error)
+            if error
+                .downcast_ref::<cagents::app::startup_window::StartupFailure>()
+                .is_some_and(|error| error.is_canceled()) =>
+        {
+            let _ = cagents::instance::report_ui_startup(&Err(error.to_string()));
+        }
         Err(error) => report_startup_failure(&error.to_string()),
         // The window reports readiness from its first frame, so reaching here
         // with the handshake unclaimed means no window ever opened.
@@ -294,116 +317,24 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
 }
 
 fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
-    let Options {
-        new_window,
-        slot,
-        source,
-        device,
-        device_window_scoped,
-    } = options;
-    let _device_cleanup = cagents::device::Cleanup;
-    cagents::device::select(device)?;
-    cagents::device::prepare()?;
+    // Selection is read-only identity setup. Keep the existing staged exec
+    // before threads or StateEntered; remote preparation remains behind the
+    // configured-surface barrier on the owned worker.
+    cagents::device::select(options.device)?;
     if !cagents::device::is_remote() {
-        if let Some(executable) = cagents::control::staged_ui_executable()? {
-            // exec preserves the launcher handshake pipe and window arguments.
+        if let Some(executable) = cagents::control::staged_ui_executable_without_restoration()? {
             let mut command = std::process::Command::new(executable);
             command.args(std::env::args_os().skip(1));
             return Err(command.exec().into());
         }
     }
-    let unique_slot = uuid::Uuid::new_v4().to_string();
-    let remote_new_window = new_window && cagents::device::is_remote();
-    let new_window = new_window && !remote_new_window;
-    let slot = if remote_new_window {
-        Some(unique_slot.as_str())
-    } else {
-        slot
-    };
-    let scoped_slot = if device_window_scoped && !remote_new_window {
-        slot.map(str::to_owned)
-    } else {
-        cagents::device::window_slot(slot)?
-    };
-    let slot = scoped_slot.as_deref();
-    let fixture =
-        cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
-    let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
-        let lease = cagents::instance::WindowLease::acquire(new_window, slot)?;
-        let device_source = if device_window_scoped && source.is_some() {
-            source.map(str::to_owned)
-        } else {
-            cagents::device::window_slot(source)?
-        };
-        cagents::session::SessionRuntime::initialize_window(
-            device_source
-                .as_deref()
-                .unwrap_or(cagents::instance::PRIMARY_WINDOW),
-        )?;
-        let (activation_tx, activation_rx) = async_channel::unbounded();
-        let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
-        if !fixture {
-            cagents::terminal::ensure_daemon_ready()?;
-        }
-        let restored = cagents::app::Cagents::load_startup()?;
-        Ok((lease, (listener, activation_rx), restored))
-    })();
-    let (_application_lease, activation, restored) = startup?;
-    let restored = std::cell::RefCell::new(Some(restored));
-    let activation = Some(activation);
-
-    // The pinned COSMIC run helper does not wire its scale_factor callback
-    // into iced. Build the daemon through the public shell API so interface
-    // scaling changes the actual viewport, not only Core's preference.
-    type Shell = Cosmic<cagents::app::Cagents>;
-    cosmic::icon_theme::set_default(cosmic::config::icon_theme());
-    let settings = iced::Settings {
-        id: Some(cagents::instance::APPLICATION_ID.to_owned()),
-        default_font: cosmic::font::default(),
-        default_text_size: iced::Pixels(14.0),
-        antialiasing: true,
-        is_daemon: false,
-        ..iced::Settings::default()
-    };
-    let activation_rx = activation.as_ref().map(|(_, rx)| rx.clone());
-    let _activation = activation;
-    iced::daemon(
-        move || {
-            let mut window_settings = iced::window::Settings {
-                size: iced::Size::new(1440.0, 900.0),
-                min_size: Some(iced::Size::new(900.0, 600.0)),
-                decorations: false,
-                transparent: true,
-                resize_border: cagents::design::WINDOW_RESIZE_BORDER as u32,
-                exit_on_close_request: false,
-                // The startup task runs alongside window creation. Supply the
-                // icon here so no update can be dropped before the window opens.
-                icon: Some(cagents::app::application_window_icon()),
-                ..iced::window::Settings::default()
-            };
-            window_settings.platform_specific.application_id =
-                cagents::instance::APPLICATION_ID.to_owned();
-            let (window, open) = iced::window::open(window_settings);
-            let mut core = Core::default();
-            core.set_main_window_id(Some(window));
-            let startup = restored.borrow_mut().take().expect("UI initialized once");
-            let (shell, initialize) = Shell::init((core, (activation_rx.clone(), startup)));
-            let opened = open
-                .map(cagents::app::Message::StartupWindowOpened)
-                .map(cosmic::Action::App);
-            (shell, iced::Task::batch([opened, initialize]))
-        },
-        Shell::update,
-        Shell::view,
-    )
-    .subscription(Shell::subscription)
-    .title(Shell::title)
-    .style(Shell::style)
-    .theme(Shell::theme)
-    .scale_factor(Shell::scale_factor)
-    .settings(settings)
-    .run()?;
-    Ok(())
+    cagents::app::startup_window::run(cagents::app::startup_window::Request {
+        new_window: options.new_window,
+        slot: options.slot.map(str::to_owned),
+        source: options.source.map(str::to_owned),
+        device_window_scoped: options.device_window_scoped,
+    })
+    .map_err(Into::into)
 }
 
 /// Minimal standalone shell that tells the user why nothing opened. It runs in

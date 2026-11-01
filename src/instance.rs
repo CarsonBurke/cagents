@@ -63,6 +63,19 @@ const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents-browserless";
 #[cfg(not(feature = "full"))]
 const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents";
 pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
+/// Private matched CLI/UI startup ABI; ordinary launches keep value "1".
+pub(crate) const UI_LAUNCH_UPDATE_HANDSHAKE: &str = "update-retry-v1";
+pub(crate) const UI_PRESTATE_RENDERER_PREFIX: &str = "renderer-before-state-v1: ";
+static UI_STARTUP_REPORTED: AtomicBool = AtomicBool::new(false);
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RendererBeforeStateRecord {
+    pub version: u8,
+    pub kind: String,
+    pub detail: String,
+}
+
 /// Older launchers understand only the final ready/error response. Progress
 /// requires a separate explicit capability to keep their stdout protocol valid.
 pub const UI_LAUNCH_RECOVERY_PROGRESS_ENV: &str = "CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS";
@@ -352,8 +365,51 @@ impl WindowLease {
     }
 }
 
+fn ui_launch_handshake_mode(value: Option<&std::ffi::OsStr>) -> Option<bool> {
+    match value {
+        Some(value) if value == "1" => Some(false),
+        Some(value) if value == UI_LAUNCH_UPDATE_HANDSHAKE => Some(true),
+        _ => None,
+    }
+}
+
 pub fn ui_launch_handshake_requested() -> bool {
-    env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref() == Some("1".as_ref())
+    ui_launch_handshake_mode(env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref()).is_some()
+}
+
+pub fn ui_launch_update_handshake_requested() -> bool {
+    ui_launch_handshake_mode(env::var_os(UI_LAUNCH_HANDSHAKE_ENV).as_deref()) == Some(true)
+}
+
+/// Only the guarded deferred window's actual before-state graphics failure
+/// uses this record. It shares the final ready/error latch, not a progress ACK.
+pub fn report_ui_renderer_before_state(detail: &str) -> io::Result<()> {
+    if ui_launch_update_handshake_requested() && !UI_STARTUP_REPORTED.swap(true, Ordering::AcqRel) {
+        let encoded = renderer_before_state_record(detail)?;
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "{UI_PRESTATE_RENDERER_PREFIX}{encoded}")?;
+        stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn renderer_before_state_record(detail: &str) -> io::Result<String> {
+    // At most 512 UTF-8 bytes => at most 3072 JSON-escaped bytes, below the
+    // existing 4096-byte private startup frame limit including fixed fields.
+    let end = detail
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(detail.len()))
+        .take_while(|i| *i <= 512)
+        .last()
+        .unwrap_or(0);
+    let record = RendererBeforeStateRecord {
+        version: 1,
+        kind: "graphics_initialization".into(),
+        detail: detail[..end].to_owned(),
+    };
+    let encoded = serde_json::to_string(&record).map_err(io::Error::other)?;
+    Ok(encoded)
 }
 
 /// Advertise the saved-pane inventory before the final readiness acknowledgement.
@@ -377,11 +433,11 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
 }
 
 pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {
         crate::diagnostics::record(crate::diagnostics::Event::Ready);
     }
-    if ui_launch_handshake_requested() && !REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
+    if ui_launch_handshake_requested()
+        && !UI_STARTUP_REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
     {
         let message = match result {
             Ok(()) => UI_LAUNCH_READY.to_owned(),
@@ -1124,7 +1180,9 @@ impl UiUpdateGuard {
         self.closed.clear();
         let mut errors = Vec::new();
         for slot in slots {
-            if let Err(error) = launch_window_at(executable, false, Some(slot), None) {
+            if let Err(error) =
+                launch_window_at_with_policy(executable, false, Some(slot), None, true)
+            {
                 errors.push(format!("{slot}: {error}"));
             }
         }
@@ -1294,6 +1352,16 @@ fn launch_window_at(
     slot: Option<&str>,
     source: Option<&str>,
 ) -> io::Result<()> {
+    launch_window_at_with_policy(executable, new_window, slot, source, false)
+}
+
+fn launch_window_at_with_policy(
+    executable: &Path,
+    new_window: bool,
+    slot: Option<&str>,
+    source: Option<&str>,
+    update_retry: bool,
+) -> io::Result<()> {
     if let Some(slot) = slot {
         validate_window_slot(slot)?;
     }
@@ -1317,7 +1385,11 @@ fn launch_window_at(
     if let Some(source) = source {
         command.args(["--from-window", source]);
     }
-    crate::control::spawn_ui_process(&mut command)
+    if update_retry {
+        crate::control::spawn_updated_ui_process(&mut command)
+    } else {
+        crate::control::spawn_ui_process(&mut command)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -3091,5 +3163,40 @@ mod startup_update_tests {
             )
             .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod renderer_startup_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn updater_mode_is_fixed_and_ordinary_mode_remains_distinct() {
+        assert_eq!(ui_launch_handshake_mode(Some("1".as_ref())), Some(false));
+        assert_eq!(
+            ui_launch_handshake_mode(Some(UI_LAUNCH_UPDATE_HANDSHAKE.as_ref())),
+            Some(true)
+        );
+        for value in [
+            None,
+            Some("".as_ref()),
+            Some("update".as_ref()),
+            Some("2".as_ref()),
+        ] {
+            assert_eq!(ui_launch_handshake_mode(value), None);
+        }
+    }
+
+    #[test]
+    fn typed_renderer_detail_is_utf8_safe_and_bounded_after_json_escaping() {
+        for detail in ["é".repeat(1024), "\0".repeat(1024)] {
+            let encoded = renderer_before_state_record(&detail).unwrap();
+            assert!(UI_PRESTATE_RENDERER_PREFIX.len() + encoded.len() + 1 < 4096);
+            let record: RendererBeforeStateRecord = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(record.version, 1);
+            assert_eq!(record.kind, "graphics_initialization");
+            assert!(record.detail.len() <= 512);
+            assert!(detail.starts_with(&record.detail));
+        }
     }
 }

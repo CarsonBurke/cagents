@@ -532,25 +532,40 @@ where
                                     window.clone(),
                                 );
 
-                                self.process_event(
-                                    event_loop,
-                                    Some(Event::WindowCreated {
-                                        id,
-                                        window,
-                                        exit_on_close_request,
-                                        make_visible: visible,
-                                        on_open,
-                                        resize_border,
-                                    }),
-                                );
+                                let created = Event::WindowCreated {
+                                    id,
+                                    window,
+                                    exit_on_close_request,
+                                    make_visible: visible,
+                                    on_open,
+                                    resize_border,
+                                };
                                 #[cfg(feature = "a11y")]
-                                self.process_event(
-                                    event_loop,
-                                    Some(Event::A11yAdapter(
-                                        id,
-                                        self.adapters[&id].0,
-                                    )),
-                                );
+                                {
+                                    let node = dispatch_then_registered(
+                                        self,
+                                        |runner| {
+                                            runner.process_event(
+                                                event_loop,
+                                                Some(created),
+                                            )
+                                        },
+                                        |runner| {
+                                            runner
+                                                .adapters
+                                                .get(&id)
+                                                .map(|adapter| adapter.0)
+                                        },
+                                    );
+                                    if let Some(node) = node {
+                                        self.process_event(
+                                            event_loop,
+                                            Some(Event::A11yAdapter(id, node)),
+                                        );
+                                    }
+                                }
+                                #[cfg(not(feature = "a11y"))]
+                                self.process_event(event_loop, Some(created));
                             }
                             Control::Exit => {
                                 self.process_event(
@@ -803,6 +818,18 @@ enum Control {
     StartDnd,
 }
 
+// Recursive dispatch may remove the original adapter. Query only its current
+// registration after dispatch, never a pre-dispatch snapshot.
+#[cfg(any(feature = "a11y", test))]
+fn dispatch_then_registered<S, R>(
+    state: &mut S,
+    dispatch: impl FnOnce(&mut S),
+    registered: impl FnOnce(&S) -> Option<R>,
+) -> Option<R> {
+    dispatch(state);
+    registered(state)
+}
+
 enum OpenCompletion {
     Legacy(oneshot::Sender<window::Id>),
     Configured(oneshot::Sender<Result<window::Id, runtime::window::OpenError>>),
@@ -850,6 +877,9 @@ fn configured_surface_error(
         compositor::SurfaceInitError::ZeroSize => {
             runtime::window::OpenError::ZeroSize
         }
+        compositor::SurfaceInitError::Graphics(
+            graphics::Error::BackendError(detail),
+        ) => runtime::window::OpenError::GraphicsInitialization(detail),
         compositor::SurfaceInitError::Graphics(error) => {
             runtime::window::OpenError::GraphicsInitialization(
                 error.to_string(),
@@ -1054,7 +1084,15 @@ async fn run_instance<P>(
                                 let _ = control_sender
                                     .start_send(Control::Cleanup(id));
                                 is_window_opening = false;
-                                on_open.failed(runtime::window::OpenError::GraphicsInitialization(error.to_string()), &mut keep_alive_for_failed_open, window_manager.is_empty());
+                                on_open.failed(
+                                    configured_surface_error(
+                                        compositor::SurfaceInitError::Graphics(
+                                            error,
+                                        ),
+                                    ),
+                                    &mut keep_alive_for_failed_open,
+                                    window_manager.is_empty(),
+                                );
                                 continue;
                             }
                             control_sender
@@ -3038,6 +3076,32 @@ pub use platform_specific::*;
 #[cfg(test)]
 mod configured_open_tests {
     use super::*;
+
+    #[test]
+    fn adapter_registration_is_checked_after_recursive_dispatch() {
+        let mut adapters = std::collections::BTreeMap::from([(7_u64, 11_u64)]);
+        assert_eq!(
+            dispatch_then_registered(
+                &mut adapters,
+                |adapters| {
+                    adapters.remove(&7);
+                },
+                |adapters| adapters.get(&7).copied()
+            ),
+            None
+        );
+        adapters.insert(7, 11);
+        assert_eq!(
+            dispatch_then_registered(
+                &mut adapters,
+                |adapters| {
+                    adapters.insert(7, 13);
+                },
+                |adapters| adapters.get(&7).copied()
+            ),
+            Some(13)
+        );
+    }
 
     #[test]
     fn checked_surface_categories_and_completions_stay_distinct() {
