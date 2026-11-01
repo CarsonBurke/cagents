@@ -1129,7 +1129,7 @@ fn rpc_result(mut frame: Value) -> RpcResult {
     }
 }
 
-#[cfg(all(test, feature = "ui"))]
+#[cfg(all(feature = "ui", any(test, feature = "development")))]
 pub(crate) mod collector_fixture {
     use super::*;
     use tokio::sync::oneshot;
