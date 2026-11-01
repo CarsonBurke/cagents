@@ -147,8 +147,9 @@ completion **after** its real cleanup/IPC work has finished. For `edit`, click
 the actual editor and type synthetic text only after the original callback is
 held; for `unchanged`, keep it clean; for `reopen`, use ordinary CLI project open
 for the same literal path and wait for the actual peer-reopen observation.
-Release that original callback only through the existing native `key ... F8`
-input. There is no callback/release RPC or manufactured reducer message.
+Release that original callback only through the existing native `key ... F9`
+input with no modifiers; keep the editor focused for the edit comparison.
+There is no callback/release RPC or manufactured reducer message.
 Maintained runner stdout and stderr go to the original `ui.log`, not runner
 stdout. A receipt alone is not native input, rendered pixels, retirement or
 process-settlement evidence.
