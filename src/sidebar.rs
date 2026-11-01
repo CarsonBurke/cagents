@@ -17196,13 +17196,19 @@ pub(crate) mod tests {
                         );
                     }
                     // Native popup scrolling needs a hovered menu item. The
-                    // captured motion also proves insertion kept the popup open.
+                    // exact command below must still resolve to its original owner.
                     captured(
                         &mut sidebar,
                         Event::Mouse(mouse::Event::CursorMoved { position: inside }),
                         inside,
                     );
                     if wheel {
+                        let (before_controls, before) = sidebar.attention_frame();
+                        let before_target = before_controls
+                            .iter()
+                            .find(|(name, _)| name == &label)
+                            .expect("the target is mounted before menu scrolling")
+                            .1;
                         captured(
                             &mut sidebar,
                             Event::Mouse(mouse::Event::WheelScrolled {
@@ -17211,6 +17217,26 @@ pub(crate) mod tests {
                             inside,
                         );
                         redraw(&mut sidebar, inside);
+                        let (after_controls, after) = sidebar.attention_frame();
+                        let after_target = after_controls
+                            .iter()
+                            .find(|(name, _)| name == &label)
+                            .expect("the target is mounted after menu scrolling")
+                            .1;
+                        assert_eq!(
+                            after_target, before_target,
+                            "popup wheel input cannot move the underlying row"
+                        );
+                        let width = sidebar.bounds.width as usize;
+                        let left = inside.x as usize;
+                        let right = (left + 120).min(width);
+                        assert!(
+                            (top..=bottom).any(|y| {
+                                let strip = 4 * (y * width + left)..4 * (y * width + right);
+                                before[strip.clone()] != after[strip]
+                            }),
+                            "the same popup must actually repaint its visible command rows after wheel input"
+                        );
                     }
                     let at = Point::new(inside.x, y as f32);
                     sidebar.move_to(at);
@@ -17222,6 +17248,8 @@ pub(crate) mod tests {
                                 command: ProjectCommand::Delete | ProjectCommand::Remove,
                                 ..
                             } | SidebarAction::DeleteChannel { .. }
+                                | SidebarAction::DeleteRow(_)
+                                | SidebarAction::DeleteSelectedRows
                         )
                     });
                     attempts.push(actions.clone());
