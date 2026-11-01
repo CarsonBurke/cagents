@@ -5234,6 +5234,23 @@ fn body<'a>(
     }
 }
 
+/// Retain the complete project/member tree when navigation rows are inserted
+/// or reordered. An inner button's ID retains only that button: the sibling
+/// native popup and row interaction state must follow the same entity too.
+fn identified_navigation_row(
+    row: SelectionRow,
+    content: impl Into<Element<'static, SidebarAction>>,
+) -> Element<'static, SidebarAction> {
+    let id = match row {
+        SelectionRow::Project(id) => entity_id("navigation.row.project", id),
+        SelectionRow::Channel(id) => entity_id("navigation.row.channel", id),
+        SelectionRow::Worktree(project, worktree) => {
+            stable_id(format!("navigation.row.worktree.{project}.{worktree}"))
+        }
+    };
+    widget::id_container(content, id).into()
+}
+
 /// The scrollable project list. `responsive` is avoided here because it does
 /// not forward child accessibility nodes, and every row in this list is a
 /// named a11y target.
@@ -5264,13 +5281,16 @@ fn project_list<'a>(
     });
     for project in &projects {
         let project_id = project.project.id;
-        column = column.push(project_view(
-            project,
-            searching || !state.collapsed_projects.contains(&project_id),
-            compact,
-            selection,
-            modal_open,
-            sticky_viewport.clone(),
+        column = column.push(identified_navigation_row(
+            SelectionRow::Project(project_id),
+            project_view(
+                project,
+                searching || !state.collapsed_projects.contains(&project_id),
+                compact,
+                selection,
+                modal_open,
+                sticky_viewport.clone(),
+            ),
         ));
     }
 
@@ -6287,9 +6307,12 @@ fn project_view<'a>(
             members.sort_by_cached_key(|(_, row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
         }
         let ids = members.iter().map(|(_, row, _)| *row).collect();
-        let content =
-            widget::column::with_children(members.into_iter().map(|(_, _, element)| element))
-                .width(Length::Fill);
+        let content = widget::column::with_children(
+            members
+                .into_iter()
+                .map(|(_, row, element)| identified_navigation_row(row, element)),
+        )
+        .width(Length::Fill);
         let disabled = entity
             .channels
             .iter()
@@ -6581,8 +6604,8 @@ fn compact_project<'a>(
         let ranks = navigation_search_ranks(entity, &fold(project.state.query.trim()));
         members.sort_by_cached_key(|(row, _)| ranks.get(row).copied().unwrap_or(usize::MAX));
     }
-    for (_, member) in members {
-        column = column.push(member);
+    for (row, member) in members {
+        column = column.push(identified_navigation_row(row, member));
     }
     widget::container(RowInteraction::group(
         header,
