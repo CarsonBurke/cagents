@@ -8260,7 +8260,10 @@ mod tests {
         let command = |index: usize, status: &str| json!({"id":index.to_string(),"type":"commandExecution","command":"sleep 1","cwd":"/repo","status":status,"aggregatedOutput":""});
         for index in 0..=MAX_ACTIVE_ITEMS {
             let started = adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"turn","item":command(index, "inProgress")}})).unwrap();
-            assert!(matches!(&started.events[0], Event::Item(_)));
+            assert!(matches!(
+                &started.events[0],
+                Event::Item(_) | Event::ItemAfter { .. } | Event::ItemBefore { .. }
+            ));
         }
         assert_eq!(adapter.active_items.len(), MAX_ACTIVE_ITEMS);
         let unheld = adapter.receive(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-exact","turnId":"turn","itemId":MAX_ACTIVE_ITEMS.to_string(),"delta":"lost"}})).unwrap();

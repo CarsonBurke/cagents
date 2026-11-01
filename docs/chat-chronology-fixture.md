@@ -30,12 +30,25 @@ are needed to decide the fixture's event order.
 
 ## Run in an owned native development session
 
-Use a genuine User/operator shell and the supported development runner. An
-agent shell that inherits `CAGENTS_AGENT_AUTHORITY` must stop at the guard below;
-do not remove, replace, or impersonate that authority. The synthetic fixture
-does not log in to a real provider account or change the current agent's
-account. Coordinate the runner's build slot with the lead and reuse the
-configured Cargo cache. Do not run another development session concurrently.
+Use the supported development runner in an owned isolated session. Retain any
+inherited `CAGENTS_AGENT_AUTHORITY` unchanged; do not remove, replace, copy into
+another registry, or impersonate it. Neither the runner nor ordinary native
+window startup has a blanket User-shell requirement. Builds and native window
+launch must not be held behind a custom fixture approval guard. Coordinate the
+runner's build slot with the lead, reuse the configured Cargo cache, and do not
+run another development session concurrently. The synthetic provider does not
+log in to a real provider account or change the active agent's account.
+
+The CLI setup, account, and cleanup commands below have narrower enforced
+boundaries. Scoped requests keep their original capability, and a fresh
+isolated daemon does not know the current agent's capability: it returns
+`This agent session authority is no longer registered`. The CLI also refuses
+daemon lifecycle and account-changing commands under inherited agent authority.
+Those operations require a genuine User/operator shell unless an existing
+supported path already grants the exact scoped operation. The environment
+wrapper below preserves authority and does not make those commands authorized.
+Launching a window alone does not establish that fixture setup or the changed
+interaction succeeded.
 
 Before switching to a baseline checkout, retain the absolute paths to the
 fixtures so both revisions can run the same provider executables:
@@ -56,10 +69,6 @@ mkdir -p "$fixture_root"/{home,data,config,cache,bin,project}
 ln -s "$fixture_source" "$fixture_root/bin/claude"
 git init --initial-branch=main "$fixture_root/project"
 fixture_env() {
-  if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
-    printf '%s\n' 'This fixture requires a genuine User shell; inherited agent authority was not modified.' >&2
-    return 77
-  fi
   env -u CLAUDE_CONFIG_DIR \
     HOME="$fixture_root/home" XDG_RUNTIME_DIR="$fixture_runtime" \
     XDG_DATA_HOME="$fixture_root/data" XDG_CONFIG_HOME="$fixture_root/config" \
@@ -75,8 +84,10 @@ fixture's instructions for absolute `WAYLAND_DISPLAY`, inherited `NIRI_SOCKET`,
 and an owned nested session. Keep the short runtime path; do not point these
 commands at production or another person's UI or daemon.
 
-Use the newly built matched CLI from the runner's configured target directory
-in a second operator shell with the same `fixture_env`:
+Use the newly built matched CLI from the runner's configured target directory.
+The project/spawn mutations below require a caller recognized by this isolated
+daemon. In a fresh fixture with no registered agent capability, run those
+mutations in a genuine operator shell with the same isolated environment:
 
 ```sh
 fixture_target=$(fixture_env cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
@@ -147,11 +158,11 @@ to read/write state or bind a socket unless `CODEX_HOME` is private, owned by
 the operator, and contains the explicit `fixture-chronology-enabled` marker.
 Never put that marker in a real provider account home.
 
-Use a separate fresh root/runtime from the Claude scenario. In the same genuine
-operator shell, keep the `fixture_env` authority guard and isolation above,
-create this `codex` executable symlink, and explicitly select its synthetic
-home. The `fixture_codex_source` path must still point to the pinned source
-checkout above, including when the runner checkout is the before revision:
+Use a separate fresh root/runtime from the Claude scenario. Preserve authority
+and the `fixture_env` isolation above, create this `codex` executable symlink,
+and explicitly select its synthetic home. The `fixture_codex_source` path must
+still point to the pinned source checkout above, including when the runner
+checkout is the before revision:
 
 ```sh
 mkdir -p "$PWD/.worktrees"
@@ -235,6 +246,38 @@ Cleanup must address only this owned fixture process/session, through the
 operator's normal process ownership controls; do not signal unrelated jobs or
 restart production. A stale or absent shared endpoint is a failed history
 setup, not evidence that reopening worked.
+
+## Source scope and remaining native setup
+
+The launcher behavior and mutation boundaries are different contracts:
+
+- `scripts/run-development` builds the matched executables and launches the
+  normal UI. Native startup calls `ensure_daemon_ready` in
+  `src/bin/cagents-ui.rs`; neither entry point rejects inherited agent authority.
+  The nested Niri harness also inherits the caller's environment. They can
+  launch an owned isolated window without changing that authority.
+- `src/control.rs` rejects daemon lifecycle and account-changing CLI commands
+  when `CAGENTS_AGENT_AUTHORITY` is present, before daemon startup. Scoped Agent
+  requests keep the capability in their business envelope. The isolated
+  daemon's `src/host/model/execution.rs::execution_origin` requires that
+  capability to be registered in its own execution registry; changing XDG paths
+  does not transfer it. Invalid/missing registration has no User fallback.
+- Native mutations do not uniformly capture the inherited capability. The
+  native chat client and workspace publisher open ordinary UI connections,
+  while `src/device_service.rs::request` captures and authenticates the caller's
+  authority. Local Accounts UI also has direct registry paths. An agent must
+  not automate those User-origin paths to circumvent a scoped setup refusal.
+
+No existing agent-scoped path has been established that provisions the complete
+fresh fixture, performs its User-only lifecycle operations, and preserves the
+exact allowed Carson account mapping. The concrete missing inputs are a
+genuine operator for the User-only fixture setup/cleanup and a supported safe
+mapping for that exact Codex account selector. The latter remains unresolved
+even though window launch itself has no blanket User-shell restriction. Do
+not manufacture either input by transferring authority, editing registries or
+databases, or relabeling a synthetic account as Carson. Native window launch
+alone, standalone fixture output, and passing source tests do not establish
+the changed interaction or its saved-history acceptance.
 
 ## Evidence and limits
 

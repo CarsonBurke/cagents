@@ -3846,7 +3846,7 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
         .collect();
     let first = receive.recv_timeout(Duration::from_secs(2));
     let later: Vec<_> = receive.try_iter().collect();
-    let snapshot = handle.0.state.lock().unwrap().clone();
+    let snapshot = handle.snapshot(None).expect("unconditional fixture snapshot");
     // Retire the actual process before asserting any result, including the
     // missing-callback/error paths, just as the one-frame fixture did.
     let closed = handle.close();

@@ -35,7 +35,7 @@ fn delayed_standalone_items_and_retry_receipts_keep_the_originating_turn_positio
             false,
         );
         assert_eq!(snapshot.items.len(), 7, "{method}");
-        assert_eq!(snapshot.items[0].id, "old-a/prompt");
+        assert_eq!(snapshot.items[0].id, "old-a/prompt/input/0");
         assert_eq!(snapshot.items[1].id, "old-a/answer");
         assert!(snapshot.items[2].id.starts_with("codex-notice:"));
         assert!(snapshot.items[3].id.starts_with("codex-notice:"));
@@ -44,7 +44,7 @@ fn delayed_standalone_items_and_retry_receipts_keep_the_originating_turn_positio
             "retry receipts retain distinct UUID identities"
         );
         assert_eq!(snapshot.items[4].id, turn_error_item("old-a", raw).id);
-        assert_eq!(snapshot.items[5].id, "new-b/prompt");
+        assert_eq!(snapshot.items[5].id, "new-b/prompt/input/0");
         assert_eq!(snapshot.items[6].id, "new-b/answer");
         for index in 2..5 {
             assert_eq!(
@@ -101,10 +101,10 @@ fn partial_overlap_history_preserves_the_last_known_item_for_a_later_error() {
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>(),
         [
-            "old-a/prompt",
+            "old-a/prompt/input/0",
             "old-a/answer",
             &error_id,
-            "new-b/prompt",
+            "new-b/prompt/input/0",
             "new-b/answer"
         ]
     );
@@ -183,10 +183,10 @@ fn first_delayed_terminal_error_is_inserted_before_the_new_turn_without_history(
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
             [
-                "old-a/prompt",
+                "old-a/prompt/input/0",
                 "old-a/answer",
                 &error_id,
-                "new-b/prompt",
+                "new-b/prompt/input/0",
                 "new-b/answer"
             ],
             "first late error must precede B before any history: completion={completion}, early={early}, unseen={unseen}"
@@ -294,9 +294,14 @@ fn authoritative_missing_middle_content_precedes_its_streamed_successor_and_late
             Some(raw)
         );
         let expected = if missing_middle {
-            vec!["turn/p", "turn/r/summary/0", "turn/a", retry.id.as_str()]
+            vec![
+                "turn/p/input/0",
+                "turn/r/summary/0",
+                "turn/a",
+                retry.id.as_str(),
+            ]
         } else {
-            vec!["turn/p", retry.id.as_str(), "turn/a"]
+            vec!["turn/p/input/0", retry.id.as_str(), "turn/a"]
         };
         assert_eq!(
             snapshot
@@ -392,10 +397,10 @@ fn first_delayed_child_completion_preserves_child_turn_order_without_history() {
             .map(|item| item.id.as_str())
             .collect::<Vec<_>>(),
         [
-            "old-a/prompt",
+            "old-a/prompt/input/0",
             "old-a/answer",
             &error_id,
-            "new-b/prompt",
+            "new-b/prompt/input/0",
             "new-b/answer"
         ]
     );
@@ -462,12 +467,12 @@ fn terminal_error_incidents_keep_turn_order_through_streaming_dedup_and_history_
         "same text in later turns is a new incident"
     );
     let expected = vec![
-        "failed-a/prompt",
+        "failed-a/prompt/input/0",
         "failed-a/answer",
         &failure_a,
-        "resumed-b/prompt",
+        "resumed-b/prompt/input/0",
         "resumed-b/answer",
-        "failed-c/prompt",
+        "failed-c/prompt/input/0",
         &failure_c,
     ];
     let ids = |snapshot: &chat::Snapshot| {
