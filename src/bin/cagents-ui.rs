@@ -40,15 +40,19 @@ pub(crate) fn main_with_before_start(
     before_start: impl FnOnce() -> Result<(), Box<dyn std::error::Error>>,
 ) -> std::process::ExitCode {
     // SAFETY: first statement of main, before any thread exists.
-    unsafe { cagents::account::detach_inherited_selections() };
+    if !cagents::app::Cagents::native_chronology_fixture_enabled() {
+        unsafe { cagents::account::detach_inherited_selections() };
+    }
     // The document render helper answers before anything else exists. Its
     // stdout is a binary page frame, so a tracing subscriber, a panic hook
     // writing a crash record, the window lease or the launcher handshake
     // putting a single line there would corrupt the page the reader is
     // waiting for. It is also the one mode that must stay cheap: it runs
     // once per page turn.
-    if let Some(code) = cagents::document_render::hook() {
-        return code;
+    if !cagents::app::Cagents::native_chronology_fixture_enabled() {
+        if let Some(code) = cagents::document_render::hook() {
+            return code;
+        }
     }
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     // The standalone dialogs write their result to stdout and the tray shows
@@ -59,7 +63,7 @@ pub(crate) fn main_with_before_start(
     let standalone = arguments.first().is_some_and(|argument| {
         argument == CONFIRM_DAEMON_STOP || argument == STARTUP_ERROR || argument == STARTUP_UPDATE
     });
-    if standalone {
+    if standalone && !cagents::app::Cagents::native_chronology_fixture_enabled() {
         cagents::instance::install_panic_hook(PRODUCT);
         cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
         return report(run_internal(&arguments));
@@ -74,8 +78,10 @@ pub(crate) fn main_with_before_start(
         Ok(None) => return std::process::ExitCode::SUCCESS,
         Err(error) => return report(Err(error)),
     };
-    if let Err(error) = before_start() {
-        return report(Err(error));
+    if !cagents::app::Cagents::native_chronology_fixture_enabled() {
+        if let Err(error) = before_start() {
+            return report(Err(error));
+        }
     }
 
     // Diagnostics come before every other statement. The startup sequence
@@ -92,7 +98,9 @@ pub(crate) fn main_with_before_start(
         // The launcher is blocked reading the startup handshake; a main-thread
         // panic has to release it before this process dies. The crash record
         // itself is written by the hook installed above, which runs next.
-        if std::thread::current().id() == main_thread {
+        if std::thread::current().id() == main_thread
+            && !cagents::app::Cagents::native_chronology_fixture_enabled()
+        {
             let _ = cagents::instance::report_ui_startup(&Err(format!(
                 "UI initialization failed: {panic}"
             )));
@@ -101,8 +109,12 @@ pub(crate) fn main_with_before_start(
     }));
 
     #[cfg(feature = "integrated-browser")]
-    let _browser_cleanup = cagents::browser::ProcessShutdown;
+    let _browser_cleanup = (!cagents::app::Cagents::native_chronology_fixture_enabled())
+        .then(|| cagents::browser::ProcessShutdown);
     let result = run(options);
+    if cagents::app::Cagents::native_chronology_fixture_enabled() {
+        return report(result);
+    }
     match &result {
         Err(error) if cagents::instance::is_update_in_progress(error.as_ref()) => {
             // Expected coordinator ownership is not a crash. Preserve the
@@ -294,6 +306,7 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
 }
 
 fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let chronology_fixture = cagents::app::Cagents::native_chronology_fixture_enabled();
     let Options {
         new_window,
         slot,
@@ -301,10 +314,17 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device,
         device_window_scoped,
     } = options;
-    let _device_cleanup = cagents::device::Cleanup;
-    cagents::device::select(device)?;
-    cagents::device::prepare()?;
-    if !cagents::device::is_remote() {
+    if chronology_fixture && (device.is_some() || slot.is_some() || source.is_some()) {
+        return Err(
+            "The local chronology fixture does not accept device or saved-window options".into(),
+        );
+    }
+    let _device_cleanup = (!chronology_fixture).then(|| cagents::device::Cleanup);
+    if !chronology_fixture {
+        cagents::device::select(device)?;
+        cagents::device::prepare()?;
+    }
+    if !chronology_fixture && !cagents::device::is_remote() {
         if let Some(executable) = cagents::control::staged_ui_executable()? {
             // exec preserves the launcher handshake pipe and window arguments.
             let mut command = std::process::Command::new(executable);
@@ -320,7 +340,9 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         slot
     };
-    let scoped_slot = if device_window_scoped && !remote_new_window {
+    let scoped_slot = if chronology_fixture {
+        None
+    } else if device_window_scoped && !remote_new_window {
         slot.map(str::to_owned)
     } else {
         cagents::device::window_slot(slot)?
@@ -329,6 +351,9 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let fixture =
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
+        if chronology_fixture {
+            return Ok((None, None, cagents::app::Cagents::load_startup()?));
+        }
         let lease = cagents::instance::WindowLease::acquire(new_window, slot)?;
         let device_source = if device_window_scoped && source.is_some() {
             source.map(str::to_owned)
@@ -346,11 +371,10 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
             cagents::terminal::ensure_daemon_ready()?;
         }
         let restored = cagents::app::Cagents::load_startup()?;
-        Ok((lease, (listener, activation_rx), restored))
+        Ok((Some(lease), Some((listener, activation_rx)), restored))
     })();
     let (_application_lease, activation, restored) = startup?;
     let restored = std::cell::RefCell::new(Some(restored));
-    let activation = Some(activation);
 
     // The pinned COSMIC run helper does not wire its scale_factor callback
     // into iced. Build the daemon through the public shell API so interface

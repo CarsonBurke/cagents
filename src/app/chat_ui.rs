@@ -19,6 +19,8 @@ mod attachment_draft;
 mod auth_recovery;
 mod changes;
 mod child_navigation;
+#[cfg(feature = "development")]
+pub(in crate::app) mod chronology_fixture;
 mod clipboard_image;
 mod closed_draft;
 mod completion;
@@ -2022,6 +2024,8 @@ enum QueuedStep {
 const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
 
 pub(super) struct Runtime {
+    #[cfg(feature = "development")]
+    chronology_fixture: Option<chronology_fixture::State>,
     preparation: preparation::State,
     find: Option<String>,
     find_focused: bool,
@@ -2958,6 +2962,8 @@ impl Runtime {
         let permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let mut runtime = Self {
+            #[cfg(feature = "development")]
+            chronology_fixture: None,
             preparation: preparation::State::default(),
             target,
             session,

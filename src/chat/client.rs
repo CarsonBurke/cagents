@@ -116,6 +116,15 @@ pub enum Wake {
 #[derive(Clone)]
 pub struct ClientHandle {
     inner: Arc<Inner>,
+    #[cfg(all(feature = "development", feature = "ui"))]
+    local_fixture: bool,
+}
+
+#[cfg(any(test, all(feature = "development", feature = "ui")))]
+struct FixturePeers {
+    _wire: UnixStream,
+    _cancel: UnixStream,
+    _visibility: crossbeam_channel::Receiver<()>,
 }
 struct Wire {
     stream: UnixStream,
@@ -567,6 +576,8 @@ struct InnerPayload {
     text_copies: AtomicUsize,
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(any(test, all(feature = "development", feature = "ui")))]
+    _fixture_peers: Option<FixturePeers>,
     #[cfg(test)]
     retirement_complete: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
 }
@@ -1307,11 +1318,23 @@ fn restore(
 }
 impl ClientHandle {
     /// A handle whose snapshot the UI can render without a daemon.
-    ///
-    /// The peer sockets are kept open for the process lifetime so dropping the
-    /// handle does not look like a protocol failure to a test that only draws.
     #[cfg(test)]
     pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+        Self::snapshot_fixture(session, snapshot)
+    }
+
+    /// A development-only presentation source. It has no authenticated host
+    /// identity and cannot issue daemon or provider operations.
+    #[cfg(all(feature = "development", feature = "ui"))]
+    pub(crate) fn development_fixture(mut session: Session, snapshot: Snapshot) -> Self {
+        session.proof = None;
+        let mut handle = Self::snapshot_fixture(session, snapshot);
+        handle.local_fixture = true;
+        handle
+    }
+
+    #[cfg(any(test, all(feature = "development", feature = "ui")))]
+    fn snapshot_fixture(session: Session, snapshot: Snapshot) -> Self {
         let retirement = ClientRetirement::shared().expect("start fixture client retirement");
         let body_requested = Arc::new(AtomicBool::new(true));
         let user_item_seen = snapshot
@@ -1321,9 +1344,6 @@ impl ClientHandle {
         let (stream, peer) = UnixStream::pair().expect("socket pair");
         let (cancel, cancel_peer) = UnixStream::pair().expect("socket pair");
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
-        std::mem::forget(peer);
-        std::mem::forget(cancel_peer);
-        std::mem::forget(visibility_rx);
         let proof = HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("fixture-host"),
             boot_id: crate::model::BootId::new("fixture-boot"),
@@ -1363,10 +1383,48 @@ impl ClientHandle {
                     text_copies: AtomicUsize::new(0),
                     visibility_tx,
                     visibility_worker: Mutex::new(None),
+                    _fixture_peers: Some(FixturePeers {
+                        _wire: peer,
+                        _cancel: cancel_peer,
+                        _visibility: visibility_rx,
+                    }),
+                    #[cfg(test)]
                     retirement_complete: None,
                 },
                 retirement,
             )),
+            #[cfg(all(feature = "development", feature = "ui"))]
+            local_fixture: false,
+        }
+    }
+
+    /// Install an in-memory fixture frame through the normal full-publication
+    /// path. This provides presentation evidence, never a provider receipt.
+    #[cfg(all(feature = "development", feature = "ui"))]
+    pub(crate) fn development_fixture_publish(&self, snapshot: Snapshot) -> Result<(), String> {
+        if !self.local_fixture {
+            return Err("Only a development chat fixture accepts local publications".into());
+        }
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return Err("Chat fixture is disconnected".into());
+        }
+        self.inner.user_item_seen.fetch_or(
+            snapshot
+                .items
+                .iter()
+                .any(|item| item.role == super::Role::User),
+            Ordering::AcqRel,
+        );
+        match self
+            .inner
+            .publication
+            .replace(snapshot, &self.inner.body_requested, true, false)
+        {
+            Some(true) => {
+                (self.inner.wake)(Wake::Changed);
+                Ok(())
+            }
+            _ => Err("Chat fixture publication was superseded".into()),
         }
     }
 
@@ -2061,6 +2119,8 @@ impl ClientHandle {
                 text_copies: AtomicUsize::new(0),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
+                #[cfg(any(test, all(feature = "development", feature = "ui")))]
+                _fixture_peers: None,
                 #[cfg(test)]
                 retirement_complete: None,
             },
@@ -2329,7 +2389,11 @@ impl ClientHandle {
             wake(Wake::Disconnected(failure));
         }).map_err(|e| e.to_string())?;
         *inner.reader.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            #[cfg(all(feature = "development", feature = "ui"))]
+            local_fixture: false,
+        })
     }
     /// The durable descriptor for this chat, with the conversation the
     /// provider has confirmed.
@@ -2449,12 +2513,28 @@ impl ClientHandle {
             .take()
     }
     pub fn proof(&self) -> Option<HostSessionProof> {
+        #[cfg(all(feature = "development", feature = "ui"))]
+        if self.local_fixture {
+            return None;
+        }
         Some(self.inner.proof.clone())
     }
+
+    #[cfg(all(feature = "development", feature = "ui"))]
+    fn require_daemon_transport(&self) -> Result<(), String> {
+        if self.local_fixture {
+            Err("Development chat fixtures do not issue daemon operations".into())
+        } else {
+            Ok(())
+        }
+    }
+
     fn request_response(
         &self,
         request: ClientRequest,
     ) -> Result<Option<crate::model::TerminalSession>, String> {
+        #[cfg(all(feature = "development", feature = "ui"))]
+        self.require_daemon_transport()?;
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; exact reattachment is required".into());
         }
@@ -2501,6 +2581,8 @@ impl ClientHandle {
     /// Read immutable cached edit data on this connection's own reply channel.
     /// Call off the UI thread; no watch publication or provider state is mutated.
     pub fn file_changes(&self, command: Command) -> Result<super::FileChangeReply, String> {
+        #[cfg(all(feature = "development", feature = "ui"))]
+        self.require_daemon_transport()?;
         if !matches!(
             &command,
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. }
@@ -2548,6 +2630,8 @@ impl ClientHandle {
     /// Call off the UI thread: all pages share one total deadline and never
     /// publish snapshots or dispatch commands to the provider.
     pub fn copy_text(&self, source: super::TextCopySource) -> Result<String, String> {
+        #[cfg(all(feature = "development", feature = "ui"))]
+        self.require_daemon_transport()?;
         let deadline = Instant::now() + TEXT_COPY_TIMEOUT;
         if source.bytes > super::TEXT_COPY_LIMIT_BYTES as u64 {
             return Err("Text copy exceeds the supported byte limit".into());
@@ -2648,6 +2732,16 @@ impl ClientHandle {
     pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
+        }
+        #[cfg(all(feature = "development", feature = "ui"))]
+        if self.local_fixture {
+            // No daemon can rehydrate this presentation source. Visibility is
+            // local bookkeeping; keep its body resident across tab switches.
+            let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
+            if interested && changed {
+                (self.inner.wake)(Wake::Changed);
+            }
+            return Ok(());
         }
         let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
         let (old, current, result) = {
@@ -2882,6 +2976,131 @@ mod tests {
             paused.send(()).unwrap();
             resume.recv_timeout(Duration::from_secs(10)).unwrap();
         }
+    }
+
+    #[cfg(all(feature = "development", feature = "ui"))]
+    #[test]
+    fn development_fixture_refuses_operations_before_allocating_or_writing_requests() {
+        use std::io::Read;
+
+        let session = omp_card(Some("fixture"), Some(host_proof("not-a-live-host")));
+        let client = ClientHandle::development_fixture(session, Snapshot::default());
+        assert!(client.proof().is_none());
+        assert!(client.session().proof.is_none());
+        let next_request = client.inner.next.load(Ordering::Relaxed);
+        let epoch = client.begin_acknowledgement();
+        let errors = [
+            client.send(Command::Interrupt).unwrap_err(),
+            client.return_terminal().unwrap_err(),
+            client.close().unwrap_err(),
+            client.acknowledge_updates(epoch).unwrap_err(),
+            client
+                .file_changes(Command::LoadFileChanges {
+                    request_id: 1,
+                    after: None,
+                })
+                .unwrap_err(),
+            client.copy_text(text_copy_source(1, 10)).unwrap_err(),
+        ];
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.contains("fixtures do not issue daemon operations"))
+        );
+        assert_eq!(client.inner.next.load(Ordering::Relaxed), next_request);
+        assert!(client.inner.pending.lock().unwrap().is_empty());
+        assert!(client.inner.file_pending.lock().unwrap().is_empty());
+        assert!(client.inner.text_copy_pending.lock().unwrap().is_empty());
+        assert_eq!(client.inner.text_copies.load(Ordering::Relaxed), 0);
+        let mut peer = client
+            .inner
+            ._fixture_peers
+            .as_ref()
+            .unwrap()
+            ._wire
+            .try_clone()
+            .unwrap();
+        peer.set_nonblocking(true).unwrap();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[cfg(all(feature = "development", feature = "ui"))]
+    #[test]
+    fn development_fixture_keeps_resident_body_across_visibility_and_publications() {
+        let initial = Snapshot {
+            generation: 1,
+            sampled_at: Some(100),
+            items: vec![retirement_text("earlier answer".into())],
+            ..Snapshot::default()
+        };
+        let client = ClientHandle::development_fixture(omp_card(None, None), initial);
+        let before = client.snapshot();
+        client.set_interest(false, false).unwrap();
+        assert!(Arc::ptr_eq(&before, &client.snapshot()));
+        assert!(client.resident_snapshot_with_clock().is_some());
+        assert!(client.inner.body_requested.load(Ordering::Acquire));
+
+        let mut user = retirement_text("later prompt".into());
+        Arc::make_mut(&mut user).role = super::super::Role::User;
+        let next = Snapshot {
+            generation: 2,
+            sampled_at: Some(101),
+            items: vec![before.items[0].clone(), user],
+            ..Snapshot::default()
+        };
+        client.development_fixture_publish(next.clone()).unwrap();
+        client.set_interest(true, false).unwrap();
+        assert_eq!(*client.snapshot(), next);
+        assert!(client.resident_snapshot_with_clock().is_some());
+        assert!(client.has_observed_user_item());
+        assert!(client.snapshot_with_clock().1.unwrap().sampled_at >= 101);
+        assert!(client.inner.visibility_worker.lock().unwrap().is_none());
+        assert!(client.inner.reader.lock().unwrap().is_none());
+        assert!(
+            client
+                .inner
+                ._fixture_peers
+                .as_ref()
+                .unwrap()
+                ._visibility
+                .is_empty()
+        );
+
+        let ordinary_fixture = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        assert!(ordinary_fixture.proof().is_some());
+        assert!(ordinary_fixture.development_fixture_publish(next).is_err());
+    }
+
+    #[cfg(all(feature = "development", feature = "ui"))]
+    #[test]
+    fn development_fixture_drops_owned_socket_peers_with_the_client() {
+        use std::io::Read;
+
+        let mut client =
+            ClientHandle::development_fixture(omp_card(None, None), Snapshot::default());
+        let mut endpoint = client
+            .inner
+            .wire
+            .lock()
+            .unwrap()
+            .stream
+            .try_clone()
+            .unwrap();
+        endpoint
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (completed, completion) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut client.inner).unwrap().retirement_complete = Some(completed);
+        drop(client);
+        completion.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            endpoint.read(&mut [0]).unwrap(),
+            0,
+            "fixture peer must not leak"
+        );
     }
 
     #[test]
