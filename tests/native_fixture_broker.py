@@ -1751,6 +1751,66 @@ class OwnershipContracts(TemporaryRepository):
             self.manager.run_ui(other, {})
             self.assertEqual(start.call_count, 2)
 
+    def test_unacknowledged_runner_launch_blocks_other_build_without_cli_credit(self):
+        failures = (broker.Refusal("timeout", "synthetic lost launch reply"),
+                    subprocess.TimeoutExpired("synthetic launch reply", 10),
+                    {}, {"state": "not_started"})
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__, reply=repr(failure)):
+                first = self.owned_fixture("demo", 44)
+                other = self.owned_fixture("other", 45)
+                self.manager.live = {"demo": first, "other": other}
+
+                def original_reply(request, _timeout):
+                    if request == {"poll": "runner"}:
+                        return {"state": "not_started"}
+                    self.assertEqual(request["background"], "runner")
+                    self.assertTrue(first.runner_attempted)
+                    self.assertFalse(first.runner_started)
+                    if isinstance(failure, BaseException):
+                        raise failure
+                    return failure
+
+                first.channel.call.side_effect = original_reply
+                with self.assertRaises((broker.Refusal, subprocess.TimeoutExpired)):
+                    self.manager.run_ui(first, {})
+                self.assertTrue(first.runner_attempted)
+                self.assertFalse(first.runner_started)
+                self.assertEqual(first.channel.call.call_count, 2)
+                with mock.patch.object(broker, "read_regular", return_value=None), mock.patch.object(
+                        self.manager, "_holder_alive", return_value=True), mock.patch.object(
+                        self.manager, "_runner_state", side_effect=broker.Refusal("timeout", "synthetic unknown runner")):
+                    with self.assertRaises(broker.Refusal) as caught:
+                        self.manager.run_ui(other, {})
+                    self.assertEqual(caught.exception.code, "build_busy")
+                    other.channel.call.assert_not_called()
+                    self.assertEqual(first.channel.call.call_count, 2)
+                matching_dep_info = f"{first.layout.cli}: {first.layout.checkout}/src/main.rs\n".encode()
+                with mock.patch.object(broker, "read_regular", return_value=matching_dep_info), mock.patch.object(
+                        self.manager, "_in_sandbox") as command:
+                    self.assertFalse(self.manager._cli_built(first))
+                    with self.assertRaises(broker.Refusal) as caught:
+                        self.manager.cli(first, {"args": ["version"]})
+                    self.assertEqual(caught.exception.code, "cli_not_built")
+                    command.assert_not_called()
+                with mock.patch.object(broker, "read_regular", return_value=None), mock.patch.object(
+                        self.manager, "_holder_alive", return_value=True), mock.patch.object(
+                        self.manager, "_runner_state", return_value="exited_1"), mock.patch.object(
+                        self.manager, "_start_runner", return_value={"state": "synthetic-start"}) as start:
+                    self.assertEqual(self.manager.run_ui(other, {}), {"state": "synthetic-start"})
+                    start.assert_called_once_with(other)
+                self.assertFalse(first.runner_started)
+
+    def test_acknowledged_runner_launch_retains_successful_cli_receipt_control(self):
+        self.fixture.channel.call.side_effect = [{"state": "not_started"}, {"state": "running"}]
+        result = self.manager.run_ui(self.fixture, {})
+        self.assertEqual(result["state"], "building_then_launching")
+        self.assertTrue(self.fixture.runner_attempted)
+        self.assertTrue(self.fixture.runner_started)
+        matching_dep_info = f"{self.fixture.layout.cli}: {self.fixture.layout.checkout}/src/main.rs\n".encode()
+        with mock.patch.object(broker, "read_regular", return_value=matching_dep_info):
+            self.assertTrue(self.manager._cli_built(self.fixture))
+
     def test_partial_holder_acquisitions_close_every_prior_original_once(self):
         for stage in ("pipe", "socketpair", "RelayChannel", "Popen", "pidfd"):
             with self.subTest(stage=stage):

@@ -921,6 +921,7 @@ class Fixture:
     host_session_attempted: bool = False
     host_session_stopped: bool = False
     released: bool = False
+    runner_attempted: bool = False
 
 
 class Spawner:
@@ -1517,7 +1518,7 @@ class Fixtures:
 
     def _is_building(self, fixture):
         """Whether this fixture's runner has not reached launching its UI yet."""
-        if fixture.stopped or not fixture.runner_started:
+        if fixture.stopped or not (fixture.runner_attempted or fixture.runner_started):
             return False
         layout = fixture.layout
         log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), layout.runner_log.name, MAX_RUNNER_LOG_BYTES)
@@ -1552,6 +1553,7 @@ class Fixtures:
         if self._runner_state(fixture) == "running":
             raise Refusal("runner_active", "the development runner is already running")
         layout = fixture.layout
+        fixture.runner_attempted = True
         reply = fixture.channel.call(
             {"argv": runner_command(layout), "cwd": str(layout.checkout),
              "env": self.environment_for(layout), "background": "runner", "log": str(layout.runner_log)},

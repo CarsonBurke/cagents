@@ -63,7 +63,9 @@ before and an after can be live together.
   time: `run-ui` refuses with `build_busy` while another is building, so run it
   again once that fixture's `status` says `building` is false. Unreadable or
   malformed runner state remains busy or unavailable; it does not permit a
-  second build.
+  second build. An unacknowledged runner launch also keeps that build exclusion
+  until existing completion or holder-exit evidence is available; it does not
+  make the CLI usable.
 - **Viewport:** `start --width` and `viewport --width` set the app's logical width
   from 320 to 3840, through the nested output's scale, and fit it again before
   input and screenshots if the host has resized the nested window. The host lays
