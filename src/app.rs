@@ -19075,10 +19075,10 @@ impl Application for Cagents {
         );
         #[cfg(feature = "development")]
         if Self::native_chronology_fixture_enabled() {
-            let busy = self.cards.values().any(
-                |runtime| matches!(runtime, CardRuntime::Chat(runtime) if runtime.snapshot.busy),
+            return native_fixture_frames::instrument(
+                surface,
+                chat_ui::chronology_fixture::busy(self),
             );
-            return native_fixture_frames::instrument(surface, busy);
         }
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(

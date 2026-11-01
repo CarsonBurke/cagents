@@ -487,6 +487,12 @@ pub(in crate::app) fn update(app: &mut Cagents, message: Message) -> Task<Messag
     app.sync_chrome()
 }
 
+pub(in crate::app) fn busy(app: &Cagents) -> bool {
+    app.cards
+        .values()
+        .any(|runtime| matches!(runtime, CardRuntime::Chat(runtime) if runtime.snapshot.busy))
+}
+
 pub(in crate::app) fn subscription(app: &Cagents) -> Subscription<Message> {
     let running = app.cards.values().any(|card| {
         matches!(card,
