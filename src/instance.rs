@@ -2966,6 +2966,106 @@ mod tests {
         assert_eq!(activation.token, None);
     }
 
+    #[cfg(feature = "ui")]
+    #[test]
+    fn loading_startup_acknowledges_and_retains_the_original_session_activation() {
+        use crate::app::startup_window::{StartupFailure, prepare_with_activation};
+        use std::sync::{Arc, atomic::AtomicUsize, mpsc};
+
+        struct Prepared(Arc<AtomicUsize>);
+        impl Drop for Prepared {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        type Loaded = Result<
+            (
+                Prepared,
+                UiActivationListener,
+                async_channel::Receiver<UiActivation>,
+            ),
+            StartupFailure,
+        >;
+        struct OriginalLoad {
+            release: Option<mpsc::Sender<()>>,
+            original: Option<JoinHandle<Loaded>>,
+        }
+        impl Drop for OriginalLoad {
+            fn drop(&mut self) {
+                if let Some(release) = self.release.take() {
+                    let _ = release.send(());
+                }
+                if let Some(original) = self.original.take() {
+                    // Drop a late payload/listener only after the exact load
+                    // thread is joined, before the fixture directory disappears.
+                    drop(original.join());
+                }
+            }
+        }
+
+        for cancel in [false, true] {
+            let runtime = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let root = runtime.path().to_owned();
+            let canceled = Arc::new(AtomicBool::new(false));
+            let worker_cancel = canceled.clone();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let prepared_drops = dropped.clone();
+            let (entered, loading) = mpsc::channel();
+            let (release, held) = mpsc::channel();
+            let original = thread::spawn(move || {
+                prepare_with_activation(
+                    &worker_cancel,
+                    |events| UiActivationListener::bind_in(&root, events),
+                    || {
+                        let prepared = Prepared(prepared_drops);
+                        entered.send(()).unwrap();
+                        held.recv().unwrap();
+                        Ok(prepared)
+                    },
+                )
+            });
+            let mut owner = OriginalLoad {
+                release: Some(release),
+                original: Some(original),
+            };
+            loading.recv_timeout(Duration::from_secs(2)).unwrap();
+            let session = crate::model::TerminalId::new();
+            assert!(
+                activate_window_session_in(
+                    runtime.path(),
+                    PRIMARY_WINDOW,
+                    session,
+                    Some("loading-token"),
+                )
+                .unwrap()
+            );
+            assert_eq!(dropped.load(Ordering::Acquire), 0);
+            canceled.store(cancel, Ordering::Release);
+            owner.release.take().unwrap().send(()).unwrap();
+            let loaded = owner.original.take().unwrap().join().unwrap();
+            if cancel {
+                assert!(matches!(loaded, Err(error) if error.is_canceled()));
+            } else {
+                let (prepared, listener, receiver) = loaded.unwrap();
+                let activation = receiver
+                    .try_recv()
+                    .expect("original queued activation after loading");
+                assert_eq!(activation.session, Some(session));
+                assert_eq!(activation.token.as_deref(), Some("loading-token"));
+                assert!(activation.update.is_none());
+                assert!(receiver.try_recv().is_err());
+                drop(prepared);
+                drop(listener);
+                drop(receiver);
+            }
+            assert_eq!(dropped.load(Ordering::Acquire), 1);
+            assert!(!runtime.path().join(ACTIVATION_SOCKET_FILE).exists());
+        }
+    }
+
     #[test]
     fn local_session_links_exclude_device_window_namespaces() {
         assert!(window_matches_selected_device(PRIMARY_WINDOW).unwrap());

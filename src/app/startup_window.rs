@@ -270,20 +270,20 @@ fn load_prepared_window(request: Request, canceled: &AtomicBool) -> LoadResult {
     )
     .map_err(|error| StartupFailure(Failure::Other(error.to_string())))?;
     checkpoint(canceled)?;
-    let fixture =
-        cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
-    if !fixture {
-        crate::terminal::ensure_daemon_ready()
-            .map_err(|error| StartupFailure(Failure::Daemon(error)))?;
-    }
-    checkpoint(canceled)?;
-    let mut startup =
-        Cagents::load_startup().map_err(|error| StartupFailure(Failure::Other(error)))?;
-    startup.prepare_for_window();
-    checkpoint(canceled)?;
-    // Do not accept activation/update callbacks while no real reducer exists.
-    let (sender, receiver) = async_channel::unbounded();
-    let activation = instance::UiActivationListener::bind(sender)?;
+    let (startup, activation, receiver) =
+        prepare_with_activation(canceled, instance::UiActivationListener::bind, || {
+            let fixture = cfg!(feature = "latency-harness")
+                && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
+            if !fixture {
+                crate::terminal::ensure_daemon_ready()
+                    .map_err(|error| StartupFailure(Failure::Daemon(error)))?;
+            }
+            checkpoint(canceled)?;
+            let mut startup =
+                Cagents::load_startup().map_err(|error| StartupFailure(Failure::Other(error)))?;
+            startup.prepare_for_window();
+            Ok(startup)
+        })?;
     Ok(PreparedWindow {
         startup: Some(startup),
         activation: Some(receiver),
@@ -293,6 +293,33 @@ fn load_prepared_window(request: Request, canceled: &AtomicBool) -> LoadResult {
             device: Some(cleanup),
         }),
     })
+}
+
+// This one post-source-initialization stage preserves the original activation
+// queue during heavy loading. T/bind are parameterized only so the owning test
+// can hold this actual ordering with the maintained private socket fixture.
+pub(crate) fn prepare_with_activation<T>(
+    canceled: &AtomicBool,
+    bind: impl FnOnce(
+        async_channel::Sender<instance::UiActivation>,
+    ) -> io::Result<instance::UiActivationListener>,
+    prepare: impl FnOnce() -> Result<T, StartupFailure>,
+) -> Result<
+    (
+        T,
+        instance::UiActivationListener,
+        async_channel::Receiver<instance::UiActivation>,
+    ),
+    StartupFailure,
+> {
+    checkpoint(canceled)?;
+    let (sender, receiver) = async_channel::unbounded();
+    let activation = bind(sender)?;
+    let startup = prepare()?;
+    // On cancellation/error, startup (and its writer) drops before activation;
+    // the outer worker still retains the original lease/device owners.
+    checkpoint(canceled)?;
+    Ok((startup, activation, receiver))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
