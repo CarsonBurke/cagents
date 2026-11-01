@@ -15309,6 +15309,11 @@ impl Application for Cagents {
                         tasks.push(repository_task(runtime.reconcile_operation_recovery(*card)));
                     }
                 }
+                // Recovery can release a clean editor's last close barrier
+                // without producing another repository event.
+                if !self.project_ui.closing.is_empty() {
+                    tasks.push(self.complete_closed_projects());
+                }
                 Task::batch(tasks)
             }
             Message::Repository(action) => {
