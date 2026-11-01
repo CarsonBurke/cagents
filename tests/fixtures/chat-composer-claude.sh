@@ -26,6 +26,19 @@ done
 # daemon restart. Mirror that contract rather than emitting an ephemeral stream.
 umask 077
 config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+task_scene=
+task_scene_file=$config/fixture-agent-task-receipt.json
+if [ -e "$task_scene_file" ] || [ -L "$task_scene_file" ]; then
+    if [ ! -f "$task_scene_file" ] || [ -L "$task_scene_file" ] ||
+        ! task_scene=$(jq -ers 'select(length == 1) | .[0]
+            | select(type == "object" and keys == ["situation", "status"])
+            | select(.situation == "text" or .situation == "task-only")
+            | select(.status == "completed" or .status == "failed")
+            | .situation + "-" + .status' "$task_scene_file" 2>/dev/null); then
+        printf '%s\n' 'Invalid fixture-agent-task-receipt.json' >&2
+        exit 2
+    fi
+fi
 project=$(pwd -P | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
 history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"
@@ -51,6 +64,28 @@ emit_record() {
     persist_record "$1"
     printf '%s\n' "$1"
 }
+
+# A fixed live receipt precedes its launch acknowledgement, without a timer.
+# The main result ends the turn; only the receipt/ACK can settle its Agent.
+task_receipt_turn() {
+    agent_tool=fixture-agent-tool-$turn
+    agent_task=fixture-agent-task-$turn
+    agent_status=${task_scene##*-}
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" '{type:"assistant",uuid:("fixture-agent-launch-"+$turn),message:{id:("fixture-agent-launch-"+$turn),role:"assistant",content:[{type:"tool_use",id:$tool,name:"Agent",input:{description:"Check receipt settlement",run_in_background:true}}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" '{type:"system",subtype:"task_started",uuid:("fixture-agent-start-"+$turn),task_id:$task,tool_use_id:$tool,task_type:"local_agent",description:"Check receipt settlement"}')"
+    case $task_scene in
+        text-*)
+            emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" --arg status "$agent_status" '{type:"user",uuid:("fixture-agent-notice-"+$turn),origin:{kind:"task-notification"},message:{role:"user",content:("<task-notification>\n<task-id>"+$task+"</task-id>\n<tool-use-id>"+$tool+"</tool-use-id>\n<status>"+$status+"</status>\n<summary>Offline Agent task "+$status+"</summary>\n<result>Offline report.</result>\n</task-notification>")}}')"
+            ;;
+        task-only-*)
+            emit_record "$(jq -cn --arg turn "$turn" --arg task "$agent_task" --arg status "$agent_status" '{type:"system",subtype:"task_notification",uuid:("fixture-agent-notice-"+$turn),task_id:$task,status:$status,summary:("Offline Agent task "+$status)}')"
+            ;;
+    esac
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" '{type:"user",uuid:("fixture-agent-ack-"+$turn),tool_use_result:{status:"async_launched",agentId:$task},message:{role:"user",content:[{type:"tool_result",tool_use_id:$tool,content:"Launched"}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("fixture-agent-answer-"+$turn),message:{id:("fixture-agent-answer-"+$turn),role:"assistant",content:[{type:"text",text:"The offline task receipt has arrived."}]}}')"
+    emit_record "$(jq -cn --arg session "$session" --arg turn "$turn" '{type:"result",uuid:("fixture-agent-result-"+$turn),subtype:"success",is_error:false,session_id:$session}')"
+}
+
 verbosity_turn() {
     input=$(jq -cn '{path:"src/app.rs",prompt:("Internal skill and protocol framing.\n" * 80)}')
     first=$(printf '%s' "$input" | jq -Rs '.[0:30]')
@@ -141,6 +176,11 @@ while IFS= read -r frame; do
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
                 jq -cn --arg session "$session" --arg model "$model" \
                     '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
+                if [ -n "$task_scene" ]; then
+                    task_receipt_turn
+                    busy=false
+                    continue
+                fi
                 # Optional provider failure for a prompt with an image, settled
                 # before any reply as an expired login does.
                 if [ -s "$config/fixture-image-prompt-error" ] &&
