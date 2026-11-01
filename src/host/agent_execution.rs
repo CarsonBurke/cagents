@@ -1397,14 +1397,17 @@ fn console(
 }
 
 /// One console line per transcript item. The console is a plain-text view a
-/// person reads, so it shows what the agent said and a one-line account of
-/// each step; command output, tool payloads and delivered reports stay in the
-/// native chat view, which discloses them on demand. A step appears once it
-/// settles: the client prints only what extends the text it already printed,
-/// and a step changing from running to finished in place would make it print
-/// the whole transcript again.
+/// person reads, so it shows what the agent said, what it was sent, and a
+/// one-line account of each step, named as the native chat view names it.
+/// Command output, tool payloads and delivered reports stay in that view,
+/// which discloses them on demand.
+///
+/// A step appears once it settles. The client prints only text that extends
+/// what it already printed, so a step rewritten in place from running to
+/// finished made it print the whole transcript again. Steps that settle out of
+/// order, such as parallel tool calls, still do.
 fn console_line(item: &chat::Item) -> Option<String> {
-    use chat::{CommandAction, ItemContent, ToolStatus};
+    use chat::{ChangeKind, CommandAction, DeliveryKind, ItemContent, ToolStatus};
     if item.content.status() == Some(ToolStatus::Running) {
         return None;
     }
@@ -1414,12 +1417,14 @@ fn console_line(item: &chat::Item) -> Option<String> {
         ToolStatus::Denied => " (denied)",
         ToolStatus::Stopped => " (stopped)",
     };
-    Some(match &item.content {
+    let first_line = |text: &str| text.trim().lines().next().unwrap_or_default().to_owned();
+    let line = match &item.content {
         ItemContent::Text {
             text,
             thinking: false,
             ..
-        } => format!("{:?}: {text}\n", item.role),
+        } => return Some(format!("{:?}: {text}\n", item.role)),
+        ItemContent::Text { .. } => return None,
         ItemContent::Command {
             label,
             command,
@@ -1428,39 +1433,65 @@ fn console_line(item: &chat::Item) -> Option<String> {
             exit_code,
             ..
         } => {
-            let verb = match action {
-                CommandAction::Run => "Ran",
-                CommandAction::Read => "Read",
-                CommandAction::Search => "Searched",
-                CommandAction::List => "Listed",
+            let (verb, stored) = match action {
+                CommandAction::Run => ("Ran", None),
+                CommandAction::Read => ("Read", Some("Read ")),
+                CommandAction::Search => ("Searched", Some("Search ")),
+                CommandAction::List => ("Listed", Some("List ")),
             };
-            let target = if label.trim().is_empty() {
-                command.trim()
-            } else {
-                label.trim()
-            };
-            let target = target.lines().next().unwrap_or_default();
+            let label = label.trim();
+            // Transcripts stored before adapters dropped the verb from the
+            // label still carry it, as the native view also allows for.
+            let label = stored
+                .and_then(|verb| label.strip_prefix(verb))
+                .filter(|target| !target.is_empty())
+                .unwrap_or(label);
+            let target = first_line(if label.is_empty() { command } else { label });
             let exit = match (status, exit_code) {
                 (ToolStatus::Failed, Some(code)) => format!(" (failed, exit {code})"),
                 _ => outcome(status).to_owned(),
             };
-            format!("{verb} {target}{exit}\n")
+            format!("{verb} {target}").trim_end().to_owned() + &exit
         }
         ItemContent::Changes { changes, status } => match changes.as_slice() {
             [] => return None,
-            [single] => format!("Edited {}{}\n", single.path, outcome(status)),
-            many => format!("Edited {} files{}\n", many.len(), outcome(status)),
+            [single] => {
+                let verb = match single.kind {
+                    ChangeKind::Added => "Added",
+                    ChangeKind::Deleted => "Deleted",
+                    ChangeKind::Updated => "Edited",
+                    ChangeKind::Renamed { .. } => "Renamed",
+                };
+                format!("{verb} {}{}", single.path, outcome(status))
+            }
+            many => format!("Edited {} files{}", many.len(), outcome(status)),
         },
-        ItemContent::Tool { name, status, .. } => format!("Called {name}{}\n", outcome(status)),
+        ItemContent::WebSearch { query, .. } => {
+            format!("Searched the web for {}", first_line(query))
+        }
+        ItemContent::Tool { name, status, .. } => format!("Called {name}{}", outcome(status)),
+        ItemContent::Image { description, .. } => format!("Viewed {}", first_line(description))
+            .trim_end()
+            .to_owned(),
         ItemContent::Delivery {
             kind,
             from,
             sender,
             summary,
-            ..
-        } => format!("{}\n", chat::delivery_heading(*kind, from, sender, summary)),
-        _ => return None,
-    })
+            body,
+        } => {
+            let heading = chat::delivery_heading(*kind, from, sender, summary);
+            // A message from another session is what the agent is asked to
+            // act on, so it stays readable. Reports and notices are payload.
+            match kind {
+                DeliveryKind::Message if !body.trim().is_empty() => {
+                    format!("{heading}:\n{}", body.trim_end())
+                }
+                _ => heading,
+            }
+        }
+    };
+    Some(line + "\n")
 }
 
 #[cfg(test)]

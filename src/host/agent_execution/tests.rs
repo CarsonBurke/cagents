@@ -4446,7 +4446,9 @@ fn execution_gates_keep_existing_callers_after_successful_close() {
 
 #[test]
 fn console_lines_summarize_steps_without_their_payloads() {
-    use chat::{CommandAction, DeliveryKind, Item, ItemContent, Role, ToolStatus};
+    use chat::{
+        ChangeKind, CommandAction, DeliveryKind, FileChange, Item, ItemContent, Role, ToolStatus,
+    };
     let item = |role, content| Item {
         started_at: None,
         id: "item".into(),
@@ -4454,14 +4456,14 @@ fn console_lines_summarize_steps_without_their_payloads() {
         content,
         at: None,
     };
-    let command = |label: &str, status, exit_code| {
+    let command = |action, label: &str, status, exit_code| {
         item(
             Role::Assistant,
             ItemContent::Command {
                 label: label.into(),
                 command: "cargo test --locked\nexit 0".into(),
                 working_directory: "/repo".into(),
-                action: CommandAction::Run,
+                action,
                 status,
                 exit_code,
                 duration_ms: None,
@@ -4480,7 +4482,33 @@ fn console_lines_summarize_steps_without_their_payloads() {
             },
         )
     };
-    let lines = [
+    let change = |path: &str, kind| FileChange {
+        path: path.into(),
+        kind,
+        diff: "+SECRET_DIFF".into(),
+    };
+    let changes = |changes| {
+        item(
+            Role::Assistant,
+            ItemContent::Changes {
+                changes,
+                status: ToolStatus::Succeeded,
+            },
+        )
+    };
+    let delivery = |kind, body: &str| {
+        item(
+            Role::User,
+            ItemContent::Delivery {
+                kind,
+                from: "Explore".into(),
+                sender: "task".into(),
+                summary: "Mapped the console".into(),
+                body: body.into(),
+            },
+        )
+    };
+    let items = [
         item(
             Role::Assistant,
             ItemContent::Text {
@@ -4497,41 +4525,92 @@ fn console_lines_summarize_steps_without_their_payloads() {
                 phase: Default::default(),
             },
         ),
-        command("", ToolStatus::Succeeded, Some(0)),
-        command("Run the tests", ToolStatus::Failed, Some(101)),
-        command("Run the tests", ToolStatus::Running, None),
+        command(CommandAction::Run, " \n", ToolStatus::Succeeded, Some(0)),
+        command(
+            CommandAction::Run,
+            "Run the tests",
+            ToolStatus::Failed,
+            Some(101),
+        ),
+        command(
+            CommandAction::Run,
+            "Run the tests",
+            ToolStatus::Running,
+            None,
+        ),
+        command(
+            CommandAction::Read,
+            "Read src/app.rs",
+            ToolStatus::Succeeded,
+            None,
+        ),
         tool(ToolStatus::Succeeded),
         tool(ToolStatus::Denied),
         tool(ToolStatus::Running),
-        item(
-            Role::User,
-            ItemContent::Delivery {
-                kind: DeliveryKind::Report,
-                from: "Explore".into(),
-                sender: "task".into(),
-                summary: "Mapped the console".into(),
-                body: "FULL_REPORT_BODY".into(),
-            },
-        ),
-    ]
-    .iter()
-    .filter_map(console_line)
-    .collect::<String>();
-    assert!(lines.starts_with(
-        "Assistant: Done.\n\
-         Ran cargo test --locked\n\
-         Ran Run the tests (failed, exit 101)\n\
-         Called Agent\n\
-         Called Agent (denied)\n"
-    ));
+        changes(vec![]),
+        changes(vec![change("src/new.rs", ChangeKind::Added)]),
+        changes(vec![
+            change("a.rs", ChangeKind::Updated),
+            change("b.rs", ChangeKind::Deleted),
+        ]),
+        delivery(DeliveryKind::Report, "FULL_REPORT_BODY"),
+        delivery(DeliveryKind::Message, "Please rerun the build.\n"),
+    ];
+    let lines = items.iter().filter_map(console_line).collect::<String>();
+    let report = chat::delivery_heading(
+        DeliveryKind::Report,
+        "Explore",
+        "task",
+        "Mapped the console",
+    );
+    let message = chat::delivery_heading(
+        DeliveryKind::Message,
+        "Explore",
+        "task",
+        "Mapped the console",
+    );
+    assert_eq!(
+        lines,
+        format!(
+            "Assistant: Done.\n\
+             Ran cargo test --locked\n\
+             Ran Run the tests (failed, exit 101)\n\
+             Read src/app.rs\n\
+             Called Agent\n\
+             Called Agent (denied)\n\
+             Added src/new.rs\n\
+             Edited 2 files\n\
+             {report}\n\
+             {message}:\nPlease rerun the build.\n"
+        )
+    );
     for hidden in [
         "private reasoning",
-        "SECRET_OUTPUT",
+        "SECRET",
         "exit 0",
         "internal",
         "FULL_REPORT_BODY",
     ] {
         assert!(!lines.contains(hidden), "{hidden} leaked into {lines:?}");
     }
-    assert_eq!(lines.lines().count(), 6, "{lines:?}");
+    // Settling the running steps in sequence only appends to what the client
+    // already printed, so it never reprints the transcript.
+    let mut settled = items.to_vec();
+    for item in &mut settled {
+        if let ItemContent::Command { status, .. } | ItemContent::Tool { status, .. } =
+            &mut item.content
+            && *status == ToolStatus::Running
+        {
+            *status = ToolStatus::Succeeded;
+        }
+    }
+    let before = items[..5]
+        .iter()
+        .filter_map(console_line)
+        .collect::<String>();
+    let after = settled[..5]
+        .iter()
+        .filter_map(console_line)
+        .collect::<String>();
+    assert!(after.starts_with(&before) && after.len() > before.len());
 }
