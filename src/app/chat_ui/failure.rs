@@ -37,6 +37,12 @@ pub(super) struct Incident {
     pub anchor: Option<String>,
     pub child_scope: Option<String>,
     pub active_recovery: bool,
+    /// Consecutive prompt attempts this notice stands for: earlier attempts
+    /// that failed the same way, with nothing else in between, fold into it.
+    pub attempts: usize,
+    /// The prompt scope and the cause within it, which `key` combines.
+    scope: String,
+    cause: String,
 }
 
 #[derive(Clone)]
@@ -45,6 +51,8 @@ struct Metadata {
     summary: String,
     guidance: &'static str,
     kind: Option<FailureKind>,
+    scope: String,
+    cause: String,
 }
 
 #[derive(Default)]
@@ -245,14 +253,18 @@ impl State {
         if known_only && parsed.is_none() {
             return None;
         }
-        let (key, summary, guidance, kind) = match parsed {
+        let (key, cause, summary, guidance, kind) = match parsed {
+            // A classified failure recurs as the same cause even when its
+            // text carries a new request ID.
             Some(failure) => (
                 diagnostic_key(failure.key.as_ref()),
+                diagnostic_key(&format!("{:?}\0{}", failure.kind, failure.summary)),
                 failure.summary,
                 failure.action,
                 Some(failure.kind),
             ),
             None => (
+                diagnostic_key(text),
                 diagnostic_key(text),
                 fallback_summary(text),
                 "Review the details before trying again.",
@@ -264,6 +276,8 @@ impl State {
             summary,
             guidance,
             kind,
+            scope: context.to_owned(),
+            cause,
         };
         Some(meta)
     }
@@ -305,6 +319,9 @@ impl State {
                 anchor: None,
                 child_scope: None,
                 active_recovery: false,
+                attempts: 1,
+                scope: meta.scope,
+                cause: meta.cause,
             });
         }
     }
@@ -661,18 +678,22 @@ impl State {
                         .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
                 });
         }
+        // A notice opened before a newer attempt folded into it stays open.
+        let successors = state.fold_repeated_attempts(runtime, &contexts);
+        let current = |key: &String| successors.get(key).unwrap_or(key).clone();
         state.expanded = runtime
             .failure_ui
             .expanded
             .iter()
-            .filter(|key| state.incidents.iter().any(|incident| &incident.key == *key))
-            .cloned()
+            .map(current)
+            .filter(|key| state.incidents.iter().any(|incident| &incident.key == key))
             .collect();
         state.find_expanded = runtime
             .failure_ui
             .find_expanded
-            .intersection(&state.expanded)
-            .cloned()
+            .iter()
+            .map(current)
+            .filter(|key| state.expanded.contains(key))
             .collect();
         let mut hash = std::hash::DefaultHasher::new();
         for incident in &state.incidents {
@@ -684,6 +705,7 @@ impl State {
                 &incident.anchor,
                 &incident.active_recovery,
                 &incident.child_scope,
+                &incident.attempts,
             )
                 .hash(&mut hash);
             for source in &incident.sources {
@@ -699,6 +721,132 @@ impl State {
             state.previews = runtime.failure_ui.previews.clone();
         }
         state
+    }
+
+    /// Folds runs of consecutive prompt attempts that each ended in nothing
+    /// but the same failure into the run's latest notice, which keeps its
+    /// place, identity and recovery controls and gains the earlier sources.
+    /// Any attempt with other work, another or no failure, or no loaded
+    /// prompt ends a run.
+    fn fold_repeated_attempts(
+        &mut self,
+        runtime: &Runtime,
+        contexts: &HashMap<&str, String>,
+    ) -> HashMap<String, String> {
+        let provider = runtime.session.launch.provider;
+        // Prompts and work in transcript order; one turn can hold several
+        // prompts sent with nothing between them.
+        let mut entries: Vec<(usize, Option<String>)> = runtime
+            .turns
+            .iter()
+            .flat_map(|turn| {
+                turn.prompt.iter().chain(
+                    turn.steps
+                        .iter()
+                        .chain(&turn.prose)
+                        .map(|placed| &placed.index),
+                )
+            })
+            .filter_map(|index| {
+                let item = runtime.snapshot.items.get(*index)?;
+                let typed = item.role == chat::Role::User
+                    && !matches!(item.content, ItemContent::Delivery { .. });
+                Some((
+                    *index,
+                    typed.then(|| {
+                        contexts
+                            .get(item.id.as_str())
+                            .cloned()
+                            .unwrap_or_else(|| prompt_scope(provider, &item.id))
+                    }),
+                ))
+            })
+            .collect();
+        entries.sort_by_key(|(index, _)| *index);
+        let mut attempts: Vec<(String, Vec<&str>)> = Vec::new();
+        for (index, scope) in entries {
+            match scope {
+                // The parts of one message are one attempt.
+                Some(scope) if attempts.last().is_some_and(|(last, _)| *last == scope) => {}
+                Some(scope) => attempts.push((scope, Vec::new())),
+                None => {
+                    if let Some((_, work)) = attempts.last_mut() {
+                        work.push(runtime.snapshot.items[index].id.as_str());
+                    }
+                }
+            }
+        }
+        // The one incident each attempt amounts to, if it is only a failure.
+        let failed: Vec<Option<usize>> = attempts
+            .iter()
+            .map(|(scope, work)| {
+                let mut owned = self.incidents.iter().enumerate().filter(|(_, incident)| {
+                    &incident.scope == scope
+                        && incident.child_scope.is_none()
+                        && !incident.sources.iter().any(|source| {
+                            matches!(source, Source::ChildDetail(_) | Source::ChildItem(..))
+                        })
+                });
+                let (index, incident) = owned.next()?;
+                // An interruption stops a turn rather than failing it.
+                (incident.kind != Some(FailureKind::Interrupted)
+                    && owned.next().is_none()
+                    && work.iter().all(|id| {
+                        incident
+                            .sources
+                            .iter()
+                            .any(|source| matches!(source, Source::Item(item) if item == id))
+                    }))
+                .then_some(index)
+            })
+            .collect();
+        let mut failed = failed;
+        failed.dedup_by(|next, previous| next.is_some() && next == previous);
+        // An incident that stands for attempts apart from each other, such as
+        // a message whose parts another prompt separates, ends any run.
+        for index in failed.clone().into_iter().flatten() {
+            if failed.iter().filter(|other| **other == Some(index)).count() > 1 {
+                for other in failed.iter_mut().filter(|other| **other == Some(index)) {
+                    *other = None;
+                }
+            }
+        }
+        let mut folded = Vec::new();
+        let mut successors = HashMap::new();
+        let mut run: Vec<usize> = Vec::new();
+        for index in failed.into_iter().chain([None]) {
+            let continues = index.is_some_and(|index| {
+                run.last()
+                    .is_none_or(|last| self.incidents[*last].cause == self.incidents[index].cause)
+            });
+            if !continues {
+                if let Some((latest, earlier)) = run.split_last()
+                    && !earlier.is_empty()
+                {
+                    let mut sources: Vec<Source> = earlier
+                        .iter()
+                        .flat_map(|index| self.incidents[*index].sources.clone())
+                        .collect();
+                    let survivor = self.incidents[*latest].key.clone();
+                    for index in earlier {
+                        successors.insert(self.incidents[*index].key.clone(), survivor.clone());
+                    }
+                    let latest = &mut self.incidents[*latest];
+                    sources.append(&mut latest.sources);
+                    latest.sources = sources;
+                    latest.attempts = run.len();
+                    folded.extend_from_slice(earlier);
+                }
+                run.clear();
+            }
+            run.extend(index);
+        }
+        let mut position = 0;
+        self.incidents.retain(|_| {
+            position += 1;
+            !folded.contains(&(position - 1))
+        });
+        successors
     }
 
     pub fn child_item(&self, child: &str, id: &str) -> Option<(&Incident, bool)> {
@@ -970,6 +1118,16 @@ impl Runtime {
         let target = self.target;
         let open = self.failure_ui.expanded.contains(&incident.key);
         let mut rows = Vec::new();
+        if incident.attempts > 1 {
+            rows.push(
+                design::caption(format!(
+                    "Failed the same way {} times in a row.",
+                    incident.attempts
+                ))
+                .width(Length::Fill)
+                .into(),
+            );
+        }
         rows.push(
             widget::row::with_children(vec![
                 crate::ui_controls::button::quiet(if open { "Hide details" } else { "Details" })
@@ -1184,6 +1342,221 @@ mod tests {
             runtime.refresh();
             assert_eq!(runtime.failure_ui.revision, revision);
         }
+    }
+
+    /// The notices a transcript of prompts and outcomes shows, oldest first:
+    /// the attempts each stands for and the turn it is drawn after.
+    fn notices(items: Vec<chat::Item>) -> Vec<(usize, Option<String>)> {
+        let (runtime, _) = live_fixture(Provider::Claude, items);
+        runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .map(|incident| (incident.attempts, incident.anchor.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn consecutive_attempts_failing_the_same_way_show_one_notice() {
+        let provider = Provider::Claude;
+        let expired = "Failed to authenticate: OAuth session expired and could not be refreshed";
+        let (runtime, _) = live_fixture(
+            provider,
+            vec![
+                text("p1", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e1", expired),
+                text("p2", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e2", expired),
+                text("p3", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e3", expired),
+            ],
+        );
+        let [incident] = &runtime.failure_ui.incidents[..] else {
+            panic!("{} notices", runtime.failure_ui.incidents.len());
+        };
+        assert_eq!(incident.attempts, 3);
+        assert_eq!(incident.anchor.as_deref(), Some("p3"));
+        assert_eq!(incident.first_item.as_deref(), Some("e3"));
+        for id in ["e1", "e2", "e3"] {
+            assert_eq!(
+                runtime.failure_ui.item(id).map(|found| &found.key),
+                Some(&incident.key),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            runtime.failure_details(&incident.key).as_deref(),
+            Some(expired)
+        );
+    }
+
+    #[test]
+    fn a_recurring_failure_folds_across_new_request_ids_and_keeps_each_text() {
+        let provider = Provider::Codex;
+        let first =
+            "Your access token could not be refreshed. Please sign in again.\nrequest-id: aaa";
+        let second =
+            "Your access token could not be refreshed. Please sign in again.\nrequest-id: bbb";
+        let (runtime, _) = live_fixture(
+            provider,
+            vec![
+                text("p1", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e1", first),
+                text("p2", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e2", second),
+            ],
+        );
+        let [incident] = &runtime.failure_ui.incidents[..] else {
+            panic!("{} notices", runtime.failure_ui.incidents.len());
+        };
+        assert_eq!(incident.attempts, 2);
+        assert_eq!(
+            runtime.failure_details(&incident.key),
+            Some(format!("{first}\n\n---\n\n{second}"))
+        );
+    }
+
+    #[test]
+    fn an_opened_notice_stays_open_when_the_next_attempt_folds_into_it() {
+        let provider = Provider::Claude;
+        let expired = "Failed to authenticate: OAuth session expired and could not be refreshed";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text("p1", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e1", expired),
+                text("p2", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e2", expired),
+            ],
+        );
+        let opened = runtime.failure_ui.incidents[0].key.clone();
+        runtime.failure_ui.expanded.insert(opened.clone());
+        publish(&mut runtime, &handle, |next| {
+            next.items
+                .push(Arc::new(text("p3", chat::Role::User, "Fix the build")));
+            next.items
+                .push(Arc::new(provider_error(provider, "e3", expired)));
+        });
+        let [incident] = &runtime.failure_ui.incidents[..] else {
+            panic!("{} notices", runtime.failure_ui.incidents.len());
+        };
+        assert_ne!(incident.key, opened);
+        assert_eq!(incident.attempts, 3);
+        assert_eq!(
+            runtime.failure_ui.expanded,
+            HashSet::from([incident.key.clone()])
+        );
+    }
+
+    #[test]
+    fn retrying_an_expired_sign_in_keeps_one_notice_with_the_latest_recovery() {
+        let provider = Provider::Codex;
+        let expired = "Your access token could not be refreshed. Please sign in again.";
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![text("p1", chat::Role::User, "Fix the build")],
+        );
+        publish_error(&mut runtime, &handle, expired);
+        publish(&mut runtime, &handle, |next| {
+            next.error = None;
+            next.items
+                .push(Arc::new(text("p2", chat::Role::User, "Fix the build")));
+        });
+        publish_error(&mut runtime, &handle, expired);
+        assert_eq!(runtime.failures.len(), 2, "each attempt keeps its own note");
+        let [incident] = &runtime.failure_ui.incidents[..] else {
+            panic!("{} notices", runtime.failure_ui.incidents.len());
+        };
+        assert_eq!(
+            (
+                incident.attempts,
+                incident.anchor.as_deref(),
+                incident.active_recovery
+            ),
+            (2, Some("p1"), true)
+        );
+    }
+
+    #[test]
+    fn other_work_or_another_failure_between_attempts_keeps_notices_apart() {
+        let provider = Provider::Claude;
+        let expired = "Failed to authenticate: OAuth session expired and could not be refreshed";
+        let overloaded = "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}";
+        let prompt = |id: &str| text(id, chat::Role::User, "Fix the build");
+        // A reply between two failures.
+        assert_eq!(
+            notices(vec![
+                prompt("p1"),
+                provider_error(provider, "e1", expired),
+                prompt("p2"),
+                text("r2", chat::Role::Assistant, "Done."),
+                prompt("p3"),
+                provider_error(provider, "e3", expired),
+                prompt("p4"),
+                provider_error(provider, "e4", expired),
+            ]),
+            [(1, Some("p1".into())), (2, Some("p4".into()))]
+        );
+        // Different failures, then the first again.
+        assert_eq!(
+            notices(vec![
+                prompt("p1"),
+                provider_error(provider, "e1", expired),
+                prompt("p2"),
+                provider_error(provider, "e2", overloaded),
+                prompt("p3"),
+                provider_error(provider, "e3", expired),
+            ]),
+            [
+                (1, Some("p1".into())),
+                (1, Some("p2".into())),
+                (1, Some("p3".into()))
+            ]
+        );
+        // Interrupted turns.
+        let interrupted = "API Error: Request was interrupted";
+        assert_eq!(
+            notices(vec![
+                prompt("p1"),
+                provider_error(provider, "e1", interrupted),
+                prompt("p2"),
+                provider_error(provider, "e2", interrupted),
+            ]),
+            [(1, Some("p1".into())), (1, Some("p2".into()))]
+        );
+        // Unclassified failures that read differently.
+        assert_eq!(
+            notices(vec![
+                prompt("p1"),
+                provider_error(provider, "e1", "Opaque provider failure one"),
+                prompt("p2"),
+                provider_error(provider, "e2", "Opaque provider failure two"),
+            ]),
+            [(1, Some("p1".into())), (1, Some("p2".into()))]
+        );
+        // One message's failure on both sides of another prompt's.
+        assert_eq!(
+            notices(vec![
+                text("m1:0", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e1", expired),
+                prompt("p2"),
+                provider_error(provider, "e2", expired),
+                text("m1:1", chat::Role::User, "Fix the build"),
+                provider_error(provider, "e3", expired),
+            ]),
+            [(1, Some("m1:0".into())), (1, Some("p2".into()))]
+        );
+        // Work the failing attempt did before it failed.
+        assert_eq!(
+            notices(vec![
+                prompt("p1"),
+                provider_error(provider, "e1", expired),
+                prompt("p2"),
+                tool("t2"),
+                provider_error(provider, "e2", expired),
+            ]),
+            [(1, Some("p1".into())), (1, Some("p2".into()))]
+        );
     }
 
     #[test]
@@ -1485,7 +1858,16 @@ mod tests {
             ],
         );
         publish_error(&mut runtime, &handle, raw);
-        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+        // Two attempts, each its own scope, folded into one notice.
+        assert_eq!(
+            runtime
+                .failure_ui
+                .incidents
+                .iter()
+                .map(|incident| incident.attempts)
+                .collect::<Vec<_>>(),
+            [2]
+        );
 
         // Child failures reporting the same body after the multipart prompt
         // stay scoped to each child rather than merging into the parent.
@@ -1553,7 +1935,16 @@ mod tests {
                 provider_error(provider, "error-message:0", raw),
             ],
         );
-        assert_eq!(runtime.failure_ui.incidents.len(), 2);
+        // Aliased scopes would make one attempt of both failures.
+        assert_eq!(
+            runtime
+                .failure_ui
+                .incidents
+                .iter()
+                .map(|incident| incident.attempts)
+                .collect::<Vec<_>>(),
+            [2]
+        );
     }
 
     #[test]
@@ -1588,7 +1979,8 @@ mod tests {
                 Some(runtime.turns[0].key.as_str())
             );
 
-            // A later message reporting the same diagnostic is a new incident.
+            // A later message failing the same way next is its own attempt,
+            // folded into the same notice.
             publish(&mut runtime, &handle, |next| {
                 next.error = None;
                 next.items.push(Arc::new(text(
@@ -1600,7 +1992,15 @@ mod tests {
             });
             publish_error(&mut runtime, &handle, raw);
             assert_eq!(runtime.failures.len(), 2);
-            assert_eq!(runtime.failure_ui.incidents.len(), 2);
+            let [incident] = &runtime.failure_ui.incidents[..] else {
+                panic!(
+                    "{} notices: {provider:?}",
+                    runtime.failure_ui.incidents.len()
+                );
+            };
+            assert_eq!(incident.attempts, 2, "{provider:?}");
+            assert!(incident.sources.contains(&Source::Note(0)));
+            assert!(incident.sources.contains(&Source::Note(1)));
         }
     }
 
