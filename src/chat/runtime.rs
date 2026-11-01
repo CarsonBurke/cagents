@@ -1698,10 +1698,11 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     if stop.load(Ordering::Acquire) {
         return Err("Provider startup was cancelled before process creation".into());
     }
-    let child = process
-        .spawn()
+    // A retained actor sweeps its unregistered exited children; this
+    // registration keeps the provider's status for its ChildGuard.
+    let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(&mut process)
         .map_err(|e| format!("Cannot start {}: {e}", spec.program))?;
-    let mut child = ChildGuard::new(child)
+    let mut child = ChildGuard::new(child, registration)
         .map_err(|e| format!("Cannot retain {} process identity: {e}", spec.program))?;
     child.directory = Some(directory);
     // Scope enrollment happens before this child is handed to the actor and
@@ -1722,6 +1723,8 @@ struct ChildGuard {
     identity: OwnedFd,
     terminated: bool,
     directory: Option<Arc<std::fs::File>>,
+    // Dropped after `Drop::drop` has run the final reap in `terminate`.
+    _registration: crate::daemon::adopted_orphans::Registration,
 }
 impl ChildGuard {
     /// Wait on the original child capability without reaping it or releasing
@@ -1764,7 +1767,10 @@ impl ChildGuard {
     }
 
     /// Capture immediately after spawn, before any code can reap this child.
-    fn new(mut child: Child) -> std::io::Result<Self> {
+    fn new(
+        mut child: Child,
+        registration: crate::daemon::adopted_orphans::Registration,
+    ) -> std::io::Result<Self> {
         // SAFETY: pidfd_open obtains a capability for our freshly spawned,
         // unreaped child. Its PID remains reserved even if it has exited.
         let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id(), 0) };
@@ -1804,7 +1810,15 @@ impl ChildGuard {
             identity,
             terminated: false,
             directory: None,
+            _registration: registration,
         })
+    }
+
+    /// Test fixtures spawn through the same ownership registration.
+    #[cfg(test)]
+    fn spawn(command: &mut Process) -> Self {
+        let (child, registration) = crate::daemon::adopted_orphans::spawn_owned(command).unwrap();
+        Self::new(child, registration).unwrap()
     }
 
     fn observed_exit_status(&self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -7333,7 +7347,7 @@ mod tests {
                 Ok(())
             });
         }
-        let mut provider = ChildGuard::new(original.spawn().unwrap()).unwrap();
+        let mut provider = ChildGuard::spawn(&mut original);
         let pid = provider.child.id();
         assert_eq!(pid, 200);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -7464,18 +7478,17 @@ mod tests {
         for already_reaped in [false, true] {
             use std::io::{BufRead, BufReader};
             let script = "import os,signal,sys,time\npid=os.fork()\nif pid==0:\n signal.signal(signal.SIGTERM,signal.SIG_DFL if sys.argv[1]=='default' else signal.SIG_IGN)\n print(os.getpid(),flush=True)\n time.sleep(30)\n os._exit(0)\nsys.stdin.readline()\nos._exit(7)\n";
-            let child = Process::new("/usr/bin/python3")
-                .args([
-                    "-c",
-                    script,
-                    if already_reaped { "default" } else { "ignore" },
-                ])
-                .process_group(0)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let mut provider = ChildGuard::new(child).unwrap();
+            let mut provider = ChildGuard::spawn(
+                Process::new("/usr/bin/python3")
+                    .args([
+                        "-c",
+                        script,
+                        if already_reaped { "default" } else { "ignore" },
+                    ])
+                    .process_group(0)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped()),
+            );
             let mut line = String::new();
             BufReader::new(provider.child.stdout.take().unwrap())
                 .read_line(&mut line)
@@ -7631,12 +7644,11 @@ mod tests {
     #[test]
     fn direct_provider_non_reaping_observation_preserves_exit_status() {
         for script in ["exit 7", "kill -TERM $$"] {
-            let child = Process::new("/bin/sh")
-                .args(["-c", script])
-                .process_group(0)
-                .spawn()
-                .unwrap();
-            let mut provider = ChildGuard::new(child).unwrap();
+            let mut provider = ChildGuard::spawn(
+                Process::new("/bin/sh")
+                    .args(["-c", script])
+                    .process_group(0),
+            );
             let deadline = Instant::now() + Duration::from_secs(5);
             let observed = loop {
                 if let Some(status) = provider.observed_exit_status().unwrap() {
