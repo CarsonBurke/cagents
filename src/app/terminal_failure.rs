@@ -56,8 +56,22 @@ pub(super) struct Details {
     exit: Option<crate::model::TerminalExit>,
     consequence: &'static str,
 }
+/// The daemon answered and does not host this terminal, as after a restart.
+/// Reattaching cannot work, so the failure must not promise it.
+pub(super) const TERMINAL_NOT_HOSTED: &str = "the daemon no longer hosts this shared terminal";
+pub(super) fn runtime_error_code(message: &str, default: &'static str) -> &'static str {
+    if message == TERMINAL_NOT_HOSTED {
+        "terminal_not_hosted"
+    } else {
+        default
+    }
+}
 fn known_failure(code: &str) -> (&'static str, &'static str) {
     match code {
+        "terminal_not_hosted" => (
+            "terminal_not_hosted",
+            "This terminal is no longer running.",
+        ),
         "start_failed" => ("start_failed", "The terminal could not be started."),
         "runtime_hydration_failed" => (
             "runtime_hydration_failed",
@@ -117,7 +131,7 @@ impl Details {
         } else {
             known_failure(typed.unwrap_or(""))
         };
-        let consequence = if session.continuity.live_proof().is_some() {
+        let consequence = if code != "terminal_not_hosted" && session.continuity.live_proof().is_some() {
             "Reconnect to the existing terminal."
         } else if session.agent_resume_recipe().is_some() {
             "Resume the saved conversation in a new terminal."
@@ -847,6 +861,15 @@ mod tests {
         assert_eq!(details.message, "The terminal could not be restored.");
         assert!(!details.copy_text().contains("secret"));
         assert!(details.exit.is_none());
+    }
+    #[test]
+    fn a_terminal_the_daemon_lost_does_not_promise_reconnecting() {
+        let (mut app, card, _) = app_and_session();
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        let details = app.terminal_details(card).unwrap();
+        assert_eq!(details.code, "terminal_not_hosted");
+        assert_eq!(details.message, "This terminal is no longer running.");
+        assert_ne!(details.consequence, "Reconnect to the existing terminal.");
     }
     #[test]
     fn new_failure_on_same_identity_captures_current_typed_state() {
