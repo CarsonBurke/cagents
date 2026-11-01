@@ -50,7 +50,8 @@ scripts/native-fixture stop --owner "$owner" composer --keep
 ```
 
 The checkout must be beneath this repository's `.worktrees/`, so add one with
-`git worktree add` if you work elsewhere. At most two fixtures run at once.
+`git worktree add` if you work elsewhere. At most two fixtures run at once, so a
+before and an after can be live together.
 
 - **Building:** `run-ui` runs `scripts/run-development --browserless` and returns
   while it builds; follow `sandbox/runner.log` and `sandbox/ui.log` under the
@@ -58,16 +59,21 @@ The checkout must be beneath this repository's `.worktrees/`, so add one with
   `.worktrees/native-fixture-targets/`, because sandboxed build scripts can write
   there. The first build of each checkout is cold, and these directories stay
   until you delete them. `cli` is refused until this fixture's runner has built a
-  binary whose Cargo dep-info names this checkout.
+  binary whose Cargo dep-info names this checkout. Only one fixture builds at a
+  time: `run-ui` refuses with `build_busy` while another is building, so run it
+  again once that fixture's `status` says `building` is false.
 - **Viewport:** `start --width` and `viewport --width` set the app's logical width
-  from 320 to 3840, through the nested output's scale. The host lays out the
-  nested window, so its framebuffer and height are not chosen here. `start`,
+  from 320 to 3840, through the nested output's scale, and fit it again before
+  input and screenshots if the host has resized the nested window. The host lays
+  out that window, so its framebuffer and height are not chosen here. `start`,
   `viewport` and `screenshot` report what was reached, and `matches` is false when
-  the width could not be. Compare those values across a before/after pair, and
-  keep the host window the same size between them.
+  the width could not be, such as a narrow width on a small nested window. Compare
+  those values across a before/after pair, and keep the host window the same size
+  between them.
 - **Screenshots** land in `shots/` under the root as PNG; convert them to WebP for
   a PR.
-- **Stopping:** `stop` removes the fixture directory unless given `--keep`. A kept
+- **Stopping:** `stop` removes the fixture directory unless given `--keep`, and
+  lists under `left_behind` anything it could not remove. A kept
   directory, or one left by a killed broker, blocks a new `start` of that name
   until `scripts/native-fixture clear NAME`. A failed `start` frees its name
   itself. If the broker is killed outright, its sandboxes die with it, but its
@@ -95,7 +101,9 @@ or `$XDG_RUNTIME_DIR/cagents*`. `claude` there is this fixture script.
 - **Limits:** per-process address space (128 GiB) and file size (32 GiB), 8192
   processes, and no core files. Total memory is not capped, because that needs a
   cgroup, which this does not set up. Several fixtures building at once can still
-  exhaust the host's memory.
+  exhaust the host's memory. `run-ui` learns a build has finished from a line in
+  a log the sandbox can write, so sandbox code can hold other fixtures' builds
+  back until its own fixture is stopped.
 
 On the host side only the broker, `niri-harness` and `niri` run. Nested niri runs
 nothing from a checkout. Commands reach the sandbox over an inherited socket, not

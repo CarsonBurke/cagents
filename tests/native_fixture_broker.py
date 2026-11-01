@@ -435,13 +435,59 @@ class HeldPaths(TemporaryRepository):
         self.assertFalse(fixture.exists())
         self.assertEqual((victim / "keep").read_text(), "keep")
 
-    def test_reading_refuses_links_and_fifos_without_blocking(self):
-        (self.base / "real").write_text("data")
-        (self.base / "link").symlink_to(self.base / "real")
+    def test_reading_refuses_links_at_every_level(self):
+        (self.base / "real").mkdir()
+        (self.base / "real/file").write_text("data")
+        (self.base / "real/link").symlink_to(self.base / "real/file")
+        (self.base / "linked").symlink_to(self.base / "real")
+        self.assertEqual(broker.read_regular(self.base, ("real",), "file", 2), b"da")
+        self.assertIsNone(broker.read_regular(self.base, ("real",), "link", 10))
+        self.assertIsNone(broker.read_regular(self.base, ("linked",), "file", 10))
+        self.assertIsNone(broker.read_regular(self.base, ("absent",), "file", 10))
+
+    def test_reading_a_fifo_is_refused_within_a_time_limit(self):
         os.mkfifo(self.base / "fifo")
-        self.assertEqual(broker.read_regular(self.base / "real", 2), b"da")
-        self.assertIsNone(broker.read_regular(self.base / "link", 10))
-        self.assertIsNone(broker.read_regular(self.base / "fifo", 10))
+        result = []
+        thread = threading.Thread(
+            target=lambda: result.append(broker.read_regular(self.base, (), "fifo", 10)), daemon=True,
+        )
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "reading a FIFO must not block the broker")
+        self.assertEqual(result, [None])
+
+    def trap(self, root, victim):
+        """What sandbox code can leave: revoked modes, nested, around a planted link."""
+        (root / "trap/deeper").mkdir(parents=True)
+        (root / "trap/deeper/file").write_text("x")
+        (root / "trap/deeper/link").symlink_to(victim)
+        (root / "trap/deeper").chmod(0)
+        (root / "trap").chmod(0)
+
+    def test_removal_repairs_revoked_modes_without_following_links(self):
+        victim = self.base / "victim"
+        victim.mkdir(mode=0o755)
+        (victim / "keep").write_text("keep")
+        fixture = self.repo / ".worktrees/native-fixture/name"
+        fixture.mkdir(parents=True)
+        self.trap(fixture, victim)
+        fixture.chmod(0)
+        self.assertTrue(broker.remove_beneath(self.repo, (".worktrees", "native-fixture", "name")))
+        self.assertFalse(os.path.lexists(fixture))
+        self.assertEqual((victim / "keep").read_text(), "keep")
+        self.assertEqual(stat.S_IMODE(victim.stat().st_mode), 0o755)
+
+    def test_removal_reports_rather_than_raises_when_it_cannot(self):
+        fixture = self.repo / ".worktrees/native-fixture/name"
+        fixture.mkdir(parents=True)
+        original = broker._remove_entry
+
+        def fails(_parent, _name):
+            raise PermissionError("resisted")
+
+        broker._remove_entry = fails
+        self.addCleanup(setattr, broker, "_remove_entry", original)
+        self.assertFalse(broker.remove_beneath(self.repo, (".worktrees", "native-fixture", "name")))
 
 
 class Relay(unittest.TestCase):
@@ -512,6 +558,7 @@ PROBE = r"""
 import json, os, resource, socket, sys
 spec = json.loads(sys.argv[1])
 def writable(path):
+    # Used for directories only.
     probe = os.path.join(path, ".probe")
     try:
         with open(probe, "w"):
@@ -529,6 +576,7 @@ report = {
     "writable": [path for path in spec["read_only"] if writable(path)],
     "sandbox_writable": writable(spec["sandbox"]),
     "root_writable": writable("/"),
+    "cargo_home_writable": writable(spec["cargo_home"]),
     "capabilities": capabilities,
     "routes": open("/proc/net/route").read().splitlines()[1:],
     "home_entries": sorted(os.listdir(spec["home"])) if os.path.isdir(spec["home"]) else [],
@@ -613,6 +661,7 @@ class Isolation(SandboxCase):
             "sandbox": str(layout.sandbox),
             "abstract": abstract,
             "home": str(layout.host.home),
+            "cargo_home": str(layout.host.cargo_home),
             "wayland": str(layout.nested_wayland),
         }
         binds = broker.hold_binds(layout, directory, "wayland-1")
@@ -676,6 +725,7 @@ class Isolation(SandboxCase):
         self.assertEqual(report["writable"], [])
         self.assertTrue(report["sandbox_writable"])
         self.assertFalse(report["root_writable"], "nothing may be planted at the root")
+        self.assertTrue(report["cargo_home_writable"], "Cargo needs its lock file there")
         self.assertEqual(int(report["capabilities"], 16), 0)
         self.assertEqual(report["routes"], [], "the sandbox must have no route out")
         self.assertFalse(report["abstract_reachable"], "abstract sockets must stay on the host")
@@ -783,13 +833,32 @@ case "$*" in
 esac
 printf '{"driven": true}\n'
 """
-STUB_NIRI = r"""#!/bin/sh
-printf 'NIRI_SOCKET=%s %s\n' "$NIRI_SOCKET" "$*" >> "$STUB_LOG"
-case "$*" in
-  "msg --json outputs") printf '{"Nested": {"logical": {"width": 800, "height": 600, "scale": 2.0}}}\n' ;;
-  "msg --json windows") printf '[]\n' ;;
-  "msg --json focused-window") printf 'null\n' ;;
-esac
+STUB_NIRI = r"""#!/usr/bin/python3 -I
+import json, os, sys, time
+args = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as log:
+    log.write(f"NIRI_SOCKET={os.environ.get('NIRI_SOCKET')} {' '.join(args)}\n")
+state = os.environ["STUB_STATE"]
+def load():
+    try:
+        with open(state) as stream:
+            return json.load(stream)
+    except OSError:
+        return {"physical": 1600, "scale": 1.0, "next": None, "at": 0}
+current = load()
+if current["next"] is not None and time.time() >= current["at"]:
+    current.update(scale=current["next"], next=None)
+if args == ["msg", "--json", "outputs"]:
+    width = round(current["physical"] / current["scale"])
+    print(json.dumps({"Nested": {"logical": {"width": width, "height": 600, "scale": current["scale"]}}}))
+elif args == ["msg", "--json", "windows"]:
+    print("[]")
+elif args == ["msg", "--json", "focused-window"]:
+    print("null")
+elif args[:2] == ["msg", "output"]:
+    current.update(next=float(args[-1]), at=time.time() + float(os.environ.get("STUB_SCALE_DELAY", "0")))
+with open(state, "w") as stream:
+    json.dump(current, stream)
 """
 STUB_RUNNER = r"""#!/bin/sh
 mkdir -p "$CARGO_TARGET_DIR/dev-runtime"
@@ -797,6 +866,9 @@ self=$(dirname "$(dirname "$0")")
 printf '#!/bin/sh\nprintf "stub cli: %%s %%s\\n" "$(pwd)" "$*"\n' > "$CARGO_TARGET_DIR/dev-runtime/cagents"
 chmod +x "$CARGO_TARGET_DIR/dev-runtime/cagents"
 printf '%s: %s/src/main.rs\n' "$CARGO_TARGET_DIR/dev-runtime/cagents" "$self" > "$CARGO_TARGET_DIR/dev-runtime/cagents.d"
+[ -e "$HOME/fail-build" ] && exit 1
+while [ -e "$HOME/hold-build" ]; do /usr/bin/sleep 0.02; done
+printf 'writing UI diagnostics to %s\n' ui.log
 exec /usr/bin/sleep 300
 """
 
@@ -825,7 +897,7 @@ class Lifecycle(SandboxCase):
         self.listen(host.runtime_dir / "wayland-9")
         self.log = self.base / "stub.log"
         self.harness_env = {
-            **os.environ, "STUB_LOG": str(self.log),
+            **os.environ, "STUB_LOG": str(self.log), "STUB_STATE": str(self.base / "niri.json"),
             "STUB_SHOTS": str(host.runtime_dir / broker.PRIVATE_DIR / "demo/niri/shots"),
         }
         self.fixtures = broker.Fixtures(host, self.harness_env)
@@ -895,6 +967,7 @@ class Lifecycle(SandboxCase):
         self.assertTrue(started["viewport"]["matches"])
         log = self.log.read_text()
         self.assertIn("NIRI_SOCKET=/nested.sock msg output Nested scale 2.0", log)
+        self.assertEqual(started["viewport"]["width"], 800)
         self.assertIn("--cmd /usr/bin/true", log, "nested niri must run nothing from a checkout")
         fixture = self.fixtures.live["demo"]
         holder = fixture.holder_pid
@@ -918,11 +991,16 @@ class Lifecycle(SandboxCase):
         self.assertEqual(Path(shot["path"]).read_bytes(), b"image")
         self.assertEqual(Path(shot["path"]).parent, Path(started["shots"]))
         self.assertEqual(shot["viewport"]["width"], 800)
+        self.assertTrue(shot["viewport"]["matches"])
 
         wide = self.call("viewport", fixture="demo", owner=owner, width=1600)
         self.assertEqual(wide["requested_width"], 1600)
-        self.assertFalse(wide["matches"], "a width that was not reached must say so")
+        self.assertTrue(wide["matches"])
         self.assertIn("msg output Nested scale 1.0", self.log.read_text())
+        # 1600 physical pixels cannot reach 320 logical at niri's largest scale of 4.
+        narrow = self.call("viewport", fixture="demo", owner=owner, width=320)
+        self.assertFalse(narrow["matches"], "a width that was not reached must say so")
+        self.assertEqual(narrow["width"], 400)
 
         stopped = self.call("stop", fixture="demo", owner=owner)
         self.assertTrue(stopped["removed"])
@@ -1004,6 +1082,218 @@ class Lifecycle(SandboxCase):
         os.kill(child, signal.SIGKILL)
         os.waitpid(child, 0)
         self.assertTrue(self.await_gone(holder), "the sandbox must not outlive a killed broker")
+
+    def test_the_viewport_is_read_only_after_the_scale_is_applied(self):
+        self.harness_env["STUB_SCALE_DELAY"] = "0.4"
+        started = self.start(width=800)
+        self.assertEqual(started["viewport"]["scale"], 2.0)
+        self.assertTrue(started["viewport"]["matches"], started["viewport"])
+
+    def test_a_scale_that_never_applies_is_reported_within_a_bound(self):
+        original = broker.VIEWPORT_APPLY_SECONDS
+        broker.VIEWPORT_APPLY_SECONDS = 0.2
+        self.addCleanup(setattr, broker, "VIEWPORT_APPLY_SECONDS", original)
+        self.harness_env["STUB_SCALE_DELAY"] = "60"
+        started = self.start(width=800)
+        self.assertFalse(started["viewport"]["matches"])
+
+    def resize_host_window(self, physical):
+        state = self.base / "niri.json"
+        current = json.loads(state.read_text())
+        current["physical"] = physical
+        state.write_text(json.dumps(current))
+
+    def test_a_screenshot_refits_after_the_host_resizes_and_reports_a_match(self):
+        owner = self.start(width=800)["owner"]
+        self.resize_host_window(1200)
+        shot = self.call("screenshot", fixture="demo", owner=owner, name="after")
+        self.assertEqual(shot["viewport"]["width"], 800)
+        self.assertTrue(shot["viewport"]["matches"], shot["viewport"])
+        self.assertIn("msg output Nested scale 1.5", self.log.read_text())
+
+    def test_input_refits_after_the_host_resizes(self):
+        owner = self.start(width=800)["owner"]
+        self.resize_host_window(1200)
+        self.call("input", fixture="demo", owner=owner, action="key", chords=["Escape"])
+        self.assertIn("msg output Nested scale 1.5", self.log.read_text())
+
+    def test_a_screenshot_reports_a_width_it_could_not_reach(self):
+        owner = self.start(width=800)["owner"]
+        self.fixtures.live["demo"].width = 320
+        shot = self.call("screenshot", fixture="demo", owner=owner, name="after")
+        self.assertFalse(shot["viewport"]["matches"])
+
+    def await_marker(self, path):
+        deadline = time.monotonic() + 15
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(path.exists(), path)
+
+    def test_only_one_fixture_builds_at_a_time_and_a_pair_still_works(self):
+        first = self.start("before")
+        second = self.start("after")
+        fixture = self.fixtures.live["before"]
+        hold = fixture.layout.sandbox / "home/hold-build"
+        hold.write_text("")
+        self.call("run-ui", fixture="before", owner=first["owner"])
+        self.await_marker(fixture.layout.cli.with_suffix(".d"))
+        self.assertTrue(self.call("status", fixture="before", owner=first["owner"])["building"])
+        self.refused("build_busy", "run-ui", fixture="after", owner=second["owner"])
+        hold.unlink()
+        self.await_marker(fixture.layout.runner_log)
+        deadline = time.monotonic() + 15
+        while self.call("status", fixture="before", owner=first["owner"])["building"]:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        self.call("run-ui", fixture="after", owner=second["owner"])
+
+    def test_a_failed_build_does_not_block_the_next_one(self):
+        first = self.start("before")
+        second = self.start("after")
+        fixture = self.fixtures.live["before"]
+        (fixture.layout.sandbox / "home/fail-build").write_text("")
+        self.call("run-ui", fixture="before", owner=first["owner"])
+        deadline = time.monotonic() + 15
+        while self.call("status", fixture="before", owner=first["owner"])["runner"] == "running":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.02)
+        self.call("run-ui", fixture="after", owner=second["owner"])
+
+    def plant_traps(self, fixture):
+        """As sandbox code, through the relay: a tree it may then lock everyone out of."""
+        layout = fixture.layout
+        script = (
+            f"mkdir -p {layout.sandbox}/trap/deep {layout.host.runtime_dir}/trap/deep && "
+            f"ln -s {self.base} {layout.sandbox}/trap/deep/link && "
+            f"chmod 000 {layout.sandbox}/trap/deep {layout.sandbox}/trap "
+            f"{layout.host.runtime_dir}/trap/deep {layout.host.runtime_dir}/trap"
+        )
+        result = self.fixtures._in_sandbox(fixture, ["/bin/sh", "-c", script])
+        self.assertEqual(result["exit_code"], 0, result)
+
+    def test_stop_gets_past_traps_a_sandbox_left(self):
+        owner = self.start()["owner"]
+        fixture = self.fixtures.live["demo"]
+        self.plant_traps(fixture)
+        stopped = self.call("stop", fixture="demo", owner=owner)
+        self.assertEqual(stopped["left_behind"], [])
+        self.assertTrue(stopped["removed"])
+        self.assertFalse(os.path.lexists(fixture.layout.root))
+        self.assertFalse(os.path.lexists(fixture.layout.runtime))
+        self.assertTrue(self.base.exists(), "the planted link must not be followed")
+
+    def test_stop_keep_then_clear_get_past_traps(self):
+        owner = self.start()["owner"]
+        fixture = self.fixtures.live["demo"]
+        self.plant_traps(fixture)
+        stopped = self.call("stop", fixture="demo", owner=owner, keep=True)
+        self.assertEqual(stopped["left_behind"], [])
+        self.assertFalse(os.path.lexists(fixture.layout.runtime))
+        self.assertTrue(fixture.layout.root.exists())
+        self.call("clear", fixture="demo")
+        self.assertFalse(os.path.lexists(fixture.layout.root))
+        self.assertIn("owner", self.start())
+
+    def test_stop_all_gets_past_traps(self):
+        self.start()
+        fixture = self.fixtures.live["demo"]
+        self.plant_traps(fixture)
+        self.assertEqual(self.fixtures.stop_all(), [])
+        self.assertEqual(self.fixtures.live, {})
+
+    def test_stop_releases_the_fixture_when_cleanup_itself_fails(self):
+        owner = self.start()["owner"]
+        fixture = self.fixtures.live["demo"]
+        holder = fixture.holder_pid
+        original = self.fixtures._discard
+
+        def fails(_layout, *, remove):
+            raise RuntimeError("cleanup failed")
+
+        self.fixtures._discard = fails
+        with self.assertRaises(RuntimeError):
+            self.call("stop", fixture="demo", owner=owner)
+        self.fixtures._discard = original
+        self.assertEqual(self.fixtures.live, {})
+        self.assertTrue(fixture.stopped)
+        self.assertIsNone(fixture.pidfd)
+        self.assertTrue(self.await_gone(holder))
+
+    def test_stop_all_continues_past_a_failure_and_reports_it(self):
+        self.start("a")
+        self.start("b")
+        holders = [fixture.holder_pid for fixture in self.fixtures.live.values()]
+        original = self.fixtures.stop
+        visited = []
+
+        def fails_first(fixture, request):
+            visited.append(fixture.layout.name)
+            if len(visited) == 1:
+                raise RuntimeError("cleanup failed")
+            return original(fixture, request)
+
+        self.fixtures.stop = fails_first
+        problems = self.fixtures.stop_all()
+        self.fixtures.stop = original
+        self.assertEqual(len(visited), 2)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cleanup failed", problems[0])
+        for holder in holders:
+            self.assertTrue(self.await_gone(holder))
+
+    def test_startup_recovery_continues_past_a_failure_and_reports_it(self):
+        private = self.host.runtime_dir / broker.PRIVATE_DIR
+        (private / "aa").mkdir(parents=True)
+        (private / "bb").mkdir()
+        original = self.fixtures._discard
+        visited = []
+
+        def fails_first(layout, *, remove):
+            visited.append(layout.name)
+            if len(visited) == 1:
+                raise RuntimeError("recovery failed")
+            return original(layout, remove=remove)
+
+        self.fixtures._discard = fails_first
+        recovered, problems = self.fixtures.recover_stale()
+        self.fixtures._discard = original
+        self.assertEqual(len(visited), 2)
+        self.assertEqual(len(recovered), 1)
+        self.assertIn("recovery failed", problems[0])
+
+    def test_clear_holds_its_name_until_it_has_finished(self):
+        (self.repo / ".worktrees/native-fixture/demo").mkdir(parents=True)
+        entered, proceed = threading.Event(), threading.Event()
+        original = self.fixtures._discard
+
+        def waits(layout, *, remove):
+            entered.set()
+            proceed.wait(10)
+            return original(layout, remove=remove)
+
+        self.fixtures._discard = waits
+        thread = threading.Thread(target=lambda: self.call("clear", fixture="demo"))
+        thread.start()
+        self.assertTrue(entered.wait(10))
+        try:
+            with self.assertRaises(broker.Refusal) as start_refused:
+                self.fixtures.start({"op": "start", "fixture": "demo", "checkout": self.checkout, "width": 800})
+            with self.assertRaises(broker.Refusal) as clear_refused:
+                self.call("clear", fixture="demo")
+        finally:
+            proceed.set()
+            thread.join(15)
+            self.fixtures._discard = original
+        self.assertEqual(start_refused.exception.code, "fixture_exists")
+        self.assertEqual(clear_refused.exception.code, "fixture_exists")
+        self.assertIn("owner", self.start())
+
+    def test_the_sandbox_has_its_own_session_and_no_terminal(self):
+        self.start()
+        holder = self.fixtures.live["demo"].holder_pid
+        fields = Path(f"/proc/{holder}/stat").read_text().rpartition(")")[2].split()
+        self.assertNotEqual(int(fields[3]), os.getsid(0), "it must not share this process's session")
+        self.assertEqual(int(fields[4]), 0, "it must have no controlling terminal")
 
     def test_at_most_two_fixtures_run_at_once(self):
         self.start("a")
@@ -1123,14 +1413,14 @@ class Lifecycle(SandboxCase):
         (victim / "demo").mkdir(parents=True)
         (victim / "demo/keep").write_text("keep")
         (self.repo / ".worktrees/native-fixture").symlink_to(victim)
-        self.refused("path_escape", "clear", fixture="demo")
+        self.refused("not_removed", "clear", fixture="demo")
         self.assertEqual((victim / "demo/keep").read_text(), "keep")
 
     def test_startup_recovers_sessions_left_by_a_killed_broker(self):
         stale = self.host.runtime_dir / broker.PRIVATE_DIR / "old"
         (stale / "state").mkdir(parents=True)
         (self.host.runtime_dir / "nf-old").mkdir()
-        self.assertEqual(self.fixtures.recover_stale(), ["old"])
+        self.assertEqual(self.fixtures.recover_stale(), (["old"], []))
         self.assertIn("session stop old", self.log.read_text())
         self.assertFalse(stale.exists())
         self.assertFalse((self.host.runtime_dir / "nf-old").exists())

@@ -66,6 +66,10 @@ HARNESS_SECONDS = 180
 CLI_SECONDS = 120
 LOCK_SECONDS = 200
 STOP_ALL_LOCK_SECONDS = 5
+VIEWPORT_APPLY_SECONDS = 3
+VIEWPORT_POLL_SECONDS = 0.05
+BUILD_FINISHED_MARKER = b"writing UI diagnostics to"
+MAX_RUNNER_LOG_BYTES = 8 * 1024 * 1024
 DEFAULT_WIDTH = 1600
 MIN_WIDTH = 320
 MAX_WIDTH = 3840
@@ -353,37 +357,68 @@ def hold_socket(directory, name):
     return held
 
 
+def _remove_entry(parent, name):
+    """Remove one entry, repairing directory modes a sandbox may have revoked.
+
+    The mode is changed through a descriptor already known to be a real
+    directory, so a planted symlink is unlinked and never followed.
+    """
+    mode = os.stat(name, dir_fd=parent, follow_symlinks=False).st_mode
+    if not stat.S_ISDIR(mode):
+        os.unlink(name, dir_fd=parent)
+        return
+    held = os.open(name, NO_FOLLOW_DIRECTORY, dir_fd=parent)
+    try:
+        os.chmod(f"/proc/self/fd/{held}", 0o700)
+        listing = os.open(f"/proc/self/fd/{held}", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            for entry in os.listdir(listing):
+                _remove_entry(listing, entry)
+        finally:
+            os.close(listing)
+    finally:
+        os.close(held)
+    os.rmdir(name, dir_fd=parent)
+
+
 def remove_beneath(base, parts):
     """Remove base/parts... without following a symlink at any level.
 
-    Returns False, removing nothing, when a parent is not a real directory.
+    Returns False when it could not: a parent is not a real directory, or the
+    tree resisted removal. It never raises for what a sandbox left behind.
     """
     try:
         parent = hold_directory(base, parts[:-1])
-    except Refusal:
-        return False
     except FileNotFoundError:
         return True
+    except (Refusal, OSError):
+        return False
     try:
-        if os.path.lexists(f"/proc/self/fd/{parent}/{parts[-1]}"):
-            mode = os.stat(parts[-1], dir_fd=parent, follow_symlinks=False).st_mode
-            if stat.S_ISDIR(mode):
-                shutil.rmtree(parts[-1], dir_fd=parent)
-            else:
-                os.unlink(parts[-1], dir_fd=parent)
+        _remove_entry(parent, parts[-1])
     except FileNotFoundError:
-        pass
+        return True
+    except (OSError, RecursionError):
+        return False
     finally:
         os.close(parent)
     return True
 
 
-def read_regular(path, limit):
-    """Read a file a sandbox could have replaced with a link, FIFO or device."""
+def read_regular(base, parts, name, limit):
+    """Read base/parts/name, which a sandbox could have replaced or redirected.
+
+    No component may be a symlink, and a FIFO or device is refused unopened.
+    """
     try:
-        descriptor = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        directory = hold_directory(base, parts)
+    except (Refusal, OSError):
+        return None
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
     except OSError:
         return None
+    finally:
+        os.close(directory)
     with os.fdopen(descriptor, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             return None
@@ -678,7 +713,7 @@ def relay_command(descriptor):
 def holder_argv(layout, binds, info_fd, relay_fd):
     return [
         "/usr/bin/prlimit", *SANDBOX_RLIMITS,
-        "/usr/bin/bwrap", "--new-session", "--info-fd", str(info_fd),
+        "/usr/bin/bwrap", "--info-fd", str(info_fd),
         *sandbox_args(layout, binds),
         "--", *relay_command(relay_fd),
     ]
@@ -850,6 +885,7 @@ class Fixture:
     channel: RelayChannel = None
     nested_socket: str = None
     runner_started: bool = False
+    width: int = DEFAULT_WIDTH
     stopped: bool = False
 
 
@@ -892,6 +928,9 @@ class Fixtures:
         self.harness_env = harness_env
         self.lock = threading.Lock()
         self.live = {}
+        self.clearing = set()
+        # Separate targets mean Cargo's own lock cannot keep two cold builds apart.
+        self.build_lock = threading.Lock()
         self.spawner = Spawner()
 
     def handle(self, request):
@@ -945,7 +984,7 @@ class Fixtures:
     def start(self, request):
         name = request["fixture"]
         with self.lock:
-            if name in self.live:
+            if name in self.live or name in self.clearing:
                 raise Refusal("fixture_exists", "a live fixture already has that name")
             if len(self.live) >= MAX_LIVE_FIXTURES:
                 raise Refusal("too_many_fixtures", f"at most {MAX_LIVE_FIXTURES} fixtures can run at once")
@@ -960,10 +999,12 @@ class Fixtures:
             except BaseException:
                 # Frees the name: nothing is left to clear after a failed start.
                 self._kill_holder(fixture)
-                self._discard(layout, remove=True)
-                self._release(fixture)
-                fixture.stopped = True
-                self.live.pop(name, None)
+                try:
+                    self._discard(layout, remove=True)
+                finally:
+                    self._release(fixture)
+                    fixture.stopped = True
+                    self.live.pop(name, None)
                 raise
         return {
             "fixture": name,
@@ -1016,7 +1057,7 @@ class Fixtures:
         return self._apply_viewport(fixture, width)
 
     def _nested_session(self, layout):
-        handshake = read_regular(layout.niri_root / "session.env", 4096)
+        handshake = read_regular(self.host.runtime_dir, (*layout.private_parts, "niri"), "session.env", 4096)
         text = (handshake or b"").decode("utf-8", "replace")
         display, nested = NESTED_DISPLAY.search(text), NESTED_SOCKET.search(text)
         if not display or not nested:
@@ -1153,6 +1194,7 @@ class Fixtures:
         The framebuffer is laid out by the host, so its height and physical size
         are reported rather than promised. Compare these across a before/after pair.
         """
+        fixture.width = width
         name, logical = self._nested_output(fixture)
         if logical is None:
             raise Refusal("viewport_failed", "the nested session reports no output")
@@ -1162,6 +1204,15 @@ class Fixtures:
             [self.host.niri, "msg", "output", name, "scale", str(scale)],
             env=self._nested_env(fixture), capture_output=True, timeout=10, stdin=subprocess.DEVNULL,
         )
+        # Reporting before niri applies the scale would describe the old layout.
+        deadline = time.monotonic() + VIEWPORT_APPLY_SECONDS
+        while True:
+            _name, logical = self._nested_output(fixture)
+            if logical is not None and abs(logical["scale"] - scale) < 0.001:
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(VIEWPORT_POLL_SECONDS)
         return self._viewport_report(fixture, width)
 
     def _viewport_report(self, fixture, requested):
@@ -1176,6 +1227,19 @@ class Fixtures:
         }
         report["matches"] = abs(logical["width"] - requested) <= 1
         return report
+
+    def _fit_viewport(self, fixture):
+        """Fit again if the host has resized the nested window since the last fit.
+
+        The window's final size is the host's to decide and can arrive after start.
+        """
+        try:
+            report = self._viewport_report(fixture, fixture.width)
+            if not report["matches"]:
+                report = self._apply_viewport(fixture, fixture.width)
+            return report
+        except (Refusal, OSError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            return {"requested_width": fixture.width, "matches": False, "error": str(error)}
 
     def viewport(self, fixture, request):
         return self._apply_viewport(fixture, request["width"])
@@ -1195,7 +1259,35 @@ class Fixtures:
             raise Refusal("sandbox_failed", "the fixture sandbox sent a malformed state")
         return state
 
+    def _is_building(self, fixture):
+        """Whether this fixture's runner has not reached launching its UI yet."""
+        if fixture.stopped or not fixture.runner_started:
+            return False
+        layout = fixture.layout
+        log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), layout.runner_log.name, MAX_RUNNER_LOG_BYTES)
+        if log is not None and BUILD_FINISHED_MARKER in log:
+            return False
+        if not fixture.lock.acquire(blocking=False):
+            return True  # It is busy, and it cannot be shown to have finished.
+        try:
+            return self._holder_alive(fixture) and self._runner_state(fixture) == "running"
+        except Refusal:
+            return False
+        finally:
+            fixture.lock.release()
+
     def run_ui(self, fixture, _request):
+        with self.build_lock:
+            for other in list(self.live.values()):
+                if other is not fixture and self._is_building(other):
+                    raise Refusal(
+                        "build_busy",
+                        f"fixture {other.layout.name} is still building; retry run-ui when its status "
+                        "says building is false, because two builds must not run at once",
+                    )
+            return self._start_runner(fixture)
+
+    def _start_runner(self, fixture):
         if self._runner_state(fixture) == "running":
             raise Refusal("runner_active", "the development runner is already running")
         layout = fixture.layout
@@ -1217,7 +1309,7 @@ class Fixtures:
     def _cli_built(self, fixture):
         """Built by this fixture's runner, from this fixture's checkout."""
         layout = fixture.layout
-        dep_info = read_regular(layout.cli.with_suffix(".d"), MAX_DEP_INFO_BYTES)
+        dep_info = read_regular(self.host.repo, (*layout.target_parts, "dev-runtime"), "cagents.d", MAX_DEP_INFO_BYTES)
         return fixture.runner_started and binary_belongs_to(dep_info, layout.checkout)
 
     def cli(self, fixture, request):
@@ -1237,13 +1329,17 @@ class Fixtures:
         }
 
     def input(self, fixture, request):
+        self._fit_viewport(fixture)
         return self._drive(fixture, input_argv(request))
 
     def screenshot(self, fixture, request):
         layout = fixture.layout
+        viewport = self._fit_viewport(fixture)
         result = self._drive(fixture, ["shot", "--", request["name"]])
         file_name = f"{request['name']}.png"
-        image = read_regular(layout.niri_root / "shots" / file_name, 64 * 1024 * 1024)
+        image = read_regular(
+            self.host.runtime_dir, (*layout.private_parts, "niri", "shots"), file_name, 64 * 1024 * 1024
+        )
         if result["exit_code"] == 0 and image is not None:
             shots = hold_directory(self.host.repo, (*layout.root_parts, "shots"))
             try:
@@ -1258,8 +1354,7 @@ class Fixtures:
             with os.fdopen(output, "wb") as stream:
                 stream.write(image)
             result["path"] = str(layout.shots / file_name)
-        _name, logical = self._nested_output(fixture)
-        result["viewport"] = logical
+        result["viewport"] = viewport
         return result
 
     def status(self, fixture, _request):
@@ -1271,68 +1366,120 @@ class Fixtures:
             "target": str(layout.target),
             "runner": self._runner_state(fixture),
             "cli_built": self._cli_built(fixture),
+            "building": self._building_now(fixture),
         }
+
+    def _building_now(self, fixture):
+        """_is_building, for a caller that already holds this fixture's lock."""
+        if not fixture.runner_started:
+            return False
+        layout = fixture.layout
+        log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), layout.runner_log.name, MAX_RUNNER_LOG_BYTES)
+        if log is not None and BUILD_FINISHED_MARKER in log:
+            return False
+        return self._runner_state(fixture) == "running"
 
     def stop(self, fixture, request):
         layout = fixture.layout
         self._kill_holder(fixture)
         keep = bool(request.get("keep"))
-        removed = self._discard(layout, remove=not keep)
-        fixture.stopped = True
-        self._release(fixture)
-        with self.lock:
-            if self.live.get(layout.name) is fixture:
-                del self.live[layout.name]
-        return {"fixture": layout.name, "kept": keep, "removed": removed}
+        try:
+            left_behind = self._discard(layout, remove=not keep)
+        finally:
+            # The fixture is over whatever cleanup managed; its name must not stick.
+            self._release(fixture)
+            fixture.stopped = True
+            with self.lock:
+                if self.live.get(layout.name) is fixture:
+                    del self.live[layout.name]
+        return {
+            "fixture": layout.name,
+            "kept": keep,
+            "removed": not keep and str(layout.root) not in left_behind,
+            "left_behind": left_behind,
+        }
 
     def _discard(self, layout, *, remove):
-        """Stop the nested session and remove broker state; say if the root went."""
+        """Stop the nested session and remove broker state; name what remains."""
         try:
             self.harness(layout, [self.host.harness, "session", "stop", layout.name], timeout=30)
         except (OSError, subprocess.SubprocessError):
             pass
-        remove_beneath(self.host.runtime_dir, layout.private_parts)
-        remove_beneath(self.host.runtime_dir, (layout.runtime_name,))
-        if not remove:
-            return False
-        return remove_beneath(self.host.repo, layout.root_parts)
+        left_behind = []
+        if not remove_beneath(self.host.runtime_dir, layout.private_parts):
+            left_behind.append(str(layout.private))
+        if not remove_beneath(self.host.runtime_dir, (layout.runtime_name,)):
+            left_behind.append(str(layout.runtime))
+        if remove and not remove_beneath(self.host.repo, layout.root_parts):
+            left_behind.append(str(layout.root))
+        return left_behind
 
     def clear(self, request):
         """Recover a name no live fixture holds, including after a killed broker."""
         name = request["fixture"]
         with self.lock:
-            if name in self.live:
+            if name in self.live or name in self.clearing:
                 raise Refusal("fixture_exists", "that fixture is live; stop it instead")
-        placeholder = Layout(self.host, name, self.host.repo / ".worktrees" / name, Path("/"))
-        removed = self._discard(placeholder, remove=True)
-        if not removed:
-            raise Refusal("path_escape", f"{placeholder.root} has a symlinked parent and was left alone")
+            # Held to the end, so a start cannot create what this is removing.
+            self.clearing.add(name)
+        try:
+            placeholder = Layout(self.host, name, self.host.repo / ".worktrees" / name, Path("/"))
+            left_behind = self._discard(placeholder, remove=True)
+        finally:
+            with self.lock:
+                self.clearing.discard(name)
+        if left_behind:
+            raise Refusal("not_removed", f"could not remove: {', '.join(left_behind)}")
         return {"fixture": name, "cleared": True}
 
     def recover_stale(self):
-        """At startup every fixture on disk is stale: its broker is gone."""
+        """At startup every fixture on disk is stale: its broker is gone.
+
+        Returns the names recovered and a message for each that was not.
+        """
         private = self.host.runtime_dir / PRIVATE_DIR
         try:
             names = [path.name for path in private.iterdir() if FIXTURE_NAME.fullmatch(path.name)]
         except OSError:
-            return []
+            return [], []
+        recovered, problems = [], []
         for name in names:
             placeholder = Layout(self.host, name, self.host.repo / ".worktrees" / name, Path("/"))
-            self._discard(placeholder, remove=False)
-        return names
+            try:
+                left_behind = self._discard(placeholder, remove=False)
+            except Exception as error:
+                problems.append(f"{name}: {type(error).__name__}: {error}")
+                continue
+            if left_behind:
+                problems.append(f"{name}: could not remove {', '.join(left_behind)}")
+            else:
+                recovered.append(name)
+        return recovered, problems
 
     def stop_all(self):
-        """End every sandbox first; then clean up as far as a bounded wait allows."""
+        """End every sandbox first; then clean up as far as a bounded wait allows.
+
+        Returns a message for each fixture it could not finish, and never raises.
+        """
         fixtures = list(self.live.values())
         for fixture in fixtures:
             self._kill_holder(fixture)
+        problems = []
         for fixture in fixtures:
-            if fixture.lock.acquire(timeout=STOP_ALL_LOCK_SECONDS):
-                try:
-                    if not fixture.stopped:
-                        self.stop(fixture, {"keep": True})
-                finally:
-                    fixture.lock.release()
+            name = fixture.layout.name
+            if not fixture.lock.acquire(timeout=STOP_ALL_LOCK_SECONDS):
+                problems.append(f"{name}: busy; its sandbox was ended and its directories remain")
+                continue
+            try:
+                if not fixture.stopped:
+                    left_behind = self.stop(fixture, {"keep": True})["left_behind"]
+                    if left_behind:
+                        problems.append(f"{name}: could not remove {', '.join(left_behind)}")
+            except Exception as error:
+                problems.append(f"{name}: {type(error).__name__}: {error}")
+            finally:
+                fixture.lock.release()
+        return problems
 
 
 # --------------------------------------------------------------------------
@@ -1497,8 +1644,11 @@ def main(argv=None):
         return 1
     install_termination()
     # After the socket, which proves no other broker owns these sessions.
-    for name in fixtures.recover_stale():
+    recovered, problems = fixtures.recover_stale()
+    for name in recovered:
         print(f"recovered stale fixture session {name}; `clear` removes its directory", flush=True)
+    for problem in problems:
+        print(f"could not recover a stale fixture session: {problem}", file=sys.stderr, flush=True)
 
     digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
     print(f"native-fixture-broker listening at {path}", flush=True)
@@ -1509,7 +1659,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         pass
     finally:
-        fixtures.stop_all()
+        for problem in fixtures.stop_all():
+            print(f"fixture cleanup incomplete: {problem}", file=sys.stderr, flush=True)
         server.server_close()
         Path(path).unlink(missing_ok=True)
     return 0
