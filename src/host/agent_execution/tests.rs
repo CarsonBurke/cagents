@@ -55,6 +55,21 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
         std::fs::create_dir_all(root.join(path)).unwrap();
     }
     install_claude(&root.join("bin/claude"));
+    // Keep the child's libtest framing separate from the owning parent output.
+    // Exclusive fixture-owned files preserve diagnostics without adding a pipe
+    // reader or changing the original child's natural status wait.
+    let stdout_path = root.join("isolated-child.stdout");
+    let stderr_path = root.join("isolated-child.stderr");
+    let stdout = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stdout_path)
+        .unwrap();
+    let stderr = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stderr_path)
+        .unwrap();
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     // Keep the caller's delegation inherited unchanged, without inspecting or
     // copying its value. Every other environment input is fixture-owned.
@@ -93,9 +108,23 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
             "PATH",
             format!("{}:/usr/bin:/bin", root.join("bin").display()),
         )
+        .stdout(stdout)
+        .stderr(stderr)
         .status()
         .unwrap();
-    assert!(result.success(), "isolated service fixture failed");
+    if !result.success() {
+        let stdout = std::fs::read(&stdout_path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|error| format!("<failed to read {}: {error}>", stdout_path.display()));
+        let stderr = std::fs::read(&stderr_path)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|error| format!("<failed to read {}: {error}>", stderr_path.display()));
+        panic!(
+            "isolated service fixture failed ({result})\nstdout ({}):\n{stdout}\nstderr ({}):\n{stderr}",
+            stdout_path.display(),
+            stderr_path.display(),
+        );
+    }
     Some(directory)
 }
 
