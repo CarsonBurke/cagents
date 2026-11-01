@@ -284,6 +284,10 @@ pub(crate) struct HostState {
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
+    /// Retained setup requires explicit User authentication on this exact
+    /// connection, with no fallback after any delegated authentication attempt.
+    pub(super) account_preparation_callers:
+        BTreeMap<ClientId, super::agent_execution::terminals::AccountPreparationCaller>,
     pub(super) automations: Option<super::automations::Handle>,
     /// Answers Work board reads; absent before startup and after shutdown.
     pub(super) work: Option<super::work::Handle>,
@@ -432,6 +436,7 @@ impl HostState {
             model: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
+            account_preparation_callers: BTreeMap::new(),
             automations: None,
             work: None,
             mailbox: None,
@@ -485,6 +490,7 @@ impl HostState {
     }
 
     pub(crate) fn register_client(&mut self, client_id: ClientId) -> Arc<DeliveryQueue> {
+        self.account_preparation_callers.remove(&client_id);
         let delivery = Arc::new(DeliveryQueue::new(client_id, DEFAULT_CLIENT_QUEUE_CAPACITY));
         if self.ordinary_exit_registration_closed {
             // The existing writer closes both stream directions when this
@@ -523,6 +529,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.account_preparation_callers.remove(&client_id);
     }
 
     /// Installs the durable shared sidebar model.
@@ -935,6 +942,7 @@ impl HostState {
         self.watchers.remove(&client_id);
         self.model_watchers.remove(&client_id);
         self.agent_clients.remove(&client_id);
+        self.account_preparation_callers.remove(&client_id);
         handles
     }
 

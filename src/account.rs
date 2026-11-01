@@ -28,6 +28,8 @@ use crate::chat::local_time;
 pub mod cache;
 pub mod claude;
 pub mod codex;
+#[cfg(any(feature = "ui", feature = "host"))]
+mod durability;
 #[cfg(feature = "host")]
 pub mod handoff;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -37,6 +39,9 @@ pub mod info;
 pub mod login;
 pub mod omp;
 pub mod preferences;
+pub mod preparation;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod preparation_api;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod probe;
 #[cfg(any(feature = "ui", feature = "host"))]

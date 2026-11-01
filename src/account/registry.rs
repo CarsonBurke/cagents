@@ -33,7 +33,15 @@ use crate::model::ProjectId;
 
 const FILE_NAME: &str = "accounts.toml";
 const LOCK_NAME: &str = "accounts.toml.lock";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
+#[cfg(test)]
+mod installation_observation_tests;
+mod pending_retention;
+mod preparations;
+pub use super::preparation::{
+    ExistingPending, ExistingPendingBinding, ExistingPendingState, ExistingPendingTarget,
+    Preparation, PreparationBinding, PreparationPayload, PreparationState,
+};
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
@@ -86,6 +94,23 @@ pub enum Observed {
     Conflict,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationError {
+    Duplicate(AccountId),
+    RetainedPreparation,
+}
+impl std::fmt::Display for RegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duplicate(_) => f.write_str("This login is already registered"),
+            Self::RetainedPreparation => {
+                f.write_str("The account setup was retained and cannot be registered")
+            }
+        }
+    }
+}
+impl std::error::Error for RegistrationError {}
+
 /// A home created for a sign-in that has not finished: registered before the
 /// provider's login runs in it, so that no window, and no later run, takes it
 /// for a directory nothing knows about.
@@ -108,6 +133,12 @@ pub struct Registry {
     /// order; an older snapshot must never replace a newer account choice.
     #[serde(default)]
     revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    installation: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    preparations: Vec<Preparation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    existing_pending: Vec<ExistingPending>,
     /// The account each provider starts new conversations on, by provider
     /// executable name: `"system"` or a registered account's key. A provider
     /// with no entry, or an entry naming an account that is gone, uses its
@@ -147,7 +178,7 @@ fn project_key(repository: &Path) -> String {
 }
 
 impl Registry {
-    pub fn contains_managed_home(&self, homes: &Homes, provider: Provider, key: Uuid) -> bool {
+    fn has_registered_home(&self, homes: &Homes, provider: Provider, key: Uuid) -> bool {
         let path = homes.path(provider, key);
         self.accounts.iter().any(|account| {
             (account.provider == provider && account.key == key && account.linked_home.is_none())
@@ -155,10 +186,28 @@ impl Registry {
                     .linked_home
                     .as_ref()
                     .is_some_and(|linked| linked == &path)
-        }) || self
-            .pending
-            .iter()
-            .any(|pending| pending.provider == provider && pending.key == key)
+        })
+    }
+
+    fn registered_home_is_eligible(&self, homes: &Homes, provider: Provider, key: Uuid) -> bool {
+        self.has_registered_home(homes, provider, key)
+            || self.accounts.iter().any(|account| {
+                account.linked_home.as_ref().is_some_and(|linked| {
+                    homes.canonical_managed_identity(linked) == Some((provider, key))
+                })
+            })
+    }
+
+    pub fn contains_managed_home(&self, homes: &Homes, provider: Provider, key: Uuid) -> bool {
+        self.has_registered_home(homes, provider, key)
+            || self
+                .pending
+                .iter()
+                .any(|pending| pending.provider == provider && pending.key == key)
+            || self.preparation_for_key(provider, key).is_some()
+            || self
+                .existing_pending(key)
+                .is_some_and(|entry| entry.binding.provider == provider)
     }
     /// Credential homes affected by an externally proposed preference edit.
     /// Include physical aliases and both ends of changed routing preferences.
@@ -498,13 +547,42 @@ impl Registry {
         &mut self,
         managed: Registered,
         system: &[(Provider, Identity)],
-    ) -> Result<(), AccountId> {
+    ) -> Result<(), RegistrationError> {
+        if let Some(preparation) = self
+            .preparations
+            .iter()
+            .find(|entry| entry.binding.key == managed.key)
+        {
+            if preparation.binding.payload.provider != managed.provider
+                || managed.linked_home.is_some()
+                || !self.pending_is_eligible(managed.provider, managed.key)
+            {
+                return Err(RegistrationError::RetainedPreparation);
+            }
+        }
+        if let Some(entry) = self.existing_pending(managed.key) {
+            if entry.binding.provider != managed.provider
+                || managed.linked_home.is_some()
+                || entry.state != ExistingPendingState::Pending
+                || !self.pending_is_eligible(managed.provider, managed.key)
+            {
+                return Err(RegistrationError::RetainedPreparation);
+            }
+        }
+        if self.pending.iter().any(|row| {
+            row.key == managed.key
+                && (row.provider != managed.provider || managed.linked_home.is_some())
+        }) {
+            return Err(RegistrationError::RetainedPreparation);
+        }
         let identity = managed.identity();
         if let Some((provider, _)) = system
             .iter()
             .find(|(provider, known)| *provider == managed.provider && known.same_login(&identity))
         {
-            return Err(Account::system(*provider).id());
+            return Err(RegistrationError::Duplicate(
+                Account::system(*provider).id(),
+            ));
         }
         if let Some(existing) = self.accounts.iter().find(|existing| {
             existing.key != managed.key
@@ -512,9 +590,38 @@ impl Registry {
                 && existing.provider == managed.provider
                 && existing.identity().same_login(&identity)
         }) {
-            return Err(Account::managed(existing.provider, existing.key, PathBuf::new()).id());
+            return Err(RegistrationError::Duplicate(
+                Account::managed(existing.provider, existing.key, PathBuf::new()).id(),
+            ));
         }
-        self.abandon(managed.key);
+        if self
+            .preparations
+            .iter()
+            .all(|entry| entry.binding.key != managed.key)
+        {
+            if let Some(pending) = self
+                .pending
+                .iter()
+                .find(|row| row.key == managed.key)
+                .cloned()
+            {
+                self.adopt_existing_pending(pending.provider, pending.key, pending.started_at)
+                    .map_err(|_| RegistrationError::RetainedPreparation)?;
+                self.existing_pending
+                    .iter_mut()
+                    .find(|entry| entry.binding.key == managed.key)
+                    .unwrap()
+                    .state = ExistingPendingState::Registered;
+            }
+        }
+        if let Some(entry) = self
+            .preparations
+            .iter_mut()
+            .find(|entry| entry.binding.key == managed.key)
+        {
+            entry.state = PreparationState::Registered;
+        }
+        self.pending.retain(|pending| pending.key != managed.key);
         match self
             .accounts
             .iter_mut()
@@ -571,6 +678,16 @@ impl Registry {
             self.archived.retain(|archived| *archived != key);
             return Ok(key);
         }
+        if self.find(key).is_some()
+            || self.pending.iter().any(|row| row.key == key)
+            || self
+                .preparations
+                .iter()
+                .any(|entry| entry.binding.key == key)
+            || self.existing_pending(key).is_some()
+        {
+            return Err("That account identity is already listed or retained".into());
+        }
         self.accounts.push(Registered {
             key,
             provider,
@@ -585,6 +702,16 @@ impl Registry {
 
     /// Records a home created for a sign-in that is about to start.
     pub fn begin(&mut self, provider: Provider, key: Uuid, started_at: u64) {
+        if self.existing_pending(key).is_some() {
+            return;
+        }
+        if self.preparations.iter().any(|entry| {
+            entry.binding.key == key
+                && (entry.binding.payload.provider != provider
+                    || entry.state != PreparationState::Created)
+        }) {
+            return;
+        }
         if self.find(key).is_none() && !self.pending.iter().any(|pending| pending.key == key) {
             self.pending.push(Pending {
                 key,
@@ -601,6 +728,16 @@ impl Registry {
 
     /// Forgets a sign-in whose home is gone.
     pub fn abandon(&mut self, key: Uuid) {
+        if self.existing_pending(key).is_some() {
+            return;
+        }
+        if self
+            .preparations
+            .iter()
+            .any(|entry| entry.binding.key == key)
+        {
+            return;
+        }
         self.pending.retain(|pending| pending.key != key);
     }
 
@@ -828,10 +965,16 @@ impl Store {
         let selected: Vec<_> = Account::PROVIDERS
             .into_iter()
             .filter(|candidate| provider.is_none_or(|provider| provider == *candidate))
-            .filter_map(|provider| {
-                environment
-                    .get(super::home_variable(provider)?)
-                    .and_then(|path| homes.managed_identity(Path::new(path)))
+            .flat_map(|provider| {
+                let path = super::home_variable(provider)
+                    .and_then(|name| environment.get(name))
+                    .map(Path::new);
+                [
+                    path.and_then(|path| homes.managed_identity(path)),
+                    path.and_then(|path| homes.canonical_managed_identity(path)),
+                ]
+                .into_iter()
+                .flatten()
             })
             .collect();
         if selected.is_empty() {
@@ -848,7 +991,7 @@ impl Store {
             )));
         }
         for (provider, key) in selected {
-            if !registry.contains_managed_home(homes, provider, key) {
+            if !registry.managed_home_is_eligible(homes, provider, key) {
                 return Err(LaunchAccountError::Removed { provider, key });
             }
         }
@@ -862,6 +1005,59 @@ impl Store {
         Self {
             directory: directory.into(),
         }
+    }
+
+    /// Observes an existing installation identity without preparing storage,
+    /// taking locks, repairing permissions, or creating an identity. Absence
+    /// is distinct from an unsafe or unreadable registry. This observation
+    /// grants no account setup or filesystem authority.
+    pub fn inspect_installation_id(&self) -> io::Result<Option<Uuid>> {
+        let directory = if self.directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            &self.directory
+        };
+        let path = directory.join(FILE_NAME);
+        let unavailable = |error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                "The account installation identity could not be inspected",
+            )
+        };
+        crate::secure_file::reject_symlink_components(&path).map_err(unavailable)?;
+        match crate::secure_file::validate_owned_directory(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unavailable(error)),
+        }
+        let file = match crate::secure_file::open_existing_private_file_readonly(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(unavailable(error)),
+        };
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "The accounts file could not be validated",
+            )
+        };
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(unavailable)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid());
+        }
+        let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+        let registry: Registry = toml::from_str(text).map_err(|_| invalid())?;
+        registry.validate_preparations().map_err(|_| invalid())?;
+        if registry.is_newer() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "The accounts file was saved by a newer cagents",
+            ));
+        }
+        Ok(registry.installation_id())
     }
 
     /// Creates and records a pending sign-in as one lifecycle transaction.
@@ -1025,12 +1221,28 @@ impl Store {
         nonblocking: bool,
         validate: impl FnOnce(&Registry) -> io::Result<()>,
     ) -> io::Result<(Registry, Result<(), AccountId>)> {
+        self.register_pending_with_io(homes, account, system, nonblocking, validate, |namespace| {
+            namespace.sync()
+        })
+    }
+
+    fn register_pending_with_io(
+        &self,
+        homes: &Homes,
+        account: Registered,
+        system: &[(Provider, Identity)],
+        nonblocking: bool,
+        validate: impl FnOnce(&Registry) -> io::Result<()>,
+        sync: impl FnMut(&super::durability::Directories) -> io::Result<()>,
+    ) -> io::Result<(Registry, Result<(), AccountId>)> {
         let _lifecycle = if nonblocking {
             homes.try_lifecycle_lock()?
         } else {
             homes.lifecycle_lock()?
         };
-        self.update_checked_with_mode(
+        let key = account.key;
+        let provider = account.provider;
+        self.update_checked_with_io(
             |registry| {
                 validate(registry)?;
                 if registry.find(account.key).is_some_and(|existing| {
@@ -1038,17 +1250,32 @@ impl Store {
                 }) {
                     return Ok(Ok(()));
                 }
-                if !registry.pending.iter().any(|pending| {
-                    pending.key == account.key && pending.provider == account.provider
-                }) {
+                if !registry.pending_is_eligible(account.provider, account.key) {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
                         "The pending sign-in was removed before it completed",
                     ));
                 }
-                Ok(registry.register(account, system))
+                match registry.register(account, system) {
+                    Ok(()) => Ok(Ok(())),
+                    Err(RegistrationError::Duplicate(existing)) => Ok(Err(existing)),
+                    Err(RegistrationError::RetainedPreparation) => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "The account setup was retained and cannot be registered",
+                    )),
+                }
             },
             nonblocking,
+            |registry| {
+                registry
+                    .preparation_for_key(provider, key)
+                    .is_some_and(|entry| entry.state == PreparationState::Registered)
+                    || registry.existing_pending(key).is_some_and(|entry| {
+                        entry.binding.provider == provider
+                            && entry.state == ExistingPendingState::Registered
+                    })
+            },
+            sync,
         )
     }
 
@@ -1134,6 +1361,16 @@ impl Store {
         change: impl FnOnce(&mut Registry) -> io::Result<T>,
         nonblocking: bool,
     ) -> io::Result<(Registry, T)> {
+        self.update_checked_with_io(change, nonblocking, |_| false, |namespace| namespace.sync())
+    }
+
+    fn update_checked_with_io<T>(
+        &self,
+        change: impl FnOnce(&mut Registry) -> io::Result<T>,
+        nonblocking: bool,
+        sync_unchanged: impl FnOnce(&Registry) -> bool,
+        mut sync: impl FnMut(&super::durability::Directories) -> io::Result<()>,
+    ) -> io::Result<(Registry, T)> {
         let _lock = if nonblocking {
             self.try_lock()?
         } else {
@@ -1155,7 +1392,11 @@ impl Store {
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("accounts revision exhausted"))?;
-            write(&self.directory, &path, &registry)?;
+            write_with_directory_sync(&self.directory, &path, &registry, |namespace| {
+                sync(namespace)
+            })?;
+        } else if sync_unchanged(&registry) {
+            sync(&super::durability::Directories::capture(&self.directory)?)?;
         }
         Ok((registry, result))
     }
@@ -1183,10 +1424,34 @@ fn read(path: &Path) -> io::Result<Registry> {
     Read::by_ref(&mut file)
         .take(MAX_BYTES)
         .read_to_string(&mut text)?;
-    toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let registry: Registry =
+        toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    registry.validate_preparations()?;
+    Ok(registry)
 }
 
 fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<()> {
+    write_with_directory_sync(directory, path, registry, |namespace| namespace.sync())
+}
+
+fn write_with_directory_sync(
+    directory: &Path,
+    path: &Path,
+    registry: &Registry,
+    sync: impl FnOnce(&super::durability::Directories) -> io::Result<()>,
+) -> io::Result<()> {
+    write_with_io(directory, path, registry, || Ok(()), sync)
+}
+
+fn write_with_io(
+    directory: &Path,
+    path: &Path,
+    registry: &Registry,
+    before_publish: impl FnOnce() -> io::Result<()>,
+    sync: impl FnOnce(&super::durability::Directories) -> io::Result<()>,
+) -> io::Result<()> {
+    registry.validate_preparations()?;
+    let namespace = super::durability::Directories::capture(directory)?;
     let mut document = toml::to_string_pretty(registry).map_err(io::Error::other)?;
     if !document.ends_with('\n') {
         document.push('\n');
@@ -1203,10 +1468,11 @@ fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<()> {
         .tempfile_in(directory)?;
     temporary.write_all(document.as_bytes())?;
     temporary.as_file().sync_all()?;
+    before_publish()?;
     // The rename replaces whatever is at `path` - a link included - rather
     // than writing through it.
     temporary.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    sync(&namespace)
 }
 
 /// A provider written as its executable name, which is what a reader
@@ -1520,7 +1786,9 @@ mod tests {
         );
         assert_eq!(
             registry.register(managed(Provider::Codex, "same@example.com"), &[]),
-            Err(Account::linked(Provider::Codex, linked, home).id())
+            Err(RegistrationError::Duplicate(
+                Account::linked(Provider::Codex, linked, home).id()
+            ))
         );
         assert_eq!(registry.registered().len(), 1);
     }
@@ -1846,7 +2114,9 @@ mod tests {
         let again = managed(Provider::Claude, "ME@example.com");
         assert_eq!(
             registry.register(again, &[]),
-            Err(Account::managed(Provider::Claude, first.key, PathBuf::new()).id())
+            Err(RegistrationError::Duplicate(
+                Account::managed(Provider::Claude, first.key, PathBuf::new()).id()
+            ))
         );
         // The same address at the other provider is another account.
         registry
@@ -1862,7 +2132,9 @@ mod tests {
         )];
         assert_eq!(
             registry.register(managed(Provider::Codex, "sys@example.com"), &system),
-            Err(Account::system(Provider::Codex).id())
+            Err(RegistrationError::Duplicate(
+                Account::system(Provider::Codex).id()
+            ))
         );
         assert_eq!(registry.registered().len(), 2);
     }
