@@ -1501,8 +1501,39 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
     Ok(answers)
 }
 
+/// How long a console keeps trying before it reports the connection as gone.
+const CONSOLE_RECONNECT_WINDOW: Duration = Duration::from_secs(60);
+
+/// A failure of the connection, not an answer from the daemon. A refusal, proof
+/// mismatch or version change is an answer, and retrying would only hide it.
+fn console_connection_lost(error: &ControlError) -> bool {
+    matches!(
+        error,
+        ControlError::Connect(_)
+            | ControlError::Frame(_)
+            | ControlError::ReplyTimeout { .. }
+            | ControlError::ConnectionClosed
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_console_retries_a_lost_connection_but_not_an_answer() {
+        assert!(super::console_connection_lost(
+            &ControlError::ConnectionClosed
+        ));
+        assert!(super::console_connection_lost(&ControlError::Connect(
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused)
+        )));
+        assert!(!super::console_connection_lost(
+            &ControlError::ProofMismatch
+        ));
+        assert!(!super::console_connection_lost(
+            &ControlError::UnsupportedVersion { actual: 1 }
+        ));
+    }
+
     use super::*;
 
     #[test]
@@ -2706,6 +2737,7 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         "cagents provider console — agent {agent}\nPrompts create durable runs. /interrupt [--including-subagents], /answer REQUEST ACTION [ANSWERS_JSON], /quit\nThis is a console over the hosted provider, not its stock TUI.\n"
     );
     let startup = Instant::now() + Duration::from_secs(10);
+    let mut reconnecting: Option<Instant> = None;
     let mut generation = None;
     let mut previous = String::new();
     let mut last_run = None;
@@ -2722,6 +2754,9 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
             },
         ) {
             Ok(Reply::Console(Some(view))) => {
+                if reconnecting.take().is_some() {
+                    eprintln!("Reconnected to the daemon.");
+                }
                 generation = Some(view.generation);
                 let text: String = view
                     .text
@@ -2758,7 +2793,11 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                 }
                 let _ = io::stdout().flush();
             }
-            Ok(Reply::Console(None)) => {}
+            Ok(Reply::Console(None)) => {
+                if reconnecting.take().is_some() {
+                    eprintln!("Reconnected to the daemon.");
+                }
+            }
             Ok(_) => {
                 return Err(AppError::new(
                     "agent_console",
@@ -2771,6 +2810,20 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                     && (message.contains("not attached yet")
                         || message.contains("no longer live")
                         || message.contains("paired provider console is unavailable")) => {}
+            // A reply that was late or lost says nothing about the agent, so the
+            // console outlives it. Only this idempotent read is ever repeated.
+            Err(error) if console_connection_lost(&error) => {
+                let deadline = *reconnecting.get_or_insert_with(|| {
+                    eprintln!("Lost the daemon connection ({error}); reconnecting.");
+                    Instant::now() + CONSOLE_RECONNECT_WINDOW
+                });
+                if Instant::now() >= deadline {
+                    return Err(protocol_error(error));
+                }
+                if let Ok(replacement) = ControlClient::connect(&socket) {
+                    client = replacement;
+                }
+            }
             Err(error) => return Err(protocol_error(error)),
         }
         match input.recv_timeout(Duration::from_millis(250)) {
