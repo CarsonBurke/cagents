@@ -1,0 +1,128 @@
+#!/usr/bin/python3 -I
+"""Ask a person's native-fixture-broker to drive an isolated native UI fixture.
+
+This only sends one structured request and prints the reply. It starts nothing,
+and neither reads nor forwards the caller's agent authority.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+
+SOCKET_NAME = "native-fixture-broker.sock"
+EXIT_NO_BROKER = 69
+NO_BROKER = (
+    "No native-fixture-broker is listening. Ask the person to run "
+    "scripts/native-fixture-broker in a terminal outside cagents; "
+    "do not start it from this shell."
+)
+
+
+def parse(argv):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def command(name, help_text):
+        sub = commands.add_parser(name, help=help_text)
+        sub.add_argument("fixture")
+        return sub
+
+    command("start", "start a nested session and sandbox").add_argument(
+        "--checkout", required=True, help="checkout beneath this repository's .worktrees/"
+    )
+    command("run-ui", "build and launch through scripts/run-development --browserless")
+    command("cli", "run the fixture's own cagents").add_argument("args", nargs=argparse.REMAINDER)
+    command("click", "click a label or X,Y").add_argument("target")
+    commands.choices["click"].add_argument("--button", choices=("left", "right", "middle"))
+    commands.choices["click"].add_argument("--double", action="store_true")
+    command("move", "hover a label or X,Y").add_argument("target")
+    command("type", "type literal text").add_argument("text")
+    command("key", "press key chords").add_argument("chords", nargs="+")
+    scroll = command("scroll", "scroll the pointer's surface")
+    scroll.add_argument("axis", choices=("v", "h"))
+    scroll.add_argument("notches", type=float)
+    scroll.add_argument("--at")
+    wait = command("wait", "wait for text to appear or disappear")
+    wait.add_argument("text")
+    wait.add_argument("--gone", action="store_true")
+    wait.add_argument("--timeout", type=float)
+    command("observe", "report windows and located text").add_argument("--no-text", action="store_true")
+    command("screenshot", "capture into the fixture root").add_argument("name")
+    command("status", "report the fixture's state")
+    command("stop", "stop the fixture and remove its directory").add_argument(
+        "--keep", action="store_true", help="keep the fixture directory and its screenshots"
+    )
+    return parser.parse_args(argv)
+
+
+def request_from(parsed):
+    command = parsed.command
+    fixture = parsed.fixture
+    if command == "start":
+        return {"op": "start", "fixture": fixture, "checkout": str(Path(parsed.checkout).absolute())}
+    if command == "run-ui":
+        return {"op": "run-ui", "fixture": fixture}
+    if command == "cli":
+        args = parsed.args[1:] if parsed.args[:1] == ["--"] else parsed.args
+        return {"op": "cli", "fixture": fixture, "args": args}
+    if command == "screenshot":
+        return {"op": "screenshot", "fixture": fixture, "name": parsed.name}
+    if command == "status":
+        return {"op": "status", "fixture": fixture}
+    if command == "stop":
+        return {"op": "stop", "fixture": fixture, "keep": parsed.keep}
+    request = {"op": "input", "fixture": fixture, "action": command}
+    if command in ("click", "move"):
+        request["target"] = parsed.target
+        if command == "click":
+            request["double"] = parsed.double
+            if parsed.button:
+                request["button"] = parsed.button
+    elif command == "type":
+        request["text"] = parsed.text
+    elif command == "key":
+        request["chords"] = parsed.chords
+    elif command == "scroll":
+        request.update(axis=parsed.axis, notches=parsed.notches)
+        if parsed.at:
+            request["at"] = parsed.at
+    elif command == "wait":
+        request.update(text=parsed.text, gone=parsed.gone)
+        if parsed.timeout is not None:
+            request["timeout"] = parsed.timeout
+    elif command == "observe":
+        request["no_text"] = parsed.no_text
+    return request
+
+
+def main(argv=None):
+    request = request_from(parse(argv))
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        print(NO_BROKER, file=sys.stderr)
+        return EXIT_NO_BROKER
+    connection = socket.socket(socket.AF_UNIX)
+    try:
+        connection.connect(str(Path(runtime) / SOCKET_NAME))
+    except OSError:
+        print(NO_BROKER, file=sys.stderr)
+        return EXIT_NO_BROKER
+    with connection, connection.makefile("rwb") as stream:
+        stream.write(json.dumps(request).encode() + b"\n")
+        stream.flush()
+        reply = stream.readline()
+    if not reply:
+        print("The broker closed the connection without replying.", file=sys.stderr)
+        return 1
+    print(reply.decode().rstrip("\n"))
+    decoded = json.loads(reply)
+    if not decoded.get("ok"):
+        return 1
+    return decoded.get("result", {}).get("exit_code", 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

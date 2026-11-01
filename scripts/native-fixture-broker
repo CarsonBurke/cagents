@@ -1,0 +1,954 @@
+#!/usr/bin/python3 -I
+"""Run isolated native UI fixtures for agents, from a person's own terminal.
+
+A person starts this once, in a terminal outside cagents. Agents then ask it,
+through scripts/native-fixture, to drive a fixture that only ever sees its own
+HOME, XDG directories, daemon and offline provider. The broker never scrubs an
+authority token: it refuses to start where one is present or inherited.
+
+Every process that runs code from a checkout runs inside the fixture's sandbox.
+Only niri-harness and niri run outside it, driving their own nested session.
+"""
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import socket
+import socketserver
+import stat
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+EXIT_AGENT_AUTHORITY = 77
+# The same inherited identities src/control.rs treats as a hosted session.
+AUTHORITY_NAMES = (
+    "CAGENTS_AGENT_AUTHORITY",
+    "CAGENTS_AGENT_TOKEN",
+    "CAGENTS_SESSION_TOKEN",
+)
+GUARD_MESSAGE = (
+    "native-fixture-broker must be started by a person in a terminal outside "
+    "cagents; inherited agent authority was not modified."
+)
+SOCKET_NAME = "native-fixture-broker.sock"
+FIXTURE_DIR = "native-fixture"
+MAX_REQUEST_BYTES = 256 * 1024
+MAX_OUTPUT_BYTES = 64 * 1024
+MAX_TEXT = 8192
+MAX_ARGS = 64
+HOLDER_START_SECONDS = 20
+HARNESS_SECONDS = 180
+CLI_SECONDS = 120
+SYSTEM_PATH = "/usr/bin:/usr/sbin"
+
+FIXTURE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,23}")
+SHOT_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+PATH_COMPONENT = re.compile(r"[A-Za-z0-9._+-]+")
+KEY_CHORD = re.compile(r"[A-Za-z0-9_+-]{1,64}")
+ZIG_VERSION = re.compile(r'^\s*zig\s*=\s*"(\d+\.\d+\.\d+)"\s*$', re.MULTILINE)
+
+
+class Refusal(Exception):
+    def __init__(self, code, detail):
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
+# --------------------------------------------------------------------------
+# Starting only where no agent authority exists
+
+
+def ancestors_holding_authority(start_pid, proc_root="/proc"):
+    """Name the ancestors whose environment holds authority, never its value.
+
+    An unset variable passes a check of this process alone, so a broker launched
+    from inside an agent's process tree is refused as well. Unreadable ancestors
+    belong to another user or have exited, and hold nothing of this user's.
+    """
+    found = []
+    pid = start_pid
+    seen = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        try:
+            environment = Path(proc_root, str(pid), "environ").read_bytes()
+        except OSError:
+            environment = b""
+        names = {entry.partition(b"=")[0] for entry in environment.split(b"\0")}
+        if any(name.encode() in names for name in AUTHORITY_NAMES):
+            found.append(pid)
+        try:
+            status = Path(proc_root, str(pid), "status").read_text()
+            pid = int(re.search(r"^PPid:\s*(\d+)$", status, re.MULTILINE).group(1))
+        except (OSError, AttributeError, ValueError):
+            break
+    return found
+
+
+def guard(environ=None, parent_pid=None, proc_root="/proc"):
+    """Return an exit code when agent authority is present or inherited."""
+    environ = os.environ if environ is None else environ
+    parent_pid = os.getppid() if parent_pid is None else parent_pid
+    if any(name in environ for name in AUTHORITY_NAMES):
+        print(GUARD_MESSAGE, file=sys.stderr)
+        return EXIT_AGENT_AUTHORITY
+    holders = ancestors_holding_authority(parent_pid, proc_root)
+    if holders:
+        print(
+            f"{GUARD_MESSAGE} An ancestor process holds it: {holders}",
+            file=sys.stderr,
+        )
+        return EXIT_AGENT_AUTHORITY
+    return None
+
+
+# --------------------------------------------------------------------------
+# Request validation. Nothing here touches anything but the paths it checks.
+
+
+def _text(request, key, *, limit=MAX_TEXT):
+    value = request.get(key)
+    if not isinstance(value, str) or not value or len(value) > limit or "\0" in value:
+        raise Refusal("invalid_request", f"{key} must be nonempty text within {limit} characters")
+    return value
+
+
+def _matching(request, key, pattern):
+    value = request.get(key)
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise Refusal("invalid_request", f"{key} must match {pattern.pattern}")
+    return value
+
+
+def _flag(request, key):
+    value = request.get(key, False)
+    if not isinstance(value, bool):
+        raise Refusal("invalid_request", f"{key} must be true or false")
+    return value
+
+
+def _number(request, key, low, high, default=None):
+    value = request.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
+        raise Refusal("invalid_request", f"{key} must be a number from {low} to {high}")
+    return value
+
+
+def validate_checkout(value, repo):
+    """Resolve a checkout path to a directory beneath the repo's .worktrees/."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise Refusal("invalid_request", "checkout must be a path")
+    candidate = Path(value)
+    worktrees = (repo / ".worktrees").resolve()
+    if not candidate.is_absolute():
+        candidate = worktrees / candidate
+    # Resolved so a symlink under .worktrees/ cannot lead out of it.
+    resolved = candidate.resolve()
+    if worktrees not in resolved.parents:
+        raise Refusal("path_escape", "checkout must be beneath this repository's .worktrees/")
+    relative = resolved.relative_to(worktrees)
+    if relative.parts[0] == FIXTURE_DIR:
+        raise Refusal("path_escape", "a fixture directory is not a checkout")
+    if not all(PATH_COMPONENT.fullmatch(part) for part in resolved.parts[1:]):
+        raise Refusal("invalid_request", "checkout path contains unsupported characters")
+    for required in (
+        "scripts/run-development",
+        "tests/fixtures/chat-composer-claude.sh",
+        "mise.toml",
+    ):
+        if not (resolved / required).is_file():
+            raise Refusal("invalid_checkout", f"checkout has no {required}")
+    return resolved
+
+
+def _input_fields(request):
+    action = request.get("action")
+    if action in ("click", "move"):
+        fields = {"target": _text(request, "target")}
+        if action == "click":
+            button = request.get("button", "left")
+            if button not in ("left", "right", "middle"):
+                raise Refusal("invalid_request", "button must be left, right or middle")
+            fields.update(button=button, double=_flag(request, "double"))
+        return fields
+    if action == "type":
+        return {"text": _text(request, "text")}
+    if action == "key":
+        chords = request.get("chords")
+        if not isinstance(chords, list) or not 1 <= len(chords) <= MAX_ARGS:
+            raise Refusal("invalid_request", f"chords must list 1 to {MAX_ARGS} keys")
+        for chord in chords:
+            if not isinstance(chord, str) or not KEY_CHORD.fullmatch(chord):
+                raise Refusal("invalid_request", f"chords must match {KEY_CHORD.pattern}")
+        return {"chords": chords}
+    if action == "scroll":
+        axis = request.get("axis")
+        if axis not in ("v", "h", "vertical", "horizontal"):
+            raise Refusal("invalid_request", "axis must be v or h")
+        fields = {"axis": axis, "notches": _number(request, "notches", -100, 100)}
+        if "at" in request:
+            fields["at"] = _text(request, "at")
+        return fields
+    if action == "wait":
+        return {
+            "text": _text(request, "text"),
+            "gone": _flag(request, "gone"),
+            "timeout": _number(request, "timeout", 1, 120, default=20),
+        }
+    if action == "observe":
+        return {"no_text": _flag(request, "no_text")}
+    raise Refusal("unknown_action", "unknown input action")
+
+
+INPUT_KEYS = {"op", "fixture", "action", "target", "button", "double", "text", "chords",
+              "axis", "notches", "at", "gone", "timeout", "no_text"}
+OP_KEYS = {
+    "start": {"op", "fixture", "checkout"},
+    "run-ui": {"op", "fixture"},
+    "cli": {"op", "fixture", "args"},
+    "input": INPUT_KEYS,
+    "screenshot": {"op", "fixture", "name"},
+    "status": {"op", "fixture"},
+    "stop": {"op", "fixture", "keep"},
+}
+
+
+def validate_request(request, repo):
+    """Reduce a decoded request to the fields its operation allows."""
+    if not isinstance(request, dict):
+        raise Refusal("invalid_request", "a request is one JSON object")
+    op = request.get("op")
+    if not isinstance(op, str) or op not in OP_KEYS:
+        raise Refusal("unknown_op", "unknown operation")
+    # No environment, cwd or executable field can reach a sandboxed command.
+    unexpected = set(request) - OP_KEYS[op]
+    if unexpected:
+        raise Refusal("invalid_request", f"unexpected fields: {sorted(unexpected)}")
+    fixture = _matching(request, "fixture", FIXTURE_NAME)
+    result = {"op": op, "fixture": fixture}
+    if op == "start":
+        result["checkout"] = validate_checkout(request.get("checkout"), repo)
+    elif op == "cli":
+        args = request.get("args")
+        if not isinstance(args, list) or not 1 <= len(args) <= MAX_ARGS:
+            raise Refusal("invalid_request", f"args must list 1 to {MAX_ARGS} arguments")
+        for argument in args:
+            if not isinstance(argument, str) or "\0" in argument or len(argument) > MAX_TEXT:
+                raise Refusal("invalid_request", "each argument must be text")
+        result["args"] = args
+    elif op == "input":
+        result["action"] = request.get("action")
+        result.update(_input_fields(request))
+    elif op == "screenshot":
+        result["name"] = _matching(request, "name", SHOT_NAME)
+    elif op == "stop":
+        result["keep"] = _flag(request, "keep")
+    return result
+
+
+# --------------------------------------------------------------------------
+# Sandbox construction
+
+
+@dataclass(frozen=True)
+class Host:
+    repo: Path
+    home: Path
+    runtime_dir: Path
+    cargo_home: Path
+    rustup_home: Path
+    cargo_target: Path
+    mise_data: Path
+    harness: str = "niri-harness"
+    niri: str = "niri"
+
+
+@dataclass(frozen=True)
+class Layout:
+    host: Host
+    name: str
+    checkout: Path
+    zig_dir: Path
+
+    @property
+    def root(self):
+        return self.host.repo / ".worktrees" / FIXTURE_DIR / self.name
+
+    @property
+    def sandbox(self):
+        # The only part of the fixture root a sandboxed process can write.
+        return self.root / "sandbox"
+
+    @property
+    def niri_root(self):
+        # Outside the sandbox, so its contents cannot redirect the harness.
+        return self.root / "niri"
+
+    @property
+    def runner_log(self):
+        return self.sandbox / "runner.log"
+
+    @property
+    def shots(self):
+        return self.niri_root / "shots"
+
+    @property
+    def runtime(self):
+        # Mounted as XDG_RUNTIME_DIR inside; the short path keeps sockets legal.
+        return self.host.runtime_dir / f"nf-{self.name}"
+
+    @property
+    def relay_host(self):
+        return self.runtime / "relay.sock"
+
+    @property
+    def relay_inside(self):
+        return self.host.runtime_dir / "relay.sock"
+
+    @property
+    def info_file(self):
+        return self.host.runtime_dir / f"nf-{self.name}.info"
+
+    @property
+    def sentinel(self):
+        return f"/.native-fixture-{self.name}"
+
+    @property
+    def nested_wayland(self):
+        return self.host.runtime_dir / "nested-wayland"
+
+    @property
+    def cli(self):
+        return self.host.cargo_target / "dev-runtime" / "cagents"
+
+    @property
+    def directories(self):
+        return [
+            self.sandbox / name
+            for name in ("home", "data", "config", "cache", "bin", "project")
+        ] + [self.niri_root, self.sandbox / "cache/zig"]
+
+
+def git_common_dir(checkout, repo):
+    """The repo's .git when this checkout is a linked worktree of it."""
+    pointer = checkout / ".git"
+    if not pointer.is_file():
+        return None
+    common = (repo / ".git").resolve()
+    if not common.is_dir():
+        return None
+    target = pointer.read_text(errors="replace").removeprefix("gitdir:").strip()
+    return common if common in Path(target).resolve().parents else None
+
+
+def sandbox_args(layout, wayland_source):
+    """bwrap arguments that decide what a fixture process can reach.
+
+    Environment is deliberately absent: holder_command starts from an empty one
+    and each command receives sandbox_env.
+    """
+    host = layout.host
+    args = [
+        "--unshare-all",
+        "--die-with-parent",
+        "--cap-drop", "ALL",
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/etc", "/etc",
+    ]
+    for name in ("bin", "sbin", "lib", "lib64"):
+        path = Path("/") / name
+        if path.is_symlink():
+            args += ["--symlink", os.readlink(path), str(path)]
+        elif path.is_dir():
+            args += ["--ro-bind", str(path), str(path)]
+    args += [
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--dev-bind-try", "/dev/dri", "/dev/dri",
+        "--ro-bind-try", "/sys", "/sys",
+        "--tmpfs", "/tmp",
+        "--tmpfs", "/var",
+        "--dir", layout.sentinel,
+        # Cargo keeps its real paths so the shared target stays reusable, and
+        # its lock file lands on a tmpfs. credentials.toml beside them is absent.
+        "--tmpfs", str(host.cargo_home),
+        "--ro-bind-try", str(host.cargo_home / "bin"), str(host.cargo_home / "bin"),
+        "--ro-bind-try", str(host.cargo_home / "registry"), str(host.cargo_home / "registry"),
+        "--ro-bind-try", str(host.cargo_home / "git"), str(host.cargo_home / "git"),
+        "--ro-bind", str(host.rustup_home), str(host.rustup_home),
+        "--ro-bind", str(layout.zig_dir), str(layout.zig_dir),
+        "--ro-bind", str(layout.checkout), str(layout.checkout),
+    ]
+    git = git_common_dir(layout.checkout, host.repo)
+    if git is not None:
+        args += ["--ro-bind", str(git), str(git)]
+    args += [
+        "--bind", str(host.cargo_target), str(host.cargo_target),
+        "--bind", str(layout.sandbox), str(layout.sandbox),
+        # Zig fetches into this cache; with no network it reads what exists.
+        "--ro-bind-try", str(host.home / ".cache/zig/p"), str(layout.sandbox / "cache/zig/p"),
+        "--bind", str(layout.runtime), str(host.runtime_dir),
+        "--bind", wayland_source, str(layout.nested_wayland),
+        "--chdir", str(layout.sandbox / "project"),
+    ]
+    return args
+
+
+def sandbox_env(layout):
+    """The whole environment of a sandboxed process, built from nothing."""
+    host = layout.host
+    sandbox = layout.sandbox
+    return {
+        "HOME": str(sandbox / "home"),
+        "USER": host.home.name,
+        "LOGNAME": host.home.name,
+        "LANG": "C.UTF-8",
+        "TERM": "dumb",
+        "TMPDIR": "/tmp",
+        "XDG_RUNTIME_DIR": str(host.runtime_dir),
+        "XDG_DATA_HOME": str(sandbox / "data"),
+        "XDG_CONFIG_HOME": str(sandbox / "config"),
+        "XDG_CACHE_HOME": str(sandbox / "cache"),
+        "XDG_SESSION_TYPE": "wayland",
+        "WAYLAND_DISPLAY": layout.nested_wayland.name,
+        "PATH": ":".join(
+            [str(sandbox / "bin"), str(host.cargo_home / "bin"), str(layout.zig_dir), SYSTEM_PATH]
+        ),
+        "CARGO_HOME": str(host.cargo_home),
+        "RUSTUP_HOME": str(host.rustup_home),
+        "RUSTUP_AUTO_INSTALL": "0",
+        "CARGO_TARGET_DIR": str(host.cargo_target),
+        "CARGO_NET_OFFLINE": "true",
+        "ZIG_GLOBAL_CACHE_DIR": str(sandbox / "cache/zig"),
+    }
+
+
+# Runs as the sandbox's long-lived process, so every fixture command shares one
+# PID namespace. A separate sandbox per command would give the daemon peers it
+# cannot name, and end any daemon a CLI command autostarted when it exits.
+# nsenter cannot join instead: setns into a bwrap sandbox using --dev is refused.
+RELAY = r"""
+import json, socketserver, subprocess, sys
+LIMIT = %d
+children = {}
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        request = json.loads(self.rfile.readline())
+        self.wfile.write(json.dumps(run(request)).encode() + b"\n")
+def run(request):
+    name = request.get("poll")
+    if name is not None:
+        child = children.get(name)
+        return {"state": "not_started" if child is None else "running" if child.poll() is None else f"exited_{child.returncode}"}
+    spawn = dict(args=request["argv"], cwd=request["cwd"], env=request.get("env"), stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        if "log" in request:
+            with open(request["log"], "ab") as log:
+                children[request["background"]] = subprocess.Popen(stdout=log, stderr=subprocess.STDOUT, **spawn)
+            return {"state": "running"}
+        done = subprocess.run(capture_output=True, timeout=request["timeout"], **spawn)
+    except subprocess.TimeoutExpired:
+        return {"timed_out": True}
+    except OSError as error:
+        return {"exit_code": 127, "stdout": "", "stderr": str(error)}
+    return {"exit_code": done.returncode, "stdout": done.stdout[-LIMIT:].decode("utf-8", "replace"), "stderr": done.stderr[-LIMIT:].decode("utf-8", "replace")}
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+Server(sys.argv[1], Handler).serve_forever()
+""" % MAX_OUTPUT_BYTES
+
+
+def relay_command(socket_path):
+    return ["/usr/bin/python3", "-I", "-c", RELAY, str(socket_path)]
+
+
+def holder_command(layout):
+    """The shell command niri-harness runs: the sandbox and its command relay.
+
+    niri-harness only accepts a shell string. Every validated value is quoted,
+    and the nested socket is named by the compositor's own environment. env -i
+    keeps this person's terminal environment out of the sandbox's /proc; this
+    only ever runs under a broker that the guard proved holds no authority.
+    """
+    # A placeholder keeps the one expansion out of shlex's quoting.
+    source = "@NESTED_WAYLAND@"
+    arguments = ["exec", "/usr/bin/env", "-i", "/usr/bin/bwrap", "--new-session", "--info-fd", "3"]
+    arguments += sandbox_args(layout, source)
+    arguments += ["--", *relay_command(layout.relay_inside)]
+    quoted = " ".join(shlex.quote(argument) for argument in arguments)
+    quoted = quoted.replace(shlex.quote(source), '"$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"')
+    return f"{quoted} 3>{shlex.quote(str(layout.info_file))}"
+
+
+def relay_call(socket_path, request, timeout):
+    """Send one request into the sandbox. Everything sandboxed there is argv."""
+    connection = socket.socket(socket.AF_UNIX)
+    connection.settimeout(timeout)
+    try:
+        connection.connect(str(socket_path))
+        with connection, connection.makefile("rwb") as stream:
+            stream.write(json.dumps(request).encode() + b"\n")
+            stream.flush()
+            reply = stream.readline()
+    except OSError as error:
+        raise Refusal("sandbox_failed", f"the fixture sandbox did not answer: {error}") from None
+    if not reply:
+        raise Refusal("sandbox_failed", "the fixture sandbox closed the connection")
+    return json.loads(reply)
+
+
+def runner_command(layout):
+    return [
+        str(layout.checkout / "scripts/run-development"),
+        "--browserless", "--debug", "--log-file", str(layout.sandbox / "ui.log"),
+    ]
+
+
+def input_argv(request):
+    """Arguments after the harness's global flags. `--` keeps text from being flags."""
+    action = request["action"]
+    if action == "click":
+        extra = ["--button", request["button"]] + (["--double"] if request["double"] else [])
+        return ["click", *extra, "--", request["target"]]
+    if action == "move":
+        return ["move", "--", request["target"]]
+    if action == "type":
+        return ["type", "--", request["text"]]
+    if action == "key":
+        return ["key", "--", *request["chords"]]
+    if action == "scroll":
+        extra = ["--at", request["at"]] if "at" in request else []
+        return ["scroll", *extra, "--", request["axis"], str(request["notches"])]
+    if action == "wait":
+        extra = ["--gone"] if request["gone"] else []
+        return ["wait", *extra, "--timeout", str(request["timeout"]), "--", request["text"]]
+    if action == "observe":
+        return ["observe", *(["--no-text"] if request["no_text"] else [])]
+    raise Refusal("unknown_action", "unknown input action")
+
+
+def harness_argv(host, name, command):
+    return [host.harness, "--session", name, "--json", *command]
+
+
+def bounded(data):
+    return data[-MAX_OUTPUT_BYTES:].decode("utf-8", "replace")
+
+
+# --------------------------------------------------------------------------
+# Fixture lifecycle
+
+
+class Fixture:
+    def __init__(self, layout, holder_pid):
+        self.layout = layout
+        self.holder_pid = holder_pid
+        self.lock = threading.Lock()
+
+
+def holder_is_live(layout, pid):
+    """True while this PID is still the sandbox that carries the fixture's mark."""
+    return os.path.isdir(f"/proc/{pid}/root{layout.sentinel}")
+
+
+class Fixtures:
+    def __init__(self, host, harness_env):
+        self.host = host
+        self.harness_env = harness_env
+        self.lock = threading.Lock()
+        # Holder PIDs live only in this process's memory: nothing on disk can
+        # point the broker at some other process's namespaces.
+        self.live = {}
+
+    def handle(self, request):
+        op = request["op"]
+        if op == "start":
+            return self.start(request)
+        fixture = self.live.get(request["fixture"])
+        if fixture is None:
+            raise Refusal("unknown_fixture", "this broker does not own a fixture by that name")
+        with fixture.lock:
+            if not holder_is_live(fixture.layout, fixture.holder_pid) and op != "stop":
+                raise Refusal("fixture_dead", "the fixture sandbox has exited; stop it and start again")
+            return getattr(self, op.replace("-", "_"))(fixture, request)
+
+    def harness(self, layout, command, timeout=HARNESS_SECONDS):
+        return subprocess.run(
+            command,
+            env={**self.harness_env, "NIRI_HARNESS_STATE": str(layout.root / "harness-state")},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            start_new_session=True,
+        )
+
+    def layout_for(self, name, checkout):
+        pin = ZIG_VERSION.search((checkout / "mise.toml").read_text(errors="replace"))
+        if pin is None:
+            raise Refusal("invalid_checkout", "mise.toml does not pin a Zig version")
+        zig_dir = self.host.mise_data / "installs/zig" / pin.group(1)
+        if not (zig_dir / "zig").is_file():
+            zig_dir = zig_dir / "bin"
+        if not (zig_dir / "zig").is_file():
+            raise Refusal("missing_toolchain", f"Zig {pin.group(1)} is not installed")
+        return Layout(self.host, name, checkout, zig_dir)
+
+    def start(self, request):
+        name = request["fixture"]
+        with self.lock:
+            if name in self.live:
+                raise Refusal("fixture_exists", "a live fixture already has that name")
+            layout = self.layout_for(name, request["checkout"])
+            if os.path.lexists(layout.root):
+                raise Refusal("fixture_exists", f"remove the stale fixture directory {layout.root}")
+            fixture = Fixture(layout, None)
+            self.live[name] = fixture
+        try:
+            with fixture.lock:
+                self._create(fixture)
+        except BaseException:
+            self.live.pop(name, None)
+            if fixture.holder_pid is not None and holder_is_live(layout, fixture.holder_pid):
+                os.kill(fixture.holder_pid, signal.SIGKILL)
+            self._discard(layout, remove=False)
+            raise
+        return {
+            "fixture": name,
+            "root": str(layout.root),
+            "fixture_home": str(layout.sandbox / "home"),
+            "shots": str(layout.shots),
+        }
+
+    def _create(self, fixture):
+        layout = fixture.layout
+        for directory in layout.directories:
+            directory.mkdir(parents=True, exist_ok=True)
+        layout.runtime.mkdir(mode=0o700)
+        os.symlink(
+            layout.checkout / "tests/fixtures/chat-composer-claude.sh",
+            layout.sandbox / "bin/claude",
+        )
+        focused = self._host_focus()
+        started = self.harness(
+            layout,
+            [
+                self.host.harness, "session", "start", layout.name,
+                "--root", str(layout.niri_root),
+                "--no-window-wait",
+                "--cmd", holder_command(layout),
+            ],
+        )
+        # --no-window-wait returns before niri-harness hands focus back.
+        self._restore_host_focus(focused)
+        if started.returncode:
+            raise Refusal("harness_failed", bounded(started.stderr or started.stdout))
+        fixture.holder_pid = self._await_holder(layout)
+        initialized = self._in_sandbox(
+            fixture, ["/usr/bin/git", "init", "--quiet", "--initial-branch=main", "."]
+        )
+        if initialized["exit_code"]:
+            raise Refusal("sandbox_failed", initialized["stderr"])
+
+    def _host_focus(self):
+        try:
+            output = subprocess.run(
+                [self.host.niri, "msg", "--json", "focused-window"],
+                env=self.harness_env, capture_output=True, timeout=5, stdin=subprocess.DEVNULL,
+            )
+            window = json.loads(output.stdout or b"null")
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        return window.get("id") if isinstance(window, dict) else None
+
+    def _restore_host_focus(self, window_id):
+        if window_id is None:
+            return
+        try:
+            subprocess.run(
+                [self.host.niri, "msg", "action", "focus-window", "--id", str(window_id)],
+                env=self.harness_env, capture_output=True, timeout=5, stdin=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _await_holder(self, layout):
+        deadline = time.monotonic() + HOLDER_START_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                pid = json.loads(layout.info_file.read_text())["child-pid"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pid = None
+            if isinstance(pid, int) and holder_is_live(layout, pid) and layout.relay_host.exists():
+                layout.info_file.unlink(missing_ok=True)
+                return pid
+            time.sleep(0.1)
+        try:
+            log = bounded((layout.niri_root / "session.log").read_bytes())
+        except OSError:
+            log = ""
+        raise Refusal("sandbox_failed", f"the fixture sandbox did not start. {log}")
+
+    def _in_sandbox(self, fixture, command, timeout=CLI_SECONDS):
+        layout = fixture.layout
+        reply = relay_call(
+            layout.relay_host,
+            {"argv": command, "cwd": str(layout.sandbox / "project"),
+             "env": sandbox_env(layout), "timeout": timeout},
+            timeout + 5,
+        )
+        if reply.get("timed_out"):
+            raise Refusal("timeout", f"the command did not finish within {timeout}s")
+        return reply
+
+    def _runner_state(self, fixture):
+        return relay_call(fixture.layout.relay_host, {"poll": "runner"}, 10)["state"]
+
+    def run_ui(self, fixture, _request):
+        if self._runner_state(fixture) == "running":
+            raise Refusal("runner_active", "the development runner is already running")
+        layout = fixture.layout
+        relay_call(
+            layout.relay_host,
+            {"argv": runner_command(layout), "cwd": str(layout.checkout),
+             "env": sandbox_env(layout), "background": "runner", "log": str(layout.runner_log)},
+            10,
+        )
+        return {
+            "state": "building_then_launching",
+            "runner_log": str(layout.runner_log),
+            "ui_log": str(layout.sandbox / "ui.log"),
+        }
+
+    def cli(self, fixture, request):
+        if not fixture.layout.cli.is_file():
+            raise Refusal("cli_not_built", "run-ui has not built this fixture's cagents CLI yet")
+        return self._in_sandbox(fixture, [str(fixture.layout.cli), *request["args"]])
+
+    def _drive(self, fixture, command):
+        try:
+            result = self.harness(fixture.layout, harness_argv(self.host, fixture.layout.name, command))
+        except subprocess.TimeoutExpired:
+            raise Refusal("timeout", "niri-harness did not finish") from None
+        return {
+            "exit_code": result.returncode,
+            "stdout": bounded(result.stdout),
+            "stderr": bounded(result.stderr),
+        }
+
+    def input(self, fixture, request):
+        return self._drive(fixture, input_argv(request))
+
+    def screenshot(self, fixture, request):
+        result = self._drive(fixture, ["shot", "--", request["name"]])
+        result["path"] = str(fixture.layout.shots / f"{request['name']}.png")
+        return result
+
+    def status(self, fixture, _request):
+        return {
+            "fixture": fixture.layout.name,
+            "root": str(fixture.layout.root),
+            "runner": self._runner_state(fixture),
+            "cli_built": fixture.layout.cli.is_file(),
+        }
+
+    def stop(self, fixture, request):
+        layout = fixture.layout
+        # niri quitting does not end the process waiting on the holder, so the
+        # holder ends first. Its PID namespace takes every fixture process along.
+        if fixture.holder_pid is not None and holder_is_live(layout, fixture.holder_pid):
+            os.kill(fixture.holder_pid, signal.SIGKILL)
+        self._discard(layout, remove=not request.get("keep"))
+        self.live.pop(layout.name, None)
+        return {"fixture": layout.name, "kept": bool(request.get("keep"))}
+
+    def _discard(self, layout, *, remove):
+        try:
+            self.harness(layout, [self.host.harness, "session", "stop", layout.name], timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        layout.info_file.unlink(missing_ok=True)
+        shutil.rmtree(layout.runtime, ignore_errors=True)
+        if remove:
+            # rmtree does not follow symlinks a sandboxed process may have planted.
+            shutil.rmtree(layout.root, ignore_errors=True)
+
+    def stop_all(self):
+        for fixture in list(self.live.values()):
+            with fixture.lock:
+                self.stop(fixture, {"keep": True})
+
+
+# --------------------------------------------------------------------------
+# Socket protocol: one JSON line each way, one request per connection
+
+
+def peer_uid(connection):
+    data = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    return struct.unpack("3i", data)[2]
+
+
+def answer(raw, repo, handler):
+    """Turn one request line into one response object."""
+    try:
+        if len(raw) >= MAX_REQUEST_BYTES:
+            raise Refusal("invalid_request", "the request is too large")
+        try:
+            decoded = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            raise Refusal("invalid_request", "a request is one JSON object") from None
+        return {"ok": True, "result": handler(validate_request(decoded, repo))}
+    except Refusal as refusal:
+        return {"ok": False, "code": refusal.code, "detail": refusal.detail}
+    except Exception as error:  # A failed fixture must not take down the others.
+        return {"ok": False, "code": "internal_error", "detail": f"{type(error).__name__}: {error}"}
+
+
+class Connection(socketserver.StreamRequestHandler):
+    def handle(self):
+        if peer_uid(self.request) != os.getuid():
+            return
+        raw = self.rfile.readline(MAX_REQUEST_BYTES)
+        response = answer(raw, self.server.repo, self.server.handler)
+        self.wfile.write(json.dumps(response).encode() + b"\n")
+
+
+class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+    # Removal of a live socket is decided by prepare_socket, never by a reuse flag.
+    allow_reuse_address = False
+
+    def __init__(self, path, repo, handler):
+        self.repo = repo
+        self.handler = handler
+        prepare_socket(path)
+        previous = os.umask(0o177)
+        try:
+            super().__init__(str(path), Connection)
+        finally:
+            os.umask(previous)
+        os.chmod(path, 0o600)
+
+
+def prepare_socket(path):
+    """Replace only a socket nothing is listening on."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(mode):
+        raise Refusal("socket_path_in_use", f"{path} exists and is not a socket")
+    probe = socket.socket(socket.AF_UNIX)
+    try:
+        probe.connect(str(path))
+    except OSError:
+        os.unlink(path)
+    else:
+        raise Refusal("broker_running", f"a broker is already listening at {path}")
+    finally:
+        probe.close()
+
+
+# --------------------------------------------------------------------------
+# Entry point
+
+
+def repository_root(script):
+    """The main checkout this script belongs to, also from a linked worktree."""
+    checkout = script.resolve().parents[1]
+    marker = checkout / ".git"
+    if marker.is_file():
+        target = marker.read_text(errors="replace").removeprefix("gitdir:").strip()
+        return Path(target).resolve().parents[2]
+    return checkout
+
+
+def host_from_environment(arguments):
+    environ = os.environ
+    home = Path(environ["HOME"])
+    repo = repository_root(Path(__file__))
+    target = arguments.cargo_target_dir or environ.get("CARGO_TARGET_DIR") or repo / "target"
+    return Host(
+        repo=repo,
+        home=home,
+        runtime_dir=Path(environ["XDG_RUNTIME_DIR"]),
+        cargo_home=Path(environ.get("CARGO_HOME", home / ".cargo")),
+        rustup_home=Path(environ.get("RUSTUP_HOME", home / ".rustup")),
+        cargo_target=Path(target).resolve(),
+        mise_data=Path(environ.get("MISE_DATA_DIR", home / ".local/share/mise")),
+        harness=shutil.which("niri-harness") or "niri-harness",
+        niri=shutil.which("niri") or "niri",
+    )
+
+
+def missing_requirements():
+    missing = [name for name in ("WAYLAND_DISPLAY", "NIRI_SOCKET", "XDG_RUNTIME_DIR", "HOME")
+               if not os.environ.get(name)]
+    missing += [tool for tool in ("niri-harness", "niri") if shutil.which(tool) is None]
+    missing += [tool for tool in ("/usr/bin/bwrap", "/usr/bin/env", "/usr/bin/python3") if not os.access(tool, os.X_OK)]
+    return missing
+
+
+def main(argv=None):
+    # First, before reading arguments, so nothing runs where authority exists.
+    refused = guard()
+    if refused is not None:
+        return refused
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--check-guard", action="store_true",
+                        help="report that this shell may start a broker, and exit")
+    parser.add_argument("--cargo-target-dir",
+                        help="build directory the sandbox may write "
+                             "(default: CARGO_TARGET_DIR, then the repository's target)")
+    arguments = parser.parse_args(argv)
+    if arguments.check_guard:
+        print("No agent authority is present or inherited.")
+        return 0
+    missing = missing_requirements()
+    if missing:
+        print(f"native-fixture-broker needs a niri session and: {', '.join(missing)}", file=sys.stderr)
+        return 2
+    host = host_from_environment(arguments)
+    host.cargo_target.mkdir(parents=True, exist_ok=True)
+    if host.cargo_target in (host.home, *host.home.parents):
+        print("The Cargo target must not contain HOME.", file=sys.stderr)
+        return 2
+    fixtures = Fixtures(host, dict(os.environ))
+    path = host.runtime_dir / SOCKET_NAME
+    try:
+        server = Server(path, host.repo, fixtures.handle)
+    except Refusal as refusal:
+        print(refusal.detail, file=sys.stderr)
+        return 1
+
+    def terminate(_signal, _frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
+
+    digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    print(f"native-fixture-broker listening at {path}", flush=True)
+    print(f"script {Path(__file__).resolve()} sha256 {digest}", flush=True)
+    print(f"sandbox may write the Cargo target {host.cargo_target}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        fixtures.stop_all()
+        server.server_close()
+        Path(path).unlink(missing_ok=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

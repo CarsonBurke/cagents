@@ -7,6 +7,74 @@ turn busy, acknowledges queued-message removal, and settles on interrupt.
 Later turns complete immediately. Busy messages deliberately stay queued;
 this fixture checks composer interactions, not provider delivery.
 
+There are two routes. An agent uses the broker below. A person in a terminal
+outside cagents can also follow the direct steps after it.
+
+## From an agent: the native fixture broker
+
+A hosted session carries `CAGENTS_AGENT_AUTHORITY`, so the direct steps refuse
+to run there, and that guard stays. Do not unset, proxy or forge the capability
+to get past it. Instead, ask the person to start the broker once, in their own
+terminal outside cagents and inside their niri session:
+
+```sh
+scripts/native-fixture-broker
+```
+
+It exits 77 if agent authority is present in its environment or in any ancestor
+process's. It listens on `$XDG_RUNTIME_DIR/native-fixture-broker.sock` (mode
+0600) until stopped with Ctrl-C, which stops its fixtures and keeps their
+directories. Start it from a commit you have reviewed, because it runs with your
+full authority; it prints its path and SHA-256 when it starts. If this terminal
+has a `CARGO_TARGET_DIR`, or you pass `--cargo-target-dir`, sandboxed builds can
+write there.
+
+An agent then drives a named fixture from any shell, with its environment
+unchanged. The client sends one structured request and never reads or forwards
+the capability. If no broker is listening it says so and exits 69; do not start
+one yourself.
+
+```sh
+scripts/native-fixture start composer --checkout "$repo/.worktrees/my-branch"
+scripts/native-fixture run-ui composer
+scripts/native-fixture status composer
+scripts/native-fixture cli composer -- project open "$fixture/sandbox/project"
+scripts/native-fixture cli composer -- --json agent spawn --provider claude \
+  --model haiku --surface chat --repository "$fixture/sandbox/project" \
+  --prompt 'Can you investigate why the Kaggle submission failed?'
+scripts/native-fixture wait composer 'Kaggle' --timeout 60
+scripts/native-fixture click composer 'Steer'
+scripts/native-fixture type composer 'a literal message'
+scripts/native-fixture key composer ctrl+Return
+scripts/native-fixture screenshot composer after-queued-steer
+scripts/native-fixture stop composer --keep
+```
+
+`start` prints `root`, written as `$fixture` above. The checkout must be beneath
+this repository's `.worktrees/`, so add one with `git worktree add` if you work
+elsewhere. `run-ui` runs `scripts/run-development --browserless` and returns
+while it builds; follow `sandbox/runner.log` and `sandbox/ui.log` under the
+root. Screenshots land in `niri/shots/` under the root as PNG; convert them to
+WebP for a PR. `stop` removes the fixture directory unless given `--keep`. A
+stale directory blocks a new `start` of that name until you remove it. Also
+`move`, `scroll` and `observe`; see `scripts/native-fixture --help`.
+
+Each fixture runs in a bubblewrap sandbox with its own HOME, XDG directories,
+runtime directory, daemon and project. The sandbox has no network, so builds use
+only what is cached, and it sees none of your real HOME, credentials,
+`~/.local/share/cagents*` or `$XDG_RUNTIME_DIR/cagents*`. It binds the toolchain,
+the Cargo registry and Zig package caches and the checkout read-only, and only
+the Cargo target, fixture directory and nested Wayland socket for writing.
+`claude` there is this fixture script. Only `niri-harness` runs outside the
+sandbox, driving its own nested session. The optional behaviors below use
+`sandbox/home/.claude` under the root, which you can write from your own shell.
+
+This is a supported route, not a security boundary against a process of the same
+user. It keeps fixture work away from real state, and does not make an agent's
+own shell any less able to reach it.
+
+## Directly: from a person's own terminal
+
 Use a new directory beneath the repository's ignored `.worktrees/` for every
 run. Keep its HOME, XDG data/config/cache, daemon runtime, and project isolated
 from the development application you normally use. For example, from the
