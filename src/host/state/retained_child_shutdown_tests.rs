@@ -19,6 +19,7 @@ use std::{
 
 const ROOT: &str = "CAGENTS_RETAINED_CHILD_ADMISSION_ROOT";
 const SCOPE: &str = "CAGENTS_RETAINED_CHILD_ADMISSION_AUTHORITY_PRESENCE";
+const ISOLATED_CONSUMER_TEST: &str = "host::state::retained_child_shutdown_tests::retained_original_refuses_parent_upgrade_but_not_an_isolated_upgrade_consumer";
 
 struct TestChild(Child);
 
@@ -107,9 +108,20 @@ fn private_runtime(test: &str) -> Option<PathBuf> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
-            break Some(status);
+            // A late producer completion cannot extend this fixture's acceptance.
+            break (test != ISOLATED_CONSUMER_TEST || Instant::now() < deadline).then_some(status);
         }
         if Instant::now() >= deadline {
+            if test == ISOLATED_CONSUMER_TEST {
+                // Acceptance has expired, but this producer owns a retained
+                // original. Let its guard settle; do not kill its cleanup owner.
+                eprintln!("retained-custody fixture timed out; waiting for its original producer");
+                while let Err(error) = child.0.wait() {
+                    eprintln!("waiting for retained-custody producer: {error}");
+                    thread::sleep(Duration::from_millis(100));
+                }
+                break None;
+            }
             child.0.kill().unwrap();
             child.0.wait().unwrap();
             break None;
@@ -467,10 +479,9 @@ fn retained_original_child_refuses_empty_control_until_exact_reap() {
 
 #[test]
 fn retained_original_refuses_parent_upgrade_but_not_an_isolated_upgrade_consumer() {
-    const NAME: &str = "host::state::retained_child_shutdown_tests::retained_original_refuses_parent_upgrade_but_not_an_isolated_upgrade_consumer";
     const CONSUMER: &str =
         "host::state::tests::committed_upgrade_fences_control_and_retains_checkpoint_until_close";
-    let Some(root) = private_runtime(NAME) else {
+    let Some(root) = private_runtime(ISOLATED_CONSUMER_TEST) else {
         return;
     };
     let host = host();
