@@ -9,6 +9,7 @@ niri-harness and niri with stubs. Where CI has no token, children that must hold
 one get an inert placeholder.
 """
 
+import ast
 import importlib.machinery
 import importlib.util
 import io
@@ -1810,6 +1811,156 @@ class OwnershipContracts(TemporaryRepository):
         matching_dep_info = f"{self.fixture.layout.cli}: {self.fixture.layout.checkout}/src/main.rs\n".encode()
         with mock.patch.object(broker, "read_regular", return_value=matching_dep_info):
             self.assertTrue(self.manager._cli_built(self.fixture))
+
+    def test_retry_uses_current_log_for_build_admission_and_status(self):
+        first = self.fixture
+        other = self.owned_fixture("other", 45)
+        self.manager.live["other"] = other
+        logs, state = {}, {"poll": "not_started"}
+
+        def reply(request, _timeout):
+            if request == {"poll": "runner"}:
+                return {"state": state["poll"]}
+            self.assertEqual(request["background"], "runner")
+            self.assertEqual(request["log"], str(first.runner_log))
+            self.assertFalse(first.runner_started)
+            self.assertNotIn(request["log"], logs)
+            logs[request["log"]] = b"synthetic current cold build\n"
+            state["poll"] = "running"
+            return {"state": "running"}
+
+        def read(root, parts, name, _limit):
+            return logs.get(str(Path(root).joinpath(*parts, name)))
+
+        first.channel.call.side_effect = reply
+        with mock.patch.object(broker, "read_regular", side_effect=read) as reads, mock.patch.object(
+                self.manager, "_holder_alive", return_value=True):
+            initial = self.manager.run_ui(first, {})
+            previous = first.runner_log
+            self.assertEqual(previous, first.layout.runner_log)
+            self.assertEqual(initial["runner_log"], str(previous))
+            logs[str(previous)] = broker.BUILD_FINISHED_MARKER
+            state["poll"] = "exited_0"
+            current = self.manager.run_ui(first, {})
+            self.assertEqual(first.runner_attempt, 2)
+            self.assertEqual(first.runner_log, first.layout.sandbox / "runner-2.log")
+            self.assertEqual(current["runner_log"], str(first.runner_log))
+            self.assertEqual(logs[str(previous)], broker.BUILD_FINISHED_MARKER)
+            reads.reset_mock()
+            status = self.manager.status(first, {})
+            self.assertTrue(status["building"])
+            self.assertEqual(status["runner_log"], current["runner_log"])
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.run_ui(other, {})
+            self.assertEqual(caught.exception.code, "build_busy")
+            other.channel.call.assert_not_called()
+            self.assertTrue(self.manager._is_building(first))
+            logs[str(first.runner_log)] = broker.BUILD_FINISHED_MARKER
+            self.assertFalse(self.manager.status(first, {})["building"])
+            self.assertFalse(self.manager._is_building(first))
+            with mock.patch.object(self.manager, "_start_runner", return_value={"state": "synthetic-start"}) as start:
+                self.assertEqual(self.manager.run_ui(other, {}), {"state": "synthetic-start"})
+                start.assert_called_once_with(other)
+            read_names = [call.args[2] for call in reads.call_args_list]
+            self.assertIn("runner-2.log", read_names)
+            self.assertNotIn("runner.log", read_names)
+            self.assertEqual(logs[str(previous)], broker.BUILD_FINISHED_MARKER)
+
+    def test_retry_without_ack_keeps_current_attempt_busy_and_drops_old_cli_credit(self):
+        for failure in (broker.Refusal("timeout", "synthetic retry ACK lost"), {"state": "not_started"}):
+            with self.subTest(failure=type(failure).__name__):
+                first = self.owned_fixture("demo", 44)
+                other = self.owned_fixture("other", 45)
+                self.manager.live = {"demo": first, "other": other}
+                logs, state = {}, {"poll": "not_started", "launches": 0}
+                logs[str(first.layout.cli.with_suffix(".d"))] = f"{first.layout.cli}: {first.layout.checkout}/src/main.rs\n".encode()
+
+                def reply(request, _timeout):
+                    if request == {"poll": "runner"}:
+                        if state["poll"] == "unreadable":
+                            raise broker.Refusal("timeout", "synthetic unreadable retry")
+                        return {"state": state["poll"]}
+                    self.assertEqual(request["log"], str(first.runner_log))
+                    self.assertFalse(first.runner_started)
+                    self.assertTrue(first.runner_attempted)
+                    self.assertNotIn(request["log"], logs)
+                    logs[request["log"]] = b"synthetic uncompleted retry\n"
+                    state["launches"] += 1
+                    if state["launches"] == 1:
+                        state["poll"] = "running"
+                        return {"state": "running"}
+                    if isinstance(failure, BaseException):
+                        state["poll"] = "unreadable"
+                        raise failure
+                    state["poll"] = "not_started"
+                    return failure
+
+                def read(root, parts, name, _limit):
+                    return logs.get(str(Path(root).joinpath(*parts, name)))
+
+                first.channel.call.side_effect = reply
+                with mock.patch.object(broker, "read_regular", side_effect=read), mock.patch.object(
+                        self.manager, "_holder_alive", return_value=True):
+                    self.manager.run_ui(first, {})
+                    self.assertTrue(self.manager._cli_built(first))
+                    previous = first.runner_log
+                    logs[str(previous)] = broker.BUILD_FINISHED_MARKER
+                    state["poll"] = "exited_0"
+                    with self.assertRaises(broker.Refusal):
+                        self.manager.run_ui(first, {})
+                    self.assertEqual(first.runner_attempt, 2)
+                    self.assertTrue(first.runner_attempted)
+                    self.assertFalse(first.runner_started)
+                    self.assertFalse(self.manager._cli_built(first))
+                    self.assertTrue(self.manager._building_now(first))
+                    if isinstance(failure, BaseException):
+                        with self.assertRaises(broker.Refusal):
+                            self.manager.status(first, {})
+                    else:
+                        status = self.manager.status(first, {})
+                        self.assertTrue(status["building"])
+                        self.assertFalse(status["cli_built"])
+                        self.assertEqual(status["runner_log"], str(first.runner_log))
+                    with self.assertRaises(broker.Refusal) as caught:
+                        self.manager.run_ui(other, {})
+                    self.assertEqual(caught.exception.code, "build_busy")
+                    other.channel.call.assert_not_called()
+                    self.assertEqual(logs[str(previous)], broker.BUILD_FINISHED_MARKER)
+
+    def test_fixed_relay_refuses_existing_log_before_child_dispatch(self):
+        # Future execution extracts only the fixed run definition. No RELAY
+        # imports/socket loop execute; all IO/process globals are explicit mocks.
+        functions = [node for node in ast.parse(broker.RELAY).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "run"]
+        self.assertEqual(len(functions), 1)
+        process = mock.Mock()
+        process.TimeoutExpired = subprocess.TimeoutExpired
+        process.DEVNULL, process.STDOUT = subprocess.DEVNULL, subprocess.STDOUT
+        opening = mock.Mock(side_effect=FileExistsError("synthetic existing private log"))
+        previous, child = object(), object()
+        children = {"runner": previous}
+        namespace = {"__builtins__": {"dict": dict, "str": str, "OSError": OSError},
+                     "children": children, "subprocess": process, "tempfile": mock.Mock(), "open": opening}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), "<fixed-relay-run-mock>", "exec"), namespace)
+        request = {"argv": ["/synthetic/runner"], "cwd": "/synthetic/project",
+                   "env": {"SYNTHETIC_FIXTURE": "mock only"}, "background": "runner", "log": "/synthetic/runner-2.log"}
+        refused = namespace["run"](request)
+        self.assertEqual(refused["exit_code"], 127)
+        self.assertIn("synthetic existing private log", refused["stderr"])
+        opening.assert_called_once_with(request["log"], "xb")
+        process.Popen.assert_not_called()
+        process.run.assert_not_called()
+        self.assertIs(children["runner"], previous)
+        opening.side_effect = None
+        context = mock.MagicMock()
+        log = context.__enter__.return_value
+        opening.return_value = context
+        process.Popen.return_value = child
+        self.assertEqual(namespace["run"](request), {"state": "running"})
+        process.Popen.assert_called_once_with(stdout=log, stderr=subprocess.STDOUT, args=request["argv"],
+                                             cwd=request["cwd"], env=request["env"], stdin=subprocess.DEVNULL,
+                                             start_new_session=True)
+        self.assertIs(children["runner"], child)
 
     def test_partial_holder_acquisitions_close_every_prior_original_once(self):
         for stage in ("pipe", "socketpair", "RelayChannel", "Popen", "pidfd"):

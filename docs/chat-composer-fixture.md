@@ -65,7 +65,11 @@ before and an after can be live together.
   malformed runner state remains busy or unavailable; it does not permit a
   second build. An unacknowledged runner launch also keeps that build exclusion
   until existing completion or holder-exit evidence is available; it does not
-  make the CLI usable.
+  make the CLI usable. Each launch uses a new log: first `sandbox/runner.log`,
+  then `sandbox/runner-2.log`, and so on. `run-ui` and `status` report the current
+  log; previous logs remain intact and their completion markers do not complete
+  a later attempt. An existing attempt-log path refuses launch before its child
+  is started. CLI use requires the current attempt's successful launch reply.
 - **Viewport:** `start --width` and `viewport --width` set the app's logical width
   from 320 to 3840, through the nested output's scale, and fit it again before
   input and screenshots if the host has resized the nested window. The host lays

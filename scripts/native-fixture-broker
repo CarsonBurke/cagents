@@ -711,7 +711,7 @@ def run(request):
     spawn = dict(args=request["argv"], cwd=request["cwd"], env=request.get("env"), stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         if "log" in request:
-            with open(request["log"], "ab") as log:
+            with open(request["log"], "xb") as log:
                 children[request["background"]] = subprocess.Popen(stdout=log, stderr=subprocess.STDOUT, **spawn)
             return {"state": "running"}
         with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
@@ -922,6 +922,13 @@ class Fixture:
     host_session_stopped: bool = False
     released: bool = False
     runner_attempted: bool = False
+    runner_attempt: int = 0
+
+    @property
+    def runner_log(self):
+        if self.runner_attempt <= 1:
+            return self.layout.runner_log
+        return self.layout.sandbox / f"runner-{self.runner_attempt}.log"
 
 
 class Spawner:
@@ -1521,7 +1528,7 @@ class Fixtures:
         if fixture.stopped or not (fixture.runner_attempted or fixture.runner_started):
             return False
         layout = fixture.layout
-        log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), layout.runner_log.name, MAX_RUNNER_LOG_BYTES)
+        log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), fixture.runner_log.name, MAX_RUNNER_LOG_BYTES)
         if log is not None and BUILD_FINISHED_MARKER in log:
             return False
         if not fixture.lock.acquire(blocking=False):
@@ -1553,10 +1560,12 @@ class Fixtures:
         if self._runner_state(fixture) == "running":
             raise Refusal("runner_active", "the development runner is already running")
         layout = fixture.layout
+        fixture.runner_attempt += 1
+        fixture.runner_started = False
         fixture.runner_attempted = True
         reply = fixture.channel.call(
             {"argv": runner_command(layout), "cwd": str(layout.checkout),
-             "env": self.environment_for(layout), "background": "runner", "log": str(layout.runner_log)},
+             "env": self.environment_for(layout), "background": "runner", "log": str(fixture.runner_log)},
             10,
         )
         if reply.get("state") != "running":
@@ -1565,7 +1574,7 @@ class Fixtures:
         return {
             "state": "building_then_launching",
             "checkout": str(layout.checkout),
-            "runner_log": str(layout.runner_log),
+            "runner_log": str(fixture.runner_log),
             "ui_log": str(layout.sandbox / "ui.log"),
         }
 
@@ -1627,6 +1636,7 @@ class Fixtures:
             "root": str(layout.root),
             "checkout": str(layout.checkout),
             "target": str(layout.target),
+            "runner_log": str(fixture.runner_log),
             "runner": self._runner_state(fixture),
             "cli_built": self._cli_built(fixture),
             "building": self._building_now(fixture),
@@ -1634,13 +1644,20 @@ class Fixtures:
 
     def _building_now(self, fixture):
         """_is_building, for a caller that already holds this fixture's lock."""
-        if not fixture.runner_started:
+        if fixture.stopped or not (fixture.runner_attempted or fixture.runner_started):
             return False
         layout = fixture.layout
-        log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), layout.runner_log.name, MAX_RUNNER_LOG_BYTES)
+        log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), fixture.runner_log.name, MAX_RUNNER_LOG_BYTES)
         if log is not None and BUILD_FINISHED_MARKER in log:
             return False
-        return self._runner_state(fixture) == "running"
+        try:
+            if fixture.pidfd is None and fixture.process is None:
+                return True
+            if not self._holder_alive(fixture):
+                return False
+            return not self._runner_state(fixture).startswith("exited_")
+        except (Refusal, OSError):
+            return True
 
     def stop(self, fixture, request):
         layout = fixture.layout
