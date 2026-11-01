@@ -822,6 +822,7 @@ STUB_HARNESS = r"""#!/bin/sh
 printf '%s\n' "$*" >> "$STUB_LOG"
 case "$1 $2" in
   "session start")
+    name=$3
     root=
     while [ "$#" -gt 0 ]; do
       [ "$1" = "--root" ] && root=$2
@@ -831,23 +832,24 @@ case "$1 $2" in
     printf 'WAYLAND_DISPLAY=wayland-9\nNIRI_SOCKET=/nested.sock\n' > "$root/session.env"
     [ -n "$STUB_START_FAILS" ] && exit 3
     mkdir -p "$NIRI_HARNESS_STATE"
-    : > "$NIRI_HARNESS_STATE/session"
+    : > "$NIRI_HARNESS_STATE/$name.json"
     exit 0 ;;
   "session stop")
     # As the real harness: an unrecorded name is an error, not a success.
-    if [ ! -e "$NIRI_HARNESS_STATE/session" ] || [ -n "$STUB_STOP_FAILS" ]; then
+    if [ ! -e "$NIRI_HARNESS_STATE/$3.json" ] || [ -n "$STUB_STOP_FAILS" ]; then
       echo "error: unknown session" >&2
       exit 1
     fi
-    rm -f "$NIRI_HARNESS_STATE/session"
+    rm -f "$NIRI_HARNESS_STATE/$3.json"
     exit 0 ;;
 esac
 if [ "$*" = "--json session list" ]; then
   [ -n "$STUB_LIST_FAILS" ] && exit 4
-  if [ -e "$NIRI_HARNESS_STATE/session" ]; then
-    printf '[{"name": "demo", "alive": true}]\n'
-  else
+  # The real list skips a record it cannot parse.
+  if [ -n "$STUB_RECORD_CORRUPT" ] || [ ! -e "$NIRI_HARNESS_STATE/demo.json" ]; then
     printf '[]\n'
+  else
+    printf '[{"name": "demo", "alive": true}]\n'
   fi
   exit 0
 fi
@@ -1351,6 +1353,49 @@ class Lifecycle(SandboxCase):
         del self.harness_env["STUB_LIST_FAILS"]
         self.call("clear", fixture="demo")
 
+    def test_a_corrupt_session_record_is_not_proof_of_stop(self):
+        owner = self.start()["owner"]
+        self.harness_env.update(STUB_STOP_FAILS="1", STUB_RECORD_CORRUPT="1")
+        self.refused("cleanup_incomplete", "stop", fixture="demo", owner=owner)
+        self.assertIn("demo", self.fixtures.live)
+        del self.harness_env["STUB_STOP_FAILS"], self.harness_env["STUB_RECORD_CORRUPT"]
+        self.call("stop", fixture="demo", owner=owner)
+
+    def test_a_signalled_host_start_is_retained(self):
+        original = self.fixtures.harness
+
+        def signalled(layout, command, timeout=broker.HARNESS_SECONDS):
+            if "start" in command:
+                return subprocess.CompletedProcess(command, -9, b"", b"synthetic signal")
+            return original(layout, command, timeout)
+
+        self.fixtures.harness = signalled
+        with mock.patch.object(broker, "stopping"):
+            self.refused("harness_failed", "start", fixture="demo", checkout="wt")
+        fixture = self.fixtures.live["demo"]
+        self.assertTrue(fixture.host_start_interrupted)
+        fixture.host_start_interrupted = False
+        self.fixtures.harness = original
+        self.fixtures.stop(fixture, {})
+
+    def test_a_start_refused_before_any_harness_child_frees_its_name(self):
+        original = self.fixtures.harness
+
+        def refused(layout, command, timeout=broker.HARNESS_SECONDS):
+            if "start" in command:
+                raise OSError("synthetic spawn failure")
+            return original(layout, command, timeout)
+
+        self.fixtures.harness = refused
+        with self.assertRaises(OSError):
+            self.start()
+        self.assertEqual(self.fixtures.live, {})
+
+    def test_the_session_list_still_runs_during_shutdown(self):
+        placeholder = broker.Layout(self.host, "demo", self.checkout, Path("/"))
+        self.fixtures.begin_shutdown()
+        self.assertTrue(self.fixtures._host_session_gone(placeholder, None))
+
     def test_a_killed_host_start_is_not_cleared_by_a_missing_record(self):
         original = self.fixtures.harness
 
@@ -1379,7 +1424,13 @@ class Lifecycle(SandboxCase):
         self.refused("sandbox_failed", "run-ui", fixture="demo", owner=first["owner"])
         self.assertTrue(fixture.runner_attempted)
         self.assertFalse(self.fixtures._is_building(fixture))
+        self.assertFalse(self.fixtures._building_now(fixture))
         self.assertEqual(self.call("run-ui", fixture="other", owner=other["owner"])["state"], "building_then_launching")
+        # A retry that launches must hold the exclusion again.
+        self.call("stop", fixture="other", owner=other["owner"])
+        os.chmod(fixture.layout.checkout / "scripts/run-development", 0o755)
+        self.call("run-ui", fixture="demo", owner=first["owner"])
+        self.assertFalse(fixture.runner_launch_refused)
 
     def test_a_sandbox_that_never_greets_is_killed_when_start_fails(self):
         relay = broker.RELAY
@@ -1788,6 +1839,22 @@ class OwnershipContracts(TemporaryRepository):
             server.slots.release.assert_called_once_with()
             self.assertTrue(server.request_threads[0]["joined"])
             server.server_close()
+
+    def test_an_interrupted_thread_start_keeps_its_request(self):
+        server = object.__new__(broker.Server)
+        server.requests_lock = threading.Lock()
+        server.accepting = True
+        server.request_threads = []
+        server.slots = mock.Mock()
+        server.shutdown_request = mock.Mock()
+        real = threading.Thread(target=lambda: None)
+        with mock.patch.object(real, "start", side_effect=KeyboardInterrupt()), \
+                mock.patch.object(broker.threading, "Thread", return_value=real), \
+                mock.patch.object(broker, "stopping"):
+            server.process_request(object(), "synthetic-client")
+        server.shutdown_request.assert_not_called()
+        server.slots.release.assert_not_called()
+        self.assertFalse(server.request_threads[0]["joined"])
 
     def test_closed_request_admission_closes_only_the_accepted_socket(self):
         server = object.__new__(broker.Server)

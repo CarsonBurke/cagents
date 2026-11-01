@@ -1297,9 +1297,13 @@ class Fixtures:
                     "--cmd", "/usr/bin/true",
                 ],
             )
+        except (Refusal, OSError):
+            raise  # Refused or failed before any harness child existed.
         except BaseException:
             fixture.host_start_interrupted = True
             raise
+        # A signal ended the harness, so it could not finish or stop its niri.
+        fixture.host_start_interrupted = started.returncode < 0
         # --no-window-wait returns before niri-harness hands focus back.
         self._restore_host_focus(previous, before)
         if started.returncode:
@@ -1815,6 +1819,9 @@ class Fixtures:
         """
         if fixture is not None and fixture.host_start_interrupted:
             return False
+        # The list skips a record it cannot parse, whose niri may still be alive.
+        if os.path.lexists(layout.harness_state / f"{layout.name}.json"):
+            return False
         listed = self.harness(layout, [self.host.harness, "--json", "session", "list"], timeout=30)
         if listed.returncode != 0:
             return False
@@ -2068,7 +2075,8 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                 # A Thread.start interruption is not proof that no worker exists.
                 # Retain the original handle/request rather than close underneath it.
                 record["start_error"] = f"{type(error).__name__}: {error}"
-                if thread.ident is None and not thread.is_alive():
+                # An interrupted start can leave a running worker looking unstarted.
+                if isinstance(error, Exception) and thread.ident is None and not thread.is_alive():
                     # Python refused to create the thread: no worker holds this
                     # request, and join would raise forever on an unstarted thread.
                     record["joined"] = True
