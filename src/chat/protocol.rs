@@ -38,6 +38,10 @@ pub struct ProcessSpec {
     /// transcript records, so they are shown as messages rather than as the
     /// user's own words.
     pub(crate) messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
+    /// Opt-in tolerance for non-JSON lines on JSON-lines stdout. `None` keeps
+    /// such output immediately fatal. The function reports whether a skipped
+    /// line hides a protocol frame, which must never be dropped silently.
+    pub(crate) stdout_noise: Option<fn(&[u8]) -> bool>,
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
@@ -62,6 +66,7 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
         Self {
             execution: None,
             messages: None,
+            stdout_noise: None,
             transport: TransportSpec::JsonLines,
             program: recipe.program.clone(),
             arguments: recipe.arguments.clone(),

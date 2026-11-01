@@ -45,6 +45,50 @@ pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Ad
     create_inner(launch, None, true)
 }
 
+/// Whether a non-JSON stdout line carries a complete Claude frame next to other
+/// text, as when a wrapper prints without a newline. Skipping that line would
+/// lose the frame, and a lost `result` or `control_request` never settles. A
+/// candidate must be a whole JSON object with the shape of a real frame, so
+/// ordinary text that merely has braces or mentions a frame type is still noise.
+pub(crate) fn embedded_protocol_frame(line: &[u8]) -> bool {
+    // Inspect a bounded number of objects, however many braces a line has.
+    const CANDIDATES: usize = 64;
+    if !line.windows(6).any(|window| window == b"\"type\"") {
+        return false;
+    }
+    let mut start = 0;
+    for _ in 0..CANDIDATES {
+        let Some(offset) = line[start..].iter().position(|byte| *byte == b'{') else {
+            return false;
+        };
+        let at = start + offset;
+        let mut values = serde_json::Deserializer::from_slice(&line[at..]).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) => {
+                if has_frame_shape(&value) {
+                    return true;
+                }
+                // Fields nested in a complete object are not top-level frames.
+                start = at + values.byte_offset();
+            }
+            _ => start = at + 1,
+        }
+    }
+    false
+}
+
+fn has_frame_shape(value: &Value) -> bool {
+    match value["type"].as_str() {
+        Some("result" | "system") => value["subtype"].is_string(),
+        Some("control_request") => value["request_id"].is_string() && value["request"].is_object(),
+        Some("control_cancel_request") => value["request_id"].is_string(),
+        Some("control_response") => value["response"].is_object(),
+        Some("assistant" | "user") => value["message"].is_object(),
+        Some("stream_event") => value["event"].is_object(),
+        _ => false,
+    }
+}
+
 /// Transient identity selected by the original adapter during preparation.
 /// A fresh UUID is not provider confirmation or a disk-resume descriptor.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -101,6 +145,7 @@ fn create_inner(
         );
     }
     let mut spec = ProcessSpec::from(&launch.recipe);
+    spec.stdout_noise = Some(embedded_protocol_frame);
     spec.arguments = arguments(launch)?;
     let history = launch
         .session_id
@@ -129,6 +174,8 @@ fn create_inner(
             resumed: launch.session_id.is_some(),
             history_only,
             forced_history,
+            turn_unsupported_content: false,
+            turn_visible_content: false,
             cwd: launch.recipe.working_directory.clone(),
             history,
             titles: super::claude_titles::ClaudeTitles::new(launch),
@@ -495,6 +542,10 @@ struct Claude {
     /// A saved directory is gone; only its exact persisted history is readable.
     history_only: bool,
     forced_history: bool,
+    /// The running main turn received content this version cannot show.
+    turn_unsupported_content: bool,
+    /// The running main turn produced something the transcript can show.
+    turn_visible_content: bool,
 }
 impl Claude {
     fn warn_unknown(&mut self, kind: &str, name: &str) {
@@ -1437,7 +1488,17 @@ impl Claude {
                     .map(|((_, index), _)| *index as usize)
                     .min()
                     .unwrap_or(base + index);
-                match required(block, "type")? {
+                let block_type = match required(block, "type") {
+                    Ok(block_type) => block_type,
+                    // One damaged saved block must not make the whole
+                    // conversation unreadable. Live frames stay strict.
+                    Err(_) if history => {
+                        self.warn_unknown("content", "<untyped>");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match block_type {
                     "text" | "thinking" | "redacted_thinking" => {
                         let thinking = string(block, "type") != "text";
                         let text = if string(block, "type") == "redacted_thinking" {
@@ -1655,11 +1716,24 @@ impl Claude {
                         started_at: None,
                         at: None,
                     })),
-                    other => self.warn_unknown("content", other),
+                    other => {
+                        self.warn_unknown("content", other);
+                        if !history && child.is_none() && role == Role::Assistant {
+                            self.turn_unsupported_content = true;
+                        }
+                    }
                 }
             }
         }
         if role == Role::Assistant {
+            if !history
+                && child.is_none()
+                && step.events[event_start..]
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_)))
+            {
+                self.turn_visible_content = true;
+            }
             if frame["error"].as_str().is_some() {
                 for event in &mut step.events[event_start..] {
                     if let Event::Item(item) = event {
@@ -2674,6 +2748,20 @@ impl Adapter for Claude {
                 if frame["parent_tool_use_id"].is_null() {
                     self.observe_title(&mut step);
                 }
+                // A successful reply must not look empty when its only content
+                // could not be shown. The private content itself stays omitted.
+                if std::mem::take(&mut self.turn_unsupported_content)
+                    && !std::mem::take(&mut self.turn_visible_content)
+                    && frame["is_error"] != true
+                {
+                    step.events.push(Event::Item(unsupported_content_item(
+                        frame["uuid"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    )));
+                }
+                self.turn_visible_content = false;
                 let can_suggest = frame["parent_tool_use_id"].is_null()
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
@@ -3283,6 +3371,22 @@ fn context_item(id: String, body: String) -> Item {
             sender: String::new(),
             summary: "Claude context".into(),
             body,
+        },
+        started_at: None,
+        at: None,
+    }
+}
+
+fn unsupported_content_item(result: String) -> Item {
+    Item {
+        id: format!("{result}:unsupported-content"),
+        role: Role::System,
+        content: ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "Claude sent unsupported content, which was omitted".into(),
+            body: String::new(),
         },
         started_at: None,
         at: None,
@@ -4186,9 +4290,15 @@ impl Claude {
                     other => {
                         self.ignored_blocks.insert(key);
                         self.warn_unknown("stream content", other);
+                        if parent.is_empty() {
+                            self.turn_unsupported_content = true;
+                        }
                         return Ok(());
                     }
                 };
+                if parent.is_empty() {
+                    self.turn_visible_content = true;
+                }
                 if !matches!(&item.content, ItemContent::Tool { .. })
                     || !self.completed_tool(Some(&parent), &item.id)
                 {
@@ -5702,6 +5812,191 @@ mod history_tests;
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    #[test]
+    fn embedded_frames_are_recognized_without_flagging_ordinary_text() {
+        for line in [
+            r#"wrapper diag{"type":"result","subtype":"success","is_error":false}"#,
+            r#"{"type":"result","subtype":"success"} wrapper tail"#,
+            r#"x{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool"}}"#,
+            r#"x{"type":"control_response","response":{"subtype":"success"}}"#,
+            r#"x{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"unterminated {"type":"stream_event","event":{"type":"ping"}}"#,
+        ] {
+            assert!(embedded_protocol_frame(line.as_bytes()), "{line}");
+        }
+        for line in [
+            "plain wrapper diagnostic",
+            "Loaded {config} with { braces }",
+            r#"the "type" field is {broken"#,
+            r#"note {"type":"info","subtype":"x"}"#,
+            r#"a result looks like {"type":"result"}"#,
+            r#"logged {"payload":{"type":"result","subtype":"success"}}"#,
+            r#"partial {"type":"result","subtype":"succ"#,
+        ] {
+            assert!(!embedded_protocol_frame(line.as_bytes()), "{line}");
+        }
+        // The candidate bound holds on a line made of unparsable openers.
+        assert!(!embedded_protocol_frame(
+            format!(r#"{}"type""#, "{".repeat(100_000)).as_bytes()
+        ));
+    }
+
+    #[test]
+    fn a_reply_of_only_unknown_content_says_it_was_omitted() {
+        let private = "private protocol payload";
+        let notices = |step: &Step| {
+            step.events
+                .iter()
+                .filter(|event| {
+                    matches!(event, Event::Item(Item {
+                        content: ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. },
+                        ..
+                    }) if summary.contains("unsupported content") && body.is_empty())
+                })
+                .count()
+        };
+        let result = || json!({"type":"result","subtype":"success","is_error":false,"uuid":"r"});
+        let unknown = json!({"type":"assistant","uuid":"a","message":{"content":[{"type":"future","opaque":private}]}});
+
+        // A complete assistant frame with nothing else to show.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown.clone()).unwrap();
+        let step = adapter.receive(result()).unwrap();
+        assert_eq!(notices(&step), 1);
+        assert!(!format!("{:?}", step.events).contains(private));
+        // The next turn starts clean.
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 0);
+
+        // A streamed future block with nothing else to show.
+        let mut adapter = Claude::default();
+        for event in [
+            json!({"type":"message_start","message":{"id":"m"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"future","opaque":private}}),
+        ] {
+            adapter
+                .receive(json!({"type":"stream_event","event":event}))
+                .unwrap();
+        }
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 1);
+
+        // Visible content next to the unknown block needs no notice.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown.clone()).unwrap();
+        adapter
+            .receive(json!({"type":"assistant","uuid":"b","message":{"content":[{"type":"text","text":"Answer"}]}}))
+            .unwrap();
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 0);
+
+        // A failed turn already reports its failure.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown).unwrap();
+        let step = adapter
+            .receive(json!({"type":"result","subtype":"error_during_execution","is_error":true,"uuid":"r"}))
+            .unwrap();
+        assert_eq!(notices(&step), 0);
+    }
+
+    #[test]
+    fn saved_untyped_blocks_are_skipped_but_live_frames_stay_strict() {
+        let frame =
+            |content: Value| json!({"type":"assistant","uuid":"a","message":{"content":content}});
+        let content = json!([
+            {"text":"no discriminant"},
+            {"type":""},
+            {"type":7},
+            "bare string",
+            {"type":"text","text":"Still readable"},
+        ]);
+        let record = HistoryRecord {
+            frame: frame(content),
+            tool_calls: HashMap::new(),
+        };
+        let mut adapter = Claude::default();
+        let mut step = Step::default();
+        adapter.history_message(&record, &mut step).unwrap();
+        let texts: Vec<_> = step
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(Item {
+                    content: ItemContent::Text { text, .. },
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Still readable"]);
+
+        let mut adapter = Claude::default();
+        assert!(
+            adapter
+                .receive(frame(json!([{"text":"no discriminant"}])))
+                .is_err()
+        );
+    }
+
+    // Damage on both sides of the page boundary: `initialize` opens the newest
+    // page and `LoadEarlier` replays the older one.
+    #[test]
+    fn a_saved_conversation_with_untyped_blocks_opens_and_pages() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("removed-worktree");
+        std::fs::create_dir(&cwd).unwrap();
+        let config = root.path().join("config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let history_dir = config.join("projects").join(project);
+        std::fs::create_dir_all(&history_dir).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = File::create(history_dir.join(format!("{id}.jsonl"))).unwrap();
+        let count = 220;
+        for index in 0..count {
+            let parent = (index > 0).then(|| format!("record-{}", index - 1));
+            let damaged = index == 0 || index == count - 1;
+            let content = if damaged {
+                json!([{"text":"no discriminant"}, {"type":"text","text":format!("Saved {index}")}])
+            } else {
+                json!(format!("Saved {index}"))
+            };
+            writeln!(file, "{}", json!({"type":"assistant","uuid":format!("record-{index}"),"parentUuid":parent,"sessionId":id,"message":{"role":"assistant","content":content}})).unwrap();
+        }
+        drop(file);
+        std::fs::remove_dir(&cwd).unwrap();
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd,
+                environment: std::collections::BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    config.to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        let (_, mut adapter) = create(&launch).unwrap();
+        let opened = format!("{:?}", adapter.initialize().unwrap().events);
+        assert!(opened.contains("Saved 219"));
+        let mut oldest = false;
+        for _ in 0..count {
+            let page = format!(
+                "{:?}",
+                adapter.command(Command::LoadEarlier).unwrap().events
+            );
+            if page.contains("\"Saved 0\"") {
+                oldest = true;
+                break;
+            }
+        }
+        assert!(oldest);
+    }
 
     #[test]
     fn initialization_waits_for_the_matching_success_including_optional_retry() {
