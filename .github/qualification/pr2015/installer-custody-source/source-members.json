@@ -1,0 +1,49 @@
+{
+  "schema": "installer_custody_unselected_author_source_members_v1",
+  "product_head": "375c37ff01aab0b226c58f547012af74e93a8643",
+  "product_tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+  "files": {
+    ".github/qualification/pr2015/installer-custody-manifest.json": {
+      "sha256": "e7eb0192eb3c347cc2905588dff93f3ee96e8f5e316cc785055ab8f67e07e33b",
+      "bytes": 20855
+    },
+    ".github/qualification/pr2015/installer-custody-plan.json": {
+      "sha256": "8e10fe09043d7ad8dbfa69744d49f9ecda2ce5d367a84e14ab320a7851e91a80",
+      "bytes": 35435
+    },
+    ".github/qualification/pr2015/installer-custody-runner.py": {
+      "sha256": "c02b8bfa407d709c696a87ca2ec65c91a2d9f86808dafd70a41c228382baacb8",
+      "bytes": 63370
+    },
+    ".github/qualification/pr2015/installer-custody-source/README.md": {
+      "sha256": "adddee616bc6d38a981f26382f932550a885cacac84021539b9b27db1dfbf75d",
+      "bytes": 836
+    },
+    ".github/qualification/pr2015/installer-custody-source/author-conservation.json": {
+      "sha256": "50888ba31984ae694449a4635ec07e82a531d2273d2069d182946ba93688f816",
+      "bytes": 1955
+    },
+    ".github/qualification/pr2015/installer-custody-source/command-data-independent-review.json": {
+      "sha256": "2b4279b70e68371b93e818569e87306ec1e9892f3872379d54ec4870c2a74e15",
+      "bytes": 20657
+    },
+    ".github/qualification/pr2015/installer-custody-source/runner-forward.patch.json": {
+      "sha256": "831eeca2e071563a6244c914bd2094318052b3934ff61dc076b46d9ade4ae3a0",
+      "bytes": 7725
+    },
+    ".github/qualification/pr2015/installer-custody-source/runner-inverse.patch.json": {
+      "sha256": "735dc18014213fe833d4830d8518246ea30ff91fd147875ad8a31fb74bbbbccf",
+      "bytes": 7725
+    },
+    ".github/qualification/pr2015/installer-custody-source/source-plan.json": {
+      "sha256": "7f464865f22931ca280ad33473d8ddf6da768b3b781e211463d8e490992428b1",
+      "bytes": 16747
+    },
+    ".github/qualification/pr2015/installer-custody-source-binding.json": {
+      "sha256": "02fee817c9cf8cd5abf92279fcd0989e7a1084ee585c921f47b854cd22265c7c",
+      "bytes": 1490
+    }
+  },
+  "runtime": "UNRUN_UNGRANTED_UNPUBLISHED_UNSELECTED",
+  "scope": "Only new installertask source; originalinstaller and producer26603 sharedcase/selector/workflow remain exact. No selfclear or runtimeactivation."
+}

@@ -1,0 +1,398 @@
+{
+  "kind": "SOURCE_FEASIBILITY_DESIGN_NOT_IMPLEMENTATION_OR_REVIEW_OR_GRANT",
+  "utc": "2026-10-31T16:53:27.870466+00:00",
+  "control": {
+    "head": "ac4bbf446957317d022a987e20887af4b3f70481",
+    "tree": "080df4b11b539f89def8207db283f052df2bca18",
+    "research_pr": 1921,
+    "NEVERMERGE": true,
+    "source_pins": {
+      ".github/workflows/research-pr1853-bd88.yml": {
+        "sha256": "97bef99d9c141bbed508a3d9ea4b5b04904f6a92346994279ff16f4da338a181",
+        "bytes": 45944
+      },
+      ".github/qualification/pr2015/case-select.py": {
+        "sha256": "360fd8c0c1b7dbed1ed80c6aca01fe2fdd23e382b0d0d07ad914045fb0675c85",
+        "bytes": 8042
+      },
+      ".github/qualification/pr2015/case.json": {
+        "sha256": "9af20ec84ffb12ac682df8cf8767d670cf25a9b9f2970bc248ab8f8833ec103f",
+        "bytes": 2943
+      },
+      ".github/qualification/pr2015/cache-restore-gate.py": {
+        "sha256": "f184c16a0b0df8c363233e933c4aafe4deea81a3818669ac48a28042814a2da4",
+        "bytes": 14139
+      },
+      ".github/qualification/pr2015/run-packet.py": {
+        "sha256": "1e9ea92f63c4d26728666e0e964ef716661fa579384730dc8c197070f58b0b20",
+        "bytes": 62066
+      },
+      ".github/qualification/pr2015/plan.json": {
+        "sha256": "b617f0a06e4548b5157acc28fba52bec7d10a76484554b27d1187a491a97dbdb",
+        "bytes": 32449
+      },
+      ".github/qualification/pr2015/manifest.json": {
+        "sha256": "ce9a12cb0dd3c41e5f254851aa79d779c0bfc238c67d83ff6ea88e2953d25a22",
+        "bytes": 19645
+      },
+      ".github/qualification/pr2015/README.md": {
+        "sha256": "8b5a733fe46462fa31488f1cf731d688a3e23cd345c1306e1b03da8ed6a5986d",
+        "bytes": 10970
+      },
+      ".github/qualification/pr2015/reviews/workflow-cache-attempt1-source-review.json": {
+        "sha256": "bca2054a85b241763e071074b2354714f3b85e1de8a193f85b11c5edb889c178",
+        "bytes": 10208
+      },
+      ".github/qualification/pr2015/lineage/main15/qualify-held-scope.yml": {
+        "sha256": "c44afb360a5306da40b317bfdff9b39fded4b32018522d2165a2443b6944d8c7",
+        "bytes": 7442
+      }
+    }
+  },
+  "product": {
+    "head": "375c37ff01aab0b226c58f547012af74e93a8643",
+    "tree": "acb2cc6e049562469643e49a1ee5f7abc179c28b",
+    "parents": [
+      "6dc09b9a1b5d205650e244401da0938b653d16da",
+      "4429728a1f179ea7f7eaca9667156553209a46ac"
+    ],
+    "current_17_hosted_manifest_source_hashes_exact": {
+      "Cargo.toml": {
+        "sha256": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+        "bytes": 13087
+      },
+      "Cargo.lock": {
+        "sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+        "bytes": 341188
+      },
+      ".cargo/config.toml": {
+        "sha256": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+        "bytes": 412
+      },
+      "build.rs": {
+        "sha256": "9b97e52fdf299915e32838ec0bd8e60798adf9a37d19890422b4180e022372e9",
+        "bytes": 4593
+      },
+      "src/main.rs": {
+        "sha256": "9fe8e34bf957f3c0aa4b09344aa8124493232ea0c19ee145ede0599cbf66d85d",
+        "bytes": 656
+      },
+      "src/lib.rs": {
+        "sha256": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+        "bytes": 350
+      },
+      "src/modules.rs": {
+        "sha256": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+        "bytes": 4143
+      },
+      "src/companion.rs": {
+        "sha256": "76d991bd5ff1cd73a4252d6f5961bc1b19e50b0936dc4d00b699fbf56d93af00",
+        "bytes": 4113
+      },
+      "src/install_guard.rs": {
+        "sha256": "b735f0b9564a0e7f4b90e496af57fe06319e07ee64477073a377f9517849356a",
+        "bytes": 39315
+      },
+      "src/instance.rs": {
+        "sha256": "76a8e958c7b183ff9815d990b490c646c63aa2e11332716d8a8233fc1c948e1d",
+        "bytes": 119199
+      },
+      "src/update.rs": {
+        "sha256": "48a9c75b73a3948063f4fca76e0ecf3159e0065a3a9ab19d6d8749a8446eec55",
+        "bytes": 129555
+      },
+      "src/app.rs": {
+        "sha256": "c405ea52503acc5076a5e77d3bc81d5e9ab341b1a78e313147e9ca70dfc67e77",
+        "bytes": 1376636
+      },
+      "src/app/update_ui.rs": {
+        "sha256": "5bae66ddb5fd6ef6bb50de4add827f5212e390aa8d0d495a1678b225e8748e2f",
+        "bytes": 65494
+      },
+      "install.sh": {
+        "sha256": "7b49493d90d0aeeb627b488c8c4fd372b005a038af83098860780b19c0134d07",
+        "bytes": 41938
+      },
+      "tests/installer_lifecycle_contract.rs": {
+        "sha256": "ca9bb7034feddd8f21f303dea1ebcab2125315d8bf66a52964fe66df4fe05dec",
+        "bytes": 51789
+      },
+      "tests/installer_guard_contract.rs": {
+        "sha256": "a4413f4a235ef796438d32fa538f0e1d46fa5221283a588e1f36aaac01d92a00",
+        "bytes": 70505
+      },
+      "tests/support/user_fixture.rs": {
+        "sha256": "a016d99771e4ffdd6d413fcb89a0671462c56dda32956e0b89c09bd50b848079",
+        "bytes": 3948
+      }
+    },
+    "scope": "New producer plan binds375 directly; historical manifest/old6dc receipts are not retargeted."
+  },
+  "accepted_original_miss": {
+    "path": "/tmp/fw16-backend-ec204421/issue2015-b63bd0-actual-return-ACCEPTED.json",
+    "sha256": "9804ed50d018088c345bcf7906b9c8f558ea958c75e1bffafbb1ab2c65393f83",
+    "bytes": 1193
+  },
+  "sole_original_RAW": {
+    "path": "/tmp/issue2015-run41136465523-sole-raw-wrT9jS/sole-raw-report.json",
+    "sha256": "90c5ad82c6ade4a305858470c3b28c2ddd6cf6365816ca1e43c89dbe94487dda",
+    "bytes": 20680
+  },
+  "existing_hosted_runner_helper_pins": {
+    "digest": {
+      "line": 29,
+      "end_line": 34,
+      "sha256": "9e0e51114a07afc8aa7e03dd8ec7f5d5a5878e92714f34bd0ac76749d97b11d9"
+    },
+    "now": {
+      "line": 37,
+      "end_line": 38,
+      "sha256": "f34344d0eeb6b443b60f2d70aacc4d33844254b0d6829e57abf992dca6415ca2"
+    },
+    "observed_wait": {
+      "line": 41,
+      "end_line": 45,
+      "sha256": "11e210358d1284acb95f321ef77812b3758c3c353f109c955085e7217dfadde0"
+    },
+    "supervision_failure": {
+      "line": 48,
+      "end_line": 54,
+      "sha256": "1069f773ea393e75eec0af8625da49234d9d368574420d9ace63b37e061c3b2e"
+    },
+    "bounded_capture": {
+      "line": 57,
+      "end_line": 110,
+      "sha256": "72bc1e42ca29c4b4c3fccdcbe129b9250714ba746b6fa4a1d60fa090a386f911"
+    },
+    "refuse_git_routing": {
+      "line": 120,
+      "end_line": 122,
+      "sha256": "88292fa06a39c22e19f6ed29c3f818675309c9665ef4cf074e82cab7e6762b04"
+    },
+    "git": {
+      "line": 125,
+      "end_line": 132,
+      "sha256": "53c3fd98251d1c08e6b3ed562f39bc8d324bf7c6d87386e69b7535130dc418dd"
+    },
+    "git_nul_fields": {
+      "line": 135,
+      "end_line": 137,
+      "sha256": "790f7b41a67559be869580944bd0e35babcaa0fff2955f70e8715380832d67bf"
+    },
+    "guard_git_metadata": {
+      "line": 140,
+      "end_line": 197,
+      "sha256": "d115d39287c6aed9ef5a6cc6c9a94aaa945a536b0babd8151cd174a573477193"
+    },
+    "signal_pidfd": {
+      "line": 200,
+      "end_line": 205,
+      "sha256": "66008663ef799c9b674dd4fe52814d9a6ec4f5a9b8a03d0fe03442c9b5401679"
+    },
+    "children": {
+      "line": 208,
+      "end_line": 217,
+      "sha256": "2907dcff335af0591d007a09a091c77d55e902e78828f1b4d84c101608b10460"
+    },
+    "settle_children": {
+      "line": 220,
+      "end_line": 264,
+      "sha256": "8cb801225fac1539666e597ae5ff0517a8da4bc2a1173156716e528fe1e8537b"
+    },
+    "cargo_test_artifacts": {
+      "line": 267,
+      "end_line": 288,
+      "sha256": "f254b79aa510009abfe653f8f8a1f8bb08fe6039c3e828644c128c3b716fdba3"
+    },
+    "elf_record": {
+      "line": 291,
+      "end_line": 305,
+      "sha256": "85ac46b364c4e1089ad18b8c2096bfa8824399f0607e85305835574766949acd"
+    },
+    "verify_elf": {
+      "line": 308,
+      "end_line": 315,
+      "sha256": "ba38754aae9613ffad2cb728bd0df99b7f028182822ae731a06a6f0fbcef2543"
+    },
+    "inventory_names": {
+      "line": 318,
+      "end_line": 335,
+      "sha256": "3c90ef64bc653df9eb0c8eccf269bba7fad3f6e7c6fef2c0a2956aa4a4f0856e"
+    },
+    "parent_pass": {
+      "line": 338,
+      "end_line": 391,
+      "sha256": "75176d3a1466fa2fd72877cb4b6494f4efc3896a8139f8a11209aa460ef37db2"
+    },
+    "validate_controller_review": {
+      "line": 394,
+      "end_line": 399,
+      "sha256": "d700649fcc68222196518f1619e69f3a1f7491816243aeca22c333154d01d7ad"
+    },
+    "evidence_copy": {
+      "line": 402,
+      "end_line": 407,
+      "sha256": "8cb5ee3ef8e70abcae834c074db258b0edda04f04ff6e189a406fb51479e35b8"
+    },
+    "execute_contracts": {
+      "line": 410,
+      "end_line": 448,
+      "sha256": "11a3da9e934474392175d2298456ac3792ca1cfeba723a89a236a40e0e1a967b"
+    },
+    "custody_clean": {
+      "line": 451,
+      "end_line": 454,
+      "sha256": "27a0dc6f84ba93733a30a1995696bc9bd1af66f6e79f1717a869a4fd70cbff6b"
+    },
+    "safe_lane_handoff": {
+      "line": 457,
+      "end_line": 473,
+      "sha256": "9334a89a9c17ae17db2cb66b04be75f1d7ec975eb4953b788cc55d04ef4d6329"
+    },
+    "parent_accounting": {
+      "line": 476,
+      "end_line": 520,
+      "sha256": "790f4874837914d32eb67e9347c3681e2061b9180d6d65cace368a4466ce7d22"
+    },
+    "final_observations": {
+      "line": 523,
+      "end_line": 547,
+      "sha256": "9a0246bbb814dbeda0658611ccd0524f24b46018ed6f59ef45d4e47d9618628a"
+    },
+    "note_lane_cancellation": {
+      "line": 550,
+      "end_line": 553,
+      "sha256": "760afa76f10b73acb9587a54e7f93e5365bd006e3df29dd14e3e9b154742d726"
+    },
+    "require_workload_allowed": {
+      "line": 556,
+      "end_line": 558,
+      "sha256": "7febe847e79b279a013660c1b61b4863a0e7cde8cbf61d1dbf998a7914110fa9"
+    },
+    "retain_uncertain_lane": {
+      "line": 561,
+      "end_line": 580,
+      "sha256": "5e7d6f0627744c5c5ce5bc13190822f99b61361c9fd55c3913a8b674d2a344c9"
+    },
+    "control_path": {
+      "line": 583,
+      "end_line": 588,
+      "sha256": "68c3d35e32a566cf3f09448f2e8e19b35ce6d895720afd97bb81494b47d926b2"
+    },
+    "hosted_context": {
+      "line": 591,
+      "end_line": 628,
+      "sha256": "7d608c3c8fedf183bd3cbf01aefecd516c474729b2ae0a1a2eef07ba56988cb0"
+    },
+    "materialize_plan": {
+      "line": 631,
+      "end_line": 680,
+      "sha256": "7276b8aa16c20fd61cc9eaf5aaa0d1c7df92e8911ae72922686f9984bdc801b0"
+    },
+    "main": {
+      "line": 683,
+      "end_line": 1034,
+      "sha256": "bcfdac9ccd9b8d48acb1e02909fbbeffedb56ee7b8bfb156a93cc231b7cf39f5"
+    }
+  },
+  "required_canonical_settler": {
+    "immutable_source_ref": "f08d8cc096f8b1d4c53372ca6009d7905793ad7c:qualification-packets/pr1269-repository-git/dependencies/canonical_function.py",
+    "sha256": "9004ca5e53e46b257791bb7ccf23c92a450b9bc957e391408e5729f41e307483",
+    "scope": "New producer only; old installer force branch not edited by this design."
+  },
+  "cache": {
+    "prefix": "held1922-Linux-X64-rust193-bca4125b50134707a8afdb92ce04572c6ca6b3d3e43d177c5c679cecbc89c91b-",
+    "lock_sha256": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+    "hashFiles_single_file": "bca4125b50134707a8afdb92ce04572c6ca6b3d3e43d177c5c679cecbc89c91b",
+    "key_expression": "held1922-${{ runner.os }}-${{ runner.arch }}-rust193-${{ hashFiles('product/Cargo.lock') }}-${{ github.event.pull_request.head.sha }}",
+    "paths_in_original_order": [
+      "${{ env.CARGO_TARGET_DIR }}",
+      "~/.cargo/registry",
+      "~/.cargo/git"
+    ],
+    "target": "$RUNNER_TEMP/held-scope-target",
+    "action": "actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830",
+    "future_restore": "Keep original installer restore key/prefix/paths and cache gate byte-exact; actual future visibility/version/payload admission still mandatory.",
+    "actual_cache": null
+  },
+  "proposed_compile_commands": [
+    {
+      "label": "cli-binary-check",
+      "argv": [
+        "<actual admitted physical Cargo1.93>",
+        "check",
+        "--locked",
+        "--no-default-features",
+        "--bin",
+        "cagents"
+      ],
+      "cap_seconds": 600,
+      "actual": null
+    },
+    {
+      "label": "compile-installer_lifecycle_contract",
+      "argv": [
+        "<same actual physical Cargo1.93>",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_lifecycle_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cap_seconds": 900,
+      "actual": null
+    },
+    {
+      "label": "compile-installer_guard_contract",
+      "argv": [
+        "<same actual physical Cargo1.93>",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--test",
+        "installer_guard_contract",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cap_seconds": 900,
+      "actual": null
+    }
+  ],
+  "phases": 3,
+  "owning_parents_invoked": 0,
+  "tests_inventory_native_installer_provider_invoked": false,
+  "proposed_absolute_workload_cap_seconds": 2400,
+  "jobs": 2,
+  "logical_lane": "C, external actual fresh Root reservation before source publication; A/B count occupied2; no grant made here",
+  "actual": {
+    "grant": null,
+    "implementation": null,
+    "source_review": null,
+    "execution": null,
+    "cache_save": null,
+    "cache_visibility": null,
+    "parent_results": null,
+    "C_return": null
+  },
+  "primary_public_source_reads_only": [
+    {
+      "url": "https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching",
+      "scope": "PR merge-ref access, key/version/path matching and retention limits; current docs, not observed cache state."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/actions/cache/0057852bfaa89a56745cba8c7296529d2fc39830/save/action.yml",
+      "scope": "Save-only inputs and lack of outputs at exact existing pin."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/actions/cache/0057852bfaa89a56745cba8c7296529d2fc39830/src/saveImpl.ts",
+      "scope": "Source catches save errors/warns and may exit0; explicit successful saved-key log only on returned cache id."
+    },
+    {
+      "url": "https://raw.githubusercontent.com/actions/cache/0057852bfaa89a56745cba8c7296529d2fc39830/README.md",
+      "scope": "Pinned action key/version/path compatibility."
+    }
+  ],
+  "primary_transport_limit": "Public static documentation/pinned source tool reads completed; no raw HTTP byte/hash or installed action execution claimed. No live cache/run/account API queried."
+}

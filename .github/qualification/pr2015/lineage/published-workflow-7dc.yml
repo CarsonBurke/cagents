@@ -1,0 +1,521 @@
+name: Research exact final-save diagnostic
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/research-pr1853-bd88.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-final-save-diagnostic-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_TERM_COLOR: never
+  RUSTUP_TOOLCHAIN: 1.93.0
+  # Exact reviewed diagnostic manifest, embedded to keep this control to one file.
+  FINAL_SAVE_DIAGNOSTIC_MANIFEST: |
+    {
+      "contract_sources": [
+        {
+          "head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+          "path": ".github/workflows/qualify-recovery-products.yml",
+          "sha256": "5ed902501f1bba82391b2ae1d407dbcf7c0011604a3fd54b204b037f655973cb"
+        }
+      ],
+      "fixture_source_review": {
+        "head": "bc80ba61f9d1a5de02cb570902d3b55fb024a230",
+        "scope": "Independent source clear for bounded cfg(test) fixture-only correction and real StateStore regression; current-head execution UNRUN.",
+        "sha256": "fda81c8029a1ce4af1f4154914cfb11064664e6941538df78a7c74e1b4181813",
+        "tree": "dee67e666efcd48b7dbcba20d5980aa577a775c2"
+      },
+      "lanes": [
+        {
+          "binary": "cagents-ui",
+          "feature": "ui",
+          "id": "1726-ui",
+          "matched_helper": false,
+          "pr": 1726,
+          "selectors": [
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+            "app::shared_views::tests::retained_chat_fixture_round_trips_and_rejects_invalid_native_continuity"
+          ]
+        }
+      ],
+      "limits": [
+        "Temporary isolated research control only; never merge. Preparation is not queue admission, publication or dispatch authorization. Parent must grant a shared lane before execution.",
+        "One serial hosted job, CARGO_BUILD_JOBS=2, one browserless UI target and one isolated UI binary check followed by two exact compiled inventories and two distinct exact parent invocations, each once. Exactly five planned phases; planned counts are not executed results. No CLI/HOST builds, graph unification, helper build, provider or native launcher.",
+        "Natural hosted User context is mandatory: refuse every inherited CAGENTS_ name by presence without reading values or clearing authority. Source Cargo checkout-root configuration stays intact.",
+        "Pin exact source head/tree/clean status, source hashes, build configuration/input hashes, control head/tree/workflow and proven setup action. Recheck source/config/context around every command; retain original stdout/stderr/command/exits/digests and final source state.",
+        "Each command retains GNU timeout2700s plus30s TERM-to-KILL grace and direct-wrapper wait accounting. Uncertain timeout/signal/wrapper, context, source or config faults stop globally; ordinary settled check/inventory/parent failure stops dependent phases and fails qualification. No retry, ignored-test waiver or evidence replacement.",
+        "Each selector requires its own exact inventory entry and matching named outer parent plus a single1P0F0I summary. Both parents are required for qualification. A real runtime failure remains a failure with raw diagnostics retained; stop the first negative and do not salvage inner lines or start dependent invocations.",
+        "All three equal-read scenarios in their original order, original ten assertions, real final-save/settings-writer ownership and all production native-continuity/storage guards are preserved. The retained Claude synthetic test descriptor alone is corrected under cfg(test), with a new real StateStore regression. Runtime success and any production repair are unclaimed.",
+        "Both previous final-save negatives remain at original source/run scopes:1959 exit101 at7e280 and40a exit101 in the third/final retained-chat scenario before ACK. Earlier cancelled-close negative remains. No prior check/test/native pass transfers tobc80.",
+        "No native close/recovery interaction, matched screenshots, UX acceptance, responsiveness, whole feature suite, integrated-browser, commercial provider or merge readiness is established. All current Cargo/test/helper/native/provider/workflow execution is UNRUN."
+      ],
+      "never_merge": true,
+      "original_negative": {
+        "artifact_id": 12878074392,
+        "command_exit": 101,
+        "control_head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+        "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+        "outer_result": {
+          "failed": 1,
+          "ignored": 0,
+          "passed": 0
+        },
+        "phase": "1726-ui-parent-5",
+        "pr": 1959,
+        "product_head": "7e280fb86d6678143f61fa1448a5af5272951ea1",
+        "product_pr": 1726,
+        "receipt": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490276690",
+        "run_id": 40828554073,
+        "scope": "Original final shared-read parent actually failed before ACK; saved/result error and scenario were omitted. First four UI parents passed at the predecessor only. No old pass qualifies40a; the new invocation obtains actual diagnostics and must not be reclassified as a repair.",
+        "stderr_sha256": "fdd7d2abec57c67abf1fdb99fbe9f1d8acbbe9c34994676196f3264137b8a0ea",
+        "stdout_sha256": "a5c7745061aa487466ee04516815704d8248297314480363726cc6ade401a317",
+        "zip_sha256": "3cf10d720deb86022aaf8d59c5673ae4c6cf865ad69debe1cbffdf8cfce43b9a"
+      },
+      "original_negatives": [
+        {
+          "artifact_id": 12878074392,
+          "command_exit": 101,
+          "control_head": "04d70c428ada276145ae4fffbc9cd41f86255b0b",
+          "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+          "outer_result": {
+            "failed": 1,
+            "ignored": 0,
+            "passed": 0
+          },
+          "phase": "1726-ui-parent-5",
+          "pr": 1959,
+          "product_head": "7e280fb86d6678143f61fa1448a5af5272951ea1",
+          "product_pr": 1726,
+          "receipt": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490276690",
+          "run_id": 40828554073,
+          "scope": "Original final shared-read parent actually failed before ACK; saved/result error and scenario were omitted. First four UI parents passed at the predecessor only. No old pass qualifies40a; the new invocation obtains actual diagnostics and must not be reclassified as a repair.",
+          "stderr_sha256": "fdd7d2abec57c67abf1fdb99fbe9f1d8acbbe9c34994676196f3264137b8a0ea",
+          "stdout_sha256": "a5c7745061aa487466ee04516815704d8248297314480363726cc6ade401a317",
+          "zip_sha256": "3cf10d720deb86022aaf8d59c5673ae4c6cf865ad69debe1cbffdf8cfce43b9a"
+        },
+        {
+          "artifact_id": 12925179838,
+          "command_exit": 101,
+          "control_head": "fd44a82e61726afe33b691ced245e410c189264f",
+          "failed_parent": "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+          "flush_error_category": "InvalidState at the window pane before ACK",
+          "outer_result": {
+            "failed": 1,
+            "ignored": 0,
+            "passed": 0
+          },
+          "phase": "1726-ui-parent-1",
+          "product_head": "40a574dcb5fdb8a96986412399324fda07598032",
+          "raw_audit_sha256": "7a37f09b88b59e7c901d38fc20ecece36d43adb7094378a2d8a6d625b8b2ad72",
+          "run_id": 40938441627,
+          "saved_error": null,
+          "scenario": {
+            "ordinal": 3,
+            "retained_chat": true,
+            "scoped": false,
+            "total": 3
+          },
+          "scope": "The third/final retained-chat scenario failed before ACK on40a. This is not the first scenario. The log gives the invalid-state category and pane; the violated native-continuity invariant and fixture-only correction are source-established. No40a pass qualifiesbc80.",
+          "stderr_sha256": "65179de862b85829d5821813d3b54d9b67b21f004977b469ddd9fc0b3a33e6cc",
+          "stdout_sha256": "c64587bd901b1397c3cf835c8de785c036ff6749bedbbc76ec48c38c62b38b83",
+          "zip_sha256": "11aac71ae51658014701c0d7616b48354df396f1cf88763b840e955a42a460f4"
+        }
+      ],
+      "prepared_only": true,
+      "products": [
+        {
+          "fixture_contract": "Fixture-only correction of the synthetic retained Claude native-continuity descriptor plus a real StateStore save/load/refusal/rollback regression. The original equal-read parent, all ten assertion predicates and all three scenarios in their original order are unchanged. All production guards and production source prefix are unchanged. No production repair, native holder/provider authority, authenticated adoption, window or helper is proved by this fixture.",
+          "fixture_source_review_sha256": "fda81c8029a1ce4af1f4154914cfb11064664e6941538df78a7c74e1b4181813",
+          "head": "bc80ba61f9d1a5de02cb570902d3b55fb024a230",
+          "pr": 1726,
+          "predecessor_source_approval_comment": "https://github.com/CarsonBurke/cagents/pull/1726#issuecomment-6490739169",
+          "selector_sources": {
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save": "src/app/shared_views.rs",
+            "app::shared_views::tests::retained_chat_fixture_round_trips_and_rejects_invalid_native_continuity": "src/app/shared_views.rs"
+          },
+          "selectors": [
+            "app::shared_views::tests::equal_shared_model_reads_do_not_veto_the_current_final_window_save",
+            "app::shared_views::tests::retained_chat_fixture_round_trips_and_rejects_invalid_native_continuity"
+          ],
+          "source_paths": [
+            "src/app.rs",
+            "src/app/shared_views.rs",
+            "src/settings.rs",
+            "src/persistence.rs",
+            ".cargo/config.toml"
+          ],
+          "source_sha256": {
+            ".cargo/config.toml": "2c342229ea06870a03fd22eede7299b883b2d5eb02d9f162a4f71b041c705018",
+            "Cargo.lock": "cbcb8b31eb6b00cbafe0a087145e2e6274ce5775413827b4f35295f0b93c383e",
+            "Cargo.toml": "8cf513d01300436076de1092e3c45cbbadc6c3c4b49286b65f882d7a3da92e48",
+            "src/app.rs": "903af3883ddc6c7dcfde3c7862d8a19e83444491a1ea7d485bfb24961bc30b54",
+            "src/app/shared_views.rs": "ed3a003b782272bc39e00233078e83759c3f9e508a6303b2f427006cbf8106ea",
+            "src/lib.rs": "8694b000688068810d33e2a50d2f9973f987daf3dc34b14004843a388ce79d1e",
+            "src/modules.rs": "5fdc1d071a5263883d1415ffb8ec84435128aad1019ef3753924bd37a2599374",
+            "src/persistence.rs": "10d102d5a0e62097b1bde4b161067343899f8b9a497e658f6d627ef815e7c37d",
+            "src/settings.rs": "624c77c9e820e75224bbebec6d826a2eb2a6b14509a0d1291294dabeb97556de"
+          },
+          "tree": "dee67e666efcd48b7dbcba20d5980aa577a775c2"
+        }
+      ],
+      "schema": 2,
+      "setup_head": "b855d789f2609cf16870951b5e92914f66843fc4",
+      "setup_sha256": "82a5284e0640b3c6648e3b9b3d6e0e0b323ada03eb087cbf95b9b63ca3d0c052",
+      "setup_tree": "7ca55d5d699847a3878a9595ee9e5b8dba664a21"
+    }
+
+jobs:
+  qualify:
+    if: >-
+      github.event.pull_request.head.ref == 'research/pr1853-bd88-qualification-20261028' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    name: One exact UI final-save diagnostic
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Require natural hosted User context and initialize evidence
+        run: |
+          set -euo pipefail
+          evidence_root="$RUNNER_TEMP/final-save-diagnostic-evidence"
+          install -d -m 700 "$evidence_root"
+          printf '%s\n' "FINAL_SAVE_DIAGNOSTIC_EVIDENCE_ROOT=$evidence_root" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "final-save-diagnostic-evidence"
+          present = sorted(name for name in os.environ if name.startswith("CAGENTS_"))
+          (root / "context.json").write_text(json.dumps({
+              "hosted": os.environ.get("GITHUB_ACTIONS") == "true",
+              "inherited_cagents_names": present,
+              "policy": "Presence only; no values inspected, removed or replaced."
+          }, indent=2) + "\n")
+          if os.environ.get("GITHUB_ACTIONS") != "true" or present:
+              print("Natural hosted User context required; present names: " + ", ".join(present), file=sys.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Check out the exact research control
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: research
+          persist-credentials: false
+
+      - name: Check out the pinned main setup
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: b855d789f2609cf16870951b5e92914f66843fc4
+          path: setup-main
+          persist-credentials: false
+
+      - name: Check out exact PR 1726
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: bc80ba61f9d1a5de02cb570902d3b55fb024a230
+          path: product-1726
+          persist-credentials: false
+
+      - name: Verify every literal source and setup before compilation
+        env:
+          EXPECTED_CONTROL_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, shutil, subprocess
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["FINAL_SAVE_DIAGNOSTIC_EVIDENCE_ROOT"])
+          manifest_text = os.environ["FINAL_SAVE_DIAGNOSTIC_MANIFEST"]
+          manifest = json.loads(manifest_text)
+          (evidence / "manifest.json").write_text(manifest_text)
+          def git(root, *args):
+              return subprocess.check_output(["git", "--no-optional-locks", "-C", str(root), *args], text=True).strip()
+          def source(root, head, tree):
+              result = {"head": git(root, "rev-parse", "HEAD"), "tree": git(root, "rev-parse", "HEAD^{tree}"),
+                        "status": git(root, "status", "--porcelain=v1", "--untracked-files=all")}
+              assert result == {"head": head, "tree": tree, "status": ""}, result
+              assert not any(line.startswith("160000 ") for line in git(root, "ls-files", "--stage").splitlines()), "unexpected submodule"
+              return result
+          control = workspace / "research"
+          assert git(control, "rev-parse", "HEAD") == os.environ["EXPECTED_CONTROL_SHA"]
+          assert git(control, "status", "--porcelain=v1", "--untracked-files=all") == ""
+          records = {"control_head": git(control, "rev-parse", "HEAD"),
+                     "control_tree": git(control, "rev-parse", "HEAD^{tree}"),
+                     "workflow_sha256": hashlib.sha256((control / ".github/workflows/research-pr1853-bd88.yml").read_bytes()).hexdigest(),
+                     "setup": source(workspace / "setup-main", manifest["setup_head"], manifest["setup_tree"]),
+                     "products": {}}
+          action = workspace / "setup-main/.github/actions/setup-linux-build/action.yml"
+          assert hashlib.sha256(action.read_bytes()).hexdigest() == manifest["setup_sha256"]
+          assert manifest["never_merge"] is True
+          assert [p["pr"] for p in manifest["products"]] == [1726]
+          assert [lane["id"] for lane in manifest["lanes"]] == ["1726-ui"]
+          assert [len(lane["selectors"]) for lane in manifest["lanes"]] == [2]
+          selected = [name for lane in manifest["lanes"] for name in lane["selectors"]]
+          assert len(selected) == len(set(selected)) == 2
+          for lane in manifest["lanes"]:
+              assert lane["feature"] == "ui" and lane["binary"] == "cagents-ui"
+              assert lane["matched_helper"] is False
+          for product in manifest["products"]:
+              names = [name for lane in manifest["lanes"] if lane["pr"] == product["pr"] for name in lane["selectors"]]
+              assert sorted(names) == sorted(product["selectors"])
+          for product in manifest["products"]:
+              names = product["selectors"] + [name for suite in product.get("suites", []) for name in suite["selectors"]]
+              assert len(names) == len(set(names)), "no parent may run twice"
+              assert set(product.get("owning_selectors", product["selectors"])).issubset(names)
+          for product in manifest["products"]:
+              root = workspace / ("product-" + str(product["pr"]))
+              record = source(root, product["head"], product["tree"])
+              paths = ["Cargo.toml", "Cargo.lock", "src/lib.rs", "src/modules.rs", *product["source_paths"]]
+              record["source_sha256"] = {path: hashlib.sha256((root / path).read_bytes()).hexdigest() for path in paths}
+              assert record["source_sha256"] == product["source_sha256"], "immutable source hashes differ"
+              for selector, path in product["selector_sources"].items():
+                  leaf = selector.rsplit("::", 1)[1]
+                  assert len(re.findall(r"\bfn\s+" + re.escape(leaf) + r"\s*\(", (root / path).read_text())) == 1
+              records["products"][str(product["pr"])] = record
+          (evidence / "sources-before.json").write_text(json.dumps(records, indent=2) + "\n")
+          PY
+
+      - name: Install the pinned main Linux Rust and Zig setup
+        uses: ./setup-main/.github/actions/setup-linux-build
+
+      - name: Retain the pinned build tools
+        run: |
+          set -euo pipefail
+          {
+            rustc -vV
+            cargo --version
+            zig version
+            clang --version
+            git --version
+            timeout --version
+          } > "$FINAL_SAVE_DIAGNOSTIC_EVIDENCE_ROOT/tools.txt"
+
+      - name: Check and run the exact UI diagnostic serially
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, hashlib, json, os, pathlib, re, subprocess, tempfile, time
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["FINAL_SAVE_DIAGNOSTIC_EVIDENCE_ROOT"])
+          manifest = json.loads((evidence / "manifest.json").read_text())
+          results = []
+          outcomes = []
+          class ProductFailure(RuntimeError):
+              def __init__(self, label, message):
+                  self.label = label
+                  super().__init__(message)
+          def put(path, value):
+              path.write_text(json.dumps(value, indent=2) + "\n")
+          def digest(path):
+              value = hashlib.sha256()
+              with pathlib.Path(path).open("rb") as stream:
+                  for block in iter(lambda: stream.read(1024 * 1024), b""):
+                      value.update(block)
+              return value.hexdigest()
+          def result(global_error=None):
+              if global_error is not None:
+                  for outcome in outcomes:
+                      if outcome["status"] == "running":
+                          outcome.update(status="stopped_globally", unrun_selector_invocations=None)
+              grouped = []
+              for product in manifest["products"]:
+                  observed = [outcome for outcome in outcomes if outcome["pr"] == product["pr"]]
+                  requested = [lane for lane in manifest["lanes"] if lane["pr"] == product["pr"]]
+                  status = "passed" if len(observed) == len(requested) and all(o["status"] == "passed" for o in observed) else "incomplete"
+                  if any(o["status"] in ("failed", "stopped_globally") for o in observed):
+                      status = "failed"
+                  grouped.append({"pr": product["pr"], "head": product["head"], "status": status,
+                                  "qualified_parents": [name for outcome in observed for name in outcome["qualified_parents"]]})
+              passed = len(outcomes) == len(manifest["lanes"]) and all(o["status"] == "passed" for o in outcomes)
+              value = {"narrow_qualification": "passed" if passed and global_error is None else "failed",
+                       "stopped_globally": global_error is not None, "error": global_error,
+                       "completed_phases": len(results), "lanes": outcomes, "products": grouped,
+                       "unattempted_lanes": [lane["id"] for lane in manifest["lanes"] if lane["id"] not in {o["id"] for o in outcomes}],
+                       "qualified_parent_count": sum(len(o["qualified_parents"]) for o in outcomes),
+                       "requested_parent_count": sum(len(lane["selectors"]) for lane in manifest["lanes"]),
+                       "requested_check_count": len(manifest["lanes"]), "limits": manifest["limits"]}
+              put(evidence / "result.json", value)
+              return value
+          def git(root, *args):
+              return subprocess.check_output(["git", "--no-optional-locks", "-C", str(root), *args], text=True).strip()
+          def verify(root, product):
+              assert git(root, "rev-parse", "HEAD") == product["head"]
+              assert git(root, "rev-parse", "HEAD^{tree}") == product["tree"]
+              assert git(root, "status", "--porcelain=v1", "--untracked-files=all") == ""
+              assert {name: digest(root / name) for name in product["source_sha256"]} == product["source_sha256"], "source hashes changed"
+          def configuration(root, env):
+              candidates = {parent / ".cargo" / name for parent in [root, *root.parents] for name in ["config", "config.toml"]}
+              cargo_home = pathlib.Path(env.get("CARGO_HOME", str(pathlib.Path(env["HOME"]) / ".cargo"))).resolve()
+              candidates.update(cargo_home / name for name in ["config", "config.toml"])
+              files = {}
+              for path in sorted(candidates):
+                  try:
+                      metadata = path.lstat()
+                  except FileNotFoundError:
+                      files[str(path)] = {"present": False}
+                      continue
+                  assert path.is_file(), "Cargo config is not a readable regular file: " + str(path)
+                  files[str(path)] = {"present": True, "sha256": digest(path), "mode": metadata.st_mode,
+                                      "symlink": os.readlink(path) if path.is_symlink() else None}
+              explicit = {"PATH", "HOME", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTC", "RUSTC_WRAPPER",
+                          "RUSTC_WORKSPACE_WRAPPER", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTDOCFLAGS",
+                          "CARGO_ENCODED_RUSTDOCFLAGS", "RUSTUP_TOOLCHAIN", "CC", "CXX", "AR", "LD",
+                          "LIBCLANG_PATH", "LD_LIBRARY_PATH", "PKG_CONFIG_PATH", "PKG_CONFIG_LIBDIR", "PKG_CONFIG_SYSROOT_DIR"}
+              inputs = {name: hashlib.sha256(value.encode()).hexdigest() for name, value in env.items()
+                        if name in explicit or name.startswith(("CARGO_BUILD_", "CARGO_TARGET_", "CARGO_PROFILE_", "CC_", "CXX_", "AR_"))}
+              return {"cargo_configs": files, "build_environment_sha256": inputs,
+                      "scope": "Input names and hashes only; no credential values or inherited authority are disclosed or changed."}
+          def phase(product, label, command, env, selector=None, expected_names=None, inventory_names=None, helper=None):
+              root = workspace / ("product-" + str(product["pr"]))
+              verify(root, product)
+              assert configuration(root, env) == baseline_context, "Cargo configuration or build environment changed"
+              assert helper is None, "This diagnostic never accepts a helper"
+              expected_names_present = set()
+              assert {name for name in env if name.startswith("CAGENTS_")} == expected_names_present, "unexpected inherited authority or helper context"
+              output = evidence / (active_lane["id"] + "-" + label)
+              output.mkdir()
+              bounded = ["timeout", "--signal=TERM", "--kill-after=30s", "2700s", *command]
+              record = {"source": product, "lane": active_lane, "label": label, "selector": selector, "cwd": str(root), "command": command,
+                        "expected_names": expected_names, "inventory_names": inventory_names, "matched_helper": helper,
+                        "bounded_command": bounded, "command_bound_seconds": 2700,
+                        "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "status": "running", "fixture_root": env["TMPDIR"],
+                        "target_dir": env["CARGO_TARGET_DIR"],
+                        "completion_scope": "GNU timeout wrapper/direct wait only; no detached-family closure claim."}
+              put(output / "command.json", record)
+              print("START", product["pr"], label, flush=True)
+              start = time.monotonic()
+              with (output / "stdout.log").open("wb") as stdout, (output / "stderr.log").open("wb") as stderr:
+                  completed = subprocess.run(bounded, cwd=root, env=env, stdout=stdout, stderr=stderr)
+              status = completed.returncode
+              record.update(status="returned", wrapper_exit=status, direct_wait_complete=True,
+                            wall_seconds=time.monotonic() - start)
+              record["command_exit"] = status if 0 <= status < 124 else None
+              record["timeout_or_wrapper_failure"] = status >= 124 or status < 0
+              record["stdout_sha256"] = hashlib.sha256((output / "stdout.log").read_bytes()).hexdigest()
+              record["stderr_sha256"] = hashlib.sha256((output / "stderr.log").read_bytes()).hexdigest()
+              put(output / "command.json", record)
+              (output / "exit.txt").write_text(str(status) + "\n")
+              results.append(record)
+              put(evidence / "phases.json", results)
+              print("RETURN", product["pr"], label, "exit", status, flush=True)
+              verify(root, product)
+              assert configuration(root, env) == baseline_context, "Cargo configuration or build environment changed"
+              assert helper is None, "This diagnostic never accepts a helper"
+              expected_names_present = set()
+              assert {name for name in env if name.startswith("CAGENTS_")} == expected_names_present, "unexpected inherited authority or helper context"
+              if record["timeout_or_wrapper_failure"]:
+                  raise RuntimeError(f"PR {product['pr']} {label}: uncertain timeout/signal/wrapper outcome; stop globally")
+              if status != 0:
+                  raise ProductFailure(label, f"PR {product['pr']} {label} failed with exit {status}; preserve original logs, no retry")
+              if inventory_names is not None:
+                  text = (output / "stdout.log").read_text() + "\n" + (output / "stderr.log").read_text()
+                  names = re.findall(r"^(\S+): test$", text, re.M)
+                  if not inventory_names or sorted(names) != sorted(inventory_names):
+                      raise ProductFailure(label, f"Compiled test inventory differs: expected={inventory_names}, actual={names}")
+                  put(output / "inventory.json", {"names": names, "count": len(names), "execution": "list only; no parent pass claimed"})
+              if selector or expected_names is not None:
+                  text = (output / "stdout.log").read_text() + "\n" + (output / "stderr.log").read_text()
+                  names = re.findall(r"^test (\S+) \.\.\. ok$", text, re.M)
+                  summaries = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.M)
+                  expected = [selector] if selector else expected_names
+                  if not expected or sorted(names) != sorted(expected) or summaries != [("ok", str(len(expected)), "0", "0")]:
+                      raise ProductFailure(label, f"Parent oracle failed: expected={expected}, names={names}, summaries={summaries}")
+                  put(output / ("exact-parent.json" if selector else "suite-parents.json"),
+                      {"names": names, "passed": len(names), "failed": 0, "ignored": 0})
+              return output
+          try:
+              assert not any(name.startswith("CAGENTS_") for name in os.environ)
+              for lane in manifest["lanes"]:
+                  product = next(p for p in manifest["products"] if p["pr"] == lane["pr"])
+                  active_lane, active_product = lane, product
+                  assert lane["feature"] == "ui" and lane["binary"] == "cagents-ui"
+                  fixture = pathlib.Path(tempfile.mkdtemp(prefix="rp", dir="/tmp"))
+                  fixture.chmod(0o700)
+                  env = os.environ.copy()
+                  env["TMPDIR"] = str(fixture)
+                  for key, leaf in [("XDG_RUNTIME_DIR", "run"), ("XDG_DATA_HOME", "data"), ("XDG_CONFIG_HOME", "config"), ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")]:
+                      directory = fixture / leaf
+                      directory.mkdir(mode=0o700)
+                      env[key] = str(directory)
+                  env["CARGO_TARGET_DIR"] = str(pathlib.Path(os.environ["RUNNER_TEMP"]) / ("final-save-diagnostic-target-" + lane["feature"]))
+                  env["CARGO_BUILD_JOBS"] = "2"
+                  root = workspace / ("product-" + str(product["pr"]))
+                  baseline_context = configuration(root, env)
+                  put(evidence / (lane["id"] + "-build-context.json"), baseline_context)
+                  outcome = {"id": lane["id"], "pr": product["pr"], "head": product["head"], "feature": lane["feature"],
+                             "status": "running", "check": "unrun", "qualified_parents": [],
+                             "unrun_selector_invocations": list(lane["selectors"])}
+                  outcomes.append(outcome)
+                  result()
+                  feature_arguments = [] if lane["feature"] == "cli" else ["--features", lane["feature"]]
+                  try:
+                      outcome["check"] = "running"
+                      phase(product, "check", ["cargo", "check", "--locked", "--no-default-features", *feature_arguments, "--bin", lane["binary"]], env)
+                      outcome["check"] = "passed"
+                      for index, selector in enumerate(lane["selectors"], 1):
+                          command = ["cargo", "test", "--locked", "--no-default-features", *feature_arguments, "--lib", selector]
+                          phase(product, f"list-{index}", command + ["--", "--exact", "--list", "--color=never"], env, inventory_names=[selector])
+                          outcome["unrun_selector_invocations"].remove(selector)
+                          observed = phase(product, f"parent-{index}", command + ["--", "--exact", "--nocapture", "--test-threads=1", "--color=never"], env, selector)
+                          outcome["qualified_parents"].extend(json.loads((observed / "exact-parent.json").read_text())["names"])
+                      outcome["status"] = "passed"
+                  except ProductFailure as error:
+                      outcome.update(status="failed", failed_phase=error.label, error=str(error))
+                      if error.label == "check":
+                          outcome["check"] = "failed"
+                      print("LANE FAILED", lane["id"], str(error), flush=True)
+                  result()
+          except BaseException as error:
+              result(global_error=str(error))
+              raise
+          if result()["narrow_qualification"] != "passed":
+              raise SystemExit(1)
+          PY
+
+      - name: Retain final source state even after a failed phase
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          evidence = pathlib.Path(os.environ["RUNNER_TEMP"]) / "final-save-diagnostic-evidence"
+          evidence.mkdir(mode=0o700, exist_ok=True)
+          expected = evidence / "manifest.json"
+          if not expected.exists():
+              (evidence / "sources-after.json").write_text(json.dumps({"audit": "unavailable before source preflight"}) + "\n")
+              raise SystemExit(0)
+          manifest = json.loads(expected.read_text())
+          records, failures = {}, []
+          for product in manifest["products"]:
+              root = workspace / ("product-" + str(product["pr"]))
+              record = {}
+              for label, args in [("head", ["rev-parse", "HEAD"]), ("tree", ["rev-parse", "HEAD^{tree}"]),
+                                  ("status", ["status", "--porcelain=v1", "--untracked-files=all"])]:
+                  result = subprocess.run(["git", "--no-optional-locks", "-C", str(root), *args], capture_output=True, text=True)
+                  record[label] = {"exit": result.returncode, "stdout": result.stdout.strip(), "stderr": result.stderr}
+              records[str(product["pr"])] = record
+              if any(item["exit"] != 0 for item in record.values()) or record["head"]["stdout"] != product["head"] or record["tree"]["stdout"] != product["tree"] or record["status"]["stdout"]:
+                  failures.append(product["pr"])
+          (evidence / "sources-after.json").write_text(json.dumps({"products": records, "failures": failures}, indent=2) + "\n")
+          assert not failures, failures
+          PY
+
+      - name: Retain original raw qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: final-save-diagnostic-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/final-save-diagnostic-evidence/
+          if-no-files-found: error
+          retention-days: 14
