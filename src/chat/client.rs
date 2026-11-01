@@ -187,6 +187,7 @@ enum UpgradeRecoveryKind {
     Exact,
     FirstIdentity,
     BoundRetainedReset,
+    LostHolderHistory,
 }
 
 impl UpgradeRecovery {
@@ -197,6 +198,9 @@ impl UpgradeRecovery {
     }
 
     fn candidate(source: &Session, replacement: &Session) -> Option<UpgradeRecoveryKind> {
+        if super::is_lost_holder_history(source, replacement) {
+            return Some(UpgradeRecoveryKind::LostHolderHistory);
+        }
         if super::is_upgrade_recovery(source, replacement) {
             return Some(UpgradeRecoveryKind::Exact);
         }
@@ -263,6 +267,10 @@ impl UpgradeRecovery {
                 | (
                     UpgradeRecoveryKind::BoundRetainedReset,
                     Some(UpgradeRecoveryKind::BoundRetainedReset)
+                )
+                | (
+                    UpgradeRecoveryKind::LostHolderHistory,
+                    Some(UpgradeRecoveryKind::LostHolderHistory)
                 )
         )
     }
