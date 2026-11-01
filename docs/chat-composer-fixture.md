@@ -61,7 +61,8 @@ before and an after can be live together.
   until you delete them. `cli` is refused until this fixture's runner has built a
   binary whose Cargo dep-info names this checkout. Only one fixture builds at a
   time: `run-ui` refuses with `build_busy` while another is building, so run it
-  again once that fixture's `status` says `building` is false. Unreadable or
+  again later. Only that fixture's owner can read its `status` or stop it; if
+  its owner is gone, the person running the broker restarts it. Unreadable or
   malformed runner state remains busy or unavailable; it does not permit a
   second build. An unacknowledged runner launch also keeps that build exclusion
   until existing completion or holder-exit evidence is available; it does not
@@ -90,8 +91,11 @@ before and an after can be live together.
   after that same cleanup is confirmed. During broker shutdown, new work is
   refused and accepted requests and original children are drained. A stopping
   diagnostic can remain indefinitely while ownership is uncertain; request
-  timeouts do not promise safe release. If the broker is killed outright, its sandboxes die with it, but its
-  nested niri windows stay until the broker next starts or `clear` runs.
+  timeouts do not promise safe release. The way out is the person's: `kill -9`
+  the broker. Its sandboxes die with it, its nested niri windows stay until the
+  broker next starts or `clear` runs, and that next start recovers the names. A
+  host start the broker itself killed may leave a nested window with no session
+  record, which the person closes by hand.
 - **Owner:** the owner value only stops agents using each other's fixtures by
   accident. It is not a security control.
 

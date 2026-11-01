@@ -963,6 +963,10 @@ class Fixture:
     spawn_resources: dict = field(default_factory=dict)
     resource_errors: list = field(default_factory=list)
     host_session_attempted: bool = False
+    # The harness was killed mid-start, so its nested niri may lack a record.
+    host_start_interrupted: bool = False
+    # The relay answered that no runner child was created for this attempt.
+    runner_launch_refused: bool = False
     host_session_stopped: bool = False
     released: bool = False
     runner_attempted: bool = False
@@ -1118,7 +1122,8 @@ class Fixtures:
     def harness(self, layout, command, timeout=HARNESS_SECONDS):
         # Only this fixed host operation changes: retain its actual Popen and
         # capture files through every original wait, including cancellation.
-        cleanup = command == [self.host.harness, "session", "stop", layout.name]
+        cleanup = command in ([self.host.harness, "session", "stop", layout.name],
+                              [self.host.harness, "--json", "session", "list"])
         streams, child, first = [], None, None
         operation = {"child": None, "wait_settled": False, "streams": streams, "close_errors": []}
         result = None
@@ -1281,16 +1286,20 @@ class Fixtures:
             if self.closing:
                 raise Refusal("shutting_down", "the broker is stopping; no new host session")
             fixture.host_session_attempted = True
-        started = self.harness(
-            layout,
-            [
-                self.host.harness, "session", "start", layout.name,
-                "--root", str(layout.niri_root),
-                "--no-window-wait",
-                # The sandbox is this broker's own child, so nested niri runs nothing.
-                "--cmd", "/usr/bin/true",
-            ],
-        )
+        try:
+            started = self.harness(
+                layout,
+                [
+                    self.host.harness, "session", "start", layout.name,
+                    "--root", str(layout.niri_root),
+                    "--no-window-wait",
+                    # The sandbox is this broker's own child, so nested niri runs nothing.
+                    "--cmd", "/usr/bin/true",
+                ],
+            )
+        except BaseException:
+            fixture.host_start_interrupted = True
+            raise
         # --no-window-wait returns before niri-harness hands focus back.
         self._restore_host_focus(previous, before)
         if started.returncode:
@@ -1630,6 +1639,8 @@ class Fixtures:
         """Whether this fixture's runner has not reached launching its UI yet."""
         if fixture.stopped or not (fixture.runner_attempted or fixture.runner_started):
             return False
+        if fixture.runner_launch_refused:
+            return False
         layout = fixture.layout
         log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), fixture.runner_log.name, MAX_RUNNER_LOG_BYTES)
         if log is not None and BUILD_FINISHED_MARKER in log:
@@ -1654,8 +1665,9 @@ class Fixtures:
                 if other is not fixture and self._is_building(other):
                     raise Refusal(
                         "build_busy",
-                        f"fixture {other.layout.name} is still building; retry run-ui when its status "
-                        "says building is false, because two builds must not run at once",
+                        f"fixture {other.layout.name} is still building and two builds must not run at "
+                        "once; retry run-ui later. Only its owner can stop it; if that owner is gone, "
+                        "ask the person running the broker to restart it",
                     )
             return self._start_runner(fixture)
 
@@ -1668,12 +1680,15 @@ class Fixtures:
         fixture.runner_attempt += 1
         fixture.runner_started = False
         fixture.runner_attempted = True
+        fixture.runner_launch_refused = False
         reply = fixture.channel.call(
             {"argv": runner_command(layout), "cwd": str(layout.checkout),
              "env": self.environment_for(layout), "background": "runner", "log": str(fixture.runner_log)},
             10,
         )
         if reply.get("state") != "running":
+            # A definite answer that creating the child failed; nothing is building.
+            fixture.runner_launch_refused = "exit_code" in reply
             raise Refusal("sandbox_failed", "the development runner did not start")
         fixture.runner_started = True
         return {
@@ -1752,6 +1767,8 @@ class Fixtures:
         if fixture.stopped or not (fixture.runner_attempted or fixture.runner_started):
             return False
         layout = fixture.layout
+        if fixture.runner_launch_refused:
+            return False
         log = read_regular(self.host.repo, (*layout.root_parts, "sandbox"), fixture.runner_log.name, MAX_RUNNER_LOG_BYTES)
         if log is not None and BUILD_FINISHED_MARKER in log:
             return False
@@ -1788,6 +1805,25 @@ class Fixtures:
             "left_behind": left_behind,
         }
 
+    def _host_session_gone(self, layout, fixture):
+        """A completed list with no record: the harness has nothing left to stop.
+
+        `session stop` exits nonzero for an unknown name. That is the normal state
+        after `stop --keep` removed the state directory, or a start that failed
+        before the harness recorded a session. A start the broker killed is
+        different: its nested niri can be running with no record.
+        """
+        if fixture is not None and fixture.host_start_interrupted:
+            return False
+        listed = self.harness(layout, [self.host.harness, "--json", "session", "list"], timeout=30)
+        if listed.returncode != 0:
+            return False
+        try:
+            sessions = json.loads(listed.stdout)
+            return isinstance(sessions, list) and all(session["name"] != layout.name for session in sessions)
+        except (ValueError, KeyError, TypeError):
+            return False
+
     def _discard(self, layout, *, remove):
         """Remove controls only after positive host stop and original release."""
         with self.lock:
@@ -1796,7 +1832,7 @@ class Fixtures:
             raise Refusal("cleanup_incomplete", "another original fixture owns this layout")
         if fixture is None or (fixture.host_session_attempted and not fixture.host_session_stopped):
             stopped = self.harness(layout, [self.host.harness, "session", "stop", layout.name], timeout=30)
-            if stopped.returncode != 0:
+            if stopped.returncode != 0 and not self._host_session_gone(layout, fixture):
                 raise Refusal("cleanup_incomplete", "host session stop failed: " + bounded(stopped.stderr or stopped.stdout))
         if fixture is not None:
             fixture.host_session_stopped = True
@@ -2032,6 +2068,17 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                 # A Thread.start interruption is not proof that no worker exists.
                 # Retain the original handle/request rather than close underneath it.
                 record["start_error"] = f"{type(error).__name__}: {error}"
+                if thread.ident is None and not thread.is_alive():
+                    # Python refused to create the thread: no worker holds this
+                    # request, and join would raise forever on an unstarted thread.
+                    record["joined"] = True
+                    try:
+                        self.shutdown_request(request)
+                    except BaseException as close_error:
+                        record["close_error"] = f"{type(close_error).__name__}: {close_error}"
+                    finally:
+                        self.slots.release()
+                    return
                 stopping("request thread start is uncertain; retaining its original handle")
 
     def process_request_thread(self, request, client_address, record=None):

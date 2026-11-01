@@ -830,9 +830,27 @@ case "$1 $2" in
     mkdir -p "$root"
     printf 'WAYLAND_DISPLAY=wayland-9\nNIRI_SOCKET=/nested.sock\n' > "$root/session.env"
     [ -n "$STUB_START_FAILS" ] && exit 3
+    mkdir -p "$NIRI_HARNESS_STATE"
+    : > "$NIRI_HARNESS_STATE/session"
     exit 0 ;;
-  "session stop") exit 0 ;;
+  "session stop")
+    # As the real harness: an unrecorded name is an error, not a success.
+    if [ ! -e "$NIRI_HARNESS_STATE/session" ] || [ -n "$STUB_STOP_FAILS" ]; then
+      echo "error: unknown session" >&2
+      exit 1
+    fi
+    rm -f "$NIRI_HARNESS_STATE/session"
+    exit 0 ;;
 esac
+if [ "$*" = "--json session list" ]; then
+  [ -n "$STUB_LIST_FAILS" ] && exit 4
+  if [ -e "$NIRI_HARNESS_STATE/session" ]; then
+    printf '[{"name": "demo", "alive": true}]\n'
+  else
+    printf '[]\n'
+  fi
+  exit 0
+fi
 case "$*" in
   *" shot -- "*)
     for name; do :; done
@@ -1316,6 +1334,53 @@ class Lifecycle(SandboxCase):
         del self.harness_env["STUB_START_FAILS"]
         self.assertIn("owner", self.start())
 
+    def test_a_recorded_session_that_will_not_stop_keeps_its_fixture(self):
+        owner = self.start()["owner"]
+        self.harness_env["STUB_STOP_FAILS"] = "1"
+        self.refused("cleanup_incomplete", "stop", fixture="demo", owner=owner)
+        self.assertIn("demo", self.fixtures.live)
+        del self.harness_env["STUB_STOP_FAILS"]
+        self.call("stop", fixture="demo", owner=owner)
+        self.assertEqual(self.fixtures.live, {})
+
+    def test_an_unreadable_session_list_is_not_proof_of_stop(self):
+        owner = self.start()["owner"]
+        self.call("stop", fixture="demo", owner=owner, keep=True)
+        self.harness_env["STUB_LIST_FAILS"] = "1"
+        self.refused("cleanup_incomplete", "clear", fixture="demo")
+        del self.harness_env["STUB_LIST_FAILS"]
+        self.call("clear", fixture="demo")
+
+    def test_a_killed_host_start_is_not_cleared_by_a_missing_record(self):
+        original = self.fixtures.harness
+
+        def killed_start(layout, command, timeout=broker.HARNESS_SECONDS):
+            if "start" in command:
+                raise subprocess.TimeoutExpired(command, timeout)
+            return original(layout, command, timeout)
+
+        self.fixtures.harness = killed_start
+        with self.assertRaises(subprocess.TimeoutExpired), mock.patch.object(broker, "stopping"):
+            self.start()
+        fixture = self.fixtures.live["demo"]
+        self.assertTrue(fixture.host_start_interrupted)
+        self.assertFalse(fixture.stopped)
+        # Cleanup of the fixture this test deliberately left retained.
+        fixture.host_start_interrupted = False
+        self.fixtures.harness = original
+        self.fixtures.stop(fixture, {})
+
+    def test_a_refused_runner_launch_does_not_hold_the_build_exclusion(self):
+        self.make_checkout("wt2")
+        first = self.start()
+        other = self.start("other", checkout="wt2")
+        fixture = self.fixtures.live["demo"]
+        os.chmod(fixture.layout.checkout / "scripts/run-development", 0o644)
+        self.refused("sandbox_failed", "run-ui", fixture="demo", owner=first["owner"])
+        self.assertTrue(fixture.runner_attempted)
+        self.assertFalse(self.fixtures._is_building(fixture))
+        self.assertEqual(self.call("run-ui", fixture="other", owner=other["owner"])["state"], "building_then_launching")
+
     def test_a_sandbox_that_never_greets_is_killed_when_start_fails(self):
         relay = broker.RELAY
         # Never touches its channel, so closing that channel cannot end it.
@@ -1703,6 +1768,26 @@ class OwnershipContracts(TemporaryRepository):
             original.join.assert_called_once_with()
             self.assertTrue(record["joined"])
             self.assertTrue(server.ownership_settled())
+
+    def test_a_thread_python_could_not_create_does_not_hang_shutdown(self):
+        server = object.__new__(broker.Server)
+        server.requests_lock = threading.Lock()
+        server.accepting = True
+        server.request_threads = []
+        server.slots = mock.Mock()
+        server.shutdown_request = mock.Mock()
+        server.listen_close_attempted = False
+        server.socket_close_uncertain = False
+        request = object()
+        real = threading.Thread(target=lambda: None)
+        with mock.patch.object(real, "start", side_effect=RuntimeError("can't start new thread")), \
+                mock.patch.object(broker.threading, "Thread", return_value=real), \
+                mock.patch.object(broker.socketserver.UnixStreamServer, "server_close"):
+            server.process_request(request, "synthetic-client")
+            server.shutdown_request.assert_called_once_with(request)
+            server.slots.release.assert_called_once_with()
+            self.assertTrue(server.request_threads[0]["joined"])
+            server.server_close()
 
     def test_closed_request_admission_closes_only_the_accepted_socket(self):
         server = object.__new__(broker.Server)
@@ -2482,11 +2567,11 @@ class RootCustodyContracts(TemporaryRepository):
                     recovered, problems = self.manager.recover_stale()
                     self.assertEqual(recovered, [])
                     self.assertEqual(len(problems), 1)
-                    self.harness.assert_called_once()
+                    self.assertEqual(self.harness.call_count, 2)  # The stop, then its unreadable list.
                     with self.assertRaises(broker.Refusal) as caught:
                         self.manager.start(self.request(accounts))
                     self.assertEqual(caught.exception.code, "fixture_exists")
-                    self.harness.assert_called_once()  # No host operation from the refused new start.
+                    self.assertEqual(self.harness.call_count, 2)  # No host operation from the refused new start.
                     fixture = create.call_args_list[0].args[0]
                     self.assertFalse(fixture.private_root_owned)
                     self.assertFalse(fixture.runtime_root_owned)
