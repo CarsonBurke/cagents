@@ -438,19 +438,59 @@ fn release(app: &mut Cagents) -> Task<Message> {
     cosmic::task::message(original)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CompletionObservation {
+    card_present: bool,
+    row_present: bool,
+    current_text_preserved: Option<bool>,
+    matches_expected: bool,
+}
+
+fn completion_observation(
+    expected_retained: bool,
+    card_present: bool,
+    row_present: bool,
+    current_text: Option<&str>,
+    expected_text: Option<&str>,
+) -> CompletionObservation {
+    let current_text_preserved = expected_retained.then(|| {
+        current_text
+            .zip(expected_text)
+            .is_some_and(|(current, expected)| current == expected)
+    });
+    let matches_expected = if expected_retained {
+        card_present && row_present && current_text_preserved == Some(true)
+    } else {
+        !card_present && !row_present
+    };
+    CompletionObservation {
+        card_present,
+        row_present,
+        current_text_preserved,
+        matches_expected,
+    }
+}
+
 fn completed(app: &mut Cagents) {
     let f = app.project_ui.native_fixture.as_ref().unwrap();
     let project = f.project.unwrap();
     let card = f.card.unwrap();
-    let present = app.cards.contains_key(&card) && app.sidebar_model.project(project).is_some();
+    let card_present = app.cards.contains_key(&card);
+    let row_present = app.sidebar_model.project(project).is_some();
     let retained = match f.context.scene {
         Scene::Edit => EXPECTS_EDIT_RETAINED,
         Scene::Unchanged => false,
         Scene::Reopen => true,
     };
-    let text_preserved =
-        !retained || editor(app).and_then(RepositoryRuntime::editor_text) == f.expected_text;
-    if present != retained || !text_preserved {
+    let current_text = editor(app).and_then(RepositoryRuntime::editor_text);
+    let observation = completion_observation(
+        retained,
+        card_present,
+        row_present,
+        current_text.as_deref(),
+        f.expected_text.as_deref(),
+    );
+    if !observation.matches_expected {
         fail(
             app,
             "original callback outcome disagreed with the source side or lost current text",
@@ -460,7 +500,10 @@ fn completed(app: &mut Cagents) {
     f.phase = Phase::Finished;
     receipt(
         serde_json::json!({"event":"original_callback_consumed","original":f.original,
-        "row_and_editor_present":present,"expected_retained":retained,"current_text_preserved":text_preserved,
+        "row_present":observation.row_present,"card_present":observation.card_present,
+        "expected_retained":retained,"current_text_preserved":observation.current_text_preserved,
+        "text_observation":if retained {"REQUIRED"} else {"NOT_APPLICABLE"},
+        "matches_source_expectation":observation.matches_expected,
         "fixture_error":f.error,"native_input_or_ux_qualified":false}),
     );
 }
@@ -584,7 +627,7 @@ pub(in crate::app) fn before_update(
         edit: crate::workspace_model::ModelEdit::ReopenProject { repository, .. }, ..
     }) if repository == &f.context.project());
     let delivering = f.phase == Phase::Delivering
-        && matches!(view,
+        && matches!(&message,
         Message::ProjectUi(Action::ProjectSessionsClosed(project, generation, _))
             if f.original == Some((*project, *generation)));
     let f = app.project_ui.native_fixture.as_mut().unwrap();
@@ -744,6 +787,100 @@ mod tests {
         let f = app.project_ui.native_fixture.as_ref().unwrap();
         assert!(f.held.is_none());
         assert!(f.error.is_none());
+
+        app.project_ui.native_fixture.as_mut().unwrap().phase = Phase::Delivering;
+        let wrapped = Box::new(Message::ProjectUi(Action::ProjectSessionsClosed(
+            project,
+            7,
+            Err("wrapped delivery control, not the original global callback".into()),
+        )));
+        let pointer = wrapped.as_ref() as *const Message;
+        let (returned, task) = before_update(&mut app, Message::UtilityPaneUi(wrapped));
+        drop(task);
+        assert!(matches!(returned, Message::UtilityPaneUi(original)
+            if std::ptr::eq(original.as_ref(), pointer)));
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert_eq!(f.phase, Phase::Delivering);
+        assert!(!f.delivering);
+        assert!(f.held.is_none());
+        assert!(f.error.is_none());
+
+        let (returned, task) = before_update(
+            &mut app,
+            Message::ProjectUi(Action::ProjectSessionsClosed(
+                project,
+                7,
+                Err("top-level original-delivery plumbing control".into()),
+            )),
+        );
+        drop(task);
+        assert!(
+            matches!(returned, Message::ProjectUi(Action::ProjectSessionsClosed(
+            got, 7, Err(error))) if got == project && error == "top-level original-delivery plumbing control")
+        );
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert_eq!(f.phase, Phase::Delivering);
+        assert!(f.delivering);
+        assert!(f.held.is_none());
+        assert!(f.error.is_none());
+    }
+
+    #[test]
+    fn retired_completion_rejects_each_remaining_owner_and_has_no_text_claim() {
+        for (card_present, row_present) in [(true, false), (false, true), (true, true)] {
+            let observation = completion_observation(
+                false,
+                card_present,
+                row_present,
+                Some("same text"),
+                Some("same text"),
+            );
+            assert_eq!(observation.card_present, card_present);
+            assert_eq!(observation.row_present, row_present);
+            assert_eq!(observation.current_text_preserved, None);
+            assert!(!observation.matches_expected);
+        }
+        let retired = completion_observation(false, false, false, None, None);
+        assert!(!retired.card_present);
+        assert!(!retired.row_present);
+        assert_eq!(retired.current_text_preserved, None);
+        assert!(retired.matches_expected);
+    }
+
+    #[test]
+    fn retained_completion_requires_both_owners_and_exact_available_text() {
+        let retained = completion_observation(
+            true,
+            true,
+            true,
+            Some("actual current edit"),
+            Some("actual current edit"),
+        );
+        assert!(retained.card_present);
+        assert!(retained.row_present);
+        assert_eq!(retained.current_text_preserved, Some(true));
+        assert!(retained.matches_expected);
+        for (card_present, row_present) in [(true, false), (false, true), (false, false)] {
+            let observation = completion_observation(
+                true,
+                card_present,
+                row_present,
+                Some("actual current edit"),
+                Some("actual current edit"),
+            );
+            assert_eq!(observation.current_text_preserved, Some(true));
+            assert!(!observation.matches_expected);
+        }
+        for (current_text, expected_text) in [
+            (Some("changed"), Some("actual current edit")),
+            (None, Some("actual current edit")),
+            (Some("actual current edit"), None),
+            (None, None),
+        ] {
+            let observation = completion_observation(true, true, true, current_text, expected_text);
+            assert_eq!(observation.current_text_preserved, Some(false));
+            assert!(!observation.matches_expected);
+        }
     }
 
     #[test]
