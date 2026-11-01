@@ -1970,11 +1970,10 @@ impl Runtime {
                 && let Some((_, label, full)) = &self.finished_stamp
             {
                 transcript.push(
-                    widget::tooltip(
+                    crate::interaction::tooltip_above(
                         design::caption(label.clone())
                             .class(cosmic::theme::Text::Custom(design::muted_text)),
-                        design::caption(full.clone()),
-                        widget::tooltip::Position::Top,
+                        full.clone(),
                     )
                     .into(),
                 );
@@ -2493,13 +2492,12 @@ impl Runtime {
             .align_y(Alignment::Center)
             .spacing(step::GAP_XS);
             attachment_chips.push(
-                widget::tooltip(
+                crate::interaction::tooltip_above(
                     chip,
-                    design::caption(attachment.reference.as_ref().map_or_else(
+                    attachment.reference.as_ref().map_or_else(
                         || attachment.path.display().to_string(),
                         |reference| reference.name.clone(),
-                    )),
-                    widget::tooltip::Position::Top,
+                    ),
                 )
                 .into(),
             );
@@ -4358,11 +4356,10 @@ impl Runtime {
             && item.at == Some(*at)
         {
             controls.push(
-                widget::tooltip(
+                crate::interaction::tooltip_above(
                     design::caption(stamp.clone())
                         .class(cosmic::theme::Text::Custom(design::muted_text)),
-                    design::caption(full.clone()),
-                    widget::tooltip::Position::Top,
+                    full.clone(),
                 )
                 .into(),
             );
@@ -5710,6 +5707,561 @@ pub(super) fn prepared_runtime_for_test(items: &[chat::Item]) -> (Runtime, Arc<C
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug, PartialEq)]
+    struct NativeTooltipChild {
+        id: iced_accessibility::A11yId,
+        role: iced_accessibility::accesskit::Role,
+        label: String,
+        bounds: iced_accessibility::accesskit::Rect,
+        disabled: bool,
+        click: bool,
+        focus: bool,
+    }
+
+    fn native_tooltip_children(
+        element: &Element<'_, Message>,
+        node: &iced::advanced::layout::Node,
+        tree: &iced::advanced::widget::Tree,
+        labels: &[&str],
+    ) -> Vec<NativeTooltipChild> {
+        use iced_accessibility::accesskit::Action;
+        let accessible = element.as_widget().a11y_nodes(
+            iced::advanced::Layout::new(node),
+            tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter(|node| {
+                node.node()
+                    .label()
+                    .is_some_and(|label| labels.contains(&label))
+            })
+            .map(|node| NativeTooltipChild {
+                id: node.id().clone(),
+                role: node.node().role(),
+                label: node.node().label().unwrap().into(),
+                bounds: node.node().bounds().expect("native child bounds"),
+                disabled: node.node().is_disabled(),
+                click: node.node().supports_action(Action::Click),
+                focus: node.node().supports_action(Action::Focus),
+            })
+            .collect()
+    }
+
+    fn tooltip_consumer_event(
+        element: &mut Element<'_, Message>,
+        node: &iced::advanced::layout::Node,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        viewport: &iced::Rectangle,
+        event: iced::Event,
+        cursor: iced::mouse::Cursor,
+    ) -> Vec<Message> {
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            tree,
+            &event,
+            iced::advanced::Layout::new(node),
+            cursor,
+            renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut iced::advanced::Shell::new(&mut messages),
+            viewport,
+        );
+        messages
+    }
+
+    fn tooltip_consumer_hover_cycle(
+        element: &mut Element<'_, Message>,
+        node: &iced::advanced::layout::Node,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &cosmic::Renderer,
+        viewport: &iced::Rectangle,
+        point: iced::Point,
+        labels: &[&str],
+    ) {
+        let original = native_tooltip_children(element, node, tree, labels);
+        let now = std::time::Instant::now();
+        let inside = iced::mouse::Cursor::Available(point);
+        // The established tooltip has a 300 ms dwell and 120 ms animation.
+        // Keep the actual consumer and its child IDs mounted for the cycle.
+        for (event, cursor, open) in [
+            (
+                iced::Event::Window(iced::window::Event::Focused),
+                inside,
+                false,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: point }),
+                inside,
+                false,
+            ),
+            (
+                iced::Event::Window(iced::window::Event::RedrawRequested(
+                    now + Duration::from_millis(450),
+                )),
+                inside,
+                true,
+            ),
+            (
+                iced::Event::Window(iced::window::Event::RedrawRequested(
+                    now + Duration::from_millis(600),
+                )),
+                inside,
+                true,
+            ),
+            (
+                iced::Event::Mouse(iced::mouse::Event::CursorLeft),
+                iced::mouse::Cursor::Unavailable,
+                false,
+            ),
+            (
+                iced::Event::Window(iced::window::Event::RedrawRequested(
+                    now + Duration::from_millis(1000),
+                )),
+                iced::mouse::Cursor::Unavailable,
+                false,
+            ),
+        ] {
+            assert!(
+                tooltip_consumer_event(element, node, tree, renderer, viewport, event, cursor)
+                    .is_empty()
+            );
+            if open {
+                assert!(
+                    element
+                        .as_widget_mut()
+                        .overlay(
+                            tree,
+                            iced::advanced::Layout::new(node),
+                            renderer,
+                            viewport,
+                            iced::Vector::ZERO
+                        )
+                        .is_some(),
+                    "actual consumer tooltip opens after dwell"
+                );
+            }
+            assert_eq!(
+                native_tooltip_children(element, node, tree, labels),
+                original
+            );
+        }
+        tree.diff(element.as_widget_mut());
+        assert_eq!(
+            native_tooltip_children(element, node, tree, labels),
+            original
+        );
+        assert!(
+            element
+                .as_widget_mut()
+                .overlay(
+                    tree,
+                    iced::advanced::Layout::new(node),
+                    renderer,
+                    viewport,
+                    iced::Vector::ZERO
+                )
+                .is_none(),
+            "the actual consumer tooltip closes after pointer exit"
+        );
+    }
+
+    fn tooltip_consumer_a11y(
+        id: iced_accessibility::A11yId,
+        action: iced_accessibility::accesskit::Action,
+    ) -> iced::Event {
+        use iced_accessibility::{
+            A11yId,
+            accesskit::{ActionRequest, TreeId},
+        };
+        let A11yId::Widget(widget) = id.clone() else {
+            panic!("native widget identity")
+        };
+        iced::Event::A11y(
+            widget,
+            ActionRequest {
+                action,
+                target_tree: TreeId::ROOT,
+                target_node: id.into(),
+                data: None,
+            },
+        )
+    }
+
+    #[test]
+    fn composer_attachment_tooltip_preserves_native_image_and_remove_ownership() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree, operation},
+        };
+        use iced_accessibility::{
+            A11yId,
+            accesskit::{Action as A11yAction, Role},
+        };
+        fn remove_is_focused(
+            element: &mut Element<'_, Message>,
+            node: &iced::advanced::layout::Node,
+            tree: &mut Tree,
+            renderer: &cosmic::Renderer,
+            target: &widget::Id,
+        ) -> bool {
+            struct Probe<'a> {
+                target: &'a widget::Id,
+                focused: Vec<bool>,
+            }
+            impl Operation for Probe<'_> {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
+                fn focusable(
+                    &mut self,
+                    id: Option<&widget::Id>,
+                    _: iced::Rectangle,
+                    state: &mut dyn operation::Focusable,
+                ) {
+                    if id == Some(self.target) {
+                        self.focused.push(state.is_focused());
+                    }
+                }
+            }
+            let mut probe = Probe {
+                target,
+                focused: vec![],
+            };
+            element
+                .as_widget_mut()
+                .operate(tree, Layout::new(node), renderer, &mut probe);
+            assert_eq!(probe.focused.len(), 1, "one actual Remove focus owner");
+            probe.focused[0]
+        }
+        fn enter(pressed: bool) -> iced::Event {
+            let key = keyboard::Key::Named(keyboard::key::Named::Enter);
+            let physical_key = keyboard::key::Physical::Code(keyboard::key::Code::Enter);
+            iced::Event::Keyboard(if pressed {
+                keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key,
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }
+            } else {
+                keyboard::Event::KeyReleased {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key,
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                }
+            })
+        }
+        chat::attachment_assets::with_test_image(|image| {
+            // This owns a real Store receipt and the production view, without
+            // claiming clipboard, ImageSaved, provider or writer execution.
+            chat::attachment_assets::validate(&image).unwrap();
+            assert_eq!(image.label(), "Image 1");
+            let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+            let mut publication = (*handle.snapshot()).clone();
+            publication.generation += 1;
+            publication.finished_at = Some(1_700_000_000_000);
+            handle.publish_delta_snapshot_for_test(publication);
+            runtime.refresh();
+            preparation::drain_fixture(&mut runtime);
+            let finished = runtime
+                .finished_stamp
+                .as_ref()
+                .expect("snapshot generates finished stamp")
+                .1
+                .clone();
+            runtime.attachments = vec![image.clone()];
+            assert_eq!(runtime.composer.text(), "");
+            assert_eq!(runtime.pastes_pending, 0);
+            assert_eq!(runtime.transition_blocker(), None);
+            let renderer = crate::app::tests::headless_renderer();
+            let shortcuts = crate::settings::KeyboardShortcuts::default();
+            for width in [600.0, 320.0] {
+                for transitioning in [false, true] {
+                    let view = || {
+                        runtime.view(
+                            None,
+                            transitioning,
+                            true,
+                            &shortcuts,
+                            width,
+                            Place {
+                                name: "Fixture".into(),
+                                channel: None,
+                                branch: None,
+                            },
+                            true,
+                            None,
+                            vec![],
+                        )
+                    };
+                    let mut element = view();
+                    let mut tree = Tree::new(element.as_widget());
+                    let viewport = iced::Rectangle::with_size(iced::Size::new(width, 800.0));
+                    let mut node = element.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+                    );
+                    let labels = ["Image 1", "Remove attachment", finished.as_str()];
+                    let children = native_tooltip_children(&element, &node, &tree, &labels);
+                    for label in labels {
+                        assert_eq!(
+                            children.iter().filter(|child| child.label == label).count(),
+                            1,
+                            "one real {label} native child"
+                        );
+                    }
+                    for child in &children {
+                        assert!(
+                            child.bounds.x1 > child.bounds.x0
+                                && child.bounds.y1 > child.bounds.y0
+                                && child.bounds.y0 >= 0.0
+                                && child.bounds.y0 < f64::from(viewport.height)
+                        );
+                    }
+                    for label in ["Image 1", finished.as_str()] {
+                        let child = children.iter().find(|child| child.label == label).unwrap();
+                        assert_eq!(child.role, Role::Paragraph);
+                        assert!(!child.click && !child.focus);
+                    }
+                    let remove = children
+                        .iter()
+                        .find(|child| child.label == "Remove attachment")
+                        .unwrap();
+                    assert_eq!(remove.role, Role::Button);
+                    assert_eq!(remove.disabled, transitioning);
+                    if !transitioning {
+                        assert!(remove.click && remove.focus);
+                    }
+                    for label in ["Image 1", finished.as_str()] {
+                        let bounds = children
+                            .iter()
+                            .find(|child| child.label == label)
+                            .unwrap()
+                            .bounds;
+                        tooltip_consumer_hover_cycle(
+                            &mut element,
+                            &node,
+                            &mut tree,
+                            &renderer,
+                            &viewport,
+                            iced::Point::new(
+                                ((bounds.x0 + bounds.x1) / 2.0) as f32,
+                                ((bounds.y0 + bounds.y1) / 2.0) as f32,
+                            ),
+                            &labels,
+                        );
+                    }
+                    let mut dispatch = |event| {
+                        tooltip_consumer_event(
+                            &mut element,
+                            &node,
+                            &mut tree,
+                            &renderer,
+                            &viewport,
+                            event,
+                            iced::mouse::Cursor::Unavailable,
+                        )
+                    };
+                    for action in [A11yAction::Click, A11yAction::Focus] {
+                        assert!(
+                            dispatch(tooltip_consumer_a11y(
+                                A11yId::from(widget::Id::unique()),
+                                action
+                            ))
+                            .is_empty()
+                        );
+                    }
+                    // Winit derives the outer widget ID from target_node.
+                    // Exercise coherent events for actual passive children;
+                    // an independent outer Remove ID is not native ingress.
+                    for label in ["Image 1", finished.as_str()] {
+                        let passive = children.iter().find(|child| child.label == label).unwrap();
+                        for action in [A11yAction::Click, A11yAction::Focus] {
+                            assert!(
+                                dispatch(tooltip_consumer_a11y(passive.id.clone(), action))
+                                    .is_empty()
+                            );
+                        }
+                    }
+                    assert!(
+                        dispatch(tooltip_consumer_a11y(remove.id.clone(), A11yAction::Focus))
+                            .is_empty()
+                    );
+                    let messages =
+                        dispatch(tooltip_consumer_a11y(remove.id.clone(), A11yAction::Click));
+                    if transitioning {
+                        assert!(messages.is_empty());
+                    } else {
+                        assert!(
+                            matches!(messages.as_slice(), [Message::ChatUi(Action::RemoveAttachment(target, 0))] if *target == runtime.target)
+                        );
+                    }
+                    drop(dispatch);
+                    let A11yId::Widget(remove_id) = remove.id.clone() else {
+                        panic!("actual Remove widget identity")
+                    };
+                    assert!(
+                        !remove_is_focused(&mut element, &node, &mut tree, &renderer, &remove_id),
+                        "a direct A11y Focus callback alone does not move focus"
+                    );
+                    for pressed in [true, false] {
+                        assert!(
+                            tooltip_consumer_event(
+                                &mut element,
+                                &node,
+                                &mut tree,
+                                &renderer,
+                                &viewport,
+                                enter(pressed),
+                                iced::mouse::Cursor::Unavailable
+                            )
+                            .is_empty(),
+                            "unfocused Remove cannot activate from Enter"
+                        );
+                    }
+                    // This is the public operation Winit applies after finding
+                    // the requested target in the published accessibility tree.
+                    assert!(
+                        element
+                            .as_widget()
+                            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable)
+                            .contains(&remove.id)
+                    );
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(remove_id.clone()),
+                    );
+                    let focused = tooltip_consumer_event(
+                        &mut element,
+                        &node,
+                        &mut tree,
+                        &renderer,
+                        &viewport,
+                        tooltip_consumer_a11y(remove.id.clone(), A11yAction::Focus),
+                        iced::mouse::Cursor::Unavailable,
+                    );
+                    if transitioning {
+                        assert!(focused.is_empty(), "switching has no editable composer");
+                    } else {
+                        // Public focus unfocuses the other focusables. The
+                        // editor publishes its pending selection cleanup here.
+                        assert!(
+                            matches!(focused.as_slice(), [Message::ChatUi(Action::Composer(target, text_editor::Action::ClearSelection))]
+                            if *target == runtime.target),
+                            "public focus emits only the exact editor's selection cleanup"
+                        );
+                    }
+                    for rerender in [false, true] {
+                        if rerender {
+                            // Rebuild the actual consumer against the retained
+                            // tree; fresh unrelated trees have no ID guarantee.
+                            element = view();
+                            tree.diff(element.as_widget_mut());
+                            node = element.as_widget_mut().layout(
+                                &mut tree,
+                                &renderer,
+                                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+                            );
+                            assert_eq!(
+                                native_tooltip_children(&element, &node, &tree, &labels),
+                                children
+                            );
+                        }
+                        assert!(
+                            remove_is_focused(
+                                &mut element,
+                                &node,
+                                &mut tree,
+                                &renderer,
+                                &remove_id
+                            ),
+                            "public focus survives the mounted consumer's rerender"
+                        );
+                        let pressed = tooltip_consumer_event(
+                            &mut element,
+                            &node,
+                            &mut tree,
+                            &renderer,
+                            &viewport,
+                            enter(true),
+                            iced::mouse::Cursor::Unavailable,
+                        );
+                        if transitioning {
+                            assert!(pressed.is_empty(), "focused disabled Remove stays inert");
+                        } else {
+                            assert!(
+                                matches!(pressed.as_slice(), [Message::ChatUi(Action::RemoveAttachment(target, 0))]
+                                if *target == runtime.target),
+                                "one focused Enter keeps exact attachment ownership"
+                            );
+                        }
+                        assert!(
+                            tooltip_consumer_event(
+                                &mut element,
+                                &node,
+                                &mut tree,
+                                &renderer,
+                                &viewport,
+                                enter(false),
+                                iced::mouse::Cursor::Unavailable
+                            )
+                            .is_empty(),
+                            "Enter release cannot remove a second attachment"
+                        );
+                    }
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::unfocus::<()>(),
+                    );
+                    assert!(!remove_is_focused(
+                        &mut element,
+                        &node,
+                        &mut tree,
+                        &renderer,
+                        &remove_id
+                    ));
+                    for pressed in [true, false] {
+                        let messages = tooltip_consumer_event(
+                            &mut element,
+                            &node,
+                            &mut tree,
+                            &renderer,
+                            &viewport,
+                            enter(pressed),
+                            iced::mouse::Cursor::Unavailable,
+                        );
+                        if !transitioning && pressed {
+                            // Global unfocus queues the same editor cleanup;
+                            // the first event flushes it without activating Remove.
+                            assert!(
+                                matches!(messages.as_slice(), [Message::ChatUi(Action::Composer(target, text_editor::Action::ClearSelection))]
+                                if *target == runtime.target),
+                                "unfocused Enter emits only the exact editor's selection cleanup"
+                            );
+                        } else {
+                            assert!(messages.is_empty(), "unfocused Remove stays inert");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     #[test]
     fn saved_history_composer_exposes_attachment_control_without_enabling_send() {
         use iced::advanced::{
@@ -6153,6 +6705,33 @@ mod tests {
                 Layout::new(&node),
                 &tree,
                 iced::mouse::Cursor::Unavailable,
+            );
+            let timestamp_nodes = native_tooltip_children(
+                &footer,
+                &node,
+                &tree,
+                &[expected.1.as_str(), "Copy this message"],
+            );
+            let stamps = timestamp_nodes
+                .iter()
+                .filter(|child| child.label == expected.1)
+                .collect::<Vec<_>>();
+            assert_eq!(stamps.len(), 1, "recorded stamp remains a native child");
+            let stamp = stamps[0];
+            assert_eq!(stamp.role, iced_accessibility::accesskit::Role::Paragraph);
+            assert!(!stamp.click && !stamp.focus, "the recorded time is passive");
+            assert!(stamp.bounds.x1 > stamp.bounds.x0 && stamp.bounds.y1 > stamp.bounds.y0);
+            tooltip_consumer_hover_cycle(
+                &mut footer,
+                &node,
+                &mut tree,
+                &renderer,
+                &iced::Rectangle::with_size(iced::Size::new(600.0, 100.0)),
+                iced::Point::new(
+                    ((stamp.bounds.x0 + stamp.bounds.x1) / 2.0) as f32,
+                    ((stamp.bounds.y0 + stamp.bounds.y1) / 2.0) as f32,
+                ),
+                &[expected.1.as_str(), "Copy this message"],
             );
             let copy = accessible
                 .root()

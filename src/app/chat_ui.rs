@@ -29,9 +29,13 @@ mod find_navigation;
 mod flow_layout;
 mod fold;
 mod hover;
+#[cfg(test)]
+mod image_only_peer_remove_tests;
 pub(super) mod images;
 mod layout;
 mod literal_content;
+#[cfg(test)]
+pub(super) mod managed_image_retention_test_support;
 mod markdown;
 mod markdown_source;
 mod monospace;
@@ -6185,7 +6189,12 @@ impl Cagents {
             .durable
             .cards
             .iter()
-            .filter(|card| card.existence.is_open() && !defaults.contains(&card.id))
+            .filter(|card| {
+                (card.existence.is_open()
+                    || self.durable.local_only_cards.contains(&card.id)
+                    || self.shared_views.quarantined.contains(&card.id))
+                    && !defaults.contains(&card.id)
+            })
             .map(|card| card.id)
             .collect::<std::collections::HashSet<_>>();
         let mut chat_drafts: HashMap<CardId, String> = self
@@ -6689,6 +6698,7 @@ impl Cagents {
         runtime.is_some_and(|runtime| {
             runtime.closed_elsewhere
                 || runtime.has_unsent_text()
+                || !runtime.unsent_attachments().is_empty()
                 || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
@@ -6772,6 +6782,77 @@ impl Cagents {
         }
         self.chat_ui.phases.remove(&card);
         self.observe_agent_activity_for_card(card, None);
+    }
+
+    pub(super) fn quarantined_pane_draft(&self, card: CardId) -> Option<&str> {
+        self.shared_views
+            .quarantined
+            .contains(&card)
+            .then(|| self.chat_ui.drafts.get(&card).map(String::as_str))
+            .flatten()
+    }
+
+    pub(super) fn quarantined_pane_attachment_count(&self, card: CardId) -> usize {
+        self.chat_ui
+            .draft_attachments
+            .get(&card)
+            .map_or(0, Vec::len)
+    }
+
+    pub(super) fn copy_quarantined_attachment_paths(
+        &mut self,
+        card: CardId,
+        nonce: uuid::Uuid,
+    ) -> Task<Message> {
+        if !self.quarantine_presentation_action_allowed(card, nonce) {
+            return Task::none();
+        }
+        let paths = self
+            .chat_ui
+            .draft_attachments
+            .get(&card)
+            .into_iter()
+            .flatten()
+            .map(|attachment| attachment.path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if paths.is_empty() {
+            return Task::none();
+        }
+        invalidate_copy_intent();
+        self.status = Some(TransientNotice::success(
+            "Copied saved attachment locations",
+        ));
+        iced::clipboard::write(paths).map(cosmic::Action::App)
+    }
+
+    pub(super) fn quarantine_shared_chat(&mut self, card: CardId) -> bool {
+        let payload_replaced = self.chat_ui.parked.contains_key(&card)
+            || matches!(self.cards.get(&card), Some(CardRuntime::Chat(_)));
+        // A parked runtime can own newer text/images than either the durable
+        // snapshot or the visible surface. Preserve that payload before detach.
+        if let Some(runtime) = self.chat_ui.parked.remove(&card) {
+            let draft = runtime.unsent_text();
+            if draft.is_empty() {
+                self.chat_ui.drafts.remove(&card);
+            } else {
+                self.chat_ui.drafts.insert(card, draft);
+            }
+            let images = runtime
+                .unsent_attachments()
+                .iter()
+                .filter(|image| image.reference.is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            if images.is_empty() {
+                self.chat_ui.draft_attachments.remove(&card);
+            } else {
+                self.chat_ui.draft_attachments.insert(card, images);
+            }
+        }
+        self.chat_forget(card);
+        self.shared_chat_detach(card);
+        payload_replaced
     }
     /// Forgets a chat runtime whose card is going away for good.
     ///
@@ -7029,6 +7110,9 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        if self.pane_is_quarantined(card) {
+            return self.dismiss_quarantined_pane(card);
+        }
         if self.chat_awaiting_admission(card) {
             let Some(remove) = self.remove_chat_card(card, None) else {
                 return Task::none();
@@ -7365,6 +7449,9 @@ impl Cagents {
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
     ) -> Task<Message> {
+        if self.shared_views.quarantined.contains(&card) {
+            return Task::none();
+        }
         if intent == chat::Intent::Start
             && source.is_none()
             && !terminate_source
@@ -8341,7 +8428,8 @@ impl Cagents {
     }
     fn handle_chat_action(&mut self, action: Action) -> Task<Message> {
         if let Some(target) = action.mutation_target()
-            && (self.chat_awaiting_admission(target.card)
+            && (self.shared_views.quarantined.contains(&target.card)
+                || self.chat_awaiting_admission(target.card)
                 || self.chat_start_pending(target.card)
                 || self
                     .card_state(target.card)
@@ -8350,7 +8438,8 @@ impl Cagents {
             return Task::none();
         }
         if let Some(card) = action.starts_session()
-            && (self.chat_awaiting_admission(card)
+            && (self.shared_views.quarantined.contains(&card)
+                || self.chat_awaiting_admission(card)
                 || self.chat_closed_elsewhere(card)
                 || self.refuse_for_deleting_card(card))
         {
@@ -16840,6 +16929,54 @@ mod tests {
     }
 
     #[test]
+    fn quarantining_a_parked_chat_preserves_its_latest_draft_and_image_receipt() {
+        for empty in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let Some(CardRuntime::Chat(mut runtime)) = app.cards.remove(&card) else {
+                panic!("chat runtime")
+            };
+            let image = Attachment {
+                path: "/retained/parked.png".into(),
+                reference: Some(chat::ImageReference {
+                    id: uuid::Uuid::new_v4(),
+                    number: 1,
+                    device: uuid::Uuid::new_v4(),
+                    name: "parked.png".into(),
+                    sha256: "0".repeat(64),
+                    extension: "png".into(),
+                }),
+            };
+            runtime.replace_draft(text_editor::Content::with_text(if empty {
+                ""
+            } else {
+                "Newest parked draft"
+            }));
+            runtime.replace_attachments(if empty { vec![] } else { vec![image.clone()] });
+            app.chat_ui.parked.insert(card, runtime);
+            app.chat_ui.drafts.insert(card, "Older cached text".into());
+            app.chat_ui
+                .draft_attachments
+                .insert(card, vec![image.clone()]);
+            app.shared_views.quarantined.insert(card);
+            app.quarantine_shared_chat(card);
+            assert!(!app.chat_ui.parked.contains_key(&card));
+            assert_eq!(
+                app.quarantined_pane_draft(card),
+                (!empty).then_some("Newest parked draft")
+            );
+            let saved = app.persistent_workspace();
+            if empty {
+                assert!(!saved.chat_drafts.contains_key(&card));
+                assert!(!saved.chat_draft_attachments.contains_key(&card));
+            } else {
+                assert_eq!(saved.chat_drafts[&card], "Newest parked draft");
+                assert_eq!(saved.chat_draft_attachments[&card], vec![image]);
+            }
+        }
+    }
+
+    #[test]
     fn managed_image_drafts_can_close_with_their_saved_receipts() {
         chat::attachment_assets::with_test_image(|image| {
             let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -22058,6 +22195,7 @@ mod tests {
             title: "Earlier".into(),
             session,
             open: false,
+            quarantined: false,
             updated_at_unix_ms: 1,
         }
     }
@@ -26337,6 +26475,142 @@ mod tests {
                         .contains("Message changed")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn quarantine_copy_supersedes_older_deferred_transcript_copy_for_both_controls() {
+        let _context = text_copy::isolated_context();
+        for attachments in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (_, target, request, body) = valid_message_copy_completion(&mut app);
+            let deferred = app.handle_chat_ui(Action::MessageCopied(
+                target,
+                "last-part".into(),
+                request,
+                Ok(body),
+            ));
+            let card = crate::app::tests::terminal_card_state();
+            let id = card.id;
+            Arc::make_mut(&mut app.durable).cards.push(card);
+            app.shared_views.quarantined.insert(id);
+            app.chat_ui
+                .drafts
+                .insert(id, "The newer saved draft".into());
+            app.chat_ui.draft_attachments.insert(
+                id,
+                vec![Attachment {
+                    path: "/saved/quarantined-image.png".into(),
+                    reference: None,
+                }],
+            );
+            app.present_quarantined_pane(id);
+            let nonce = app.shared_views.quarantine_actions[&id].nonce;
+            let task = app.update(if attachments {
+                Message::CopyQuarantinedAttachmentPaths(id, nonce)
+            } else {
+                Message::CopyQuarantinedDraft(id, nonce)
+            });
+            assert_chat_copy_task_writes(
+                task,
+                if attachments {
+                    "/saved/quarantined-image.png"
+                } else {
+                    "The newer saved draft"
+                },
+            );
+            // MessageCopied already scheduled its normal copied-state expiry.
+            // That timer may settle, but the deferred clipboard write must not.
+            assert_chat_copy_task_has_no_clipboard_write(
+                deferred,
+                "older transcript write cannot overwrite either newer saved-payload copy",
+            );
+        }
+    }
+
+    #[test]
+    fn quarantine_user_actions_are_inert_behind_modals_updates_and_closed_history() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let id = app.durable.cards[0].id;
+        app.shared_views.quarantined.insert(id);
+        app.chat_ui.drafts.insert(id, "Stored draft".into());
+        app.chat_ui.draft_attachments.insert(
+            id,
+            vec![Attachment {
+                path: "/saved/quarantined-image.png".into(),
+                reference: None,
+            }],
+        );
+        app.present_quarantined_pane(id);
+        let nonce = app.shared_views.quarantine_actions[&id].nonce;
+        for block in ["modal", "update", "closed"] {
+            app.settings_reset_confirm = block == "modal";
+            app.update_prepared = block == "update";
+            if block == "closed" {
+                app.card_state_mut(id).unwrap().existence =
+                    crate::app::project_ui::removed_existence("removed saved presentation");
+            }
+            for message in [
+                Message::RecheckQuarantinedPane(id),
+                Message::CopyQuarantinedDraft(id, nonce),
+                Message::CopyQuarantinedAttachmentPaths(id, nonce),
+                Message::RemoveQuarantinedPane(id, nonce),
+            ] {
+                assert_chat_copy_task_has_no_effects(app.update(message), block);
+                assert!(app.shared_views.rechecking.is_empty());
+            }
+        }
+        assert!(app.shared_views.quarantined.contains(&id));
+        assert_eq!(app.chat_ui.drafts[&id], "Stored draft");
+    }
+
+    #[test]
+    fn stale_quarantine_copy_buttons_cannot_copy_a_successor_source_or_payload() {
+        let _context = text_copy::isolated_context();
+        for replacement in ["source", "payload", "reentry"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let id = draft_chat(&mut app);
+            let Some(CardRuntime::Chat(mut runtime)) = app.cards.remove(&id) else {
+                unreachable!()
+            };
+            app.shared_views.quarantined.insert(id);
+            app.chat_ui.drafts.insert(id, "Original saved draft".into());
+            app.chat_ui.draft_attachments.insert(
+                id,
+                vec![Attachment {
+                    path: "/saved/original.png".into(),
+                    reference: None,
+                }],
+            );
+            app.present_quarantined_pane(id);
+            let old = app.shared_views.quarantine_actions[&id].nonce;
+            match replacement {
+                "source" => {
+                    let CardKind::Chat(source) = &mut app.card_state_mut(id).unwrap().kind else {
+                        unreachable!()
+                    };
+                    source.id = TerminalId::new();
+                }
+                "payload" => {
+                    runtime.replace_draft(text_editor::Content::with_text("Successor payload"));
+                    app.chat_ui.parked.insert(id, runtime);
+                }
+                "reentry" => {
+                    app.shared_views.quarantine_actions.remove(&id);
+                }
+                _ => unreachable!(),
+            }
+            app.present_quarantined_pane(id);
+            assert_ne!(app.shared_views.quarantine_actions[&id].nonce, old);
+            for message in [
+                Message::CopyQuarantinedDraft(id, old),
+                Message::CopyQuarantinedAttachmentPaths(id, old),
+                Message::RemoveQuarantinedPane(id, old),
+            ] {
+                assert_chat_copy_task_has_no_effects(app.update(message), replacement);
+            }
+            assert!(app.pane_is_quarantined(id));
         }
     }
 
