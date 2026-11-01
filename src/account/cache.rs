@@ -126,18 +126,26 @@ impl Cache {
             .unwrap_or_default()
     }
 
-    /// Remembers `entry`, observed just now, for `key` - unless the cache
-    /// already holds something newer for it that another window wrote
-    /// meanwhile. An entry stamped further ahead than [`CLOCK_SLACK`] is from
-    /// a clock that has since been set back, and is replaced.
+    /// Remembers `entry` for `key`, unless another writer already stored a
+    /// newer observation. Background writes may arrive long after observation;
+    /// only a stamp ahead of the current clock by more than [`CLOCK_SLACK`]
+    /// indicates a clock that has since been set back and is replaced.
     pub fn store(&self, key: &str, entry: Entry) -> io::Result<()> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         let _lock = self.lock(libc::LOCK_EX)?;
         let path = self.path();
         let mut document = read_document(&path).unwrap_or_default();
         document.version = VERSION;
+        // Read after acquiring the lock: even waiting to publish can outlast
+        // CLOCK_SLACK, without a clock rollback having occurred.
+        let now = crate::chat::now_ms()
+            .ok_or_else(|| io::Error::other("The system clock is before the Unix epoch"))?;
         if document.entries.get(key).is_some_and(|existing| {
-            supersedes(existing.snapshot.observed_at, entry.snapshot.observed_at)
+            supersedes(
+                existing.snapshot.observed_at,
+                entry.snapshot.observed_at,
+                now,
+            )
         }) {
             return Ok(());
         }
@@ -167,10 +175,12 @@ impl Cache {
         let path = self.path();
         let mut document = read_document(&path).unwrap_or_default();
         document.version = VERSION;
+        let now = crate::chat::now_ms()
+            .ok_or_else(|| io::Error::other("The system clock is before the Unix epoch"))?;
         if document
             .catalogs
             .get(&provider)
-            .is_some_and(|existing| supersedes(existing.observed_at, catalog.observed_at))
+            .is_some_and(|existing| supersedes(existing.observed_at, catalog.observed_at, now))
         {
             return Ok(());
         }
@@ -252,10 +262,10 @@ impl Cache {
 }
 
 /// Whether something already cached at `existing` is newer than an
-/// observation at `incoming`, and stays. A stamp further ahead than
-/// [`CLOCK_SLACK`] is from a clock since set back, and is replaced.
-fn supersedes(existing: u64, incoming: u64) -> bool {
-    existing > incoming && existing <= incoming.saturating_add(CLOCK_SLACK)
+/// observation at `incoming`, and stays. Only a stamp further ahead of `now`
+/// than [`CLOCK_SLACK`] is from a clock since set back, and is replaced.
+fn supersedes(existing: u64, incoming: u64, now: u64) -> bool {
+    existing > incoming && existing <= now.saturating_add(CLOCK_SLACK)
 }
 
 /// Whether `entry` is recent enough at `now` to keep with nothing referring
@@ -356,13 +366,39 @@ mod tests {
         assert_eq!(directory_mode & 0o777, 0o700);
     }
 
+    #[test]
+    fn delayed_probe_write_cannot_replace_newer_live_quota_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let now = crate::chat::now_ms().unwrap();
+        let newer_at = now - 1_000;
+        let older_at = newer_at - CLOCK_SLACK - 1;
+        // Logical observation times model a held background write without
+        // sleeping or changing the process clock. Both stamps are in the past.
+        let mut held_probe = entry(older_at, "held successful probe");
+        held_probe.identity = None;
+        held_probe.snapshot.status = UsageStatus::Ok;
+        let mut newer_live = entry(newer_at, "newer live quota rejection");
+        newer_live.snapshot.status = UsageStatus::Limited;
+        newer_live.snapshot.source = UsageSource::Live;
+        newer_live.snapshot.ordinary_usage_allowed = Some(false);
+
+        cache.store("codex:/fixture", newer_live.clone()).unwrap();
+        cache.store("codex:/fixture", held_probe).unwrap();
+        assert_eq!(
+            cache.load(now).remove("codex:/fixture"),
+            Some(newer_live),
+            "a delayed probe must preserve the newer status, identity and timestamp"
+        );
+    }
+
     /// A clock set back after a probe must not freeze the figures until it
     /// catches up with the stamp.
     #[test]
     fn entries_stamped_in_the_future_are_neither_read_nor_kept() {
         let directory = tempfile::tempdir().unwrap();
         let cache = Cache::at(directory.path());
-        let now = 1_000_000;
+        let now = crate::chat::now_ms().unwrap();
         cache
             .store("k", entry(now + 10 * CLOCK_SLACK, "ahead"))
             .unwrap();
@@ -479,6 +515,63 @@ mod tests {
             .unwrap();
         assert!(cache.catalogs(u64::MAX).contains_key(&Provider::Omp));
         assert!(!cache.catalogs(CLOCK_SLACK).contains_key(&Provider::Omp));
+    }
+
+    #[test]
+    fn delayed_catalog_write_preserves_newer_models_and_other_cached_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let now = crate::chat::now_ms().unwrap();
+        let newer_at = now - 1_000;
+        let older_at = newer_at - CLOCK_SLACK - 1;
+        let held_catalog = catalog(older_at, "old-model");
+        let newer_catalog = catalog(newer_at, "new-model");
+        let other_catalog = catalog(newer_at, "other-provider-model");
+        let figures = entry(newer_at, "other account figures");
+        cache.store("other-account", figures.clone()).unwrap();
+        cache
+            .store_catalog(Provider::Claude, newer_catalog.clone())
+            .unwrap();
+        cache
+            .store_catalog(Provider::Codex, other_catalog.clone())
+            .unwrap();
+        cache.store_catalog(Provider::Claude, held_catalog).unwrap();
+
+        let catalogs = cache.catalogs(now);
+        assert_eq!(catalogs[&Provider::Claude], newer_catalog);
+        assert_eq!(catalogs[&Provider::Codex], other_catalog);
+        assert_eq!(cache.load(now).remove("other-account"), Some(figures));
+    }
+
+    #[test]
+    fn catalogs_stamped_in_the_future_are_neither_read_nor_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let now = crate::chat::now_ms().unwrap();
+        cache
+            .store_catalog(Provider::Claude, catalog(now + 10 * CLOCK_SLACK, "ahead"))
+            .unwrap();
+        assert!(cache.catalogs(now).is_empty());
+        cache
+            .store_catalog(Provider::Claude, catalog(now, "current"))
+            .unwrap();
+        assert_eq!(
+            cache.catalogs(now)[&Provider::Claude],
+            catalog(now, "current")
+        );
+        cache
+            .store_catalog(
+                Provider::Claude,
+                catalog(now + CLOCK_SLACK / 2, "other-window"),
+            )
+            .unwrap();
+        cache
+            .store_catalog(Provider::Claude, catalog(now, "late"))
+            .unwrap();
+        assert_eq!(
+            cache.catalogs(now)[&Provider::Claude],
+            catalog(now + CLOCK_SLACK / 2, "other-window")
+        );
     }
 
     /// A list this build cannot read - a provider added since, or a model
