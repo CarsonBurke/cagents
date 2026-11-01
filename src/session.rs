@@ -87,11 +87,26 @@ impl From<SaveFailureCategory> for crate::diagnostics::Failure {
     }
 }
 
-/// What to do about writes storage refused by construction. Retrying the same
-/// content cannot help, so the remedy is changing it.
-pub const QUARANTINE_GUIDANCE: &str = "Storage refused these changes and will not retry them on \
-     its own; everything else keeps saving. Changing or closing the item saves it again. If this \
-     repeats, report the failure category and database path.";
+/// A refused workspace snapshot contains the whole window, so sibling pane
+/// changes remain in memory too. A retry is an offer, not an identity repair.
+pub const QUARANTINE_GUIDANCE: &str = "Recent changes in this window are not saved, including \
+     changes in other panes. Keep this window open; unsaved changes remain only in memory. \
+     Storage will not retry them automatically. Retry save offers them again, but cannot repair \
+     an incompatible pane identity. If the refusal continues, report the failure category and \
+     database path.";
+
+const CATALOG_QUARANTINE_GUIDANCE: &str = "The listed project or worktree changes are not saved. \
+     Other changes in this window can still be saved independently. Storage will not retry the \
+     listed changes automatically. Retry save offers them again, but does not repair invalid \
+     data. If the refusal continues, report the failure category and database path.";
+
+pub fn quarantine_guidance(refused: &[QuarantinedWrite]) -> &'static str {
+    if refused.iter().any(|write| write.subject.is_window_state()) {
+        QUARANTINE_GUIDANCE
+    } else {
+        CATALOG_QUARANTINE_GUIDANCE
+    }
+}
 
 impl SaveFailureCategory {
     pub fn label(self) -> &'static str {
@@ -2902,10 +2917,10 @@ fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
 
 /// Why a barrier cannot vouch for a window whose state storage refused.
 ///
-/// It names each refused part of that state. The guidance asks the reader to
-/// change or close "the item", and whoever reads this is often not looking at
-/// the window - an updater relays it to a terminal - so without the names
-/// there is nothing to act on.
+/// It names each refused part of that state and explains that the whole
+/// window's changes remain unsaved. Whoever reads this may not be looking at
+/// the window - an updater relays it to a terminal - so retain that scope and
+/// the instruction to keep the window open.
 fn window_state_refusal(category: SaveFailureCategory, refused: &[QuarantinedWrite]) -> String {
     let subjects = refused
         .iter()
@@ -5711,6 +5726,17 @@ mod tests {
             "a refused barrier names what the reader has to change: {refusal}"
         );
         assert!(refusal.contains(QUARANTINE_GUIDANCE), "{refusal}");
+        assert!(
+            refusal.contains("including changes in other panes"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("Keep this window open"), "{refusal}");
+        assert!(refusal.contains("remain only in memory"), "{refusal}");
+        assert!(
+            !refusal.contains("everything else keeps saving"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("closing the item"), "{refusal}");
         let refused = latest_health(&health);
         assert_eq!(refused.health, SessionSaveHealth::Healthy);
         assert_eq!(
@@ -5763,6 +5789,10 @@ mod tests {
                 .map(|write| &write.subject)
                 .collect::<Vec<_>>(),
             vec![&WriteSubject::Pane { card: resurrected }]
+        );
+        assert_eq!(
+            quarantine_guidance(&refused.quarantined),
+            QUARANTINE_GUIDANCE
         );
 
         // The catalog still saves beside it.
