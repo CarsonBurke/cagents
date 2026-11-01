@@ -6864,7 +6864,37 @@ impl Cagents {
             .then_some(runtime.target)
     }
 
+    /// An open agent's own pane that can show either its native chat or its
+    /// console, with what it shows now. Both are the same running provider.
+    pub(super) fn agent_presentation(
+        &self,
+        card: CardId,
+    ) -> Option<(
+        crate::workspace_model::views::AgentPresentation,
+        crate::agent_execution::Surface,
+    )> {
+        let state = self
+            .card_state(card)
+            .filter(|state| state.existence.is_open())?;
+        let agent = self
+            .workspace_model
+            .agents
+            .iter()
+            .find(|agent| CardId::from_uuid(agent.id.as_uuid()) == card)?;
+        if let CardKind::Terminal(terminal) = &state.kind
+            && crate::agent_execution::console_agent(&terminal.launch) != Some(agent.id)
+        {
+            return None;
+        }
+        let presentation = crate::workspace_model::views::AgentPresentation::of(agent)?;
+        let shown = presentation.shown(agent, &state.kind)?;
+        Some((presentation, shown))
+    }
+
     pub(super) fn chat_switch_available(&self, card: CardId) -> bool {
+        if self.agent_presentation(card).is_some() {
+            return true;
+        }
         match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(_)) => true,
             Some(CardKind::Terminal(session)) => {
@@ -6874,6 +6904,11 @@ impl Cagents {
         }
     }
     pub(super) fn chat_switch_label(&self, card: CardId) -> &'static str {
+        match self.agent_presentation(card) {
+            Some((_, crate::agent_execution::Surface::Terminal)) => return "Show as chat",
+            Some((_, crate::agent_execution::Surface::Chat)) => return "Show as console",
+            None => {}
+        }
         match self.card_state(card).map(|state| &state.kind) {
             Some(CardKind::Chat(session)) => {
                 let named = match self.cards.get(&card) {
@@ -6925,6 +6960,16 @@ impl Cagents {
         else {
             return Some(Cow::Borrowed("This pane is closed."));
         };
+        if let Some((_, shown)) = self.agent_presentation(card) {
+            // Showing the console leaves the chat, so whatever the chat has
+            // not finished sending has to finish first.
+            return match (shown, self.cards.get(&card)) {
+                (crate::agent_execution::Surface::Chat, Some(CardRuntime::Chat(runtime))) => {
+                    runtime.transition_blocker().map(Cow::Borrowed)
+                }
+                _ => None,
+            };
+        }
         if self.chat_ui.parked.contains_key(&card) {
             return None;
         }
@@ -7299,7 +7344,73 @@ impl Cagents {
     }
 
     fn retire_switched_terminal(&mut self, terminal: TerminalSurface, session: &chat::Session) {
-        self.retire_terminal_surface(terminal, !retains_source_pty(session));
+        // An agent's console is not the provider's CLI: it keeps running
+        // hidden while the chat is shown, and closing it would close the agent.
+        let console = session
+            .terminal
+            .as_ref()
+            .is_some_and(|source| crate::agent_execution::console_agent(&source.launch).is_some());
+        self.retire_terminal_surface(terminal, !console && !retains_source_pty(session));
+    }
+
+    /// Shows an agent's own pane as the other of its two surfaces, in place.
+    ///
+    /// The chat attaches to the agent's running provider and the console to
+    /// its running terminal. Neither is started, closed or handed off, and
+    /// showing the agent does not take it over; only this card's kind and the
+    /// surface this window draws change, through the ordinary saved and
+    /// shared pane edits.
+    fn switch_agent_presentation(
+        &mut self,
+        card: CardId,
+        presentation: crate::workspace_model::views::AgentPresentation,
+        shown: crate::agent_execution::Surface,
+    ) -> Task<Message> {
+        use crate::agent_execution::Surface;
+        match shown {
+            Surface::Terminal => {
+                let session = presentation.chat;
+                if let Some(CardRuntime::Terminal(terminal)) = self.cards.remove(&card) {
+                    // Detach only: the console keeps running while hidden.
+                    self.retire_terminal_surface(terminal, false);
+                }
+                self.commit_chat_session(card, session.clone());
+                self.cards.insert(card, CardRuntime::Loading);
+                self.open_chat(card, session, chat::Intent::Restore)
+            }
+            Surface::Chat => {
+                let Some(state) = self.card_state(card).cloned() else {
+                    return Task::none();
+                };
+                let console = presentation.console;
+                // Keeps the unsent draft for the next time the chat is shown.
+                // Dropping the runtime detaches this window; the provider runs on.
+                self.chat_forget(card);
+                self.cards.remove(&card);
+                let residency = Residency::Hydrating {
+                    epoch: unix_millis().max(1) as u64,
+                };
+                self.lifecycle
+                    .register(card, state.exposure, residency.clone(), Instant::now());
+                if let Some(state) = self.card_state_mut(card) {
+                    state.kind = CardKind::Terminal(console.clone());
+                    state.residency = residency;
+                }
+                self.closed_terminal_cards.remove(&card);
+                self.cards.insert(card, CardRuntime::Loading);
+                self.card_chrome.remove(&card);
+                let saved = self.shared_window_snapshot();
+                if let Some(writer) = &self.session {
+                    writer.snapshot_conversion(saved);
+                }
+                self.start_terminal(
+                    card,
+                    console,
+                    state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
+                    false,
+                )
+            }
+        }
     }
 
     /// Hands the models the conversation in `card` lists to the catalog a
@@ -8510,6 +8621,9 @@ impl Cagents {
                         },
                     );
                     return Task::none();
+                }
+                if let Some((presentation, shown)) = self.agent_presentation(card) {
+                    return self.switch_agent_presentation(card, presentation, shown);
                 }
                 if let Some(mut runtime) = self.chat_ui.parked.remove(&card) {
                     runtime.show(true);
@@ -28091,5 +28205,228 @@ mod tests {
             1,
             "an old account wake must not drain the replacement connection's report queue"
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_presentation_tests {
+    use super::*;
+    use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+    use crate::terminal::ipc::{
+        ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+        ServerResponse, TerminalDescriptor, read_frame, write_frame,
+    };
+
+    /// A hosted console whose fake daemon reports whether the window ever
+    /// asked it to shut the console down.
+    fn hosted_console(
+        console: &TerminalSession,
+    ) -> (
+        TerminalSurface,
+        std::thread::JoinHandle<bool>,
+        tempfile::TempDir,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let live = console.continuity.live_proof().unwrap();
+        let proof = HostSessionProof {
+            host_session_id: live.host_session_id.as_str().into(),
+            boot_id: live.boot_id.as_str().into(),
+            host_incarnation: live.host_incarnation.as_str().into(),
+        };
+        let descriptor = TerminalDescriptor {
+            screen_lost_after_crash: false,
+            session: console.clone(),
+            generation: 0,
+            event_sequence: 0,
+            oldest_event_sequence: 1,
+            attached: true,
+            transcript: None,
+            activity: None,
+            agent_activity: None,
+            upgrade_sources: Vec::new(),
+            upgrade_relaunches: Vec::new(),
+            title: None,
+        };
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut connected = false;
+            loop {
+                let request = match read_frame::<ClientEnvelope>(&mut stream) {
+                    Ok(Some(request)) => request,
+                    Ok(None) | Err(_) => return false,
+                };
+                if matches!(request.request, ClientRequest::ShutdownTerminal { .. }) {
+                    return true;
+                }
+                let response = if connected {
+                    ServerResponse::Accepted
+                } else {
+                    connected = true;
+                    ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![descriptor.clone()],
+                    }
+                };
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+                let _ = ready_tx.send(());
+            }
+        });
+        let handle = TerminalSurface::from(
+            HostedTerminalHandle::connect_at(socket, console.id, None, |_| {}).unwrap(),
+        );
+        // The handshake completes before the test acts on the connection.
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        (handle, server, directory)
+    }
+
+    /// An agent spawned onto its console, shown in its own pane.
+    fn console_agent_app() -> (Cagents, CardId, Agent, tempfile::TempDir) {
+        let (mut app, card, directory) = crate::app::tests::live_agent_app("cagents");
+        let agent_id = crate::model::AgentId::from_uuid(card.as_uuid());
+        let CardKind::Terminal(console) = &mut Arc::make_mut(&mut app.durable).cards[0].kind else {
+            unreachable!();
+        };
+        console.launch.arguments = vec!["agent".into(), "console".into(), agent_id.to_string()];
+        let console = console.clone();
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        // The proof the fixture chat client reports, as the daemon would
+        // report the actor's own.
+        let live = HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("fixture-host"),
+            boot_id: crate::model::BootId::new("fixture-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("fixture-incarnation"),
+        };
+        let native = chat::Session {
+            id: console.id,
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                session_id: Some("presented-conversation".into()),
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec![],
+                    working_directory: console.launch.working_directory.clone(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+            },
+            proof: Some(live),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let placement =
+            crate::workspace_model::views::Scope::Channel(crate::model::ChannelId::new());
+        let agent = Agent {
+            id: agent_id,
+            name: None,
+            origin: Origin::User,
+            spec: Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/execution/.git".into(),
+                    directory: console.launch.working_directory.clone(),
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement,
+            session: Some(HostedSession::Chat(native)),
+            console: Some(console),
+            created_ms: 0,
+            closed: false,
+        };
+        app.workspace_model.agents = vec![agent.clone()];
+        (app, card, agent, directory)
+    }
+
+    /// Showing a console agent as its chat attaches the chat to the running
+    /// provider in place and leaves the console running; showing the console
+    /// again puts the same console back. Neither direction hands the
+    /// conversation off or stops anything.
+    #[test]
+    fn show_as_chat_and_back_keeps_the_console_and_the_provider() {
+        let (mut app, card, agent, _directory) = console_agent_app();
+        let presentation = crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
+        let (surface, server, _socket) = hosted_console(&presentation.console);
+        app.cards.insert(card, CardRuntime::Terminal(surface));
+        assert!(app.chat_switch_available(card));
+        assert_eq!(app.chat_switch_label(card), "Show as chat");
+        assert_eq!(app.chat_switch_blocker(card), None);
+
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(presentation.chat.clone())
+        );
+        let attempt = app.chat_ui.attempt(card).expect("the chat attaches");
+        assert_eq!(attempt.session, presentation.chat);
+        assert!(
+            !app.terminal_runtime_claims(presentation.console.id),
+            "this window stops drawing the console"
+        );
+        let ready = ready_message_for_pending_switch(&app, card, chat::Snapshot::default());
+        drop(app.update(ready));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+        assert!(app.pending_terminal_handoffs.is_empty());
+        assert_eq!(app.chat_switch_label(card), "Show as console");
+
+        for teardown in std::mem::take(&mut app.terminal_teardowns) {
+            teardown.join().unwrap();
+        }
+        assert!(
+            !server.join().unwrap(),
+            "showing the chat shut down the agent's console"
+        );
+
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Terminal(presentation.console.clone())
+        );
+        assert!(app.chat_ui.attempt(card).is_none());
+        assert!(!matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
+        assert!(
+            app.pending_terminal_handoffs.is_empty(),
+            "showing the console is not a handoff back to a terminal"
+        );
+        assert_eq!(app.chat_switch_label(card), "Show as chat");
+    }
+
+    /// Only the agent's own pane switches. A console card that is not the
+    /// agent's canonical card, or an agent that has no console, offers no
+    /// presentation switch.
+    #[test]
+    fn only_an_agents_own_pane_offers_the_presentation_switch() {
+        let (mut app, card, mut agent, _directory) = console_agent_app();
+        agent.id = crate::model::AgentId::new();
+        app.workspace_model.agents = vec![agent.clone()];
+        assert!(app.agent_presentation(card).is_none());
+        agent.id = crate::model::AgentId::from_uuid(card.as_uuid());
+        agent.console = None;
+        app.workspace_model.agents = vec![agent.clone()];
+        assert!(app.agent_presentation(card).is_none());
+        agent.closed = true;
+        app.workspace_model.agents = vec![agent];
+        assert!(app.agent_presentation(card).is_none());
     }
 }

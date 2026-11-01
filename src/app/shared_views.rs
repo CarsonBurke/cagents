@@ -1673,7 +1673,15 @@ impl Cagents {
                         if !same_session {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
-                            self.cards.remove(&pane.id);
+                            if let Some(CardRuntime::Terminal(terminal)) =
+                                self.cards.remove(&pane.id)
+                            {
+                                // Another client owns what replaced it; this
+                                // window only stops drawing the terminal,
+                                // and detaching it off the UI thread keeps
+                                // the frame from waiting on its worker.
+                                self.retire_terminal_surface(terminal, false);
+                            }
                             self.lifecycle.remove(pane.id);
                             // Card identity survives a session replacement, but
                             // the previous actor's attention does not. This is
