@@ -296,6 +296,7 @@ fn sidebar_action(app: &mut Cagents, action: SidebarAction) -> Task<Message> {
         SidebarAction::DeleteRow(row @ (SelectionRow::Worktree(..) | SelectionRow::Channel(_))) => {
             app.delete_sidebar_row(row)
         }
+        SidebarAction::DeleteSelectedRows => app.begin_sidebar_group_delete(),
         SidebarAction::DeleteChannel { channel_id: id } => {
             app.handle_channel_ui(channel_ui::Action::Delete(id))
         }
@@ -396,6 +397,9 @@ pub(super) fn update(app: &mut Cagents, message: Message) -> Task<Message> {
         Message::ChannelUi(channel_ui::Action::Dismiss) => {
             app.handle_channel_ui(channel_ui::Action::Dismiss)
         }
+        Message::SidebarSelection(sidebar_selection_ui::Action::Dismiss) => {
+            app.update_sidebar_selection(sidebar_selection_ui::Action::Dismiss)
+        }
         Message::KeyEvent { event, captured } => {
             if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                 app.keyboard_modifiers = *modifiers;
@@ -430,6 +434,9 @@ pub(super) fn update(app: &mut Cagents, message: Message) -> Task<Message> {
                 }
                 if app.channel_ui.modal_open() {
                     return app.handle_channel_ui(channel_ui::Action::Dismiss);
+                }
+                if app.sidebar_selection_ui.dialog.is_some() {
+                    return app.update_sidebar_selection(sidebar_selection_ui::Action::Dismiss);
                 }
             }
             Task::none()
@@ -477,6 +484,29 @@ pub(super) fn subscription(_app: &Cagents) -> Subscription<Message> {
 mod tests {
     use super::*;
 
+    fn dialog_labels(app: &Cagents) -> Vec<String> {
+        // Read the actual dialog element; its popup is outside the frame tree.
+        use iced::advanced::{Layout, layout, mouse, widget::Tree};
+        let renderer = super::super::tests::headless_renderer();
+        let mut element = app.dialog().expect("the actual mounted confirmation");
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1600.0, 1200.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect()
+    }
+
     #[test]
     fn sidebar_fixture_is_exact_opt_in_and_has_no_store_or_executable_editors() {
         for value in [None, Some("1"), Some("sidebar-row-2004-extra")] {
@@ -519,6 +549,18 @@ mod tests {
             }),
         ));
         assert!(app.project_ui.modal_open() && app.session.is_none());
+        let labels = dialog_labels(&app);
+        assert!(
+            labels
+                .iter()
+                .any(|label| label == "fix/sidebar-identifying-title-original")
+        );
+        assert!(labels.iter().any(|label| label == TARGET));
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("inserted-neighbor"))
+        );
         drop(update(
             &mut app,
             Message::ProjectUi(project_ui::Action::ConfirmDelete),
@@ -537,5 +579,81 @@ mod tests {
             app.sidebar_model.project(project_id(1)).unwrap().worktrees[2],
             original
         );
+    }
+
+    #[test]
+    fn selected_row_delete_reaches_the_real_exact_confirmation_and_can_cancel() {
+        for count in [1, 2] {
+            let (mut app, _) = install(super::super::tests::context_inspector_test_app(false));
+            app.chrome_ui.projects_collapsed = false;
+            let selected = app.sidebar_model.projects[0].channels[..count].to_vec();
+            let unrelated = app.sidebar_model.projects[0].channels[2].title.clone();
+            for channel in &selected {
+                drop(update(
+                    &mut app,
+                    Message::Sidebar(SidebarAction::SelectRows {
+                        row: SelectionRow::Channel(channel.id),
+                        intent: SelectionIntent::Toggle,
+                    }),
+                ));
+            }
+            insert_neighbors(&mut app);
+            let sidebar = sidebar::view_cached(
+                &app.sidebar_model,
+                &app.sidebar_state,
+                SidebarMode::Expanded,
+                260.0,
+                false,
+                &app.navigation_cache,
+                &app.settings.keyboard_shortcuts,
+            )
+            .map(Message::Sidebar);
+            let (mut messages, captured) = dialog_ui::tests::key_control(
+                sidebar,
+                sidebar::selection_row_focus_id(SelectionRow::Channel(selected[0].id)),
+                dialog_ui::tests::key_press(keyboard::key::Named::Delete),
+            );
+            assert!(captured);
+            assert_eq!(messages.len(), 1);
+            let message = messages.pop().unwrap();
+            assert!(matches!(
+                &message,
+                Message::Sidebar(SidebarAction::DeleteSelectedRows)
+            ));
+            drop(update(&mut app, message));
+            assert!(app.modal_is_open());
+            let labels = dialog_labels(&app);
+            for channel in &selected {
+                assert!(
+                    labels.iter().any(|label| label.contains(&channel.title)),
+                    "{labels:?}"
+                );
+            }
+            assert!(!labels.iter().any(|label| label.contains(&unrelated)));
+            assert_eq!(app.sidebar_selection_ui.dialog.is_some(), count == 2);
+            // No confirmation action is admitted even if an old callback arrives.
+            let confirm = if count == 1 {
+                Message::ChannelUi(channel_ui::Action::ConfirmDelete)
+            } else {
+                Message::SidebarSelection(sidebar_selection_ui::Action::Confirm)
+            };
+            drop(update(&mut app, confirm));
+            assert!(app.modal_is_open());
+            let cancel = if count == 1 {
+                "dialog.channel.close"
+            } else {
+                "dialog.sidebar-selection.close"
+            };
+            let dismiss =
+                dialog_ui::tests::enter_control(app.dialog().unwrap(), widget::Id::new(cancel));
+            assert!(matches!(
+                &dismiss,
+                Message::ChannelUi(channel_ui::Action::Dismiss)
+                    | Message::SidebarSelection(sidebar_selection_ui::Action::Dismiss)
+            ));
+            drop(update(&mut app, dismiss));
+            assert!(!app.modal_is_open());
+            assert_eq!(app.durable.channels.len(), 4);
+        }
     }
 }
