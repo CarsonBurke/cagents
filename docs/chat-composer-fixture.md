@@ -131,6 +131,15 @@ is mounted at that namespace's `runtime/nested-wayland`. HOME stays private.
 Existing roots are refused, not adopted or repaired, and failed setup does not
 automatically delete an unowned preexisting runtime root.
 
+All starts, including the ordinary recipe, exclusively create their private
+control, runtime and repository fixture roots. A live start records each
+successful creation before any later setup step, and automatic failed-start
+cleanup or stop can remove only those roots it created. An earlier failed stale
+recovery does not authorize a later start to borrow its controls. Explicit
+`clear` and startup stale recovery retain their existing host-stop requirements.
+Shared parent directories remain the existing trusted starting points; these
+creation records do not establish ownership against arbitrary same-user changes.
+
 Accounts launches are single-use, including a lost launch reply. A second
 `run-ui` refuses; safely stop/clear the fixture and start a fresh one instead.
 Never delete `accounts-native-started` or reset logs to reuse a scene. Original

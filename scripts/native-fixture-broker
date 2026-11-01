@@ -967,7 +967,9 @@ class Fixture:
     released: bool = False
     runner_attempted: bool = False
     runner_attempt: int = 0
-    accounts_root_owned: bool = False
+    private_root_owned: bool = False
+    runtime_root_owned: bool = False
+    repository_root_owned: bool = False
 
     @property
     def runner_log(self):
@@ -1249,18 +1251,21 @@ class Fixtures:
         with self.lock:
             if self.closing:
                 raise Refusal("shutting_down", "the broker is stopping; no fixture creation")
+            self._create_owned_root(fixture, self.host.runtime_dir, layout.private_parts,
+                                    "private_root_owned", ("niri", "state"))
+            if layout.accounts is not None:
+                self._create_accounts_runtime(fixture)
+            else:
+                self._create_owned_root(fixture, self.host.runtime_dir, (layout.runtime_name,), "runtime_root_owned")
+            self._create_owned_root(fixture, repo, layout.root_parts, "repository_root_owned")
             for directory, parts in (
                 (repo, (*layout.root_parts, "shots")),
                 *((repo, (*layout.root_parts, "sandbox", *name.split("/"))) for name in layout.sandbox_directories),
-                *(((self.host.runtime_dir, (layout.runtime_name,)),) if layout.accounts is None else ()),
-                *((self.host.runtime_dir, (*layout.private_parts, name)) for name in ("niri", "state")),
             ):
                 fixture.spawn_resources["creation_directory"] = hold_directory(directory, parts, create=True)
                 errors = self._close_spawn_resources(fixture, ("creation_directory",))
                 if errors:
                     raise Refusal("cleanup_incomplete", "; ".join(errors))
-            if layout.accounts is not None:
-                self._create_accounts_runtime(fixture)
             provider = hold_directory(repo, (*layout.root_parts, "sandbox", "bin"))
             fixture.spawn_resources["provider_directory"] = provider
             try:
@@ -1302,37 +1307,43 @@ class Fixtures:
 
     def _create_accounts_runtime(self, fixture):
         """One new fixed namespace, backed by the original held runtime bind."""
-        layout = fixture.layout
+        self._create_owned_root(fixture, self.host.runtime_dir, (fixture.layout.runtime_name,),
+                                "runtime_root_owned", tuple(child for _name, child in ACCOUNTS_XDG))
+
+    def _create_owned_root(self, fixture, base, parts, ownership, children=()):
+        """Exclusive creation for the three fixed internal fixture-root roles."""
         owner = os.geteuid()
         try:
-            parent = hold_directory(self.host.runtime_dir, ())
-            fixture.spawn_resources["accounts_parent"] = parent
+            parent = hold_directory(base, parts[:-1], create=True)
+            fixture.spawn_resources["root_parent"] = parent
             try:
-                os.mkdir(layout.runtime_name, mode=0o700, dir_fd=parent)
+                os.mkdir(parts[-1], mode=0o700, dir_fd=parent)
             except FileExistsError:
-                raise Refusal("fixture_exists", "existing private Accounts runtime is not adopted") from None
-            fixture.accounts_root_owned = True
-            root = os.open(layout.runtime_name, NO_FOLLOW_DIRECTORY, dir_fd=parent)
-            fixture.spawn_resources["accounts_root"] = root
+                raise Refusal("fixture_exists", "existing fixture root is not adopted; use explicit stale cleanup") from None
+            # Even a later open, child creation or close failure cannot lose
+            # the fact that this original mkdir created this particular root.
+            setattr(fixture, ownership, True)
+            root = os.open(parts[-1], NO_FOLLOW_DIRECTORY, dir_fd=parent)
+            fixture.spawn_resources["root_directory"] = root
             metadata = os.fstat(root)
             if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or metadata.st_mode & 0o7777 != 0o700:
-                raise Refusal("invalid_fixture_roots", "Accounts root must be an owned private mode0700 directory")
-            for _name, child in ACCOUNTS_XDG:
+                raise Refusal("invalid_fixture_roots", "fixture root must be an owned private mode0700 directory")
+            for child in children:
                 try:
                     os.mkdir(child, mode=0o700, dir_fd=root)
                 except FileExistsError:
-                    raise Refusal("invalid_fixture_roots", "existing Accounts child is not adopted") from None
+                    raise Refusal("invalid_fixture_roots", "existing fixture child is not adopted") from None
                 descriptor = os.open(child, NO_FOLLOW_DIRECTORY, dir_fd=root)
-                fixture.spawn_resources["accounts_child"] = descriptor
+                fixture.spawn_resources["root_child"] = descriptor
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or metadata.st_mode & 0o7777 != 0o700:
-                    raise Refusal("invalid_fixture_roots", "Accounts child must be an owned private mode0700 directory")
-                errors = self._close_spawn_resources(fixture, ("accounts_child",))
+                    raise Refusal("invalid_fixture_roots", "fixture child must be an owned private mode0700 directory")
+                errors = self._close_spawn_resources(fixture, ("root_child",))
                 if errors:
                     raise Refusal("cleanup_incomplete", "; ".join(errors))
         finally:
             original = sys.exc_info()[1]
-            errors = self._close_spawn_resources(fixture, ("accounts_child", "accounts_root", "accounts_parent"))
+            errors = self._close_spawn_resources(fixture, ("root_child", "root_directory", "root_parent"))
             if errors and original is None:
                 raise Refusal("cleanup_incomplete", "; ".join(errors))
 
@@ -1791,15 +1802,22 @@ class Fixtures:
             fixture.host_session_stopped = True
             self._release(fixture)
         left_behind = []
-        if not remove_beneath(self.host.runtime_dir, layout.private_parts):
+        if fixture is not None and not fixture.private_root_owned:
+            if os.path.lexists(layout.private):
+                left_behind.append(str(layout.private))
+        elif not remove_beneath(self.host.runtime_dir, layout.private_parts):
             left_behind.append(str(layout.private))
-        if layout.accounts is not None and fixture is not None and not fixture.accounts_root_owned:
+        if fixture is not None and not fixture.runtime_root_owned:
             if os.path.lexists(layout.runtime):
                 left_behind.append(str(layout.runtime))
         elif not remove_beneath(self.host.runtime_dir, (layout.runtime_name,)):
             left_behind.append(str(layout.runtime))
-        if remove and not remove_beneath(self.host.repo, layout.root_parts):
-            left_behind.append(str(layout.root))
+        if remove:
+            if fixture is not None and not fixture.repository_root_owned:
+                if os.path.lexists(layout.root):
+                    left_behind.append(str(layout.root))
+            elif not remove_beneath(self.host.repo, layout.root_parts):
+                left_behind.append(str(layout.root))
         return left_behind
 
     def clear(self, request):

@@ -1499,6 +1499,11 @@ class OwnershipContracts(TemporaryRepository):
     def owned_fixture(self, name, descriptor):
         layout = broker.Layout(self.host, name, self.checkout, self.base / "zig")
         fixture = broker.Fixture(layout, OWNER)
+        # This helper represents an already-created live original. Fresh
+        # production fixtures keep all three ownership fields false.
+        fixture.private_root_owned = True
+        fixture.runtime_root_owned = True
+        fixture.repository_root_owned = True
         fixture.process = mock.Mock(pid=700 + descriptor, returncode=None)
         fixture.process.wait.return_value = 0
         fixture.pidfd = descriptor
@@ -2281,7 +2286,7 @@ class AccountsContracts(TemporaryRepository):
                 broker.os, "open", side_effect=range(101, 107)) as opened, mock.patch.object(
                 broker.os, "fstat", side_effect=lambda _fd: self.directory_metadata()), mock.patch.object(broker.os, "close") as close:
             self.manager._create_accounts_runtime(fixture)
-        self.assertTrue(fixture.accounts_root_owned)
+        self.assertTrue(fixture.runtime_root_owned)
         self.assertEqual(fixture.spawn_resources, {})
         self.assertEqual(fixture.resource_errors, [])
         self.assertEqual(mkdir.call_args_list, [mock.call("nf-accounts", mode=0o700, dir_fd=100)]
@@ -2347,7 +2352,7 @@ class AccountsContracts(TemporaryRepository):
             with self.assertRaises(broker.Refusal) as caught:
                 self.manager.start(broker.validate_request(self.request(), self.repo))
         self.assertEqual(caught.exception.code, "fixture_exists")
-        self.assertFalse(retained[0].accounts_root_owned)
+        self.assertFalse(retained[0].runtime_root_owned)
         self.assertEqual(retained[0].spawn_resources, {})
         self.assertEqual(sentinel.read_bytes(), b"preserve original collision")
         self.assertTrue(runtime.is_dir())
@@ -2373,7 +2378,7 @@ class AccountsContracts(TemporaryRepository):
                 self.manager.start(broker.validate_request(self.request(), self.repo))
         self.assertEqual(caught.exception.code, "invalid_fixture_roots")
         fixture, = retained
-        self.assertTrue(fixture.accounts_root_owned)
+        self.assertTrue(fixture.runtime_root_owned)
         self.assertIs(self.manager.live["accounts"], fixture)
         self.assertTrue(fixture.resource_errors)
         self.assertEqual(fixture.spawn_resources, {})
@@ -2410,6 +2415,267 @@ class AccountsContracts(TemporaryRepository):
                 self.manager.viewport(fixture, {"width": 1600})
             self.assertEqual(caught.exception.code, "invalid_request")
             apply.assert_called_once_with(fixture, 480)
+
+
+class RootCustodyContracts(TemporaryRepository):
+    """Actual start/create/discard flow with private files and native seams mocked.
+
+    No real child, host operation, broker entry point or inherited environment
+    is used. These fixtures are not native or global stale-recovery proof.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.host = broker.Host(
+            repo=self.repo, home=self.base / "home", runtime_dir=self.base / "runtime",
+            cargo_home=self.base / "cargo", rustup_home=self.base / "rustup",
+            mise_data=self.base / "mise", harness="synthetic-harness", niri="synthetic-niri",
+        )
+        self.host.runtime_dir.mkdir(mode=0o700)
+        self.manager = object.__new__(broker.Fixtures)
+        self.manager.host = self.host
+        self.manager.harness_env = {"SYNTHETIC_FIXTURE": "mock only; no child executes"}
+        self.manager.lock = threading.Lock()
+        self.manager.build_lock = threading.Lock()
+        self.manager.closing = False
+        self.manager.clearing = set()
+        self.manager.host_operations = []
+        self.manager.spawner = mock.Mock()
+        self.manager.spawner.close.return_value = []
+        self.manager.live = {}
+
+    def request(self, accounts):
+        request = {"op": "start", "fixture": "owned", "checkout": str(self.checkout), "width": 480}
+        if accounts:
+            request.update(recipe="accounts-quota", scene="claude-sparse", layout="narrow", side="before")
+        return broker.validate_request(request, self.repo)
+
+    def layout(self):
+        return broker.Layout(self.host, "owned", self.checkout, self.base / "zig")
+
+    def native_seams(self):
+        stack = ExitStack()
+        self.focus = stack.enter_context(mock.patch.object(self.manager, "_host_focus", return_value=(None, set())))
+        self.restore_focus = stack.enter_context(mock.patch.object(self.manager, "_restore_host_focus"))
+        self.harness = stack.enter_context(mock.patch.object(
+            self.manager, "harness", return_value=subprocess.CompletedProcess([], 0, b"", b"")))
+        self.holder = stack.enter_context(mock.patch.object(self.manager, "_spawn_holder"))
+        self.child = stack.enter_context(mock.patch.object(broker.subprocess, "Popen"))
+        stack.enter_context(mock.patch.object(self.manager, "layout_for", return_value=self.layout()))
+        return stack
+
+    def test_failed_recovery_then_actual_start_preserves_private_and_runtime_sentinels(self):
+        for accounts in (False, True):
+            with self.subTest(accounts=accounts):
+                layout = self.layout()
+                sentinels = []
+                layout.private.mkdir(mode=0o700, parents=True)
+                for directory in (layout.niri_root, layout.harness_state, layout.runtime):
+                    directory.mkdir(mode=0o700, parents=True)
+                    sentinel = directory / "belongs-to-the-unrecovered-original"
+                    sentinel.write_bytes(b"keep this original")
+                    sentinels.append(sentinel)
+                with self.native_seams(), mock.patch.object(
+                        broker, "remove_beneath", wraps=broker.remove_beneath) as remove, mock.patch.object(
+                        self.manager, "_create_owned_root", wraps=self.manager._create_owned_root) as create:
+                    self.harness.return_value = subprocess.CompletedProcess([], 1, b"", b"synthetic stop refusal")
+                    recovered, problems = self.manager.recover_stale()
+                    self.assertEqual(recovered, [])
+                    self.assertEqual(len(problems), 1)
+                    self.harness.assert_called_once()
+                    with self.assertRaises(broker.Refusal) as caught:
+                        self.manager.start(self.request(accounts))
+                    self.assertEqual(caught.exception.code, "fixture_exists")
+                    self.harness.assert_called_once()  # No host operation from the refused new start.
+                    fixture = create.call_args_list[0].args[0]
+                    self.assertFalse(fixture.private_root_owned)
+                    self.assertFalse(fixture.runtime_root_owned)
+                    self.assertFalse(fixture.repository_root_owned)
+                    self.assertEqual(fixture.spawn_resources, {})
+                    self.focus.assert_not_called()
+                    self.holder.assert_not_called()
+                    self.child.assert_not_called()
+                    remove.assert_not_called()
+                self.assertEqual(self.manager.live, {})
+                self.assertFalse(layout.root.exists())
+                self.assertEqual([path.read_bytes() for path in sentinels], [b"keep this original"] * 3)
+                # Only this test owns these files; clear the private test case
+                # for its second inline variant without invoking broker clear.
+                shutil.rmtree(layout.private)
+                shutil.rmtree(layout.runtime)
+
+    def test_runtime_collision_removes_only_the_fresh_owned_private_root(self):
+        for accounts in (False, True):
+            with self.subTest(accounts=accounts):
+                layout = self.layout()
+                layout.runtime.mkdir(mode=0o700)
+                sentinel = layout.runtime / "unowned-runtime"
+                sentinel.write_bytes(b"keep runtime")
+                with self.native_seams(), mock.patch.object(
+                        broker, "remove_beneath", wraps=broker.remove_beneath) as remove, mock.patch.object(
+                        self.manager, "_create_owned_root", wraps=self.manager._create_owned_root) as create:
+                    with self.assertRaises(broker.Refusal) as caught:
+                        self.manager.start(self.request(accounts))
+                    self.assertEqual(caught.exception.code, "fixture_exists")
+                    fixture = create.call_args_list[0].args[0]
+                    self.assertTrue(fixture.private_root_owned)
+                    self.assertFalse(fixture.runtime_root_owned)
+                    self.assertFalse(fixture.repository_root_owned)
+                    self.assertEqual(remove.call_args_list, [mock.call(self.host.runtime_dir, layout.private_parts)])
+                    self.focus.assert_not_called()
+                    self.harness.assert_not_called()
+                    self.holder.assert_not_called()
+                    self.child.assert_not_called()
+                self.assertFalse(layout.private.exists())
+                self.assertFalse(layout.root.exists())
+                self.assertEqual(sentinel.read_bytes(), b"keep runtime")
+                self.assertEqual(self.manager.live, {})
+                shutil.rmtree(layout.runtime)
+
+    def test_repository_race_collision_is_never_adopted_or_automatically_removed(self):
+        layout = self.layout()
+        original = self.manager._create_owned_root
+        observed = []
+        def acquire(fixture, base, parts, ownership, children=()):
+            observed.append(fixture)
+            if ownership == "repository_root_owned":
+                layout.root.mkdir(mode=0o700, parents=True)
+                (layout.root / "unowned-repository").write_bytes(b"keep repository")
+            return original(fixture, base, parts, ownership, children)
+        with self.native_seams(), mock.patch.object(self.manager, "_create_owned_root", side_effect=acquire), mock.patch.object(
+                broker, "remove_beneath", wraps=broker.remove_beneath) as remove:
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.start(self.request(True))
+            self.assertEqual(caught.exception.code, "fixture_exists")
+            fixture = observed[0]
+            self.assertTrue(fixture.private_root_owned)
+            self.assertTrue(fixture.runtime_root_owned)
+            self.assertFalse(fixture.repository_root_owned)
+            self.assertEqual(remove.call_args_list, [mock.call(self.host.runtime_dir, layout.private_parts),
+                                                    mock.call(self.host.runtime_dir, (layout.runtime_name,))])
+            self.focus.assert_not_called()
+            self.harness.assert_not_called()
+            self.holder.assert_not_called()
+            self.child.assert_not_called()
+        self.assertEqual((layout.root / "unowned-repository").read_bytes(), b"keep repository")
+        self.assertFalse(layout.private.exists())
+        self.assertFalse(layout.runtime.exists())
+        self.assertEqual(self.manager.live, {})
+
+    def test_child_creation_failure_keeps_original_error_and_created_root_identity(self):
+        original_mkdir = broker.os.mkdir
+        failure = PermissionError("synthetic private state child refusal")
+        observed = []
+        original_create = self.manager._create_owned_root
+        def acquire(*args, **kwargs):
+            observed.append(args[0])
+            return original_create(*args, **kwargs)
+        def mkdir(name, *args, **kwargs):
+            if name == "state" and "dir_fd" in kwargs:
+                raise failure
+            return original_mkdir(name, *args, **kwargs)
+        with self.native_seams(), mock.patch.object(self.manager, "_create_owned_root", side_effect=acquire), mock.patch.object(
+                broker.os, "mkdir", side_effect=mkdir), mock.patch.object(broker, "remove_beneath", wraps=broker.remove_beneath) as remove:
+            with self.assertRaises(PermissionError) as caught:
+                self.manager.start(self.request(False))
+            self.assertIs(caught.exception, failure)
+            fixture = observed[0]
+            self.assertTrue(fixture.private_root_owned)
+            self.assertFalse(fixture.runtime_root_owned)
+            self.assertFalse(fixture.repository_root_owned)
+            self.assertEqual(fixture.spawn_resources, {})
+            self.assertEqual(remove.call_args_list, [mock.call(self.host.runtime_dir, self.layout().private_parts)])
+            self.harness.assert_not_called()
+            self.holder.assert_not_called()
+            self.child.assert_not_called()
+        self.assertFalse(self.layout().private.exists())
+        self.assertEqual(self.manager.live, {})
+
+    def test_uncertain_original_child_directory_close_retains_owned_root_and_name(self):
+        original_open, original_close = broker.os.open, broker.os.close
+        directory = []
+        raised = []
+        def opened(name, *args, **kwargs):
+            descriptor = original_open(name, *args, **kwargs)
+            if name == "niri" and "dir_fd" in kwargs:
+                directory.append(descriptor)
+            return descriptor
+        def closed(descriptor):
+            original_close(descriptor)  # The test owns and really closes its private FD.
+            if directory == [descriptor] and not raised:
+                raised.append(descriptor)
+                raise OSError("synthetic close disposition unknown to broker")
+        with self.native_seams(), mock.patch.object(broker.os, "open", side_effect=opened), mock.patch.object(
+                broker.os, "close", side_effect=closed) as close, mock.patch.object(broker, "remove_beneath") as remove, mock.patch.object(
+                broker, "stopping"):
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.start(self.request(True))
+            self.assertEqual(caught.exception.code, "cleanup_incomplete")
+            fixture = self.manager.live["owned"]
+            self.assertTrue(fixture.private_root_owned)
+            self.assertFalse(fixture.runtime_root_owned)
+            self.assertFalse(fixture.repository_root_owned)
+            self.assertTrue(fixture.resource_errors)
+            self.assertEqual(fixture.spawn_resources, {})
+            self.assertEqual(close.call_args_list.count(mock.call(directory[0])), 1)
+            self.harness.assert_not_called()
+            self.holder.assert_not_called()
+            self.child.assert_not_called()
+            remove.assert_not_called()
+        self.assertTrue(self.layout().niri_root.is_dir())
+
+    def test_owned_roots_cleanup_only_after_original_wait_host_stop_and_release(self):
+        for accounts in (False, True):
+            with self.subTest(accounts=accounts):
+                events = []
+                created = []
+                original_close = broker.os.close
+                original_remove = broker.remove_beneath
+                held_pidfd = object()  # Mock identity cannot alias a real private-file descriptor.
+                child = mock.Mock(pid=744, returncode=None)
+                child.wait.side_effect = lambda **_kwargs: events.append("original-wait") or 0
+                channel = mock.Mock()
+                channel.close.side_effect = lambda: events.append("channel-close")
+                def spawn(fixture, _display):
+                    created.append(fixture)
+                    fixture.process, fixture.pidfd, fixture.channel = child, held_pidfd, channel
+                def close(descriptor):
+                    if descriptor is held_pidfd:
+                        events.append("pidfd-close")
+                    else:
+                        original_close(descriptor)
+                def remove(*args):
+                    events.append("remove")
+                    return original_remove(*args)
+                with self.native_seams(), mock.patch.object(self.manager, "_nested_session", return_value=("mock-wayland", "mock-niri")), mock.patch.object(
+                        self.manager, "_in_sandbox", return_value={"exit_code": 0}), mock.patch.object(
+                        self.manager, "_apply_viewport", return_value={"matches": True}), mock.patch.object(
+                        broker.select, "select", side_effect=lambda read, *_args: (read, [], [])), mock.patch.object(
+                        broker.signal, "pidfd_send_signal") as signal_original, mock.patch.object(
+                        broker.os, "close", side_effect=close), mock.patch.object(broker, "remove_beneath", side_effect=remove) as removed:
+                    self.holder.side_effect = spawn
+                    result = self.manager.start(self.request(accounts))
+                    fixture, = created
+                    self.assertEqual(result["fixture"], "owned")
+                    self.assertTrue(fixture.private_root_owned)
+                    self.assertTrue(fixture.runtime_root_owned)
+                    self.assertTrue(fixture.repository_root_owned)
+                    self.assertEqual(fixture.spawn_resources, {})
+                    self.harness.side_effect = lambda *_args, **_kwargs: events.append("host-stop") or subprocess.CompletedProcess([], 0, b"", b"")
+                    self.manager.stop(fixture, {"keep": False})
+                    signal_original.assert_not_called()
+                    child.wait.assert_called_once()
+                    channel.close.assert_called_once()
+                    self.assertLess(events.index("original-wait"), events.index("host-stop"))
+                    self.assertLess(events.index("host-stop"), events.index("pidfd-close"))
+                    self.assertLess(events.index("channel-close"), events.index("remove"))
+                    self.assertEqual(removed.call_args_list, [mock.call(self.host.runtime_dir, fixture.layout.private_parts),
+                                                             mock.call(self.host.runtime_dir, (fixture.layout.runtime_name,)),
+                                                             mock.call(self.host.repo, fixture.layout.root_parts)])
+                self.assertFalse(fixture.layout.private.exists())
+                self.assertFalse(fixture.layout.runtime.exists())
+                self.assertFalse(fixture.layout.root.exists())
+                self.assertEqual(self.manager.live, {})
 
 
 class Protocol(TemporaryRepository):
