@@ -110,6 +110,12 @@ jobs:
                   raise SystemExit(result.returncode)
           PY
 
+      - name: Check offline Claude resume fixture contracts
+        run: |
+          sha256sum tests/claude_upgrade_fixture_contract.py \
+            tests/fixtures/claude-upgrade-continuity.py
+          /usr/bin/python3 -I -B tests/claude_upgrade_fixture_contract.py -v
+
       - name: Check all formatter contracts
         env:
           CHECK_FORMAT_CARGO_FIXTURE: "1"
