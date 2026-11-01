@@ -33,6 +33,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -99,6 +100,14 @@ class Refusal(Exception):
         super().__init__(detail)
         self.code = code
         self.detail = detail
+
+
+def stopping(detail):
+    """A diagnostic must not interrupt retained original ownership."""
+    try:
+        print(f"broker stopping incomplete: {detail}", file=sys.stderr, flush=True)
+    except BaseException:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -553,11 +562,24 @@ class Binds:
     wayland: int
 
     def fds(self):
-        return (self.checkout, self.target, self.sandbox, self.runtime, self.wayland)
+        return tuple(value for value in (self.checkout, self.target, self.sandbox, self.runtime, self.wayland)
+                     if value is not None)
 
     def close(self):
-        for descriptor in self.fds():
-            os.close(descriptor)
+        errors = []
+        for name in ("checkout", "target", "sandbox", "runtime", "wayland"):
+            descriptor = getattr(self, name)
+            if descriptor is None:
+                continue
+            # A failed close has unknown disposition. Never retry its number.
+            setattr(self, name, None)
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            errors[0].broker_close_errors = [f"bind close: {type(error).__name__}: {error}" for error in errors]
+            raise errors[0]
 
 
 def hold_binds(layout, wayland_directory, wayland_name):
@@ -573,9 +595,15 @@ def hold_binds(layout, wayland_directory, wayland_name):
             lambda: hold_socket(wayland_directory, wayland_name),
         ):
             held.append(open_one())
-    except BaseException:
+    except BaseException as original:
+        errors = []
         for descriptor in held:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except BaseException as error:
+                errors.append(f"partial bind close: {type(error).__name__}: {error}")
+        if errors:
+            original.broker_close_errors = errors
         raise
     return Binds(*held)
 
@@ -887,6 +915,12 @@ class Fixture:
     runner_started: bool = False
     width: int = DEFAULT_WIDTH
     stopped: bool = False
+    settlement: dict = None
+    spawn_resources: dict = field(default_factory=dict)
+    resource_errors: list = field(default_factory=list)
+    host_session_attempted: bool = False
+    host_session_stopped: bool = False
+    released: bool = False
 
 
 class Spawner:
@@ -898,11 +932,18 @@ class Spawner:
 
     def __init__(self):
         self.jobs = queue.Queue()
-        threading.Thread(target=self._serve, daemon=True, name="sandbox-spawner").start()
+        self.lock = threading.Lock()
+        self.closed = False
+        self.stop_queued = False
+        self.thread = threading.Thread(target=self._serve, daemon=True, name="sandbox-spawner")
+        self.thread.start()
 
     def _serve(self):
         while True:
-            job, finished = self.jobs.get()
+            item = self.jobs.get()
+            if item is None:
+                return
+            job, finished = item
             try:
                 finished.put((True, job()))
             except BaseException as error:
@@ -910,11 +951,57 @@ class Spawner:
 
     def run(self, job):
         finished = queue.Queue(maxsize=1)
-        self.jobs.put((job, finished))
-        succeeded, value = finished.get()
+        first = None
+        with self.lock:
+            if self.closed:
+                raise Refusal("shutting_down", "the broker is stopping; no new sandbox")
+            try:
+                self.jobs.put((job, finished))
+            except BaseException as error:
+                # Queue admission can be interrupted after insertion. Do not
+                # release the job's inputs before its actual result is known.
+                first = error
+                stopping("spawn queue admission is uncertain; retaining original inputs")
+        while True:
+            try:
+                succeeded, value = finished.get()
+                break
+            except BaseException as error:
+                if first is None:
+                    first = error
+                    stopping("retaining the original spawn job")
+                try:
+                    time.sleep(0.1)
+                except BaseException:
+                    pass
+        # The job registers any original child before returning. Cancellation
+        # cannot discard a result that still owns a newly created sandbox.
+        if first is not None:
+            raise first
         if not succeeded:
             raise value
         return value
+
+    def close(self):
+        with self.lock:
+            self.closed = True
+            if not self.stop_queued:
+                self.jobs.put(None)
+                self.stop_queued = True
+        errors = []
+        while True:
+            try:
+                self.thread.join()
+                return errors
+            except BaseException as error:
+                if not errors:
+                    stopping("retaining the original spawner thread")
+                if len(errors) < 20:
+                    errors.append(f"spawner join: {type(error).__name__}: {error}")
+                try:
+                    time.sleep(0.1)
+                except BaseException:
+                    pass
 
 
 class Fixtures:
@@ -929,12 +1016,17 @@ class Fixtures:
         self.lock = threading.Lock()
         self.live = {}
         self.clearing = set()
+        self.closing = False
+        self.host_operations = []
         # Separate targets mean Cargo's own lock cannot keep two cold builds apart.
         self.build_lock = threading.Lock()
         self.spawner = Spawner()
 
     def handle(self, request):
         op = request["op"]
+        with self.lock:
+            if self.closing:
+                raise Refusal("shutting_down", "the broker is stopping; no new requests")
         if op == "start":
             return self.start(request)
         if op == "clear":
@@ -944,31 +1036,105 @@ class Fixtures:
             raise Refusal("unknown_fixture", "this broker does not own a fixture by that name")
         if not hmac.compare_digest(fixture.owner, request["owner"]):
             raise Refusal("wrong_owner", "another start owns this fixture; use the owner it returned")
+        early_settlement = None
         if op == "stop":
             # Before the lock, so a slow command cannot delay the end of the sandbox.
-            self._kill_holder(fixture)
+            early_settlement = self._kill_holder(fixture)
         if not fixture.lock.acquire(timeout=LOCK_SECONDS):
             raise Refusal("busy", "another request on this fixture has not finished")
         try:
             # A stop may have finished, and a new start reused the name, while
             # this request waited; it must not act on what it looked up.
+            with self.lock:
+                if self.closing:
+                    raise Refusal("shutting_down", "the broker is stopping; no queued request work")
             if fixture.stopped:
                 raise Refusal("unknown_fixture", "that fixture has stopped")
             if op != "stop" and not self._holder_alive(fixture):
                 raise Refusal("fixture_dead", "the fixture sandbox has exited; stop it and start again")
-            return getattr(self, op.replace("-", "_"))(fixture, request)
+            result = getattr(self, op.replace("-", "_"))(fixture, request)
+            if early_settlement and (not early_settlement["settled"] or early_settlement["errors"]):
+                raise Refusal("cleanup_incomplete", "; ".join(early_settlement["errors"])
+                              or "the first original holder exit observation was incomplete")
+            return result
         finally:
             fixture.lock.release()
 
     def harness(self, layout, command, timeout=HARNESS_SECONDS):
-        return subprocess.run(
-            command,
-            env={**self.harness_env, "NIRI_HARNESS_STATE": str(layout.harness_state)},
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            timeout=timeout,
-            start_new_session=True,
-        )
+        # Only this fixed host operation changes: retain its actual Popen and
+        # capture files through every original wait, including cancellation.
+        cleanup = command == [self.host.harness, "session", "stop", layout.name]
+        streams, child, first = [], None, None
+        operation = {"child": None, "wait_settled": False, "streams": streams, "close_errors": []}
+        result = None
+        try:
+            with self.lock:
+                if self.closing and not cleanup:
+                    raise Refusal("shutting_down", "the broker is stopping; no new host operation")
+                self.host_operations.append(operation)
+                streams.append(tempfile.TemporaryFile())
+                streams.append(tempfile.TemporaryFile())
+                child = subprocess.Popen(
+                    command, env={**self.harness_env, "NIRI_HARNESS_STATE": str(layout.harness_state)},
+                    stdin=subprocess.DEVNULL, stdout=streams[0], stderr=streams[1], start_new_session=True,
+                )
+                operation["child"] = child
+            try:
+                code = child.wait(timeout=timeout)
+                operation["wait_settled"] = True
+            except BaseException as error:
+                first = error
+                if isinstance(error, subprocess.TimeoutExpired):
+                    try:
+                        child.kill()  # Only this original host command, as before.
+                    except BaseException:
+                        pass
+                stopping("retaining the original host command wait")
+                while True:
+                    try:
+                        code = child.wait()
+                        operation["wait_settled"] = True
+                        break
+                    except BaseException:
+                        try:
+                            time.sleep(0.1)
+                        except BaseException:
+                            pass
+            if first is None:
+                for stream in streams:
+                    stream.seek(0)
+                result = subprocess.CompletedProcess(command, code, streams[0].read(), streams[1].read())
+        except BaseException as error:
+            if first is None:
+                first = error
+        finally:
+            # No exception/second interrupt may drop a created original child.
+            if child is not None and not operation["wait_settled"]:
+                while True:
+                    try:
+                        child.wait()
+                        operation["wait_settled"] = True
+                        break
+                    except BaseException as error:
+                        if first is None:
+                            first = error
+                        try:
+                            time.sleep(0.1)
+                        except BaseException:
+                            pass
+            for stream in streams:
+                try:
+                    stream.close()
+                except BaseException as error:
+                    operation["close_errors"].append(f"host capture close: {type(error).__name__}: {error}")
+                    if first is None:
+                        first = error
+            with self.lock:
+                if operation in self.host_operations and not operation["close_errors"]:
+                    self.host_operations.remove(operation)
+        if first is not None:
+            raise first
+        return result
 
     def layout_for(self, name, checkout):
         pin = ZIG_VERSION.search((checkout / "mise.toml").read_text(errors="replace"))
@@ -984,6 +1150,8 @@ class Fixtures:
     def start(self, request):
         name = request["fixture"]
         with self.lock:
+            if self.closing:
+                raise Refusal("shutting_down", "the broker is stopping; no new fixture")
             if name in self.live or name in self.clearing:
                 raise Refusal("fixture_exists", "a live fixture already has that name")
             if len(self.live) >= MAX_LIVE_FIXTURES:
@@ -996,15 +1164,13 @@ class Fixtures:
         with fixture.lock:
             try:
                 viewport = self._create(fixture, request["width"])
-            except BaseException:
-                # Frees the name: nothing is left to clear after a failed start.
-                self._kill_holder(fixture)
+            except BaseException as original:
+                fixture.resource_errors.extend(getattr(original, "broker_close_errors", []))
+                # Only positive original settlement permits release/name reuse.
                 try:
-                    self._discard(layout, remove=True)
-                finally:
-                    self._release(fixture)
-                    fixture.stopped = True
-                    self.live.pop(name, None)
+                    self.stop(fixture, {"keep": False})
+                except BaseException as cleanup_error:
+                    stopping(f"{name}: failed start remains owned: {type(cleanup_error).__name__}: {cleanup_error}")
                 raise
         return {
             "fixture": name,
@@ -1020,21 +1186,34 @@ class Fixtures:
     def _create(self, fixture, width):
         layout = fixture.layout
         repo = self.host.repo
-        for parts in (
-            (*layout.root_parts, "shots"),
-            *((*layout.root_parts, "sandbox", *name.split("/")) for name in layout.sandbox_directories),
-        ):
-            os.close(hold_directory(repo, parts, create=True))
-        os.close(hold_directory(self.host.runtime_dir, (layout.runtime_name,), create=True))
-        for name in ("niri", "state"):
-            os.close(hold_directory(self.host.runtime_dir, (*layout.private_parts, name), create=True))
-        provider = hold_directory(repo, (*layout.root_parts, "sandbox", "bin"))
-        try:
-            os.symlink(layout.checkout / "tests/fixtures/chat-composer-claude.sh", "claude", dir_fd=provider)
-        finally:
-            os.close(provider)
+        with self.lock:
+            if self.closing:
+                raise Refusal("shutting_down", "the broker is stopping; no fixture creation")
+            for directory, parts in (
+                (repo, (*layout.root_parts, "shots")),
+                *((repo, (*layout.root_parts, "sandbox", *name.split("/"))) for name in layout.sandbox_directories),
+                (self.host.runtime_dir, (layout.runtime_name,)),
+                *((self.host.runtime_dir, (*layout.private_parts, name)) for name in ("niri", "state")),
+            ):
+                fixture.spawn_resources["creation_directory"] = hold_directory(directory, parts, create=True)
+                errors = self._close_spawn_resources(fixture, ("creation_directory",))
+                if errors:
+                    raise Refusal("cleanup_incomplete", "; ".join(errors))
+            provider = hold_directory(repo, (*layout.root_parts, "sandbox", "bin"))
+            fixture.spawn_resources["provider_directory"] = provider
+            try:
+                os.symlink(layout.checkout / "tests/fixtures/chat-composer-claude.sh", "claude", dir_fd=provider)
+            finally:
+                original_error = sys.exc_info()[1]
+                errors = self._close_spawn_resources(fixture, ("provider_directory",))
+                if errors and original_error is None:
+                    raise Refusal("cleanup_incomplete", "; ".join(errors))
 
         previous, before = self._host_focus()
+        with self.lock:
+            if self.closing:
+                raise Refusal("shutting_down", "the broker is stopping; no new host session")
+            fixture.host_session_attempted = True
         started = self.harness(
             layout,
             [
@@ -1049,6 +1228,9 @@ class Fixtures:
         self._restore_host_focus(previous, before)
         if started.returncode:
             raise Refusal("harness_failed", bounded(started.stderr or started.stdout))
+        with self.lock:
+            if self.closing:
+                raise Refusal("shutting_down", "the broker stopped admission during session startup")
         display, fixture.nested_socket = self._nested_session(layout)
         self._spawn_holder(fixture, display)
         initialized = self._in_sandbox(fixture, ["/usr/bin/git", "init", "--quiet", "--initial-branch=main", "."])
@@ -1066,39 +1248,73 @@ class Fixtures:
 
     def _spawn_holder(self, fixture, display):
         layout = fixture.layout
-        binds = hold_binds(layout, self.host.runtime_dir, display)
-        read_info, write_info = os.pipe()
-        ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        fixture.channel = RelayChannel(ours)
         try:
-            argv = holder_argv(layout, binds, write_info, theirs.fileno())
-            fixture.process = self.spawner.run(
-                lambda: subprocess.Popen(
-                    argv,
-                    env=self.holder_environment,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    pass_fds=(*binds.fds(), write_info, theirs.fileno()),
-                    start_new_session=True,
-                )
-            )
-            # Held from the moment it exists, so every failure below can end it.
-            fixture.pidfd = os.pidfd_open(fixture.process.pid)
-        finally:
-            binds.close()
-            os.close(write_info)
-            theirs.close()
-        try:
+            with self.lock:
+                if self.closing:
+                    raise Refusal("shutting_down", "the broker is stopping; no holder resources")
+                binds = hold_binds(layout, self.host.runtime_dir, display)
+                fixture.spawn_resources["binds"] = binds
+                read_info, write_info = os.pipe()
+                fixture.spawn_resources.update(read_info=read_info, write_info=write_info)
+                ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+                fixture.spawn_resources.update(ours=ours, theirs=theirs)
+                fixture.channel = RelayChannel(ours)
+                del fixture.spawn_resources["ours"]  # Transferred only after construction.
+            try:
+                argv = holder_argv(layout, binds, write_info, theirs.fileno())
+
+                def spawn_original():
+                    with self.lock:
+                        if self.closing:
+                            raise Refusal("shutting_down", "the broker is stopping; no new holder")
+                        original = subprocess.Popen(
+                            argv, env=self.holder_environment, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            pass_fds=(*binds.fds(), write_info, theirs.fileno()), start_new_session=True,
+                        )
+                        fixture.process = original  # Registered before the queue reply.
+                        return original
+
+                self.spawner.run(spawn_original)
+                fixture.pidfd = os.pidfd_open(fixture.process.pid)
+            finally:
+                original_error = sys.exc_info()[1]
+                errors = self._close_spawn_resources(fixture, ("binds", "write_info", "theirs"))
+                if errors and original_error is None:
+                    raise Refusal("cleanup_incomplete", "; ".join(errors))
             fixture.holder_pid = self._read_holder_pid(read_info)
+            inner = os.pidfd_open(fixture.holder_pid)
+            fixture.spawn_resources["inner_pidfd"] = inner
+            with fixture.kill_lock:
+                fixture.spawn_resources["retiring_pidfd"] = fixture.pidfd
+                fixture.pidfd = inner
+                del fixture.spawn_resources["inner_pidfd"]
+                errors = self._close_spawn_resources(fixture, ("retiring_pidfd",))
+                if errors:
+                    raise Refusal("cleanup_incomplete", "; ".join(errors))
+            fixture.channel.await_ready(HOLDER_START_SECONDS)
         finally:
-            os.close(read_info)
-        # The sandbox's own PID 1. Ending it ends every process in the namespace.
-        inner = os.pidfd_open(fixture.holder_pid)
-        with fixture.kill_lock:
-            os.close(fixture.pidfd)
-            fixture.pidfd = inner
-        fixture.channel.await_ready(HOLDER_START_SECONDS)
+            original_error = sys.exc_info()[1]
+            errors = self._close_spawn_resources(fixture, tuple(fixture.spawn_resources))
+            if errors and original_error is None:
+                raise Refusal("cleanup_incomplete", "; ".join(errors))
+
+    def _close_spawn_resources(self, fixture, names):
+        errors = []
+        for name in names:
+            resource = fixture.spawn_resources.pop(name, None)
+            if resource is None:
+                continue
+            try:
+                if name in ("binds", "ours", "theirs"):
+                    resource.close()
+                else:
+                    os.close(resource)
+            except BaseException as error:
+                detail = f"{name} close uncertain: {type(error).__name__}: {error}"
+                errors.append(detail)
+                fixture.resource_errors.append(detail)
+        return errors
 
     def _read_holder_pid(self, descriptor):
         deadline = time.monotonic() + HOLDER_START_SECONDS
@@ -1121,32 +1337,72 @@ class Fixtures:
 
     def _holder_alive(self, fixture):
         if fixture.pidfd is None:
-            return False
+            return fixture.process is not None and fixture.process.returncode is None
         return not select.select([fixture.pidfd], [], [], 0)[0]
 
     def _kill_holder(self, fixture):
-        """End the sandbox. Unconditional: no sandbox-writable state is consulted."""
+        """Attempt only owned termination, then require original exit evidence."""
         with fixture.kill_lock:
+            deadline = time.monotonic() + 5
+            errors = []
+            pidfd_exited = fixture.pidfd is None
             if fixture.pidfd is not None:
                 try:
-                    signal.pidfd_send_signal(fixture.pidfd, signal.SIGKILL)
-                except OSError:
-                    pass
+                    pidfd_exited = bool(select.select([fixture.pidfd], [], [], 0)[0])
+                except BaseException as error:
+                    errors.append(f"held pidfd exit: {type(error).__name__}: {error}")
+                if not pidfd_exited:
+                    try:
+                        signal.pidfd_send_signal(fixture.pidfd, signal.SIGKILL)
+                    except BaseException as error:
+                        errors.append(f"held pidfd signal: {type(error).__name__}: {error}")
             process = fixture.process
-        if process is not None:
-            process.kill()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+            waited = process is None
+            if process is not None:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except BaseException as error:
+                        errors.append(f"original child signal: {type(error).__name__}: {error}")
+                try:
+                    code = process.wait(timeout=max(0, deadline - time.monotonic()))
+                    waited = isinstance(code, int) and not isinstance(code, bool)
+                except BaseException as error:
+                    errors.append(f"original child wait: {type(error).__name__}: {error}")
+            if fixture.pidfd is not None and not pidfd_exited:
+                try:
+                    pidfd_exited = bool(select.select([fixture.pidfd], [], [], max(0, deadline - time.monotonic()))[0])
+                except BaseException as error:
+                    errors.append(f"held pidfd exit: {type(error).__name__}: {error}")
+            fixture.settlement = {"settled": waited and pidfd_exited,
+                                  "original_wait": waited, "held_pidfd_exited": pidfd_exited,
+                                  "errors": errors}
+            return fixture.settlement
 
     def _release(self, fixture):
+        if fixture.released:
+            return
+        if (not fixture.settlement or not fixture.settlement["settled"]
+                or not fixture.host_session_stopped or fixture.resource_errors):
+            raise Refusal("cleanup_incomplete", "original exit, host stop or resource close remains unproven")
         with fixture.kill_lock:
             if fixture.pidfd is not None:
-                os.close(fixture.pidfd)
+                descriptor = fixture.pidfd
                 fixture.pidfd = None
+                try:
+                    os.close(descriptor)
+                except BaseException as error:
+                    fixture.resource_errors.append(f"pidfd close uncertain: {type(error).__name__}: {error}")
         if fixture.channel is not None:
-            fixture.channel.close()
+            channel = fixture.channel
+            fixture.channel = None
+            try:
+                channel.close()
+            except BaseException as error:
+                fixture.resource_errors.append(f"channel close uncertain: {type(error).__name__}: {error}")
+        if fixture.resource_errors:
+            raise Refusal("cleanup_incomplete", "; ".join(fixture.resource_errors))
+        fixture.released = True
 
     def _host_focus(self):
         focused = self._niri_json(self.harness_env, "focused-window")
@@ -1270,9 +1526,14 @@ class Fixtures:
         if not fixture.lock.acquire(blocking=False):
             return True  # It is busy, and it cannot be shown to have finished.
         try:
-            return self._holder_alive(fixture) and self._runner_state(fixture) == "running"
-        except Refusal:
-            return False
+            if fixture.pidfd is None and fixture.process is None:
+                return True  # Started work without a retained exit observation is unknown.
+            if not self._holder_alive(fixture):
+                return False
+            state = self._runner_state(fixture)
+            return not state.startswith("exited_")
+        except (Refusal, OSError):
+            return True
         finally:
             fixture.lock.release()
 
@@ -1381,17 +1642,21 @@ class Fixtures:
 
     def stop(self, fixture, request):
         layout = fixture.layout
-        self._kill_holder(fixture)
+        settlement = self._kill_holder(fixture)
+        if not settlement["settled"]:
+            raise Refusal("cleanup_incomplete", "; ".join(settlement["errors"]) or "original holder exit remains unproven")
         keep = bool(request.get("keep"))
-        try:
-            left_behind = self._discard(layout, remove=not keep)
-        finally:
-            # The fixture is over whatever cleanup managed; its name must not stick.
-            self._release(fixture)
-            fixture.stopped = True
-            with self.lock:
-                if self.live.get(layout.name) is fixture:
-                    del self.live[layout.name]
+        left_behind = self._discard(layout, remove=not keep)
+        if not fixture.released:
+            raise Refusal("cleanup_incomplete", "original resources were not released")
+        fixture.stopped = True
+        with self.lock:
+            if self.live.get(layout.name) is fixture:
+                del self.live[layout.name]
+        if settlement["errors"]:
+            # Later positive settlement permits cleanup, never success for an
+            # original failed signal/wait/exit observation.
+            raise Refusal("cleanup_incomplete", "; ".join(settlement["errors"]))
         return {
             "fixture": layout.name,
             "kept": keep,
@@ -1400,11 +1665,18 @@ class Fixtures:
         }
 
     def _discard(self, layout, *, remove):
-        """Stop the nested session and remove broker state; name what remains."""
-        try:
-            self.harness(layout, [self.host.harness, "session", "stop", layout.name], timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            pass
+        """Remove controls only after positive host stop and original release."""
+        with self.lock:
+            fixture = self.live.get(layout.name)
+        if fixture is not None and fixture.layout is not layout:
+            raise Refusal("cleanup_incomplete", "another original fixture owns this layout")
+        if fixture is None or (fixture.host_session_attempted and not fixture.host_session_stopped):
+            stopped = self.harness(layout, [self.host.harness, "session", "stop", layout.name], timeout=30)
+            if stopped.returncode != 0:
+                raise Refusal("cleanup_incomplete", "host session stop failed: " + bounded(stopped.stderr or stopped.stdout))
+        if fixture is not None:
+            fixture.host_session_stopped = True
+            self._release(fixture)
         left_behind = []
         if not remove_beneath(self.host.runtime_dir, layout.private_parts):
             left_behind.append(str(layout.private))
@@ -1418,6 +1690,8 @@ class Fixtures:
         """Recover a name no live fixture holds, including after a killed broker."""
         name = request["fixture"]
         with self.lock:
+            if self.closing:
+                raise Refusal("shutting_down", "the broker is stopping; no new cleanup request")
             if name in self.live or name in self.clearing:
                 raise Refusal("fixture_exists", "that fixture is live; stop it instead")
             # Held to the end, so a start cannot create what this is removing.
@@ -1456,29 +1730,52 @@ class Fixtures:
                 recovered.append(name)
         return recovered, problems
 
-    def stop_all(self):
-        """End every sandbox first; then clean up as far as a bounded wait allows.
+    def begin_shutdown(self):
+        with self.lock:
+            self.closing = True
 
-        Returns a message for each fixture it could not finish, and never raises.
-        """
-        fixtures = list(self.live.values())
-        for fixture in fixtures:
-            self._kill_holder(fixture)
+    def stop_all(self):
+        """One cleanup pass; incomplete originals remain owned for later drain."""
+        with self.lock:
+            self.closing = True
+            fixtures = list(self.live.values())
         problems = []
         for fixture in fixtures:
+            try:
+                settlement = self._kill_holder(fixture)
+                if not settlement["settled"] or settlement["errors"]:
+                    detail = "; ".join(settlement["errors"]) or "original holder exit remains unproven"
+                    problems.append(f"{fixture.layout.name}: {detail}")
+            except BaseException as error:
+                problems.append(f"{fixture.layout.name}: {type(error).__name__}: {error}")
+        for fixture in fixtures:
             name = fixture.layout.name
-            if not fixture.lock.acquire(timeout=STOP_ALL_LOCK_SECONDS):
-                problems.append(f"{name}: busy; its sandbox was ended and its directories remain")
+            try:
+                acquired = fixture.lock.acquire(timeout=STOP_ALL_LOCK_SECONDS)
+            except BaseException as error:
+                problems.append(f"{name}: lock wait interrupted: {type(error).__name__}: {error}")
+                continue
+            if not acquired:
+                problems.append(f"{name}: busy; original ownership and directories remain")
                 continue
             try:
                 if not fixture.stopped:
                     left_behind = self.stop(fixture, {"keep": True})["left_behind"]
                     if left_behind:
                         problems.append(f"{name}: could not remove {', '.join(left_behind)}")
-            except Exception as error:
+            except BaseException as error:
                 problems.append(f"{name}: {type(error).__name__}: {error}")
             finally:
-                fixture.lock.release()
+                try:
+                    fixture.lock.release()
+                except BaseException as error:
+                    problems.append(f"{name}: lock release: {type(error).__name__}: {error}")
+        with self.lock:
+            complete = not self.live and not self.clearing and not self.host_operations
+            if self.host_operations:
+                problems.append("original host operation or capture close remains owned")
+        if complete:
+            problems.extend(self.spawner.close())
         return problems
 
 
@@ -1526,7 +1823,7 @@ class Connection(socketserver.StreamRequestHandler):
 
 
 class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
+    daemon_threads = False
     # Removal of a live socket is decided by prepare_socket, never by a reuse flag.
     allow_reuse_address = False
     request_queue_size = MAX_CONNECTIONS
@@ -1535,6 +1832,11 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         self.repo = repo
         self.handler = handler
         self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.requests_lock = threading.Lock()
+        self.accepting = True
+        self.request_threads = []
+        self.listen_close_attempted = False
+        self.socket_close_uncertain = False
         prepare_socket(path)
         previous = os.umask(0o177)
         try:
@@ -1544,13 +1846,168 @@ class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         os.chmod(path, 0o600)
 
     def verify_request(self, request, client_address):
-        return self.slots.acquire(blocking=False)
+        with self.requests_lock:
+            return self.accepting and self.slots.acquire(blocking=False)
 
-    def process_request_thread(self, request, client_address):
+    def process_request(self, request, client_address):
+        with self.requests_lock:
+            if not self.accepting:
+                record = {"request": request, "thread": None, "joined": True,
+                          "start_error": None, "close_error": None}
+                self.request_threads.append(record)
+                try:
+                    self.shutdown_request(request)
+                except BaseException as error:
+                    record["close_error"] = f"{type(error).__name__}: {error}"
+                finally:
+                    self.slots.release()
+                return
+            # Keep only unjoined/uncertain originals, not an unbounded history
+            # of positively joined request threads and closed sockets.
+            for record in self.request_threads.copy():
+                thread = record["thread"]
+                if thread is not None and record["start_error"] is None and not thread.is_alive():
+                    try:
+                        thread.join(0)
+                        record["joined"] = True
+                    except BaseException:
+                        pass
+                if record["joined"] and record["close_error"] is None:
+                    self.request_threads.remove(record)
+            record = {"request": request, "thread": None, "joined": False,
+                      "start_error": None, "close_error": None}
+            self.request_threads.append(record)
+            try:
+                thread = threading.Thread(target=self.process_request_thread,
+                                          args=(request, client_address, record), daemon=False)
+                record["thread"] = thread
+            except BaseException as error:
+                # Construction never invoked start: no original worker exists.
+                record["start_error"] = f"{type(error).__name__}: {error}"
+                record["joined"] = True
+                try:
+                    self.shutdown_request(request)
+                except BaseException as close_error:
+                    record["close_error"] = f"{type(close_error).__name__}: {close_error}"
+                finally:
+                    self.slots.release()
+                return
+            try:
+                thread.start()
+            except BaseException as error:
+                # A Thread.start interruption is not proof that no worker exists.
+                # Retain the original handle/request rather than close underneath it.
+                record["start_error"] = f"{type(error).__name__}: {error}"
+                stopping("request thread start is uncertain; retaining its original handle")
+
+    def process_request_thread(self, request, client_address, record=None):
         try:
-            super().process_request_thread(request, client_address)
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
         finally:
-            self.slots.release()
+            try:
+                self.shutdown_request(request)
+            except BaseException as error:
+                if record is not None:
+                    record["close_error"] = f"{type(error).__name__}: {error}"
+            finally:
+                self.slots.release()
+
+    def server_close(self):
+        errors = []
+        with self.requests_lock:
+            self.accepting = False
+            if not self.listen_close_attempted:
+                self.listen_close_attempted = True
+                try:
+                    socketserver.UnixStreamServer.server_close(self)
+                except BaseException as error:
+                    self.socket_close_uncertain = True
+                    errors.append(f"listener close uncertain: {type(error).__name__}: {error}")
+            records = tuple(self.request_threads)
+        for record in records:
+            warned = False
+            while not record["joined"]:
+                try:
+                    if record["thread"] is None:
+                        raise RuntimeError("request thread creation did not return an original handle")
+                    record["thread"].join()
+                    record["joined"] = True
+                except BaseException as error:
+                    if not warned:
+                        warned = True
+                        errors.append(f"original request join: {type(error).__name__}: {error}")
+                        stopping("retaining original accepted request until its join is known")
+                    try:
+                        time.sleep(0.1)
+                    except BaseException:
+                        pass
+            if record["close_error"] is not None:
+                errors.append("request close uncertain: " + record["close_error"])
+            if record["start_error"] is not None:
+                errors.append("original request start failed: " + record["start_error"])
+        return errors
+
+    def ownership_settled(self):
+        with self.requests_lock:
+            return (self.listen_close_attempted and not self.socket_close_uncertain
+                    and all(record["joined"] and record["close_error"] is None for record in self.request_threads))
+
+
+def shutdown(server, fixtures):
+    """Close admission, drain actual requests, then retain every incomplete owner."""
+    failed = False
+    reported = set()
+
+    def report(problems):
+        nonlocal failed
+        if problems:
+            failed = True
+        for problem in problems:
+            if problem not in reported:
+                reported.add(problem)
+                stopping(problem)
+
+    while True:
+        try:
+            fixtures.begin_shutdown()
+            break
+        except BaseException as error:
+            report([f"closing admission: {type(error).__name__}: {error}"])
+            try:
+                time.sleep(0.1)
+            except BaseException:
+                pass
+    try:
+        report(fixtures.stop_all())
+    except BaseException as error:
+        report([f"first cleanup pass: {type(error).__name__}: {error}"])
+    while True:
+        try:
+            report(server.server_close())
+            break
+        except BaseException as error:
+            report([f"original server drain: {type(error).__name__}: {error}"])
+            try:
+                time.sleep(0.1)
+            except BaseException:
+                pass
+    while True:
+        try:
+            report(fixtures.stop_all())
+            with fixtures.lock:
+                complete = not fixtures.live and not fixtures.clearing and not fixtures.host_operations
+            if complete and server.ownership_settled():
+                return failed
+        except BaseException as error:
+            report([f"retained cleanup: {type(error).__name__}: {error}"])
+        # A nominal request bound is not a promise of safe cleanup. No retry of
+        # uncertain descriptor numbers or further work on an unsettled child.
+        try:
+            time.sleep(1)
+        except BaseException as error:
+            report([f"shutdown interrupted while originals remain: {type(error).__name__}: {error}"])
 
 
 def prepare_socket(path):
@@ -1642,28 +2099,27 @@ def main(argv=None):
     except Refusal as refusal:
         print(refusal.detail, file=sys.stderr)
         return 1
-    install_termination()
-    # After the socket, which proves no other broker owns these sessions.
-    recovered, problems = fixtures.recover_stale()
-    for name in recovered:
-        print(f"recovered stale fixture session {name}; `clear` removes its directory", flush=True)
-    for problem in problems:
-        print(f"could not recover a stale fixture session: {problem}", file=sys.stderr, flush=True)
-
-    digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    print(f"native-fixture-broker listening at {path}", flush=True)
-    print(f"script {Path(__file__).resolve()} sha256 {digest}", flush=True)
-    print(f"sandboxed builds write beneath {host.repo / '.worktrees' / TARGETS_DIR}", flush=True)
+    cleanup_failed = False
     try:
+        install_termination()
+        # After the socket, which proves no other broker owns these sessions.
+        recovered, problems = fixtures.recover_stale()
+        for name in recovered:
+            print(f"recovered stale fixture session {name}; `clear` removes its directory", flush=True)
+        for problem in problems:
+            print(f"could not recover a stale fixture session: {problem}", file=sys.stderr, flush=True)
+
+        digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        print(f"native-fixture-broker listening at {path}", flush=True)
+        print(f"script {Path(__file__).resolve()} sha256 {digest}", flush=True)
+        print(f"sandboxed builds write beneath {host.repo / '.worktrees' / TARGETS_DIR}", flush=True)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        for problem in fixtures.stop_all():
-            print(f"fixture cleanup incomplete: {problem}", file=sys.stderr, flush=True)
-        server.server_close()
+        cleanup_failed = shutdown(server, fixtures)
         Path(path).unlink(missing_ok=True)
-    return 0
+    return 1 if cleanup_failed else 0
 
 
 if __name__ == "__main__":

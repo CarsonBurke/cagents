@@ -61,7 +61,9 @@ before and an after can be live together.
   until you delete them. `cli` is refused until this fixture's runner has built a
   binary whose Cargo dep-info names this checkout. Only one fixture builds at a
   time: `run-ui` refuses with `build_busy` while another is building, so run it
-  again once that fixture's `status` says `building` is false.
+  again once that fixture's `status` says `building` is false. Unreadable or
+  malformed runner state remains busy or unavailable; it does not permit a
+  second build.
 - **Viewport:** `start --width` and `viewport --width` set the app's logical width
   from 320 to 3840, through the nested output's scale, and fit it again before
   input and screenshots if the host has resized the nested window. The host lays
@@ -72,11 +74,17 @@ before and an after can be live together.
   between them.
 - **Screenshots** land in `shots/` under the root as PNG; convert them to WebP for
   a PR.
-- **Stopping:** `stop` removes the fixture directory unless given `--keep`, and
-  lists under `left_behind` anything it could not remove. A kept
+- **Stopping:** after the original holder's exit and a successful nested-session
+  stop are confirmed, `stop` removes the fixture directory unless given `--keep`,
+  and lists under `left_behind` anything it could not remove. Uncertain waits,
+  failed session stops or resource closes retain the name and private controls;
+  a failed request stays failed even if later settlement permits cleanup. A kept
   directory, or one left by a killed broker, blocks a new `start` of that name
-  until `scripts/native-fixture clear NAME`. A failed `start` frees its name
-  itself. If the broker is killed outright, its sandboxes die with it, but its
+  until `scripts/native-fixture clear NAME`. A failed `start` frees its name only
+  after that same cleanup is confirmed. During broker shutdown, new work is
+  refused and accepted requests and original children are drained. A stopping
+  diagnostic can remain indefinitely while ownership is uncertain; request
+  timeouts do not promise safe release. If the broker is killed outright, its sandboxes die with it, but its
   nested niri windows stay until the broker next starts or `clear` runs.
 - **Owner:** the owner value only stops agents using each other's fixtures by
   accident. It is not a security control.

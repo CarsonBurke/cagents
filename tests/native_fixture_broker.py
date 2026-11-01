@@ -11,6 +11,8 @@ one get an inert placeholder.
 
 import importlib.machinery
 import importlib.util
+import io
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -25,6 +27,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 BROKER = Path(os.environ.get("NATIVE_FIXTURE_BROKER_UNDER_TEST", REPOSITORY / "scripts/native-fixture-broker"))
@@ -1204,7 +1207,7 @@ class Lifecycle(SandboxCase):
         self.assertEqual(self.fixtures.stop_all(), [])
         self.assertEqual(self.fixtures.live, {})
 
-    def test_stop_releases_the_fixture_when_cleanup_itself_fails(self):
+    def test_stop_retains_the_fixture_when_cleanup_itself_fails(self):
         owner = self.start()["owner"]
         fixture = self.fixtures.live["demo"]
         holder = fixture.holder_pid
@@ -1217,10 +1220,11 @@ class Lifecycle(SandboxCase):
         with self.assertRaises(RuntimeError):
             self.call("stop", fixture="demo", owner=owner)
         self.fixtures._discard = original
-        self.assertEqual(self.fixtures.live, {})
-        self.assertTrue(fixture.stopped)
-        self.assertIsNone(fixture.pidfd)
+        self.assertIs(self.fixtures.live["demo"], fixture)
+        self.assertFalse(fixture.stopped)
+        self.assertIsNotNone(fixture.pidfd)
         self.assertTrue(self.await_gone(holder))
+        self.call("stop", fixture="demo", owner=owner)
 
     def test_stop_all_continues_past_a_failure_and_reports_it(self):
         self.start("a")
@@ -1461,6 +1465,449 @@ class Lifecycle(SandboxCase):
 
 
 STATUS = b'{"op":"status","fixture":"a","owner":"' + OWNER.encode() + b'"}\n'
+
+
+class OwnershipContracts(TemporaryRepository):
+    """Inert/mock ownership oracles; no broker guard, native child or sandbox.
+
+    Synthetic descriptor numbers are used only while all corresponding OS
+    operations are mocked. No inherited environment or authority is changed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.host = broker.Host(
+            repo=self.repo, home=self.base / "home", runtime_dir=self.base / "runtime",
+            cargo_home=self.base / "cargo", rustup_home=self.base / "rustup",
+            mise_data=self.base / "mise", harness="synthetic-harness", niri="synthetic-niri",
+        )
+        self.manager = object.__new__(broker.Fixtures)
+        self.manager.host = self.host
+        self.manager.harness_env = {"SYNTHETIC_FIXTURE": "mock only; no child executes"}
+        self.manager.lock = threading.Lock()
+        self.manager.build_lock = threading.Lock()
+        self.manager.closing = False
+        self.manager.clearing = set()
+        self.manager.host_operations = []
+        self.manager.spawner = mock.Mock()
+        self.manager.spawner.close.return_value = []
+        self.fixture = self.owned_fixture("demo", 44)
+        self.manager.live = {"demo": self.fixture}
+
+    def owned_fixture(self, name, descriptor):
+        layout = broker.Layout(self.host, name, self.checkout, self.base / "zig")
+        fixture = broker.Fixture(layout, OWNER)
+        fixture.process = mock.Mock(pid=700 + descriptor, returncode=None)
+        fixture.process.wait.return_value = 0
+        fixture.pidfd = descriptor
+        fixture.channel = mock.Mock()
+        fixture.host_session_attempted = True
+        return fixture
+
+    def stop_seams(self, ready=True):
+        stack = ExitStack()
+        stack.enter_context(mock.patch.object(broker.signal, "pidfd_send_signal"))
+        stack.enter_context(mock.patch.object(broker.select, "select", side_effect=lambda read, *_: (read if ready else [], [], [])))
+        self.close_fd = stack.enter_context(mock.patch.object(broker.os, "close"))
+        self.host_stop = stack.enter_context(mock.patch.object(
+            self.manager, "harness", return_value=subprocess.CompletedProcess([], 0, b"", b"")))
+        self.remove = stack.enter_context(mock.patch.object(broker, "remove_beneath", return_value=True))
+        return stack
+
+    def test_original_wait_timeout_retains_name_pidfd_channel_and_controls(self):
+        original = self.fixture.process
+        channel = self.fixture.channel
+        original.wait.side_effect = subprocess.TimeoutExpired("synthetic-owned-child", 5)
+        with self.stop_seams():
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.stop(self.fixture, {"keep": False})
+            self.assertEqual(caught.exception.code, "cleanup_incomplete")
+            self.assertIs(self.manager.live["demo"], self.fixture)
+            self.assertIs(self.fixture.process, original)
+            self.assertEqual(self.fixture.pidfd, 44)
+            self.assertFalse(self.fixture.stopped)
+            channel.close.assert_not_called()
+            self.close_fd.assert_not_called()
+            self.host_stop.assert_not_called()
+            self.remove.assert_not_called()
+
+    def test_signal_attempt_does_not_replace_positive_held_exit(self):
+        with self.stop_seams(ready=False), mock.patch.object(
+                broker.signal, "pidfd_send_signal", side_effect=OSError("synthetic signal refusal")):
+            with self.assertRaises(broker.Refusal):
+                self.manager.stop(self.fixture, {})
+            self.fixture.process.wait.assert_called_once()
+            self.assertFalse(self.fixture.settlement["held_pidfd_exited"])
+            self.assertIs(self.manager.live["demo"], self.fixture)
+            self.host_stop.assert_not_called()
+            self.close_fd.assert_not_called()
+
+    def test_positive_original_wait_and_host_stop_precede_release_and_removal(self):
+        events = []
+        self.fixture.process.wait.side_effect = lambda **_: events.append("original-wait") or 0
+        channel = self.fixture.channel
+        with self.stop_seams():
+            self.host_stop.side_effect = lambda *_a, **_k: events.append("host-stop") or subprocess.CompletedProcess([], 0, b"", b"")
+            self.close_fd.side_effect = lambda _fd: events.append("close")
+            self.remove.side_effect = lambda *_a: events.append("remove") or True
+            result = self.manager.stop(self.fixture, {"keep": False})
+            self.assertEqual(result["left_behind"], [])
+            self.assertTrue(result["removed"])
+            self.assertLess(events.index("original-wait"), events.index("host-stop"))
+            self.assertLess(events.index("host-stop"), events.index("close"))
+            self.assertLess(events.index("close"), events.index("remove"))
+            self.assertEqual(self.manager.live, {})
+            self.assertTrue(self.fixture.released)
+            channel.close.assert_called_once()
+
+    def test_failed_signal_stays_failure_after_positive_settlement_and_cleanup(self):
+        with self.stop_seams(), mock.patch.object(
+                broker.select, "select", side_effect=[([], [], []), ([44], [], [])]), mock.patch.object(
+                broker.signal, "pidfd_send_signal", side_effect=OSError("synthetic signal failure")):
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.stop(self.fixture, {})
+            self.assertIn("synthetic signal failure", caught.exception.detail)
+            self.assertTrue(self.fixture.released)
+            self.assertTrue(self.fixture.stopped)
+            self.assertEqual(self.manager.live, {})
+            self.remove.assert_called()
+
+    def test_already_settled_original_does_not_signal_an_exited_pidfd_again(self):
+        self.fixture.process.returncode = 0
+        with self.stop_seams(), mock.patch.object(broker.signal, "pidfd_send_signal") as send:
+            self.manager.stop(self.fixture, {})
+            send.assert_not_called()
+            self.fixture.process.kill.assert_not_called()
+            self.fixture.process.wait.assert_called_once()
+            self.assertEqual(self.manager.live, {})
+
+    def test_early_stop_wait_failure_is_not_overwritten_by_later_settlement(self):
+        self.fixture.process.wait.side_effect = [subprocess.TimeoutExpired("synthetic first wait", 5), 0]
+        with self.stop_seams():
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.handle({"op": "stop", "fixture": "demo", "owner": OWNER})
+            self.assertIn("synthetic first wait", caught.exception.detail)
+            self.assertEqual(self.fixture.process.wait.call_count, 2)
+            self.assertTrue(self.fixture.released)
+            self.assertEqual(self.manager.live, {})
+
+    def test_failed_or_timed_out_host_stop_retains_private_controls(self):
+        for failure in (subprocess.CompletedProcess([], 9, b"", b"synthetic failed stop"),
+                        subprocess.TimeoutExpired("synthetic host stop", 30)):
+            with self.subTest(failure=type(failure).__name__):
+                self.fixture = self.owned_fixture("demo", 44)
+                self.manager.live = {"demo": self.fixture}
+                with self.stop_seams():
+                    if isinstance(failure, BaseException):
+                        self.host_stop.side_effect = failure
+                    else:
+                        self.host_stop.return_value = failure
+                    with self.assertRaises((broker.Refusal, subprocess.TimeoutExpired)):
+                        self.manager.stop(self.fixture, {})
+                    self.assertIs(self.manager.live["demo"], self.fixture)
+                    self.assertFalse(self.fixture.host_session_stopped)
+                    self.assertFalse(self.fixture.stopped)
+                    self.close_fd.assert_not_called()
+                    self.remove.assert_not_called()
+
+    def test_cleanup_pass_continues_past_an_unsettled_original(self):
+        other = self.owned_fixture("other", 45)
+        self.manager.live["other"] = other
+        self.fixture.process.wait.side_effect = subprocess.TimeoutExpired("synthetic first", 5)
+        with self.stop_seams():
+            problems = self.manager.stop_all()
+            self.assertTrue(any("demo" in problem for problem in problems))
+            self.assertIs(self.manager.live["demo"], self.fixture)
+            self.assertNotIn("other", self.manager.live)
+            self.assertTrue(other.stopped)
+            self.manager.spawner.close.assert_not_called()
+
+    def test_shutdown_fences_a_start_that_was_already_accepted(self):
+        self.manager.live = {}
+        self.manager.layout_for = mock.Mock(return_value=self.fixture.layout)
+        self.manager._host_focus = mock.Mock(return_value=(None, set()))
+        seen = []
+
+        def held_create(fixture, _width):
+            seen.append(fixture)
+            self.manager.begin_shutdown()
+            problems = self.manager.stop_all()
+            self.assertTrue(any("busy" in problem for problem in problems))
+            self.assertIs(self.manager.live["demo"], fixture)
+            self.manager._spawn_holder(fixture, "synthetic-display")
+
+        self.manager._create = held_create
+        with mock.patch.object(broker, "STOP_ALL_LOCK_SECONDS", 0), self.stop_seams(), mock.patch.object(
+                broker, "hold_binds") as binds, mock.patch.object(broker, "stopping"):
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.start({"fixture": "demo", "checkout": self.checkout, "width": 960})
+            self.assertEqual(caught.exception.code, "shutting_down")
+            self.assertEqual(len(seen), 1)
+            binds.assert_not_called()
+            self.manager.spawner.run.assert_not_called()
+            self.assertEqual(self.manager.live, {})
+            self.assertTrue(seen[0].released)
+            with self.assertRaises(broker.Refusal):
+                self.manager.start({"fixture": "later", "checkout": self.checkout, "width": 960})
+            self.manager.layout_for.assert_called_once()
+
+    def test_original_request_join_retries_interruptions_without_losing_handle(self):
+        server = object.__new__(broker.Server)
+        server.requests_lock = threading.Lock()
+        server.accepting = True
+        server.listen_close_attempted = False
+        server.socket_close_uncertain = False
+        original = mock.Mock()
+        original.join.side_effect = [KeyboardInterrupt(), OSError("synthetic interrupted join"), None]
+        record = {"thread": original, "joined": False, "start_error": None, "close_error": None}
+        server.request_threads = [record]
+        with mock.patch.object(broker.socketserver.UnixStreamServer, "server_close") as close, mock.patch.object(
+                broker.time, "sleep"), mock.patch.object(broker, "stopping") as diagnostic:
+            problems = server.server_close()
+            self.assertEqual(original.join.call_count, 3)
+            self.assertEqual(len(problems), 1)
+            self.assertTrue(record["joined"])
+            self.assertTrue(server.ownership_settled())
+            diagnostic.assert_called_once()
+            self.assertEqual(server.server_close(), [])
+            close.assert_called_once()
+
+    def test_request_start_uncertainty_retains_original_thread_and_request(self):
+        server = object.__new__(broker.Server)
+        server.requests_lock = threading.Lock()
+        server.accepting = True
+        server.request_threads = []
+        server.slots = mock.Mock()
+        server.shutdown_request = mock.Mock()
+        server.listen_close_attempted = False
+        server.socket_close_uncertain = False
+        original, request = mock.Mock(), object()
+        original.start.side_effect = KeyboardInterrupt()
+        with mock.patch.object(broker.threading, "Thread", return_value=original), mock.patch.object(
+                broker, "stopping"), mock.patch.object(broker.socketserver.UnixStreamServer, "server_close"):
+            server.process_request(request, "synthetic-client")
+            record, = server.request_threads
+            self.assertIs(record["thread"], original)
+            self.assertIs(record["request"], request)
+            self.assertFalse(record["joined"])
+            server.shutdown_request.assert_not_called()
+            server.slots.release.assert_not_called()
+            self.assertTrue(server.server_close())
+            original.join.assert_called_once_with()
+            self.assertTrue(record["joined"])
+            self.assertTrue(server.ownership_settled())
+
+    def test_closed_request_admission_closes_only_the_accepted_socket(self):
+        server = object.__new__(broker.Server)
+        server.requests_lock = threading.Lock()
+        server.accepting = False
+        server.request_threads = []
+        server.slots = mock.Mock()
+        server.shutdown_request = mock.Mock()
+        request = object()
+        with mock.patch.object(broker.threading, "Thread") as worker:
+            self.assertFalse(server.verify_request(request, "synthetic-client"))
+            server.slots.acquire.assert_not_called()
+            # process_request handles a request accepted before admission closed.
+            server.process_request(request, "synthetic-client")
+            worker.assert_not_called()
+            server.shutdown_request.assert_called_once_with(request)
+            server.slots.release.assert_called_once_with()
+            self.assertTrue(server.request_threads[0]["joined"])
+
+    def test_shutdown_keeps_first_failure_after_later_positive_drain(self):
+        fixtures = mock.Mock()
+        fixtures.lock = threading.Lock()
+        fixtures.live, fixtures.clearing, fixtures.host_operations = {}, set(), []
+        fixtures.stop_all.side_effect = [["synthetic original cleanup failure"], []]
+        server = mock.Mock()
+        server.server_close.side_effect = [KeyboardInterrupt(), []]
+        server.ownership_settled.return_value = True
+        with mock.patch.object(broker.time, "sleep"), mock.patch.object(broker, "stopping"):
+            self.assertTrue(broker.shutdown(server, fixtures))
+        fixtures.begin_shutdown.assert_called_once()
+        self.assertEqual(server.server_close.call_count, 2)
+        self.assertEqual(fixtures.stop_all.call_count, 2)
+
+    def test_unknown_runner_refuses_another_build_until_positive_completion(self):
+        self.fixture.runner_started = True
+        other = self.owned_fixture("other", 45)
+        self.manager.live["other"] = other
+        with mock.patch.object(broker, "read_regular", return_value=None) as log, mock.patch.object(
+                self.manager, "_holder_alive", return_value=True), mock.patch.object(
+                self.manager, "_runner_state", side_effect=broker.Refusal("timeout", "synthetic unreadable runner")) as state, mock.patch.object(
+                self.manager, "_start_runner", return_value={"state": "synthetic-start"}) as start:
+            with self.assertRaises(broker.Refusal) as caught:
+                self.manager.run_ui(other, {})
+            self.assertEqual(caught.exception.code, "build_busy")
+            start.assert_not_called()
+            state.side_effect = None
+            state.return_value = "not_started"
+            with self.assertRaises(broker.Refusal):
+                self.manager.run_ui(other, {})
+            state.return_value = "exited_1"
+            self.assertEqual(self.manager.run_ui(other, {}), {"state": "synthetic-start"})
+            log.return_value = broker.BUILD_FINISHED_MARKER
+            self.manager.run_ui(other, {})
+            self.assertEqual(start.call_count, 2)
+
+    def test_partial_holder_acquisitions_close_every_prior_original_once(self):
+        for stage in ("pipe", "socketpair", "RelayChannel", "Popen", "pidfd"):
+            with self.subTest(stage=stage):
+                fixture = broker.Fixture(self.fixture.layout, OWNER)
+                binds, ours, theirs, channel, child = (mock.Mock() for _ in range(5))
+                binds.fds.return_value = (100, 101, 102, 103, 104)
+                theirs.fileno.return_value = 301
+                self.manager.spawner.run.side_effect = lambda job: job()
+                failure = OSError("synthetic " + stage)
+                with mock.patch.object(broker, "hold_binds", return_value=binds), mock.patch.object(
+                        broker.os, "pipe", side_effect=failure if stage == "pipe" else None, return_value=(200, 201)), mock.patch.object(
+                        broker.socket, "socketpair", side_effect=failure if stage == "socketpair" else None, return_value=(ours, theirs)), mock.patch.object(
+                        broker, "RelayChannel", side_effect=failure if stage == "RelayChannel" else None, return_value=channel), mock.patch.object(
+                        broker, "holder_argv", return_value=["synthetic-no-execution"]), mock.patch.object(
+                        broker.subprocess, "Popen", side_effect=failure if stage == "Popen" else None, return_value=child), mock.patch.object(
+                        broker.os, "pidfd_open", side_effect=failure), mock.patch.object(broker.os, "close") as close:
+                    with self.assertRaises(OSError) as caught:
+                        self.manager._spawn_holder(fixture, "synthetic-display")
+                    self.assertIs(caught.exception, failure)
+                    binds.close.assert_called_once()
+                    self.assertEqual(close.call_args_list, [] if stage == "pipe" else [mock.call(201), mock.call(200)] if stage in ("Popen", "pidfd") else [mock.call(200), mock.call(201)])
+                    if stage in ("Popen", "pidfd"):
+                        theirs.close.assert_called_once()
+                        channel.close.assert_not_called()
+                    if stage == "RelayChannel":
+                        ours.close.assert_called_once()
+                        theirs.close.assert_called_once()
+                    if stage == "pidfd":
+                        self.assertIs(fixture.process, child)
+                        child.wait.assert_not_called()
+                    self.assertEqual(fixture.spawn_resources, {})
+
+    def test_partial_bind_failure_attempts_all_original_closes_and_keeps_first_error(self):
+        original = OSError("synthetic last bind acquisition")
+        with mock.patch.object(broker, "hold_directory", side_effect=[100, 101, 102, 103]), mock.patch.object(
+                broker, "hold_socket", side_effect=original), mock.patch.object(
+                broker.os, "close", side_effect=[OSError("synthetic first close"), None, None, None]) as close:
+            with self.assertRaises(OSError) as caught:
+                broker.hold_binds(self.fixture.layout, self.host.runtime_dir, "synthetic-wayland")
+        self.assertIs(caught.exception, original)
+        self.assertEqual(close.call_args_list, [mock.call(value) for value in range(100, 104)])
+        self.assertEqual(len(original.broker_close_errors), 1)
+
+    def test_pidfd_open_failure_keeps_created_child_until_original_wait_settles(self):
+        self.manager.live = {}
+        self.manager.layout_for = mock.Mock(return_value=self.fixture.layout)
+        self.manager._create = lambda fixture, _width: self.manager._spawn_holder(fixture, "synthetic-display")
+        self.manager.spawner.run.side_effect = lambda job: job()
+        child = mock.Mock(pid=744, returncode=None)
+        child.wait.side_effect = subprocess.TimeoutExpired("synthetic original", 5)
+        binds, ours, theirs, channel = (mock.Mock() for _ in range(4))
+        binds.fds.return_value = (100, 101, 102, 103, 104)
+        theirs.fileno.return_value = 301
+        failure = OSError("synthetic pidfd open failure")
+        with mock.patch.object(broker, "hold_binds", return_value=binds), mock.patch.object(
+                broker.os, "pipe", return_value=(200, 201)), mock.patch.object(
+                broker.socket, "socketpair", return_value=(ours, theirs)), mock.patch.object(
+                broker, "RelayChannel", return_value=channel), mock.patch.object(
+                broker, "holder_argv", return_value=["synthetic-no-execution"]), mock.patch.object(
+                broker.subprocess, "Popen", return_value=child), mock.patch.object(
+                broker.os, "pidfd_open", side_effect=failure), mock.patch.object(
+                broker.os, "close"), mock.patch.object(broker, "remove_beneath", return_value=True), mock.patch.object(broker, "stopping"):
+            with self.assertRaises(OSError) as caught:
+                self.manager.start({"fixture": "demo", "checkout": self.checkout, "width": 960})
+            self.assertIs(caught.exception, failure)
+            retained = self.manager.live["demo"]
+            self.assertIs(retained.process, child)
+            self.assertFalse(retained.stopped)
+            channel.close.assert_not_called()
+            child.wait.assert_called_once()
+            child.wait.side_effect = None
+            child.wait.return_value = 0
+            self.manager.stop(retained, {"keep": False})
+            self.assertEqual(self.manager.live, {})
+            channel.close.assert_called_once()
+
+    def test_close_uncertainty_is_recorded_without_retrying_descriptor_numbers(self):
+        self.fixture.spawn_resources = {"read_info": 200, "write_info": 201}
+        with mock.patch.object(broker.os, "close", side_effect=[OSError("synthetic close uncertainty"), None]) as close:
+            errors = self.manager._close_spawn_resources(self.fixture, ("read_info", "write_info"))
+            self.assertEqual(len(errors), 1)
+            self.assertEqual(self.fixture.spawn_resources, {})
+            self.assertTrue(self.fixture.resource_errors)
+            self.assertEqual(self.manager._close_spawn_resources(self.fixture, ("read_info", "write_info")), [])
+            self.assertEqual(close.call_args_list, [mock.call(200), mock.call(201)])
+        binds = broker.Binds(100, 101, 102, 103, 104)
+        with mock.patch.object(broker.os, "close", side_effect=[OSError("synthetic bind close"), None, None, None, None]) as close:
+            with self.assertRaises(OSError):
+                binds.close()
+            binds.close()
+            self.assertEqual(close.call_args_list, [mock.call(value) for value in range(100, 105)])
+
+    def test_host_wait_retains_first_timeout_or_cancel_until_positive_settlement(self):
+        for original in (subprocess.TimeoutExpired("synthetic host", 3), KeyboardInterrupt()):
+            with self.subTest(original=type(original).__name__):
+                child = mock.Mock()
+                child.wait.side_effect = [original, OSError("synthetic transient wait"), 0]
+                streams = [io.BytesIO(), io.BytesIO()]
+                with mock.patch.object(broker.tempfile, "TemporaryFile", side_effect=streams), mock.patch.object(
+                        broker.subprocess, "Popen", return_value=child), mock.patch.object(
+                        broker.time, "sleep"), mock.patch.object(broker, "stopping"):
+                    with self.assertRaises(type(original)) as caught:
+                        self.manager.harness(self.fixture.layout, ["synthetic-host-operation"], timeout=3)
+                    self.assertIs(caught.exception, original)
+                    self.assertEqual(child.wait.call_args_list, [mock.call(timeout=3), mock.call(), mock.call()])
+                    self.assertEqual(child.kill.call_count, int(isinstance(original, subprocess.TimeoutExpired)))
+                    self.assertTrue(all(stream.closed for stream in streams))
+                    self.assertEqual(self.manager.host_operations, [])
+
+    def test_positive_host_wait_returns_original_captured_output(self):
+        child = mock.Mock()
+        child.wait.return_value = 0
+        streams = [io.BytesIO(b"synthetic stdout"), io.BytesIO(b"synthetic stderr")]
+        with mock.patch.object(broker.tempfile, "TemporaryFile", side_effect=streams), mock.patch.object(
+                broker.subprocess, "Popen", return_value=child):
+            result = self.manager.harness(self.fixture.layout, ["synthetic-host-operation"], timeout=3)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"synthetic stdout", b"synthetic stderr"))
+        child.wait.assert_called_once_with(timeout=3)
+        child.kill.assert_not_called()
+        self.assertEqual(self.manager.host_operations, [])
+
+    def test_uncertain_host_capture_close_remains_owned_without_second_close(self):
+        child = mock.Mock()
+        child.wait.return_value = 0
+        streams = [mock.Mock(), mock.Mock()]
+        streams[0].read.return_value = streams[1].read.return_value = b""
+        failure = OSError("synthetic capture close")
+        streams[0].close.side_effect = failure
+        with mock.patch.object(broker.tempfile, "TemporaryFile", side_effect=streams), mock.patch.object(
+                broker.subprocess, "Popen", return_value=child):
+            with self.assertRaises(OSError) as caught:
+                self.manager.harness(self.fixture.layout, ["synthetic-host-operation"], timeout=3)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(len(self.manager.host_operations), 1)
+        self.assertTrue(self.manager.host_operations[0]["wait_settled"])
+        self.assertTrue(self.manager.host_operations[0]["close_errors"])
+        self.manager.live = {}
+        self.assertTrue(self.manager.stop_all())
+        for stream in streams:
+            stream.close.assert_called_once()
+        self.manager.spawner.close.assert_not_called()
+
+    def test_partial_host_capture_acquisition_retains_a_failed_original_close(self):
+        stream = mock.Mock()
+        creation = OSError("synthetic second capture acquisition")
+        stream.close.side_effect = OSError("synthetic first capture close")
+        with mock.patch.object(broker.tempfile, "TemporaryFile", side_effect=[stream, creation]), mock.patch.object(
+                broker.subprocess, "Popen") as child:
+            with self.assertRaises(OSError) as caught:
+                self.manager.harness(self.fixture.layout, ["synthetic-host-operation"])
+        self.assertIs(caught.exception, creation)
+        child.assert_not_called()
+        stream.close.assert_called_once_with()
+        operation, = self.manager.host_operations
+        self.assertIsNone(operation["child"])
+        self.assertEqual(operation["streams"], [stream])
+        self.assertTrue(operation["close_errors"])
 
 
 class Protocol(TemporaryRepository):
