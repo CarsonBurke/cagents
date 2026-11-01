@@ -2177,7 +2177,42 @@ impl Drop for FindReplacementJob {
     }
 }
 
+#[cfg(all(feature = "development", target_os = "linux"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeSaveIdentity {
+    pub identity: AsyncIdentity,
+    pub ticket: u64,
+    pub revision: u64,
+    pub snapshot: String,
+}
+
+#[cfg(all(feature = "development", target_os = "linux"))]
+pub(crate) struct NativeHeldSave {
+    pub original: NativeSaveIdentity,
+    task: Task<RepositoryAction>,
+}
+
+#[cfg(all(feature = "development", target_os = "linux"))]
+impl std::fmt::Debug for NativeHeldSave {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeHeldSave")
+            .field("original", &self.original)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "development", target_os = "linux"))]
+impl NativeHeldSave {
+    pub(crate) fn into_task(self) -> Task<RepositoryAction> {
+        self.task
+    }
+}
+
 pub struct RepositoryRuntime {
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    native_save_arm: Option<CardId>,
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    native_held_save: Option<NativeHeldSave>,
     pub descriptor: RepositoryView,
     original_editor_root: Option<Arc<crate::fs_safety::Root>>,
     original_read_attested: bool,
@@ -2421,6 +2456,10 @@ impl RepositoryRuntime {
     pub fn new(descriptor: RepositoryView) -> Self {
         let identity = descriptor.worktree.display().to_string();
         Self {
+            #[cfg(all(feature = "development", target_os = "linux"))]
+            native_save_arm: None,
+            #[cfg(all(feature = "development", target_os = "linux"))]
+            native_held_save: None,
             directory_only: descriptor.selected_file.is_some(),
             descriptor,
             original_editor_root: None,
@@ -5677,6 +5716,21 @@ impl RepositoryRuntime {
         })
     }
 
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    pub(crate) fn native_fixture_arm_save(&mut self, card: CardId) -> bool {
+        if self.native_save_arm.is_some() || self.native_held_save.is_some() || self.is_saving() {
+            return false;
+        }
+        self.native_save_arm = Some(card);
+        true
+    }
+
+    #[cfg(all(feature = "development", target_os = "linux"))]
+    pub(crate) fn native_fixture_take_save(&mut self) -> Option<NativeHeldSave> {
+        self.native_save_arm = None;
+        self.native_held_save.take()
+    }
+
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
         // Save is an editing boundary even when the current bytes are already
         // saved, or a background write currently prevents starting a new one.
@@ -5825,7 +5879,16 @@ impl RepositoryRuntime {
             self.markdown_mode = MarkdownMode::Edit;
         }
         let saved_text = text.clone();
-        cosmic::task::future(async move {
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        let native_original = (self.native_save_arm == Some(card)
+            && self.native_held_save.is_none())
+        .then(|| NativeSaveIdentity {
+            identity: identity.clone(),
+            ticket: ticket.id,
+            revision,
+            snapshot: saved_text.clone(),
+        });
+        let task = cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 operation.start();
                 let result =
@@ -5899,7 +5962,17 @@ impl RepositoryRuntime {
                 saved_text,
                 result,
             }
-        })
+        });
+        #[cfg(all(feature = "development", target_os = "linux"))]
+        if let Some(native_original) = native_original {
+            self.native_save_arm = None;
+            self.native_held_save = Some(NativeHeldSave {
+                original: native_original,
+                task,
+            });
+            return Task::none();
+        }
+        task
     }
 
     /// The shell owns this subscription for every open buffer, including

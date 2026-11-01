@@ -15402,16 +15402,28 @@ impl Application for Cagents {
                     _ => None,
                 };
                 let closing_card = self.dirty_repository_close.as_ref().map(|close| close.card);
+                #[cfg(all(feature = "development", target_os = "linux"))]
+                let native_save_arm = project_ui::native_close_fixture::wants_save_hold(self, &action);
+                #[cfg(all(feature = "development", target_os = "linux"))]
+                let mut native_save = None;
                 let task = match self.cards.get_mut(&card) {
-                    Some(CardRuntime::Repository(runtime)) => runtime
-                        .update(action)
+                    Some(CardRuntime::Repository(runtime)) => {
+                        #[cfg(all(feature = "development", target_os = "linux"))]
+                        let native_armed = native_save_arm && runtime.native_fixture_arm_save(card);
+                        let task = runtime.update(action);
+                        #[cfg(all(feature = "development", target_os = "linux"))]
+                        if native_armed {
+                            native_save = runtime.native_fixture_take_save();
+                        }
+                        task
                         .map(move |action| match action {
                             RepositoryAction::ApplyDiffBasis { card, basis } if basis_resolved => {
                                 Message::ResolvedDiffBasis { card, basis }
                             }
                             action => Message::Repository(action),
                         })
-                        .map(cosmic::Action::App),
+                        .map(cosmic::Action::App)
+                    }
                     // The pane's runtime only ever shows committed content
                     // from a fetched range, so the working-tree bookkeeping
                     // below (source-control reloads, dirty closes) has
@@ -15426,6 +15438,12 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                #[cfg(all(feature = "development", target_os = "linux"))]
+                if native_save_arm {
+                    // Lossless rejection returns this same save to the ordinary
+                    // batch; unrelated Runtime/App tasks were never held.
+                    tasks.push(project_ui::native_close_fixture::accept_save(self, native_save));
+                }
                 if find_preferences_changed {
                     let preferences = match self.cards.get(&card) {
                         Some(CardRuntime::Repository(runtime)) => Some(runtime.find_preferences()),
