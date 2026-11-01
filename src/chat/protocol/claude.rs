@@ -7257,7 +7257,7 @@ mod tests {
         )
         .unwrap();
         let streaming = adapter
-            .receive(json!({"type":"stream_event","session_id":id,"event":{}}))
+            .receive(json!({"type":"stream_event","session_id":id,"event":{"type":"future_stream_event"}}))
             .unwrap();
         assert!(
             !streaming

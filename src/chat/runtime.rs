@@ -2119,7 +2119,11 @@ impl Actor {
                         let preview =
                             super::protocol::diagnostic_preview(&self.output[..newline], 200);
                         if garbage_total <= 3 || garbage_total.is_power_of_two() {
-                            tracing::warn!(%preview, consecutive = garbage_lines, ignored_total = garbage_total, "Skipping non-JSON provider stdout line");
+                            tracing::warn!(
+                                consecutive = garbage_lines,
+                                ignored_total = garbage_total,
+                                "Skipping non-JSON provider stdout line"
+                            );
                         }
                         if garbage_lines >= 8 {
                             return Err(format!(
