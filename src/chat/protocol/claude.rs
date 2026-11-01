@@ -45,6 +45,50 @@ pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Ad
     create_inner(launch, None, true)
 }
 
+/// Whether a non-JSON stdout line carries a complete Claude frame next to other
+/// text, as when a wrapper prints without a newline. Skipping that line would
+/// lose the frame, and a lost `result` or `control_request` never settles. A
+/// candidate must be a whole JSON object with the shape of a real frame, so
+/// ordinary text that merely has braces or mentions a frame type is still noise.
+pub(crate) fn embedded_protocol_frame(line: &[u8]) -> bool {
+    // Inspect a bounded number of objects, however many braces a line has.
+    const CANDIDATES: usize = 64;
+    if !line.windows(6).any(|window| window == b"\"type\"") {
+        return false;
+    }
+    let mut start = 0;
+    for _ in 0..CANDIDATES {
+        let Some(offset) = line[start..].iter().position(|byte| *byte == b'{') else {
+            return false;
+        };
+        let at = start + offset;
+        let mut values = serde_json::Deserializer::from_slice(&line[at..]).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) => {
+                if has_frame_shape(&value) {
+                    return true;
+                }
+                // Fields nested in a complete object are not top-level frames.
+                start = at + values.byte_offset();
+            }
+            _ => start = at + 1,
+        }
+    }
+    false
+}
+
+fn has_frame_shape(value: &Value) -> bool {
+    match value["type"].as_str() {
+        Some("result" | "system") => value["subtype"].is_string(),
+        Some("control_request") => value["request_id"].is_string() && value["request"].is_object(),
+        Some("control_cancel_request") => value["request_id"].is_string(),
+        Some("control_response") => value["response"].is_object(),
+        Some("assistant" | "user") => value["message"].is_object(),
+        Some("stream_event") => value["event"].is_object(),
+        _ => false,
+    }
+}
+
 /// Transient identity selected by the original adapter during preparation.
 /// A fresh UUID is not provider confirmation or a disk-resume descriptor.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -101,6 +145,7 @@ fn create_inner(
         );
     }
     let mut spec = ProcessSpec::from(&launch.recipe);
+    spec.stdout_noise = Some(embedded_protocol_frame);
     spec.arguments = arguments(launch)?;
     let history = launch
         .session_id
@@ -129,6 +174,8 @@ fn create_inner(
             resumed: launch.session_id.is_some(),
             history_only,
             forced_history,
+            turn_unsupported_content: false,
+            turn_visible_content: false,
             cwd: launch.recipe.working_directory.clone(),
             history,
             titles: super::claude_titles::ClaudeTitles::new(launch),
@@ -414,11 +461,15 @@ struct Claude {
     pending: HashMap<String, Value>,
     retired: VecDeque<String>,
     controls: HashMap<String, Value>,
+    unknown_frames: HashSet<String>,
     streams: HashMap<String, Stream>,
     /// Blocks of the messages still streaming. Claude emits each block's
     /// assistant frame before that block stops, so a message's blocks are
     /// dropped at its `message_stop`, or when its stream starts another message.
     blocks: HashMap<(ScopedId, u64), Item>,
+    /// Unknown block types still own their stream index. Their later deltas
+    /// must not mutate an older block or look like an orphan known block.
+    ignored_blocks: HashSet<(ScopedId, u64)>,
     stream_events: VecDeque<String>,
     carrier_offsets: HashMap<String, usize>,
     message_offsets: HashMap<ScopedId, usize>,
@@ -491,8 +542,20 @@ struct Claude {
     /// A saved directory is gone; only its exact persisted history is readable.
     history_only: bool,
     forced_history: bool,
+    /// The running main turn received content this version cannot show.
+    turn_unsupported_content: bool,
+    /// The running main turn produced something the transcript can show.
+    turn_visible_content: bool,
 }
 impl Claude {
+    fn warn_unknown(&mut self, kind: &str, name: &str) {
+        // Provider-controlled names cannot grow the rate-limit map forever.
+        let key = format!("{kind}:{}", super::diagnostic_preview(name.as_bytes(), 128));
+        if self.unknown_frames.len() < 64 && self.unknown_frames.insert(key.clone()) {
+            tracing::warn!(frame_type = %key, "Skipping unknown Claude protocol frame");
+        }
+    }
+
     fn remember_failure_receipt(&mut self, receipt: Option<[u8; 32]>) {
         if let Some(receipt) = receipt {
             self.failure_receipts.push_back(receipt);
@@ -1425,7 +1488,17 @@ impl Claude {
                     .map(|((_, index), _)| *index as usize)
                     .min()
                     .unwrap_or(base + index);
-                match string(block, "type") {
+                let block_type = match required(block, "type") {
+                    Ok(block_type) => block_type,
+                    // One damaged saved block must not make the whole
+                    // conversation unreadable. Live frames stay strict.
+                    Err(_) if history => {
+                        self.warn_unknown("content", "<untyped>");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match block_type {
                     "text" | "thinking" | "redacted_thinking" => {
                         let thinking = string(block, "type") != "text";
                         let text = if string(block, "type") == "redacted_thinking" {
@@ -1643,16 +1716,24 @@ impl Claude {
                         started_at: None,
                         at: None,
                     })),
-                    other => step.events.push(Event::Item(text_item(
-                        format!("{id}:{index}"),
-                        content_role,
-                        format!("Unsupported Claude content block {other}: {block}"),
-                        false,
-                    ))),
+                    other => {
+                        self.warn_unknown("content", other);
+                        if !history && child.is_none() && role == Role::Assistant {
+                            self.turn_unsupported_content = true;
+                        }
+                    }
                 }
             }
         }
         if role == Role::Assistant {
+            if !history
+                && child.is_none()
+                && step.events[event_start..]
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_)))
+            {
+                self.turn_visible_content = true;
+            }
             if frame["error"].as_str().is_some() {
                 for event in &mut step.events[event_start..] {
                     if let Event::Item(item) = event {
@@ -1917,6 +1998,9 @@ impl Adapter for Claude {
             },
         );
         Ok(step)
+    }
+    fn initialization_pending(&self) -> bool {
+        !self.history_only && !self.ready
     }
     fn initialize(&mut self) -> Result<Step, String> {
         let mut step = if self.history_only {
@@ -2309,7 +2393,7 @@ impl Adapter for Claude {
                 title: None,
             });
         }
-        match string(&frame, "type") {
+        match required(&frame, "type")? {
             "control_request" => return self.permission(frame),
             "control_cancel_request" => {
                 self.retire(required(&frame, "request_id")?.into(), &mut step);
@@ -2322,6 +2406,7 @@ impl Adapter for Claude {
                 self.retired.clear();
                 self.streams.clear();
                 self.blocks.clear();
+                self.ignored_blocks.clear();
                 self.carrier_offsets.clear();
                 self.message_offsets.clear();
                 self.message_order.clear();
@@ -2663,6 +2748,20 @@ impl Adapter for Claude {
                 if frame["parent_tool_use_id"].is_null() {
                     self.observe_title(&mut step);
                 }
+                // A successful reply must not look empty when its only content
+                // could not be shown. The private content itself stays omitted.
+                if std::mem::take(&mut self.turn_unsupported_content)
+                    && !std::mem::take(&mut self.turn_visible_content)
+                    && frame["is_error"] != true
+                {
+                    step.events.push(Event::Item(unsupported_content_item(
+                        frame["uuid"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    )));
+                }
+                self.turn_visible_content = false;
                 let can_suggest = frame["parent_tool_use_id"].is_null()
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
@@ -2891,7 +2990,7 @@ impl Adapter for Claude {
                 }
             }
             "keep_alive" => {}
-            other => return Err(format!("Unsupported Claude stream-json frame type {other}")),
+            other => self.warn_unknown("frame", other),
         }
         self.remember_failure_receipt(receipt);
         Ok(step)
@@ -3272,6 +3371,22 @@ fn context_item(id: String, body: String) -> Item {
             sender: String::new(),
             summary: "Claude context".into(),
             body,
+        },
+        started_at: None,
+        at: None,
+    }
+}
+
+fn unsupported_content_item(result: String) -> Item {
+    Item {
+        id: format!("{result}:unsupported-content"),
+        role: Role::System,
+        content: ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: "Claude sent unsupported content, which was omitted".into(),
+            body: String::new(),
         },
         started_at: None,
         at: None,
@@ -4074,7 +4189,7 @@ impl Claude {
     fn stream(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
         let event = &frame["event"];
         let parent = string(frame, "parent_tool_use_id").to_owned();
-        match string(event, "type") {
+        match required(event, "type")? {
             "message_start" => {
                 if self.streams.len() >= MAX_PENDING && !self.streams.contains_key(&parent) {
                     return Err("Too many simultaneous Claude streams".into());
@@ -4115,13 +4230,23 @@ impl Claude {
                 }
             }
             "content_block_start" => {
+                let block = &event["content_block"];
+                let block_type = required(block, "type")?;
+                // Overflow still requires valid known protocol fields.
+                if matches!(block_type, "tool_use" | "server_tool_use") {
+                    required(block, "id")?;
+                    required(block, "name")?;
+                }
                 let stream = self
                     .streams
                     .get_mut(&parent)
                     .ok_or("Claude block arrived before message_start")?;
                 let message = stream.message.clone();
                 let index = event["index"].as_u64().ok_or("Claude block has no index")?;
-                if self.blocks.len() >= MAX_TOOLS {
+                let key = (ScopedId::new(Some(&parent), &message), index);
+                self.blocks.remove(&key);
+                self.ignored_blocks.remove(&key);
+                if self.blocks.len() + self.ignored_blocks.len() >= MAX_TOOLS {
                     if !stream.truncated {
                         stream.truncated = true;
                         step.events.push(Event::Error {
@@ -4131,8 +4256,7 @@ impl Claude {
                     }
                     return Ok(());
                 }
-                let block = &event["content_block"];
-                let item = match string(block, "type") {
+                let item = match block_type {
                     "text" => text_item(
                         format!("{message}:{index}"),
                         Role::Assistant,
@@ -4164,13 +4288,17 @@ impl Claude {
                         at: None,
                     },
                     other => {
-                        step.events.push(Event::Error {
-                            message: format!("Unsupported Claude streaming content block {other}"),
-                            fatal: false,
-                        });
+                        self.ignored_blocks.insert(key);
+                        self.warn_unknown("stream content", other);
+                        if parent.is_empty() {
+                            self.turn_unsupported_content = true;
+                        }
                         return Ok(());
                     }
                 };
+                if parent.is_empty() {
+                    self.turn_visible_content = true;
+                }
                 if !matches!(&item.content, ItemContent::Tool { .. })
                     || !self.completed_tool(Some(&parent), &item.id)
                 {
@@ -4186,8 +4314,35 @@ impl Claude {
                     .ok_or("Claude delta arrived before message_start")?;
                 let index = event["index"].as_u64().ok_or("Claude delta has no index")?;
                 let delta = &event["delta"];
-                if matches!(string(delta, "type"), "signature_delta" | "citations_delta") {
+                let delta_type = required(delta, "type")?;
+                if self
+                    .ignored_blocks
+                    .contains(&(ScopedId::new(Some(&parent), &stream.message), index))
+                {
                     return Ok(());
+                }
+                if matches!(delta_type, "signature_delta" | "citations_delta") {
+                    return Ok(());
+                }
+                let payload_field = match delta_type {
+                    "text_delta" => "text",
+                    "thinking_delta" => "thinking",
+                    "input_json_delta" => "partial_json",
+                    other => {
+                        self.warn_unknown("stream delta", other);
+                        return Ok(());
+                    }
+                };
+                // A discarded known block still requires a well-formed known
+                // delta. Only an explicitly ignored future block bypasses its
+                // payload, above; budget truncation must not hide corruption.
+                if !delta[payload_field].is_string() {
+                    return Err(if delta_type == "input_json_delta" {
+                        "Claude tool input delta has no string payload"
+                    } else {
+                        "Claude text delta has no string payload"
+                    }
+                    .into());
                 }
                 let Some(item) = self
                     .blocks
@@ -4210,7 +4365,7 @@ impl Claude {
                 {
                     return Ok(());
                 }
-                match (&mut item.content, string(delta, "type")) {
+                match (&mut item.content, delta_type) {
                     (ItemContent::Text { text, thinking, .. }, "text_delta" | "thinking_delta") => {
                         let value = delta[if *thinking { "thinking" } else { "text" }]
                             .as_str()
@@ -4252,6 +4407,12 @@ impl Claude {
                 let index = event["index"]
                     .as_u64()
                     .ok_or("Claude block stop has no index")?;
+                if self
+                    .ignored_blocks
+                    .remove(&(ScopedId::new(Some(&parent), &message), index))
+                {
+                    return Ok(());
+                }
                 if let Some(mut item) = self
                     .blocks
                     .get(&(ScopedId::new(Some(&parent), &message), index))
@@ -4323,10 +4484,7 @@ impl Claude {
                     fatal: false,
                 });
             }
-            other => step.events.push(Event::Error {
-                message: format!("Unsupported Claude API stream event {other}"),
-                fatal: false,
-            }),
+            other => self.warn_unknown("stream event", other),
         }
         Ok(())
     }
@@ -4334,6 +4492,7 @@ impl Claude {
     fn settle(&mut self, parent: Option<&str>, message: &str) {
         let key = ScopedId::new(parent, message);
         self.blocks.retain(|(id, _), _| id != &key);
+        self.ignored_blocks.retain(|(id, _)| id != &key);
     }
 
     fn permission_denied(
@@ -4384,6 +4543,7 @@ impl Claude {
     }
 
     fn system(&mut self, frame: &Value, step: &mut Step) -> Result<(), String> {
+        let subtype = required(frame, "subtype")?;
         // Both initial metadata and autonomous plan-mode transitions report
         // the effective permission mode, independent of our control replies.
         if let Some(mode) = frame["permissionMode"].as_str() {
@@ -4391,7 +4551,7 @@ impl Claude {
                 if mode == "default" { "manual" } else { mode }.into(),
             )));
         }
-        match string(frame, "subtype") {
+        match subtype {
             "permission_denied" => {
                 self.permission_denied(frame["parent_tool_use_id"].as_str(), frame, step)?
             }
@@ -4659,10 +4819,7 @@ impl Claude {
             | "background_tasks_changed"
             | "vcs_state_changed"
             | "elicitation_complete" => {}
-            other => step.events.push(Event::Error {
-                message: format!("Unsupported Claude system event {other}: {frame}"),
-                fatal: false,
-            }),
+            other => self.warn_unknown("system", other),
         }
         Ok(())
     }
@@ -5657,6 +5814,783 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     #[test]
+    fn embedded_frames_are_recognized_without_flagging_ordinary_text() {
+        for line in [
+            r#"wrapper diag{"type":"result","subtype":"success","is_error":false}"#,
+            r#"{"type":"result","subtype":"success"} wrapper tail"#,
+            r#"x{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool"}}"#,
+            r#"x{"type":"control_response","response":{"subtype":"success"}}"#,
+            r#"x{"type":"assistant","message":{"content":[]}}"#,
+            r#"{"unterminated {"type":"stream_event","event":{"type":"ping"}}"#,
+        ] {
+            assert!(embedded_protocol_frame(line.as_bytes()), "{line}");
+        }
+        for line in [
+            "plain wrapper diagnostic",
+            "Loaded {config} with { braces }",
+            r#"the "type" field is {broken"#,
+            r#"note {"type":"info","subtype":"x"}"#,
+            r#"a result looks like {"type":"result"}"#,
+            r#"logged {"payload":{"type":"result","subtype":"success"}}"#,
+            r#"partial {"type":"result","subtype":"succ"#,
+        ] {
+            assert!(!embedded_protocol_frame(line.as_bytes()), "{line}");
+        }
+        // The candidate bound holds on a line made of unparsable openers.
+        assert!(!embedded_protocol_frame(
+            format!(r#"{}"type""#, "{".repeat(100_000)).as_bytes()
+        ));
+    }
+
+    #[test]
+    fn a_reply_of_only_unknown_content_says_it_was_omitted() {
+        let private = "private protocol payload";
+        let notices = |step: &Step| {
+            step.events
+                .iter()
+                .filter(|event| {
+                    matches!(event, Event::Item(Item {
+                        content: ItemContent::Delivery { kind: DeliveryKind::Notice, summary, body, .. },
+                        ..
+                    }) if summary.contains("unsupported content") && body.is_empty())
+                })
+                .count()
+        };
+        let result = || json!({"type":"result","subtype":"success","is_error":false,"uuid":"r"});
+        let unknown = json!({"type":"assistant","uuid":"a","message":{"content":[{"type":"future","opaque":private}]}});
+
+        // A complete assistant frame with nothing else to show.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown.clone()).unwrap();
+        let step = adapter.receive(result()).unwrap();
+        assert_eq!(notices(&step), 1);
+        assert!(!format!("{:?}", step.events).contains(private));
+        // The next turn starts clean.
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 0);
+
+        // A streamed future block with nothing else to show.
+        let mut adapter = Claude::default();
+        for event in [
+            json!({"type":"message_start","message":{"id":"m"}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"future","opaque":private}}),
+        ] {
+            adapter
+                .receive(json!({"type":"stream_event","event":event}))
+                .unwrap();
+        }
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 1);
+
+        // Visible content next to the unknown block needs no notice.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown.clone()).unwrap();
+        adapter
+            .receive(json!({"type":"assistant","uuid":"b","message":{"content":[{"type":"text","text":"Answer"}]}}))
+            .unwrap();
+        assert_eq!(notices(&adapter.receive(result()).unwrap()), 0);
+
+        // A failed turn already reports its failure.
+        let mut adapter = Claude::default();
+        adapter.receive(unknown).unwrap();
+        let step = adapter
+            .receive(json!({"type":"result","subtype":"error_during_execution","is_error":true,"uuid":"r"}))
+            .unwrap();
+        assert_eq!(notices(&step), 0);
+    }
+
+    #[test]
+    fn saved_untyped_blocks_are_skipped_but_live_frames_stay_strict() {
+        let frame =
+            |content: Value| json!({"type":"assistant","uuid":"a","message":{"content":content}});
+        let content = json!([
+            {"text":"no discriminant"},
+            {"type":""},
+            {"type":7},
+            "bare string",
+            {"type":"text","text":"Still readable"},
+        ]);
+        let record = HistoryRecord {
+            frame: frame(content),
+            tool_calls: HashMap::new(),
+        };
+        let mut adapter = Claude::default();
+        let mut step = Step::default();
+        adapter.history_message(&record, &mut step).unwrap();
+        let texts: Vec<_> = step
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Item(Item {
+                    content: ItemContent::Text { text, .. },
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Still readable"]);
+
+        let mut adapter = Claude::default();
+        assert!(
+            adapter
+                .receive(frame(json!([{"text":"no discriminant"}])))
+                .is_err()
+        );
+    }
+
+    // Damage on both sides of the page boundary: `initialize` opens the newest
+    // page and `LoadEarlier` replays the older one.
+    #[test]
+    fn a_saved_conversation_with_untyped_blocks_opens_and_pages() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("removed-worktree");
+        std::fs::create_dir(&cwd).unwrap();
+        let config = root.path().join("config");
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let history_dir = config.join("projects").join(project);
+        std::fs::create_dir_all(&history_dir).unwrap();
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = File::create(history_dir.join(format!("{id}.jsonl"))).unwrap();
+        let count = 220;
+        for index in 0..count {
+            let parent = (index > 0).then(|| format!("record-{}", index - 1));
+            let damaged = index == 0 || index == count - 1;
+            let content = if damaged {
+                json!([{"text":"no discriminant"}, {"type":"text","text":format!("Saved {index}")}])
+            } else {
+                json!(format!("Saved {index}"))
+            };
+            writeln!(file, "{}", json!({"type":"assistant","uuid":format!("record-{index}"),"parentUuid":parent,"sessionId":id,"message":{"role":"assistant","content":content}})).unwrap();
+        }
+        drop(file);
+        std::fs::remove_dir(&cwd).unwrap();
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd,
+                environment: std::collections::BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    config.to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        let (_, mut adapter) = create(&launch).unwrap();
+        let opened = format!("{:?}", adapter.initialize().unwrap().events);
+        assert!(opened.contains("Saved 219"));
+        let mut oldest = false;
+        for _ in 0..count {
+            let page = format!(
+                "{:?}",
+                adapter.command(Command::LoadEarlier).unwrap().events
+            );
+            if page.contains("\"Saved 0\"") {
+                oldest = true;
+                break;
+            }
+        }
+        assert!(oldest);
+    }
+
+    #[test]
+    fn initialization_waits_for_the_matching_success_including_optional_retry() {
+        let mut adapter = Claude::default();
+        assert!(adapter.initialization_pending());
+        let initial = adapter.initialize().unwrap();
+        let first = initial.writes[0]["request_id"].as_str().unwrap();
+        for frame in [
+            json!({"type":"keep_alive"}),
+            json!({"type":"future_advisory"}),
+            reply("unrelated-request", json!({})),
+        ] {
+            adapter.receive(frame).unwrap();
+            assert!(adapter.initialization_pending());
+        }
+        let retry = adapter
+            .receive(json!({"type":"control_response","response":{
+                "subtype":"error","request_id":first,"error":"Unsupported initialize option"
+            }}))
+            .unwrap();
+        assert_eq!(retry.writes.len(), 1);
+        assert!(adapter.initialization_pending());
+        // A late reply to the replaced request cannot acknowledge the retry.
+        adapter.receive(reply(first, json!({}))).unwrap();
+        assert!(adapter.initialization_pending());
+        let ready = adapter
+            .receive(reply(
+                retry.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert!(!adapter.initialization_pending());
+        assert!(
+            ready
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Ready(true)))
+        );
+        adapter
+            .receive(json!({"type":"conversation_reset"}))
+            .unwrap();
+        assert!(
+            !adapter.initialization_pending(),
+            "a reset is not a new transport handshake"
+        );
+
+        let mut history = Claude {
+            history_only: true,
+            ..Claude::default()
+        };
+        assert!(!history.initialization_pending());
+        assert!(history.initialize().unwrap().writes.is_empty());
+    }
+
+    #[test]
+    fn malformed_nested_discriminants_are_not_future_protocol_variants() {
+        for value in [
+            None,
+            Some(Value::Null),
+            Some(json!(false)),
+            Some(json!(7)),
+            Some(json!({})),
+            Some(json!([])),
+            Some(json!("")),
+        ] {
+            let tagged = |key: &str| {
+                let mut object = json!({});
+                if let Some(value) = &value {
+                    object[key] = value.clone();
+                }
+                object
+            };
+            for frame in [
+                {
+                    let mut frame = tagged("subtype");
+                    frame["type"] = json!("system");
+                    frame
+                },
+                stream(tagged("type")),
+                json!({"type":"assistant","uuid":"malformed-content",
+                    "message":{"role":"assistant","content":[tagged("type")]}}),
+            ] {
+                let mut adapter = Claude::default();
+                assert!(adapter.receive(frame.clone()).is_err(), "accepted {frame}");
+                assert!(adapter.unknown_frames.is_empty());
+            }
+
+            let start = || stream(json!({"type":"message_start","message":{"id":"m"}}));
+            let mut adapter = Claude::default();
+            adapter.receive(start()).unwrap();
+            adapter
+                .receive(stream(json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":"text","text":"retained"}})))
+                .unwrap();
+            assert!(
+                adapter
+                    .receive(stream(json!({"type":"content_block_start","index":0,
+                "content_block":tagged("type")})))
+                    .is_err()
+            );
+            assert_eq!(adapter.blocks.len(), 1);
+            assert!(adapter.ignored_blocks.is_empty());
+            assert!(matches!(
+                &adapter.blocks[&(ScopedId::new(None, "m"), 0)].content,
+                ItemContent::Text { text, .. } if text == "retained"
+            ));
+
+            // Even deltas for a deliberately ignored future block need a type.
+            for block_type in ["text", "future_content"] {
+                let mut adapter = Claude::default();
+                adapter.receive(start()).unwrap();
+                adapter
+                    .receive(stream(json!({"type":"content_block_start","index":0,
+                    "content_block":{"type":block_type,"text":""}})))
+                    .unwrap();
+                assert!(
+                    adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":0,
+                    "delta":tagged("type")})))
+                        .is_err(),
+                    "accepted {value:?} for {block_type}"
+                );
+            }
+        }
+
+        let mut adapter = Claude::default();
+        adapter
+            .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+            .unwrap();
+        for index in 0..MAX_TOOLS {
+            adapter
+                .receive(stream(json!({"type":"content_block_start","index":index,
+                "content_block":{"type":"future_content"}})))
+                .unwrap();
+        }
+        assert!(
+            adapter
+                .receive(stream(
+                    json!({"type":"content_block_start","index":MAX_TOOLS,
+            "content_block":{}})
+                ))
+                .is_err(),
+            "a full block budget must not hide a missing type"
+        );
+        assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS);
+    }
+
+    #[test]
+    fn known_stream_tool_metadata_is_validated_before_the_block_budget() {
+        for (retained_type, count) in [
+            ("future_content", 0),
+            ("future_content", MAX_TOOLS - 1),
+            ("future_content", MAX_TOOLS),
+            ("text", MAX_TOOLS),
+        ] {
+            for block_type in ["tool_use", "server_tool_use"] {
+                for field in ["id", "name"] {
+                    for value in [
+                        None,
+                        Some(Value::Null),
+                        Some(json!(false)),
+                        Some(json!(7)),
+                        Some(json!({})),
+                        Some(json!([])),
+                        Some(json!("")),
+                    ] {
+                        let mut adapter = Claude::default();
+                        adapter
+                            .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                            .unwrap();
+                        for index in 0..count {
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":index,
+                                    "content_block":{"type":retained_type,"text":""}})))
+                                .unwrap();
+                        }
+                        let mut block = json!({"type":block_type,"id":"tool","name":"Bash"});
+                        if let Some(value) = &value {
+                            block[field] = value.clone();
+                        } else {
+                            block.as_object_mut().unwrap().remove(field);
+                        }
+                        assert_eq!(
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":count,
+                                    "content_block":block})))
+                                .err(),
+                            Some(format!("Claude protocol frame is missing {field}")),
+                            "accepted {block_type} with {field}={value:?} after {count} {retained_type} blocks"
+                        );
+                        assert_eq!(adapter.blocks.len() + adapter.ignored_blocks.len(), count);
+                        assert!(!adapter.streams[""].truncated);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_stream_tools_still_overflow_the_block_budget_nonfatally() {
+        for retained_type in ["future_content", "text"] {
+            for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+                for block_type in ["tool_use", "server_tool_use"] {
+                    let mut adapter = Claude::default();
+                    adapter
+                        .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                        .unwrap();
+                    for index in 0..count {
+                        adapter
+                            .receive(stream(json!({"type":"content_block_start","index":index,
+                                "content_block":{"type":retained_type,"text":""}})))
+                            .unwrap();
+                    }
+                    let mut events = Vec::new();
+                    for index in count..MAX_TOOLS + 2 {
+                        events.extend(
+                            adapter
+                                .receive(stream(json!({"type":"content_block_start","index":index,
+                                    "content_block":{"type":block_type,"id":format!("tool-{index}"),"name":"Bash"}})))
+                                .unwrap()
+                                .events,
+                        );
+                        assert_eq!(
+                            adapter.blocks.len() + adapter.ignored_blocks.len(),
+                            MAX_TOOLS
+                        );
+                    }
+                    assert_eq!(errors(&events).len(), 1);
+                    assert!(events.iter().any(|event| matches!(event,
+                        Event::Error { message, fatal: false }
+                            if message.contains("too many streaming blocks")
+                    )));
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(event, Event::Item(_)))
+                            .count(),
+                        MAX_TOOLS - count
+                    );
+                    assert!(adapter.busy && adapter.streams[""].truncated);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_stream_delta_payloads_are_validated_before_the_block_budget() {
+        for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+            for (block_type, delta_type, field) in [
+                ("text", "text_delta", "text"),
+                ("thinking", "thinking_delta", "thinking"),
+                ("tool_use", "input_json_delta", "partial_json"),
+                ("server_tool_use", "input_json_delta", "partial_json"),
+            ] {
+                for payload in [
+                    None,
+                    Some(Value::Null),
+                    Some(json!(false)),
+                    Some(json!(7)),
+                    Some(json!({})),
+                    Some(json!([])),
+                ] {
+                    let mut adapter = Claude::default();
+                    adapter
+                        .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                        .unwrap();
+                    for index in 0..count {
+                        adapter
+                            .receive(stream(json!({"type":"content_block_start","index":index,
+                                "content_block":{"type":"future_content"}})))
+                            .unwrap();
+                    }
+                    let block = match block_type {
+                        "text" => json!({"type":"text","text":""}),
+                        "thinking" => json!({"type":"thinking","thinking":""}),
+                        _ => json!({"type":block_type,"id":"tool","name":"Opaque"}),
+                    };
+                    adapter
+                        .receive(stream(json!({"type":"content_block_start","index":count,
+                            "content_block":block})))
+                        .unwrap();
+                    assert_eq!(adapter.streams[""].truncated, count == MAX_TOOLS);
+                    let mut delta = json!({"type":delta_type});
+                    if let Some(payload) = &payload {
+                        delta[field] = payload.clone();
+                    }
+                    assert_eq!(
+                        adapter
+                            .receive(stream(json!({"type":"content_block_delta","index":count,
+                                "delta":delta})))
+                            .err(),
+                        Some(
+                            if delta_type == "input_json_delta" {
+                                "Claude tool input delta has no string payload"
+                            } else {
+                                "Claude text delta has no string payload"
+                            }
+                            .into()
+                        ),
+                        "accepted {delta_type} with {field}={payload:?} after {count} future blocks"
+                    );
+                    assert_eq!(
+                        adapter.blocks.len() + adapter.ignored_blocks.len(),
+                        MAX_TOOLS
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn valid_stream_delta_overflow_keeps_unknown_indices_and_next_text_usable() {
+        for count in [MAX_TOOLS - 1, MAX_TOOLS] {
+            for (block_type, delta_type, field, payload) in [
+                ("text", "text_delta", "text", "kept"),
+                ("thinking", "thinking_delta", "thinking", "kept"),
+                ("tool_use", "input_json_delta", "partial_json", "{}"),
+                ("server_tool_use", "input_json_delta", "partial_json", "{}"),
+            ] {
+                let mut adapter = Claude::default();
+                adapter
+                    .receive(stream(json!({"type":"message_start","message":{"id":"m"}})))
+                    .unwrap();
+                for index in 0..count {
+                    adapter
+                        .receive(stream(json!({"type":"content_block_start","index":index,
+                            "content_block":{"type":"future_content"}})))
+                        .unwrap();
+                }
+                let block = match block_type {
+                    "text" => json!({"type":"text","text":""}),
+                    "thinking" => json!({"type":"thinking","thinking":""}),
+                    _ => json!({"type":block_type,"id":"tool","name":"Opaque"}),
+                };
+                let start = adapter
+                    .receive(stream(json!({"type":"content_block_start","index":count,
+                        "content_block":block})))
+                    .unwrap();
+                assert_eq!(errors(&start.events).len(), usize::from(count == MAX_TOOLS));
+                for payload in ["", payload] {
+                    let mut delta = json!({"type":delta_type});
+                    delta[field] = json!(payload);
+                    let step = adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":count,
+                            "delta":delta})))
+                        .unwrap();
+                    assert!(errors(&step.events).is_empty());
+                    if count == MAX_TOOLS {
+                        assert!(step.events.is_empty());
+                    } else {
+                        assert!(step.events.iter().any(|event| match event {
+                            Event::TextDelta { delta, .. } => delta == payload,
+                            Event::Item(Item {
+                                content: ItemContent::Tool { input, .. },
+                                ..
+                            }) => input == payload,
+                            _ => false,
+                        }));
+                    }
+                }
+                // Future delta types remain advisory even at an unowned index.
+                assert!(
+                    adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":count+1,
+                            "delta":{"type":"future_delta"}})))
+                        .unwrap()
+                        .events
+                        .is_empty()
+                );
+                // An index explicitly owned by future content keeps its opaque
+                // delta behavior, even when a known-looking payload is absent.
+                assert!(
+                    adapter
+                        .receive(stream(json!({"type":"content_block_delta","index":0,
+                            "delta":{"type":"text_delta"}})))
+                        .unwrap()
+                        .events
+                        .is_empty()
+                );
+                // Replacing just that ignored index makes room for real text;
+                // truncation must not poison the next retained valid block.
+                adapter
+                    .receive(stream(json!({"type":"content_block_start","index":0,
+                        "content_block":{"type":"text","text":""}})))
+                    .unwrap();
+                let resumed = adapter
+                    .receive(stream(json!({"type":"content_block_delta","index":0,
+                        "delta":{"type":"text_delta","text":"next valid answer"}})))
+                    .unwrap();
+                assert!(resumed.events.iter().any(|event| matches!(event,
+                    Event::TextDelta { delta, .. } if delta == "next valid answer"
+                )));
+                assert!(errors(&resumed.events).is_empty());
+                assert_eq!(
+                    adapter.blocks.len() + adapter.ignored_blocks.len(),
+                    MAX_TOOLS
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_frames_do_not_interrupt_a_streamed_turn() {
+        let mut adapter = Claude::default();
+        adapter.busy = true;
+        for frame in [
+            json!({"type":"future_frame", "payload":"private protocol payload"}),
+            json!({"type":"system", "subtype":"future_system", "payload":"private protocol payload"}),
+        ] {
+            assert!(adapter.receive(frame).unwrap().events.is_empty());
+        }
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        for event in [
+            json!({"type":"future_stream_event"}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content","opaque":"private protocol payload"}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"future_delta"}}),
+        ] {
+            assert!(
+                adapter
+                    .receive(json!({"type":"stream_event","event":event}))
+                    .unwrap()
+                    .events
+                    .is_empty()
+            );
+        }
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
+        let delta = adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}})).unwrap();
+        assert!(
+            delta
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TextDelta { delta, .. } if delta == "answer"))
+        );
+        let result = adapter
+            .receive(
+                json!({"type":"result","subtype":"success","result":"answer","is_error":false}),
+            )
+            .unwrap();
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Succeeded,
+                ..
+            }
+        )));
+        assert!(
+            !result
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        assert!(!adapter.busy);
+
+        let message = adapter.receive(json!({"type":"assistant","uuid":"unknown-body","message":{"role":"assistant","content":[{"type":"future_content","payload":"private protocol payload"}]}})).unwrap();
+        assert!(
+            !message
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Item(_) | Event::Error { .. }))
+        );
+    }
+
+    #[test]
+    fn unknown_frame_warnings_keep_bounded_names_and_cardinality() {
+        let mut adapter = Claude::default();
+        for index in 0..100 {
+            let name = format!("future-{index}-\u{1b}\n{}", "🦀".repeat(200));
+            adapter.receive(json!({"type":name})).unwrap();
+        }
+        assert_eq!(adapter.unknown_frames.len(), 64);
+        assert!(adapter.unknown_frames.iter().all(|key| {
+            key.len() <= "frame:".len() + 128 && !key.chars().any(char::is_control)
+        }));
+    }
+
+    #[test]
+    fn unknown_stream_blocks_own_scoped_indices_until_stop_or_settlement() {
+        fn event(adapter: &mut Claude, parent: &str, event: Value) -> Result<Step, String> {
+            adapter
+                .receive(json!({"type":"stream_event","parent_tool_use_id":parent,"event":event}))
+        }
+        let mut adapter = Claude::default();
+        for parent in ["", "child"] {
+            event(
+                &mut adapter,
+                parent,
+                json!({"type":"message_start","message":{"id":"m"}}),
+            )
+            .unwrap();
+        }
+        event(&mut adapter, "", json!({"type":"content_block_start","index":1,"content_block":{"type":"future_content"}})).unwrap();
+        for delta in [
+            json!({"type":"text_delta","text":"omitted text"}),
+            json!({"type":"thinking_delta","thinking":"omitted thinking"}),
+            json!({"type":"input_json_delta","partial_json":"{}"}),
+        ] {
+            assert!(
+                event(
+                    &mut adapter,
+                    "",
+                    json!({"type":"content_block_delta","index":1,"delta":delta})
+                )
+                .unwrap()
+                .events
+                .is_empty()
+            );
+        }
+        assert!(event(&mut adapter, "child", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"unowned child index"}})).is_err());
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"old"}})).unwrap();
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"future_content"}})).unwrap();
+        assert!(event(&mut adapter, "", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"must not append to old"}})).unwrap().events.is_empty());
+        assert!(!adapter.blocks.contains_key(&(ScopedId::new(None, "m"), 0)));
+        event(&mut adapter, "", json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":"fresh"}})).unwrap();
+        let delta = event(&mut adapter, "", json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" answer"}})).unwrap();
+        assert!(
+            delta
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TextDelta { delta, .. } if delta == " answer"))
+        );
+        event(
+            &mut adapter,
+            "",
+            json!({"type":"content_block_stop","index":1}),
+        )
+        .unwrap();
+        assert!(adapter.ignored_blocks.is_empty());
+        assert!(event(&mut adapter, "", json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"after stop"}})).is_err());
+        event(&mut adapter, "", json!({"type":"content_block_start","index":2,"content_block":{"type":"future_content"}})).unwrap();
+        event(
+            &mut adapter,
+            "",
+            json!({"type":"message_start","message":{"id":"successor"}}),
+        )
+        .unwrap();
+        assert!(
+            adapter.ignored_blocks.is_empty(),
+            "a new message settles the abandoned stream"
+        );
+        assert!(adapter.blocks.is_empty());
+    }
+
+    #[test]
+    fn unknown_stream_blocks_share_the_existing_block_budget_and_clear_on_reset() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        for index in 0..MAX_TOOLS {
+            adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":index,"content_block":{"type":"future_content"}}})).unwrap();
+        }
+        assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS);
+        // Replacement at a full budget releases only that exact index.
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"known"}}})).unwrap();
+        assert_eq!(adapter.blocks.len(), 1);
+        assert_eq!(adapter.ignored_blocks.len(), MAX_TOOLS - 1);
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":MAX_TOOLS,"content_block":{"type":"future_content"}}})).unwrap();
+        assert_eq!(
+            adapter.blocks.len() + adapter.ignored_blocks.len(),
+            MAX_TOOLS
+        );
+        adapter
+            .receive(json!({"type":"conversation_reset"}))
+            .unwrap();
+        assert!(adapter.blocks.is_empty() && adapter.ignored_blocks.is_empty());
+    }
+
+    #[test]
+    fn unknown_frame_tolerance_preserves_identity_and_known_protocol_errors() {
+        let mut adapter = Claude::default();
+        let session = uuid::Uuid::new_v4().to_string();
+        adapter.session_id = Some(session.clone());
+        assert!(
+            adapter
+                .receive(
+                    json!({"type":"future_frame","session_id":uuid::Uuid::new_v4().to_string()})
+                )
+                .unwrap_err()
+                .contains("different session ID")
+        );
+        assert_eq!(adapter.session_id.as_deref(), Some(session.as_str()));
+        assert!(adapter.receive(json!({"payload":"missing type"})).is_err());
+        let control = adapter.control(json!({"subtype":"initialize"})).unwrap();
+        let id = control.writes[0]["request_id"].clone();
+        assert!(adapter.receive(json!({"type":"control_response","response":{"request_id":id,"subtype":"future_response"}})).is_err());
+        let auth = adapter
+            .receive(json!({"type":"auth_status","error":"Authentication failed"}))
+            .unwrap();
+        assert!(auth.events.iter().any(|event| matches!(event, Event::Error { message, .. } if message == "Authentication failed")));
+        adapter.receive(json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}})).unwrap();
+        assert!(adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"unowned"}}})).is_err());
+        adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
+        assert!(adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta"}}})).is_err());
+    }
+
+    #[test]
     fn unverified_owned_claude_image_history_never_downgrades_to_a_coincident_path() {
         crate::chat::attachment_assets::with_test_image(|image| {
             let reference = image.reference.as_ref().unwrap();
@@ -6618,7 +7552,7 @@ mod tests {
         )
         .unwrap();
         let streaming = adapter
-            .receive(json!({"type":"stream_event","session_id":id,"event":{}}))
+            .receive(json!({"type":"stream_event","session_id":id,"event":{"type":"future_stream_event"}}))
             .unwrap();
         assert!(
             !streaming
