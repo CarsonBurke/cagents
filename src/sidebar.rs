@@ -17053,6 +17053,194 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn compact_tall_menu_wheels_to_delete_the_original_worktree_after_insertions() {
+        use cosmic::iced::{
+            Event, Point,
+            advanced::{clipboard, mouse},
+            event,
+        };
+
+        fn fixture() -> Sidebar {
+            let mut sidebar = Sidebar::with_channel(ChannelId::from_uuid(Uuid::from_u128(20)));
+            sidebar.model.mode = SidebarMode::Compact;
+            sidebar.bounds.width = 760.0;
+            assert_eq!(sidebar.bounds.height, 640.0);
+            assert_eq!(sidebar.model.external_editors.len(), 6);
+            let entry = &mut sidebar.model.projects[0];
+            entry.worktrees[0].path = entry.repository.clone();
+            let mut pr = entry.pull_requests[0].clone();
+            pr.state = Some(WorktreePullRequestState::Merged);
+            entry.worktrees[1].set_pull_request(pr);
+            let target = &entry.worktrees[1];
+            sidebar.state.active_worktree = Some(ActiveWorktreeKey {
+                project_id: entry.id,
+                worktree_id: target.id,
+                canonical_path: target.path.clone(),
+            });
+            sidebar
+        }
+
+        fn redraw(sidebar: &mut Sidebar, at: Point) {
+            assert!(
+                sidebar
+                    .feed(
+                        &[Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                            std::time::Instant::now(),
+                        ))],
+                        at,
+                    )
+                    .is_empty()
+            );
+        }
+
+        fn captured(sidebar: &mut Sidebar, event: Event, at: Point) {
+            let mut ui = interface_in_mode(
+                &sidebar.model,
+                &sidebar.state,
+                &sidebar.navigation,
+                sidebar.bounds,
+                SidebarMode::Compact,
+                sidebar.modal_open,
+                std::mem::take(&mut sidebar.cache),
+                &mut sidebar.renderer,
+            );
+            let mut actions = Vec::new();
+            let (_, statuses) = ui.update(
+                &[event],
+                mouse::Cursor::Available(at),
+                &mut sidebar.renderer,
+                &mut clipboard::Null,
+                &mut actions,
+            );
+            assert_eq!(statuses, vec![event::Status::Captured]);
+            assert!(actions.is_empty(), "menu motion/wheel emitted {actions:?}");
+            sidebar.cache = ui.into_cache();
+        }
+
+        let mut initial = fixture();
+        let owner = initial.model.projects[0].id;
+        let target = &initial.model.projects[0].worktrees[1];
+        let target_id = target.id;
+        let label = worktree_accessible_name(target, WorktreeRowState::default()).into_owned();
+        let expected = SidebarAction::ProjectCommand {
+            project_id: owner,
+            worktree_id: Some(target_id),
+            command: ProjectCommand::Delete,
+        };
+        let (controls, _) = initial.attention_frame();
+        let (_, original) = controls
+            .iter()
+            .find(|(name, _)| name == &label)
+            .expect("the original compact worktree is mounted");
+        let row = Point::new(
+            ((original[0] + original[2]) / 2.0) as f32,
+            ((original[1] + original[3]) / 2.0) as f32,
+        );
+        let painted = Sidebar::menu_rows_for(fixture, row, 0.0);
+        let &(top, bottom) = painted
+            .iter()
+            .find(|(top, bottom)| *top <= row.y as usize && *bottom > row.y as usize)
+            .expect("the tall popup paints inside the original compact viewport");
+        assert!(bottom < initial.bounds.height as usize);
+        let inside = Point::new(row.x + 30.0, row.y + 8.0);
+        assert!((top as f32..bottom as f32).contains(&inside.y));
+
+        // Remount only between hit probes. Each probe retains one real open
+        // popup and its cache across model insertion, pointer motion and wheel.
+        for insert_rows in [false, true] {
+            for wheel in [false, true] {
+                let mut attempts = Vec::new();
+                let mut deletion = None;
+                for y in (top..=bottom).step_by(4) {
+                    let mut sidebar = fixture();
+                    assert!(sidebar.click(mouse::Button::Right, row).is_empty());
+                    redraw(&mut sidebar, row);
+                    if insert_rows {
+                        let neighbor = worktree(90, "aaa-inserted-neighbor", false);
+                        let neighbor_id = neighbor.id;
+                        let entry = sidebar
+                            .model
+                            .projects
+                            .iter_mut()
+                            .find(|entry| entry.id == owner)
+                            .unwrap();
+                        entry.worktrees.insert(0, neighbor);
+                        sidebar.state.set_agent_activity(
+                            CardId::new(),
+                            owner,
+                            neighbor_id,
+                            crate::agent::Activity {
+                                provider: crate::agent::Provider::Codex,
+                                state: crate::agent::ActivityState::Waiting,
+                            },
+                        );
+                        sidebar.model.projects.insert(
+                            0,
+                            SidebarProject::new(
+                                project_id(99),
+                                RepositoryId(Uuid::from_u128(99)),
+                                "Inserted project".into(),
+                                "/repo/inserted-project".into(),
+                                Vec::new(),
+                                Vec::new(),
+                            ),
+                        );
+                        let (controls, _) = sidebar.attention_frame();
+                        let (_, shifted) = controls
+                            .iter()
+                            .find(|(name, _)| name == &label)
+                            .expect("insertion keeps the original target mounted");
+                        assert!(
+                            shifted[1] >= original[1] + 2.0 * f64::from(WORKTREE_ROW_HEIGHT),
+                            "both inserted rows must actually precede the target: {original:?} -> {shifted:?}"
+                        );
+                    }
+                    // Native popup scrolling needs a hovered menu item. The
+                    // captured motion also proves insertion kept the popup open.
+                    captured(
+                        &mut sidebar,
+                        Event::Mouse(mouse::Event::CursorMoved { position: inside }),
+                        inside,
+                    );
+                    if wheel {
+                        captured(
+                            &mut sidebar,
+                            Event::Mouse(mouse::Event::WheelScrolled {
+                                delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -480.0 },
+                            }),
+                            inside,
+                        );
+                        redraw(&mut sidebar, inside);
+                    }
+                    let at = Point::new(inside.x, y as f32);
+                    sidebar.move_to(at);
+                    let actions = sidebar.click(mouse::Button::Left, at);
+                    let destructive = actions.iter().any(|action| {
+                        matches!(
+                            action,
+                            SidebarAction::ProjectCommand {
+                                command: ProjectCommand::Delete | ProjectCommand::Remove,
+                                ..
+                            } | SidebarAction::DeleteChannel { .. }
+                        )
+                    });
+                    attempts.push(actions.clone());
+                    if destructive {
+                        deletion = Some(actions);
+                        break;
+                    }
+                }
+                assert_eq!(
+                    deletion,
+                    wheel.then(|| vec![expected.clone()]),
+                    "the final command needs popup wheel input and retains its captured owner \
+                     (insert_rows={insert_rows}, wheel={wheel}): {attempts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_row_menu_paints_where_it_answers_the_pointer() {
         // The band a menu paints on starts at the pointer and runs down the
         // window. Opening it also repaints the row it was opened on, which
