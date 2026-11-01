@@ -1552,8 +1552,8 @@ pub(in crate::app) fn subscription(app: &Cagents) -> Subscription<Message> {
 
 // Matched Before/After data. These are logical observations, not an OS clock
 // change or a cache/provider execution. Expiration requires a new reviewed seed.
-const CATALOG_CURRENT_AT: Millis = 1_793_491_200_000; // 2026-11-01T00:00:00Z
-const CATALOG_WINDOW_END: Millis = 1_793_577_600_000; // 2026-11-02T00:00:00Z
+const CATALOG_CURRENT_AT: Millis = 1_793_577_600_000; // 2026-11-02T00:00:00Z
+const CATALOG_WINDOW_END: Millis = 1_793_664_000_000; // 2026-11-03T00:00:00Z
 const CATALOG_OLD_AT: Millis = 4_102_444_800_000; // already-known pre-rollback 2100
 const CATALOG_EXPECTS_CURRENT: bool = true;
 
@@ -1698,7 +1698,7 @@ fn install_catalog(app: &mut Cagents, context: Context) -> Task<Message> {
         .resize_viewport((app.content_width() - sidebar).max(0.0));
     receipt(
         serde_json::json!({"event":"catalog_installed","scene":"claude-catalog",
-        "capture_window_utc":["2026-11-01T00:00:00Z","2026-11-02T00:00:00Z"],
+        "capture_window_utc":["2026-11-02T00:00:00Z","2026-11-03T00:00:00Z"],
         "old_observed_at":CATALOG_OLD_AT,"incoming_observed_at":CATALOG_CURRENT_AT,
         "stale_presentation_clock":app.account_ui.now_ms,"draft":catalog_draft(app),
         "cache_provider_or_native_input_executed":false}),
