@@ -257,7 +257,7 @@ pub(in crate::app) fn install(app: &mut Cagents, context: Context) -> Task<Messa
     app.settings.language_servers.clear();
     app.lsp = LspManager::new(Vec::new());
     app.context_inspector_open = false;
-    app.notices.record(TransientNotice::warning("INERT editor scene · peer closes this private project; F8 delivers the original callback AFTER cleanup has finished · no active-census claim"));
+    app.notices.record(TransientNotice::warning("INERT editor scene · peer closes this private project; F9 delivers the original callback AFTER cleanup has finished · no active-census claim"));
     receipt(serde_json::json!({"event":"installed","project":project,
         "mode":"ORIGINAL_COMPLETION_DELAY","provider_started":false,"native_input_proven":false}));
     // Normal folder discovery/publication, without select_worktree's default
@@ -595,7 +595,7 @@ pub(in crate::app) fn before_update(
     f.reopened = false;
     f.delivering = false;
     if matches!(&message, Message::KeyEvent { captured: false, event: keyboard::Event::KeyPressed {
-        key: keyboard::Key::Named(keyboard::key::Named::F8), modifiers, ..
+        key: keyboard::Key::Named(keyboard::key::Named::F9), modifiers, ..
     }} if modifiers.is_empty())
     {
         return (Message::ProjectCloseFixtureCheckpoint, release(app));
@@ -606,7 +606,7 @@ pub(in crate::app) fn before_update(
             || (f.original.is_some() && f.error.is_none() && f.phase != Phase::Finished))
     {
         app.notices.record(TransientNotice::warning(
-            "Finish the original fixture callback with F8 before closing this private window.",
+            "Finish the original fixture callback with F9 before closing this private window.",
         ));
         return (Message::ProjectCloseFixtureCheckpoint, Task::none());
     }
@@ -1010,6 +1010,126 @@ mod tests {
         assert!(
             matches!(returned, Message::ProjectUi(Action::ProjectSessionsClosed(
             got, 7, Err(error))) if got == project && error.as_ptr() == pointer && error == "original allocation retained")
+        );
+        assert!(
+            app.project_ui
+                .native_fixture
+                .as_ref()
+                .unwrap()
+                .held
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn only_bare_uncaptured_f9_releases_the_original_callback_once() {
+        let project = ProjectId::new();
+        let mut app = gate_app(project);
+        // Negative gate plumbing only: no successful closure, host proof or
+        // actual native event is manufactured by this owning key control.
+        let payload = String::from("same original key-gate payload");
+        let payload_pointer = payload.as_ptr();
+        let original = Box::new(Message::ProjectUi(Action::ProjectSessionsClosed(
+            project,
+            7,
+            Err(payload),
+        )));
+        let message_pointer = original.as_ref() as *const Message;
+        let f = app.project_ui.native_fixture.as_mut().unwrap();
+        f.phase = Phase::Held;
+        f.error = Some("key-gate-plumbing-only control".into());
+        f.held = Some(original);
+
+        let key_message = |key, captured, modifiers| Message::KeyEvent {
+            captured,
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(key),
+                modified_key: keyboard::Key::Named(key),
+                physical_key: keyboard::key::Physical::Code(if key == keyboard::key::Named::F8 {
+                    keyboard::key::Code::F8
+                } else {
+                    keyboard::key::Code::F9
+                }),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: None,
+                repeat: false,
+            },
+        };
+        for (key, captured, modifiers) in [
+            (keyboard::key::Named::F9, true, keyboard::Modifiers::empty()),
+            (keyboard::key::Named::F9, false, keyboard::Modifiers::SHIFT),
+            (keyboard::key::Named::F9, false, keyboard::Modifiers::CTRL),
+            (keyboard::key::Named::F9, false, keyboard::Modifiers::ALT),
+            (keyboard::key::Named::F9, false, keyboard::Modifiers::LOGO),
+            (
+                keyboard::key::Named::F8,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        ] {
+            let (returned, task) = before_update(&mut app, key_message(key, captured, modifiers));
+            assert!(matches!(returned, Message::ProjectCloseFixtureCheckpoint));
+            assert!(iced::runtime::task::into_stream(task).is_none());
+            let f = app.project_ui.native_fixture.as_ref().unwrap();
+            assert_eq!(f.phase, Phase::Held);
+            assert_eq!(f.project, Some(project));
+            assert_eq!(f.original, Some((project, 7)));
+            assert_eq!(f.error.as_deref(), Some("key-gate-plumbing-only control"));
+            assert!(!f.delivering);
+            assert!(
+                f.held
+                    .as_deref()
+                    .is_some_and(|message| std::ptr::eq(message, message_pointer))
+            );
+            assert!(
+                matches!(f.held.as_deref(), Some(Message::ProjectUi(Action::ProjectSessionsClosed(
+                got, 7, Err(error)))) if *got == project && error.as_ptr() == payload_pointer)
+            );
+        }
+
+        let (returned, task) = before_update(
+            &mut app,
+            key_message(
+                keyboard::key::Named::F9,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(matches!(returned, Message::ProjectCloseFixtureCheckpoint));
+        let f = app.project_ui.native_fixture.as_ref().unwrap();
+        assert_eq!(f.phase, Phase::Delivering);
+        assert_eq!(f.original, Some((project, 7)));
+        assert!(f.held.is_none());
+        let (returned, duplicate) = before_update(
+            &mut app,
+            key_message(
+                keyboard::key::Named::F9,
+                false,
+                keyboard::Modifiers::empty(),
+            ),
+        );
+        assert!(matches!(returned, Message::ProjectCloseFixtureCheckpoint));
+        assert!(iced::runtime::task::into_stream(duplicate).is_none());
+        assert_eq!(
+            app.project_ui.native_fixture.as_ref().unwrap().phase,
+            Phase::Delivering
+        );
+
+        let mut outputs =
+            iced::runtime::task::into_stream(task).expect("one original callback Task");
+        let mut delivered = None;
+        while let Some(action) = outputs.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                assert!(
+                    delivered.replace(message).is_none(),
+                    "original emitted twice"
+                );
+            }
+        }
+        assert!(
+            matches!(delivered, Some(Message::ProjectUi(Action::ProjectSessionsClosed(
+            got, 7, Err(error)))) if got == project && error.as_ptr() == payload_pointer && error == "same original key-gate payload")
         );
         assert!(
             app.project_ui
