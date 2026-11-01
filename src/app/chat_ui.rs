@@ -256,6 +256,12 @@ pub enum Action {
     SubagentQuery(Target, String),
     ToggleFailure(Target, String),
     CopyFailure(Target, String),
+    FailureCopied(
+        Target,
+        String,
+        text_copy::FailureRequest,
+        Result<String, String>,
+    ),
     SubagentFilter(Target, child_navigation::Filter),
     SubagentPage(Target, bool),
     /// Shows the whole of one folded part of a coordination card, addressed
@@ -10621,12 +10627,21 @@ impl Cagents {
                 }
             }
             Action::CopyFailure(target, key) => {
+                if self
+                    .chat_runtime_mut(target)
+                    .is_some_and(|runtime| runtime.failure_originals_retained(&key).is_some())
+                {
+                    return self.start_failure_copy(target, key);
+                }
                 if let Some(runtime) = self.chat_runtime_mut(target)
                     && let Some(text) = runtime.failure_details(&key)
                 {
                     text_copy::invalidate();
                     return iced::clipboard::write(text).map(cosmic::Action::App);
                 }
+            }
+            Action::FailureCopied(target, key, request, result) => {
+                return self.finish_failure_copy(target, key, request, result);
             }
             Action::SubagentPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -25902,6 +25917,174 @@ mod tests {
         assert_eq!(app.workspace.focused(), Some(card));
         app.chat_runtime_mut(target).unwrap().copied = None;
         (card, target, request, body)
+    }
+
+    fn valid_child_failure_copy_completion(
+        app: &mut Cagents,
+    ) -> (Target, String, text_copy::FailureRequest, String) {
+        let (card, target, handle) = history_fixture(app);
+        app.workspace.focus(card).unwrap();
+        let raw = format!(
+            "You've hit your session limit · resets 3:40pm (America/Vancouver)\n{}\nTAIL original λ",
+            "猫 exact diagnostics\n".repeat(20_000)
+        );
+        let mut preview = (*presentation_text("child-failure", "You've hit your session limit · resets 3:40pm (America/Vancouver)\nDiagnostic preview only")).clone();
+        assert!(chat::failure::mark_provider_error(
+            Provider::Codex,
+            &mut preview
+        ));
+        let source = chat::TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: chat::TextCopyScope::Subagent { id: "child".into() },
+            token: 7,
+            revision: 3,
+            bytes: raw.len() as u64,
+        };
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.subagents = vec![presentation_child("child", Arc::new(preview))];
+        snapshot
+            .text_copy_sources
+            .children
+            .insert("child".into(), vec![Some(source)]);
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.selected_subagent = Some("child".into());
+        runtime.refresh();
+        let key = runtime
+            .failure_ui
+            .incidents
+            .iter()
+            .find(|incident| incident.child_scope.as_deref() == Some("child"))
+            .unwrap()
+            .key
+            .clone();
+        let plan = runtime.failure_copy_plan(&key).unwrap().unwrap();
+        let request =
+            text_copy::FailureRequest::for_test(handle, runtime.selected_subagent.clone(), plan);
+        (target, key, request, raw)
+    }
+
+    #[test]
+    fn child_failure_copy_completion_writes_exact_original_and_rechecks_deferred_authority() {
+        let _context = text_copy::isolated_context();
+        // This UI oracle begins at the completed worker boundary. The HOST
+        // actor oracle separately exercises actual owned-source page reads.
+        for change in ["none", "source", "remove", "new-copy", "selection"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (target, key, request, raw) = valid_child_failure_copy_completion(&mut app);
+            let handle = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .handle()
+                .unwrap()
+                .clone();
+            let task =
+                app.handle_chat_ui(Action::FailureCopied(target, key, request, Ok(raw.clone())));
+            match change {
+                "source" | "remove" => {
+                    let mut snapshot = (*handle.snapshot()).clone();
+                    if change == "source" {
+                        snapshot
+                            .text_copy_sources
+                            .children
+                            .get_mut("child")
+                            .unwrap()[0]
+                            .as_mut()
+                            .unwrap()
+                            .revision += 1;
+                    } else {
+                        snapshot.subagents.clear();
+                        snapshot.text_copy_sources.children.clear();
+                    }
+                    snapshot.generation += 1;
+                    handle.publish_snapshot_for_test(snapshot);
+                }
+                "new-copy" => {
+                    drop(app.handle_chat_ui(Action::CopyLiteral("newer intent".into())));
+                }
+                "selection" => {
+                    drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+                }
+                _ => {}
+            }
+            if change == "none" {
+                assert_chat_copy_task_writes(task, &raw);
+            } else {
+                assert_chat_copy_task_has_no_clipboard_write(task, change);
+            }
+        }
+    }
+
+    #[test]
+    fn child_failure_copy_refuses_unavailable_original_instead_of_copying_preview() {
+        let _context = text_copy::isolated_context();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (target, key, _, _) = valid_child_failure_copy_completion(&mut app);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let handle = runtime.handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot
+            .text_copy_sources
+            .children
+            .insert("child".into(), vec![None]);
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(runtime.failure_originals_retained(&key), Some(false));
+        let task = app.handle_chat_ui(Action::CopyFailure(target, key));
+        assert_chat_copy_task_has_no_clipboard_write(
+            task,
+            "an unavailable original must never copy the resident excerpt",
+        );
+        assert!(
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Original diagnostic unavailable")
+        );
+    }
+
+    #[test]
+    fn child_failure_read_error_reports_withdrawal_but_suppresses_replacement_feedback() {
+        let _context = text_copy::isolated_context();
+        for change in ["withdrawn", "replacement"] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (target, key, request, _) = valid_child_failure_copy_completion(&mut app);
+            let handle = app
+                .chat_runtime_mut(target)
+                .unwrap()
+                .handle()
+                .unwrap()
+                .clone();
+            let mut snapshot = (*handle.snapshot()).clone();
+            let source = &mut snapshot
+                .text_copy_sources
+                .children
+                .get_mut("child")
+                .unwrap()[0];
+            if change == "withdrawn" {
+                *source = None;
+            } else {
+                source.as_mut().unwrap().cache = uuid::Uuid::new_v4();
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            let task = app.handle_chat_ui(Action::FailureCopied(
+                target,
+                key,
+                request,
+                Err("owned backing read failed".into()),
+            ));
+            assert_chat_copy_task_has_no_clipboard_write(task, "read errors cannot copy a preview");
+            let error = app.chat_runtime_mut(target).unwrap().error.as_deref();
+            assert_eq!(
+                error.is_some_and(|error| error.contains("Original diagnostic unavailable")),
+                change == "withdrawn"
+            );
+        }
     }
 
     #[test]
