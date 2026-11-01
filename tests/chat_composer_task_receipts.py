@@ -9,12 +9,12 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parent / "fixtures/chat-composer-claude.sh"
 SESSION = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 DIAGNOSTIC = "Invalid fixture-agent-task-receipt.json\n"
-UNSETTLED = []  # Retain original Child objects and directories, never signal a PID.
 
 
 def prompt(number):
@@ -48,24 +48,47 @@ class PrivateFixture:
         return self
 
     def __exit__(self, kind, error, traceback):
-        unsettled = []
-        for child, deadline in self.children:
-            try:
-                if child.returncode is None:
-                    child.communicate(timeout=max(0.001, deadline - time.monotonic()))
-                child.wait(timeout=max(0.001, deadline - time.monotonic()))
-            except (subprocess.TimeoutExpired, OSError) as cleanup_error:
-                unsettled.append((child, self.root))
-                if error is not None:
-                    error.add_note(f"Original fixture cleanup failed: {cleanup_error}")
-        if unsettled:
-            UNSETTLED.extend(unsettled)
-            detail = f"Original fixture child not settled; directory retained at {self.root}"
-            if error is not None:
-                error.add_note(detail)
-                return False
-            raise AssertionError(detail)
-        shutil.rmtree(self.root)
+        first_cleanup_error = None
+        for ownership in self.children:
+            # A timeout bounds an individual observation, never ownership.
+            # Keep this root and original Child locally until its wait settles;
+            # no later test, directory removal or exit can abandon that wait.
+            while True:
+                try:
+                    child = ownership["child"]
+                    deadline = ownership["deadline"]
+                    if not ownership["drained"]:
+                        try:
+                            child.communicate(timeout=max(0.001, deadline - time.monotonic()))
+                            ownership["drained"] = True
+                        except BaseException as cleanup_error:
+                            if first_cleanup_error is None:
+                                first_cleanup_error = cleanup_error
+                    # A drain failure must not hide an observable original wait.
+                    child.wait(timeout=max(0.001, deadline - time.monotonic()))
+                    break
+                except BaseException as cleanup_error:
+                    if first_cleanup_error is None:
+                        first_cleanup_error = cleanup_error
+                try:
+                    time.sleep(0.05)
+                except BaseException as cleanup_error:
+                    if first_cleanup_error is None:
+                        first_cleanup_error = cleanup_error
+        try:
+            shutil.rmtree(self.root)
+        except BaseException as cleanup_error:
+            if first_cleanup_error is None:
+                first_cleanup_error = cleanup_error
+        if error is not None:
+            if first_cleanup_error is not None:
+                try:
+                    error.add_note("A cleanup error also occurred; original fixture children were settled before propagation.")
+                except BaseException:
+                    pass  # Preserve the original failure object after settlement.
+            return False
+        if first_cleanup_error is not None:
+            raise first_cleanup_error
         return False
 
     @property
@@ -92,9 +115,11 @@ class PrivateFixture:
             argv, cwd=self.project, env=None, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        self.children.append((child, time.monotonic() + 10))
+        ownership = {"child": child, "deadline": time.monotonic() + 10, "drained": False}
+        self.children.append(ownership)
         payload = "".join(json.dumps(frame) + "\n" for frame in frames)
         stdout, stderr = child.communicate(payload, timeout=5)
+        ownership["drained"] = True
         status = child.wait(timeout=1)  # Original Child wait, even on a nonzero result.
         return status, stdout, stderr
 
@@ -208,6 +233,74 @@ class TaskReceiptContracts(unittest.TestCase):
             self.assertEqual(len(history), 21)
             self.assertEqual(len({f["uuid"] for f in history}), 21)
             self.assertEqual(history[-1]["uuid"], "fixture-agent-result-3")
+
+    def test_cleanup_keeps_original_wait_and_first_failure_before_further_work(self):
+        class DrainFailure(BaseException):
+            pass
+
+        class WaitFailure(BaseException):
+            pass
+
+        class Ownership(dict):
+            # Also model the original tuple record: an old-helper failure
+            # must concern ownership, rather than its record representation.
+            def __iter__(self):
+                yield self["child"]
+                yield self["deadline"]
+
+        for original, permanent_drain in [(AssertionError("original assertion"), False), (None, False), (None, True)]:
+            with self.subTest(original=original is not None, permanent_drain=permanent_drain):
+                events = []
+                drain_error, wait_error = DrainFailure("drain"), WaitFailure("wait")
+
+                class FakeChild:
+                    returncode = None
+                    drained = False
+                    settled = False
+                    waits = 0
+
+                    def communicate(self, timeout):
+                        events.append("drain")
+                        if not self.drained or permanent_drain:
+                            self.drained = True
+                            raise drain_error
+                        return "", ""
+
+                    def wait(self, timeout):
+                        events.append("wait")
+                        self.waits += 1
+                        if self.waits == 1 and not permanent_drain:
+                            raise wait_error
+                        self.returncode = 0
+                        self.settled = True
+                        events.append("settled")
+                        return 0
+
+                child = FakeChild()
+                fixture = object.__new__(PrivateFixture)
+                fixture.root = Path("/synthetic-fixture-not-created")
+                fixture.children = [Ownership(child=child, deadline=10, drained=False)]
+
+                def remove_root(path):
+                    events.append("remove")
+                    self.assertEqual(path, fixture.root)
+                    self.assertTrue(child.settled, "root must outlive its original wait")
+
+                expected = original if original is not None else drain_error
+                with mock.patch.object(time, "monotonic", return_value=0), mock.patch.object(time, "sleep", side_effect=lambda seconds: events.append("sleep")) as sleep, mock.patch.object(shutil, "rmtree", side_effect=remove_root):
+                    with self.assertRaises(type(expected)) as caught:
+                        with fixture:
+                            if original is not None:
+                                raise original
+                self.assertIs(caught.exception, expected)
+                events.append("further-work")
+                self.assertTrue(child.settled)
+                if permanent_drain:
+                    self.assertEqual(events, ["drain", "wait", "settled", "remove", "further-work"])
+                    sleep.assert_not_called()
+                else:
+                    self.assertEqual(events, ["drain", "wait", "sleep", "drain", "wait", "settled", "remove", "further-work"])
+                    sleep.assert_called_once_with(0.05)
 
 
 if __name__ == "__main__":
