@@ -633,6 +633,246 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
     assert!(host.lock().unwrap().chats.is_empty());
 }
 
+/// The whole reboot route through the real helper, host and client. The kill
+/// and removed discovery stand in for the reboot; the saved proof carries the
+/// changed boot because one kernel cannot host both sides of it. The fixture
+/// provider aborts on any second prompt.
+#[test]
+fn named_claude_resume_after_lost_holder_sends_nothing() {
+    let name = "named_claude_resume_after_lost_holder_sends_nothing";
+    let Some(root) = isolated(name) else { return };
+    let provider = root.join("bin/claude");
+    fs::write(
+        &provider,
+        include_str!("../../../tests/fixtures/claude-upgrade-continuity.py"),
+    )
+    .unwrap();
+    fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let project = root.join("fixture-inputs/workload/project");
+    let wait = |stage: &str, condition: &mut dyn FnMut() -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(Instant::now() < deadline, "did not settle at {stage}");
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let serve = |host: &SharedHost, id: ClientId, source: Session| {
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let served = host.clone();
+        let worker = thread::spawn(move || super::super::client::serve(server, id, served));
+        (
+            chat::client::ClientHandle::fixture_restore(client, source),
+            worker,
+        )
+    };
+    let users = |items: &[Arc<chat::Item>]| {
+        items
+            .iter()
+            .filter(|item| item.role == chat::Role::User)
+            .count()
+    };
+    let initial = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        project.clone(),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let initial_id = initial.id;
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let original = {
+        let (host, proof) = setup(&root, "before-reboot");
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let notifications = super::super::notifications::Broker::start(
+            &host,
+            crate::notifications::Application::Cagents,
+        )
+        .unwrap();
+        host.lock().unwrap().notifications = Some(notifications.handle());
+        let _wire = HostClientWire::start(&host, &proof);
+        start(&host, initial).unwrap();
+        let handle = host.lock().unwrap().chats[&initial_id].handle.clone();
+        wait("initial SDK", &mut || handle.attachment_snapshot().ready);
+        handle
+            .command(chat::Command::Prompt {
+                text: "LIVE_WORK_1513".into(),
+                attachments: vec![],
+                mode: chat::PromptMode::Send,
+            })
+            .unwrap();
+        wait("initial prompt", &mut || {
+            root.join("provider-done").exists() && handle.is_idle()
+        });
+        let ServerResponse::ChatListed { sessions } =
+            process(&host, 0, ClientRequest::ChatList).unwrap()
+        else {
+            panic!("expected the hosted conversation");
+        };
+        let original = sessions
+            .into_iter()
+            .find(|session| session.id == initial_id)
+            .unwrap();
+        assert!(original.native_continuity.retains_provider());
+
+        // A live holder still attaches as itself.
+        let (attached, worker) = serve(&host, 80, original.clone());
+        let attached = attached.unwrap();
+        assert_eq!(attached.session(), original);
+        assert!(attached.snapshot().read_only_reason.is_none());
+        drop(attached);
+        worker.join().unwrap();
+        // And a live owner is not displaced by a descriptor claiming a changed
+        // boot: the reader needs that allocation to be empty.
+        let mut claimed = original.clone();
+        claimed.proof.as_mut().unwrap().boot_id = "earlier-boot".into();
+        let (refused, worker) = serve(&host, 81, claimed);
+        assert!(refused.is_err());
+        worker.join().unwrap();
+        assert!(host.lock().unwrap().chats[&initial_id].handle.owns_work());
+
+        let owner = handle.actor_identity().unwrap().record;
+        cleanup_owner(&owner);
+        wait("holder exit", &mut || {
+            !owner.holder.is_current()
+                && (owner.root.pid == std::process::id() as i32 || !owner.root.is_current())
+        });
+        original
+    };
+    fs::remove_dir_all(holders::directory(Kind::Native).unwrap()).unwrap();
+    let _ = fs::remove_file(crate::terminal::ipc::daemon_socket_path().unwrap());
+
+    let thread = original.launch.session_id.clone().unwrap();
+    let project_key = project
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect::<String>();
+    let account = root.join("fixture-inputs/workload/account-alpha");
+    let history = account
+        .join("projects")
+        .join(project_key)
+        .join(format!("{thread}.jsonl"));
+    let history_before = fs::read(&history).unwrap();
+    let prompts_before = fs::read_to_string(root.join("prompts")).unwrap();
+    assert_eq!(prompts_before, "prompt\n");
+    let provider_runs = || {
+        fs::read_to_string(root.join("provider-trace.jsonl"))
+            .unwrap()
+            .matches("\"bootstrap\"")
+            .count()
+    };
+    let runs_before = provider_runs();
+    // The fixture otherwise fails its first resume on purpose.
+    let refused_once = root.join("history-retry-start-failed-once.json");
+    fs::write(
+        &refused_once,
+        serde_json::to_string(&serde_json::json!({
+            "account": account.canonicalize().unwrap(),
+            "thread": thread,
+        }))
+        .unwrap()
+        .replace("\":\"", "\": \"")
+        .replace("\",\"", "\", \""),
+    )
+    .unwrap();
+    fs::set_permissions(&refused_once, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let (host, proof) = setup(&root, "after-reboot");
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let notifications = super::super::notifications::Broker::start(
+        &host,
+        crate::notifications::Application::Cagents,
+    )
+    .unwrap();
+    host.lock().unwrap().notifications = Some(notifications.handle());
+    let _wire = HostClientWire::start(&host, &proof);
+    let mut saved = original.clone();
+    saved.proof.as_mut().unwrap().boot_id = "earlier-boot".into();
+    let reader = saved.lost_holder_history(&proof).unwrap();
+    // A persisted row carries the old boot too; it is the descriptor's own.
+    {
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let db = registry.lock().unwrap();
+        assert!(!db.retained_agent_sources(saved.id).unwrap().is_empty());
+        drop(db);
+        let fixture = rusqlite::Connection::open(root.join("registry.sqlite3")).unwrap();
+        let (stored,): (String,) = fixture
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id=?1",
+                [saved.id.to_string()],
+                |row| Ok((row.get(0)?,)),
+            )
+            .unwrap();
+        let live_boot = crate::daemon::read_boot_id().unwrap().to_string();
+        fixture
+            .execute(
+                "UPDATE agent_authorities SET source=?2 WHERE session_id=?1",
+                rusqlite::params![
+                    saved.id.to_string(),
+                    stored.replace(&live_boot, "earlier-boot")
+                ],
+            )
+            .unwrap();
+    }
+
+    let (restored, worker) = serve(&host, 82, saved.clone());
+    let restored = restored.unwrap();
+    assert_eq!(restored.session(), reader);
+    restored.set_visible(true).unwrap();
+    wait("saved transcript", &mut || {
+        let snapshot = restored.snapshot();
+        !snapshot.history_loading && users(&snapshot.items) == 1
+    });
+    let snapshot = restored.snapshot();
+    assert!(snapshot.read_only_reason.is_some() && snapshot.exited);
+    assert!(snapshot.items.iter().any(
+        |item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == "FRAME_000|")
+    ));
+    assert_eq!(
+        provider_runs(),
+        runs_before,
+        "opening history ran no provider"
+    );
+    assert_eq!(fs::read(&history).unwrap(), history_before);
+
+    // The one explicit action: normal Start on the exact reader descriptor.
+    let resumed = crate::chat::client::ClientHandle::connect(
+        reader.clone(),
+        chat::Intent::Start,
+        None,
+        false,
+        None,
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        provider_runs() > runs_before,
+        "the action resumed a provider"
+    );
+    let session = resumed.session();
+    assert_eq!(session.id, original.id);
+    assert_eq!(session.launch, original.launch);
+    assert!(session.native_continuity.retains_provider());
+    resumed.set_visible(true).unwrap();
+    wait("resumed transcript", &mut || {
+        let snapshot = resumed.snapshot();
+        snapshot.ready && !snapshot.history_loading && users(&snapshot.items) == 1
+    });
+    assert_eq!(
+        fs::read_to_string(root.join("prompts")).unwrap(),
+        prompts_before,
+        "no prompt reached the provider"
+    );
+    assert_eq!(
+        fs::read(&history).unwrap(),
+        history_before,
+        "the provider's user records are unchanged"
+    );
+    resumed.close().unwrap();
+    drop(restored);
+    drop(worker);
+}
+
 /// Framed native Client calls use the actual HOST handlers, lease and private
 /// execed helper. This test adapter supplies only the Connect envelope; it does
 /// not fabricate start/attach, provider exit, semantic ACK or retirement data.

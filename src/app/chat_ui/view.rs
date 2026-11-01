@@ -1035,6 +1035,32 @@ impl Cagents {
 }
 
 /// Prefer concrete activity from the newest assistant item when available.
+/// A read-only pane cannot take a message, so its empty transcript must not
+/// invite one, and must not read as loss while its history is still on the way.
+pub(super) fn empty_transcript_text(saved_history: bool, loading: bool) -> &'static str {
+    match (saved_history, loading) {
+        (false, _) => "Your conversation appears here. Send a message to begin.",
+        (true, true) => "Loading the saved conversation.",
+        (true, false) => "This conversation has no saved messages to show.",
+    }
+}
+
+/// What a saved transcript's reader is told beside its Resume action. The
+/// uncertainty is only claimed from the newest page of the transcript.
+pub(super) fn saved_history_caption(snapshot: &chat::Snapshot) -> &str {
+    if !snapshot.history_loading
+        && !snapshot.has_later
+        && chat::last_turn_uncertain(&snapshot.items)
+    {
+        "The last turn may not have finished: no final reply was saved. Resuming reopens this conversation and sends nothing, so read it first and decide what to ask next. Your draft is retained."
+    } else {
+        snapshot
+            .read_only_reason
+            .as_deref()
+            .unwrap_or("Saved conversation history is read-only; no provider was started.")
+    }
+}
+
 fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
     if snapshot.has_later {
         return "Working";
@@ -1885,8 +1911,11 @@ impl Runtime {
                 // of an invitation; the status line is where a state belongs.
                 transcript.push(
                     widget::container(
-                        design::body("Your conversation appears here. Send a message to begin.")
-                            .class(cosmic::theme::Text::Custom(design::muted_text)),
+                        design::body(empty_transcript_text(
+                            self.has_connected_saved_history(snapshot),
+                            snapshot.history_loading,
+                        ))
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
                     )
                     .center_x(Length::Fill)
                     .padding(space::XXL)
@@ -2267,6 +2296,8 @@ impl Runtime {
                     "The saved conversation did not load. Retry resumes it, or start a new one beside it - the old conversation stays on disk, but this card stops pointing at it."
                 } else if snapshot.exited && self.session.owns_codex_listener() {
                     "Chat attachment ended. The retained provider may still be running; your draft is retained."
+                } else if saved_history {
+                    saved_history_caption(snapshot)
                 } else if snapshot.exited {
                     snapshot.read_only_reason.as_deref().unwrap_or(
                         "Agent process exited. The transcript and draft are retained.",

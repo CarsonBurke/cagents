@@ -865,6 +865,144 @@ mod tests {
         }
     }
 
+    /// The real client handshake over the real host, for a retained pane whose
+    /// helper died with `saved_boot`.
+    fn lost_holder_source(
+        host: &SharedHost,
+        transcript: &[serde_json::Value],
+        saved_boot: &str,
+    ) -> (tempfile::TempDir, Session, std::path::PathBuf) {
+        let (directory, mut source, handle) = closed_history(host);
+        {
+            let mut state = host.lock().unwrap();
+            state.chats.remove(&source.id);
+        }
+        drop(handle);
+        let path = provider_history_path(&source);
+        let body = transcript
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                row["sessionId"] = source.launch.session_id.clone().into();
+                row.to_string() + "\n"
+            })
+            .collect::<String>();
+        std::fs::write(&path, body).unwrap();
+        // The directory exists again, as an ordinary project does after reboot.
+        std::fs::create_dir_all(&source.launch.recipe.working_directory).unwrap();
+        let marker = directory.path().join("provider-started");
+        let program = directory.path().join("provider");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf started > '{}'\nexit 91\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        source.launch.recipe.program = program.to_string_lossy().into_owned();
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        source.proof.as_mut().unwrap().boot_id = BootId::new(saved_boot);
+        assert!(source.has_valid_native_continuity());
+        (directory, source, marker)
+    }
+
+    fn user_row(id: &str, text: &str, parent: Option<&str>) -> serde_json::Value {
+        serde_json::json!({"type":"user","uuid":id,"parentUuid":parent,"message":{"role":"user","content":text}})
+    }
+
+    fn reply_row(id: &str, text: &str, parent: &str) -> serde_json::Value {
+        serde_json::json!({"type":"assistant","uuid":id,"parentUuid":parent,"message":{"id":id,"role":"assistant","content":[{"type":"text","text":text}]}})
+    }
+
+    #[test]
+    fn lost_holder_opens_exact_saved_transcript_without_starting_a_provider() {
+        for (uncertain, rows) in [
+            (
+                false,
+                vec![
+                    user_row("u1", "lost holder question", None),
+                    reply_row("a1", "lost holder answer", "u1"),
+                ],
+            ),
+            (true, vec![user_row("u1", "lost holder question", None)]),
+        ] {
+            let host = host();
+            let (_directory, source, marker) = lost_holder_source(&host, &rows, "earlier-boot");
+            let live = host.lock().unwrap().proof().clone();
+            let expected = source.lost_holder_history(&live).unwrap();
+            let (restored, server) = restore_client(&host, source.clone(), 71);
+            let restored = restored.unwrap();
+            restored.set_visible(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while restored.snapshot().history_loading || restored.snapshot().items.is_empty() {
+                assert!(Instant::now() < deadline, "saved history did not arrive");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(restored.session(), expected);
+            assert_eq!(expected.id, source.id);
+            assert_eq!(expected.launch, source.launch);
+            assert!(expected.is_saved_claude_history());
+            let witness = restored.authenticated_upgrade_recovery().unwrap();
+            assert!(witness.validate());
+            assert_eq!(witness.source(), &source);
+            assert_eq!(witness.replacement(), &expected);
+            let snapshot = restored.snapshot();
+            assert!(snapshot.read_only_reason.is_some());
+            assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("lost holder question"))));
+            assert_eq!(chat::last_turn_uncertain(&snapshot.items), uncertain);
+            assert!(!marker.exists(), "opening history started no provider");
+            drop(restored);
+            server.join().unwrap();
+
+            // A second window, or a lost commit, finds that same reader.
+            let (again, server) = restore_client(&host, source.clone(), 72);
+            let again = again.unwrap();
+            assert_eq!(again.session(), expected);
+            drop(again);
+            server.join().unwrap();
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn missing_holder_without_a_changed_boot_keeps_the_refusal() {
+        let host = host();
+        let rows = [user_row("u1", "same boot question", None)];
+        let (_directory, source, marker) = lost_holder_source(&host, &rows, "boot");
+        // The same kernel boot: another incarnation of the daemon, not proof
+        // that the helper is gone.
+        let mut source = source;
+        source.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("earlier");
+        let (restored, server) = restore_client(&host, source.clone(), 73);
+        let failure = match restored {
+            Err(failure) => failure,
+            Ok(_) => panic!("a same-boot missing holder opened a reader"),
+        };
+        assert!(failure.message.contains("could not be reattached"));
+        server.join().unwrap();
+        assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+        assert!(!marker.exists());
+
+        // Nor does a retained pane the provider never named, or a descriptor
+        // already owned by something other than its reader.
+        let live = host.lock().unwrap().proof().clone();
+        let mut earlier = source.clone();
+        earlier.proof.as_mut().unwrap().boot_id = BootId::new("earlier-boot");
+        let mut unnamed = earlier.clone();
+        unnamed.launch.session_id = None;
+        assert!(unnamed.lost_holder_history(&live).is_none());
+        let mut plain = earlier.clone();
+        plain.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        assert!(plain.lost_holder_history(&live).is_none());
+        let mut changed = earlier.lost_holder_history(&live).unwrap();
+        assert!(chat::is_lost_holder_history(&earlier, &changed));
+        changed.launch.recipe.program = "/other-provider".into();
+        assert!(!chat::is_lost_holder_history(&earlier, &changed));
+    }
+
     fn provider_history_path(source: &Session) -> std::path::PathBuf {
         let project: String = source
             .launch
@@ -1969,6 +2107,63 @@ pub(super) fn recover_saved_history(
     );
     restore_saved_history(host, 0, session.clone())?;
     register_saved_history_alias(host, source)
+}
+
+/// Open or find the saved reader of a retained conversation whose holder died
+/// with an earlier kernel boot. `None` leaves every other descriptor, including
+/// a same-boot missing holder, to the existing refusal.
+pub(super) fn lost_holder_history(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Session>, ProtocolError> {
+    let (proof, resident) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state.proof().clone(),
+            state.chats.get(&source.id).map(|record| {
+                (
+                    record.session.clone(),
+                    record.handle.is_read_only_history() && !record.handle.owns_work(),
+                )
+            }),
+        )
+    };
+    let Some(reader) = source.lost_holder_history(&proof) else {
+        return Ok(None);
+    };
+    match resident {
+        // A second window, or a commit lost to a closing UI, finds the same one.
+        Some((session, true)) if session == reader => Ok(Some(reader)),
+        Some(_) => Ok(None),
+        None => {
+            revoke_lost_holder_authority(host, source, &proof).map_err(unavailable)?;
+            restore_saved_history(host, 0, reader.clone())?;
+            Ok(Some(reader))
+        }
+    }
+}
+
+/// Every ordinary retained chat holds an execution capability for its provider
+/// and tools. A changed boot proves each holder of that token is gone, so the
+/// row no longer describes an owner. A managed agent's own records remain and
+/// keep its supported route; this removes only that one dead capability.
+fn revoke_lost_holder_authority(
+    host: &SharedHost,
+    source: &Session,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let sources = registry.retained_agent_sources(source.id)?;
+    let authority = registry.retained_agent_authority_source(source.id)?;
+    if let ([only], Some(authority)) = (sources.as_slice(), authority)
+        && *only == authority
+        && matches!(&authority, crate::agent_execution::HostedSession::Chat(chat)
+            if chat.proof.as_ref().is_some_and(|saved| saved.is_complete() && saved.boot_id != proof.boot_id))
+    {
+        registry.retire_agent_authority(&authority)?;
+    }
+    Ok(())
 }
 
 /// Classify an already authenticated paging reader for an explicit Retry.

@@ -603,6 +603,36 @@ impl NativeContinuity {
     }
 }
 
+/// Whether `replacement` is exactly the reader of `source`'s lost holder.
+pub(crate) fn is_lost_holder_history(source: &Session, replacement: &Session) -> bool {
+    replacement
+        .proof
+        .as_ref()
+        .and_then(|live| source.lost_holder_history(live))
+        .as_ref()
+        == Some(replacement)
+}
+
+/// Whether a saved transcript stops before its provider's closing answer. A
+/// transcript records no separate end-of-turn mark, so this is a question to
+/// put to the reader, not a statement about what the provider did.
+pub(crate) fn last_turn_uncertain(items: &[std::sync::Arc<Item>]) -> bool {
+    items
+        .iter()
+        .rev()
+        .find(|item| item.role != Role::System)
+        .is_some_and(|item| {
+            !(item.role == Role::Assistant
+                && matches!(
+                    &item.content,
+                    ItemContent::Text {
+                        thinking: false,
+                        ..
+                    }
+                ))
+        })
+}
+
 /// Account recovery changes only account selection. It never changes the
 /// provider, conversation, executable, working directory, or launch options.
 /// Runtime identities and daemon-allocated listener paths may be refreshed.
@@ -870,6 +900,35 @@ impl Session {
                 .session_id
                 .as_ref()
                 .is_some_and(|id| id.len() == 36 && uuid::Uuid::parse_str(id).is_ok())
+    }
+
+    /// The saved reader for a retained Claude conversation whose helper belonged
+    /// to an earlier kernel boot, when `live` is the daemon that would serve it.
+    /// A changed boot proves every old process is gone; a missing holder within
+    /// the same boot proves nothing and yields no reader. Everything except the
+    /// dead owner's proof, pair and continuity stays exact, and the result is
+    /// only a page reader: starting a provider remains a separate explicit act.
+    pub(crate) fn lost_holder_history(
+        &self,
+        live: &crate::model::HostSessionProof,
+    ) -> Option<Self> {
+        if !matches!(
+            self.native_continuity,
+            NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        ) || !self.has_valid_native_continuity()
+            || !live.is_complete()
+            || self
+                .proof
+                .as_ref()
+                .is_none_or(|saved| !saved.is_complete() || saved.boot_id == live.boot_id)
+        {
+            return None;
+        }
+        let mut reader = self.clone();
+        reader.proof = Some(live.clone());
+        reader.terminal = None;
+        reader.native_continuity = NativeContinuity::ReconnectOnly;
+        reader.is_saved_claude_history().then_some(reader)
     }
 
     /// Import an installed capability observed on this exact authenticated
