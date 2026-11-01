@@ -585,6 +585,8 @@ pub(super) struct State {
     receiver: async_channel::Receiver<(Target, Wake)>,
     generation: u64,
     phases: HashMap<CardId, Phase>,
+    /// Panes waiting for the daemon to say whether their agent's console runs.
+    console_checks: HashSet<CardId>,
     /// Transient user intent, never an execution proof. Automatic restoration
     /// cannot acquire this permission; an exact failed History start can retry.
     explicit_starts: HashMap<CardId, chat::Session>,
@@ -633,6 +635,7 @@ impl Default for State {
             receiver,
             generation: 0,
             phases: HashMap::new(),
+            console_checks: HashSet::new(),
             explicit_starts: HashMap::new(),
             abandoned: HashMap::new(),
             retiring: HashSet::new(),
@@ -4833,9 +4836,21 @@ fn console_still_hosted(console: &TerminalSession) -> Result<bool, String> {
     let mut client =
         crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     let hosted = client.list().map_err(|error| error.to_string())?;
-    Ok(hosted
-        .iter()
-        .any(|hosted| crate::agent_execution::same_terminal_process(&hosted.session, console)))
+    let Some(hosted) = hosted.iter().find(|hosted| hosted.session.id == console.id) else {
+        return Ok(false);
+    };
+    if crate::agent_execution::same_terminal_process(&hosted.session, console) {
+        return Ok(true);
+    }
+    // Running under a proof this window has not caught up with, after a daemon
+    // restart. Only a completed console has no proof at all.
+    if hosted.session.launch == console.launch && hosted.session.continuity.live_proof().is_some() {
+        return Err(
+            "The daemon restarted and this window is still catching up; try again in a moment."
+                .into(),
+        );
+    }
+    Ok(false)
 }
 
 /// The agent whose console `session` is paired with, if it is.
@@ -7448,6 +7463,9 @@ impl Cagents {
                 self.open_chat(card, session, chat::Intent::Restore)
             }
             Surface::Chat => {
+                if !self.chat_ui.console_checks.insert(card) {
+                    return Task::none();
+                }
                 let console = presentation.console;
                 cosmic::task::future(async move {
                     let hosted =
@@ -7471,6 +7489,7 @@ impl Cagents {
         hosted: Result<bool, String>,
     ) -> Task<Message> {
         use crate::agent_execution::Surface;
+        self.chat_ui.console_checks.remove(&card);
         // The person may have moved on while the daemon answered.
         let Some((presentation, Surface::Chat)) = self.agent_presentation(card) else {
             return Task::none();
@@ -28566,7 +28585,9 @@ mod agent_presentation_tests {
                 crate::workspace_model::views::AgentPresentation::of(&agent).unwrap();
             shown_as_chat(&mut app, card);
             drop(app.update(Message::ChatUi(Action::Switch(card))));
+            assert!(app.chat_ui.console_checks.contains(&card));
             drop(app.update(Message::AgentConsoleChecked { card, hosted }));
+            assert!(app.chat_ui.console_checks.is_empty());
             assert_eq!(
                 app.card_state(card).unwrap().kind,
                 CardKind::Chat(presentation.chat.clone())
