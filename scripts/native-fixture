@@ -1,0 +1,162 @@
+#!/usr/bin/python3 -I
+"""Ask a person's native-fixture-broker to drive an isolated native UI fixture.
+
+This only sends one structured request and prints the reply. It starts nothing,
+and neither reads nor forwards the caller's agent authority.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+
+SOCKET_NAME = "native-fixture-broker.sock"
+ACCOUNTS_SCENES = (
+    "claude-sparse", "codex-sparse", "claude-malformed", "codex-malformed",
+    "claude-delayed", "codex-delayed", "claude-ticket", "codex-ticket",
+    "claude-startup", "codex-startup", "claude-catalog",
+)
+EXIT_NO_BROKER = 69
+MAX_REPLY_BYTES = 2 * 1024 * 1024
+# Longer than any operation the broker allows, so a hung broker still ends this.
+REPLY_SECONDS = 420
+NO_BROKER = (
+    "No native-fixture-broker is listening. Ask the person to run "
+    "scripts/native-fixture-broker in a terminal outside cagents; "
+    "do not start it from this shell."
+)
+
+
+def parse(argv):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def command(name, help_text):
+        sub = commands.add_parser(name, help=help_text)
+        sub.add_argument("fixture")
+        if name not in ("start", "clear"):
+            sub.add_argument("--owner", required=True, help="the owner value start returned")
+        return sub
+
+    start = command("start", "start a nested session and sandbox")
+    start.add_argument("--checkout", required=True, help="checkout beneath this repository's .worktrees/")
+    start.add_argument("--width", type=int, help="logical width of the app's viewport")
+    start.add_argument("--recipe", choices=("accounts-quota",))
+    start.add_argument("--scene", choices=ACCOUNTS_SCENES)
+    start.add_argument("--layout", choices=("wide", "narrow"))
+    start.add_argument("--side", choices=("before", "after"))
+    command("viewport", "set the logical viewport width").add_argument("--width", type=int, required=True)
+    command("clear", "remove a stopped or left-behind fixture by name")
+    command("run-ui", "build and launch through scripts/run-development --browserless")
+    command("cli", "run the fixture's own cagents").add_argument("args", nargs=argparse.REMAINDER)
+    command("click", "click a label or X,Y").add_argument("target")
+    commands.choices["click"].add_argument("--button", choices=("left", "right", "middle"))
+    commands.choices["click"].add_argument("--double", action="store_true")
+    command("move", "hover a label or X,Y").add_argument("target")
+    command("type", "type literal text").add_argument("text")
+    command("key", "press key chords").add_argument("chords", nargs="+")
+    scroll = command("scroll", "scroll the pointer's surface")
+    scroll.add_argument("axis", choices=("v", "h"))
+    scroll.add_argument("notches", type=float)
+    scroll.add_argument("--at")
+    wait = command("wait", "wait for text to appear or disappear")
+    wait.add_argument("text")
+    wait.add_argument("--gone", action="store_true")
+    wait.add_argument("--timeout", type=float)
+    command("observe", "report windows and located text").add_argument("--no-text", action="store_true")
+    command("screenshot", "capture into the fixture root").add_argument("name")
+    command("status", "report the fixture's state")
+    command("stop", "stop the fixture and remove its directory").add_argument(
+        "--keep", action="store_true", help="keep the fixture directory and its screenshots"
+    )
+    return parser.parse_args(argv)
+
+
+def request_from(parsed):
+    command = parsed.command
+    fixture = parsed.fixture
+    if command == "start":
+        request = {"op": "start", "fixture": fixture, "checkout": str(Path(parsed.checkout).absolute())}
+        if parsed.width is not None:
+            request["width"] = parsed.width
+        for name in ("recipe", "scene", "layout", "side"):
+            value = getattr(parsed, name)
+            if value is not None:
+                request[name] = value
+        return request
+    if command == "clear":
+        return {"op": "clear", "fixture": fixture}
+    owned = {"fixture": fixture, "owner": parsed.owner}
+    if command == "run-ui":
+        return {"op": "run-ui", **owned}
+    if command == "viewport":
+        return {"op": "viewport", **owned, "width": parsed.width}
+    if command == "cli":
+        args = parsed.args[1:] if parsed.args[:1] == ["--"] else parsed.args
+        return {"op": "cli", **owned, "args": args}
+    if command == "screenshot":
+        return {"op": "screenshot", **owned, "name": parsed.name}
+    if command == "status":
+        return {"op": "status", **owned}
+    if command == "stop":
+        return {"op": "stop", **owned, "keep": parsed.keep}
+    request = {"op": "input", **owned, "action": command}
+    if command in ("click", "move"):
+        request["target"] = parsed.target
+        if command == "click":
+            request["double"] = parsed.double
+            if parsed.button:
+                request["button"] = parsed.button
+    elif command == "type":
+        request["text"] = parsed.text
+    elif command == "key":
+        request["chords"] = parsed.chords
+    elif command == "scroll":
+        request.update(axis=parsed.axis, notches=parsed.notches)
+        if parsed.at:
+            request["at"] = parsed.at
+    elif command == "wait":
+        request.update(text=parsed.text, gone=parsed.gone)
+        if parsed.timeout is not None:
+            request["timeout"] = parsed.timeout
+    elif command == "observe":
+        request["no_text"] = parsed.no_text
+    return request
+
+
+def main(argv=None):
+    request = request_from(parse(argv))
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        print(NO_BROKER, file=sys.stderr)
+        return EXIT_NO_BROKER
+    connection = socket.socket(socket.AF_UNIX)
+    connection.settimeout(REPLY_SECONDS)
+    try:
+        connection.connect(str(Path(runtime) / SOCKET_NAME))
+    except OSError:
+        print(NO_BROKER, file=sys.stderr)
+        return EXIT_NO_BROKER
+    with connection, connection.makefile("rwb") as stream:
+        stream.write(json.dumps(request).encode() + b"\n")
+        stream.flush()
+        try:
+            reply = stream.readline(MAX_REPLY_BYTES)
+        except TimeoutError:
+            print("The broker did not reply in time.", file=sys.stderr)
+            return 1
+    if not reply.endswith(b"\n"):
+        print("The broker closed the connection without a complete reply.", file=sys.stderr)
+        return 1
+    print(reply.decode().rstrip("\n"))
+    decoded = json.loads(reply)
+    if not decoded.get("ok"):
+        return 1
+    code = decoded.get("result", {}).get("exit_code", 0)
+    return min(abs(code), 125) if isinstance(code, int) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

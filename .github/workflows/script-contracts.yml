@@ -110,6 +110,17 @@ jobs:
                   raise SystemExit(result.returncode)
           PY
 
+      - name: Allow the native fixture sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Check native fixture broker contracts
+        env:
+          NATIVE_FIXTURE_REQUIRE_SANDBOX: "1"
+        run: python3 -I -B tests/native_fixture_broker.py -v
+
       - name: Check all formatter contracts
         env:
           CHECK_FORMAT_CARGO_FIXTURE: "1"

@@ -7,6 +7,203 @@ turn busy, acknowledges queued-message removal, and settles on interrupt.
 Later turns complete immediately. Busy messages deliberately stay queued;
 this fixture checks composer interactions, not provider delivery.
 
+There are two routes. An agent uses the broker below. A person in a terminal
+outside cagents can also follow the direct steps after it.
+
+## From an agent: the native fixture broker
+
+A hosted session carries `CAGENTS_AGENT_AUTHORITY`, so the direct steps refuse
+to run there, and that guard stays. Do not unset, proxy or forge the capability
+to get past it. Instead, ask the person to start the broker once, in their own
+terminal outside cagents and inside their niri session:
+
+```sh
+scripts/native-fixture-broker
+```
+
+It exits 77 if agent authority is present in its environment or in any ancestor
+process's. It listens on `$XDG_RUNTIME_DIR/native-fixture-broker.sock` (mode
+0600). Start it from a commit you have reviewed, because it runs with your full
+authority; it prints its path and SHA-256 when it starts. Ctrl-C, SIGTERM or
+closing the terminal stops its fixtures and keeps their directories.
+
+An agent then drives a named fixture from any shell, with its environment
+unchanged. The client sends one structured request and never reads or forwards
+the capability. If no broker is listening it says so and exits 69; do not start
+one yourself.
+
+```sh
+scripts/native-fixture start composer --checkout "$repo/.worktrees/my-branch" --width 1600
+# Prints owner and root. Later commands need --owner; put it before the name.
+scripts/native-fixture run-ui --owner "$owner" composer
+scripts/native-fixture status --owner "$owner" composer
+scripts/native-fixture cli --owner "$owner" composer -- project open "$root/sandbox/project"
+scripts/native-fixture cli --owner "$owner" composer -- --json agent spawn --provider claude \
+  --model haiku --surface chat --repository "$root/sandbox/project" \
+  --prompt 'Can you investigate why the Kaggle submission failed?'
+scripts/native-fixture wait --owner "$owner" composer 'Kaggle' --timeout 60
+scripts/native-fixture click --owner "$owner" composer 'Steer'
+scripts/native-fixture type --owner "$owner" composer 'a literal message'
+scripts/native-fixture viewport --owner "$owner" composer --width 480
+scripts/native-fixture screenshot --owner "$owner" composer after-queued-steer
+scripts/native-fixture stop --owner "$owner" composer --keep
+```
+
+The checkout must be beneath this repository's `.worktrees/`, so add one with
+`git worktree add` if you work elsewhere. At most two fixtures run at once, so a
+before and an after can be live together.
+
+- **Building:** `run-ui` runs `scripts/run-development --browserless` and returns
+  while it builds; follow `sandbox/runner.log` and `sandbox/ui.log` under the
+  root. Each checkout builds into its own target under
+  `.worktrees/native-fixture-targets/`, because sandboxed build scripts can write
+  there. The first build of each checkout is cold, and these directories stay
+  until you delete them. `cli` is refused until this fixture's runner has built a
+  binary whose Cargo dep-info names this checkout. Only one fixture builds at a
+  time: `run-ui` refuses with `build_busy` while another is building, so run it
+  again later. Only that fixture's owner can read its `status` or stop it; if
+  its owner is gone, the person running the broker restarts it. Unreadable or
+  malformed runner state remains busy or unavailable; it does not permit a
+  second build. An unacknowledged runner launch also keeps that build exclusion
+  until existing completion or holder-exit evidence is available; it does not
+  make the CLI usable. Each launch uses a new log: first `sandbox/runner.log`,
+  then `sandbox/runner-2.log`, and so on. `run-ui` and `status` report the current
+  log; previous logs remain intact and their completion markers do not complete
+  a later attempt. An existing attempt-log path refuses launch before its child
+  is started. CLI use requires the current attempt's successful launch reply.
+- **Viewport:** `start --width` and `viewport --width` set the app's logical width
+  from 320 to 3840, through the nested output's scale, and fit it again before
+  input and screenshots if the host has resized the nested window. The host lays
+  out that window, so its framebuffer and height are not chosen here. `start`,
+  `viewport` and `screenshot` report what was reached, and `matches` is false when
+  the width could not be, such as a narrow width on a small nested window. Compare
+  those values across a before/after pair, and keep the host window the same size
+  between them.
+- **Screenshots** land in `shots/` under the root as PNG; convert them to WebP for
+  a PR.
+- **Stopping:** after the original holder's exit and a successful nested-session
+  stop are confirmed, `stop` removes the fixture directory unless given `--keep`,
+  and lists under `left_behind` anything it could not remove. Uncertain waits,
+  failed session stops or resource closes retain the name and private controls;
+  a failed request stays failed even if later settlement permits cleanup. A kept
+  directory, or one left by a killed broker, blocks a new `start` of that name
+  until `scripts/native-fixture clear NAME`. A failed `start` frees its name only
+  after that same cleanup is confirmed. During broker shutdown, new work is
+  refused and accepted requests and original children are drained. A stopping
+  diagnostic can remain indefinitely while ownership is uncertain; request
+  timeouts do not promise safe release. The way out is the person's: `kill -9`
+  the broker. Its sandboxes die with it, its nested niri windows stay until the
+  broker next starts or `clear` runs, and that next start recovers the names. A
+  host start the broker itself killed may leave a nested window with no session
+  record, which the person closes by hand.
+- **Owner:** the owner value only stops agents using each other's fixtures by
+  accident. It is not a security control.
+
+The optional behaviors below use `sandbox/home/.claude` under the root, which you
+can write from your own shell. Also `move`, `key`, `scroll` and `observe`; see
+`scripts/native-fixture --help`.
+
+### Fixed Accounts scenes
+
+The optional `accounts-quota` recipe selects only these inert scenes:
+`claude-sparse`, `codex-sparse`, `claude-malformed`, `codex-malformed`,
+`claude-delayed`, `codex-delayed`, `claude-ticket`, `codex-ticket`,
+`claude-startup`, `codex-startup`, and `claude-catalog`. Select it at `start`;
+the scene, layout and source-side labels cannot change afterward. All four
+recipe fields and an explicit width are required. No environment, root path,
+extra command arguments or clock override can be supplied.
+
+```sh
+scripts/native-fixture start accounts-before --checkout "$before_checkout" \
+  --width 1600 --recipe accounts-quota --scene claude-sparse --layout wide --side before
+scripts/native-fixture run-ui --owner "$owner" accounts-before
+```
+
+Use the owner returned by that `start`. Use matching 1600-pixel wide and
+480-pixel narrow requests for a comparison, with a fresh fixture for each
+scene/layout/side. These are proposed capture sizes, not proof of the reached
+viewport; inspect the existing viewport reports and actual native frames.
+For this recipe, `viewport` can only re-fit the original requested width.
+
+The fixed selector reaches the same `scripts/run-development --browserless`
+matched CLI/HOST/UI builds and default local UI window. Inside the sandbox,
+the existing held private runtime directory is mounted at
+`/tmp/cagents-1938-native-<scene>-<wide|narrow>-<before|after>`. Its distinct
+`data`, `config`, `cache`, `state` and `runtime` children are owned mode0700
+directories; all five XDG variables point there. The held nested Wayland socket
+is mounted at that namespace's `runtime/nested-wayland`. HOME stays private.
+Existing roots are refused, not adopted or repaired, and failed setup does not
+automatically delete an unowned preexisting runtime root.
+
+All starts, including the ordinary recipe, exclusively create their private
+control, runtime and repository fixture roots. A live start records each
+successful creation before any later setup step, and automatic failed-start
+cleanup or stop can remove only those roots it created. An earlier failed stale
+recovery does not authorize a later start to borrow its controls. Explicit
+`clear` and startup stale recovery retain their existing host-stop requirements.
+Shared parent directories remain the existing trusted starting points; these
+creation records do not establish ownership against arbitrary same-user changes.
+
+Accounts launches are single-use, including a lost launch reply. A second
+`run-ui` refuses; safely stop/clear the fixture and start a fresh one instead.
+Never delete `accounts-native-started` or reset logs to reuse a scene. Original
+wait/close/host-stop uncertainty still retains ownership and can keep shutdown
+incomplete. `--keep` keeps the repository fixture logs/screenshots; the private
+runtime-backed Accounts namespace remains subject to normal runtime cleanup.
+
+Source pairs are separate from side labels. The original ten-scene ports are
+Before `dc2a10b0f3b925e5c2546722004782b629d4de3b` and After
+`48f5254a97e6b8865c40f7d9a1cbc73f41c530f2`. The catalog pair is Before
+`471bd5316a54ec9f4ed888f207dc11ceeffead8a` and After
+`aa0606e351fc4a54ed097a1878655bd216caa856`; catalog Before is the old Accounts
+feature/main composition, not the whole main baseline. Owners must bind actual
+source/build/ELF evidence. An incompatible checkout fails fixture startup;
+there is no ordinary-mode fallback. Catalog uses the fixed Nov1 UTC seed and
+refuses at Nov2 2026 00:00 UTC; no broker time override extends it. F8 supplies
+only the fixture's fixed typed Loaded event, not arbitrary callback data.
+
+This recipe supplies source controls, not build or native admission. The real
+three-graph build still needs a separately decided stable resource/build
+admission. Existing per-checkout targets and per-process limits are not an
+aggregate memory cgroup cap. A genuine User must start the reviewed broker;
+actual bootstrap, matched executables, native screenshots/interaction and UX
+review remain required. Synthetic Accounts rows and receipts do not qualify
+provider/account/home/daemon behavior or grant User authority.
+
+### What the sandbox can reach
+
+Each fixture runs in a bubblewrap sandbox with its own HOME, XDG directories,
+runtime directory, daemon and project. It has no network, so builds use only what
+is cached. It sees none of your real HOME, credentials, `~/.local/share/cagents*`
+or `$XDG_RUNTIME_DIR/cagents*`. `claude` there is this fixture script.
+
+- **Read-only:** `/usr`, `/etc`, `/sys`, the Rust toolchain, Zig, Cargo's `bin`,
+  `registry` and `git` directories, Zig's package cache, the checkout, and this
+  repository's `.git`.
+- **Writable:** the checkout's Cargo target, the fixture's `sandbox/` directory and
+  runtime directory, tmpfs at `/tmp`, `/var` and Cargo's home, and the nested
+  Wayland socket. `/dev/dri` is also bound, for the GPU.
+- **Limits:** per-process address space (128 GiB) and file size (32 GiB), 8192
+  processes, and no core files. Total memory is not capped, because that needs a
+  cgroup, which this does not set up. Several fixtures building at once can still
+  exhaust the host's memory. `run-ui` learns a build has finished from a line in
+  a log the sandbox can write, so sandbox code can hold other fixtures' builds
+  back until its own fixture is stopped.
+
+On the host side only the broker, `niri-harness` and `niri` run. Nested niri runs
+nothing from a checkout. Commands reach the sandbox over an inherited socket, not
+a path, and its replies are bounded and treated as untrusted. A sandbox can forge
+what its own commands appear to have done, including its own `status`, so treat
+fixture output as evidence about that checkout only.
+
+The broker protects you from code running inside the sandbox. It does not protect
+you from an agent's shell of the same user, which can already reach the same files
+and sockets, including `.worktrees/` and the broker's state under
+`$XDG_RUNTIME_DIR/native-fixture-broker/`. It is a supported route that removes
+the need for a workaround, not a boundary against that shell.
+
+## Directly: from a person's own terminal
+
 Use a new directory beneath the repository's ignored `.worktrees/` for every
 run. Keep its HOME, XDG data/config/cache, daemon runtime, and project isolated
 from the development application you normally use. For example, from the
