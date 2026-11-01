@@ -18,6 +18,27 @@ pub(in crate::host) enum ResidentRelease {
     CompletedWriter,
 }
 
+/// A chat's capability from an earlier kernel boot: every holder of its token is
+/// gone. It stays recorded and proves nothing beyond belonging to this pane.
+pub(in crate::host) fn earlier_boot_self_authority(
+    stored: &HostedSession,
+    reader: &HostedSession,
+) -> bool {
+    let (HostedSession::Chat(stored), HostedSession::Chat(reader)) = (stored, reader) else {
+        return false;
+    };
+    stored.id == reader.id
+        && stored.launch.provider == reader.launch.provider
+        && stored.launch.recipe == reader.launch.recipe
+        && stored
+            .proof
+            .as_ref()
+            .zip(reader.proof.as_ref())
+            .is_some_and(|(stored, reader)| {
+                stored.is_complete() && reader.is_complete() && stored.boot_id != reader.boot_id
+            })
+}
+
 /// A self capability is not a managed agent binding. A history reader cannot
 /// prove teardown of a former writer, so only a completed writer may retire it.
 fn resident_release_authority(
@@ -74,6 +95,10 @@ fn resident_release_authority(
         .map_err(|error| error.to_string())?;
     if let Some((_, stored)) = &authority {
         if matches!(kind, ResidentRelease::ReadOnlyHistory) {
+            // Nothing to prove torn down, and nothing for this release to revoke.
+            if earlier_boot_self_authority(&decode::<HostedSession>(stored)?, source) {
+                return Ok(None);
+            }
             return Err("A retained provider or managed agent authority remains; a history reader cannot prove its teardown".into());
         }
         // Provider-confirmed thread metadata can advance after startup; the

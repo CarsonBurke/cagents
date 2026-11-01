@@ -35,7 +35,7 @@ pub(super) mod channel_work;
 mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
 mod execution;
-pub(super) use execution::ResidentRelease;
+pub(super) use execution::{ResidentRelease, earlier_boot_self_authority};
 mod lineage;
 mod mailbox;
 mod native_actor;

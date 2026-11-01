@@ -789,31 +789,70 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
     let mut saved = original.clone();
     saved.proof.as_mut().unwrap().boot_id = "earlier-boot".into();
     let reader = saved.lost_holder_history(&proof).unwrap();
-    // A persisted row carries the old boot too; it is the descriptor's own.
+    // What a real reboot leaves: every durable row still names the old boot,
+    // including the ownership row's owner.
+    let fixture = rusqlite::Connection::open(root.join("registry.sqlite3")).unwrap();
+    let live_boot = proof.boot_id.to_string();
+    for table in ["agent_authorities", "native_actor_ownerships"] {
+        let column = if table == "agent_authorities" {
+            "source"
+        } else {
+            "ownership"
+        };
+        let changed = fixture
+            .execute(
+                &format!(
+                    "UPDATE {table} SET {column}=replace({column},?1,'earlier-boot') WHERE instr({column},?1)>0"
+                ),
+                [&live_boot],
+            )
+            .unwrap();
+        assert!(changed >= 1, "{table} carried no boot to rewrite");
+    }
     {
         let registry = super::super::agent_execution::registry(&host).unwrap();
-        let db = registry.lock().unwrap();
-        assert!(!db.retained_agent_sources(saved.id).unwrap().is_empty());
-        drop(db);
-        let fixture = rusqlite::Connection::open(root.join("registry.sqlite3")).unwrap();
-        let (stored,): (String,) = fixture
-            .query_row(
-                "SELECT source FROM agent_authorities WHERE session_id=?1",
-                [saved.id.to_string()],
-                |row| Ok((row.get(0)?,)),
-            )
+        let owners = registry
+            .lock()
+            .unwrap()
+            .native_actor_ownerships(None, 128)
             .unwrap();
-        let live_boot = crate::daemon::read_boot_id().unwrap().to_string();
-        fixture
-            .execute(
-                "UPDATE agent_authorities SET source=?2 WHERE session_id=?1",
-                rusqlite::params![
-                    saved.id.to_string(),
-                    stored.replace(&live_boot, "earlier-boot")
-                ],
-            )
-            .unwrap();
+        assert!(owners.iter().any(|owner| owner.source().id == saved.id
+            && owner.owner().boot.to_string() == "earlier-boot"));
     }
+    let authority_row = || -> (String, String) {
+        fixture
+            .query_row(
+                "SELECT token,source FROM agent_authorities WHERE session_id=?1",
+                [saved.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let authority_before = authority_row();
+
+    // A home remapped under the recorded launch is another account.
+    let account_moved = root.join("fixture-inputs/workload/account-moved");
+    let remap = || {
+        fs::rename(&account, &account_moved).unwrap();
+        fs::create_dir(&account).unwrap();
+        fs::set_permissions(&account, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let unmap = || {
+        fs::remove_dir_all(&account).unwrap();
+        fs::rename(&account_moved, &account).unwrap();
+    };
+    remap();
+    let (remapped, worker) = serve(&host, 83, saved.clone());
+    let failure = remapped.err().expect("a remapped home opened a reader");
+    assert!(
+        failure.message.contains("different physical account home"),
+        "{}",
+        failure.message
+    );
+    worker.join().unwrap();
+    unmap();
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert_eq!(authority_row(), authority_before);
 
     let (restored, worker) = serve(&host, 82, saved.clone());
     let restored = restored.unwrap();
@@ -834,6 +873,37 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
         "opening history ran no provider"
     );
     assert_eq!(fs::read(&history).unwrap(), history_before);
+
+    assert_eq!(authority_row(), authority_before, "reading revokes nothing");
+    assert!(
+        !super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_agent_sources(saved.id)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The same remap between reading and resuming still refuses.
+    remap();
+    let refused = crate::chat::client::ClientHandle::connect(
+        reader.clone(),
+        chat::Intent::Start,
+        None,
+        false,
+        None,
+        |_| {},
+    )
+    .err()
+    .expect("a remapped home resumed");
+    assert!(
+        refused.message.contains("different physical account home"),
+        "{}",
+        refused.message
+    );
+    unmap();
+    assert_eq!(provider_runs(), runs_before);
 
     // The one explicit action: normal Start on the exact reader descriptor.
     let resumed = crate::chat::client::ClientHandle::connect(
@@ -868,7 +938,38 @@ fn named_claude_resume_after_lost_holder_sends_nothing() {
         history_before,
         "the provider's user records are unchanged"
     );
+    // Start's own fresh capability replaced the dead row.
+    assert_ne!(authority_row().0, authority_before.0);
+
+    // The kept allocation is not poisoned by the older owner's unreadable row.
+    let closing = resumed.session();
     resumed.close().unwrap();
+    drop(resumed);
+    wait("resumed close", &mut || {
+        !host.lock().unwrap().chats.contains_key(&closing.id)
+    });
+    let ServerResponse::ChatResumePrepared { session: next } = process(
+        &host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: closing.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected exact resume preparation");
+    };
+    assert_ne!(next.id, closing.id);
+    assert_eq!(next.launch, closing.launch);
+    super::retained_actor::close_unattached(&host, &closing, None).unwrap();
+    assert_eq!(
+        fs::read(&history).unwrap(),
+        history_before,
+        "the provider's user records are still unchanged"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("prompts")).unwrap(),
+        prompts_before
+    );
     drop(restored);
     drop(worker);
 }
