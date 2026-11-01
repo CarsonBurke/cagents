@@ -4443,3 +4443,95 @@ fn execution_gates_keep_existing_callers_after_successful_close() {
     );
     assert!(Arc::ptr_eq(&pending, &agent_gate(&host, accepted.agent.id)));
 }
+
+#[test]
+fn console_lines_summarize_steps_without_their_payloads() {
+    use chat::{CommandAction, DeliveryKind, Item, ItemContent, Role, ToolStatus};
+    let item = |role, content| Item {
+        started_at: None,
+        id: "item".into(),
+        role,
+        content,
+        at: None,
+    };
+    let command = |label: &str, status, exit_code| {
+        item(
+            Role::Assistant,
+            ItemContent::Command {
+                label: label.into(),
+                command: "cargo test --locked\nexit 0".into(),
+                working_directory: "/repo".into(),
+                action: CommandAction::Run,
+                status,
+                exit_code,
+                duration_ms: None,
+                output: "SECRET_OUTPUT".into(),
+            },
+        )
+    };
+    let tool = |status| {
+        item(
+            Role::Assistant,
+            ItemContent::Tool {
+                name: "Agent".into(),
+                input: "{\"prompt\":\"internal instructions\"}".into(),
+                output: "agentId: internal metadata".into(),
+                status,
+            },
+        )
+    };
+    let lines = [
+        item(
+            Role::Assistant,
+            ItemContent::Text {
+                text: "Done.".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+        ),
+        item(
+            Role::Assistant,
+            ItemContent::Text {
+                text: "private reasoning".into(),
+                thinking: true,
+                phase: Default::default(),
+            },
+        ),
+        command("", ToolStatus::Succeeded, Some(0)),
+        command("Run the tests", ToolStatus::Failed, Some(101)),
+        command("Run the tests", ToolStatus::Running, None),
+        tool(ToolStatus::Succeeded),
+        tool(ToolStatus::Denied),
+        tool(ToolStatus::Running),
+        item(
+            Role::User,
+            ItemContent::Delivery {
+                kind: DeliveryKind::Report,
+                from: "Explore".into(),
+                sender: "task".into(),
+                summary: "Mapped the console".into(),
+                body: "FULL_REPORT_BODY".into(),
+            },
+        ),
+    ]
+    .iter()
+    .filter_map(console_line)
+    .collect::<String>();
+    assert!(lines.starts_with(
+        "Assistant: Done.\n\
+         Ran cargo test --locked\n\
+         Ran Run the tests (failed, exit 101)\n\
+         Called Agent\n\
+         Called Agent (denied)\n"
+    ));
+    for hidden in [
+        "private reasoning",
+        "SECRET_OUTPUT",
+        "exit 0",
+        "internal",
+        "FULL_REPORT_BODY",
+    ] {
+        assert!(!lines.contains(hidden), "{hidden} leaked into {lines:?}");
+    }
+    assert_eq!(lines.lines().count(), 6, "{lines:?}");
+}

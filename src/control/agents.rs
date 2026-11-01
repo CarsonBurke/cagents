@@ -2720,12 +2720,16 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                 }
                 previous = text;
                 if last_run != Some((view.run.id, view.run.revision)) {
-                    println!(
-                        "\nRun {}: {:?}; usage: {}",
-                        view.run.id,
-                        view.run.state,
-                        serde_json::to_string(&view.run.result.usage).unwrap_or_default()
-                    );
+                    let usage = &view.run.result.usage;
+                    let tokens = if usage.input_tokens + usage.output_tokens == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} input, {} output tokens)",
+                            usage.input_tokens, usage.output_tokens
+                        )
+                    };
+                    println!("\nRun {}: {:?}{tokens}", view.run.id, view.run.state);
                     if let Some(diagnostic) = &view.run.result.diagnostic {
                         println!("{diagnostic}");
                     }

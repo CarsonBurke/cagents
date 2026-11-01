@@ -1368,39 +1368,8 @@ fn console(
             let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
             let mut truncated = false;
             for item in snapshot.items.iter().rev() {
-                let mut text = match &item.content {
-                    chat::ItemContent::Text {
-                        text,
-                        thinking: false,
-                        ..
-                    } => format!("{:?}: {text}\n", item.role),
-                    chat::ItemContent::Command {
-                        command,
-                        status,
-                        output,
-                        ..
-                    } => format!("Command ({status:?}): {command}\n{output}\n"),
-                    chat::ItemContent::Tool {
-                        name,
-                        status,
-                        output,
-                        ..
-                    } => format!("Tool {name} ({status:?}): {output}\n"),
-                    chat::ItemContent::Delivery {
-                        kind,
-                        from,
-                        sender,
-                        summary,
-                        body,
-                    } => {
-                        let heading = chat::delivery_heading(*kind, from, sender, summary);
-                        if body.is_empty() {
-                            format!("{heading}\n")
-                        } else {
-                            format!("{heading}:\n{body}\n")
-                        }
-                    }
-                    _ => continue,
+                let Some(mut text) = console_line(item) else {
+                    continue;
                 };
                 if text.len() > remaining {
                     crate::agent_execution::truncate(&mut text, remaining);
@@ -1425,6 +1394,73 @@ fn console(
             })))
         }
     }
+}
+
+/// One console line per transcript item. The console is a plain-text view a
+/// person reads, so it shows what the agent said and a one-line account of
+/// each step; command output, tool payloads and delivered reports stay in the
+/// native chat view, which discloses them on demand. A step appears once it
+/// settles: the client prints only what extends the text it already printed,
+/// and a step changing from running to finished in place would make it print
+/// the whole transcript again.
+fn console_line(item: &chat::Item) -> Option<String> {
+    use chat::{CommandAction, ItemContent, ToolStatus};
+    if item.content.status() == Some(ToolStatus::Running) {
+        return None;
+    }
+    let outcome = |status: &ToolStatus| match status {
+        ToolStatus::Succeeded | ToolStatus::Running => "",
+        ToolStatus::Failed => " (failed)",
+        ToolStatus::Denied => " (denied)",
+        ToolStatus::Stopped => " (stopped)",
+    };
+    Some(match &item.content {
+        ItemContent::Text {
+            text,
+            thinking: false,
+            ..
+        } => format!("{:?}: {text}\n", item.role),
+        ItemContent::Command {
+            label,
+            command,
+            action,
+            status,
+            exit_code,
+            ..
+        } => {
+            let verb = match action {
+                CommandAction::Run => "Ran",
+                CommandAction::Read => "Read",
+                CommandAction::Search => "Searched",
+                CommandAction::List => "Listed",
+            };
+            let target = if label.trim().is_empty() {
+                command.trim()
+            } else {
+                label.trim()
+            };
+            let target = target.lines().next().unwrap_or_default();
+            let exit = match (status, exit_code) {
+                (ToolStatus::Failed, Some(code)) => format!(" (failed, exit {code})"),
+                _ => outcome(status).to_owned(),
+            };
+            format!("{verb} {target}{exit}\n")
+        }
+        ItemContent::Changes { changes, status } => match changes.as_slice() {
+            [] => return None,
+            [single] => format!("Edited {}{}\n", single.path, outcome(status)),
+            many => format!("Edited {} files{}\n", many.len(), outcome(status)),
+        },
+        ItemContent::Tool { name, status, .. } => format!("Called {name}{}\n", outcome(status)),
+        ItemContent::Delivery {
+            kind,
+            from,
+            sender,
+            summary,
+            ..
+        } => format!("{}\n", chat::delivery_heading(*kind, from, sender, summary)),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
