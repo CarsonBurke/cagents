@@ -42,6 +42,7 @@ mod settings_ui;
 mod shared_views;
 mod sidebar_selection_ui;
 mod startup_gate;
+pub mod startup_window;
 mod terminal_adoption;
 mod terminal_close;
 mod terminal_end_ui;
@@ -2227,7 +2228,7 @@ fn apply_attached_worktree_prs(
     }
 }
 
-/// Everything `bootstrap` resolves before iced exists, named rather than
+/// Everything `bootstrap` resolves before Cagents exists, named rather than
 /// positional: this used to be a nine-wide tuple mutated through `bootstrap.7`.
 pub(crate) struct Bootstrap {
     workspace: WorkspaceState,
@@ -2247,11 +2248,28 @@ pub(crate) struct Bootstrap {
     settings_warnings: Vec<String>,
 }
 
-/// Loaded before iced starts: session restoration and file locks never wait on
-/// the native event loop. Only successfully restored launches can report ready.
+/// Loaded once by the owned startup worker after initial surface configuration.
+/// Only successfully restored launches can report ready.
 pub struct Startup {
     bootstrap: Bootstrap,
     window_view: Option<WindowView>,
+}
+
+impl Startup {
+    fn prepare_for_window(&mut self) {
+        let Bootstrap {
+            workspace,
+            projects,
+            worktrees,
+            session,
+            ..
+        } = &mut self.bootstrap;
+        reconcile_restored_projects(projects, worktrees, &workspace.project_order);
+        let retired = worktree_ui::retire_missing_worktrees(worktrees);
+        if let Some(session) = session {
+            session.save_worktrees(retired);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -14046,8 +14064,8 @@ impl Application for Cagents {
         let Bootstrap {
             workspace: durable,
             session,
-            mut projects,
-            mut worktrees,
+            projects,
+            worktrees,
             mut settings,
             settings_path,
             settings_write_blocked,
@@ -14056,11 +14074,6 @@ impl Application for Cagents {
             restore_warnings,
             settings_warnings,
         } = startup.bootstrap;
-        reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
-        let retired = worktree_ui::retire_missing_worktrees(&mut worktrees);
-        if let Some(session) = &session {
-            session.save_worktrees(retired);
-        }
         let window_view = startup.window_view;
         if let Some(view) = &window_view {
             settings.sidebar_width = sidebar::clamp_expanded_width(view.sidebar_width);

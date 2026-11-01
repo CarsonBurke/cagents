@@ -19,6 +19,9 @@ pub enum Action {
     /// Open a new window with some [`Settings`].
     Open(Id, Settings, oneshot::Sender<Id>),
 
+    /// Open a window and report checked initial surface configuration.
+    OpenConfigured(Id, Settings, oneshot::Sender<Result<Id, OpenError>>),
+
     /// Close the window and exits the application.
     Close(Id),
 
@@ -311,6 +314,49 @@ pub fn open(settings: Settings) -> (Id, Task<Id>) {
     )
 }
 
+/// A failure while opening a window with checked initial configuration.
+///
+/// These categories describe window creation, not application restoration or
+/// the final readiness acknowledgement. Cancellation is never graphics proof.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OpenError {
+    /// The native window could not be created.
+    #[error("could not create the native window: {0}")]
+    NativeCreation(String),
+    /// The compositor or initial surface could not be initialized.
+    #[error("could not initialize graphics: {0}")]
+    GraphicsInitialization(String),
+    /// The initial physical dimensions were zero.
+    #[error("the initial window has zero physical size")]
+    ZeroSize,
+    /// The backend does not support checked initial configuration.
+    #[error("checked initial surface configuration is unsupported")]
+    Unsupported,
+    /// The open operation ended without a result.
+    #[error("the window open operation ended without a result")]
+    Canceled,
+}
+
+/// Opens a window, completing only after its nonzero initial surface has been
+/// configured. This does not establish that a frame was presented or that the
+/// application has restored its state.
+///
+/// Unlike [`open`], a zero-sized initial surface is an explicit error.
+pub fn open_configured(
+    settings: Settings,
+) -> (Id, Task<Result<Id, OpenError>>) {
+    let id = Id::unique();
+    let (sender, receiver) = oneshot::channel();
+    let open = task::effect(crate::Action::Window(Action::OpenConfigured(
+        id, settings, sender,
+    )));
+    let result = Task::future(async move {
+        receiver.await.unwrap_or(Err(OpenError::Canceled))
+    });
+
+    (id, open.chain(result))
+}
+
 /// Closes the window with `id`.
 pub fn close<T>(id: Id) -> Task<T> {
     task::effect(crate::Action::Window(Action::Close(id)))
@@ -580,4 +626,48 @@ pub fn enable_blur<Message>(id: Id) -> Task<Message> {
 /// This is only supported on platforms that support window blur.
 pub fn disable_blur<Message>(id: Id) -> Task<Message> {
     task::effect(crate::Action::Window(Action::DisableBlur(id)))
+}
+
+#[cfg(test)]
+mod configured_open_tests {
+    use super::*;
+    use crate::futures::futures::{FutureExt, StreamExt};
+
+    #[test]
+    fn checked_open_preserves_the_original_id_and_explicit_error() {
+        let (id, task) = open_configured(Settings::default());
+        let mut stream = task::into_stream(task).unwrap();
+        let action = stream.next().now_or_never().flatten().unwrap();
+        let crate::Action::Window(Action::OpenConfigured(actual, _, sender)) =
+            action
+        else {
+            panic!("expected checked window action");
+        };
+        assert_eq!(actual, id);
+        sender.send(Err(OpenError::ZeroSize)).unwrap();
+        let output = stream.next().now_or_never().flatten().unwrap();
+        assert!(matches!(
+            output,
+            crate::Action::Output(Err(OpenError::ZeroSize))
+        ));
+        assert!(stream.next().now_or_never().flatten().is_none());
+    }
+
+    #[test]
+    fn a_missing_checked_open_result_is_canceled_not_graphics_failure() {
+        let (_, task) = open_configured(Settings::default());
+        let mut stream = task::into_stream(task).unwrap();
+        let action = stream.next().now_or_never().flatten().unwrap();
+        let crate::Action::Window(Action::OpenConfigured(_, _, sender)) =
+            action
+        else {
+            panic!("expected checked window action");
+        };
+        drop(sender);
+        let output = stream.next().now_or_never().flatten().unwrap();
+        assert!(matches!(
+            output,
+            crate::Action::Output(Err(OpenError::Canceled))
+        ));
+    }
 }

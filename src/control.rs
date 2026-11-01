@@ -2617,6 +2617,14 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
         .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
 }
 
+/// Authenticated staged routing without restoring a daemon or checkpoint.
+/// Existing locks and authenticated stale-socket housekeeping remain possible.
+/// The original recovering lookup is still required after surface readiness.
+pub fn staged_ui_executable_without_restoration() -> io::Result<Option<PathBuf>> {
+    crate::install_guard::staged_owner_bin(&std::env::current_exe()?, false)
+        .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
+}
+
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     execute_with_model_context(command, None, None)
 }
@@ -2861,6 +2869,302 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<()> {
     finish_ui_launch(child, result, stdout)
 }
 
+/// Update-only launch. The matched UI recognizes this fixed private ABI; an
+/// ordinary launch still uses spawn_ui_process and handshake value "1".
+pub(crate) fn spawn_updated_ui_process(command: &mut Command) -> io::Result<()> {
+    let timeout = if crate::device::is_remote() {
+        UI_LAUNCH_HANDSHAKE_TIMEOUT
+    } else {
+        crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
+            + UI_LAUNCH_HANDSHAKE_TIMEOUT
+    };
+    spawn_updated_ui_with_timeout(command, timeout, |_| {})
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum UpdateLaunchEvent {
+    Spawned(usize),
+    OriginalFailureWaited(usize),
+}
+
+fn spawn_updated_ui_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    mut observe: impl FnMut(UpdateLaunchEvent),
+) -> io::Result<()> {
+    crate::install_guard::sanitize_child_environment(command);
+    command
+        .env(
+            UI_LAUNCH_HANDSHAKE_ENV,
+            instance::UI_LAUNCH_UPDATE_HANDSHAKE,
+        )
+        .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0);
+    // SAFETY: identical owned-child descriptor sealing to ordinary launch.
+    unsafe {
+        command.pre_exec(crate::daemon::seal_inherited_descriptors);
+    }
+    let mut budget = UiLaunchBudget::new(timeout);
+    for attempt in 0..2 {
+        let label_attempt = |error| {
+            if attempt == 0 {
+                error
+            } else {
+                after_ui_retry(error)
+            }
+        };
+        budget.ensure_remaining().map_err(label_attempt)?;
+        let mut original = command.spawn().map_err(label_attempt)?;
+        observe(UpdateLaunchEvent::Spawned(attempt));
+        let mut stdout = original.stdout.take();
+        let reply = stdout
+            .as_mut()
+            .ok_or_else(|| io::Error::other("cagents-ui handshake pipe was not created"))
+            .and_then(|stdout| read_ui_launch_reply(stdout, &mut budget));
+        match reply {
+            Ok(UiLaunchReply::Ready) => return finish_ui_launch(original, Ok(()), stdout),
+            Ok(UiLaunchReply::RendererBeforeState(detail)) => {
+                // Do not kill to manufacture retry eligibility. Retain this
+                // exact Child and pipe until its original wait is known.
+                if let Err(cause) =
+                    wait_renderer_failure(&mut original, stdout.as_mut(), &budget, |_| {})
+                {
+                    let error = io::Error::new(cause.kind(), RendererWaitFailure { detail, cause });
+                    return Err(if attempt == 0 {
+                        error
+                    } else {
+                        after_ui_retry(error)
+                    });
+                }
+                observe(UpdateLaunchEvent::OriginalFailureWaited(attempt));
+                let failure =
+                    || io::Error::other(format!("window graphics initialization failed: {detail}"));
+                if attempt != 0 {
+                    return Err(after_ui_retry(failure()));
+                }
+                if !budget.can_pause_for_retry() {
+                    return Err(failure());
+                }
+                thread::sleep(UI_RENDERER_RETRY_PAUSE);
+                if budget.ensure_remaining().is_err() {
+                    return Err(failure());
+                }
+            }
+            Err(error) => {
+                let result = finish_ui_launch(original, Err(error), stdout);
+                return if attempt == 0 {
+                    result
+                } else {
+                    result.map_err(after_ui_retry)
+                };
+            }
+        }
+    }
+    unreachable!("at most two update attempts")
+}
+
+#[derive(Debug)]
+struct RendererWaitFailure {
+    detail: String,
+    cause: io::Error,
+}
+impl std::fmt::Display for RendererWaitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "window graphics initialization failed: {}; original UI settlement: {}",
+            self.detail, self.cause
+        )
+    }
+}
+impl std::error::Error for RendererWaitFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+#[derive(Debug)]
+struct UiRetryFailure(io::Error);
+impl std::fmt::Display for UiRetryFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cause = self.0.to_string();
+        if let Some(detail) = cause.strip_prefix(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX) {
+            write!(
+                f,
+                "{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}Window recovery remains incomplete after one graphics initialization retry: {detail}"
+            )
+        } else {
+            write!(
+                f,
+                "window could not reopen after one graphics initialization retry: {cause}"
+            )
+        }
+    }
+}
+impl std::error::Error for UiRetryFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+fn after_ui_retry(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), UiRetryFailure(error))
+}
+
+const UI_RENDERER_RETRY_PAUSE: Duration = Duration::from_millis(100);
+
+enum UiLaunchReply {
+    Ready,
+    RendererBeforeState(String),
+}
+
+struct UiLaunchBudget {
+    started: Instant,
+    timeout: Duration,
+    deadline: Instant,
+    recovery_announced: bool,
+    strict_terminal_deadline: bool,
+}
+impl UiLaunchBudget {
+    fn new(timeout: Duration) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            timeout,
+            deadline: started + timeout,
+            recovery_announced: false,
+            strict_terminal_deadline: true,
+        }
+    }
+    fn timeout_error(&self) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            if self.recovery_announced {
+                format!(
+                    "{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}Saved conversations are still recovering. The window was kept open; inspect its recovery notices before retrying the update"
+                )
+            } else {
+                format!(
+                    "cagents-ui did not acknowledge initialization within {:?}",
+                    self.timeout
+                )
+            },
+        )
+    }
+    fn ensure_remaining(&self) -> io::Result<()> {
+        if Instant::now() >= self.deadline {
+            Err(self.timeout_error())
+        } else {
+            Ok(())
+        }
+    }
+    fn can_pause_for_retry(&self) -> bool {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .is_some_and(|remaining| remaining > UI_RENDERER_RETRY_PAUSE)
+    }
+    fn announce_recovery(&mut self, items: u64) -> io::Result<()> {
+        if self.recovery_announced {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cagents-ui announced recovery inventory more than once",
+            ));
+        }
+        self.recovery_announced = true;
+        self.deadline = self
+            .deadline
+            .max(self.started + UI_LAUNCH_HANDSHAKE_TIMEOUT + Duration::from_secs(30 * items));
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RendererWaitEvent {
+    PipePending,
+    OriginalWaited,
+}
+
+fn wait_renderer_failure(
+    original: &mut std::process::Child,
+    mut stdout: Option<&mut ChildStdout>,
+    budget: &UiLaunchBudget,
+    mut observe: impl FnMut(RendererWaitEvent),
+) -> io::Result<()> {
+    let mut first_error = None;
+    let mut original_status = None;
+    let mut eof_after_settlement = false;
+    loop {
+        if let Err(error) = budget.ensure_remaining() {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+        if let Some(stdout) = stdout.as_deref_mut() {
+            let mut buffer = [0; 256];
+            match stdout.read(&mut buffer) {
+                Ok(0) => eof_after_settlement = original_status.is_some(),
+                Ok(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "cagents-ui wrote after its terminal renderer failure",
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    observe(RendererWaitEvent::PipePending);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        // A drain error must never prevent attempting the exact original wait.
+        if original_status.is_none() {
+            match original.try_wait() {
+                Ok(Some(_)) => match original.wait() {
+                    Ok(status) => {
+                        original_status = Some(status);
+                        observe(RendererWaitEvent::OriginalWaited);
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        // The pre-wait read can race a final write/retained writer. Only EOF
+        // observed after the positive original wait completes the terminal pipe.
+        if let Some(status) = original_status.filter(|_| eof_after_settlement) {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            if status.code() != Some(1) {
+                return Err(io::Error::other(format!(
+                    "renderer failure contradicted original UI exit {status}"
+                )));
+            }
+            return Ok(());
+        }
+        // Unknown original wait OR terminal pipe retains both owners locally,
+        // even beyond the workload allowance. Neither attempt nor slot advances.
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn finish_ui_launch(
     mut child: std::process::Child,
     result: io::Result<()>,
@@ -2919,6 +3223,19 @@ fn handshake_reports_already_running(error: &io::Error) -> bool {
 }
 
 fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::Result<()> {
+    let mut budget = UiLaunchBudget::new(timeout);
+    // Preserve ordinary launch's existing ready-vs-WouldBlock timing policy.
+    budget.strict_terminal_deadline = false;
+    match read_ui_launch_reply(stdout, &mut budget)? {
+        UiLaunchReply::Ready => Ok(()),
+        UiLaunchReply::RendererBeforeState(detail) => Err(io::Error::other(detail)),
+    }
+}
+
+fn read_ui_launch_reply(
+    stdout: &mut ChildStdout,
+    budget: &mut UiLaunchBudget,
+) -> io::Result<UiLaunchReply> {
     let descriptor = stdout.as_raw_fd();
     // SAFETY: fcntl receives a live descriptor and integer flags only.
     let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
@@ -2928,9 +3245,6 @@ fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::
         return Err(io::Error::last_os_error());
     }
 
-    let started = Instant::now();
-    let mut deadline = started + timeout;
-    let mut recovery_announced = false;
     let mut response = Vec::new();
     let mut buffer = [0_u8; 256];
     loop {
@@ -2953,40 +3267,35 @@ fn read_ui_launch_handshake(stdout: &mut ChildStdout, timeout: Duration) -> io::
                     let remaining = response.split_off(newline + 1);
                     response.truncate(newline);
                     if let Some(items) = parse_ui_recovery_progress(&response)? {
-                        if recovery_announced {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                "cagents-ui announced recovery inventory more than once",
-                            ));
-                        }
-                        recovery_announced = true;
-                        // The daemon may have consumed the checkpoint before
-                        // this window starts. Its saved-pane inventory supplies
-                        // one bounded allowance, never an endless keepalive.
-                        deadline = deadline.max(
-                            started + UI_LAUNCH_HANDSHAKE_TIMEOUT + Duration::from_secs(30 * items),
-                        );
+                        budget.announce_recovery(items)?;
                         response = remaining;
                         continue;
                     }
-                    return parse_ui_launch_handshake(&response);
+                    let reply = parse_ui_launch_reply(&response)?;
+                    if matches!(reply, UiLaunchReply::RendererBeforeState(_))
+                        && budget.recovery_announced
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "renderer-before-state failure followed recovery inventory",
+                        ));
+                    }
+                    if matches!(reply, UiLaunchReply::RendererBeforeState(_))
+                        && !remaining.is_empty()
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "cagents-ui contradicted its terminal renderer failure",
+                        ));
+                    }
+                    if budget.strict_terminal_deadline {
+                        budget.ensure_remaining()?;
+                    }
+                    return Ok(reply);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        if recovery_announced {
-                            format!(
-                                "{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}Saved conversations are still recovering. The window was kept open; inspect its recovery notices before retrying the update"
-                            )
-                        } else {
-                            format!(
-                                "cagents-ui did not acknowledge initialization within {timeout:?}"
-                            )
-                        },
-                    ));
-                }
+                budget.ensure_remaining()?;
                 thread::sleep(Duration::from_millis(10));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -3013,6 +3322,26 @@ fn parse_ui_recovery_progress(response: &[u8]) -> io::Result<Option<u64>> {
             )
         })?;
     Ok(Some(count))
+}
+
+fn parse_ui_launch_reply(response: &[u8]) -> io::Result<UiLaunchReply> {
+    if let Some(payload) = response.strip_prefix(instance::UI_PRESTATE_RENDERER_PREFIX.as_bytes()) {
+        let record: instance::RendererBeforeStateRecord = serde_json::from_slice(payload)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if record.version != 1
+            || record.kind != "graphics_initialization"
+            || record.detail.is_empty()
+            || record.detail.len() > 512
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid renderer-before-state startup record",
+            ));
+        }
+        return Ok(UiLaunchReply::RendererBeforeState(record.detail));
+    }
+    parse_ui_launch_handshake(response)?;
+    Ok(UiLaunchReply::Ready)
 }
 
 fn parse_ui_launch_handshake(response: &[u8]) -> io::Result<()> {
@@ -7521,5 +7850,324 @@ mod tests {
         )
         .unwrap_err();
         assert!(handshake_reports_already_running(&already_running));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod ui_renderer_retry_tests {
+    use super::*;
+    use std::{
+        ffi::CString,
+        fs,
+        io::Write,
+        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+        sync::mpsc,
+    };
+
+    const FRAME: &str = "renderer-before-state-v1: {\"version\":1,\"kind\":\"graphics_initialization\",\"detail\":\"fixture unsupported surface\"}";
+
+    #[test]
+    fn typed_renderer_records_are_strict_and_generic_errors_stay_ineligible() {
+        assert!(matches!(
+            parse_ui_launch_reply(FRAME.as_bytes()).unwrap(),
+            UiLaunchReply::RendererBeforeState(_)
+        ));
+        for frame in [
+            "renderer-before-state-v1: {}",
+            "renderer-before-state-v1: {\"version\":2,\"kind\":\"graphics_initialization\",\"detail\":\"fixture\"}",
+            "renderer-before-state-v1: {\"version\":1,\"kind\":\"panic\",\"detail\":\"fixture\"}",
+            "renderer-before-state-v1: {\"version\":1,\"kind\":\"graphics_initialization\",\"detail\":\"fixture\",\"unknown\":0}",
+            "error: UI initialization failed: unsupported format",
+            "",
+        ] {
+            assert!(parse_ui_launch_reply(frame.as_bytes()).is_err(), "{frame}");
+        }
+    }
+
+    #[test]
+    fn retry_budget_keeps_original_origin_and_one_inventory_extension() {
+        let mut budget = UiLaunchBudget::new(Duration::from_secs(5));
+        let origin = budget.started;
+        budget.announce_recovery(2).unwrap();
+        assert_eq!(budget.started, origin);
+        assert_eq!(
+            budget.deadline,
+            origin + UI_LAUNCH_HANDSHAKE_TIMEOUT + Duration::from_secs(60)
+        );
+        assert!(budget.announce_recovery(1).is_err());
+        budget.deadline = Instant::now();
+        assert!(!budget.can_pause_for_retry());
+        assert!(budget.ensure_remaining().is_err());
+    }
+
+    struct OriginalRunner {
+        release: Option<fs::File>,
+        original: Option<thread::JoinHandle<io::Result<()>>>,
+    }
+    impl Drop for OriginalRunner {
+        fn drop(&mut self) {
+            if let Some(release) = &mut self.release {
+                let _ = release.write_all(b"release\n");
+            }
+            if let Some(original) = self.original.take() {
+                let _ = original.join();
+            }
+        }
+    }
+
+    fn fixture_command(root: &Path, body: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", body, "owned-ui-fixture"])
+            .arg(root)
+            .arg(FRAME);
+        command
+    }
+
+    #[test]
+    fn typed_renderer_failure_waits_for_original_exit_before_second_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let fifo = root.path().join("release");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: this creates only the fixture-owned FIFO with a valid path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let release = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&fifo)
+            .unwrap();
+        let body = r#"
+            test "$CAGENTS_UI_LAUNCH_HANDSHAKE" = update-retry-v1 || exit 97
+            if test ! -f "$1/count"; then
+                printf 1 > "$1/count"
+                printf '%s\n' "$2"
+                IFS= read -r release < "$1/release"
+                printf settled > "$1/first-ended"
+                exit 1
+            fi
+            test -f "$1/first-ended" || exit 98
+            printf 2 > "$1/count"
+            printf 'ready\n'
+        "#;
+        let mut command = fixture_command(root.path(), body);
+        let (events, received) = mpsc::channel();
+        let original = thread::spawn(move || {
+            spawn_updated_ui_with_timeout(&mut command, Duration::from_secs(5), |event| {
+                let _ = events.send(event);
+            })
+        });
+        let mut owner = OriginalRunner {
+            release: Some(release),
+            original: Some(original),
+        };
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            UpdateLaunchEvent::Spawned(0)
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "a held original cannot have been waited or retried"
+        );
+        owner
+            .release
+            .as_mut()
+            .unwrap()
+            .write_all(b"release\n")
+            .unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            UpdateLaunchEvent::OriginalFailureWaited(0)
+        );
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            UpdateLaunchEvent::Spawned(1)
+        );
+        owner.original.take().unwrap().join().unwrap().unwrap();
+        assert_eq!(fs::read(root.path().join("count")).unwrap(), b"2");
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_second_typed_failure_is_final_and_does_not_claim_state_was_untouched() {
+        let root = tempfile::tempdir().unwrap();
+        let body = r#"
+            if test -f "$1/count"; then printf 2 > "$1/count"; else printf 1 > "$1/count"; fi
+            printf '%s\n' "$2"
+            exit 1
+        "#;
+        let mut command = fixture_command(root.path(), body);
+        let mut events = Vec::new();
+        let error = spawn_updated_ui_with_timeout(&mut command, Duration::from_secs(5), |event| {
+            events.push(event)
+        })
+        .unwrap_err();
+        assert_eq!(
+            events,
+            [
+                UpdateLaunchEvent::Spawned(0),
+                UpdateLaunchEvent::OriginalFailureWaited(0),
+                UpdateLaunchEvent::Spawned(1),
+                UpdateLaunchEvent::OriginalFailureWaited(1)
+            ]
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("after one graphics initialization retry")
+        );
+        assert!(!error.to_string().contains("untouched"));
+        assert_eq!(fs::read(root.path().join("count")).unwrap(), b"2");
+    }
+
+    #[test]
+    fn recovery_inventory_or_a_contradictory_exit_never_earns_retry() {
+        for body in [
+            "printf 'recovering: 0\\n'; printf '%s\\n' \"$2\"; exit 1",
+            "printf '%s\\n' \"$2\"; exit 0",
+            "printf '%s\\nready\\n' \"$2\"; exit 1",
+            "printf 'error: fixture post-state failure\\n'; exit 1",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = fixture_command(root.path(), body);
+            let mut events = Vec::new();
+            assert!(
+                spawn_updated_ui_with_timeout(&mut command, Duration::from_secs(5), |event| events
+                    .push(event))
+                .is_err()
+            );
+            assert_eq!(events, [UpdateLaunchEvent::Spawned(0)]);
+        }
+    }
+
+    #[test]
+    fn recovery_incomplete_wording_and_original_error_survive_retry_labeling() {
+        let original = io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX}fixture pane still recovering"),
+        );
+        let error = after_ui_retry(original);
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .starts_with(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
+        );
+        assert!(error.to_string().contains("pane still recovering"));
+        assert!(std::error::Error::source(error.get_ref().unwrap()).is_some());
+    }
+
+    struct NaturalOriginal(std::process::Child);
+    impl Drop for NaturalOriginal {
+        fn drop(&mut self) {
+            // An assertion or callback panic must retain the exact original
+            // wait; this fixture never signals or adopts another process.
+            while self.0.wait().is_err() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn renderer_terminal_pipe() -> (NaturalOriginal, ChildStdout, fs::File) {
+        let mut descriptors = [-1; 2];
+        // SAFETY: the two returned descriptors are transferred exactly once
+        // to the original read owner and retained write owner below.
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0,
+        );
+        let stdout =
+            ChildStdout::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptors[0]) });
+        let retained = unsafe { fs::File::from_raw_fd(descriptors[1]) };
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 1", "owned-renderer-terminal-fixture"])
+            .stdin(Stdio::null())
+            .stdout(retained.try_clone().unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        (NaturalOriginal(child), stdout, retained)
+    }
+
+    struct RetainedPipeWait {
+        writer: Option<fs::File>,
+        original: Option<thread::JoinHandle<io::Result<()>>>,
+    }
+    impl Drop for RetainedPipeWait {
+        fn drop(&mut self) {
+            drop(self.writer.take());
+            if let Some(original) = self.original.take() {
+                let _ = original.join();
+            }
+        }
+    }
+
+    #[test]
+    fn renderer_retry_requires_post_wait_eof_and_rejects_boundary_bytes() {
+        let (mut child, mut stdout, retained) = renderer_terminal_pipe();
+        let (events, received) = mpsc::channel();
+        let (finished, completed) = mpsc::channel();
+        let original = thread::spawn(move || {
+            let result = wait_renderer_failure(
+                &mut child.0,
+                Some(&mut stdout),
+                &UiLaunchBudget::new(Duration::from_secs(5)),
+                |event| {
+                    let _ = events.send(event);
+                },
+            );
+            let _ = finished.send(());
+            result
+        });
+        let mut owner = RetainedPipeWait {
+            writer: Some(retained),
+            original: Some(original),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let event = received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if event == RendererWaitEvent::OriginalWaited {
+                break;
+            }
+        }
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            RendererWaitEvent::PipePending
+        );
+        assert!(
+            completed.try_recv().is_err(),
+            "a retained writer is not terminal EOF after the original wait"
+        );
+        drop(owner.writer.take());
+        owner.original.take().unwrap().join().unwrap().unwrap();
+
+        // The original exit is already naturally known. Inject a final write
+        // exactly after the next WouldBlock read and before the wait check.
+        // A wait-only admission would accept this race without seeing the bytes.
+        let (mut child, mut stdout, retained) = renderer_terminal_pipe();
+        assert_eq!(child.0.wait().unwrap().code(), Some(1));
+        let mut writer = Some(retained);
+        let mut wrote_after_pending = false;
+        let error = wait_renderer_failure(
+            &mut child.0,
+            Some(&mut stdout),
+            &UiLaunchBudget::new(Duration::from_secs(5)),
+            |event| {
+                if event == RendererWaitEvent::PipePending && !wrote_after_pending {
+                    writer.as_mut().unwrap().write_all(b"ready\n").unwrap();
+                    wrote_after_pending = true;
+                    drop(writer.take());
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(wrote_after_pending);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "cagents-ui wrote after its terminal renderer failure"
+        );
     }
 }

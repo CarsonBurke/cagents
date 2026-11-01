@@ -1,0 +1,132 @@
+{
+  "additional_test_dependency": null,
+  "local_changed_upstream_files": [
+    "Cargo.toml",
+    "src/window/compositor.rs"
+  ],
+  "locked_commit": "caec74c2559924443f12fc6faf97a5bcefe6271d",
+  "locked_package_repository": "https://github.com/pop-os/libcosmic.git",
+  "normalization": "Standalone package/workspace; exact inherited package metadata, lints, dependencies/features/target tables; iced path packages and build_helpers use original libcosmic source/revision. No dependency version updates. Local checked-surface modifications are separately visible in Git diff.",
+  "normalized_cargo_sha256": "6b46c9a467df5ecebb723a44140dc1c53a22631ba4d102edac3728dd764ec77d",
+  "ordinary_apis": "Existing create_surface/configure_surface and backend constructor paths preserved; checked method is additive. Local owning test modules are unexecuted.",
+  "pinned_root_support_files": {
+    "LICENSE": {
+      "git_blob": "f1148e26eac8202a1c2a170b41aa766d7dbb0c8d",
+      "sha256": "fc9086ba4eba4b77e4c603906362742bc3715ffa2c7810c6074fe7780d3a0398"
+    },
+    "rustfmt.toml": {
+      "git_blob": "dccc2a062e52f683d30d1807633a434ae1162a89",
+      "sha256": "17ceca29cd690094207262faad96563d9b20ffd05f03fe2036876f9e2963678f"
+    }
+  },
+  "source_files": [
+    {
+      "artifact": "iced--tiny_skia--Cargo.toml",
+      "bytes": 897,
+      "git_blob": "a01110cabf7c164089d5e156010f476680c7e200",
+      "mode": "100644",
+      "path": "tiny_skia/Cargo.toml",
+      "sha256": "f2168fa90b31032503787531415a5b0662186f2e371afcca3b051d2d16836a99"
+    },
+    {
+      "artifact": "iced--tiny_skia--fonts--Iced-Icons.ttf",
+      "bytes": 5108,
+      "git_blob": "e3273141c45fff98c2f411b421e2e3fd225668aa",
+      "mode": "100644",
+      "path": "tiny_skia/fonts/Iced-Icons.ttf",
+      "sha256": "89ce457409339061b0333d2ed374e4e3666a3c673304505963078d67b61efb77"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--engine.rs",
+      "bytes": 28730,
+      "git_blob": "9f0b54f2feba94c3c230fb73754b0f60eb856cd4",
+      "mode": "100644",
+      "path": "tiny_skia/src/engine.rs",
+      "sha256": "d34863604f1508f59ae29d1af261654282527e0e9a3a632a3ee1ffc9082ece46"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--geometry.rs",
+      "bytes": 14719,
+      "git_blob": "a45d95221374d8908689f655bec129938a54bf90",
+      "mode": "100644",
+      "path": "tiny_skia/src/geometry.rs",
+      "sha256": "8b6c53c2a31c2aa1e359ecf084900961681c117dddd14fcd829561bd917c5bbc"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--layer.rs",
+      "bytes": 11227,
+      "git_blob": "43ddbde5c57364902f05ae29c3403fd12887bab2",
+      "mode": "100644",
+      "path": "tiny_skia/src/layer.rs",
+      "sha256": "89075e6fb6d3a7e8112e621f35862bd6e537fb6e857203bfed94c2bb77ed19ee"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--lib.rs",
+      "bytes": 13336,
+      "git_blob": "b29e9eef0aa7d85cffebd467168dade98b34e889",
+      "mode": "100644",
+      "path": "tiny_skia/src/lib.rs",
+      "sha256": "752232f3ea08deec61be0960362a9d2a74f90197096e6560904a1fb4066b7a3f"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--primitive.rs",
+      "bytes": 1065,
+      "git_blob": "5de51047e229f87d7286c73c3e9f61c615ee50db",
+      "mode": "100644",
+      "path": "tiny_skia/src/primitive.rs",
+      "sha256": "fe921bf12924e7a9ae8b426bfe1cc1dd08df488010d11c375814f28b50ac5521"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--raster.rs",
+      "bytes": 9064,
+      "git_blob": "7c8209175b7c1adbcf415851370279e1fdb3685d",
+      "mode": "100644",
+      "path": "tiny_skia/src/raster.rs",
+      "sha256": "cc7c4f16ddf7e5bf77f00fb8c148720723ce7a8d2db73d8d320cd148300f3a46"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--settings.rs",
+      "bytes": 821,
+      "git_blob": "03361d21ce827b6354b39d364218de63053025e8",
+      "mode": "100644",
+      "path": "tiny_skia/src/settings.rs",
+      "sha256": "aa825ec50e5879419cfc64d01faccacef44821703ae183f49dba110df5aefccd"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--text.rs",
+      "bytes": 10444,
+      "git_blob": "add4dee88656b458e842300c83424c4f6c16e760",
+      "mode": "100644",
+      "path": "tiny_skia/src/text.rs",
+      "sha256": "35a355932757ec896551a9ef2b4c8bdca4e1a9153dd176f059d6fada1c37d9cb"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--vector.rs",
+      "bytes": 7544,
+      "git_blob": "2c3b219c6ab95d1e1a585195e2091489e0f70601",
+      "mode": "100644",
+      "path": "tiny_skia/src/vector.rs",
+      "sha256": "a0b09b290b63a792affbddab468c94c1b5602021501b4f67cdb3bd8ceaa954e5"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--window.rs",
+      "bytes": 64,
+      "git_blob": "d8d9378e162ed24e8c281422e7caee6a1cf43a3f",
+      "mode": "100644",
+      "path": "tiny_skia/src/window.rs",
+      "sha256": "e9057fd6faa34064bd1202df01c76332f896dec635f8c8d7985ec8054437fe8c"
+    },
+    {
+      "artifact": "iced--tiny_skia--src--window--compositor.rs",
+      "bytes": 7385,
+      "git_blob": "b841c24201e75a0b9244a9075a85a0f0fb106bd8",
+      "mode": "100644",
+      "path": "tiny_skia/src/window/compositor.rs",
+      "sha256": "0c136f2f3b781cb899a49fc829405911224b8e437c6b3bbf4b2374de39d84e4c"
+    }
+  ],
+  "upstream_commit": "87c0358985cae50fefdcb15eabb0271e19ecf4a2",
+  "upstream_prefix": "tiny_skia/",
+  "upstream_repository": "https://github.com/pop-os/iced",
+  "upstream_tree": "7a2d7e8eeb4c027ce92eaf0a193f4b857c28db47"
+}
