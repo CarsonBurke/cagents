@@ -15,7 +15,8 @@ use std::{
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(10);
-const INVISIBLE_MANAGER: &str = "user manager peer is not visible and owned";
+const INVISIBLE_MANAGER: &str = "user manager peer PID is unavailable";
+const UNOWNED_MANAGER: &str = "user manager peer has an unexpected owner";
 
 fn cgroup(pid: u32) -> io::Result<String> {
     let contents = fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
@@ -79,8 +80,11 @@ impl ManagerNamespace {
         }
         // SAFETY: getsockopt initialized the complete ucred above.
         let credentials = unsafe { credentials.assume_init() };
-        if credentials.pid <= 0 || credentials.uid != uid {
+        if credentials.pid <= 0 {
             return Err(io::Error::other(INVISIBLE_MANAGER));
+        }
+        if credentials.uid != uid {
+            return Err(io::Error::other(UNOWNED_MANAGER));
         }
         let mut descriptor = -1;
         let mut size = std::mem::size_of::<i32>() as libc::socklen_t;
@@ -629,9 +633,11 @@ pub(crate) mod tests {
         }
         match ManagerNamespace::connect() {
             Ok(_) => {}
-            // A container sharing /run/user cannot see the host's manager.
+            // An unavailable peer PID does not establish its underlying cause.
             Err(error) if error.to_string() == INVISIBLE_MANAGER => {
-                eprintln!("OS user manager is outside our PID namespace; unqualified here");
+                eprintln!(
+                    "OS user manager peer PID is unavailable; scope isolation unqualified here"
+                );
             }
             Err(error) => panic!("OS user manager proof failed: {error}"),
         }
@@ -642,9 +648,16 @@ pub(crate) mod tests {
         let (connection, _peer) = UnixStream::pair().unwrap();
         let wrong_uid = super::super::current_uid().wrapping_add(1);
         let proof = ManagerNamespace::from_connection(connection, wrong_uid);
-        assert!(proof.is_err());
-        with_verified_manager(proof, || panic!("wrong peer must not receive a request"))
-            .unwrap_err();
+        assert_eq!(proof.as_ref().err().unwrap().to_string(), UNOWNED_MANAGER);
+        let refused =
+            with_verified_manager(proof, || panic!("wrong peer must not receive a request"))
+                .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::Other);
+        assert_eq!(refused.raw_os_error(), None);
+        assert_eq!(
+            refused.to_string(),
+            format!("user manager proof failed: {UNOWNED_MANAGER}")
+        );
     }
 
     #[test]
