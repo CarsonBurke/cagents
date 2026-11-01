@@ -728,10 +728,53 @@ impl Codex {
         }
     }
 
+    fn snapshot_items(&mut self, turn: &str, items: Vec<Item>, step: &mut Step) {
+        use sha2::{Digest, Sha256};
+        // Capture successor evidence before this snapshot introduces any new
+        // identities. A missing middle item must stay ahead of the provider's
+        // already streamed successor, even when a retry was observed later.
+        let anchor = self.turn_anchors.iter().find(|anchor| anchor.turn == turn);
+        let mut known = items
+            .iter()
+            .filter_map(|item| {
+                let digest: [u8; 32] = Sha256::digest(item.id.as_bytes()).into();
+                anchor
+                    .is_some_and(|anchor| anchor.seen.contains(&digest))
+                    .then(|| item.id.clone())
+            })
+            .collect::<std::collections::VecDeque<_>>();
+        let mut previous = None;
+        for item in items {
+            if known.front() == Some(&item.id) {
+                known.pop_front();
+            }
+            let item_id = item.id.clone();
+            self.snapshot_item_with_successor(
+                turn,
+                item,
+                previous.as_deref(),
+                known.front().map(String::as_str),
+                step,
+            );
+            previous = Some(item_id);
+        }
+    }
+
     /// Merge an explicitly ordered provider snapshot around items that may
     /// already have streamed. New prefix content precedes the proven first
     /// item; new content after a known predecessor enters that exact gap.
     fn snapshot_item(&mut self, turn: &str, item: Item, previous: Option<&str>, step: &mut Step) {
+        self.snapshot_item_with_successor(turn, item, previous, None, step);
+    }
+
+    fn snapshot_item_with_successor(
+        &mut self,
+        turn: &str,
+        item: Item,
+        previous: Option<&str>,
+        next_known: Option<&str>,
+        step: &mut Step,
+    ) {
         use sha2::{Digest, Sha256};
         let digest: [u8; 32] = Sha256::digest(item.id.as_bytes()).into();
         let anchor = self.turn_anchors.iter().find(|anchor| anchor.turn == turn);
@@ -742,6 +785,7 @@ impl Codex {
         // included in provider item arrays, so a newly delivered answer must
         // follow the retained retry rather than fill a gap ahead of it.
         let placement_after = if previous.is_some()
+            && next_known.is_none()
             && last
                 .as_deref()
                 .is_some_and(|id| id.starts_with("codex-notice:"))
@@ -980,14 +1024,11 @@ impl Codex {
         // An ACK can recover a completion whose content arrived before exact
         // execution binding. Ordinary completed frames already publish it.
         if publish_content {
-            let mut previous = None;
+            let mut items = Vec::new();
             for value in array(turn, "items")? {
-                for item in parse_item(value, true, id)? {
-                    let item_id = item.id.clone();
-                    self.snapshot_item(id, item, previous.as_deref(), step);
-                    previous = Some(item_id);
-                }
+                items.extend(parse_item(value, true, id)?);
             }
+            self.snapshot_items(id, items, step);
             if let Some(message) = turn_error_message(turn) {
                 let current = !step.suppress_current_notification;
                 self.terminal_error(id, message, step, current);
@@ -3078,7 +3119,7 @@ impl Adapter for Codex {
                     step.events.push(Event::Waiting(false));
                     self.turn = self.busy.then(|| turn_id.to_owned());
                 }
-                let mut previous = None;
+                let mut items = Vec::new();
                 for value in array(turn, "items")? {
                     let mut windows = BTreeMap::new();
                     let parsed = parse_item_with_windows(
@@ -3093,11 +3134,10 @@ impl Adapter for Codex {
                         if method == "turn/started" {
                             self.track_snapshot_item(value, &item, windows.remove(&item.id), true);
                         }
-                        let item_id = item.id.clone();
-                        self.snapshot_item(turn_id, item, previous.as_deref(), &mut step);
-                        previous = Some(item_id);
+                        items.push(item);
                     }
                 }
+                self.snapshot_items(turn_id, items, &mut step);
                 // Non-blocking questions can outlive their originating turn.
                 // Only serverRequest/resolved or thread closure invalidates them.
                 if current {

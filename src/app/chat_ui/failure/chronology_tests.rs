@@ -706,6 +706,38 @@ fn deferred_missing_source_keeps_its_own_source_instead_of_the_latest_error() {
             Some(CAPACITY)
         );
     }
+    let missing_key = runtime.failures[0].event_key.clone().unwrap();
+    runtime.failure_ui.expanded.insert(missing_key.clone());
+    runtime.cache_failure_preview(&missing_key);
+    publish(&mut runtime, &handle, |next| {
+        next.has_earlier = false;
+        next.items.splice(
+            0..0,
+            [
+                Arc::new(text("missing:0", chat::Role::User, "The earlier request")),
+                Arc::new(provider_error(provider, "missing-error:0", CAPACITY)),
+            ],
+        );
+    });
+    assert_eq!(
+        runtime.failure_ui.incidents.len(),
+        2,
+        "one per source after its earlier page loads"
+    );
+    assert_eq!(
+        runtime
+            .failure_ui
+            .item("missing-error:0")
+            .map(|incident| &incident.key),
+        Some(&missing_key)
+    );
+    assert!(runtime.failure_ui.expanded.contains(&missing_key));
+    assert_eq!(
+        runtime.failure_details(&missing_key).as_deref(),
+        Some(CAPACITY)
+    );
+    let blocks = catalog(&mut runtime);
+    assert!(failure_position(&blocks, &missing_key) < prompt_position(&blocks, "latest:0"));
 }
 
 #[test]

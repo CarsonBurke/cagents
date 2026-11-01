@@ -685,6 +685,48 @@ impl State {
                 })
                 .collect()
         };
+        // A deferred receipt may have kept a stable key before its exact
+        // provider source was loaded. Once the complete carrier proves the
+        // association, project that source under the retained key: opening the
+        // earlier page must neither duplicate the incident nor lose Details.
+        let mut aliases: HashMap<String, String> = HashMap::new();
+        for note in &runtime.failures {
+            if let Some(retained) = &note.event_key
+                && let Some(after) = note.after.as_deref()
+                && let Some(current) = state.item(after)
+                && &current.key != retained
+            {
+                // Reuse already-proven association for an immutable source.
+                // Full-body matching is only for a newly loaded/changed
+                // carrier, never every streamed update beside old errors.
+                let unchanged = runtime.failure_ui.item(after).is_some_and(|previous| {
+                    &previous.key == retained
+                        && previous.kind == current.kind
+                        && runtime
+                            .failure_ui
+                            .item_metadata
+                            .get(&Source::Item(after.into()))
+                            .zip(state.item_metadata.get(&Source::Item(after.into())))
+                            .is_some_and(|((old, _, _), (new, _, _))| Arc::ptr_eq(old, new))
+                });
+                let Some(canonical) = unchanged
+                    .then(|| current.key.clone())
+                    .or_else(|| notice_key(provider, &runtime.snapshot, Some(after), &note.text))
+                else {
+                    continue;
+                };
+                let survivor = aliases
+                    .entry(canonical)
+                    .or_insert_with(|| retained.clone())
+                    .clone();
+                aliases.insert(retained.clone(), survivor);
+            }
+        }
+        for incident in &mut state.incidents {
+            if let Some(key) = aliases.get(&incident.key) {
+                incident.key.clone_from(key);
+            }
+        }
         // A note keeps its message's scope after paging removes the message,
         // so its incident identity, and an expanded notice, stay put.
         let note_contexts: Vec<String> = runtime
@@ -708,7 +750,7 @@ impl State {
                     Self::metadata(provider, &note.text, false, &note_contexts[index])
                 {
                     if let Some(key) = &note.event_key {
-                        meta.key.clone_from(key);
+                        meta.key.clone_from(aliases.get(key).unwrap_or(key));
                     }
                     state.push_metadata(meta, Source::Note(index));
                 }
@@ -779,13 +821,13 @@ impl State {
                     if matches!(source, Source::Snapshot)
                         && let Some(key) = &snapshot_key
                     {
-                        meta.key.clone_from(key);
+                        meta.key.clone_from(aliases.get(key).unwrap_or(key));
                     }
                     if matches!(source, Source::Local(_))
                         && let Some(key) =
                             local_note.and_then(|index| runtime.failures[index].event_key.as_ref())
                     {
-                        meta.key.clone_from(key);
+                        meta.key.clone_from(aliases.get(key).unwrap_or(key));
                     }
                     state.push_metadata(meta, source);
                 }
@@ -875,13 +917,16 @@ impl State {
             .failure_ui
             .expanded
             .iter()
+            .map(|key| aliases.get(key).unwrap_or(key))
             .filter(|key| state.incidents.iter().any(|incident| &incident.key == *key))
             .cloned()
             .collect();
         state.find_expanded = runtime
             .failure_ui
             .find_expanded
-            .intersection(&state.expanded)
+            .iter()
+            .map(|key| aliases.get(key).unwrap_or(key))
+            .filter(|key| state.expanded.contains(*key))
             .cloned()
             .collect();
         let mut hash = std::hash::DefaultHasher::new();

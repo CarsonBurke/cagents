@@ -252,6 +252,66 @@ fn terminal_error_placement_retains_exact_anchors_and_bounds_unproved_order() {
 }
 
 #[test]
+fn authoritative_missing_middle_content_precedes_its_streamed_successor_and_later_retry() {
+    let raw = "Provider is temporarily at capacity";
+    let prompt =
+        json!({"id":"p","type":"userMessage","content":[{"type":"text","text":"Continue"}]});
+    let answer = json!({"id":"a","type":"agentMessage","text":"Retained answer"});
+    for missing_middle in [true, false] {
+        let mut frames = vec![
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn","status":"inProgress","items":[prompt]}}}),
+        ];
+        if missing_middle {
+            frames.push(
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact",
+                "turnId":"turn","itemId":"a","delta":"Retained answer"}}),
+            );
+        }
+        frames.push(
+            json!({"method":"error","params":{"threadId":"thread-exact","turnId":"turn",
+            "willRetry":true,"error":{"message":raw}}}),
+        );
+        let items = if missing_middle {
+            json!([prompt, {"id":"r","type":"reasoning","summary":["Earlier reasoning"]}, answer])
+        } else {
+            json!([prompt, answer])
+        };
+        frames.push(
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":"turn","status":"completed","items":items}}}),
+        );
+        let (_, snapshot) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter()),
+            frames,
+            false,
+        );
+        let retry_index = if missing_middle { 3 } else { 1 };
+        let retry = &snapshot.items[retry_index];
+        assert!(retry.id.starts_with("codex-notice:"));
+        assert_eq!(
+            chat::failure::provider_error_text(Provider::Codex, retry),
+            Some(raw)
+        );
+        let expected = if missing_middle {
+            vec!["turn/p", "turn/r/summary/0", "turn/a", retry.id.as_str()]
+        } else {
+            vec!["turn/p", retry.id.as_str(), "turn/a"]
+        };
+        assert_eq!(
+            snapshot
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(snapshot.error_generation, 0);
+        assert!(snapshot.error.is_none());
+    }
+}
+
+#[test]
 fn newly_completed_output_keeps_an_earlier_retry_receipt_before_it() {
     let mut adapter = adapter();
     adapter.observe_turn_item("turn", "turn/prompt", false);
