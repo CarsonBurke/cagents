@@ -92,7 +92,11 @@ bounds. Do not force a window below the application's normal minimum size.
    failure/retry, provider closing, persistence, or successful operation.
 5. In expanded and compact modes, physically Tab and Shift-Tab through controls
    and inspect visible focus. Use real row Arrow/Home/End/Enter/Delete keys;
-   check modal blocking and Cancel. Exercise press-on-row/release-on-action and
+   check modal blocking and Cancel. Ctrl/Shift-select one or several channels,
+   then use focused-row Delete and the selected-row menu command. The existing
+   single-row or group confirmation must name exactly that selection, and both
+   Cancel and Escape must dismiss it. Group confirmation execution is inert.
+   Exercise press-on-row/release-on-action and
    the reverse, followed by a fresh same-control click. The fixture permits
    selection and local navigation presentation; it never opens a repository,
    channel runtime, external editor or link. Treat runtime navigation as untested.
