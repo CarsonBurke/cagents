@@ -3111,7 +3111,7 @@ impl Runtime {
     /// Records a notice in the transcript, after the message it concerns.
     fn note(&mut self, notice: String) {
         if self.snapshot.has_later {
-            self.defer_note(failure::Deferred::new(notice, &self.snapshot));
+            self.defer_note(failure::Deferred::local(notice, &self.snapshot));
             self.refresh_failure_ui();
             return;
         }
@@ -3119,32 +3119,123 @@ impl Runtime {
             .notice_anchor(&self.snapshot, &self.turns)
             .map(str::to_owned);
         let after = failure::closing_item(&self.snapshot, &self.turns).map(str::to_owned);
-        let key = failure::notice_key(
-            self.session.launch.provider,
-            &self.snapshot,
-            after.as_deref(),
-            &notice,
-        );
-        if self.note_at(anchor, after, notice, key, self.snapshot.turn_generation) {
+        let key = None;
+        if self.note_at(
+            anchor,
+            after,
+            notice,
+            key,
+            self.snapshot.turn_generation,
+            None,
+            None,
+        ) {
             self.refresh_failure_ui();
         }
     }
     fn defer_note(&mut self, notice: failure::Deferred) {
-        if !self
+        if let Some(previous) = self
             .unplaced_failures
-            .iter()
-            .any(|prior| prior.same_event(&notice))
+            .iter_mut()
+            .find(|prior| prior.same_event(&notice))
         {
-            if self.unplaced_failures.len() == 32 {
-                self.unplaced_failures.remove(0);
+            // Retain identity while the same receipt gains its proven source.
+            if notice.error_item.is_some() {
+                previous.error_item = notice.error_item;
             }
-            self.unplaced_failures.push(notice);
+            if notice.error_generation.is_some() {
+                previous.error_generation = notice.error_generation;
+            }
+            return;
         }
+        if self.unplaced_failures.len() == 32 {
+            self.unplaced_failures.remove(0);
+        }
+        self.unplaced_failures.push(notice);
     }
-    /// Records `notice` for the prompt message `anchor`, drawn after the
-    /// group containing the item `after`: work a delivery started after that
-    /// prompt still precedes the notice. Returns whether the notes changed;
-    /// the caller refreshes their presentation once its inputs agree.
+
+    /// Upgrade a receipt already observed before its source reached a reader.
+    /// This runs before grouping so the old provisional boundary disappears in
+    /// the same publication that installs the exact provider boundary.
+    fn enrich_error_source(&mut self, snapshot: &Snapshot) -> bool {
+        let Some(source) = snapshot
+            .error_item
+            .as_ref()
+            .filter(|_| snapshot.error.is_some())
+        else {
+            return false;
+        };
+        let matches = |generation: Option<u64>, turn: u64, text: &str, item: Option<&String>| {
+            generation == Some(snapshot.error_generation)
+                && snapshot.error.as_deref() == Some(text)
+                && (snapshot.error_generation != 0 || turn == snapshot.turn_generation)
+                && item.is_none_or(|item| item == source)
+        };
+        for notice in &mut self.unplaced_failures {
+            if matches(
+                notice.error_generation,
+                notice.turn_generation,
+                &notice.text,
+                notice.error_item.as_ref(),
+            ) {
+                notice.error_item = Some(source.clone());
+            }
+        }
+        let anchor = snapshot
+            .items
+            .iter()
+            .position(|item| &item.id == source)
+            .and_then(|index| {
+                failure::prompt_anchor(self.session.launch.provider, &snapshot.items[..=index])
+            })
+            .map(str::to_owned);
+        let mut changed = false;
+        for note in &mut self.failures {
+            if matches(
+                note.error_generation,
+                note.turn_generation,
+                &note.text,
+                note.error_item.as_ref(),
+            ) {
+                changed |= note.error_item.as_ref() != Some(source)
+                    || note.after.as_ref() != Some(source)
+                    || (anchor.is_some() && note.message != anchor);
+                if note.error_item.as_ref() != Some(source) || anchor.is_some() {
+                    note.message.clone_from(&anchor);
+                }
+                note.error_item = Some(source.clone());
+                note.after = Some(source.clone());
+            }
+        }
+        // A split replay may have temporarily needed its own receipt notice.
+        // Once the exact source is proven, the older source notice survives.
+        if let Some(current) = self.failures.iter().rposition(|note| {
+            matches(
+                note.error_generation,
+                note.turn_generation,
+                &note.text,
+                note.error_item.as_ref(),
+            )
+        }) && let Some(previous) = self.failures[..current].iter().position(|note| {
+            note.error_item.as_ref() == Some(source) && note.text == self.failures[current].text
+        }) {
+            let removed = self.failures.remove(current);
+            let survivor = &mut self.failures[previous];
+            survivor.error_generation = removed.error_generation;
+            if let (Some(old), Some(key)) = (removed.event_key, survivor.event_key.as_ref()) {
+                if self.failure_ui.expanded.remove(&old) {
+                    self.failure_ui.expanded.insert(key.clone());
+                }
+                if self.failure_ui.find_expanded.remove(&old) {
+                    self.failure_ui.find_expanded.insert(key.clone());
+                }
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    /// Records one local notice or actual scalar receipt. A provider source
+    /// deduplicates its replay; receipt identity permits later source enrichment.
     fn note_at(
         &mut self,
         anchor: Option<String>,
@@ -3152,27 +3243,70 @@ impl Runtime {
         notice: String,
         mut event_key: Option<String>,
         turn_generation: u64,
+        error_generation: Option<u64>,
+        error_item: Option<String>,
     ) -> bool {
         let provider = self.session.launch.provider;
+        if let Some(generation) = error_generation {
+            if let Some(note) = self.failures.iter_mut().find(|note| {
+                (note.error_generation == Some(generation)
+                    && note.text == notice
+                    && (generation != 0 || note.turn_generation == turn_generation)
+                    && (error_item.is_none()
+                        || note.error_item.is_none()
+                        || note.error_item == error_item))
+                    || (error_item.is_some()
+                        && note.error_item == error_item
+                        && note.text == notice)
+            }) {
+                let changed = note.error_generation != error_generation
+                    || (error_item.is_some()
+                        && (note.after != after
+                            || note.message != anchor
+                            || note.error_item != error_item))
+                    || note.text != notice;
+                note.error_generation = error_generation;
+                if error_item.is_some() {
+                    note.after = after;
+                    note.message = anchor;
+                    note.error_item = error_item;
+                }
+                note.text = notice;
+                if note.event_key.is_none() {
+                    note.event_key = event_key;
+                }
+                return changed;
+            }
+        }
         let mut changed = false;
         if chat::requires_sign_in(provider, &notice) {
+            let current_generation = self.snapshot.error_generation;
+            let current = |note: &failure::Note| {
+                note.error_generation == error_generation
+                    || (error_generation.is_none()
+                        && note.error_generation == Some(current_generation))
+            };
             if event_key.is_none() {
                 event_key = self
                     .failures
                     .iter()
                     .find(|note| {
-                        failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+                        current(note)
+                            && failure::same_prompt(
+                                provider,
+                                note.message.as_deref(),
+                                anchor.as_deref(),
+                            )
                             && note.after == after
                             && note.turn_generation == turn_generation
                             && chat::requires_sign_in(provider, &note.text)
                     })
                     .and_then(|note| note.event_key.clone());
             }
-            // An updated verification failure replaces this exchange's active
-            // auth warning; other exchanges and tool failures remain history.
             let before = self.failures.len();
             self.failures.retain(|note| {
-                !failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+                !current(note)
+                    || !failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
                     || note.after != after
                     || note.turn_generation != turn_generation
                     || !chat::requires_sign_in(provider, &note.text)
@@ -3180,13 +3314,13 @@ impl Runtime {
             changed = self.failures.len() != before;
         }
         if self.failures.iter().any(|note| {
-            failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
+            note.error_generation == error_generation
+                && failure::same_prompt(provider, note.message.as_deref(), anchor.as_deref())
                 && note.text == notice
                 && note.after == after
                 && note.turn_generation == turn_generation
                 && note.event_key == event_key
         }) {
-            // Replaying the same occurrence does not change its placement.
             return changed;
         }
         if self.failures.len() == 32 {
@@ -3198,6 +3332,8 @@ impl Runtime {
             text: notice,
             event_key,
             turn_generation,
+            error_generation,
+            error_item,
         });
         true
     }
@@ -4324,13 +4460,15 @@ impl Runtime {
             }
         }
         self.source_clock = source_clock;
+        grouping_dirty |= self.enrich_error_source(&snapshot);
         let cache = &self.cache;
         let mut boundaries = failure::boundaries(&self.asked_after, &self.failures);
         // Install the incoming scalar error's boundary in this grouping pass,
         // before recording its note below. A later publication may already
         // contain another prompt even when the error has since cleared.
         if (snapshot.error != self.snapshot.error
-            || snapshot.error_generation != self.snapshot.error_generation)
+            || snapshot.error_generation != self.snapshot.error_generation
+            || snapshot.error_item != self.snapshot.error_item)
             && snapshot.error.is_some()
             && !snapshot.has_later
             && let Some(last) = snapshot
@@ -4419,23 +4557,23 @@ impl Runtime {
         // Turn changes alone are not proof: a failed history load remains
         // active across TurnStarted until its own successful retry.
         if (snapshot.error != self.snapshot.error
-            || snapshot.error_generation != self.snapshot.error_generation)
+            || snapshot.error_generation != self.snapshot.error_generation
+            || snapshot.error_item != self.snapshot.error_item)
             && let Some(error) = &snapshot.error
         {
             if snapshot.has_later {
-                self.defer_note(failure::Deferred::new(error.clone(), &snapshot));
+                self.defer_note(failure::Deferred::scalar(error.clone(), &snapshot));
             } else {
                 let key = snapshot
                     .error_item
                     .as_deref()
                     .and_then(|id| failure::item_key(self.session.launch.provider, &snapshot, id))
                     .or_else(|| {
-                        failure::notice_key(
-                            self.session.launch.provider,
-                            &snapshot,
-                            next_after.as_deref(),
+                        Some(failure::receipt_key(
+                            snapshot.error_generation,
+                            snapshot.turn_generation,
                             error,
-                        )
+                        ))
                     });
                 self.note_at(
                     next_anchor.clone(),
@@ -4443,6 +4581,8 @@ impl Runtime {
                     error.clone(),
                     key,
                     snapshot.turn_generation,
+                    Some(snapshot.error_generation),
+                    snapshot.error_item.clone(),
                 );
             }
         }
@@ -4465,7 +4605,7 @@ impl Runtime {
                         )
                         .map(str::to_owned),
                         Some(id.clone()),
-                        failure::item_key(self.session.launch.provider, &snapshot, id),
+                        Some(notice.unresolved_key()),
                     )
                 } else if let Some(source) = source {
                     // Keep the actual source for a future page containing it;
@@ -4478,17 +4618,21 @@ impl Runtime {
                     (
                         next_anchor.clone(),
                         next_after.clone(),
-                        failure::notice_key(
-                            self.session.launch.provider,
-                            &snapshot,
-                            next_after.as_deref(),
-                            &notice.text,
-                        ),
+                        Some(notice.unresolved_key()),
                     )
                 } else {
                     (None, None, Some(notice.unresolved_key()))
                 };
-                self.note_at(anchor, after, notice.text, key, notice.turn_generation);
+                let error_item = source.cloned();
+                self.note_at(
+                    anchor,
+                    after,
+                    notice.text,
+                    key,
+                    notice.turn_generation,
+                    notice.error_generation,
+                    error_item,
+                );
             }
         }
         // A cancel armed for one turn must not carry over to the next.
@@ -25791,6 +25935,8 @@ mod tests {
             .notice_anchor(&runtime.snapshot, &runtime.turns)
             .map(str::to_owned);
         let older = failure::Note {
+            error_generation: None,
+            error_item: None,
             message: Some("older-exchange".into()),
             after: Some("older-exchange".into()),
             text: failure.into(),

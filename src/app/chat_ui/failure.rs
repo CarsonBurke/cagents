@@ -19,59 +19,71 @@ enum Source {
 pub(super) struct Deferred {
     pub text: String,
     pub error_item: Option<String>,
-    pub error_generation: u64,
+    pub error_generation: Option<u64>,
     pub turn_generation: u64,
+    key: String,
 }
 
 impl Deferred {
-    pub fn new(text: String, snapshot: &Snapshot) -> Self {
+    pub fn scalar(text: String, snapshot: &Snapshot) -> Self {
         Self {
-            error_item: (snapshot.error.as_deref() == Some(text.as_str()))
-                .then(|| snapshot.error_item.clone())
-                .flatten(),
+            key: receipt_key(snapshot.error_generation, snapshot.turn_generation, &text),
             text,
-            error_generation: snapshot.error_generation,
+            error_item: snapshot.error_item.clone(),
+            error_generation: Some(snapshot.error_generation),
+            turn_generation: snapshot.turn_generation,
+        }
+    }
+
+    pub fn local(text: String, snapshot: &Snapshot) -> Self {
+        Self {
+            key: format!("local:{}", receipt_key(0, snapshot.turn_generation, &text)),
+            text,
+            error_item: None,
+            error_generation: None,
             turn_generation: snapshot.turn_generation,
         }
     }
 
     pub fn same_event(&self, other: &Self) -> bool {
         self.text == other.text
-            && match (&self.error_item, &other.error_item) {
-                (Some(left), Some(right)) => left == right,
-                (None, None) => {
-                    self.error_generation == other.error_generation
-                        && self.turn_generation == other.turn_generation
+            && match (self.error_generation, other.error_generation) {
+                (Some(left), Some(right)) => {
+                    (left == right
+                        && (left != 0 || self.turn_generation == other.turn_generation)
+                        && (self.error_item.is_none()
+                            || other.error_item.is_none()
+                            || self.error_item == other.error_item))
+                        || (self.error_item.is_some() && self.error_item == other.error_item)
                 }
+                (None, None) => self.turn_generation == other.turn_generation,
                 _ => false,
             }
     }
 
     pub fn matches_snapshot(&self, snapshot: &Snapshot) -> bool {
-        snapshot.error.as_deref() == Some(self.text.as_str())
-            && snapshot.error_generation == self.error_generation
-            && snapshot.turn_generation == self.turn_generation
-            && self
-                .error_item
-                .as_ref()
-                .is_none_or(|source| snapshot.error_item.as_ref() == Some(source))
+        self.error_generation == Some(snapshot.error_generation)
+            && self.turn_generation == snapshot.turn_generation
+            && snapshot.error.as_deref() == Some(self.text.as_str())
     }
 
-    /// An unresolved receipt still has an identity, but no proven transcript
-    /// position. Keep its diagnostics distinct without borrowing a later
-    /// source or manufacturing a prompt/item to place it after.
     pub fn unresolved_key(&self) -> String {
-        use sha2::{Digest, Sha256};
-        let mut digest = Sha256::new();
-        digest.update(b"deferred-receipt\0");
-        let source = self.error_item.as_deref().unwrap_or_default();
-        digest.update((source.len() as u64).to_be_bytes());
-        digest.update(source.as_bytes());
-        digest.update(self.error_generation.to_be_bytes());
-        digest.update(self.turn_generation.to_be_bytes());
-        digest.update(self.text.as_bytes());
-        format!("{:x}", digest.finalize())
+        self.key.clone()
     }
+}
+
+/// A scalar receipt is stable while provenance is still arriving. Never derive
+/// its identity from a coincidentally equal diagnostic at the transcript tail.
+pub(super) fn receipt_key(generation: u64, turn: u64, text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"scalar-receipt\0");
+    digest.update(generation.to_be_bytes());
+    // Zero is the legacy/fixture counter, whose turn still disambiguates it.
+    // A real monotonic receipt outlives unrelated turn publications.
+    digest.update(if generation == 0 { turn } else { 0 }.to_be_bytes());
+    digest.update(text.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 /// A notice kept in the transcript after its live source has gone.
@@ -86,9 +98,12 @@ pub(super) struct Note {
     /// a group key, which paging can change.
     pub after: Option<String>,
     pub text: String,
+    /// Actual provider scalar receipt. Local notices have no provider receipt.
+    pub error_generation: Option<u64>,
+    pub error_item: Option<String>,
     pub turn_generation: u64,
-    /// Proven provider occurrence, captured while its source is loaded. Keep
-    /// this across paging so Details and selection retain the same identity.
+    /// Stable explicit occurrence or scalar receipt identity. Keep this across
+    /// paging and source enrichment so Details and selection stay addressable.
     pub event_key: Option<String>,
 }
 
@@ -280,6 +295,7 @@ pub(super) fn boundaries(asked_after: &HashSet<String>, notes: &[Note]) -> HashS
 /// A scalar failure can repeat an explicit diagnostic carried in the same
 /// publication. Join only the recorded item and its proven multipart carrier,
 /// with the complete body the adapter used, never another equal-text incident.
+#[cfg(test)]
 pub(super) fn notice_key(
     provider: Provider,
     snapshot: &Snapshot,
@@ -692,29 +708,12 @@ impl State {
         let mut aliases: HashMap<String, String> = HashMap::new();
         for note in &runtime.failures {
             if let Some(retained) = &note.event_key
-                && let Some(after) = note.after.as_deref()
+                && let Some(after) = note.error_item.as_deref()
                 && let Some(current) = state.item(after)
-                && &current.key != retained
             {
-                // Reuse already-proven association for an immutable source.
-                // Full-body matching is only for a newly loaded/changed
-                // carrier, never every streamed update beside old errors.
-                let unchanged = runtime.failure_ui.item(after).is_some_and(|previous| {
-                    &previous.key == retained
-                        && previous.kind == current.kind
-                        && runtime
-                            .failure_ui
-                            .item_metadata
-                            .get(&Source::Item(after.into()))
-                            .zip(state.item_metadata.get(&Source::Item(after.into())))
-                            .is_some_and(|((old, _, _), (new, _, _))| Arc::ptr_eq(old, new))
-                });
-                let Some(canonical) = unchanged
-                    .then(|| current.key.clone())
-                    .or_else(|| notice_key(provider, &runtime.snapshot, Some(after), &note.text))
-                else {
-                    continue;
-                };
+                // Captured ErrorSource is the association proof. Its scalar
+                // wording may include an envelope absent from the item body.
+                let canonical = current.key.clone();
                 let survivor = aliases
                     .entry(canonical)
                     .or_insert_with(|| retained.clone())
@@ -772,8 +771,13 @@ impl State {
             })
             .and_then(|error| {
                 runtime.failures.iter().rposition(|note| {
-                    note.text == error
-                        && note_destination(runtime, note, &item_groups, &user_carriers).is_some()
+                    note.error_generation == Some(runtime.snapshot.error_generation)
+                        && note.text == error
+                        && (runtime.snapshot.error_generation != 0
+                            || note.turn_generation == runtime.snapshot.turn_generation)
+                        && (runtime.snapshot.error_item.is_none()
+                            || note.error_item.is_none()
+                            || note.error_item == runtime.snapshot.error_item)
                 })
             });
         let snapshot_context =
@@ -783,10 +787,20 @@ impl State {
             .error_item
             .as_deref()
             .and_then(|id| state.item(id).map(|incident| incident.key.clone()))
-            .or_else(|| snapshot_note.and_then(|index| runtime.failures[index].event_key.clone()));
+            .or_else(|| snapshot_note.and_then(|index| runtime.failures[index].event_key.clone()))
+            .or_else(|| {
+                runtime.snapshot.error.as_deref().map(|text| {
+                    receipt_key(
+                        runtime.snapshot.error_generation,
+                        runtime.snapshot.turn_generation,
+                        text,
+                    )
+                })
+            });
         let local_note = runtime.error.as_deref().and_then(|error| {
             runtime.failures.iter().rposition(|note| {
-                note.text == error
+                note.error_generation.is_none()
+                    && note.text == error
                     && note_destination(runtime, note, &item_groups, &user_carriers).is_some()
             })
         });
@@ -831,6 +845,27 @@ impl State {
                     }
                     state.push_metadata(meta, source);
                 }
+            }
+        }
+        // Enrichment adds originals to an existing diagnostic. Keep the
+        // already exposed sources first so unchanged selected byte prefixes
+        // remain valid; chronological placement still belongs to first_item.
+        for incident in &mut state.incidents {
+            if let Some(previous) = runtime
+                .failure_ui
+                .incidents
+                .iter()
+                .find(|previous| previous.key == incident.key)
+            {
+                let order: HashMap<_, _> = previous
+                    .sources
+                    .iter()
+                    .enumerate()
+                    .map(|(index, source)| (source, index))
+                    .collect();
+                incident
+                    .sources
+                    .sort_by_key(|source| order.get(source).copied().unwrap_or(usize::MAX));
             }
         }
         let recovering = runtime.auth_error();
@@ -918,7 +953,13 @@ impl State {
             .expanded
             .iter()
             .map(|key| aliases.get(key).unwrap_or(key))
-            .filter(|key| state.incidents.iter().any(|incident| &incident.key == *key))
+            .filter(|key| {
+                state.incidents.iter().any(|incident| &incident.key == *key)
+                    || runtime
+                        .unplaced_failures
+                        .iter()
+                        .any(|notice| notice.unresolved_key() == **key)
+            })
             .cloned()
             .collect();
         state.find_expanded = runtime
@@ -1392,10 +1433,13 @@ mod tests {
     }
 
     fn publish_error(runtime: &mut Runtime, handle: &ClientHandle, error: &str) {
+        let provider = runtime.session.launch.provider;
         publish(runtime, handle, |next| {
             next.error = Some(error.into());
             next.error_generation += 1;
-            next.error_item = None;
+            next.error_item = next.items.last().and_then(|item| {
+                notice_key(provider, next, Some(&item.id), error).map(|_| item.id.clone())
+            });
         });
     }
 

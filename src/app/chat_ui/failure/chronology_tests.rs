@@ -772,17 +772,304 @@ fn same_prompt_authentication_incidents_retain_history_and_only_latest_recovery(
         next.error_generation += 1;
         next.error_item = Some("auth-b".into());
     });
-    // A local command/recovery publication carrying the same active error
-    // must join B rather than creating a third sign-in card or reviving A.
+    assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    let earlier_key = runtime.failure_ui.item("auth-a").unwrap().key.clone();
+    let latest_key = runtime.failure_ui.item("auth-b").unwrap().key.clone();
+    assert!(!runtime.failure_ui.item("auth-a").unwrap().active_recovery);
+    assert!(runtime.failure_ui.item("auth-b").unwrap().active_recovery);
+    assert_ne!(earlier_key, latest_key);
+    // Bare equal local text has no authority to join either provider source.
     runtime.error = Some(raw.into());
     runtime.refresh_failure_ui();
-    assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    assert_eq!(runtime.failure_ui.incidents.len(), 3);
     let earlier = runtime.failure_ui.item("auth-a").unwrap();
     let latest = runtime.failure_ui.item("auth-b").unwrap();
     assert_eq!(earlier.key, earlier_key);
-    assert_ne!(earlier.key, latest.key);
+    assert_eq!(latest.key, latest_key);
     assert!(!earlier.active_recovery);
     assert!(latest.active_recovery);
     assert_eq!(runtime.failure_details(&earlier.key).as_deref(), Some(raw));
     assert_eq!(runtime.failure_details(&latest.key).as_deref(), Some(raw));
+    assert!(runtime.failure_ui.incidents.iter().any(|incident| {
+        incident.key != earlier_key
+            && incident.key != latest_key
+            && incident
+                .sources
+                .iter()
+                .any(|source| matches!(source, Source::Local(_)))
+    }));
+}
+
+#[test]
+fn late_source_repairs_only_its_receipt_and_preserves_expanded_catalog_identity() {
+    let provider = Provider::Claude;
+    let scalar = format!("Claude: overloaded_error\n{CAPACITY}");
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![
+            text("prompt:0", chat::Role::User, "Inspect"),
+            provider_error(provider, "failure:0", CAPACITY),
+            text("later-prose", chat::Role::Assistant, "Later resumed prose."),
+        ],
+    );
+    publish(&mut runtime, &handle, |next| {
+        next.error = Some(scalar.clone());
+        next.error_generation += 1;
+        next.error_item = None;
+    });
+    let receipt = runtime.failures[0].error_generation;
+    let key = runtime.failures[0].event_key.clone().unwrap();
+    let before = catalog(&mut runtime);
+    let preview = diagnostic_preview_identity(&key);
+    assert!(before.iter().any(|(id, _)| *id == preview));
+    let original_preview = before
+        .iter()
+        .find(|(id, _)| *id == preview)
+        .unwrap()
+        .1
+        .clone();
+    // Obtain opaque endpoints through the production catalog API, then use
+    // those exact endpoints against the real transcript catalog before/after.
+    let mut preview_catalog = selection::Catalog::builder();
+    preview_catalog.logical(preview, original_preview.clone());
+    let (anchor, end) = preview_catalog.finish().endpoints().unwrap();
+    let before_catalog = runtime.selection_document().0;
+    let anchor_prefix = before_catalog.fingerprint(anchor).unwrap();
+    let end_prefix = before_catalog.fingerprint(end).unwrap();
+    assert_eq!(
+        before_catalog.copy(anchor, end).as_deref(),
+        Some(original_preview.as_ref())
+    );
+    publish(&mut runtime, &handle, |next| {
+        next.error_item = Some("failure:0".into())
+    });
+    assert_eq!(runtime.failures.len(), 1);
+    assert_eq!(runtime.failures[0].error_generation, receipt);
+    assert_eq!(runtime.failures[0].after.as_deref(), Some("failure:0"));
+    assert_eq!(runtime.failures[0].message.as_deref(), Some("prompt:0"));
+    assert_eq!(runtime.failures[0].event_key.as_deref(), Some(key.as_str()));
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert_eq!(runtime.failure_ui.item("failure:0").unwrap().key, key);
+    assert!(runtime.failure_ui.expanded.contains(&key));
+    let after = catalog(&mut runtime);
+    assert!(
+        after
+            .iter()
+            .find(|(id, _)| *id == preview)
+            .unwrap()
+            .1
+            .starts_with(original_preview.as_ref())
+    );
+    let after_catalog = runtime.selection_document().0;
+    assert_eq!(after_catalog.fingerprint(anchor).unwrap(), anchor_prefix);
+    assert_eq!(after_catalog.fingerprint(end).unwrap(), end_prefix);
+    assert_eq!(
+        after_catalog.copy(anchor, end).as_deref(),
+        Some(original_preview.as_ref())
+    );
+    let prose = after
+        .iter()
+        .position(|(_, text)| text.contains("Later resumed prose."))
+        .unwrap();
+    assert!(position(&after, preview) < prose);
+    assert!(runtime.failure_details(&key).unwrap().contains(&scalar));
+}
+
+#[test]
+fn deferred_receipt_enriches_before_later_equal_text_and_keeps_its_key() {
+    let provider = Provider::Claude;
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![text("old:0", chat::Role::User, "Earlier page")],
+    );
+    publish(&mut runtime, &handle, |next| {
+        next.has_later = true;
+        next.error = Some(CAPACITY.into());
+        next.error_generation += 1;
+        next.error_item = None;
+    });
+    let key_a = runtime.unplaced_failures[0].unresolved_key();
+    runtime.failure_ui.expanded.insert(key_a.clone());
+    publish(&mut runtime, &handle, |next| {
+        next.error_item = Some("error-a:0".into())
+    });
+    assert_eq!(runtime.unplaced_failures.len(), 1);
+    assert_eq!(
+        runtime.unplaced_failures[0].error_item.as_deref(),
+        Some("error-a:0")
+    );
+    assert_eq!(runtime.unplaced_failures[0].unresolved_key(), key_a);
+    publish(&mut runtime, &handle, |next| {
+        next.turn_generation += 1;
+        next.error_generation += 1;
+        next.error_item = None;
+    });
+    let key_b = runtime.unplaced_failures[1].unresolved_key();
+    assert_ne!(key_a, key_b);
+    publish(&mut runtime, &handle, |next| {
+        next.error_item = Some("error-b:0".into())
+    });
+    assert_eq!(runtime.unplaced_failures.len(), 2);
+    assert_eq!(
+        runtime.unplaced_failures[0].error_item.as_deref(),
+        Some("error-a:0")
+    );
+    assert!(runtime.failure_ui.expanded.contains(&key_a));
+    publish(&mut runtime, &handle, |next| {
+        next.has_later = false;
+        next.items = vec![
+            Arc::new(text("a:0", chat::Role::User, "First request")),
+            Arc::new(provider_error(provider, "error-a:0", CAPACITY)),
+            Arc::new(text("b:0", chat::Role::User, "Second request")),
+            Arc::new(provider_error(provider, "error-b:0", CAPACITY)),
+        ];
+    });
+    assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    assert_eq!(runtime.failure_ui.item("error-a:0").unwrap().key, key_a);
+    assert_eq!(runtime.failure_ui.item("error-b:0").unwrap().key, key_b);
+    assert!(runtime.failure_ui.expanded.contains(&key_a));
+    let blocks = catalog(&mut runtime);
+    assert!(failure_position(&blocks, &key_a) < prompt_position(&blocks, "b:0"));
+    assert!(prompt_position(&blocks, "b:0") < failure_position(&blocks, &key_b));
+}
+
+#[test]
+fn unlinked_scalar_never_guesses_the_later_equal_text_source() {
+    let provider = Provider::Claude;
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![
+            text("a:0", chat::Role::User, "First request"),
+            provider_error(provider, "error-a:0", CAPACITY),
+            text("b:0", chat::Role::User, "Second request"),
+            provider_error(provider, "error-b:0", CAPACITY),
+        ],
+    );
+    let key_b = runtime.failure_ui.item("error-b:0").unwrap().key.clone();
+    publish(&mut runtime, &handle, |next| {
+        next.error_generation += 1;
+        next.error = Some(CAPACITY.into());
+        next.error_item = None;
+    });
+    assert_eq!(
+        runtime.failure_ui.incidents.len(),
+        3,
+        "an unproven receipt cannot adopt B"
+    );
+    let key = runtime.failures[0].event_key.clone().unwrap();
+    assert_ne!(key, key_b);
+    catalog(&mut runtime);
+    publish(&mut runtime, &handle, |next| {
+        next.error_item = Some("error-a:0".into())
+    });
+    assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    assert_eq!(runtime.failure_ui.item("error-a:0").unwrap().key, key);
+    assert_eq!(runtime.failure_ui.item("error-b:0").unwrap().key, key_b);
+    assert_eq!(runtime.failures[0].after.as_deref(), Some("error-a:0"));
+    assert_eq!(runtime.failures[0].message.as_deref(), Some("a:0"));
+    assert!(runtime.failure_ui.expanded.contains(&key));
+}
+
+#[test]
+fn split_replay_reuses_the_original_proven_source_notice() {
+    let provider = Provider::Claude;
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![
+            text("p:0", chat::Role::User, "Inspect"),
+            provider_error(provider, "failure:0", CAPACITY),
+        ],
+    );
+    publish_error(&mut runtime, &handle, CAPACITY);
+    let key = runtime.failures[0].event_key.clone().unwrap();
+    catalog(&mut runtime);
+    publish(&mut runtime, &handle, |next| {
+        next.error_generation += 1;
+        next.error_item = None;
+    });
+    let latest_receipt = runtime.snapshot.error_generation;
+    publish(&mut runtime, &handle, |next| {
+        next.error_item = Some("failure:0".into())
+    });
+    assert_eq!(runtime.failures.len(), 1);
+    assert_eq!(runtime.failures[0].error_generation, Some(latest_receipt));
+    assert_eq!(runtime.failures[0].event_key.as_deref(), Some(key.as_str()));
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert_eq!(runtime.failure_ui.incidents[0].key, key);
+    assert!(runtime.failure_ui.expanded.contains(&key));
+    let blocks = catalog(&mut runtime);
+    assert_eq!(
+        blocks
+            .iter()
+            .filter(|(id, _)| *id == diagnostic_preview_identity(&key))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn local_equal_text_notice_is_not_enriched_as_a_provider_receipt() {
+    let provider = Provider::Claude;
+    let (mut runtime, handle) = live_fixture(
+        provider,
+        vec![
+            text("p:0", chat::Role::User, "Inspect"),
+            provider_error(provider, "failure:0", CAPACITY),
+            text("later", chat::Role::Assistant, "Resumed work."),
+        ],
+    );
+    publish(&mut runtime, &handle, |next| {
+        next.error_generation += 1;
+        next.error = Some(CAPACITY.into());
+        next.error_item = None;
+    });
+    runtime.note(CAPACITY.into());
+    let local = runtime
+        .failures
+        .iter()
+        .find(|note| note.error_generation.is_none())
+        .unwrap()
+        .clone();
+    publish(&mut runtime, &handle, |next| {
+        next.error_item = Some("failure:0".into())
+    });
+    assert_eq!(runtime.failures.len(), 2);
+    assert!(runtime.failures.iter().any(|note| note == &local));
+    assert!(local.error_item.is_none());
+    assert_eq!(local.after.as_deref(), Some("later"));
+    assert_eq!(runtime.failure_ui.incidents.len(), 2);
+}
+
+#[test]
+fn legacy_counter_and_changed_text_never_replace_an_unrelated_receipt() {
+    let provider = Provider::Claude;
+    let (mut runtime, handle) =
+        live_fixture(provider, vec![text("p:0", chat::Role::User, "Inspect")]);
+    for (turn, raw) in [
+        (1, CAPACITY),
+        (2, "Connection reset by peer"),
+        (3, CAPACITY),
+    ] {
+        publish(&mut runtime, &handle, |next| {
+            next.turn_generation = turn;
+            next.items.push(Arc::new(text(
+                &format!("p{turn}:0"),
+                chat::Role::User,
+                "Try again",
+            )));
+            next.error = Some(raw.into());
+            next.error_generation = 0;
+            next.error_item = None;
+        });
+    }
+    assert_eq!(runtime.failures.len(), 3);
+    assert_eq!(runtime.failure_ui.incidents.len(), 3);
+    assert_eq!(
+        runtime
+            .failures
+            .iter()
+            .filter(|note| note.text == CAPACITY)
+            .count(),
+        2
+    );
 }
