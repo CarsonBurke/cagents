@@ -2929,7 +2929,9 @@ fn spawn_updated_ui_with_timeout(
             Ok(UiLaunchReply::RendererBeforeState(detail)) => {
                 // Do not kill to manufacture retry eligibility. Retain this
                 // exact Child and pipe until its original wait is known.
-                if let Err(cause) = wait_renderer_failure(&mut original, stdout.as_mut(), &budget) {
+                if let Err(cause) =
+                    wait_renderer_failure(&mut original, stdout.as_mut(), &budget, |_| {})
+                {
                     let error = io::Error::new(cause.kind(), RendererWaitFailure { detail, cause });
                     return Err(if attempt == 0 {
                         error
@@ -3078,12 +3080,21 @@ impl UiLaunchBudget {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RendererWaitEvent {
+    PipePending,
+    OriginalWaited,
+}
+
 fn wait_renderer_failure(
     original: &mut std::process::Child,
     mut stdout: Option<&mut ChildStdout>,
     budget: &UiLaunchBudget,
+    mut observe: impl FnMut(RendererWaitEvent),
 ) -> io::Result<()> {
     let mut first_error = None;
+    let mut original_status = None;
+    let mut eof_after_settlement = false;
     loop {
         if let Err(error) = budget.ensure_remaining() {
             if first_error.is_none() {
@@ -3093,7 +3104,7 @@ fn wait_renderer_failure(
         if let Some(stdout) = stdout.as_deref_mut() {
             let mut buffer = [0; 256];
             match stdout.read(&mut buffer) {
-                Ok(0) => {}
+                Ok(0) => eof_after_settlement = original_status.is_some(),
                 Ok(_) => {
                     if first_error.is_none() {
                         first_error = Some(io::Error::new(
@@ -3102,11 +3113,10 @@ fn wait_renderer_failure(
                         ));
                     }
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    observe(RendererWaitEvent::PipePending);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
@@ -3115,32 +3125,42 @@ fn wait_renderer_failure(
             }
         }
         // A drain error must never prevent attempting the exact original wait.
-        match original.try_wait() {
-            Ok(Some(status)) => {
-                if let Err(error) = original.wait() {
+        if original_status.is_none() {
+            match original.try_wait() {
+                Ok(Some(_)) => match original.wait() {
+                    Ok(status) => {
+                        original_status = Some(status);
+                        observe(RendererWaitEvent::OriginalWaited);
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
                 }
-                if let Some(error) = first_error {
-                    return Err(error);
-                }
-                if status.code() != Some(1) {
-                    return Err(io::Error::other(format!(
-                        "renderer failure contradicted original UI exit {status}"
-                    )));
-                }
-                return Ok(());
-            }
-            Ok(None) => {}
-            Err(error) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
             }
         }
-        // Unknown settlement retains the original Child locally, even beyond
-        // its workload allowance. Neither another attempt nor slot advances.
+        // The pre-wait read can race a final write/retained writer. Only EOF
+        // observed after the positive original wait completes the terminal pipe.
+        if let Some(status) = original_status.filter(|_| eof_after_settlement) {
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            if status.code() != Some(1) {
+                return Err(io::Error::other(format!(
+                    "renderer failure contradicted original UI exit {status}"
+                )));
+            }
+            return Ok(());
+        }
+        // Unknown original wait OR terminal pipe retains both owners locally,
+        // even beyond the workload allowance. Neither attempt nor slot advances.
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -8035,5 +8055,118 @@ mod ui_renderer_retry_tests {
         );
         assert!(error.to_string().contains("pane still recovering"));
         assert!(std::error::Error::source(error.get_ref().unwrap()).is_some());
+    }
+
+    struct NaturalOriginal(std::process::Child);
+    impl Drop for NaturalOriginal {
+        fn drop(&mut self) {
+            // An assertion or callback panic must retain the exact original
+            // wait; this fixture never signals or adopts another process.
+            while self.0.wait().is_err() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    fn renderer_terminal_pipe() -> (NaturalOriginal, ChildStdout, fs::File) {
+        let mut descriptors = [-1; 2];
+        // SAFETY: the two returned descriptors are transferred exactly once
+        // to the original read owner and retained write owner below.
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0,
+        );
+        let stdout = unsafe { ChildStdout::from_raw_fd(descriptors[0]) };
+        let retained = unsafe { fs::File::from_raw_fd(descriptors[1]) };
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 1", "owned-renderer-terminal-fixture"])
+            .stdin(Stdio::null())
+            .stdout(retained.try_clone().unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        (NaturalOriginal(child), stdout, retained)
+    }
+
+    struct RetainedPipeWait {
+        writer: Option<fs::File>,
+        original: Option<thread::JoinHandle<io::Result<()>>>,
+    }
+    impl Drop for RetainedPipeWait {
+        fn drop(&mut self) {
+            drop(self.writer.take());
+            if let Some(original) = self.original.take() {
+                let _ = original.join();
+            }
+        }
+    }
+
+    #[test]
+    fn renderer_retry_requires_post_wait_eof_and_rejects_boundary_bytes() {
+        let (mut child, mut stdout, retained) = renderer_terminal_pipe();
+        let (events, received) = mpsc::channel();
+        let (finished, completed) = mpsc::channel();
+        let original = thread::spawn(move || {
+            let result = wait_renderer_failure(
+                &mut child.0,
+                Some(&mut stdout),
+                &UiLaunchBudget::new(Duration::from_secs(5)),
+                |event| {
+                    let _ = events.send(event);
+                },
+            );
+            let _ = finished.send(());
+            result
+        });
+        let mut owner = RetainedPipeWait {
+            writer: Some(retained),
+            original: Some(original),
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let event = received
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+            if event == RendererWaitEvent::OriginalWaited {
+                break;
+            }
+        }
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            RendererWaitEvent::PipePending
+        );
+        assert!(
+            completed.try_recv().is_err(),
+            "a retained writer is not terminal EOF after the original wait"
+        );
+        drop(owner.writer.take());
+        owner.original.take().unwrap().join().unwrap().unwrap();
+
+        // The original exit is already naturally known. Inject a final write
+        // exactly after the next WouldBlock read and before the wait check.
+        // A wait-only admission would accept this race without seeing the bytes.
+        let (mut child, mut stdout, retained) = renderer_terminal_pipe();
+        assert_eq!(child.0.wait().unwrap().code(), Some(1));
+        let mut writer = Some(retained);
+        let mut wrote_after_pending = false;
+        let error = wait_renderer_failure(
+            &mut child.0,
+            Some(&mut stdout),
+            &UiLaunchBudget::new(Duration::from_secs(5)),
+            |event| {
+                if event == RendererWaitEvent::PipePending && !wrote_after_pending {
+                    writer.as_mut().unwrap().write_all(b"ready\n").unwrap();
+                    wrote_after_pending = true;
+                    drop(writer.take());
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(wrote_after_pending);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "cagents-ui wrote after its terminal renderer failure"
+        );
     }
 }

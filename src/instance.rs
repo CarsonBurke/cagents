@@ -1183,7 +1183,7 @@ impl UiUpdateGuard {
             if let Err(error) =
                 launch_window_at_with_policy(executable, false, Some(slot), None, true)
             {
-                errors.push(format!("{slot}: {error}"));
+                errors.push(ui_relaunch_failure(slot, &error));
             }
         }
         if errors.is_empty() {
@@ -1200,6 +1200,14 @@ impl UiUpdateGuard {
         }
         self.lock.take();
         Ok(())
+    }
+}
+
+fn ui_relaunch_failure(slot: &str, error: &io::Error) -> String {
+    if slot == PRIMARY_WINDOW {
+        format!("Could not reopen the main saved window (primary): {error}")
+    } else {
+        format!("Could not reopen saved window “{slot}”: {error}")
     }
 }
 
@@ -3198,5 +3206,24 @@ mod renderer_startup_protocol_tests {
             assert!(record.detail.len() <= 512);
             assert!(detail.starts_with(&record.detail));
         }
+    }
+
+    #[test]
+    fn reopen_failure_identifies_the_exact_saved_window_and_original_cause() {
+        let cause = io::Error::new(io::ErrorKind::TimedOut, "fixture original recovery failure");
+        assert_eq!(
+            ui_relaunch_failure(PRIMARY_WINDOW, &cause),
+            "Could not reopen the main saved window (primary): fixture original recovery failure",
+        );
+        for slot in ["workbench", "770e8e78-dc77-4fac-8069-f024344faac8"] {
+            assert_eq!(
+                ui_relaunch_failure(slot, &cause),
+                format!(
+                    "Could not reopen saved window “{slot}”: fixture original recovery failure"
+                ),
+            );
+        }
+        assert_eq!(cause.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(cause.to_string(), "fixture original recovery failure");
     }
 }
