@@ -1,0 +1,55 @@
+{
+  "additional_test_dependency": {
+    "raw-window-handle": "0.6",
+    "scope": "dev-only existing locked package, to supply handle-error-only NoWindow fake"
+  },
+  "local_changed_upstream_files": [
+    "Cargo.toml",
+    "src/fallback.rs"
+  ],
+  "locked_commit": "caec74c2559924443f12fc6faf97a5bcefe6271d",
+  "locked_package_repository": "https://github.com/pop-os/libcosmic.git",
+  "normalization": "Standalone package/workspace; exact inherited package metadata, lints, dependencies/features/target tables; iced path packages and build_helpers use original libcosmic source/revision. No dependency version updates. Local checked-surface modifications are separately visible in Git diff.",
+  "normalized_cargo_sha256": "e7a8b87cc93af9c8afdb87ab53a9893a2977283d4befc188aede59fc8fa12adb",
+  "ordinary_apis": "Existing create_surface/configure_surface and backend constructor paths preserved; checked method is additive. Local owning test modules are unexecuted.",
+  "pinned_root_support_files": {
+    "LICENSE": {
+      "git_blob": "f1148e26eac8202a1c2a170b41aa766d7dbb0c8d",
+      "sha256": "fc9086ba4eba4b77e4c603906362742bc3715ffa2c7810c6074fe7780d3a0398"
+    },
+    "rustfmt.toml": {
+      "git_blob": "dccc2a062e52f683d30d1807633a434ae1162a89",
+      "sha256": "17ceca29cd690094207262faad96563d9b20ffd05f03fe2036876f9e2963678f"
+    }
+  },
+  "source_files": [
+    {
+      "artifact": "iced--renderer--Cargo.toml",
+      "bytes": 1061,
+      "git_blob": "2c43c8969337f2f80fea023e6c29214801774f75",
+      "mode": "100644",
+      "path": "renderer/Cargo.toml",
+      "sha256": "7bf3226823cf42fbb153519f932c60e1ac3109d5ecfae02d678cd35c2d519139"
+    },
+    {
+      "artifact": "iced--renderer--src--fallback.rs",
+      "bytes": 20535,
+      "git_blob": "2a0bdea7f06a79c949bcdeeaef150140b07b943f",
+      "mode": "100644",
+      "path": "renderer/src/fallback.rs",
+      "sha256": "f80b49312a79a26aba7368507762dac25e76bf053b23b735d8b95cf99e9a9bc0"
+    },
+    {
+      "artifact": "iced--renderer--src--lib.rs",
+      "bytes": 1655,
+      "git_blob": "0336f3dd7b9b8e16ff7f57ecd0888aa292de04bc",
+      "mode": "100644",
+      "path": "renderer/src/lib.rs",
+      "sha256": "7ffa273541b5a352cfa526907a3319ba8af25892f676ec6c4a0127320a4325be"
+    }
+  ],
+  "upstream_commit": "87c0358985cae50fefdcb15eabb0271e19ecf4a2",
+  "upstream_prefix": "renderer/",
+  "upstream_repository": "https://github.com/pop-os/iced",
+  "upstream_tree": "7a2d7e8eeb4c027ce92eaf0a193f4b857c28db47"
+}

@@ -1,0 +1,380 @@
+{
+  "additional_test_dependency": null,
+  "local_changed_upstream_files": [
+    "Cargo.toml",
+    "src/window/compositor.rs"
+  ],
+  "locked_commit": "caec74c2559924443f12fc6faf97a5bcefe6271d",
+  "locked_package_repository": "https://github.com/pop-os/libcosmic.git",
+  "normalization": "Standalone package/workspace; exact inherited package metadata, lints, dependencies/features/target tables; iced path packages and build_helpers use original libcosmic source/revision. No dependency version updates. Local checked-surface modifications are separately visible in Git diff.",
+  "normalized_cargo_sha256": "c815c9e7795550f8508ad94f9d34231454a3ac06fa26af1430eb91f355fea8d4",
+  "ordinary_apis": "Existing create_surface/configure_surface and backend constructor paths preserved; checked method is additive. Local owning test modules are unexecuted.",
+  "pinned_root_support_files": {
+    "LICENSE": {
+      "git_blob": "f1148e26eac8202a1c2a170b41aa766d7dbb0c8d",
+      "sha256": "fc9086ba4eba4b77e4c603906362742bc3715ffa2c7810c6074fe7780d3a0398"
+    },
+    "rustfmt.toml": {
+      "git_blob": "dccc2a062e52f683d30d1807633a434ae1162a89",
+      "sha256": "17ceca29cd690094207262faad96563d9b20ffd05f03fe2036876f9e2963678f"
+    }
+  },
+  "source_files": [
+    {
+      "artifact": "iced--wgpu--Cargo.toml",
+      "bytes": 1741,
+      "git_blob": "1d8ece881f89f0a8e0ccfd04451a71133f1040de",
+      "mode": "100644",
+      "path": "wgpu/Cargo.toml",
+      "sha256": "985a5e3739e2ffb21b72ed0f3fac49b0b5912dff26fce507b05edcc057424aac"
+    },
+    {
+      "artifact": "iced--wgpu--README.md",
+      "bytes": 1067,
+      "git_blob": "8e9602ea6230e059a7a65dd3023653bc69d80419",
+      "mode": "100644",
+      "path": "wgpu/README.md",
+      "sha256": "71cb63fd6d0255a14ee7e2f2dc6aad9e9568f30438eb22c0fda57c519ea0dee7"
+    },
+    {
+      "artifact": "iced--wgpu--build.rs",
+      "bytes": 54,
+      "git_blob": "db00a7739cb1d8136c71c00e02bd834148831942",
+      "mode": "100644",
+      "path": "wgpu/build.rs",
+      "sha256": "11d049184914b073ca65e99cc02d85a4d626a5211e722304348cf1d241210a37"
+    },
+    {
+      "artifact": "iced--wgpu--src--buffer.rs",
+      "bytes": 3467,
+      "git_blob": "e251e9791535cde1359b1c782f6221e449dc041d",
+      "mode": "100644",
+      "path": "wgpu/src/buffer.rs",
+      "sha256": "a84d9a623f624f95f62de24a320163202776cb72b528ad1c1db4d7f2d87cb61e"
+    },
+    {
+      "artifact": "iced--wgpu--src--color.rs",
+      "bytes": 7558,
+      "git_blob": "642d4ea72bf021b84c072b2f26447ca95ca8371e",
+      "mode": "100644",
+      "path": "wgpu/src/color.rs",
+      "sha256": "3d59dddaafeb9df7365bb655cae415b1cfadcbb48daefe6c858d1ca006924822"
+    },
+    {
+      "artifact": "iced--wgpu--src--engine.rs",
+      "bytes": 2147,
+      "git_blob": "d86499eb6a9a47b72a40d044c5494d325dfff5b6",
+      "mode": "100644",
+      "path": "wgpu/src/engine.rs",
+      "sha256": "ce8d9d294c2aa92f127a7cf9b97a581a9ab0711c34ac38d96eede374b3b60842"
+    },
+    {
+      "artifact": "iced--wgpu--src--geometry.rs",
+      "bytes": 22953,
+      "git_blob": "c1433c4541990c2fc58918b62aea1c9a61e5b053",
+      "mode": "100644",
+      "path": "wgpu/src/geometry.rs",
+      "sha256": "57cdcad6b837722021627da243f32ebeaa365512279f8b03f91b3923409d6d3c"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--atlas.rs",
+      "bytes": 19044,
+      "git_blob": "d23e74520303eff8a1b30e502c782a23e4aa2ad4",
+      "mode": "100644",
+      "path": "wgpu/src/image/atlas.rs",
+      "sha256": "6d5d906f9c9d9ef38732dac7d564725531a772851df1710feabe20bd1c32a5be"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--atlas--allocation.rs",
+      "bytes": 1273,
+      "git_blob": "295a7a132910fb063c5cf008f68f704932924310",
+      "mode": "100644",
+      "path": "wgpu/src/image/atlas/allocation.rs",
+      "sha256": "89c5b4fc10e7caadc7307a7758c9020b77892004947c96e024a64fc7230be704"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--atlas--allocator.rs",
+      "bytes": 2794,
+      "git_blob": "263619f6ecc64cccf796962124cf666037786cf3",
+      "mode": "100644",
+      "path": "wgpu/src/image/atlas/allocator.rs",
+      "sha256": "fbcf74eed8d716c7d920e5b9a12f3e8c33e9a2508129d38a7db15bcef2d33220"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--atlas--entry.rs",
+      "bytes": 552,
+      "git_blob": "7e4c92a2c777d0b00b303906df0966ffb76dcc97",
+      "mode": "100644",
+      "path": "wgpu/src/image/atlas/entry.rs",
+      "sha256": "e97cccf3b74286e6d76f3b206afb3f1563a4223a10d4908dab9d1fab08d7a9c6"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--atlas--layer.rs",
+      "bytes": 414,
+      "git_blob": "fd6788d9cf5793fe72c1b59cbaf18519f009b51d",
+      "mode": "100644",
+      "path": "wgpu/src/image/atlas/layer.rs",
+      "sha256": "0f3b7fe100b308180ee51a443ef7d813a754f6c3966fbfc3a709d552989ce40c"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--cache.rs",
+      "bytes": 19216,
+      "git_blob": "88a486403b3ced79e9147142501fc1711c74fb96",
+      "mode": "100644",
+      "path": "wgpu/src/image/cache.rs",
+      "sha256": "ecc6c7ab76ab95e5a57778727eda7a094541ed9e505f2ae174bb59dc389eed56"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--mod.rs",
+      "bytes": 23944,
+      "git_blob": "d0665ee42300934c71fd7e19936504bb00f3fb5c",
+      "mode": "100644",
+      "path": "wgpu/src/image/mod.rs",
+      "sha256": "8f503c1e238d13e51bc810d46dd319d904552ae485802ad696c2434c029656ab"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--null.rs",
+      "bytes": 279,
+      "git_blob": "d0d74cfc136992e7a3ad6dab0a1bffd2fb4308ce",
+      "mode": "100644",
+      "path": "wgpu/src/image/null.rs",
+      "sha256": "be975aab629093639ff6509139b025f98dde11958e61f35be4d5f390f900c45f"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--raster.rs",
+      "bytes": 3178,
+      "git_blob": "881e75e3dfd62a5f3b70b7c10d37df332f5f0556",
+      "mode": "100644",
+      "path": "wgpu/src/image/raster.rs",
+      "sha256": "5a477223977f8b2769d9d49c52dfee08697c39dc4bca13899cad6225220db7ea"
+    },
+    {
+      "artifact": "iced--wgpu--src--image--vector.rs",
+      "bytes": 7239,
+      "git_blob": "0704a966ed9f467a3d5460115ca3381b272ea4a3",
+      "mode": "100644",
+      "path": "wgpu/src/image/vector.rs",
+      "sha256": "434f1afd1e5688d477f7d077a25a047357e3e1631684cd7116c0b7a8afd2c019"
+    },
+    {
+      "artifact": "iced--wgpu--src--layer.rs",
+      "bytes": 10107,
+      "git_blob": "d4a96ef815fec9e51859fd2664ad49335095e778",
+      "mode": "100644",
+      "path": "wgpu/src/layer.rs",
+      "sha256": "44271e8356933bdddf47a8b71e521a895019aa1e0f1fb95e7779301c9af99656"
+    },
+    {
+      "artifact": "iced--wgpu--src--lib.rs",
+      "bytes": 33348,
+      "git_blob": "03a72042d3960a6b683ef7c32cae5053826d17da",
+      "mode": "100644",
+      "path": "wgpu/src/lib.rs",
+      "sha256": "845d46757165af967361ebfe598e5ee08ce12f8b5bfe2abb99e6ea4d15fa922d"
+    },
+    {
+      "artifact": "iced--wgpu--src--offscreen.rs",
+      "bytes": 3772,
+      "git_blob": "29913d0244aaa54baa390e6a0c3ae09a675d5cad",
+      "mode": "100644",
+      "path": "wgpu/src/offscreen.rs",
+      "sha256": "080f1164d3ea52236c5d433d9acba1ef9c94c90ab5e705438c5d8e7e5ad958aa"
+    },
+    {
+      "artifact": "iced--wgpu--src--primitive.rs",
+      "bytes": 7019,
+      "git_blob": "4c18bb6a011551ce858a06b7b15a0ac029e59d0b",
+      "mode": "100644",
+      "path": "wgpu/src/primitive.rs",
+      "sha256": "1546d83b048b763c0561b9256db023a7d4c2fc6d026076ae083e495d09d4f305"
+    },
+    {
+      "artifact": "iced--wgpu--src--quad.rs",
+      "bytes": 9902,
+      "git_blob": "4cab2598babc757fe983ceec9eb999da8cce4a74",
+      "mode": "100644",
+      "path": "wgpu/src/quad.rs",
+      "sha256": "bc9869723c31475c152eda6824a861c8c326ff6d141f6114ff674e66d8bb4d9c"
+    },
+    {
+      "artifact": "iced--wgpu--src--quad--gradient.rs",
+      "bytes": 6450,
+      "git_blob": "55e62e7945ebf2770e80a1c0379487ecc3cb4bf2",
+      "mode": "100644",
+      "path": "wgpu/src/quad/gradient.rs",
+      "sha256": "bef15969a331606e2695829b80d656d25a7e756e9c937b79c42b36d83a61f626"
+    },
+    {
+      "artifact": "iced--wgpu--src--quad--solid.rs",
+      "bytes": 5408,
+      "git_blob": "49e4cf018111e5824fc283779c81f4f74a4103c5",
+      "mode": "100644",
+      "path": "wgpu/src/quad/solid.rs",
+      "sha256": "e4af4a0ba77457cc0557d1aecd8abde162bbfd3224cbc2987f4339ed9a416d07"
+    },
+    {
+      "artifact": "iced--wgpu--src--settings.rs",
+      "bytes": 2714,
+      "git_blob": "1b46afbddc7e3f9d0ff7b164ccc7e6cf530b6e4b",
+      "mode": "100644",
+      "path": "wgpu/src/settings.rs",
+      "sha256": "5abe7ac9d05ef37dc54c495e9767997778cdfe04afc2389c382e187a47ed8a96"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--blit.wgsl",
+      "bytes": 924,
+      "git_blob": "5e600de4fee5a4b3075eab81bbd59d8392cc5d2b",
+      "mode": "100644",
+      "path": "wgpu/src/shader/blit.wgsl",
+      "sha256": "a3ead61c77980f7c9ed5184e54b057b11b4d29ecf9bc0e57fe0721c9dcbb7a82"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--color.wgsl",
+      "bytes": 384,
+      "git_blob": "a80663689d024580998494ec2383331481043ebd",
+      "mode": "100644",
+      "path": "wgpu/src/shader/color.wgsl",
+      "sha256": "ce0890df18d0b31449ca5ebb27a5add7437c57e5684ddb55445c8e6e0a7e95d7"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--color--linear_rgb.wgsl",
+      "bytes": 121,
+      "git_blob": "a5cf45d4fa6f203b5b7f56adf4dabd250bab62f5",
+      "mode": "100644",
+      "path": "wgpu/src/shader/color/linear_rgb.wgsl",
+      "sha256": "0759c36e19c10d3bc22fbccfff798d0b86549eeb3bfe75b15894b129c7979917"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--image.wgsl",
+      "bytes": 4661,
+      "git_blob": "3a237c36a961420d20064d806455ecedb0467f05",
+      "mode": "100644",
+      "path": "wgpu/src/shader/image.wgsl",
+      "sha256": "2eb4b3bb31095330b3a04b5736ad18b05ed9e9c5634a87a041136e80220227af"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--offscreen_blit.wgsl",
+      "bytes": 732,
+      "git_blob": "9c764c36dcf0950654405ac09278cf50ef2d6ff2",
+      "mode": "100644",
+      "path": "wgpu/src/shader/offscreen_blit.wgsl",
+      "sha256": "3e52c6a9851b7b94039753cae882455defac37929add62b6a51d63f19e55c072"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--quad.wgsl",
+      "bytes": 430,
+      "git_blob": "f8258a4ec387a069c6a01f1dbcbad0d0d70f6b45",
+      "mode": "100644",
+      "path": "wgpu/src/shader/quad.wgsl",
+      "sha256": "1d55963b477c51b193156301a80948b6885ed890dd8b48cbf982a867823c5fa8"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--quad--gradient.wgsl",
+      "bytes": 6158,
+      "git_blob": "7c7a6e45f03cd5de82f3ec1f679a65aa2f165643",
+      "mode": "100644",
+      "path": "wgpu/src/shader/quad/gradient.wgsl",
+      "sha256": "b1ffe24f8d3c58f913973340690674902aa2c64a9320107672bf0138267425a6"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--quad--solid.wgsl",
+      "bytes": 3676,
+      "git_blob": "2a07e3fa080714734d9ec4b85e9836a039346433",
+      "mode": "100644",
+      "path": "wgpu/src/shader/quad/solid.wgsl",
+      "sha256": "3fb50f6d68cafe8e6b27740275793046ceaf2c9c9673d8a2c80037404dfa6ada"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--triangle.wgsl",
+      "bytes": 101,
+      "git_blob": "e4c193444da2336c4ef7490ff954f27e57c1d7b5",
+      "mode": "100644",
+      "path": "wgpu/src/shader/triangle.wgsl",
+      "sha256": "bcfa1ab1a837981fed3028bb838ee42e0b8cc35ff72c7f2d0ec04ed8e860d4a6"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--triangle--gradient.wgsl",
+      "bytes": 3906,
+      "git_blob": "31a48026925fad5c51913853018b7da1cfcf5678",
+      "mode": "100644",
+      "path": "wgpu/src/shader/triangle/gradient.wgsl",
+      "sha256": "eac4280abdeb82b4c5175829e2324befad0ce3382a2557e6614dd9e5be02cfd8"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--triangle--solid.wgsl",
+      "bytes": 562,
+      "git_blob": "b0d8057bfc53e263d25e6009bed8cce2f4f9c64e",
+      "mode": "100644",
+      "path": "wgpu/src/shader/triangle/solid.wgsl",
+      "sha256": "30a9f9ba7557c7514f49f76e92b481870fd828edb6c642abe09791d710bdd380"
+    },
+    {
+      "artifact": "iced--wgpu--src--shader--vertex.wgsl",
+      "bytes": 266,
+      "git_blob": "e6af6fc008d9e241eb948b030a5c7796a487cc21",
+      "mode": "100644",
+      "path": "wgpu/src/shader/vertex.wgsl",
+      "sha256": "89d3a0e0b2ac9686a6038223c0669ff8980d08b0cea6d589237089a9b4fd12cc"
+    },
+    {
+      "artifact": "iced--wgpu--src--text.rs",
+      "bytes": 19856,
+      "git_blob": "b6d9e67900f703f8b31646c58b0baf645395ad70",
+      "mode": "100644",
+      "path": "wgpu/src/text.rs",
+      "sha256": "c9d1aec12271857c2ba07ed78fad7b4c535428f83b9b9222db752cfc10b7112e"
+    },
+    {
+      "artifact": "iced--wgpu--src--triangle.rs",
+      "bytes": 30972,
+      "git_blob": "5607d03a2e6e29e98935392fb9f08e3e4e0f501d",
+      "mode": "100644",
+      "path": "wgpu/src/triangle.rs",
+      "sha256": "1d31ab5360ec6c4ac3d42bad6087eb7af984fa68c197810567a8dd53236bf236"
+    },
+    {
+      "artifact": "iced--wgpu--src--triangle--msaa.rs",
+      "bytes": 12546,
+      "git_blob": "461183616337ba79f0ad7cd8dc182234e79bed0e",
+      "mode": "100644",
+      "path": "wgpu/src/triangle/msaa.rs",
+      "sha256": "c06688e15fb58e2d0d52e01afc817edc9aec4f2cdba5abbaee96a24f320b5da4"
+    },
+    {
+      "artifact": "iced--wgpu--src--window.rs",
+      "bytes": 1342,
+      "git_blob": "af90dd78205d8e5695b588a87f52cde91dada12c",
+      "mode": "100644",
+      "path": "wgpu/src/window.rs",
+      "sha256": "9281f07ecb513413254065b95e7500a082168b7ed992b5e7534469c43f010f94"
+    },
+    {
+      "artifact": "iced--wgpu--src--window--compositor.rs",
+      "bytes": 17452,
+      "git_blob": "f0c3920808b51ecd83480a5b127e0bbcfadf50a3",
+      "mode": "100644",
+      "path": "wgpu/src/window/compositor.rs",
+      "sha256": "38aeed4090189e026cafdded1a51490c41adf3ffb795a5e8b2eaa2d27609b934"
+    },
+    {
+      "artifact": "iced--wgpu--src--window--wayland.rs",
+      "bytes": 3153,
+      "git_blob": "48e00def30cd80dc2e29223c06ac7a78abf05b13",
+      "mode": "100644",
+      "path": "wgpu/src/window/wayland.rs",
+      "sha256": "ed23999a79e5d7d6b18e1da80cd054498b727ecf66e3e32c655bcfaef7516128"
+    },
+    {
+      "artifact": "iced--wgpu--src--window--x11.rs",
+      "bytes": 6385,
+      "git_blob": "a150813410a0aad4b3e4e28a9f32304622ab9153",
+      "mode": "100644",
+      "path": "wgpu/src/window/x11.rs",
+      "sha256": "4bf91f9f7fa913c8d701cd1e60a7dab5acc20967e3288e8bcee6a64ec23a61c1"
+    }
+  ],
+  "upstream_commit": "87c0358985cae50fefdcb15eabb0271e19ecf4a2",
+  "upstream_prefix": "wgpu/",
+  "upstream_repository": "https://github.com/pop-os/iced",
+  "upstream_tree": "7a2d7e8eeb4c027ce92eaf0a193f4b857c28db47"
+}

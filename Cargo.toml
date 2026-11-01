@@ -338,6 +338,9 @@ iced_graphics = { path = "vendor/iced-graphics" }
 iced_accessibility = { path = "vendor/iced-accessibility" }
 iced_runtime = { path = "vendor/iced-runtime" }
 iced_winit = { path = "vendor/iced-winit" }
+iced_wgpu = { path = "vendor/iced-wgpu" }
+iced_renderer = { path = "vendor/iced-renderer" }
+iced_tiny_skia = { path = "vendor/iced-tiny-skia" }
 
 # Backport upstream long-line shaping fix until cosmic-text accepts its release.
 [patch.crates-io]

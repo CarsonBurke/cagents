@@ -106,6 +106,65 @@ where
             .expect("Get window that was just inserted")
     }
 
+    pub fn try_insert_configured(
+        &mut self,
+        id: Id,
+        window: Arc<dyn winit::window::Window>,
+        program: &program::Instance<P>,
+        compositor: &mut C,
+        exit_on_close_request: bool,
+        system_theme: theme::Mode,
+        resize_border: u32,
+    ) -> Result<&mut Window<P, C>, crate::runtime::window::OpenError> {
+        let state = State::new(program, id, system_theme, window.as_ref());
+        let surface_size = state.physical_size();
+        if surface_size.width == 0 || surface_size.height == 0 {
+            return Err(crate::runtime::window::OpenError::ZeroSize);
+        }
+        let surface_version = state.surface_version();
+        let surface = compositor
+            .try_create_configured_surface(
+                window.clone(),
+                surface_size.width,
+                surface_size.height,
+            )
+            .map_err(super::configured_surface_error)?;
+        let renderer = compositor.create_renderer();
+
+        self.aliases.retain(|w, i| *w != window.id() && *i != id);
+        let _ = self.aliases.insert(window.id(), id);
+
+        self.entries.retain(|old, _| id != *old);
+        let _ = self.entries.insert(
+            id,
+            Window {
+                drag_resize_window_func: super::drag_resize::event_func(
+                    window.as_ref(),
+                    f64::from(resize_border),
+                ),
+                raw: window,
+                state,
+                exit_on_close_request,
+                surface,
+                surface_version,
+                renderer,
+                mouse_interaction: mouse::Interaction::None,
+                redraw_at: None,
+                preedit: None,
+                ime_state: None,
+                prev_dnd_destination_rectangles_count: 0,
+                viewport_version: 0,
+                redraw_requested: false,
+                resize_enabled: false,
+            },
+        );
+
+        Ok(self
+            .entries
+            .get_mut(&id)
+            .expect("Get window that was just inserted"))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
