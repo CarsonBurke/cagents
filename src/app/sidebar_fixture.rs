@@ -65,8 +65,13 @@ pub(super) fn bootstrap() -> Bootstrap {
 }
 
 fn model() -> SidebarModel {
+    // Both sides need the same synthetic origin for the ordinary constructor
+    // to attach this PR and derive its status. No Git or GitHub read occurs.
+    let repository =
+        crate::github::GitHubRepoKey::new("example.invalid", None, "sidebar-fixture", "original")
+            .unwrap();
     let worktree = |id, path: &str, branch: &str| {
-        SidebarWorktree::new(
+        let mut row = SidebarWorktree::new(
             worktree_id(id),
             path.into(),
             Some(branch.into()),
@@ -75,7 +80,9 @@ fn model() -> SidebarModel {
             None,
             None,
             None,
-        )
+        );
+        row.head_repository = Some(repository.clone());
+        row
     };
     let mut merged = sidebar::SidebarPullRequest::new(
         project_id(1),
@@ -89,6 +96,7 @@ fn model() -> SidebarModel {
         false,
         CheckStatus::Unknown,
     );
+    merged.head_repository = Some(repository.clone());
     merged.state = Some(sidebar::WorktreePullRequestState::Merged);
     let original = SidebarProject::new(
         project_id(1),
