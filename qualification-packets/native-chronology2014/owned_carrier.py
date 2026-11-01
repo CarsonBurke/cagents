@@ -30,14 +30,14 @@ import subprocess
 import time
 
 
-SOURCE_HEAD = "13ed58409699ce1e5f3b9b37d87ea988a2570cfe"
-SOURCE = Path("/home/marvin/Documents/repositories/cagents/.worktrees/fix-2014-capacity-chronology")
-CASE = Path("/tmp/issue2014-native-evidence/future-owned-after-13ed")
+SOURCE_HEAD = "f71ce673f25f5a64f3ac393349c4e64099b7145f"
+SOURCE = Path("/home/marvin/Documents/repositories/cagents/.worktrees/fix-2014-capacity-chronology-before")
+CASE = Path("/tmp/issue2014-native-evidence/future-owned-before-f71ce-wide")
 TARGET = Path("/home/marvin/Documents/repositories/cagents/.worktrees/validation-three-lanes/lane-c-target")
 HARNESS = Path("/home/marvin/.local/lib/niri-harness/bin/niri-harness")
 HARNESS_SHA256 = "b9c278ed2e496f68a12e5bafdc0f04d9deb299ca6b8294dbc95630d61ce2e7d2"
 CONFIG_SHA256 = "dac9fc580743713f13bc43718c16d61841d0596ddc149050eefb6871fd7d7173"
-SESSION = "issue2014-future-owned-after-13ed"
+SESSION = "issue2014-future-owned-before-f71ce-wide"
 QUIT = {"Action": {"Quit": {"skip_confirmation": True}}}
 
 
