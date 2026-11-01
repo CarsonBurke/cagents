@@ -226,7 +226,9 @@ Close to finish after daemon restart. A terminal receipt proves its root and PTY
 owner were released (active close also stops the inspected terminal family); it
 makes no claim about previously disowned processes outside that family. Native
 provider holders separately reap all owned provider/tool descendants before
-confirming their release.
+confirming their release. While they run, native holders and retained Claude
+actors also reap tool processes that their provider left behind and that have
+exited, without signalling any process that is still running.
 The live emulator's screen before an unexpected crash is unavailable; the UI
 warns once for the affected pane, preserves subsequent output, and requests that
 foreground programs redraw through the PTY. That redraw temporarily toggles one
